@@ -1,6 +1,7 @@
 """One-click QorCap match: record + scorebug + live local countersign + signed QorTime receipt.
 
     python sidecar/qorcap_match.py [--test-pattern] [--qortime DIR] [--qorcap PATH] [--out DIR]
+    python sidecar/qorcap_match.py finalize [BUNDLE] [--qortime DIR]     (offline, after the fact)
 
 Started by ``Start Match.cmd`` on Windows. It:
   1. finds a qortime checkout (``--qortime``, ``$QORTIME``, ``qortime/`` next to QorCap, or downloads the
@@ -12,6 +13,13 @@ Started by ``Start Match.cmd`` on Windows. It:
   4. stops on final_basis, Enter/Q, or Ctrl+C; QorCap finalises the bundle;
   5. builds the receipt with QorTime's ``receipt.build`` / ``sign_referee`` / ``sign_player`` using a device
      key (QorTime ``FileKey``), writes receipt.json, then runs ``qortime verify`` and ``qorcap verify-bundle``.
+
+Offline ``finalize`` (also ``qorcap finalize`` / ``Finalize Last Match.cmd``): decodes a bundle's recorded
+video.mp4 at 4 fps, runs the same QorTime reader + detect_final over it, writes timeline.offline.jsonl,
+score_checkpoints.jsonl (QorTime-shaped hash chain bound to QorCap's video chain) and final.offline.json, then
+signs receipt.json exactly like Start Match. If Start Match countersigned live (countersigned.jsonl), those
+signatures are reused; otherwise the local referee countersigns QorCap's checkpoints now, stamping each with
+QorCap's own recording time, and the referee ``key_kind`` says ``local-self-attested-offline``.
 
 Trust: both keys live on this PC, so the result is SELF-ATTESTED. The receipt's computed QorTime tier is
 ``single-attested`` and ``referee.key_kind`` is ``local-self-attested`` so any reader can see that the
@@ -36,6 +44,8 @@ QORTIME_PIN = "f0d532ae31e0d3ad442d3b8bea0e34bbc2298f68"
 QORTIME_ZIP = f"https://github.com/ConWan30/qortime/archive/{QORTIME_PIN}.zip"
 VERIFY_URL = "https://conwan30.github.io/qortime/verify/"
 REFEREE_KIND = "local-self-attested"
+REFEREE_KIND_OFFLINE = "local-self-attested-offline"
+CAPTURE_APPS = ("obs64.exe", "obs32.exe", "obs.exe")
 HERE = Path(__file__).resolve().parent
 WIN = sys.platform == "win32"
 
@@ -141,8 +151,8 @@ class Api:
 class Countersigner:
     """Local referee: countersigns each QorCap checkpoint at the moment it is first seen."""
 
-    def __init__(self, key, match_id: str, role: str, clock=lambda: int(time.time() * 1000)) -> None:
-        self.key, self.match_id, self.role, self.clock = key, match_id, role, clock
+    def __init__(self, key, match_id: str, role: str, clock=lambda: int(time.time() * 1000), sink: Path | None = None) -> None:
+        self.key, self.match_id, self.role, self.clock, self.sink = key, match_id, role, clock, sink
         self.signed: list[dict] = []
 
     def offer(self, cp: dict) -> bool:
@@ -152,11 +162,16 @@ class Countersigner:
             return False
         body = body_of(cp)
         body["hash"] = cp["hash"]
-        self.signed.append(countersign(self.key, self.match_id, self.role, body, self.clock()))
+        ts = self.clock() if not callable(getattr(self, "ts_of", None)) else self.ts_of(cp)
+        self.signed.append(countersign(self.key, self.match_id, self.role, body, ts))
+        if self.sink is not None:
+            with open(self.sink, "a", encoding="utf-8") as f:
+                f.write(json.dumps(self.signed[-1]) + "\n")
         return True
 
 
-def build_receipt(draft: dict, cps: list[dict], device, referee, *, match_id: str, role: str, started_ms: int) -> dict:
+def build_receipt(draft: dict, cps: list[dict], device, referee, *, match_id: str, role: str, started_ms: int,
+                  referee_kind: str = REFEREE_KIND) -> dict:
     """QorTime's receipt.build + sign_referee + sign_player on what QorCap observed."""
     from qor_receipt import receipt as R
 
@@ -164,7 +179,7 @@ def build_receipt(draft: dict, cps: list[dict], device, referee, *, match_id: st
              ended_ms=max(cps[-1]["referee_ts_ms"] if cps else started_ms, started_ms))
     player = dict(draft["players"][0], role=role, pubkey=device.pubkey_hex, key_kind=device.kind)
     rec = R.build(match=m, result=draft["result"], players=[player],
-                  referee={"pubkey": referee.pubkey_hex, "key_id": referee.key_id, "key_kind": REFEREE_KIND},
+                  referee={"pubkey": referee.pubkey_hex, "key_id": referee.key_id, "key_kind": referee_kind},
                   challenges=draft.get("challenges", []), checkpoints={role: cps},
                   agreement=draft.get("agreement") or {"timelines_agree": None, "mismatches": []},
                   signals=draft.get("signals") or {"motion_permille": {role: None}})
@@ -247,6 +262,52 @@ def start_fake_scores(api: Api, stop: threading.Event, state: dict, secs: float)
     return t
 
 
+# ------------------------------------------------------------------ apps holding the card
+def capture_apps_running() -> list[str]:
+    """obs64.exe etc. hold a USB capture card exclusively (Windows)."""
+    if not WIN:
+        return []
+    try:
+        out = subprocess.run(["tasklist", "/FO", "CSV", "/NH"], capture_output=True, text=True, timeout=10).stdout.lower()
+    except Exception:
+        return []
+    return [n for n in CAPTURE_APPS if f'"{n}"' in out]
+
+
+def offer_close_capture_apps(ask=input) -> bool:
+    """Returns True when nothing is holding the card (anymore)."""
+    apps = capture_apps_running()
+    if not apps:
+        return True
+    say("")
+    say("  Close OBS. It's using the capture card.  (" + ", ".join(apps) + " is running)")
+    try:
+        ans = ask("  Close it for you now? [Y/n] ").strip().lower()
+    except EOFError:
+        ans = "n"
+    if ans not in ("", "y", "yes"):
+        say("  OK. Close OBS yourself, then recording will start once the card is free.")
+        return False
+    for n in apps:
+        subprocess.run(["taskkill", "/IM", n], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+    for _ in range(20):
+        if not capture_apps_running():
+            say("  OBS closed.")
+            return True
+        time.sleep(0.5)
+    try:
+        ans = ask("  OBS did not close (it may be asking a question). Force-close it? [y/N] ").strip().lower()
+    except EOFError:
+        ans = "n"
+    if ans in ("y", "yes"):
+        for n in apps:
+            subprocess.run(["taskkill", "/F", "/IM", n], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+        time.sleep(1.5)
+    ok = not capture_apps_running()
+    say("  OBS closed." if ok else "  OBS is still running; the capture card may not open.")
+    return ok
+
+
 # ------------------------------------------------------------------ console
 def key_watcher(stop: threading.Event, state: dict) -> None:
     def loop():
@@ -307,6 +368,10 @@ def overall(qt_status: str, bundle_ok: bool) -> str:
 
 # ------------------------------------------------------------------ main
 def main(argv=None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if "finalize" in argv:  # `qorcap_match.py [--qorcap X ...] finalize [BUNDLE] [opts]` (launcher puts its opts first)
+        argv.remove("finalize")
+        return finalize_main(argv)
     ap = argparse.ArgumentParser(description="QorCap one-click match")
     ap.add_argument("--test-pattern", action="store_true", help="no capture card: synthetic video + scripted scores")
     ap.add_argument("--test-secs", type=float, default=20.0, help="test-pattern game length")
@@ -320,6 +385,10 @@ def main(argv=None) -> int:
     ap.add_argument("--role", choices=["home", "away"], default="home")
     ap.add_argument("--player-id", default="local:player")
     ap.add_argument("--encoder")
+    ap.add_argument("--res", default="1280x720")
+    ap.add_argument("--fps", default="30")
+    ap.add_argument("--input-format", default="mjpeg", help="mjpeg works on USB3.0 Video at 720p30; 'auto' probes the card")
+    ap.add_argument("--audio", default="auto", help="card audio device ('auto'), a device name, or 'none'")
     ap.add_argument("--no-open", action="store_true")
     a = ap.parse_args(argv)
 
@@ -349,12 +418,15 @@ def main(argv=None) -> int:
         pass
 
     cmd = [qorcap, "--port", str(a.port)] + (["--ffmpeg", a.ffmpeg] if a.ffmpeg else []) + [
-        "record", "--device", "testpattern" if a.test_pattern else a.device, "--res", "1280x720", "--fps", "30",
+        "record", "--device", "testpattern" if a.test_pattern else a.device, "--res", a.res, "--fps", a.fps,
         "--bundle", str(bundle), "--replay", "90", "--match-id", match_id, "--role", a.role, "--player-id", a.player_id]
     if a.encoder or a.test_pattern:
         cmd += ["--encoder", a.encoder or "libx264"]
     if a.test_pattern:
         cmd += ["--audio", "none"]
+    else:
+        cmd += ["--input-format", a.input_format, "--audio", a.audio]
+        offer_close_capture_apps()
     log = open(bundle / "console.log", "w", encoding="utf-8")
     started_ms = int(time.time() * 1000)
     proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT)
@@ -369,13 +441,14 @@ def main(argv=None) -> int:
     if proc.poll() is not None:
         say(f"QorCap could not start. Details: {bundle / 'console.log'}")
         say("Common fixes: plug the capture card into a blue USB 3 port, close OBS/Camera apps, run Start Match again.")
+        say("You can sign an already-recorded match later with 'Finalize Last Match'.")
         return 5
 
     say(f"Recording to: {bundle}")
     say("Play your game. Recording stops by itself at the final whistle.")
     say("Press ENTER (or Q, or Ctrl+C) to stop early.\n")
     stop, state = threading.Event(), {}
-    cs = Countersigner(referee, match_id, a.role)
+    cs = Countersigner(referee, match_id, a.role, sink=bundle / "countersigned.jsonl")
     if a.test_pattern:
         start_fake_scores(api, stop, state, a.test_secs)
     else:
@@ -442,8 +515,19 @@ def main(argv=None) -> int:
         say(f"FAIL: QorCap did not write the bundle. See {bundle / 'qorcap.log'}")
         return 2
     draft = json.loads(draft_p.read_text(encoding="utf-8"))
-    no_final = "final_basis" not in draft["result"]
-    rec = build_receipt(draft, cs.signed, device, referee, match_id=match_id, role=a.role, started_ms=started_ms)
+    return sign_and_report(bundle, draft, cs.signed, device, referee, match_id=match_id, role=a.role,
+                           started_ms=started_ms, qt=qt, qorcap=qorcap, no_open=a.no_open)
+
+
+def sign_and_report(bundle: Path, draft: dict, cps: list[dict], device, referee, *, match_id: str, role: str,
+                    started_ms: int, qt: Path, qorcap: str, no_open: bool, referee_kind: str = REFEREE_KIND,
+                    note: str | None = None) -> int:
+    """Shared by Start Match and finalize: build + sign receipt.json, run both verifiers, print the summary."""
+    no_final = "final_basis" not in draft["result"] or draft["result"].get("final_basis") is None
+    if no_final:
+        draft = dict(draft, result={k: v for k, v in draft["result"].items() if k != "final_basis"})
+    rec = build_receipt(draft, cps, device, referee, match_id=match_id, role=role, started_ms=started_ms,
+                        referee_kind=referee_kind)
     (bundle / "receipt.json").write_text(json.dumps(rec, indent=2), encoding="utf-8")
     (bundle / "referee.pub").write_text(referee.pubkey_hex + "\n", encoding="ascii")
 
@@ -472,14 +556,257 @@ def main(argv=None) -> int:
     say("  Trust level:  SELF-ATTESTED. Signed by this PC's device key and a LOCAL referee key")
     say("                (no independent QorTime referee server exists yet). It proves the video was")
     say("                not changed after recording; it does not prove who was playing.")
+    if note:
+        say(f"  Offline:      {note}")
     say(f"\n  Folder:       {bundle}")
     say("  View online:  open " + VERIFY_URL)
     say("                click 'Choose file' and pick receipt.json from the folder above")
     say("                (or paste its text), paste the text of referee.pub into the key box, click Verify.")
     say("                It runs in your browser; nothing is uploaded.")
-    if not a.no_open:
+    if not no_open:
         open_folder(bundle)
     return {"VERIFIED": 0, "PARTIAL": 0, "FAIL": 2}[result]
+
+
+# ------------------------------------------------------------------ offline finalize
+FIN_HZ = 4.0
+
+
+def read_jsonl(p: Path) -> list[dict]:
+    if not p.exists():
+        return []
+    return [json.loads(x) for x in p.read_text(encoding="utf-8").splitlines() if x.strip()]
+
+
+def latest_bundle(root: Path) -> Path | None:
+    cands = [d for d in root.glob("match-*") if (d / "video.mp4").exists()] if root.exists() else []
+    return max(cands, key=lambda d: d.name) if cands else None
+
+
+def video_files(bundle: Path) -> list[Path]:
+    """video.mp4 then any reopen parts (video.part2.mp4 ...), in manifest order."""
+    seen: list[str] = []
+    for m in read_jsonl(bundle / "manifest.jsonl"):
+        f = m.get("file")
+        if m.get("type") == "segment" and f and f not in seen:
+            seen.append(f)
+    files = [bundle / f for f in seen if (bundle / f).exists()]
+    return files or ([bundle / "video.mp4"] if (bundle / "video.mp4").exists() else [])
+
+
+def decode_frames(ffmpeg: str, video: Path, hz: float = FIN_HZ, size=(640, 360)):
+    """Yields (video_ms, BGR ndarray) at `hz`, scaled to the reader's 640x360."""
+    import numpy as np
+
+    w, h = size
+    p = subprocess.Popen([ffmpeg, "-hide_banner", "-nostdin", "-loglevel", "error", "-i", str(video), "-an",
+                          "-vf", f"fps={hz},scale={w}:{h}", "-f", "rawvideo", "-pix_fmt", "bgr24", "pipe:1"],
+                         stdout=subprocess.PIPE)
+    n, fb = 0, w * h * 3
+    try:
+        while True:
+            buf = p.stdout.read(fb)
+            if len(buf) < fb:
+                break
+            yield int(n * 1000 / hz), np.frombuffer(buf, np.uint8).reshape(h, w, 3)
+            n += 1
+    finally:
+        p.stdout.close()
+        p.wait()
+
+
+def segment_at(manifest: list[dict], wall_ms: int) -> dict | None:
+    """Latest video segment written at or before wall_ms (else the first one)."""
+    segs = [m for m in manifest if m.get("type") == "segment"]
+    best = None
+    for m in segs:
+        if m.get("wall_ms", 0) <= wall_ms:
+            best = m
+    return best or (segs[0] if segs else None)
+
+
+def score_checkpoints(events: list[dict], manifest: list[dict], match_id: str, role: str) -> list[dict]:
+    """QorTime-shaped chain over offline score changes + final, each bound to the video chain head."""
+    from qor_receipt.checkpoints import make_checkpoint, GENESIS
+    from qor_receipt.jcs import sha256_hex
+
+    out, prev, last, seq = [], GENESIS, None, 0
+    for e in events:
+        if e["type"] == "score":
+            key = (e["home"], e["away"], e["quarter"])
+            if key == last:
+                continue
+            trig, prev_score, last = "score_change", (dict(zip(("home", "away", "quarter"), last)) if last else None), key
+            extra = {"score": {k: e[k] for k in ("home", "away", "quarter", "clock_s", "clock_red")}, "prev_score": prev_score}
+        elif e["type"] == "final":
+            trig, extra = "final", {"final": {k: e[k] for k in ("home", "away", "quarter", "t_ms", "basis")}}
+        else:
+            continue
+        seg = segment_at(manifest, e["t_ms"]) or {}
+        ext = {"trigger": trig, "offline": True, "video_ms": e["video_ms"], "segment_seq": seg.get("seq"),
+               "segment_hash": seg.get("sha256"), "chain_head": seg.get("chain_head"), "match_id": match_id, "role": role, **extra}
+        cp = make_checkpoint(seq, e["t_ms"], sha256_hex(ext), sha256_hex([]), prev)
+        cp["qorcap"] = ext
+        out.append(cp)
+        prev, seq = cp["hash"], seq + 1
+    return out
+
+
+def run_offline_reader(frames, t0_ms: int, core_factory, progress=None) -> tuple[list[dict], dict]:
+    """Feeds decoded frames through ReaderCore; returns (events with video_ms, stats)."""
+    events: list[dict] = []
+    cur = {"video_ms": 0}
+
+    def post(b):
+        events.append(dict(b, video_ms=cur["video_ms"]))
+        return {}
+
+    core = core_factory(post)
+    for vms, img in frames:
+        cur["video_ms"] = vms
+        core.on_frame(t0_ms + vms, img)
+        if progress and core.stats["frames"] % 240 == 0:
+            progress(vms, core)
+    return events, core.stats
+
+
+def default_core_factory(post):
+    from qor_receipt._vendor.qoresence.vision.local_scorebug.agreement import AgreementWindow
+    from qor_receipt._vendor.qoresence.vision.local_scorebug.reader import ScorebugReader
+    from qor_receipt.agent.pause_detect import PauseDetector
+    from qor_receipt.final_detect import detect_final
+
+    sys.path.insert(0, str(HERE))
+    from qorcap_reader import ReaderCore
+
+    return ReaderCore(post, ScorebugReader(), AgreementWindow(), PauseDetector(), detect_final)
+
+
+def finalize(bundle: Path, *, qt: Path, qorcap: str, ffmpeg: str, key_dir: Path, no_open: bool = True,
+             core_factory=None, hz: float = FIN_HZ) -> int:
+    bundle = bundle.resolve()
+    vids = video_files(bundle)
+    if not vids:
+        say(f"No video.mp4 in {bundle}")
+        return 2
+    draft_p = bundle / "receipt.draft.json"
+    if not draft_p.exists():
+        say(f"{bundle} has no receipt.draft.json (was it recorded with --bundle?)")
+        return 2
+    draft = json.loads(draft_p.read_text(encoding="utf-8"))
+    meta = json.loads((bundle / "bundle.json").read_text(encoding="utf-8")) if (bundle / "bundle.json").exists() else {}
+    manifest = read_jsonl(bundle / "manifest.jsonl")
+    qcps = read_jsonl(bundle / "checkpoints.jsonl")
+    role = meta.get("role") or draft["players"][0]["role"]
+    match_id = meta.get("match_id") or draft["match"]["match_id"]
+    if match_id in ("", "unassigned"):
+        match_id = f"local-{bundle.name.removeprefix('match-')}"
+    started_ms = int(draft["match"]["started_ms"])
+    device, referee = load_keys(key_dir)
+
+    say(f"Reading the scorebug from {', '.join(v.name for v in vids)} ({hz:g} frames/s) ...")
+    t0 = time.monotonic()
+    events, stats, offset = [], {"frames": 0, "agreed": 0, "errors": 0, "paused": 0}, 0
+    factory = core_factory or default_core_factory
+    shared = {"core": None}
+
+    def fac(post):  # one reader across parts so agreement/final state carries over
+        if shared["core"] is None:
+            shared["core"] = factory(post)
+        else:
+            shared["core"].post = post
+        return shared["core"]
+
+    def prog(vms, core):
+        sys.stdout.write(f"\r  {vms // 60000:02d}:{vms // 1000 % 60:02d} of video read, {core.stats['agreed']} agreed reads ")
+        sys.stdout.flush()
+
+    for v in vids:
+        last = [0]
+
+        def frames(v=v):
+            for vms, img in decode_frames(ffmpeg, v, hz):
+                last[0] = vms
+                yield offset + vms, img
+        ev, st = run_offline_reader(frames(), started_ms, fac, prog)
+        events += ev
+        stats = dict(st)
+        offset += last[0] + int(1000 / hz)
+    say(f"\r  read {stats['frames']} frames in {time.monotonic() - t0:.0f}s: {stats['agreed']} agreed scorebug reads".ljust(78))
+
+    with open(bundle / "timeline.offline.jsonl", "w", encoding="utf-8") as f:
+        for e in events:
+            if e["type"] in ("score", "obs"):
+                f.write(json.dumps(e) + "\n")
+    scps = score_checkpoints(events, manifest, match_id, role)
+    with open(bundle / "score_checkpoints.jsonl", "w", encoding="utf-8") as f:
+        for c in scps:
+            f.write(json.dumps(c) + "\n")
+    fin = next((e for e in events if e["type"] == "final"), None)
+    reads = [e for e in events if e["type"] == "score"]
+    (bundle / "final.offline.json").write_text(json.dumps(
+        {"final": fin, "basis": fin and fin["basis"], "last_read": reads[-1] if reads else None, "frames": stats,
+         "score_checkpoints": len(scps), "score_checkpoint_head": scps[-1]["hash"] if scps else None,
+         "method": "offline: QorTime ScorebugReader + AgreementWindow + detect_final over recorded video",
+         "finalized_ms": int(time.time() * 1000)}, indent=2), encoding="utf-8")
+
+    src = fin or (reads[-1] if reads else None)
+    res = dict(draft["result"])
+    if src:
+        res.update(home_score=src["home"], away_score=src["away"], quarter=max(4, src["quarter"]) if fin else src["quarter"],
+                   final_t_ms=src["t_ms"], winner="home" if src["home"] > src["away"] else "away")
+        res["quarter"] = max(1, res["quarter"])
+    res.pop("final_basis", None)
+    if fin:
+        res["final_basis"] = fin["basis"]
+    draft = dict(draft, result=res)
+    say(f"  {len(reads)} score reads, {len(scps)} score checkpoints, final: "
+        + (f"{fin['basis']} AWAY {fin['away']} - HOME {fin['home']}" if fin else "not detected"))
+
+    live = read_jsonl(bundle / "countersigned.jsonl")
+    if live and len(live) >= len(qcps) and all(a["hash"] == b["hash"] for a, b in zip(live, qcps)):
+        cps, kind, note = live[:len(qcps)], REFEREE_KIND, "scores read after the fact; checkpoint signatures are the live ones from Start Match."
+    else:
+        cs = Countersigner(referee, match_id, role)
+        cs.ts_of = lambda cp: int(cp["t_ms"])  # stamped with QorCap's recording clock, not observed live
+        for c in qcps:
+            cs.offer(c)
+        cps, kind = cs.signed, REFEREE_KIND_OFFLINE
+        note = ("no live countersignatures; the local referee signed QorCap's checkpoints after the fact, "
+                "stamped with QorCap's recording times (referee key_kind local-self-attested-offline).")
+    say("\nSigning the receipt ...")
+    return sign_and_report(bundle, draft, cps, device, referee, match_id=match_id, role=role, started_ms=started_ms,
+                           qt=qt, qorcap=qorcap, no_open=no_open, referee_kind=kind, note=note)
+
+
+def finalize_main(argv) -> int:
+    ap = argparse.ArgumentParser(prog="qorcap finalize", description="Offline: read scores from a recorded bundle and sign it")
+    ap.add_argument("bundle", nargs="?", help="match bundle folder (default: newest in Documents/QorCap Matches)")
+    ap.add_argument("--out", help="matches folder used to find the newest bundle")
+    ap.add_argument("--qortime")
+    ap.add_argument("--qorcap")
+    ap.add_argument("--ffmpeg")
+    ap.add_argument("--key-dir")
+    ap.add_argument("--hz", type=float, default=FIN_HZ)
+    ap.add_argument("--no-open", action="store_true")
+    a = ap.parse_args(argv)
+    say("=" * 64)
+    say("  QorCap  -  Finalize Match (offline)")
+    say("=" * 64)
+    root = Path(a.out) if a.out else Path.home() / "Documents" / "QorCap Matches"
+    bundle = Path(a.bundle) if a.bundle else latest_bundle(root)
+    if bundle is None or not bundle.exists():
+        say(f"No recorded match found in {root}. Pass the bundle folder: qorcap finalize <folder>")
+        return 2
+    qt = find_qortime(a.qortime)
+    sys.path.insert(0, str(qt))
+    miss = check_python_deps(need_vision=True)
+    if miss:
+        say(f"Missing Python packages: {' '.join(miss)}\n  Fix: py -m pip install {' '.join(miss)}")
+        return 3
+    ff = a.ffmpeg or next((str(c) for c in [HERE.parent / ("ffmpeg.exe" if WIN else "ffmpeg")] if c.exists()), None) or shutil.which("ffmpeg") or "ffmpeg"
+    return finalize(bundle, qt=qt, qorcap=find_qorcap(a.qorcap), ffmpeg=ff,
+                    key_dir=Path(a.key_dir) if a.key_dir else data_dir() / "keys", no_open=a.no_open, hz=a.hz)
 
 
 if __name__ == "__main__":

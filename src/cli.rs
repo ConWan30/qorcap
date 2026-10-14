@@ -36,6 +36,19 @@ pub enum Cmd {
     Status,
     /// Re-hash a match bundle's video against its manifest and check the checkpoint chain
     VerifyBundle { dir: String },
+    /// Offline: run QorTime's scorebug reader over a recorded bundle's video.mp4, write score
+    /// checkpoints + final detection and sign receipt.json (self-attested local referee).
+    /// Runs sidecar/qorcap_match.py finalize (needs Python with numpy, opencv, cryptography).
+    Finalize {
+        /// Match bundle folder (contains video.mp4). Default: the newest folder in Documents/QorCap Matches
+        bundle: Option<String>,
+        /// Python interpreter (default: QorCap's venv, then py/python3/python)
+        #[arg(long)]
+        python: Option<String>,
+        /// Extra arguments passed to the finalizer (e.g. --qortime DIR)
+        #[arg(last = true)]
+        rest: Vec<String>,
+    },
 }
 
 #[derive(clap::Args, Debug, Clone, PartialEq)]

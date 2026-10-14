@@ -19,6 +19,40 @@ fn print_resp(r: Result<(u16, String), String>) -> i32 {
     match r { Ok((c, b)) => { println!("{b}"); if c == 200 { 0 } else { 1 } } Err(e) => { eprintln!("error: {e}"); 2 } }
 }
 
+/// `qorcap finalize`: hand off to the Python finalizer shipped in sidecar/ next to the exe.
+fn finalize(bundle: Option<String>, python: Option<String>, rest: Vec<String>, ff: &str) -> i32 {
+    let me = std::env::current_exe().unwrap_or_default();
+    let base = me.parent().map(|p| p.to_path_buf()).unwrap_or_default();
+    let roots = [base.clone(), base.join("..").join(".."), std::env::current_dir().unwrap_or_default()];
+    let Some(script) = roots.iter().map(|r| r.join("sidecar").join("qorcap_match.py")).find(|p| p.exists()) else {
+        eprintln!("error: sidecar/qorcap_match.py not found next to qorcap"); return 2;
+    };
+    let mut cands: Vec<Vec<String>> = Vec::new();
+    if let Some(p) = python.or_else(|| std::env::var("QORCAP_PYTHON").ok()) { cands.push(vec![p]); }
+    let home = std::env::var("QORCAP_HOME").map(std::path::PathBuf::from).ok().or_else(|| {
+        if cfg!(windows) { std::env::var("LOCALAPPDATA").ok().map(|d| std::path::Path::new(&d).join("QorCap")) }
+        else { std::env::var("HOME").ok().map(|d| std::path::Path::new(&d).join(".qorcap")) } });
+    if let Some(h) = home {
+        let v = if cfg!(windows) { h.join("venv").join("Scripts").join("python.exe") } else { h.join("venv").join("bin").join("python") };
+        if v.exists() { cands.push(vec![v.to_string_lossy().into_owned()]); }
+    }
+    if cfg!(windows) { cands.push(vec!["py".into(), "-3".into()]); cands.push(vec!["python".into()]); } else { cands.push(vec!["python3".into()]); cands.push(vec!["python".into()]); }
+    let mut args = vec![script.to_string_lossy().into_owned(), "finalize".into()];
+    if let Some(b) = bundle { args.push(b); }
+    args.extend(["--qorcap".into(), me.to_string_lossy().into_owned(), "--ffmpeg".into(), ff.to_string()]);
+    let qt = base.join("qortime");
+    if qt.join("qor_receipt").join("receipt.py").exists() && !rest.iter().any(|r| r == "--qortime") { args.extend(["--qortime".into(), qt.to_string_lossy().into_owned()]); }
+    args.extend(rest);
+    for c in cands {
+        match std::process::Command::new(&c[0]).args(&c[1..]).args(&args).status() {
+            Ok(s) => return s.code().unwrap_or(1),
+            Err(_) => continue,
+        }
+    }
+    eprintln!("error: Python not found. Run Start Match once (it sets Python up), or pass --python");
+    2
+}
+
 fn main() {
     let cli = Cli::parse();
     let ff = ffmpeg::find_ffmpeg(cli.ffmpeg.as_deref());
@@ -45,6 +79,7 @@ fn main() {
             }
             Err(e) => { eprintln!("error: {e}"); 2 }
         },
+        Cmd::Finalize { bundle, python, rest } => finalize(bundle, python, rest, &ff),
         Cmd::Record(mut a) => {
             if let Some(b) = a.bundle.clone() {
                 let d = std::path::Path::new(&b);
@@ -57,6 +92,13 @@ fn main() {
             let lp = init_log(cli_log.as_deref());
             info!("qorcap {} starting; log file {lp}; ffmpeg {ff}", env!("CARGO_PKG_VERSION"));
             if a.device == "testpattern" && !cfg!(feature = "test-pattern") { error!("testpattern device requires the test-pattern feature"); std::process::exit(2); }
+            if a.device != "testpattern" {
+                let apps = ffmpeg::capture_apps_running();
+                if !apps.is_empty() {
+                    eprintln!("\n  Close OBS. It's using the capture card. ({} is running)\n", apps.join(", "));
+                    log::warn!("{} is running; it may hold \"{}\" exclusively", apps.join(", "), a.device);
+                }
+            }
             let e = Engine::new(a.clone(), ff);
             let srv = match api::serve(e.clone(), cli.port) { Ok(h) => h, Err(m) => { error!("{m}"); std::process::exit(2); } };
             { let e = e.clone(); let _ = ctrlc::set_handler(move || { info!("Ctrl+C: stopping"); e.shutdown.store(true, Ordering::SeqCst); }); }

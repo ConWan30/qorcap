@@ -228,8 +228,12 @@ impl Engine {
     /// Main supervisor loop. Returns when shutdown is requested.
     pub fn run(self: &Arc<Self>) {
         let mut backoff = 1u64;
+        let mut fmt: Option<String> = None; // resolved input format (probed once per device appearance)
+        let mut audio_off = false;          // audio failed to open: continue video-only
+        let mut audio_fails = 0u32;
         while !self.shutdown.load(Ordering::SeqCst) {
             let mut audio = None;
+            if self.args.device == "testpattern" && self.args.audio != "none" && self.args.audio != "off" && !audio_off { audio = Some("sine".to_string()); }
             if self.args.device != "testpattern" {
                 match ffmpeg::list_devices(&self.ffmpeg) {
                     Err(e) => { self.set_state("waiting_for_device", Some(format!("cannot run ffmpeg `{}`: {e}", self.ffmpeg))); error!("cannot run ffmpeg `{}`: {e}", self.ffmpeg); self.sleep(5); continue; }
@@ -239,17 +243,45 @@ impl Engine {
                                 devs.iter().filter(|d| d.kind == "video").map(|d| d.name.as_str()).collect::<Vec<_>>().join(", "));
                             if self.status.lock().unwrap().state != "waiting_for_device" { warn!("{msg}; waiting for it to appear"); }
                             self.set_state("waiting_for_device", Some(msg));
+                            fmt = None;
                             self.sleep(1);
                             continue;
                         }
-                        audio = ffmpeg::pick_audio(&self.args.device, &self.args.audio, &devs);
+                        audio = if audio_off { None } else { ffmpeg::pick_audio(&self.args.device, &self.args.audio, &devs) };
+                        if self.args.audio != "none" && self.args.audio != "off" && audio.is_none() && !audio_off {
+                            warn!("no audio device for \"{}\" found; recording video-only", self.args.device);
+                            audio_off = true;
+                        }
+                        if fmt.is_none() {
+                            let f = if self.args.input_format == "auto" {
+                                match ffmpeg::list_options(&self.ffmpeg, &self.args.device) {
+                                    Ok(m) => { let f = ffmpeg::choose_input_format(&m, self.args.res.0, self.args.res.1, self.args.fps);
+                                        info!("card modes: {}; input format auto -> {f}", m.iter().map(|x| format!("{}:{}x{}@{}", x.format, x.w, x.h, x.max_fps.round())).collect::<Vec<_>>().join(" "));
+                                        f }
+                                    Err(e) => { warn!("could not list card modes ({e}); input format auto"); "auto".into() }
+                                }
+                            } else { self.args.input_format.clone() };
+                            fmt = Some(f);
+                        }
                         self.ev.lock().unwrap().device_id = devs.iter().find(|d| d.kind == "video" && d.name == self.args.device).and_then(|d| d.alt.clone());
                     }
                 }
             }
             self.status.lock().unwrap().audio = audio.clone();
             let t0 = Instant::now();
-            let ok = self.run_capture_once(audio.as_deref());
+            let (ok, why) = self.run_capture_once(fmt.as_deref().unwrap_or("auto"), audio.as_deref());
+            if self.shutdown.load(Ordering::SeqCst) { self.ring.lock().unwrap().clear(); break; }
+            if !ok && audio.is_some() {
+                audio_fails = if why == ffmpeg::Failure::AudioOpen { 99 } else { audio_fails + 1 };
+                if audio_fails >= 2 {
+                    warn!("audio device {:?} could not be opened{}; falling back to VIDEO-ONLY recording", audio,
+                        if why == ffmpeg::Failure::AudioOpen { "" } else { " (two failed opens with audio)" });
+                    audio_off = true;
+                    self.ring.lock().unwrap().clear();
+                    self.set_state("reopening", Some("audio could not be opened; retrying video-only".into()));
+                    continue; // immediate retry, no backoff, nothing was recorded
+                }
+            } else if ok { audio_fails = 0; }
             self.ring.lock().unwrap().clear();
             if self.shutdown.load(Ordering::SeqCst) { break; }
             self.status.lock().unwrap().reopen_count += 1;
@@ -272,13 +304,13 @@ impl Engine {
     }
 
     /// One capture session. Returns true if it produced data.
-    fn run_capture_once(self: &Arc<Self>, audio: Option<&str>) -> bool {
+    fn run_capture_once(self: &Arc<Self>, input_format: &str, audio: Option<&str>) -> (bool, ffmpeg::Failure) {
         if self.args.stamp && !self.stamp_file.exists() { let _ = std::fs::write(&self.stamp_file, "QorCap  no referee nonce yet"); }
         let stamp = if self.args.stamp { Some(self.stamp_file.to_string_lossy().into_owned()) } else { None };
-        let args = ffmpeg::capture_args(&self.args, audio, &self.snapshot.to_string_lossy(), stamp.as_deref());
-        info!("opening \"{}\" audio={:?} {}x{}@{} enc={}", self.args.device, audio, self.args.res.0, self.args.res.1, self.args.fps, self.args.encoder);
+        let args = ffmpeg::capture_args(&self.args, input_format, audio, &self.snapshot.to_string_lossy(), stamp.as_deref());
+        info!("opening \"{}\" format={input_format} audio={:?} {}x{}@{} enc={}", self.args.device, audio, self.args.res.0, self.args.res.1, self.args.fps, self.args.encoder);
         let child = ffmpeg::command(&self.ffmpeg).args(&args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn();
-        let mut child = match child { Ok(c) => c, Err(e) => { let m = format!("cannot start ffmpeg `{}`: {e}", self.ffmpeg); error!("{m}"); self.set_state("reopening", Some(m)); return false; } };
+        let mut child = match child { Ok(c) => c, Err(e) => { let m = format!("cannot start ffmpeg `{}`: {e}", self.ffmpeg); error!("{m}"); self.set_state("reopening", Some(m)); return (false, ffmpeg::Failure::Other); } };
         let mut stdout = child.stdout.take().unwrap();
         let stderr = child.stderr.take().unwrap();
         let child = Arc::new(Mutex::new(child));
@@ -340,15 +372,18 @@ impl Engine {
         }
         alive.store(false, Ordering::SeqCst);
         let st = { let mut c = child.lock().unwrap(); let _ = c.kill(); c.wait() };
+        let mut why = ffmpeg::Failure::Other;
         if !self.shutdown.load(Ordering::SeqCst) {
             std::thread::sleep(Duration::from_millis(200));
             let tail = last_err.lock().unwrap().join(" | ");
+            why = ffmpeg::classify_failure(&tail);
             let m = format!("ffmpeg capture exited ({:?}){}", st.ok(), if tail.is_empty() { String::new() } else { format!(": {tail}") });
-            let hint = if tail.contains("Could not run graph") || tail.contains("I/O error") || tail.contains("busy") { " (device busy/shared by another app, or unplugged)" } else { "" };
+            let apps = if got { Vec::new() } else { ffmpeg::capture_apps_running() };
+            let hint = ffmpeg::failure_hint(why, !apps.is_empty());
             error!("{m}{hint}");
             self.set_state("reopening", Some(format!("{m}{hint}")));
         }
-        got
+        (got, why)
     }
 }
 
