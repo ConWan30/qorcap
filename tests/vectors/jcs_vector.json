@@ -1,0 +1,23 @@
+{
+  "input": {
+    "z": 1,
+    "a": [
+      true,
+      false,
+      null,
+      -42,
+      9007199254740991
+    ],
+    "é": "café",
+    "😀": "emoji key",
+    "€": "euro",
+    "B": {
+      "y": "line\nbreak \"q\" \\ \t",
+      "x": "\u0001ctl"
+    },
+    "": "empty",
+    "1": 0
+  },
+  "canonical": "{\"\":\"empty\",\"1\":0,\"B\":{\"x\":\"\\u0001ctl\",\"y\":\"line\\nbreak \\\"q\\\" \\\\ \\t\"},\"a\":[true,false,null,-42,9007199254740991],\"z\":1,\"é\":\"café\",\"€\":\"euro\",\"😀\":\"emoji key\"}",
+  "sha256": "569652979effd58d9aa9c9cc46b063e55e682a84756964bb2d0cb9a5371d3271"
+}
