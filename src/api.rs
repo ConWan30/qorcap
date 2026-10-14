@@ -98,7 +98,10 @@ mod tests {
     use crate::ring::tests::{pat, pkt};
     use clap::Parser;
     fn engine(extra: &[&str]) -> Arc<Engine> {
-        let mut a = vec!["q", "record", "--device", "testpattern"]; a.extend_from_slice(extra);
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let dir = std::env::temp_dir().join(format!("qorcap-api-{}-{}", std::process::id(), N.fetch_add(1, Ordering::SeqCst)))
+            .to_string_lossy().into_owned();
+        let mut a = vec!["q", "record", "--device", "testpattern", "--bundle", &dir]; a.extend_from_slice(extra);
         let crate::cli::Cmd::Record(r) = crate::cli::Cli::try_parse_from(a).unwrap().cmd else { panic!() };
         Engine::new(r, "ffmpeg-does-not-exist".into())
     }
@@ -158,7 +161,6 @@ mod tests {
         let all: Value = serde_json::from_slice(&route(&e, "GET", "/checkpoints", "").body).unwrap();
         let mut prev = crate::evidence::GENESIS.to_string();
         for c in all["checkpoints"].as_array().unwrap() { prev = crate::evidence::check_checkpoint(c, &prev).unwrap(); }
-        for f in ["checkpoints.jsonl", "challenges.jsonl", "timeline.jsonl"] { let _ = std::fs::remove_file(format!("qorcap.{f}")); }
     }
     #[test]
     fn snapshot_and_http_roundtrip() {
