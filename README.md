@@ -1,5 +1,7 @@
 # QorCap
 
+**Website:** https://conwan30.github.io/qorcap/ · **Download:** [v0.1.0](https://github.com/ConWan30/qorcap/releases/tag/v0.1.0)
+
 A small Windows recorder for a USB HDMI capture card (built for a generic **"USB3.0 Video"** card carrying a PS5),
 made for **[QorTime](https://github.com/ConWan30/qortime)** match receipts. It does two jobs:
 

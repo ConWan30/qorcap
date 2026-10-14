@@ -1,0 +1,235 @@
+<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>QorCap — signal to seal</title>
+<meta name="description" content="QorCap is a lean Windows capture-card recorder for QorTime. Every 2 s segment is SHA-256 hash-chained, checkpointed, and bundled into a draft receipt ready for QorTime signing.">
+<meta name="theme-color" content="#04050a"><meta name="color-scheme" content="dark">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%2304050a'/%3E%3Crect x='5' y='5' width='22' height='22' rx='6' fill='none' stroke='%232ef2ff' stroke-width='3'/%3E%3C/svg%3E">
+<meta property="og:title" content="QorCap — signal to seal"><meta property="og:description" content="Hash-chained capture-card recording for QorTime match receipts.">
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Big+Shoulders+Display:wght@700;800;900&family=Inter+Tight:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css">
+</head><body>
+<div class="grain" aria-hidden="true"></div><div class="glow-cursor" aria-hidden="true"></div>
+<header class="nav glass"><a class="brand" href="#top" aria-label="QorCap home"><i></i><b>Qor<span>Cap</span></b></a>
+<nav><a href="#pipeline">Pipeline</a><a href="#api">Live API</a><a href="#challenge">Challenge</a><a href="#tamper">Tamper</a><a href="#limits">Limits</a><a class="btn sm" href="https://github.com/ConWan30/qorcap/releases/tag/v0.1.0">Download</a></nav></header>
+<main>
+
+<section class="hero" id="top">
+ <canvas id="sig" aria-hidden="true"></canvas>
+ <div class="wrap">
+  <p class="kicker"><span class="dot"></span> v0.1.0 · capture-card recorder for QorTime</p>
+  <h1 class="wordmark" aria-label="QorCap"><span aria-hidden="true">QORCAP</span></h1>
+  <p class="tag">HDMI in. <span>Hash chain</span> out.</p>
+  <p class="lede">A lean Windows recorder for your capture card. Every <b>~2 s segment is SHA-256 chained</b>, checkpointed in QorTime's format, and sealed into a match bundle with a <b>draft receipt</b> ready for QorTime signing. If the card freezes or gets replugged, it reopens itself.</p>
+  <div class="ctas"><a class="btn" href="https://github.com/ConWan30/qorcap/releases/tag/v0.1.0">Download for Windows <small>v0.1.0 · zip</small></a><a class="btn ghost" href="https://github.com/ConWan30/qorcap">View on GitHub</a></div>
+  <div class="chips"><span class="chip"><b>1.6 MB</b> exe</span><span class="chip">Rust + ffmpeg child</span><span class="chip">API on <b>127.0.0.1:8788</b></span><span class="chip">Windows x64</span></div>
+ </div>
+ <div class="hero-head glass" aria-hidden="true">
+  <div class="row"><span>segment</span><b id="hSeq">#0000</b></div>
+  <div class="row"><span>chain_head</span><b id="hHead">—</b></div>
+  <div class="row"><span>state</span><b class="ok" id="hState">locking…</b></div>
+ </div>
+ <div class="scrollcue" aria-hidden="true">SCROLL<i></i></div>
+</section>
+
+<div class="marq" aria-hidden="true"><div>
+<span>Signal</span><b>◆</b><span>Segment</span><b>◆</b><span>SHA-256</span><b>◆</b><span>Chain</span><b>◆</b><span>Checkpoint</span><b>◆</b><span>Challenge</span><b>◆</b><span>Clip</span><b>◆</b><span>Bundle</span><b>◆</b><span>Verify</span><b>◆</b>
+<span>Signal</span><b>◆</b><span>Segment</span><b>◆</b><span>SHA-256</span><b>◆</b><span>Chain</span><b>◆</b><span>Checkpoint</span><b>◆</b><span>Challenge</span><b>◆</b><span>Clip</span><b>◆</b><span>Bundle</span><b>◆</b><span>Verify</span><b>◆</b>
+</div></div>
+
+<section class="pad pipe-intro" id="pipeline"><div class="wrap rv">
+ <p class="kicker">01 · Signal to seal</p>
+ <h2>From HDMI to a <em>receipt</em> in six moves.</h2>
+ <p class="lede">Scroll to run the pipeline. Each stage is something QorCap actually writes to disk or serves on its local API.</p>
+</div></section>
+
+<section class="pipe" id="pipe">
+ <div class="stick"><div class="wrap">
+  <div class="pipe-copy">
+   <p class="kicker">Signal → Seal</p>
+   <div class="steps" id="steps">
+    <div class="step on"><span class="n">STAGE 1 / 6</span><h3>The card</h3><p>Your console's HDMI hits a USB capture card. QorCap opens it over DirectShow and drives <code>ffmpeg</code> as a child process: constant frame rate, hardware H.264 (<code>h264_mf</code>), AAC.</p></div>
+    <div class="step"><span class="n">STAGE 2 / 6</span><h3>Segments</h3><p>The stream is cut into fragmented MP4 segments of about 2 seconds, flushed as they're written. A power cut loses at most the last fragment.</p></div>
+    <div class="step"><span class="n">STAGE 3 / 6</span><h3>The chain</h3><p>Each segment's exact bytes get a SHA-256, linked to the previous head and appended to <code>manifest.jsonl</code>. Change one byte anywhere and every later link stops matching.</p></div>
+    <div class="step"><span class="n">STAGE 4 / 6</span><h3>Checkpoints</h3><p>On segments, score changes and finals, QorCap emits checkpoints in QorTime's format, served at <code>/checkpoints</code> and streamed over SSE, ready for a referee to co-sign.</p></div>
+    <div class="step"><span class="n">STAGE 5 / 6</span><h3>Draft receipt</h3><p>At the whistle it writes a match bundle: <code>bundle.json</code>, clips and a <code>receipt.draft.json</code>. It stays <b>unsigned</b> until QorTime's referee step signs it.</p></div>
+    <div class="step"><span class="n">STAGE 6 / 6</span><h3>Verify</h3><p><code>qorcap verify-bundle</code> rehashes everything and catches any changed byte. The signed receipt is checked on QorTime's browser verifier.</p></div>
+   </div>
+   <div class="prog" id="prog"><i><b></b></i><i><b></b></i><i><b></b></i><i><b></b></i><i><b></b></i><i><b></b></i></div>
+  </div>
+  <div class="stage"><canvas id="pipeCv" aria-label="Animated pipeline from capture card to verified receipt"></canvas></div>
+ </div></div>
+</section>
+
+<section class="pad" id="api"><div class="wrap two">
+ <div class="rv">
+  <p class="kicker">02 · Local API</p>
+  <h2>Watch the chain <em>grow</em>.</h2>
+  <p class="lede">QorCap serves a small HTTP API on <b>127.0.0.1:8788</b> only. QorTime's agent and referee tooling subscribe to the checkpoint stream over Server-Sent Events.</p>
+  <div class="api">
+   <div><b>GET</b><code>/status</code><span>fps, dup/drop frames, part</span></div>
+   <div><b>GET</b><code>/checkpoints</code><span>SSE stream</span></div>
+   <div><b>POST</b><code>/challenge</code><span>referee nonce</span></div>
+   <div><b>POST</b><code>/events</code><span>score / final from reader</span></div>
+   <div><b>GET</b><code>/snapshot.jpg</code><span>4 fps frame</span></div>
+  </div>
+ </div>
+ <div class="term glass rv">
+  <div class="bar"><i></i><i></i><i></i><span class="sp">curl -N 127.0.0.1:8788/checkpoints</span><span class="sim">SIMULATION</span></div>
+  <pre id="sse" aria-live="off"></pre>
+  <div class="cmd"><button data-ev="score">score change</button><button data-ev="nonce">referee nonce</button><button data-ev="final">final</button><button data-ev="pause">pause</button></div>
+ </div>
+</div>
+<div class="wrap"><p class="note rv">Simulated in your browser with real SHA-256 (WebCrypto). The field layout is illustrative, not byte-for-byte QorCap output. No data leaves this page.</p></div>
+</section>
+
+<section class="pad" id="challenge"><div class="wrap two">
+ <div class="chal glass rv">
+  <div class="chal-top"><span class="kicker">Referee challenge</span><button class="btn sm" id="chalBtn">Issue nonce</button></div>
+  <div class="nonce" id="nonce" aria-live="polite">waiting for referee…</div>
+  <div class="pattern" id="pattern" aria-hidden="true"><span>△</span><span>○</span><span>✕</span><span>□</span><span>L1</span><span>R1</span></div>
+  <div class="chal-chain" id="chalChain" aria-hidden="true"></div>
+  <dl class="kv" id="chalKv"><dt>received_wall_ms</dt><dd>—</dd><dt>segment_seq_at_receipt</dt><dd>—</dd><dt>chain_head_at_receipt</dt><dd>—</dd><dt>stamped</dt><dd>—</dd></dl>
+  <p class="note"><span class="sim">SIMULATION</span>&nbsp; The button pattern here is illustrative; QorCap uses a port of QorTime's <code>pattern_for(nonce)</code>.</p>
+ </div>
+ <div class="rv">
+  <p class="kicker">03 · Not pre-recorded</p>
+  <h2>A nonce, <em>burned</em> into the footage.</h2>
+  <p class="lede">A QorTime referee sends a random nonce to <b>POST /challenge</b>. QorCap records when it arrived, which segment was being written and the chain head at that instant, and adds a checkpoint containing the nonce.</p>
+  <p class="lede" style="margin-top:14px">With <b>--stamp</b>, the nonce and its button pattern are drawn into the recorded video itself. Footage after that point could not have existed before the nonce did.</p>
+ </div>
+</div></section>
+
+<section class="pad" id="clips"><div class="wrap two">
+ <div class="rv">
+  <p class="kicker">04 · Auto-clips</p>
+  <h2>The scorebug <em>calls</em> the clips.</h2>
+  <p class="lede">QorTime's own scorebug reader runs inline on a 4 fps snapshot. Each confirmed score change saves a clip from the in-RAM replay ring. At the end it saves a final clip and records why it thinks the game ended: <b>final_basis</b> = <code>clock_zero</code> or <code>scorebug_gone</code>.</p>
+ </div>
+ <div class="clips glass rv">
+  <div class="screen" id="screen"><div class="yard"></div><div class="rec">REC · mock match</div><div class="roi"></div>
+   <div class="bug" id="bug"><div class="h">HOME <b id="sH">0</b></div><div class="a">AWAY <b id="sA">0</b></div><div class="c"><span id="sQ">Q4</span>&nbsp;<span id="sC">2:00</span></div></div>
+   <div class="scan"></div><div class="flash" id="flash"></div></div>
+  <div class="tl" id="tl"><div class="track"></div><div class="fill" id="tlFill"></div><div class="ticks"><span>Q4 2:00</span><span>1:00</span><span>0:00</span></div></div>
+  <div class="cliplog" id="clipLog"></div>
+  <p class="note"><span class="sim">SIMULATION</span>&nbsp; Mock scorebug, not real game footage.</p>
+ </div>
+</div></section>
+
+<section class="pad" id="tamper"><div class="wrap">
+ <div class="rv"><p class="kicker">05 · Tamper demo</p>
+ <h2>Flip <em>one</em> byte. Break the chain.</h2>
+ <p class="lede">These are six tiny "segments" hashed live in your browser. <b>Tap any byte</b> to flip it, then watch <code>verify-bundle</code> find the exact break. Gold means sealed and matching.</p></div>
+ <div class="tamp glass rv">
+  <div class="segs" id="segs"></div>
+  <div class="verdict" id="verdict"><span class="ic">◆</span><span id="vText">verify-bundle: OK · 6 segments · chain intact</span><span class="sp"></span><button class="btn ghost sm" id="reset">Reset</button></div>
+ </div>
+</div></section>
+
+<section class="pad" id="obs"><div class="wrap two">
+ <div class="rv">
+  <p class="kicker">06 · Why not OBS</p>
+  <h2>Freezes are <em>survivable</em> now.</h2>
+  <p class="lede">The usual failure: a cheap capture card's driver hangs, and the recorder sits on a frozen device forever. QorCap runs ffmpeg as a <b>child process</b>, so a hung driver can only freeze ffmpeg, never QorCap. A watchdog kills the child after 4 s without data and reopens the card. The recording continues in <code>video.part2.mp4</code>, and the chain carries on across parts.</p>
+  <div class="vs">
+   <div><h4>Typical recorder</h4><ul><li>Hangs with the driver</li><li>Replug often needs restart</li><li>No integrity record</li><li>Big general-purpose install</li></ul></div>
+   <div class="us"><h4>QorCap</h4><ul><li>Watchdog kills & reopens</li><li>Polls for replugged card</li><li>Chain continues across parts</li><li>One 1.6 MB exe + ffmpeg</li></ul></div>
+  </div>
+ </div>
+ <div class="wd glass rv">
+  <div class="chal-top"><span class="kicker">Watchdog</span><span class="sim">SIMULATION</span></div>
+  <canvas id="wdCv" aria-label="Animation of byte flow, a freeze, the watchdog firing and the device reopening"></canvas>
+  <div class="wd-log" id="wdLog"></div>
+ </div>
+</div></section>
+
+<section class="pad fit" id="fit"><div class="wrap">
+ <div class="rv"><p class="kicker">07 · How it fits QorTime</p>
+ <h2>QorCap records. <em>QorTime</em> signs.</h2>
+ <p class="lede">QorCap is the capture half. It produces evidence; QorTime's agent and referee add keys and signatures, and anyone can check the result on the <a href="https://conwan30.github.io/qortime/verify/">QorTime verifier</a>.</p></div>
+ <div class="glass rv" style="padding:clamp(14px,3vw,30px);margin-top:30px">
+ <svg class="fit-d" viewBox="0 0 1100 360" role="img" aria-label="Diagram: PS5 to capture card to qorcap.exe, producing video, manifest and checkpoints; referee challenges and co-signs; bundle goes to QorTime and its verifier">
+  <defs><linearGradient id="gC" x1="0" x2="1"><stop offset="0" stop-color="#2ef2ff" stop-opacity=".25"/><stop offset="1" stop-color="#2ef2ff" stop-opacity=".05"/></linearGradient>
+  <filter id="gl"><feGaussianBlur stdDeviation="6"/></filter></defs>
+  <g fill="none" stroke="#2ef2ff" stroke-width="2" opacity=".8">
+   <path class="flow" d="M150 180H210"/><path class="flow" d="M350 180H420"/>
+   <path class="flow" d="M600 150C650 150 650 70 700 70"/><path class="flow" d="M600 180H700"/><path class="flow" d="M600 210C650 210 650 290 700 290"/>
+   <path class="flow" d="M510 50V130" /><path class="flow" d="M860 70C930 70 930 180 940 180"/><path class="flow" d="M860 180H940"/><path class="flow" d="M860 290C930 290 930 180 940 180"/>
+  </g>
+  <path class="flow" d="M1020 220V280" stroke="#ffc23d" stroke-width="2" fill="none"/>
+  <g font-size="14" text-anchor="middle">
+   <rect x="20" y="150" width="130" height="60" rx="12" fill="url(#gC)" stroke="#ffffff22"/><text x="85" y="185" fill="#eef3ff">PS5 · HDMI</text>
+   <rect x="210" y="150" width="140" height="60" rx="12" fill="url(#gC)" stroke="#ffffff22"/><text x="280" y="178" fill="#eef3ff">capture card</text><text x="280" y="196" fill="#97a0ba" font-size="11">DirectShow</text>
+   <rect x="420" y="130" width="180" height="100" rx="16" fill="#2ef2ff12" stroke="#2ef2ff"/><rect x="420" y="130" width="180" height="100" rx="16" fill="none" stroke="#2ef2ff" filter="url(#gl)" opacity=".6"/><text x="510" y="175" fill="#2ef2ff" font-size="18" font-weight="700">qorcap.exe</text><text x="510" y="198" fill="#97a0ba" font-size="11">ffmpeg child + watchdog</text>
+   <rect x="430" y="10" width="160" height="40" rx="10" fill="#ffffff08" stroke="#ffffff22"/><text x="510" y="35" fill="#eef3ff" font-size="12">referee POST /challenge</text>
+   <rect x="700" y="45" width="160" height="50" rx="12" fill="url(#gC)" stroke="#ffffff22"/><text x="780" y="75" fill="#eef3ff" font-size="13">video.mp4 + clips/</text>
+   <rect x="700" y="155" width="160" height="50" rx="12" fill="url(#gC)" stroke="#ffffff22"/><text x="780" y="185" fill="#eef3ff" font-size="13">manifest.jsonl</text>
+   <rect x="700" y="265" width="160" height="50" rx="12" fill="url(#gC)" stroke="#ffffff22"/><text x="780" y="295" fill="#eef3ff" font-size="13">checkpoints + SSE</text>
+   <rect x="940" y="140" width="150" height="80" rx="14" fill="#ffffff08" stroke="#ffffff33"/><text x="1015" y="174" fill="#eef3ff" font-size="13">match bundle</text><text x="1015" y="194" fill="#97a0ba" font-size="11">receipt.draft.json</text>
+   <rect x="940" y="280" width="150" height="66" rx="14" fill="#ffc23d14" stroke="#ffc23d"/><text x="1015" y="306" fill="#ffc23d" font-size="13" font-weight="700">QorTime signs</text><text x="1015" y="326" fill="#ffc23d" font-size="11">referee · verify page</text>
+  </g>
+ </svg>
+ <svg class="fit-m" viewBox="0 0 340 620" role="img" aria-label="Diagram: PS5 to capture card to qorcap.exe to evidence files to match bundle to QorTime signing">
+  <g fill="none" stroke="#2ef2ff" stroke-width="2"><path class="flow" d="M170 62V92"/><path class="flow" d="M170 152V182"/><path class="flow" d="M170 272V302"/><path class="flow" d="M170 412V442"/></g>
+  <path class="flow" d="M170 512V542" stroke="#ffc23d" stroke-width="2"/>
+  <g font-size="14" text-anchor="middle">
+   <rect x="70" y="10" width="200" height="52" rx="12" fill="url(#gC)" stroke="#ffffff22"/><text x="170" y="42" fill="#eef3ff">PS5 · HDMI</text>
+   <rect x="70" y="92" width="200" height="60" rx="12" fill="url(#gC)" stroke="#ffffff22"/><text x="170" y="118" fill="#eef3ff">capture card</text><text x="170" y="138" fill="#97a0ba" font-size="11">DirectShow</text>
+   <rect x="40" y="182" width="260" height="90" rx="16" fill="#2ef2ff12" stroke="#2ef2ff"/><text x="170" y="220" fill="#2ef2ff" font-size="19" font-weight="700">qorcap.exe</text><text x="170" y="242" fill="#97a0ba" font-size="11">ffmpeg child · watchdog · API</text><text x="170" y="260" fill="#97a0ba" font-size="11">← referee POST /challenge</text>
+   <rect x="40" y="302" width="260" height="110" rx="14" fill="url(#gC)" stroke="#ffffff22"/><text x="170" y="334" fill="#eef3ff" font-size="13">video.mp4 + clips/</text><text x="170" y="362" fill="#eef3ff" font-size="13">manifest.jsonl (chain)</text><text x="170" y="390" fill="#eef3ff" font-size="13">checkpoints + SSE</text>
+   <rect x="60" y="442" width="220" height="70" rx="14" fill="#ffffff08" stroke="#ffffff33"/><text x="170" y="472" fill="#eef3ff" font-size="13">match bundle</text><text x="170" y="494" fill="#97a0ba" font-size="11">receipt.draft.json (unsigned)</text>
+   <rect x="60" y="542" width="220" height="70" rx="14" fill="#ffc23d14" stroke="#ffc23d"/><text x="170" y="572" fill="#ffc23d" font-size="14" font-weight="700">QorTime signs</text><text x="170" y="594" fill="#ffc23d" font-size="11">referee co-sign · verify page</text>
+  </g>
+ </svg>
+ <div class="legend"><span><i></i>QorCap evidence</span><span><i class="g"></i>signed / verified (QorTime)</span></div>
+ </div>
+</div></section>
+
+<section class="pad" id="quick"><div class="wrap two">
+ <div class="rv">
+  <p class="kicker">08 · Quickstart</p>
+  <h2>Five minutes to a <em>bundle</em>.</h2>
+  <p class="lede">Unzip, fetch ffmpeg, find your card, record. The scorebug sidecar needs Python 3.11+ and a QorTime checkout. If <code>h264_mf</code> fails, use <code>--encoder libx264</code>; if the card refuses raw 720p, try <code>--input-format mjpeg</code>.</p>
+  <div class="dl"><a class="btn" href="https://github.com/ConWan30/qorcap/releases/download/v0.1.0/qorcap-v0.1.0-windows-x64.zip">Download zip</a><a class="btn ghost" href="https://github.com/ConWan30/qorcap#readme">Full README</a></div>
+ </div>
+ <div class="code glass rv"><button class="btn ghost sm copy" id="copy">Copy</button>
+<pre id="ps"><span class="c"># PowerShell · unzip to C:\QorCap first</span>
+<span class="p">cd</span> C:\QorCap
+<span class="p">Unblock-File</span> .\qorcap.exe, .\get-ffmpeg.ps1
+<span class="p">powershell</span> -ExecutionPolicy Bypass -File .\get-ffmpeg.ps1
+<span class="f">.\qorcap.exe</span> devices        <span class="c"># expect "USB3.0 Video"</span>
+
+<span class="c"># record a match bundle, nonce stamping on</span>
+<span class="f">.\qorcap.exe</span> record --device "USB3.0 Video" `
+  --res 1280x720 --fps 30 --bundle C:\QorCap\match1 `
+  --match-id &lt;id&gt; --role home --player-id psn:&lt;you&gt; --stamp
+
+<span class="c"># second window: scorebug sidecar</span>
+<span class="p">py</span> .\sidecar\qorcap_reader.py --qortime C:\src\qortime
+
+<span class="f">.\qorcap.exe</span> stop
+<span class="f">.\qorcap.exe</span> verify-bundle C:\QorCap\match1</pre></div>
+</div></section>
+
+<section class="pad" id="limits"><div class="wrap">
+ <div class="rv"><p class="kicker">09 · Honest limits</p>
+ <h2>What it <em>doesn't</em> prove.</h2>
+ <p class="lede">QorCap is evidence about footage, not about people. Here is exactly where the line is.</p></div>
+ <div class="lims">
+  <div class="lim glass rv"><span class="ic">Proves</span><h3>Integrity & timing</h3><p>Which exact video bytes, in what order, seen when, and (once a referee co-signs) no later than the referee's clock.</p></div>
+  <div class="lim glass rv no"><span class="ic">Does not prove</span><h3>Who is playing</h3><p>No proof of player identity. Player keys, the HID nonce response and dual-attested mode are QorTime's job.</p></div>
+  <div class="lim glass rv no"><span class="ic">Status</span><h3>v0.1.0, untested on hardware</h3><p>Cross-compiled and tested on Linux with a test-pattern source. Not yet run on Windows with a real card.</p></div>
+  <div class="lim glass rv no"><span class="ic">Receipt</span><h3>Unsigned draft</h3><p><code>receipt.draft.json</code> carries no signatures until QorTime's referee step fills in keys and signs it.</p></div>
+  <div class="lim glass rv no"><span class="ic">Scope</span><h3>No chain, no token</h3><p>Nothing goes on a blockchain. The "chain" is a local SHA-256 hash chain in a text file.</p></div>
+  <div class="lim glass rv"><span class="ic">This page</span><h3>Simulations, labelled</h3><p>Every live-looking demo here runs in your browser. No stats, no testimonials, no real match data.</p></div>
+ </div>
+</div></section>
+</main>
+<footer><div class="wrap">
+ <div class="big" aria-hidden="true">QorCap</div>
+ <div>QorCap v0.1.0 · MIT · built for <a href="https://conwan30.github.io/qortime/">QorTime</a></div>
+ <nav><a href="https://github.com/ConWan30/qorcap">GitHub</a><a href="https://github.com/ConWan30/qorcap/releases/tag/v0.1.0">Release</a><a href="https://conwan30.github.io/qortime/">QorTime</a><a href="https://conwan30.github.io/qortime/verify/">Verifier</a></nav>
+</div></footer>
+<script src="app.js"></script>
+</body></html>
