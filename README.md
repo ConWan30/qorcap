@@ -1,3 +1,5 @@
+<p align="center"><img src="docs/assets/logo-wordmark.svg" alt="QorCap" width="420"></p>
+
 # QorCap
 
 **Website:** https://conwan30.github.io/qorcap/ · **Download:** [v0.1.0](https://github.com/ConWan30/qorcap/releases/tag/v0.1.0)
