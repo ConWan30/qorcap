@@ -35,7 +35,7 @@ pub fn route(e: &Arc<Engine>, method: &str, url: &str, body: &str) -> Resp {
             let cps: Vec<&Value> = st.checkpoints.iter().filter(|c| c["seq"].as_u64().unwrap_or(0) >= since).collect();
             j(200, json!({"chain_head": st.seg.head, "segments": st.seg.seq, "checkpoint_head": st.cps.prev, "checkpoints": cps}))
         }
-        ("GET", "/timeline") => { let st = e.ev.lock().unwrap(); j(200, json!({"timeline": st.timeline, "challenges": st.challenges, "clips": st.clips, "final": st.final_})) }
+        ("GET", "/timeline") => { let st = e.ev.lock().unwrap(); j(200, json!({"timeline": st.timeline, "score": st.score, "challenges": st.challenges, "clips": st.clips, "final": st.final_})) }
         ("POST", "/bundle/write") => match e.write_bundle() { Some(d) => j(200, json!({"ok": true, "dir": d})), None => j(500, json!({"ok": false})) },
         ("POST", "/shutdown") => { e.shutdown.store(true, Ordering::SeqCst); j(200, json!({"ok": true})) }
         _ => j(404, json!({"ok": false, "error": format!("no route {method} {path}")})),

@@ -12,17 +12,17 @@
 </head><body>
 <div class="grain" aria-hidden="true"></div><div class="glow-cursor" aria-hidden="true"></div>
 <header class="nav glass"><a class="brand" href="#top" aria-label="QorCap home"><img src="assets/logo-mark.svg" alt="" width="34" height="34"><b>Qor<span>Cap</span></b></a>
-<nav><a href="#pipeline">Pipeline</a><a href="#api">Live API</a><a href="#challenge">Challenge</a><a href="#tamper">Tamper</a><a href="#limits">Limits</a><a class="btn sm" href="https://github.com/ConWan30/qorcap/releases/tag/v0.1.0">Download</a></nav></header>
+<nav><a href="#pipeline">Pipeline</a><a href="#api">Live API</a><a href="#challenge">Challenge</a><a href="#tamper">Tamper</a><a href="#limits">Limits</a><a class="btn sm" href="https://github.com/ConWan30/qorcap/releases/tag/v0.2.0">Download</a></nav></header>
 <main>
 
 <section class="hero" id="top">
  <canvas id="sig" aria-hidden="true"></canvas>
  <div class="wrap">
-  <p class="kicker"><span class="dot"></span> v0.1.0 · capture-card recorder for QorTime</p>
+  <p class="kicker"><span class="dot"></span> v0.2.0 · capture-card recorder for QorTime</p>
   <h1 class="wordmark" aria-label="QorCap"><span aria-hidden="true">QORCAP</span></h1>
   <p class="tag">HDMI in. <span>Hash chain</span> out.</p>
   <p class="lede">A lean Windows recorder for your capture card. Every <b>~2 s segment is SHA-256 chained</b>, checkpointed in QorTime's format, and sealed into a match bundle with a <b>draft receipt</b> ready for QorTime signing. If the card freezes or gets replugged, it reopens itself.</p>
-  <div class="ctas"><a class="btn" href="https://github.com/ConWan30/qorcap/releases/tag/v0.1.0">Download for Windows <small>v0.1.0 · zip</small></a><a class="btn ghost" href="https://github.com/ConWan30/qorcap">View on GitHub</a></div>
+  <div class="ctas"><a class="btn" href="https://github.com/ConWan30/qorcap/releases/tag/v0.2.0">Download for Windows <small>v0.2.0 · zip</small></a><a class="btn ghost" href="https://github.com/ConWan30/qorcap">View on GitHub</a></div>
   <div class="chips"><span class="chip"><b>1.6 MB</b> exe</span><span class="chip">Rust + ffmpeg child</span><span class="chip">API on <b>127.0.0.1:8788</b></span><span class="chip">Windows x64</span></div>
  </div>
  <div class="hero-head glass" aria-hidden="true">
@@ -189,27 +189,27 @@
 <section class="pad" id="quick"><div class="wrap two">
  <div class="rv">
   <p class="kicker">08 · Quickstart</p>
-  <h2>Five minutes to a <em>bundle</em>.</h2>
-  <p class="lede">Unzip, fetch ffmpeg, find your card, record. The scorebug sidecar needs Python 3.11+ and a QorTime checkout. If <code>h264_mf</code> fails, use <code>--encoder libx264</code>; if the card refuses raw 720p, try <code>--input-format mjpeg</code>.</p>
-  <div class="dl"><a class="btn" href="https://github.com/ConWan30/qorcap/releases/download/v0.1.0/qorcap-v0.1.0-windows-x64.zip">Download zip</a><a class="btn ghost" href="https://github.com/ConWan30/qorcap#readme">Full README</a></div>
+  <h2>Double-click <em>Start Match</em>.</h2>
+  <p class="lede">Unzip, plug the PS5 into the USB3.0 Video card, double-click <code>Start Match</code>. The first run downloads ffmpeg and sets up Python by itself. One window shows the score, clock, segments and clips; it stops at the final whistle (or press Enter), signs the receipt, verifies it and opens the match folder. No card handy? Double-click <code>Test Without Card</code>.</p>
+  <p class="lede"><small>Trust level today: <b>self-attested</b>. The receipt is signed by a key on your PC and a local referee key, because no public QorTime referee server exists yet. It proves the video was not changed after recording, not who held the controller.</small></p>
+  <div class="dl"><a class="btn" href="https://github.com/ConWan30/qorcap/releases/download/v0.2.0/qorcap-v0.2.0-windows-x64.zip">Download zip</a><a class="btn ghost" href="https://github.com/ConWan30/qorcap#readme">Full README</a></div>
  </div>
  <div class="code glass rv"><button class="btn ghost sm copy" id="copy">Copy</button>
-<pre id="ps"><span class="c"># PowerShell · unzip to C:\QorCap first</span>
-<span class="p">cd</span> C:\QorCap
-<span class="p">Unblock-File</span> .\qorcap.exe, .\get-ffmpeg.ps1
-<span class="p">powershell</span> -ExecutionPolicy Bypass -File .\get-ffmpeg.ps1
-<span class="f">.\qorcap.exe</span> devices        <span class="c"># expect "USB3.0 Video"</span>
+<pre id="ps"><span class="c"># 1. unzip qorcap-v0.2.0-windows-x64.zip (e.g. to C:\QorCap)</span>
+<span class="c"># 2. PS5 HDMI -&gt; USB3.0 Video card -&gt; blue USB 3 port</span>
+<span class="c"># 3. double-click</span>
+<span class="f">Start Match.cmd</span>
 
-<span class="c"># record a match bundle, nonce stamping on</span>
-<span class="f">.\qorcap.exe</span> record --device "USB3.0 Video" `
-  --res 1280x720 --fps 30 --bundle C:\QorCap\match1 `
-  --match-id &lt;id&gt; --role home --player-id psn:&lt;you&gt; --stamp
+<span class="c"># the window shows, then finishes with:</span>
+[REC] 12:41 | AWAY 10 - HOME 14  Q4 0:00 | segments 380 | signed 395 | clips 6
+  RESULT: PARTIAL   (self-attested)
+  Video check:  OK
 
-<span class="c"># second window: scorebug sidecar</span>
-<span class="p">py</span> .\sidecar\qorcap_reader.py --qortime C:\src\qortime
+<span class="c"># view it: conwan30.github.io/qortime/verify/</span>
+<span class="c"># choose receipt.json, paste referee.pub, Verify</span>
 
-<span class="f">.\qorcap.exe</span> stop
-<span class="f">.\qorcap.exe</span> verify-bundle C:\QorCap\match1</pre></div>
+<span class="c"># no card? dry run with a test pattern</span>
+<span class="f">Test Without Card.cmd</span></pre></div>
 </div></section>
 
 <section class="pad" id="limits"><div class="wrap">
@@ -219,7 +219,7 @@
  <div class="lims">
   <div class="lim glass rv"><span class="ic">Proves</span><h3>Integrity & timing</h3><p>Which exact video bytes, in what order, seen when, and (once a referee co-signs) no later than the referee's clock.</p></div>
   <div class="lim glass rv no"><span class="ic">Does not prove</span><h3>Who is playing</h3><p>No proof of player identity. Player keys, the HID nonce response and dual-attested mode are QorTime's job.</p></div>
-  <div class="lim glass rv no"><span class="ic">Status</span><h3>v0.1.0, untested on hardware</h3><p>Cross-compiled and tested on Linux with a test-pattern source. Not yet run on Windows with a real card.</p></div>
+  <div class="lim glass rv no"><span class="ic">Status</span><h3>v0.2.0, untested on hardware</h3><p>Cross-compiled and tested on Linux with a test-pattern source. Not yet run on Windows with a real card.</p></div>
   <div class="lim glass rv no"><span class="ic">Receipt</span><h3>Unsigned draft</h3><p><code>receipt.draft.json</code> carries no signatures until QorTime's referee step fills in keys and signs it.</p></div>
   <div class="lim glass rv no"><span class="ic">Scope</span><h3>No chain, no token</h3><p>Nothing goes on a blockchain. The "chain" is a local SHA-256 hash chain in a text file.</p></div>
   <div class="lim glass rv"><span class="ic">This page</span><h3>Simulations, labelled</h3><p>Every live-looking demo here runs in your browser. No stats, no testimonials, no real match data.</p></div>
@@ -228,8 +228,8 @@
 </main>
 <footer><div class="wrap">
  <div class="big" aria-hidden="true">QorCap</div>
- <div>QorCap v0.1.0 · MIT · built for <a href="https://conwan30.github.io/qortime/">QorTime</a></div>
- <nav><a href="https://github.com/ConWan30/qorcap">GitHub</a><a href="https://github.com/ConWan30/qorcap/releases/tag/v0.1.0">Release</a><a href="https://conwan30.github.io/qortime/">QorTime</a><a href="https://conwan30.github.io/qortime/verify/">Verifier</a></nav>
+ <div>QorCap v0.2.0 · MIT · built for <a href="https://conwan30.github.io/qortime/">QorTime</a></div>
+ <nav><a href="https://github.com/ConWan30/qorcap">GitHub</a><a href="https://github.com/ConWan30/qorcap/releases/tag/v0.2.0">Release</a><a href="https://conwan30.github.io/qortime/">QorTime</a><a href="https://conwan30.github.io/qortime/verify/">Verifier</a></nav>
 </div></footer>
 <script src="app.js"></script>
 </body></html>
