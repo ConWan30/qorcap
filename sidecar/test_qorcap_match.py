@@ -242,3 +242,18 @@ def test_obs_offer_noop_off_windows(monkeypatch):
     monkeypatch.setattr(qm.subprocess, "run", lambda *a, **k: calls.append(a[0]))
     assert qm.offer_close_capture_apps(ask=lambda _: "")
     assert calls == [["taskkill", "/IM", "obs64.exe"]]
+
+
+def test_read_jsonl_salvages_corrupt_line(tmp_path):
+    p = tmp_path / "manifest.jsonl"
+    p.write_text('{"type":"reopen"}\n{not json\n{"type":"segment","seq":0}\n', encoding="utf-8")
+    rows = qm.read_jsonl(p)
+    assert [r["type"] for r in rows] == ["reopen", "segment"]
+
+
+def test_status_line_shows_warning_and_disk():
+    s = qm.status_line(
+        {"state": "capturing", "recording_secs": 10, "warning": "AUDIO FAILED — recording video-only", "disk_free_mb": 1500},
+        {"score": {"home": 7, "away": 6, "quarter": 4, "clock_s": 0}, "segments": 2, "clips": 0}, 1)
+    assert "REC" in s and "AWAY 6 - HOME 7" in s and "disk 1500MB" in s and "AUDIO FAILED" in s
+    assert "DISK FULL" in qm.status_line({"state": "disk_full"}, {}, 0)

@@ -104,6 +104,17 @@ pub struct RecordArgs {
     /// Burn the active referee nonce/pattern into the recorded video (needs ffmpeg drawtext)
     #[arg(long)]
     pub stamp: bool,
+    /// Refuse to start (and stop cleanly mid-record) when free space is below this many GiB (default 2).
+    /// Pass 0 to disable the start-time check.
+    #[arg(long, default_value_t = 2.0)]
+    pub min_free_gb: f64,
+}
+
+impl RecordArgs {
+    /// Bytes required free to start recording (`None` = disabled when min_free_gb == 0).
+    pub fn min_free_bytes(&self) -> Option<u64> {
+        if self.min_free_gb <= 0.0 { None } else { Some((self.min_free_gb * 1024.0 * 1024.0 * 1024.0) as u64) }
+    }
 }
 
 pub fn parse_res(s: &str) -> Result<(u32, u32), String> {

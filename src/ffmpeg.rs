@@ -125,10 +125,16 @@ pub fn choose_input_format(modes: &[Mode], w: u32, h: u32, fps: u32) -> String {
 
 /// What an ffmpeg capture failure means (from its last stderr lines).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Failure { AudioOpen, VideoNotFound, FormatUnsupported, Busy, Other }
+pub enum Failure { AudioOpen, VideoNotFound, FormatUnsupported, Busy, Snapshot, Other }
 
 pub fn classify_failure(tail: &str) -> Failure {
     let t = tail.to_lowercase();
+    // Snapshot/image2 path gone (TEMP cleared) — must not burn reopen budget when video is fine.
+    if (t.contains("snapshot") || t.contains("image2") || t.contains(".jpg"))
+        && (t.contains("no such file") || t.contains("error opening output") || t.contains("permission denied") || t.contains("failed to open"))
+    {
+        return Failure::Snapshot;
+    }
     if t.contains("could not find audio only device") || (t.contains("audio") && (t.contains("could not find") || t.contains("could not enumerate audio"))) {
         return Failure::AudioOpen;
     }
@@ -153,6 +159,7 @@ pub fn failure_hint(f: Failure, obs_running: bool) -> String {
         Failure::VideoNotFound => " (video device not found: unplugged or wrong name?)".into(),
         Failure::FormatUnsupported => " (card refused this size/fps/format: try --input-format mjpeg or another --res)".into(),
         Failure::Busy => format!(" (device busy: another app is using it){obs}"),
+        Failure::Snapshot => " (snapshot path missing/unwritable; recreating — video capture continues)".into(),
         Failure::Other => if obs_running { format!(" ({})", obs.trim()) } else { String::new() },
     }
 }
@@ -324,6 +331,8 @@ video=USB3.0 Video: Immediate exit requested"#;
         assert_eq!(classify_failure("The device is busy"), Failure::Busy);
         assert_eq!(classify_failure("Could not run graph (sometimes caused by a device already in use by other application)"), Failure::Other);
         assert_eq!(classify_failure("Could not find video device with name [X] among source devices of type video."), Failure::VideoNotFound);
+        assert_eq!(classify_failure("Could not open file : C:\\Users\\x\\AppData\\Local\\Temp\\qorcap-1\\snapshot.jpg: No such file or directory"), Failure::Snapshot);
+        assert_eq!(classify_failure("Error opening output file snapshot.jpg."), Failure::Snapshot);
         assert!(failure_hint(Failure::Busy, true).contains("Close OBS. It's using the capture card"));
         assert!(!failure_hint(Failure::Other, false).contains("busy"));
     }

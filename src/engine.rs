@@ -18,7 +18,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct Status {
-    pub state: String, // starting | waiting_for_device | capturing | reopening | stopped
+    pub state: String, // starting | waiting_for_device | capturing | reopening | stopped | disk_full
     pub device: String,
     pub audio: Option<String>,
     pub res: String,
@@ -29,12 +29,15 @@ pub struct Status {
     pub drop_frames: u64,
     pub reopen_count: u64,
     pub last_error: Option<String>,
+    /// Persistent non-fatal warning (e.g. video-only after audio open failed).
+    pub warning: Option<String>,
     pub recording: Option<String>,
     pub recording_secs: f64,
     pub replay_secs_buffered: f64,
     pub replay_bytes: usize,
     pub replay_window: u64,
     pub uptime_secs: f64,
+    pub disk_free_mb: Option<u64>,
 }
 
 pub struct Recorder { reader: Option<std::thread::JoinHandle<()>>, child: Child, stdin: Option<ChildStdin>, pub path: String, started: Instant, deadline: Option<Instant>, wait_key: bool, base: String, part: u32 }
@@ -77,8 +80,13 @@ pub fn wall_ms() -> u64 { SystemTime::now().duration_since(UNIX_EPOCH).unwrap().
 
 fn append_jsonl(path: &Path, v: &Value) {
     use std::fs::OpenOptions;
+    if let Some(d) = path.parent() { if !d.as_os_str().is_empty() { let _ = std::fs::create_dir_all(d); } }
     match OpenOptions::new().create(true).append(true).open(path) {
-        Ok(mut f) => { let _ = writeln!(f, "{v}"); let _ = f.flush(); }
+        Ok(mut f) => {
+            if let Err(e) = writeln!(f, "{v}") { error!("cannot write {}: {e}", path.display()); return; }
+            let _ = f.flush();
+            let _ = f.sync_all(); // durable append: a crash leaves at most one torn line
+        }
         Err(e) => error!("cannot append {}: {e}", path.display()),
     }
 }
@@ -100,14 +108,51 @@ fn part_name(base: &str, part: u32) -> String {
     match base.rfind('.') { Some(i) => format!("{}.part{}{}", &base[..i], part, &base[i..]), None => format!("{base}.part{part}") }
 }
 
+/// True when `path` exists and already has content (must not be truncated/reopened for write).
+fn path_has_content(path: &str) -> bool {
+    std::fs::metadata(path).map(|m| m.len() > 0).unwrap_or(false)
+}
+
+/// Pick the first part index >= `start` whose target path is absent or empty.
+/// Never returns a path that would overwrite existing video bytes (MyTurn ENOSPC resume bug).
+pub fn next_free_part(base: &str, start: u32) -> (u32, String) {
+    let mut part = start.max(1);
+    loop {
+        let path = part_name(base, part);
+        if !path_has_content(&path) { return (part, path); }
+        part = part.saturating_add(1);
+        if part > 10_000 { return (part, part_name(base, part)); } // absurd safeguard
+    }
+}
+
+/// Stable run directory for snapshot/stamp (never %TEMP% — Windows clears it and ffmpeg image2 then storms).
+fn run_dir(args: &RecordArgs) -> PathBuf {
+    if let Some(b) = args.bundle.as_ref() {
+        let d = PathBuf::from(b).join(".qorcap-run");
+        let _ = std::fs::create_dir_all(&d);
+        return d;
+    }
+    let root = if let Ok(h) = std::env::var("QORCAP_HOME") {
+        PathBuf::from(h)
+    } else if cfg!(windows) {
+        std::env::var("LOCALAPPDATA").ok().map(|d| PathBuf::from(d).join("QorCap"))
+            .unwrap_or_else(|| std::env::temp_dir().join("QorCap"))
+    } else {
+        std::env::var("HOME").ok().map(|d| PathBuf::from(d).join(".qorcap"))
+            .unwrap_or_else(|| std::env::temp_dir().join("qorcap"))
+    };
+    let d = root.join(format!("run-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&d);
+    d
+}
+
 impl Engine {
     pub fn new(args: RecordArgs, ffmpeg: String) -> Arc<Self> {
         let window = args.replay.unwrap_or(3).max(3);
         // Cap memory: bitrate estimate * window * 1.5 (+ audio), at least 64 MiB.
         let bps = parse_bitrate(&args.bitrate).unwrap_or(8_000_000) + 200_000;
         let cap = ((bps / 8) as usize * window as usize * 3 / 2).max(64 << 20);
-        let dir = std::env::temp_dir().join({ static N: AtomicU64 = AtomicU64::new(0); format!("qorcap-{}-{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed)) });
-        let _ = std::fs::create_dir_all(&dir);
+        let dir = run_dir(&args);
         let st = Status { state: "starting".into(), device: args.device.clone(), res: format!("{}x{}", args.res.0, args.res.1), fps_target: args.fps, replay_window: args.replay.unwrap_or(0), ..Default::default() };
         Arc::new(Self { ffmpeg, ring: Mutex::new(ReplayRing::new(window, cap)), rec: Mutex::new(None), status: Mutex::new(st), shutdown: AtomicBool::new(false),
             ev: Mutex::new(MatchState { started_wall_ms: wall_ms(), score: Value::Null, ..Default::default() }), subs: Mutex::new(vec![]),
@@ -122,22 +167,45 @@ impl Engine {
         if self.args.replay.is_none() { s.replay_bytes = 0; s.replay_secs_buffered = 0.0; }
         if let Some(r) = self.rec.lock().unwrap().as_ref() { s.recording = Some(r.path.clone()); s.recording_secs = r.started.elapsed().as_secs_f64(); }
         s.uptime_secs = self.started.elapsed().as_secs_f64();
+        let probe = self.args.out.as_deref().or(self.args.bundle.as_deref()).unwrap_or(".");
+        if let Some(free) = crate::disk::free_bytes(Path::new(probe)) { s.disk_free_mb = Some(free / (1024 * 1024)); }
         s
     }
 
     pub fn start_recording(self: &Arc<Self>, path: &str, duration: Option<u64>) -> Result<String, String> {
         let mut g = self.rec.lock().unwrap();
         if let Some(r) = g.as_ref() { return Err(format!("already recording to {}", r.path)); }
-        let r = self.spawn_recorder(path, 1, duration.map(|d| Instant::now() + Duration::from_secs(d)))?;
+        if let Some(min) = self.args.min_free_bytes() {
+            crate::disk::check_start(Path::new(path), min)?;
+        }
+        // Never overwrite an existing video*.mp4 that already has content (resume/reopen safety).
+        let (part, _) = next_free_part(path, 1);
+        if part > 1 {
+            warn!("existing video content under {path}; starting at part {part} to avoid overwrite");
+        }
+        let r = self.spawn_recorder(path, part, duration.map(|d| Instant::now() + Duration::from_secs(d)))?;
         info!("recording started -> {}", r.path);
         let p = r.path.clone();
         *g = Some(r);
         Ok(p)
     }
     fn spawn_recorder(self: &Arc<Self>, base: &str, part: u32, deadline: Option<Instant>) -> Result<Recorder, String> {
-        let path = part_name(base, part);
+        let (part, path) = next_free_part(base, part);
         if let Some(d) = Path::new(&path).parent() { if !d.as_os_str().is_empty() { let _ = std::fs::create_dir_all(d); } }
-        let mut file = std::fs::File::create(&path).map_err(|e| format!("cannot create {path}: {e}"))?;
+        // create_new / refuse truncate: if a race created the file, bump again.
+        let file = match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                let (part2, path2) = next_free_part(base, part + 1);
+                let f = std::fs::OpenOptions::new().write(true).create_new(true).open(&path2)
+                    .map_err(|e2| format!("cannot create {path2}: {e2} (also after {path}: {e})"))?;
+                return self.spawn_recorder_with(base, part2, path2, f, deadline);
+            }
+            Err(e) => return Err(format!("cannot create {path}: {e}")),
+        };
+        self.spawn_recorder_with(base, part, path, file, deadline)
+    }
+    fn spawn_recorder_with(self: &Arc<Self>, base: &str, part: u32, path: String, mut file: std::fs::File, deadline: Option<Instant>) -> Result<Recorder, String> {
         let mut child = ffmpeg::command(&self.ffmpeg).args(ffmpeg::frag_mp4_args()).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::inherit())
             .spawn().map_err(|e| format!("cannot start ffmpeg ({}) for recording: {e}", self.ffmpeg))?;
         let stdin = child.stdin.take();
@@ -163,12 +231,21 @@ impl Engine {
         let r = self.rec.lock().unwrap().take()?;
         Some(finish(r))
     }
-    /// After a device reopen, timestamps restart: close the current part, open the next.
+    /// After a device reopen, timestamps restart: close the current part, open the next unused part name.
     fn rotate_recording(self: &Arc<Self>) {
         let mut g = self.rec.lock().unwrap();
         if let Some(r) = g.take() {
             let (base, part, deadline) = (r.base.clone(), r.part + 1, r.deadline);
             let old = finish(r);
+            // Disk guard before opening a new part mid-match.
+            if let Some(min) = self.args.min_free_bytes() {
+                let need = min.min(crate::disk::CRITICAL_FREE_BYTES * 2);
+                if let Err(e) = crate::disk::check_start(Path::new(&base), need) {
+                    error!("not continuing recording after reopen: {e}");
+                    self.set_state("disk_full", Some(e));
+                    return;
+                }
+            }
             match self.spawn_recorder(&base, part, deadline) {
                 Ok(n) => { warn!("device reopened: closed {old}, continuing in {}", n.path); *g = Some(n); }
                 Err(e) => error!("could not continue recording after reopen: {e}"),
@@ -251,6 +328,7 @@ impl Engine {
                         if self.args.audio != "none" && self.args.audio != "off" && audio.is_none() && !audio_off {
                             warn!("no audio device for \"{}\" found; recording video-only", self.args.device);
                             audio_off = true;
+                            self.status.lock().unwrap().warning = Some("AUDIO UNAVAILABLE — recording video-only (no game sound).".into());
                         }
                         if fmt.is_none() {
                             let f = if self.args.input_format == "auto" {
@@ -268,18 +346,48 @@ impl Engine {
                 }
             }
             self.status.lock().unwrap().audio = audio.clone();
+            // Disk guard: stop cleanly when critically low — never keep writing into ENOSPC.
+            let probe = self.args.out.as_deref().or(self.args.bundle.as_deref()).unwrap_or(".");
+            if let Some((crit, free)) = crate::disk::is_critical(Path::new(probe)) {
+                self.status.lock().unwrap().disk_free_mb = Some(free / (1024 * 1024));
+                if crit {
+                    let msg = format!(
+                        "disk space critically low ({} free on {}); stopping recording cleanly to avoid ENOSPC corruption",
+                        crate::disk::fmt_bytes(free), probe
+                    );
+                    error!("{msg}");
+                    self.set_state("disk_full", Some(msg.clone()));
+                    self.status.lock().unwrap().warning = Some(msg);
+                    if let Some(p) = self.stop_recording() { info!("finalised {p} due to low disk"); }
+                    self.sleep(5);
+                    if self.shutdown.load(Ordering::SeqCst) { break; }
+                    continue;
+                }
+            }
             let t0 = Instant::now();
             let (ok, why) = self.run_capture_once(fmt.as_deref().unwrap_or("auto"), audio.as_deref());
             if self.shutdown.load(Ordering::SeqCst) { self.ring.lock().unwrap().clear(); break; }
+            if why == ffmpeg::Failure::Snapshot && ok {
+                // Snapshot mux path failed but video kept flowing — recreate dir, do not burn reopen budget.
+                warn!("snapshot output failed; recreating run dir and continuing without counting as reopen");
+                if let Some(d) = self.snapshot.parent() { let _ = std::fs::create_dir_all(d); }
+                self.ring.lock().unwrap().clear();
+                continue;
+            }
             if !ok && audio.is_some() {
                 audio_fails = if why == ffmpeg::Failure::AudioOpen { 99 } else { audio_fails + 1 };
                 if audio_fails >= 2 {
                     warn!("audio device {:?} could not be opened{}; falling back to VIDEO-ONLY recording", audio,
                         if why == ffmpeg::Failure::AudioOpen { "" } else { " (two failed opens with audio)" });
                     audio_off = true;
+                    {
+                        let mut st = self.status.lock().unwrap();
+                        st.warning = Some("AUDIO FAILED — recording video-only (no game sound). Capture continues.".into());
+                        st.last_error = Some("audio could not be opened; recording video-only".into());
+                    }
                     self.ring.lock().unwrap().clear();
                     self.set_state("reopening", Some("audio could not be opened; retrying video-only".into()));
-                    continue; // immediate retry, no backoff, nothing was recorded
+                    continue; // immediate retry, no backoff / no reopen_count
                 }
             } else if ok { audio_fails = 0; }
             self.ring.lock().unwrap().clear();
@@ -305,6 +413,8 @@ impl Engine {
 
     /// One capture session. Returns true if it produced data.
     fn run_capture_once(self: &Arc<Self>, input_format: &str, audio: Option<&str>) -> (bool, ffmpeg::Failure) {
+        // Snapshot lives under the bundle / LOCALAPPDATA run dir — recreate every open (TEMP clear bug).
+        if let Some(d) = self.snapshot.parent() { let _ = std::fs::create_dir_all(d); }
         if self.args.stamp && !self.stamp_file.exists() { let _ = std::fs::write(&self.stamp_file, "QorCap  no referee nonce yet"); }
         let stamp = if self.args.stamp { Some(self.stamp_file.to_string_lossy().into_owned()) } else { None };
         let args = ffmpeg::capture_args(&self.args, input_format, audio, &self.snapshot.to_string_lossy(), stamp.as_deref());
@@ -377,6 +487,11 @@ impl Engine {
             std::thread::sleep(Duration::from_millis(200));
             let tail = last_err.lock().unwrap().join(" | ");
             why = ffmpeg::classify_failure(&tail);
+            // Snapshot-only errors must not look like a fatal capture failure when video flowed.
+            if why == ffmpeg::Failure::Snapshot && got {
+                warn!("ffmpeg snapshot path issue (video capture was ok): {tail}");
+                return (got, why);
+            }
             let m = format!("ffmpeg capture exited ({:?}){}", st.ok(), if tail.is_empty() { String::new() } else { format!(": {tail}") });
             let apps = if got { Vec::new() } else { ffmpeg::capture_apps_running() };
             let hint = ffmpeg::failure_hint(why, !apps.is_empty());
@@ -415,6 +530,63 @@ mod tests {
         assert_eq!(parse_bitrate("8M"), Some(8_000_000));
         assert_eq!(parse_bitrate("2500k"), Some(2_500_000));
         assert_eq!(now_stamp().len(), 16);
+    }
+    #[test]
+    fn no_overwrite_picks_next_part() {
+        let dir = std::env::temp_dir().join(format!("qorcap-part-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let base = dir.join("video.mp4").to_string_lossy().into_owned();
+        assert_eq!(next_free_part(&base, 1).0, 1);
+        std::fs::write(&base, b"already recorded").unwrap();
+        let (p, path) = next_free_part(&base, 1);
+        assert_eq!(p, 2);
+        assert!(path.ends_with("video.part2.mp4"), "{path}");
+        std::fs::write(&path, b"part2").unwrap();
+        assert_eq!(next_free_part(&base, 1).0, 3);
+        assert_eq!(next_free_part(&base, 2).0, 3);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    #[test]
+    fn draft_score_falls_back_to_last_timeline() {
+        use clap::Parser;
+        let dir = std::env::temp_dir().join(format!("qorcap-draft-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let d = dir.to_string_lossy().into_owned();
+        let crate::cli::Cmd::Record(r) = crate::cli::Cli::try_parse_from(["q", "record", "--device", "testpattern", "--bundle", &d]).unwrap().cmd else { panic!() };
+        let e = Engine::new(r, "ffmpeg-x".into());
+        // Simulate scorebug reads ending 7-6 with no final event.
+        let body = r#"{"type":"score","home":7,"away":6,"quarter":4,"clock_s":12}"#;
+        let v: Value = serde_json::from_str(body).unwrap();
+        e.event(&v).unwrap();
+        let out = e.write_bundle().unwrap();
+        let draft: Value = serde_json::from_str(&std::fs::read_to_string(out.join("receipt.draft.json")).unwrap()).unwrap();
+        assert_eq!(draft["result"]["home_score"], 7);
+        assert_eq!(draft["result"]["away_score"], 6);
+        assert_eq!(draft["result"]["final_confirmed"], false);
+        assert!(draft["result"].get("final_basis").is_none() || draft["result"]["final_basis"].is_null());
+        let bundle: Value = serde_json::from_str(&std::fs::read_to_string(out.join("bundle.json")).unwrap()).unwrap();
+        assert_eq!(bundle["final_confirmed"], false);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn disk_guard_refuses_start_when_min_free_huge() {
+        use clap::Parser;
+        let dir = std::env::temp_dir().join(format!("qorcap-disk-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let d = dir.to_string_lossy().into_owned();
+        let out = dir.join("video.mp4").to_string_lossy().into_owned();
+        // Demand an absurd amount of free space so check always fails.
+        let crate::cli::Cmd::Record(r) = crate::cli::Cli::try_parse_from([
+            "q", "record", "--device", "testpattern", "--bundle", &d, "--min-free-gb", "999999", "--out", &out,
+        ]).unwrap().cmd else { panic!() };
+        let e = Engine::new(r, "ffmpeg-x".into());
+        let err = e.start_recording(&out, None).unwrap_err();
+        assert!(err.contains("not enough free disk space"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
@@ -569,16 +741,37 @@ impl Engine {
     }
 
     /// Write bundle.json + receipt.draft.json (unsigned).
+    /// If no `final` event, use the last timeline scorebug read (not 0–0) and label final unconfirmed.
     pub fn write_bundle(&self) -> Option<PathBuf> {
         let st = self.ev.lock().unwrap();
-        let fin = st.final_.clone().unwrap_or(json!({"home": 0, "away": 0, "quarter": 4, "t_ms": wall_ms(), "basis": Value::Null}));
+        let unconfirmed = st.final_.is_none();
+        let fin = st.final_.clone().unwrap_or_else(|| {
+            if let Some((h, a, q)) = st.last_score {
+                json!({"home": h, "away": a, "quarter": q, "t_ms": wall_ms(), "basis": Value::Null, "unconfirmed": true})
+            } else if let Some(sc) = st.score.as_object() {
+                json!({"home": sc.get("home").and_then(|v| v.as_i64()).unwrap_or(0),
+                       "away": sc.get("away").and_then(|v| v.as_i64()).unwrap_or(0),
+                       "quarter": sc.get("quarter").and_then(|v| v.as_i64()).unwrap_or(4),
+                       "t_ms": wall_ms(), "basis": Value::Null, "unconfirmed": true})
+            } else {
+                json!({"home": 0, "away": 0, "quarter": 4, "t_ms": wall_ms(), "basis": Value::Null, "unconfirmed": true})
+            }
+        });
         let mut receipt = ev::draft_receipt(&self.args.match_id, &self.args.role, &self.args.player_id, st.started_wall_ms, wall_ms(), &fin, &st.challenges);
-        if st.final_.is_none() { receipt["result"].as_object_mut().unwrap().remove("final_basis"); }
+        if unconfirmed {
+            if let Some(r) = receipt["result"].as_object_mut() {
+                r.remove("final_basis");
+                r.insert("final_confirmed".into(), json!(false));
+                r.insert("method".into(), json!("last_scorebug_read_unconfirmed"));
+            }
+            info!("draft receipt uses last scorebug read {}-{} (final not confirmed)", fin["away"], fin["home"]);
+        }
         let bundle = json!({
             "schema": "qorcap-bundle/v0", "qorcap_version": env!("CARGO_PKG_VERSION"),
             "match_id": self.args.match_id, "role": self.args.role, "device": self.args.device, "device_id": st.device_id,
             "segments": st.seg.seq, "chain_head": st.seg.head, "checkpoints": st.checkpoints.len(),
             "checkpoint_head": st.cps.prev, "challenges": st.challenges.len(), "clips": st.clips, "final": st.final_,
+            "final_confirmed": !unconfirmed,
             "receipt_draft_sha256": ev::jcs_sha(&receipt),
             "claims": "Proves the integrity and timing of these video bytes (hash chain + checkpoints, referee co-signable). Does NOT prove who was playing.",
         });

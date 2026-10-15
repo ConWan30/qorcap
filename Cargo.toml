@@ -1,6 +1,6 @@
 [package]
 name = "qorcap"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2021"
 license = "MIT"
 description = "Lean, self-healing USB capture-card recorder for Windows (ffmpeg dshow backend)"
@@ -14,6 +14,7 @@ log = "0.4"
 simplelog = "0.12"
 ctrlc = "3"
 sha2 = "0.10"
+libc = "0.2"
 
 [features]
 # Enables the `testpattern` pseudo-device (ffmpeg lavfi testsrc + sine) so the

@@ -2,7 +2,7 @@
 
 # QorCap
 
-**Website:** https://conwan30.github.io/qorcap/ · **Download:** [v0.2.1](https://github.com/ConWan30/qorcap/releases/tag/v0.2.1)
+**Website:** https://conwan30.github.io/qorcap/ · **Download:** [v0.2.2](https://github.com/ConWan30/qorcap/releases/tag/v0.2.2)
 
 A small Windows recorder for a USB HDMI capture card (built for a generic **"USB3.0 Video"** card carrying a PS5),
 made for **[QorTime](https://github.com/ConWan30/qortime)** match receipts. It does two jobs:
@@ -26,7 +26,7 @@ with a local control surface). QorCap copies only that design idea, no code. No 
 
 ## Quickstart: double-click Start Match
 
-1. Download `qorcap-v0.2.1-windows-x64.zip` from the [release](https://github.com/ConWan30/qorcap/releases/tag/v0.2.1)
+1. Download `qorcap-v0.2.2-windows-x64.zip` from the [release](https://github.com/ConWan30/qorcap/releases/tag/v0.2.2)
    and unzip it, for example to `C:\QorCap` (right-click the zip, *Extract All*).
 2. Connect PS5 HDMI out to the **USB3.0 Video** card, and the card to a blue USB 3 port. Close OBS or the Camera app.
 3. Double-click **`Start Match`**. On the first run it downloads ffmpeg, installs Python 3.12 through winget if it
@@ -108,8 +108,9 @@ card --dshow--> ffmpeg (CFR fps filter, h264_mf, AAC) --MPEG-TS stdout--> qorcap
   power cut loses at most the last fragment.
 - **Auto-reopen:** if ffmpeg exits, or no bytes arrive for `--watchdog` s (default 4), the device is reopened.
   If the device has disappeared, QorCap polls the device list every second until it comes back. Backoff is
-  1→8 s. An active recording continues in `video.part2.mp4`, `part3`, … and the hash chain carries on across
-  parts.
+  1→8 s. An active recording continues in a **new** `video.partN.mp4` (never truncates an existing part that
+  already has content). The hash chain carries on across parts. Free space is checked before start and while
+  recording; critically low disk stops cleanly (`disk_full`) instead of writing into ENOSPC.
 - **Replay buffer:** `--replay SECS` keeps MPEG-TS in RAM. Saved clips start with the cached PAT/PMT and a
   keyframe, then are remuxed to MP4.
 
@@ -162,6 +163,7 @@ qorcap record --device "USB3.0 Video" --res 1280x720 --fps 30 --out file.mp4 [--
        [--audio auto|none|"<name>"] [--encoder h264_mf|libx264|h264_nvenc|h264_qsv|h264_amf] [--bitrate 8M]
        [--input-format auto|mjpeg|yuyv422|nv12] [--watchdog 4]
        [--bundle DIR --match-id ID --role home|away --player-id psn:you --clip-secs 20 --stamp]
+       [--min-free-gb 2]
 qorcap save-replay [--out clip.mp4]
 qorcap status
 qorcap stop
@@ -186,7 +188,7 @@ Global: `--port 8788`, `--ffmpeg PATH`, `--log FILE` (default `qorcap.log`, or `
 ## Run on Windows by hand (PowerShell, advanced)
 
 ```powershell
-# 1. unzip qorcap-v0.2.1-windows-x64.zip to C:\QorCap, then:
+# 1. unzip qorcap-v0.2.2-windows-x64.zip to C:\QorCap, then:
 cd C:\QorCap
 Unblock-File .\qorcap.exe, .\get-ffmpeg.ps1
 powershell -ExecutionPolicy Bypass -File .\get-ffmpeg.ps1     # puts ffmpeg.exe next to qorcap.exe
@@ -211,7 +213,7 @@ or unplugged" or "video device "USB3.0 Video" not present (have: …)".
 
 ## Tested vs untested
 
-Tested on Linux (`cargo test`: 24 Rust tests; `pytest sidecar`: 15 tests, including offline `finalize` on test-pattern bundles (scripted scorebug → clock_zero final, score checkpoint chain, receipt verifies; real QorTime reader through `qorcap finalize`; reuse of live countersignatures), including the full `--test-pattern` launcher run end to end: record, live countersign, final, sign, `qortime verify` PARTIAL with no errors, `verify-bundle` OK, receipt valid against QorTime's JSON schema and accepted by the browser verifier's `verify.js`):
+Tested on Linux (`cargo test`: 29 Rust tests; `pytest sidecar`: 14 passed / 3 skipped without cv2/jsonschema, including offline `finalize` on test-pattern bundles (scripted scorebug → clock_zero final, score checkpoint chain, receipt verifies; real QorTime reader through `qorcap finalize`; reuse of live countersignatures), including the full `--test-pattern` launcher run end to end: record, live countersign, final, sign, `qortime verify` PARTIAL with no errors, `verify-bundle` OK, receipt valid against QorTime's JSON schema and accepted by the browser verifier's `verify.js`):
 CLI parsing; replay ring (window/byte cap, keyframe start, PAT/PMT, last-N seconds); CFR pacing; dshow
 device-list parsing (old and new ffmpeg formats) and card-audio auto-pick; `-list_options` parsing and auto→mjpeg choice; ffmpeg failure classification (audio-open vs busy vs format); ffmpeg argument building; JCS
 against QorTime's `jcs_vector.json`; checkpoint hash against Python `make_checkpoint`; `pattern_for` against
@@ -222,11 +224,11 @@ with `--device testpattern` (ffmpeg lavfi): recording, killing ffmpeg mid-run (r
 continues), replay save, challenge stamp visible in the video, score/final events, auto clips, bundle
 written, `verify-bundle` OK, and a single flipped byte reported as FAIL.
 
-**Tested on Windows (v0.2.0, MyTurn, USB3.0 Video):** `--input-format mjpeg` 1280x720@30 with `h264_mf` recorded at 29.7 fps. That run found the audio bug, the auto-format bug and OBS holding the card, all fixed in v0.2.1.
+**Tested on Windows (v0.2.0–v0.2.1 era, MyTurn, USB3.0 Video):** `--input-format mjpeg` 1280x720@30 with `h264_mf` at 29.7 fps. v0.2.1 fixed audio / auto-format / OBS.
 
-**Not tested in v0.2.1 on Windows:** the two-input dshow audio, video-only fallback, OBS detection/closing, `Finalize Last Match.cmd`, `Start Match.cmd` / `start-match.ps1` on Windows (prerequisite checks, winget, venv, icacls key ACL, the Enter-key stop with msvcrt, opening the folder), the real USB3.0 card, DirectShow, `h264_mf`, real unplug/replug on Windows, card audio, the
-Windows `drawtext` font path (`C:\Windows\Fonts\consola.ttf`), and the sidecar on real live PS5 frames.
-The `.exe` was cross-compiled but has not been run on Windows.
+**v0.2.2 (2026-10-15 MyTurn failure):** ENOSPC mid-game overwrote ~467 MB of `video.mp4` on resume; `%TEMP%` snapshot deletion caused ffmpeg image2 reopen storms; live draft receipt used **0–0** despite last scorebug 7–6; one corrupt `manifest.jsonl` line broke `verify-bundle`. This release adds: disk-space guard (`--min-free-gb`, default 2; clean `disk_full` stop); never overwrite existing `video*.mp4` (always new `video.partN.mp4`); snapshots under the match bundle / `%LOCALAPPDATA%\QorCap\run-<pid>` (not `%TEMP%`); draft score falls back to last timeline read with `final_confirmed: false`; durable JSONL appends + bad-line salvage in verify/finalize; persistent video-only audio warning in `/status`; single-instance lock; `start-match.ps1` tolerates native stderr under `$ErrorActionPreference = "Stop"`.
+
+**Not tested in v0.2.2 on Windows yet:** the full Start Match path on MyTurn after this fix, real ENOSPC recovery, card audio video-only fallback in the wild, OBS close offer, Finalize Last Match on a real long match, DirectShow/`h264_mf` on this build, and the sidecar on live PS5 frames. The `.exe` was cross-compiled on Linux.
 
 ## Stubbed / not done
 - `receipt.draft.json` stays unsigned (see above). `Start Match` writes the signed, self-attested `receipt.json`. Signing by an independent referee needs a QorTime referee server, which does not exist yet.
