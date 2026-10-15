@@ -6,3 +6,4 @@ pub mod ffmpeg;
 pub mod ring;
 pub mod evidence;
 pub mod bundle;
+pub mod disk;

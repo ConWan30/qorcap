@@ -5,10 +5,29 @@ use serde_json::Value;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
+/// Parse JSONL, skipping blank lines and salvaging past a single corrupt line (MyTurn finalize case).
 fn lines(p: &Path) -> Result<Vec<Value>, String> {
+    lines_resilient(p, true)
+}
+
+fn lines_resilient(p: &Path, salvage: bool) -> Result<Vec<Value>, String> {
     let s = std::fs::read_to_string(p).map_err(|e| format!("{}: {e}", p.display()))?;
-    s.lines().filter(|l| !l.trim().is_empty()).enumerate()
-        .map(|(i, l)| serde_json::from_str(l).map_err(|e| format!("{}:{}: {e}", p.display(), i + 1))).collect()
+    let mut out = Vec::new();
+    let mut bad = 0usize;
+    for (i, l) in s.lines().filter(|l| !l.trim().is_empty()).enumerate() {
+        match serde_json::from_str::<Value>(l) {
+            Ok(v) => out.push(v),
+            Err(e) => {
+                bad += 1;
+                let msg = format!("{}:{}: corrupt JSONL line skipped ({e})", p.display(), i + 1);
+                if !salvage || bad > 3 {
+                    return Err(msg);
+                }
+                eprintln!("WARN: {msg}");
+            }
+        }
+    }
+    Ok(out)
 }
 
 pub struct Report { pub segments: u64, pub bytes: u64, pub checkpoints: u64, pub chain_head: String, pub errors: Vec<String> }
@@ -55,4 +74,26 @@ pub fn verify(dir: &Path) -> Result<Report, String> {
         }
     }
     Ok(r)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    #[test]
+    fn salvage_one_bad_jsonl_line() {
+        let dir = std::env::temp_dir().join(format!("qorcap-jsonl-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let man = dir.join("manifest.jsonl");
+        let mut f = std::fs::File::create(&man).unwrap();
+        writeln!(f, r#"{{"type":"reopen","mono_ms":1}}"#).unwrap();
+        writeln!(f, "{{this is not json").unwrap(); // corrupt
+        writeln!(f, r#"{{"type":"segment","seq":0,"file":"video.mp4","offset":0,"bytes":0,"sha256":"","prev":"0000000000000000000000000000000000000000000000000000000000000000","chain_head":"0000000000000000000000000000000000000000000000000000000000000000"}}"#).unwrap();
+        let v = lines(&man).unwrap();
+        assert_eq!(v.len(), 2);
+        assert_eq!(v[0]["type"], "reopen");
+        assert_eq!(v[1]["type"], "segment");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

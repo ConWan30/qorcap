@@ -53,6 +53,57 @@ fn finalize(bundle: Option<String>, python: Option<String>, rest: Vec<String>, f
     2
 }
 
+
+/// Best-effort single-instance lock so a second Start Match does not spawn a competing sidecar.
+/// Lock file is per control port under the QorCap data dir; stale locks (dead pid) are replaced.
+struct InstanceLock { path: std::path::PathBuf, _file: std::fs::File }
+impl Drop for InstanceLock {
+    fn drop(&mut self) { let _ = std::fs::remove_file(&self.path); }
+}
+fn instance_lock(port: u16) -> Result<InstanceLock, String> {
+    let root = std::env::var("QORCAP_HOME").map(std::path::PathBuf::from).ok().or_else(|| {
+        if cfg!(windows) { std::env::var("LOCALAPPDATA").ok().map(|d| std::path::Path::new(&d).join("QorCap")) }
+        else { std::env::var("HOME").ok().map(|d| std::path::Path::new(&d).join(".qorcap")) }
+    }).unwrap_or_else(|| std::env::temp_dir().join("QorCap"));
+    let _ = std::fs::create_dir_all(&root);
+    let path = root.join(format!("qorcap-{port}.instance"));
+    if path.exists() {
+        if let Ok(s) = std::fs::read_to_string(&path) {
+            let pid: u32 = s.trim().parse().unwrap_or(0);
+            if pid != 0 && pid_alive(pid) {
+                return Err(format!("QorCap is already running (pid {pid}, port {port}). Close that Start Match window first."));
+            }
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+    match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+        Ok(mut f) => {
+            use std::io::Write;
+            let _ = writeln!(f, "{}", std::process::id());
+            let _ = f.sync_all();
+            Ok(InstanceLock { path, _file: f })
+        }
+        Err(e) => Err(format!("QorCap is already running (could not claim instance lock: {e}). Close the other Start Match window first.")),
+    }
+}
+#[cfg(unix)]
+fn pid_alive(pid: u32) -> bool { unsafe { libc::kill(pid as i32, 0) == 0 } }
+#[cfg(windows)]
+fn pid_alive(pid: u32) -> bool {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn OpenProcess(access: u32, inherit: i32, pid: u32) -> *mut std::ffi::c_void;
+        fn CloseHandle(h: *mut std::ffi::c_void) -> i32;
+    }
+    const SYNCHRONIZE: u32 = 0x0010_0000;
+    unsafe {
+        let h = OpenProcess(SYNCHRONIZE, 0, pid);
+        if h.is_null() { false } else { CloseHandle(h); true }
+    }
+}
+#[cfg(not(any(unix, windows)))]
+fn pid_alive(_: u32) -> bool { true }
+
 fn main() {
     let cli = Cli::parse();
     let ff = ffmpeg::find_ffmpeg(cli.ffmpeg.as_deref());
@@ -81,6 +132,10 @@ fn main() {
         },
         Cmd::Finalize { bundle, python, rest } => finalize(bundle, python, rest, &ff),
         Cmd::Record(mut a) => {
+            let _lock = match instance_lock(cli.port) {
+                Ok(l) => l,
+                Err(m) => { eprintln!("error: {m}"); std::process::exit(4); }
+            };
             if let Some(b) = a.bundle.clone() {
                 let d = std::path::Path::new(&b);
                 if let Err(e) = std::fs::create_dir_all(d.join("clips")) { eprintln!("error: cannot create bundle dir {b}: {e}"); std::process::exit(2); }
@@ -110,6 +165,7 @@ fn main() {
             }
             e.run();
             let _ = srv.join();
+            drop(_lock);
             info!("bye");
             0
         }

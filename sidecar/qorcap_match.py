@@ -339,10 +339,15 @@ def status_line(st: dict, cps: dict, signed: int) -> str:
     sc = cps.get("score") or {}
     score = (f"AWAY {sc.get('away')} - HOME {sc.get('home')}  Q{sc.get('quarter')} {fmt_clock(sc.get('clock_s'))}"
              if sc else "score: waiting for scorebug")
-    state = {"capturing": "REC", "waiting_for_device": "NO SIGNAL (check card/PS5)", "reopening": "reconnecting"}.get(
-        st.get("state"), st.get("state", "?"))
+    state = {"capturing": "REC", "waiting_for_device": "NO SIGNAL (check card/PS5)", "reopening": "reconnecting",
+             "disk_full": "DISK FULL"}.get(st.get("state"), st.get("state", "?"))
+    warn = st.get("warning") or ""
+    warn_bit = f" | ! {warn[:40]}" if warn else ""
+    disk = st.get("disk_free_mb")
+    disk_bit = f" | disk {disk}MB" if isinstance(disk, int) else ""
     return (f"[{state}] {int(st.get('recording_secs') or 0) // 60:02d}:{int(st.get('recording_secs') or 0) % 60:02d}"
-            f" | {score} | segments {cps.get('segments', 0)} | signed {signed} | clips {cps.get('clips', 0)}")
+            f" | {score} | segments {cps.get('segments', 0)} | signed {signed} | clips {cps.get('clips', 0)}"
+            f"{disk_bit}{warn_bit}")
 
 
 def run_cmd(cmd: list[str], env=None) -> tuple[int, str]:
@@ -416,6 +421,30 @@ def main(argv=None) -> int:
         return 4
     except Exception:
         pass
+    # Also refuse if a prior instance left a live lock for this port (covers the race before /status is up).
+    lock = data_dir() / f"qorcap-{a.port}.instance"
+    if lock.exists():
+        try:
+            pid = int((lock.read_text(encoding="utf-8").strip() or "0").split()[0])
+        except ValueError:
+            pid = 0
+        alive = False
+        if pid > 0:
+            try:
+                if WIN:
+                    out = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/NH"],
+                                         capture_output=True, text=True, timeout=5)
+                    alive = str(pid) in (out.stdout or "") and "INFO:" not in (out.stdout or "")
+                else:
+                    os.kill(pid, 0)
+                    alive = True
+            except OSError:
+                alive = False
+            except Exception:
+                alive = False
+        if alive:
+            say(f"QorCap is already running (pid {pid}). Close that Start Match window first.")
+            return 4
 
     cmd = [qorcap, "--port", str(a.port)] + (["--ffmpeg", a.ffmpeg] if a.ffmpeg else []) + [
         "record", "--device", "testpattern" if a.test_pattern else a.device, "--res", a.res, "--fps", a.fps,
@@ -439,8 +468,16 @@ def main(argv=None) -> int:
                 break
             time.sleep(0.2)
     if proc.poll() is not None:
+        log_tail = ""
+        try:
+            log_tail = (bundle / "console.log").read_text(encoding="utf-8", errors="replace")[-800:]
+        except Exception:
+            pass
+        if proc.returncode == 4 or "already running" in log_tail.lower():
+            say("QorCap is already running (another Start Match window?). Close it first.")
+            return 4
         say(f"QorCap could not start. Details: {bundle / 'console.log'}")
-        say("Common fixes: plug the capture card into a blue USB 3 port, close OBS/Camera apps, run Start Match again.")
+        say("Common fixes: plug the capture card into a blue USB 3 port, close OBS/Camera apps, free disk space (~2 GB), run Start Match again.")
         say("You can sign an already-recorded match later with 'Finalize Last Match'.")
         return 5
 
@@ -546,7 +583,9 @@ def sign_and_report(bundle: Path, draft: dict, cps: list[dict], device, referee,
     say("\n" + "=" * 64)
     say(f"  RESULT: {result}")
     say("=" * 64)
-    say(f"  Score:        AWAY {r['away_score']} - HOME {r['home_score']}" + ("   (stopped early: NOT a confirmed final)" if no_final else f"   (final via {r.get('final_basis')})"))
+    unconfirmed = no_final or draft["result"].get("final_confirmed") is False
+    say(f"  Score:        AWAY {r['away_score']} - HOME {r['home_score']}" + (
+        "   (final NOT confirmed — last scorebug read)" if unconfirmed else f"   (final via {r.get('final_basis')})"))
     say(f"  Video check:  {'OK - every video byte matches the hash chain' if bcode == 0 else 'FAILED - see verify.txt'}")
     say(f"  Signatures:   {v['status']}  (QorTime verify; tier {v.get('trust_tier')})")
     if v.get("errors"):
@@ -573,9 +612,21 @@ FIN_HZ = 4.0
 
 
 def read_jsonl(p: Path) -> list[dict]:
+    """Parse JSONL, skipping blank lines and salvaging past a few corrupt lines."""
     if not p.exists():
         return []
-    return [json.loads(x) for x in p.read_text(encoding="utf-8").splitlines() if x.strip()]
+    out, bad = [], 0
+    for i, x in enumerate(p.read_text(encoding="utf-8").splitlines(), 1):
+        if not x.strip():
+            continue
+        try:
+            out.append(json.loads(x))
+        except json.JSONDecodeError as e:
+            bad += 1
+            say(f"WARN: {p.name}:{i}: corrupt JSONL line skipped ({e})")
+            if bad > 3:
+                raise
+    return out
 
 
 def latest_bundle(root: Path) -> Path | None:

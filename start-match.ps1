@@ -46,8 +46,13 @@ if (-not (Test-Path $vpy)) {
   & $py[0] $py[1..9] -m venv $venv
   if ($LASTEXITCODE -ne 0) { Fail "Could not create the Python environment in $venv" }
 }
-& $vpy -c "import numpy, cv2, cryptography" 2>$null
-if ($LASTEXITCODE -ne 0) {
+# Native stderr must not trip $ErrorActionPreference=Stop (PS 7+ / MyTurn first-run crash).
+$prevEap = $ErrorActionPreference
+$ErrorActionPreference = "Continue"
+& $vpy -c "import numpy, cv2, cryptography" 2>$null | Out-Null
+$needPkgs = ($LASTEXITCODE -ne 0)
+$ErrorActionPreference = $prevEap
+if ($needPkgs) {
   & $vpy -m pip install --disable-pip-version-check -q numpy opencv-python-headless cryptography
   if ($LASTEXITCODE -ne 0) { Fail "Could not install Python packages (numpy, opencv-python-headless, cryptography). Check the internet and try again." }
 }
