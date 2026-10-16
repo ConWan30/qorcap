@@ -676,6 +676,44 @@ mod tests {
     }
 
     #[test]
+    fn end_menu_final_amends_scorebug_final_and_confirms() {
+        use clap::Parser;
+        let dir = std::env::temp_dir().join(format!("qorcap-endmenu-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let d = dir.to_string_lossy().into_owned();
+        let crate::cli::Cmd::Record(r) = crate::cli::Cli::try_parse_from(["q", "record", "--device", "testpattern", "--bundle", &d]).unwrap().cmd else { panic!() };
+        let e = Engine::new(r, "ffmpeg-x".into());
+        let ev = |s: &str| e.event(&serde_json::from_str::<Value>(s).unwrap());
+        ev(r#"{"type":"score","home":17,"away":0,"quarter":4,"clock_s":0}"#).unwrap();
+        assert!(ev(r#"{"type":"final","basis":"end_menu","home":20,"away":0,"quarter":4}"#).is_err()); // method required
+        ev(r#"{"type":"final","basis":"clock_zero","home":17,"away":0,"quarter":4,"t_ms":1000}"#).unwrap();
+        let out = e.write_bundle().unwrap();
+        let draft: Value = serde_json::from_str(&std::fs::read_to_string(out.join("receipt.draft.json")).unwrap()).unwrap();
+        assert_eq!(draft["result"]["final_confirmed"], false); // scorebug final alone is not confirmed
+        assert_eq!(draft["result"]["final_basis"], "clock_zero");
+        let r = ev(r#"{"type":"final","basis":"end_menu","method":"end_menu_read","home":20,"away":0,"quarter":4,"t_ms":2000,
+                      "end_menu":{"away":0,"home":20,"frames":3},"scorebug_last":{"home":17,"away":0,"quarter":4,"t_ms":900},
+                      "notes":["final play score not shown on scorebug"]}"#).unwrap();
+        assert!(r.get("duplicate").is_none());
+        assert_eq!(r["final"]["amends"]["home"], 17);
+        assert_eq!(ev(r#"{"type":"final","basis":"clock_zero","home":17,"away":0,"quarter":4}"#).unwrap()["duplicate"], true);
+        let out = e.write_bundle().unwrap();
+        let draft: Value = serde_json::from_str(&std::fs::read_to_string(out.join("receipt.draft.json")).unwrap()).unwrap();
+        let res = &draft["result"];
+        assert_eq!((res["away_score"].as_i64(), res["home_score"].as_i64()), (Some(0), Some(20)));
+        assert_eq!(res["method"], "end_menu_read");
+        assert_eq!(res["final_basis"], "end_menu");
+        assert_eq!(res["final_confirmed"], true);
+        assert_eq!(res["scorebug_last"]["home_score"], 17);
+        assert_eq!(res["notes"][0], "final play score not shown on scorebug");
+        let bundle: Value = serde_json::from_str(&std::fs::read_to_string(out.join("bundle.json")).unwrap()).unwrap();
+        assert_eq!(bundle["final_confirmed"], true);
+        assert_eq!(bundle["final"]["basis"], "end_menu");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn disk_guard_refuses_start_when_min_free_huge() {
         use clap::Parser;
         let dir = std::env::temp_dir().join(format!("qorcap-disk-{}", std::process::id()));
@@ -819,14 +857,33 @@ impl Engine {
             }
             "final" => {
                 let basis = b["basis"].as_str().ok_or("missing basis")?;
-                if !["clock_zero", "scorebug_gone", "final_screen"].contains(&basis) { return Err("basis must be clock_zero|scorebug_gone|final_screen".into()); }
+                if !["clock_zero", "scorebug_gone", "final_screen", "end_menu"].contains(&basis) { return Err("basis must be clock_zero|scorebug_gone|final_screen|end_menu".into()); }
                 let (h, a, q) = (int("home")?, int("away")?, int("quarter")?);
                 if h == a { return Err("tied score cannot be final (overtime expected)".into()); }
-                let fin = json!({"home": h, "away": a, "quarter": q, "t_ms": t_ms, "basis": basis});
-                { let mut st = self.ev.lock().unwrap(); if st.final_.is_some() { return Ok(json!({"ok": true, "duplicate": true})); } st.final_ = Some(fin.clone()); }
+                // v0.3.4: the end-of-game menu score (read on consecutive frames by the sidecar) is the authoritative
+                // final. It may arrive after a scorebug final and then amends it (once); a scorebug final never
+                // replaces an end-menu final.
+                let end_menu = basis == "end_menu";
+                if end_menu && b["method"].as_str() != Some("end_menu_read") { return Err("end_menu final needs method end_menu_read".into()); }
+                let mut fin = json!({"home": h, "away": a, "quarter": q, "t_ms": t_ms, "basis": basis});
+                if end_menu {
+                    fin["method"] = json!("end_menu_read");
+                    for k in ["end_menu", "scorebug_last", "notes"] { if !b[k].is_null() { fin[k] = b[k].clone(); } }
+                }
+                let amended = {
+                    let mut st = self.ev.lock().unwrap();
+                    let prev = st.final_.clone();
+                    match &prev {
+                        Some(p) if p["basis"] == "end_menu" || !end_menu => return Ok(json!({"ok": true, "duplicate": true})),
+                        Some(p) => { fin["amends"] = json!({"basis": p["basis"], "home": p["home"], "away": p["away"], "t_ms": p["t_ms"]}); }
+                        None => {}
+                    }
+                    st.final_ = Some(fin.clone());
+                    prev.is_some()
+                };
                 let cp = self.checkpoint("final", json!({"final": fin}));
-                info!("FINAL via {basis}: away {a} - home {h} (Q{q})");
-                self.auto_clip("final", self.args.replay.unwrap_or(60));
+                info!("FINAL via {basis}: away {a} - home {h} (Q{q}){}", if amended { " (amends the scorebug final)" } else { "" });
+                if !amended { self.auto_clip("final", self.args.replay.unwrap_or(60)); }
                 let me = self.clone();
                 // Draft only: the input proof decodes the whole video and must wait for the recorder to stop.
                 std::thread::spawn(move || { std::thread::sleep(Duration::from_millis(500)); me.write_bundle_opts(false); });
@@ -873,6 +930,20 @@ impl Engine {
             }
         });
         let mut receipt = ev::draft_receipt(&self.args.match_id, &self.args.role, &self.args.player_id, st.started_wall_ms, wall_ms(), &fin, &st.challenges);
+        // Only an end-of-game-menu read confirms a final (v0.3.4); a scorebug final keeps its basis, unconfirmed.
+        let confirmed = !unconfirmed && fin["basis"] == "end_menu";
+        if let (false, Some(r)) = (unconfirmed, receipt["result"].as_object_mut()) {
+            r.insert("final_confirmed".into(), json!(confirmed));
+            if confirmed {
+                r.insert("method".into(), json!("end_menu_read"));
+                if let Some(sb) = fin.get("scorebug_last").filter(|v| v.is_object()) {
+                    r.insert("scorebug_last".into(), json!({"home_score": sb["home"], "away_score": sb["away"], "quarter": sb["quarter"], "t_ms": sb["t_ms"]}));
+                }
+                if let Some(n) = fin.get("notes").filter(|v| v.as_array().map(|a| !a.is_empty()).unwrap_or(false)) { r.insert("notes".into(), n.clone()); }
+            } else {
+                r.insert("notes".into(), json!(["end-of-game menu score not read: scorebug final only, NOT confirmed"]));
+            }
+        }
         if unconfirmed {
             if let Some(r) = receipt["result"].as_object_mut() {
                 r.remove("final_basis");
@@ -886,7 +957,7 @@ impl Engine {
             "match_id": self.args.match_id, "role": self.args.role, "device": self.args.device, "device_id": st.device_id,
             "segments": st.seg.seq, "chain_head": st.seg.head, "checkpoints": st.checkpoints.len(),
             "checkpoint_head": st.cps.prev, "challenges": st.challenges.len(), "clips": st.clips, "final": st.final_,
-            "final_confirmed": !unconfirmed,
+            "final_confirmed": confirmed,
             "receipt_draft_sha256": ev::jcs_sha(&receipt),
             "claims": "Proves the integrity and timing of these video bytes (hash chain + checkpoints, referee co-signable). Does NOT prove who was playing.",
         });

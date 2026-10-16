@@ -32,7 +32,7 @@ with a local control surface). QorCap copies only that design idea, no code. No 
 3. Double-click **`Start Match`**. On the first run it downloads ffmpeg, installs Python 3.12 through winget if it
    is missing, and sets up its Python packages in `%LOCALAPPDATA%\QorCap\venv`. This happens once.
 4. Play. One window shows `[REC] time | AWAY x - HOME y  Qn m:ss | segments | signed | clips`.
-5. Recording stops by itself when the final score is read (`final_basis`). You can also press **Enter** (or Q, or Ctrl+C).
+5. Recording stops by itself when the final score is read from Madden's **end-of-game menu** (authoritative; a scorebug-only final waits up to 120 s for that menu). You can also press **Enter** (or Q, or Ctrl+C).
 6. It signs `receipt.json`, runs `qortime verify` and `qorcap verify-bundle`, prints **VERIFIED / PARTIAL / FAIL**,
    and opens the match folder (`Documents\QorCap Matches\match-YYYYMMDD-HHMMSS`).
 7. To view it online, open https://conwan30.github.io/qortime/verify/, click *Choose file* and pick `receipt.json`
@@ -75,7 +75,7 @@ Files in the match folder: `video.mp4`, `clips/`, `manifest.jsonl`, `checkpoints
 referee countersignatures); after finalize also `timeline.offline.jsonl`, `score_checkpoints.jsonl`, `final.offline.json`; when the final was
 confirmed from the recording's last minutes at stop, `final.tail.json` and `clips/final-recorded.mp4`.
 
-QorTime code: the zip bundles a pinned copy (`qortime/`, commit `5e3e4cd`, includes `qortime referee-ai`). If it is missing, the launcher downloads that
+QorTime code: the zip bundles a pinned copy (`qortime/`, commit `d3f92ae`, includes `qortime referee-ai` and `end_menu_read` support). If it is missing, the launcher downloads that
 pinned commit's zip once into `%LOCALAPPDATA%\QorCap`.
 
 ## Stack and why
@@ -283,6 +283,23 @@ continues), replay save, challenge stamp visible in the video, score/final event
 written, `verify-bundle` OK, and a single flipped byte reported as FAIL.
 
 **Tested on Windows (v0.2.0–v0.2.1 era, MyTurn, USB3.0 Video):** `--input-format mjpeg` 1280x720@30 with `h264_mf` at 29.7 fps. v0.2.1 fixed audio / auto-format / OBS.
+
+**v0.3.4 (end-of-game menu score = authoritative final):** On match-20261016-143212 the scorebug last read
+AWAY 0 - HOME 17 at Q4 0:00 and then vanished; the final play's points were never drawn on it, so v0.3.3 recorded 0-17.
+The true final, 0-20, is on Madden's end-of-game menu (score panel beside FINISH GAME ... RESTART, `4th 0:00 KICKOFF`).
+`sidecar/qorcap_endmenu.py` reads that panel with the same method as QorTime's scorebug reader (binary glyph masks,
+`norm_vec` template match with best/margin gate, `hole_signature` topology guard) using its own pack
+(`sidecar/packs/madden27_end_menu_v1.npz`: digits 0 1 2 4 7 harvested from both 2026-10-16 matches, 3 5 6 8 9 synthetic
+from fonts, provenance in every read; see `tools/make_end_menu_pack.py`), and cross-checks every digit against
+QorTime's own scorebug digit templates (they must agree). AWAY is on the left, HOME on the right, as on the scorebug
+(Saints away left, Giants home right in both matches). No team abbreviations are drawn on that screen (logos only).
+A read counts only after 3 consecutive end-menu frames agree (>= 400 ms), a Q4 scorebug read exists, and the score
+equals the last scorebug read or is one legal scoring play past it on one side; otherwise the final stays unconfirmed.
+Used live (it amends an earlier scorebug final; Rust accepts `basis:"end_menu"`), in the stop-time tail check, and in
+Finalize Last Match. `result.method = "end_menu_read"`, `final_basis = "end_menu"`, `final_confirmed = true` only
+then; `scorebug_last` and `notes` (e.g. "final play score not shown on scorebug ...") are recorded when they differ.
+A scorebug-only final keeps its basis with `final_confirmed: false`. QorTime pin `d3f92ae` (qortime PR #17: schema +
+referee-ai accept `end_menu_read`).
 
 **v0.3.3 (second live match, 2026-10-16, match-20261016-143212):** (1) Stop order: QorCap finalises the video,
 writes a `stop` checkpoint and **seals** the chain (any later checkpoint is refused), keeps its API up, and waits up

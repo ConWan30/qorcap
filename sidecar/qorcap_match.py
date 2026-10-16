@@ -40,7 +40,7 @@ import urllib.request
 import zipfile
 from pathlib import Path
 
-QORTIME_PIN = "5e3e4cda0a8c356b1918520e2a7f961100b8bfac"
+QORTIME_PIN = "d3f92aeb8a1c698c4f285879287e6f76215bef24"
 QORTIME_ZIP = f"https://github.com/ConWan30/qortime/archive/{QORTIME_PIN}.zip"
 VERIFY_URL = "https://conwan30.github.io/qortime/verify/"
 REFEREE_KIND = "local-self-attested"
@@ -256,6 +256,7 @@ def start_reader(api: Api, stop: threading.Event, state: dict) -> threading.Thre
     from qor_receipt.final_detect import detect_final
 
     sys.path.insert(0, str(HERE))
+    from qorcap_endmenu import EndMenuReader
     from qorcap_reader import ReaderCore, madden_final_screen, prep
 
     def post(b):
@@ -268,7 +269,7 @@ def start_reader(api: Api, stop: threading.Event, state: dict) -> threading.Thre
         return r
 
     core = ReaderCore(post, ScorebugReader(), AgreementWindow(), PauseDetector(), detect_final,
-                      final_screen_detector=madden_final_screen)
+                      final_screen_detector=madden_final_screen, end_menu_reader=EndMenuReader())
 
     def loop():
         last, last_t = None, 0.0
@@ -641,14 +642,20 @@ def main(argv=None) -> int:
                     "clips": len(tl.get("clips", [])) if isinstance(tl, dict) else 0}
             sys.stdout.write("\r" + status_line(st, info, len(cs.signed)).ljust(110))
             sys.stdout.flush()
-            if state.get("final") and final_seen_at is None:
-                f = state["final"]
+            f = state.get("final")
+            if f and is_end_menu_final(f) and not state.get("end_menu_seen"):
+                state["end_menu_seen"] = True
                 final_seen_at = time.monotonic()
-                say(f"\n\nFINAL ({f['basis']}): AWAY {f['away']} - HOME {f['home']}. Saving final clip ...")
+                say(f"\n\nFINAL (end-of-game menu): AWAY {f['away']} - HOME {f['home']}. Saving final clip ..."
+                    + (f"\n  note: {f['notes'][0]}" if f.get("notes") else ""))
+            elif f and final_seen_at is None:
+                final_seen_at = time.monotonic()
+                say(f"\n\nFINAL on the scorebug ({f['basis']}): AWAY {f['away']} - HOME {f['home']}. Waiting up to "
+                    f"{END_MENU_WAIT_S} s for the end-of-game menu to confirm it (stay on that menu; do not RESTART) ...")
             if state.get("user_stop"):
                 say("\n\nStopping (you pressed a key) ...")
                 break
-            if final_seen_at and time.monotonic() - final_seen_at > 4:
+            if final_seen_at and time.monotonic() - final_seen_at > (4 if state.get("end_menu_seen") else END_MENU_WAIT_S):
                 break
             time.sleep(0.5)
     except KeyboardInterrupt:
@@ -694,7 +701,7 @@ def main(argv=None) -> int:
         say(f"FAIL: QorCap did not write the bundle. See {bundle / 'qorcap.log'}")
         return 2
     draft = json.loads(draft_p.read_text(encoding="utf-8"))
-    if not a.test_pattern and draft["result"].get("final_basis") is None and a.ffmpeg:
+    if not a.test_pattern and draft["result"].get("method") != "end_menu_read" and a.ffmpeg:
         draft = tail_final_check(bundle, draft, ffmpeg=a.ffmpeg)
     return sign_and_report(bundle, draft, cs.signed, device, referee, match_id=match_id, role=a.role,
                            started_ms=started_ms, qt=qt, qorcap=qorcap, no_open=a.no_open)
@@ -727,9 +734,13 @@ def sign_and_report(bundle: Path, draft: dict, cps: list[dict], device, referee,
     say("\n" + "=" * 64)
     say(f"  RESULT: {result}")
     say("=" * 64)
-    unconfirmed = no_final or draft["result"].get("final_confirmed") is False
+    unconfirmed = no_final or draft["result"].get("final_confirmed") is not True
     say(f"  Score:        AWAY {r['away_score']} - HOME {r['home_score']}" + (
-        "   (final NOT confirmed — last scorebug read)" if unconfirmed else f"   (final via {r.get('final_basis')})"))
+        "   (final NOT confirmed — last scorebug read)" if no_final else
+        f"   (scorebug final via {r.get('final_basis')}; end-of-game menu not read: NOT confirmed)" if unconfirmed else
+        "   (final read from the end-of-game menu)"))
+    for n in r.get("notes") or []:
+        say(f"  Note:         {n}")
     say(f"  Video check:  {'OK - every video byte matches the hash chain' if bcode == 0 else 'FAILED - see verify.txt'}")
     say(f"  Signatures:   {v['status']}  (QorTime verify; tier {v.get('trust_tier')})")
     if v.get("errors"):
@@ -834,7 +845,7 @@ def score_checkpoints(events: list[dict], manifest: list[dict], match_id: str, r
             trig, prev_score, last = "score_change", (dict(zip(("home", "away", "quarter"), last)) if last else None), key
             extra = {"score": {k: e[k] for k in ("home", "away", "quarter", "clock_s", "clock_red")}, "prev_score": prev_score}
         elif e["type"] == "final":
-            trig, extra = "final", {"final": {k: e[k] for k in ("home", "away", "quarter", "t_ms", "basis")}}
+            trig, extra = "final", {"final": {k: e[k] for k in ("home", "away", "quarter", "t_ms", "basis") + (("method",) if "method" in e else ())}}
         else:
             continue
         seg = segment_at(manifest, e["t_ms"]) or {}
@@ -872,10 +883,42 @@ def default_core_factory(post):
     from qor_receipt.final_detect import detect_final
 
     sys.path.insert(0, str(HERE))
+    from qorcap_endmenu import EndMenuReader
     from qorcap_reader import ReaderCore, madden_final_screen
 
     return ReaderCore(post, ScorebugReader(), AgreementWindow(), PauseDetector(), detect_final,
-                      final_screen_detector=madden_final_screen)
+                      final_screen_detector=madden_final_screen, end_menu_reader=EndMenuReader())
+
+
+END_MENU_WAIT_S = 120  # after a scorebug final, keep recording this long for the end-of-game menu (authoritative)
+
+
+def is_end_menu_final(f: dict | None) -> bool:
+    return bool(f) and (f.get("basis") == "end_menu" or f.get("method") == "end_menu_read")
+
+
+def apply_final(res: dict, fin: dict | None, *, fallback: dict | None = None) -> dict:
+    """Result fields from a reader final. Only an end-of-game-menu final is ``final_confirmed``; a scorebug final
+    (clock_zero / scorebug_gone / final_screen) keeps its basis but stays unconfirmed; no final -> last read."""
+    res = {k: v for k, v in res.items() if k not in ("final_basis", "final_confirmed", "scorebug_last", "notes")}
+    src = fin or fallback
+    if src:
+        q = max(4, int(src["quarter"])) if fin else max(1, int(src["quarter"]))
+        res.update(home_score=src["home"], away_score=src["away"], quarter=q, final_t_ms=src["t_ms"],
+                   winner="home" if src["home"] > src["away"] else "away")
+    if is_end_menu_final(fin):
+        res.update(method="end_menu_read", final_basis="end_menu", final_confirmed=True)
+        sb = fin.get("scorebug_last")
+        if sb:
+            res["scorebug_last"] = {"home_score": sb["home"], "away_score": sb["away"], "quarter": sb["quarter"], "t_ms": sb["t_ms"]}
+        if fin.get("notes"):
+            res["notes"] = list(fin["notes"])
+    elif fin:
+        res.update(method="agreed_scorebug_final", final_basis=fin["basis"], final_confirmed=False)
+        res["notes"] = ["end-of-game menu score not read: scorebug final only, NOT confirmed"]
+    else:
+        res.update(method="last_scorebug_read_unconfirmed", final_confirmed=False)
+    return res
 
 
 TAIL_SECS = 240
@@ -911,16 +954,23 @@ def tail_final_check(bundle: Path, draft: dict, *, ffmpeg: str, secs: int = TAIL
         if t <= last_t:
             continue
         core.on_frame(t, img)
-        if core.final is not None:
+        if getattr(core, "end_menu", None) is not None:
             break
     fin = core.final
-    out = {"final": fin, "frames": core.stats, "window_secs": secs, "video": vids[-1].name,
-           "method": "tail: QorCap end-of-game menu detector + QorTime detect_final over the recorded last minutes, seeded with the live timeline"}
+    out = {"final": fin, "end_menu": getattr(core, "end_menu", None), "end_menu_rejected": getattr(core, "end_menu_rejected", None),
+           "frames": core.stats, "window_secs": secs, "video": vids[-1].name,
+           "method": "tail: QorCap end-of-game menu score reader (authoritative) + QorTime detect_final over the recorded last minutes, seeded with the live timeline"}
     (bundle / "final.tail.json").write_text(json.dumps(out, indent=2), encoding="utf-8")
     if not fin:
         say("  no end-of-game screen in the recording's last minutes; final stays NOT confirmed.")
         return draft
-    say(f"  FINAL ({fin['basis']}, from recorded frames): AWAY {fin['away']} - HOME {fin['home']}")
+    if is_end_menu_final(fin):
+        say(f"  FINAL (end-of-game menu, from recorded frames): AWAY {fin['away']} - HOME {fin['home']}")
+        for n in fin.get("notes") or []:
+            say(f"  note: {n}")
+    else:
+        say(f"  FINAL on the scorebug ({fin['basis']}, from recorded frames): AWAY {fin['away']} - HOME {fin['home']}; "
+            "end-of-game menu score NOT read, so the final stays NOT confirmed.")
     clip = bundle / "clips" / "final-recorded.mp4"
     try:
         clip.parent.mkdir(exist_ok=True)
@@ -930,11 +980,7 @@ def tail_final_check(bundle: Path, draft: dict, *, ffmpeg: str, secs: int = TAIL
             say(f"  final clip saved: {clip}")
     except Exception as e:
         say(f"  (final clip not saved: {e})")
-    res = dict(draft["result"], home_score=fin["home"], away_score=fin["away"], quarter=max(4, fin["quarter"]),
-               final_t_ms=fin["t_ms"], winner="home" if fin["home"] > fin["away"] else "away", final_basis=fin["basis"])
-    res.pop("final_confirmed", None)
-    res["method"] = "agreed_scorebug_final"  # QorTime schema const; provenance is in final.tail.json
-    return dict(draft, result=res)
+    return dict(draft, result=apply_final(draft["result"], fin))
 
 
 def decode_frames_tail(ffmpeg: str, video: Path, secs: int, hz: float, size=(640, 360)):
@@ -1018,7 +1064,8 @@ def finalize(bundle: Path, *, qt: Path, qorcap: str, ffmpeg: str, key_dir: Path,
     with open(bundle / "score_checkpoints.jsonl", "w", encoding="utf-8") as f:
         for c in scps:
             f.write(json.dumps(c) + "\n")
-    fin = next((e for e in events if e["type"] == "final"), None)
+    finals = [e for e in events if e["type"] == "final"]
+    fin = next((e for e in finals if is_end_menu_final(e)), finals[-1] if finals else None)
     reads = [e for e in events if e["type"] == "score"]
     (bundle / "final.offline.json").write_text(json.dumps(
         {"final": fin, "basis": fin and fin["basis"], "last_read": reads[-1] if reads else None, "frames": stats,
@@ -1026,18 +1073,12 @@ def finalize(bundle: Path, *, qt: Path, qorcap: str, ffmpeg: str, key_dir: Path,
          "method": "offline: QorTime ScorebugReader + AgreementWindow + detect_final over recorded video",
          "finalized_ms": int(time.time() * 1000)}, indent=2), encoding="utf-8")
 
-    src = fin or (reads[-1] if reads else None)
-    res = dict(draft["result"])
-    if src:
-        res.update(home_score=src["home"], away_score=src["away"], quarter=max(4, src["quarter"]) if fin else src["quarter"],
-                   final_t_ms=src["t_ms"], winner="home" if src["home"] > src["away"] else "away")
-        res["quarter"] = max(1, res["quarter"])
-    res.pop("final_basis", None)
-    if fin:
-        res["final_basis"] = fin["basis"]
+    res = apply_final(draft["result"], fin, fallback=reads[-1] if reads else None)
     draft = dict(draft, result=res)
     say(f"  {len(reads)} score reads, {len(scps)} score checkpoints, final: "
         + (f"{fin['basis']} AWAY {fin['away']} - HOME {fin['home']}" if fin else "not detected"))
+    for n in res.get("notes") or []:
+        say(f"  note: {n}")
     if not fin:
         say("  The receipt uses the last score read: this is NOT a confirmed final.")
 
