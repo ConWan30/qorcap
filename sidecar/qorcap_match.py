@@ -268,8 +268,10 @@ def start_reader(api: Api, stop: threading.Event, state: dict) -> threading.Thre
             state["final"] = b
         return r
 
-    core = ReaderCore(post, ScorebugReader(), AgreementWindow(), PauseDetector(), detect_final,
+    from qorcap_mnp import AutoProfileReader
+    core = ReaderCore(post, AutoProfileReader(ScorebugReader(), prep=prep), AgreementWindow(), PauseDetector(), detect_final,
                       final_screen_detector=madden_final_screen, end_menu_reader=EndMenuReader())
+    state["core"] = core
 
     def loop():
         last, last_t = None, 0.0
@@ -288,7 +290,7 @@ def start_reader(api: Api, stop: threading.Event, state: dict) -> threading.Thre
                 img = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
                 if img is not None:
                     try:
-                        core.on_frame(int(time.time() * 1000), prep(img))
+                        core.on_frame(int(time.time() * 1000), img)
                     except Exception as e:  # never let one bad frame kill the reader thread
                         state["reader_error"] = f"{type(e).__name__}: {e}"
             time.sleep(0.25)
@@ -800,8 +802,8 @@ def video_files(bundle: Path) -> list[Path]:
     return files or ([bundle / "video.mp4"] if (bundle / "video.mp4").exists() else [])
 
 
-def decode_frames(ffmpeg: str, video: Path, hz: float = FIN_HZ, size=(640, 360)):
-    """Yields (video_ms, BGR ndarray) at `hz`, scaled to the reader's 640x360."""
+def decode_frames(ffmpeg: str, video: Path, hz: float = FIN_HZ, size=(1280, 720)):
+    """Yields (video_ms, BGR ndarray) at `hz`, full 1280x720 (v0.3.5; ReaderCore downsizes for the 640x360 readers)."""
     import numpy as np
 
     w, h = size
@@ -884,9 +886,10 @@ def default_core_factory(post):
 
     sys.path.insert(0, str(HERE))
     from qorcap_endmenu import EndMenuReader
-    from qorcap_reader import ReaderCore, madden_final_screen
+    from qorcap_mnp import AutoProfileReader
+    from qorcap_reader import ReaderCore, madden_final_screen, prep
 
-    return ReaderCore(post, ScorebugReader(), AgreementWindow(), PauseDetector(), detect_final,
+    return ReaderCore(post, AutoProfileReader(ScorebugReader(), prep=prep), AgreementWindow(), PauseDetector(), detect_final,
                       final_screen_detector=madden_final_screen, end_menu_reader=EndMenuReader())
 
 
@@ -983,7 +986,7 @@ def tail_final_check(bundle: Path, draft: dict, *, ffmpeg: str, secs: int = TAIL
     return dict(draft, result=apply_final(draft["result"], fin))
 
 
-def decode_frames_tail(ffmpeg: str, video: Path, secs: int, hz: float, size=(640, 360)):
+def decode_frames_tail(ffmpeg: str, video: Path, secs: int, hz: float, size=(1280, 720)):
     """Like decode_frames, but only the last ``secs`` of the file (fast: input seek from the end)."""
     import numpy as np
 
@@ -1069,12 +1072,17 @@ def finalize(bundle: Path, *, qt: Path, qorcap: str, ffmpeg: str, key_dir: Path,
     reads = [e for e in events if e["type"] == "score"]
     (bundle / "final.offline.json").write_text(json.dumps(
         {"final": fin, "basis": fin and fin["basis"], "last_read": reads[-1] if reads else None, "frames": stats,
+         "scorebug_profiles": getattr(getattr(shared["core"], "reader", None), "profile_counts", None),
          "score_checkpoints": len(scps), "score_checkpoint_head": scps[-1]["hash"] if scps else None,
          "method": "offline: QorTime ScorebugReader + AgreementWindow + detect_final over recorded video",
          "finalized_ms": int(time.time() * 1000)}, indent=2), encoding="utf-8")
 
     res = apply_final(draft["result"], fin, fallback=reads[-1] if reads else None)
     draft = dict(draft, result=res)
+    rdr = getattr(shared["core"], "reader", None)
+    if getattr(rdr, "profile_counts", None):  # v0.3.5: which scorebug layout was actually read
+        draft["match"] = dict(draft["match"], scorebug_profile=rdr.active_profile)
+        say(f"  scorebug profile: {rdr.active_profile} (agreed-quality reads per profile: {rdr.profile_counts})")
     say(f"  {len(reads)} score reads, {len(scps)} score checkpoints, final: "
         + (f"{fin['basis']} AWAY {fin['away']} - HOME {fin['home']}" if fin else "not detected"))
     for n in res.get("notes") or []:

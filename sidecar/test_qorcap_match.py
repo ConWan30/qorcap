@@ -169,7 +169,7 @@ class _ScriptCore:
         self.core.post = v
 
     def on_frame(self, t, img):
-        assert img.shape == (360, 640, 3)
+        assert img.shape == (720, 1280, 3)  # v0.3.5: full-resolution frames (Monday Night profile needs them)
         self.t0 = t if self.t0 is None else self.t0
         s = (t - self.t0) / 1000
         h, a, q, c = (0, 0, 1, 900) if s < 2 else (7, 0, 2, 300) if s < 4 else (14, 10, 4, 0)

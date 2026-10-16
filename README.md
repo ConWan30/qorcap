@@ -284,6 +284,22 @@ written, `verify-bundle` OK, and a single flipped byte reported as FAIL.
 
 **Tested on Windows (v0.2.0–v0.2.1 era, MyTurn, USB3.0 Video):** `--input-format mjpeg` 1280x720@30 with `h264_mf` at 29.7 fps. v0.2.1 fixed audio / auto-format / OBS.
 
+**v0.3.5 (Monday Night primetime scorebug, `madden27_monday_night`):** match-20261016-170000 (HOU at CHI/"QOR",
+online H2H) used Madden's **Monday Night** presentation, whose scorebug is a different overlay (orange `MNP` wordmark,
+`--- HOU 34 < 29 QOR ---`, then `4TH 0:00 [:39]`). QorTime's `madden27_standard` reader answered `layout_unknown` on
+every frame, so the live timeline was one `scorebug_absent` span and the draft said 0-0. `sidecar/qorcap_mnp.py` adds a
+Monday Night reader (same method as QorTime's: glyph components, `norm_vec` templates, best/margin gate, fail closed;
+pack `sidecar/packs/madden27_monday_night_v1.npz` built from that match's real frames by
+`tools/make_monday_night_pack.py` + `tools/monday_night_labels.json`; score digit 5 is synthetic from the clock font,
+everything else real) and `AutoProfileReader`: QorTime's standard reader first, unchanged; the Monday Night profile only
+when the standard layout is not on screen; whichever reads becomes active (sticky). The receipt's
+`match.scorebug_profile` is the profile actually read (Finalize). The Monday Night reader needs full-resolution frames
+(at 640x360 its digits touch), so Finalize decodes 1280x720 and ReaderCore downsizes for the other 640x360 readers.
+Also: the end-of-game-menu detector skips the online gamertag banner rows (295-328), and the end-menu pack v2 adds a real
+9. On online matches the opponent/you name tags cover the **away** score on the end-of-game menu, so that read fails
+closed (no guess) and the final stays the scorebug's (`agreed_scorebug_final`, not confirmed).
+**Sunday Night / Thursday Night presentations are NOT verified** (they read as `layout_unknown`).
+
 **v0.3.4 (end-of-game menu score = authoritative final):** On match-20261016-143212 the scorebug last read
 AWAY 0 - HOME 17 at Q4 0:00 and then vanished; the final play's points were never drawn on it, so v0.3.3 recorded 0-17.
 The true final, 0-20, is on Madden's end-of-game menu (score panel beside FINISH GAME ... RESTART, `4th 0:00 KICKOFF`).

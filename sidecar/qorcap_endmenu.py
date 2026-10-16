@@ -1,4 +1,4 @@
-"""Madden end-of-game menu score reader (QorCap v0.3.4).
+"""Madden end-of-game menu score reader (QorCap v0.3.4; pack v2 in v0.3.5).
 
 The end-of-game menu (FINISH GAME / ... / RESTART beside the final score panel) is QorTime's authoritative final
 frame: the scorebug can disappear before the final play's points are drawn on it (match-20261016-143212: scorebug
@@ -27,7 +27,7 @@ from typing import Any
 import numpy as np
 
 GLYPH = (12, 18)  # (w, h) normalised end-menu glyph
-PACK = Path(__file__).resolve().parent / "packs" / "madden27_end_menu_v1.npz"
+PACK = Path(__file__).resolve().parent / "packs" / "madden27_end_menu_v2.npz"
 BAND_Y = (28, 66)                      # score digits sit at y ~38-56
 SIDES = {"away": (280, 368), "home": (384, 462)}  # logos at x<276 and x>465 stay outside
 GLYPH_H = (15, 22)

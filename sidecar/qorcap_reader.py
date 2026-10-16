@@ -44,7 +44,7 @@ def madden_final_screen(img) -> bool:
     for minutes, so the end menu was never seen live and the static screen was swallowed by the pause
     detector. Features (640x360 coordinates, any input size):
 
-    * bottom (y 200-345) is near-black and flat: end menu mean ~0.5, std ~9; pause menus over the faded
+    * bottom (y 200-345, minus the gamertag banner rows 295-328) is near-black and flat: end menu mean ~0.5, std ~9; pause menus over the faded
       field std ~18;
     * a white highlight box (>= 8 rows that are >70% bright) somewhere in the menu column x 20-150,
       y 15-130, plus menu text in that column;
@@ -60,7 +60,8 @@ def madden_final_screen(img) -> bool:
     sy, sx = h / 360.0, w / 640.0
     ys = lambda a, b: slice(int(a * sy), int(b * sy))  # noqa: E731
     xs = lambda a, b: slice(int(a * sx), int(b * sx))  # noqa: E731
-    bottom = g[ys(200, 345), :]
+    # v0.3.5: rows 295-328 skipped: online matches draw the two gamertag banners there (match-20261016-170000)
+    bottom = np.vstack([g[ys(200, 295), :], g[ys(328, 345), :]])
     if not (bottom.mean() < 8 and (bottom > 60).mean() < 0.02 and bottom.std() < 14):
         return False
     col = g[ys(15, 130), xs(20, 150)]
@@ -94,8 +95,12 @@ class ReaderCore:
         self.end_menu: dict | None = None
         self.end_menu_rejected: dict | None = None
 
-    def on_frame(self, t_ms: int, img) -> None:
+    def on_frame(self, t_ms: int, full) -> None:
+        """``full`` may be a full-resolution frame (v0.3.5): the scorebug reader gets it when it asks for it
+        (``wants_full_res``, e.g. the Monday Night profile); everything else gets the 640x360 reader frame."""
         self.stats["frames"] += 1
+        img = prep(full)
+        rimg = full if getattr(self.reader, "wants_full_res", False) else img
         # The end-of-game menu is static, so the pause detector would swallow it; check it first.
         if self.final_screen_detector is not None and self.final_screen_detector(img):
             self.stats["final_screen"] = self.stats.get("final_screen", 0) + 1
@@ -109,8 +114,8 @@ class ReaderCore:
                 self._close_spans()
                 return
         try:
-            fr = self.reader.read(img)
-            band, _ = self.reader.reference_band(img) if hasattr(self.reader, "reference_band") else (None, None)
+            fr = self.reader.read(rimg)
+            band, _ = self.reader.reference_band(rimg) if hasattr(self.reader, "reference_band") else (None, None)
         except Exception as e:  # never silent
             self.stats["errors"] += 1
             print(f"scorebug reader error: {type(e).__name__}: {e}", file=sys.stderr)
@@ -264,7 +269,9 @@ def main(argv=None) -> int:
     from qor_receipt.final_detect import detect_final
 
     from qorcap_endmenu import EndMenuReader
-    core = ReaderCore(lambda b: http_post(a.qorcap, b), ScorebugReader(), AgreementWindow(), PauseDetector(), detect_final,
+    from qorcap_mnp import AutoProfileReader
+    core = ReaderCore(lambda b: http_post(a.qorcap, b), AutoProfileReader(ScorebugReader(), prep=prep), AgreementWindow(),
+                      PauseDetector(), detect_final,
                       final_screen_detector=madden_final_screen, end_menu_reader=EndMenuReader())
     last, period, t_print = None, 1.0 / a.hz, time.monotonic()
     print(f"qorcap scorebug sidecar -> {a.qorcap}", file=sys.stderr)
@@ -281,7 +288,7 @@ def main(argv=None) -> int:
             last = h
             img = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
             if img is not None:
-                core.on_frame(int(time.time() * 1000), prep(img))
+                core.on_frame(int(time.time() * 1000), img)
         if time.monotonic() - t_print > 30:
             t_print = time.monotonic()
             print(f"health {core.stats} timeline={len(core.timeline)}", file=sys.stderr)
