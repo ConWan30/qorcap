@@ -3,7 +3,7 @@
 //! Consumers (QorTime `qortime referee-ai`, Verified Match) read `input_proof.json` (schema
 //! `qorcap-input-proof/v0`) or the compact `bundle.json.input` / `receipt.draft.json.signals.input` copies.
 //! Every number is an integer (permille / ms) so the receipt stays inside QorTime's JCS no-float profile.
-use crate::{align, evidence as ev, humanlike, inputs};
+use crate::{align, evidence as ev, haptics, humanlike, inputs};
 use serde_json::{json, Value};
 use std::path::Path;
 
@@ -33,15 +33,29 @@ pub fn build(dir: &Path, ffmpeg: Option<&str>, n_frames: usize) -> Value {
     let manifest = jsonl(&dir.join("manifest.jsonl"));
     let timeline = jsonl(&dir.join("timeline.jsonl"));
     let alignment = if n_in > 0 { align::align_bundle(dir, &recs, &manifest, &timeline, anchor, ffmpeg, n_frames) } else { Value::Null };
+    // Haptics (0.3.1+): records live in inputs.jsonl chunks (committed by input_hash); haptics.jsonl is a copy.
+    let hp = dir.join("haptics.jsonl");
+    let committed: Vec<String> = recs.iter().filter(|r| r["type"] == "haptic").map(|r| r.to_string()).collect();
+    let (hsha, hmatch) = match std::fs::read(&hp) {
+        Ok(b) => {
+            let lines: Vec<String> = String::from_utf8_lossy(&b).lines().filter(|l| !l.trim().is_empty())
+                .filter_map(|l| serde_json::from_str::<Value>(l).ok()).map(|v| v.to_string()).collect();
+            (Some(ev::sha256_hex(&b)), Some(lines == committed))
+        }
+        Err(_) => (None, if committed.is_empty() { None } else { Some(false) }),
+    };
+    let haptics_v = haptics::summarize(&recs, &timeline, anchor, hsha, hmatch);
     let status = if n_in == 0 { "no_controller_reports" } else if !errs.is_empty() { "integrity_errors" } else { "ok" };
     let mut warnings: Vec<String> = errs.clone();
     if n_in == 0 { warnings.push("The controller was never read over USB during this recording, so there is no input proof.".into()); }
+    if hmatch == Some(false) { warnings.push("haptics.jsonl does not match the haptic records committed in inputs.jsonl".into()); }
+    if haptics_v["imu_present"] == json!(false) { warnings.push("Controller reports carried no IMU data: haptic detection was not possible.".into()); }
     if gaps > 0 { warnings.push(format!("{gaps} controller dropout/missing period(s) recorded; see status lines in inputs.jsonl")); }
     json!({
         "schema": SCHEMA, "status": status, "device": device,
         "inputs_file": "inputs.jsonl", "inputs_sha256": file_sha, "inputs_chain_head": head, "chunks": chunks.len(), "reports_logged": n_in,
         "clock": "inputs t_us and manifest/checkpoint mono_ms come from the same QorCap monotonic clock",
-        "human": human, "alignment": alignment, "warnings": warnings, "limit": LIMIT,
+        "human": human, "alignment": alignment, "haptics": haptics_v, "warnings": warnings, "limit": LIMIT,
     })
 }
 
@@ -53,6 +67,8 @@ pub fn receipt_fields(proof: &Value) -> Value {
         "human_permille": proof["human"]["score_permille"], "human_label": proof["human"]["label"],
         "match_permille": a["match_permille"], "chance_permille": a["chance_permille"], "offset_ms": a["offset_ms"],
         "inputs_sha256": proof["inputs_sha256"], "inputs_chain_head": proof["inputs_chain_head"],
+        "haptic_events": proof["haptics"]["events"], "haptic_high_confidence": proof["haptics"]["high_confidence"],
+        "haptics_sha256": proof["haptics"]["haptics_sha256"],
         "claims": LIMIT,
     })
 }
@@ -120,6 +136,50 @@ mod tests {
         assert_eq!(b["input"]["inputs_chain_head"], l.head);
         let _ = std::fs::remove_dir_all(&dir);
         let _ = hid::CROSS;
+    }
+    #[test]
+    fn haptics_jsonl_is_written_committed_and_summarized() {
+        let dir = std::env::temp_dir().join(format!("qorcap-haptic-proof-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir); std::fs::create_dir_all(&dir).unwrap();
+        let anchor = 1_700_000_000_000u64;
+        let mut l = InputLog::new(Some(dir.join("inputs.jsonl")), true, anchor);
+        l.on_status(5, "connected", "DualSense Edge (USB)");
+        let s = haptics::synth::stream(14.0, |t| {
+            let v = if (5.0..5.25).contains(&t) || (11.0..11.2).contains(&t) { 150.0 * (2.0 * std::f64::consts::PI * 60.0 * t).sin() } else { 0.0 };
+            ([v, 0.0, 0.0], [v, 0.0, 0.0], 0)
+        });
+        let mut seg = 0;
+        for (t, p) in &s {
+            l.on_report(*t, p);
+            if *t >= (seg + 1) * 2_000_000 { l.seal(seg, *t); seg += 1; }
+        }
+        l.seal(seg, 14_000_000);
+        // score change at 11.5 s (wall clock) -> haptic at 11.0 s is "near" it
+        std::fs::write(dir.join("timeline.jsonl"), format!("{{\"home\":0,\"away\":0,\"t_ms\":{}}}\n{{\"home\":7,\"away\":0,\"t_ms\":{}}}\n", anchor + 1000, anchor + 11_500)).unwrap();
+        let hb = std::fs::read(dir.join("haptics.jsonl")).unwrap();
+        let p = build(&dir, None, 15);
+        let h = &p["haptics"];
+        assert_eq!(h["events"], 2, "{h:#}");
+        assert_eq!(h["high_confidence"], 2);
+        assert_eq!(h["imu_present"], true);
+        assert_eq!(h["imu_rate_hz"], 250);
+        assert_eq!((h["score_changes"].as_u64(), h["score_changes_with_haptic"].as_u64()), (Some(1), Some(1)));
+        assert_eq!(h["haptics_sha256"], ev::sha256_hex(&hb));
+        assert_eq!(h["haptics_file_matches_inputs"], true);
+        assert_eq!(p["status"], "ok", "{p:#}");
+        let rf = receipt_fields(&p);
+        assert_eq!(rf["haptic_events"], 2);
+        ev::jcs(&json!({"x": rf})).expect("receipt fields stay JCS/no-float safe");
+        // each haptic line carries chunk_index = the segment whose checkpoint committed it, and wall time
+        let first: Value = serde_json::from_str(std::str::from_utf8(&hb).unwrap().lines().next().unwrap()).unwrap();
+        assert_eq!(first["chunk_index"], first["seg"]);
+        assert_eq!(first["t_wall_ms"].as_u64().unwrap(), anchor + first["t_mono_ms"].as_u64().unwrap());
+        // tampering with haptics.jsonl is caught
+        std::fs::write(dir.join("haptics.jsonl"), String::from_utf8(hb).unwrap().replacen("\"peak\":", "\"peak\":1", 1)).unwrap();
+        let p2 = build(&dir, None, 15);
+        assert_eq!(p2["haptics"]["haptics_file_matches_inputs"], false);
+        assert!(p2["warnings"].as_array().unwrap().iter().any(|w| w.as_str().unwrap().contains("haptics.jsonl")));
+        let _ = std::fs::remove_dir_all(&dir);
     }
     #[test]
     fn missing_log_is_explicit() {

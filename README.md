@@ -195,6 +195,14 @@ For `qortime referee-ai`: read `input_proof.json` (or `bundle.json.input`). Trea
 evidence", compare `match_permille` against `chance_permille` rather than reading it alone, and treat
 `human.score_permille` as a soft signal with its reasons.
 
+## Haptic detection from the IMU (v0.3.1)
+
+The PS5's rumble commands go over Bluetooth, so the laptop cannot see them; instead QorCap watches the pad's
+gyro + accelerometer in the USB reports for vibration bursts (20 Hz high-pass, adaptive threshold, 3 s still
+calibration). Events go into `inputs.jsonl` (committed by `input_hash`), a copy into `haptics.jsonl`, and a
+summary into `input_proof.json` `haptics`. Input Test shows `HAPTIC peak=.. dur=..ms` lines and
+`[ OK ] IMU readable`. **Advisory corroborating evidence only.** See [docs/HAPTICS.md](docs/HAPTICS.md).
+
 ## Commands
 
 ```
@@ -280,6 +288,8 @@ written, `verify-bundle` OK, and a single flipped byte reported as FAIL.
 - Controller input proof (v0.3.0) is tested with synthetic HID reports and a synthetic video only. It has not
   yet read a real DualSense on MyTurn (run Input Test.cmd first). The last <2 s of inputs after the final
   segment are not sealed. The human-likeness weights are hand-set, not trained on real Madden sessions.
+- Haptic detection (v0.3.1) is tested with synthetic IMU streams only; IMU offsets come from Linux
+  `hid-playstation.c` and are not yet checked on a real DualSense / Edge, and thresholds are hand-set.
 - No PR to qortime yet for ingesting bundles.
 
 ## Build
