@@ -7,3 +7,8 @@ pub mod ring;
 pub mod evidence;
 pub mod bundle;
 pub mod disk;
+pub mod hid;
+pub mod inputs;
+pub mod humanlike;
+pub mod align;
+pub mod inputproof;

@@ -11,7 +11,8 @@
 //! * `pattern_for`: port of QorTime's nonce -> DualSense pattern.
 //!
 //! Honesty rail: this proves footage integrity and timing (what bytes, in what
-//! order, seen when). It does NOT prove who is holding the controller.
+//! order, seen when), and since 0.3.0 that the logged controller inputs were read
+//! in sync with it. It does NOT prove who is holding the controller.
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 
@@ -93,12 +94,15 @@ pub struct CheckpointChain { pub seq: u64, pub prev: String }
 impl Default for CheckpointChain { fn default() -> Self { Self { seq: 0, prev: GENESIS.into() } } }
 impl CheckpointChain {
     /// `ext` = QorCap evidence object; committed via frames_hash = SHA-256(JCS(ext)).
-    pub fn next(&mut self, t_ms: u64, ext: Value) -> Value {
+    pub fn next(&mut self, t_ms: u64, ext: Value) -> Value { self.next_with_input(t_ms, ext, None) }
+    /// `input_hash` = SHA-256(JCS([input records])) of the controller chunk sealed with this checkpoint
+    /// (None = SHA-256(JCS([])), the pre-0.3.0 value).
+    pub fn next_with_input(&mut self, t_ms: u64, ext: Value, input_hash: Option<String>) -> Value {
         let mut body = Map::new();
         body.insert("seq".into(), json!(self.seq));
         body.insert("t_ms".into(), json!(t_ms));
         body.insert("frames_hash".into(), json!(jcs_sha(&ext)));
-        body.insert("input_hash".into(), json!(jcs_sha(&json!([])))); // no HID log in QorCap
+        body.insert("input_hash".into(), json!(input_hash.unwrap_or_else(|| jcs_sha(&json!([])))));
         body.insert("prev".into(), json!(self.prev));
         let h = jcs_sha(&Value::Object(body.clone()));
         body.insert("hash".into(), json!(h));

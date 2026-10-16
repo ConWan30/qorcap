@@ -104,6 +104,59 @@ fn pid_alive(pid: u32) -> bool {
 #[cfg(not(any(unix, windows)))]
 fn pid_alive(_: u32) -> bool { true }
 
+/// `qorcap input-test`: live proof that the laptop is reading the DualSense over USB HID.
+fn input_test(secs: Option<u64>) -> i32 {
+    use qorcap::inputs::{spawn_logger, InputLog};
+    use std::io::Write;
+    use std::sync::{atomic::AtomicBool, Arc, Mutex};
+    use std::time::{Duration, Instant};
+    println!("QorCap input test: reading the DualSense / DualSense Edge over the laptop's USB cable.");
+    println!("Keep playing on the PS5 as normal (Bluetooth); press buttons, move sticks, pull triggers. Ctrl+C to stop.\n");
+    let log = Arc::new(Mutex::new(InputLog::new(None, true, 0)));
+    let stop = Arc::new(AtomicBool::new(false));
+    { let s = stop.clone(); let _ = ctrlc::set_handler(move || s.store(true, Ordering::SeqCst)); }
+    let clock = Instant::now();
+    let h = spawn_logger(log.clone(), clock, stop.clone());
+    let (mut last_state, mut prev_btn, mut last_reports, mut last_tick) = (String::new(), Vec::<String>::new(), 0u64, Instant::now());
+    let mut rate = 0u64; let mut ever_ok = false;
+    while !stop.load(Ordering::SeqCst) && secs.map(|s| clock.elapsed() < Duration::from_secs(s)).unwrap_or(true) {
+        std::thread::sleep(Duration::from_millis(50));
+        let lv = log.lock().unwrap().live.clone();
+        if lv.state != last_state {
+            match lv.state.as_str() {
+                "connected" => { ever_ok = true; println!("\r\n[ OK ] HID is being read: {}", lv.device.clone().unwrap_or_default()); }
+                "searching" => {}
+                _ => println!("\r\n[WARN] {}", lv.warning.clone().unwrap_or_else(|| lv.state.clone())),
+            }
+            last_state = lv.state.clone();
+        }
+        if last_tick.elapsed() >= Duration::from_secs(1) { rate = lv.reports - last_reports; last_reports = lv.reports; last_tick = Instant::now(); }
+        let newly: Vec<&String> = lv.buttons.iter().filter(|b| !prev_btn.contains(b)).collect();
+        if !newly.is_empty() {
+            println!("\r{:>8.2}s  PRESS {}{}", clock.elapsed().as_secs_f64(), newly.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("+"), " ".repeat(40));
+        }
+        prev_btn = lv.buttons.clone();
+        if lv.state == "connected" {
+            print!("\r  {rate:>4} reports/s | held: {:<18} | L2 {:>3} R2 {:>3} | LS {:>3},{:>3} RS {:>3},{:>3} | presses {}   ",
+                if lv.buttons.is_empty() { "-".into() } else { lv.buttons.join("+") }, lv.l2, lv.r2, lv.sticks[0], lv.sticks[1], lv.sticks[2], lv.sticks[3], lv.presses);
+            let _ = std::io::stdout().flush();
+        }
+    }
+    stop.store(true, Ordering::SeqCst);
+    let _ = h.join();
+    let l = log.lock().unwrap();
+    println!("\n\nSummary: {} HID reports read, {} logged, {} button presses.", l.live.reports, l.live.logged, l.live.presses);
+    if l.live.reports == 0 {
+        println!("RESULT: FAIL. No HID reports were read. {}", if ever_ok { "The controller was found but sent nothing." } else { "The DualSense was not visible over USB on this laptop. Check the USB cable into the laptop; the PS5 Bluetooth link stays as is." });
+        return 1;
+    }
+    let hs = qorcap::humanlike::score(l.pending());
+    println!("RESULT: OK. The laptop is reading the controller over USB HID.");
+    println!("Human-likeness of this test (needs ~40+ presses to mean much): {} ({}, confidence {})", hs["score_permille"], hs["label"].as_str().unwrap_or(""), hs["confidence"].as_str().unwrap_or(""));
+    for r in hs["reasons"].as_array().into_iter().flatten() { println!("  - {}", r.as_str().unwrap_or("")); }
+    0
+}
+
 fn main() {
     let cli = Cli::parse();
     let ff = ffmpeg::find_ffmpeg(cli.ffmpeg.as_deref());
@@ -124,6 +177,7 @@ fn main() {
         Cmd::VerifyBundle { dir } => match qorcap::bundle::verify(std::path::Path::new(&dir)) {
             Ok(r) => {
                 println!("segments={} bytes={} checkpoints={} chain_head={}", r.segments, r.bytes, r.checkpoints, r.chain_head);
+                if let Some(h) = &r.input_head { println!("controller input chunks={} inputs_chain_head={h}", r.input_chunks); }
                 for e in &r.errors { println!("FAIL: {e}"); }
                 println!("{}", if r.errors.is_empty() { "OK: video bytes match the hash chain; checkpoints link. (Integrity + timing only; does not prove who played.)" } else { "FAILED" });
                 if r.errors.is_empty() { 0 } else { 1 }
@@ -131,6 +185,14 @@ fn main() {
             Err(e) => { eprintln!("error: {e}"); 2 }
         },
         Cmd::Finalize { bundle, python, rest } => finalize(bundle, python, rest, &ff),
+        Cmd::InputTest { secs } => input_test(secs),
+        Cmd::InputProof { dir, frames, no_video } => {
+            let d = std::path::Path::new(&dir);
+            match qorcap::inputproof::apply(d, if no_video { None } else { Some(ff.as_str()) }, frames) {
+                Ok(p) => { println!("{}", serde_json::to_string_pretty(&p).unwrap()); if p["status"] == "ok" { 0 } else { 1 } }
+                Err(e) => { eprintln!("error: {e}"); 2 }
+            }
+        }
         Cmd::Record(mut a) => {
             let _lock = match instance_lock(cli.port) {
                 Ok(l) => l,
@@ -155,6 +217,7 @@ fn main() {
                 }
             }
             let e = Engine::new(a.clone(), ff);
+            if a.no_controller { info!("controller input logging disabled (--no-controller)"); } else { let _ = e.start_input_logger(); }
             let srv = match api::serve(e.clone(), cli.port) { Ok(h) => h, Err(m) => { error!("{m}"); std::process::exit(2); } };
             { let e = e.clone(); let _ = ctrlc::set_handler(move || { info!("Ctrl+C: stopping"); e.shutdown.store(true, Ordering::SeqCst); }); }
             if let Some(out) = &a.out {

@@ -30,11 +30,13 @@ fn lines_resilient(p: &Path, salvage: bool) -> Result<Vec<Value>, String> {
     Ok(out)
 }
 
-pub struct Report { pub segments: u64, pub bytes: u64, pub checkpoints: u64, pub chain_head: String, pub errors: Vec<String> }
+pub struct Report { pub segments: u64, pub bytes: u64, pub checkpoints: u64, pub chain_head: String, pub errors: Vec<String>,
+    /// Controller input chunks verified (0 when the bundle has no inputs.jsonl).
+    pub input_chunks: u64, pub input_head: Option<String> }
 
 pub fn verify(dir: &Path) -> Result<Report, String> {
     let man = lines(&dir.join("manifest.jsonl"))?;
-    let mut r = Report { segments: 0, bytes: 0, checkpoints: 0, chain_head: GENESIS.into(), errors: vec![] };
+    let mut r = Report { segments: 0, bytes: 0, checkpoints: 0, chain_head: GENESIS.into(), errors: vec![], input_chunks: 0, input_head: None };
     let mut expect_off: std::collections::HashMap<String, u64> = Default::default();
     let mut heads = std::collections::HashSet::new();
     heads.insert(GENESIS.to_string());
@@ -64,15 +66,35 @@ pub fn verify(dir: &Path) -> Result<Report, String> {
         let real = std::fs::metadata(dir.join(f)).map(|m| m.len()).unwrap_or(0);
         if real != *end { r.errors.push(format!("{f}: {real} bytes on disk but manifest covers {end} (unhashed tail or truncation)")); }
     }
+    // Controller inputs: re-hash chunks + chain, and tie each chunk to the checkpoint that committed it.
+    let mut input_by_seg: Option<std::collections::HashMap<u64, String>> = None;
+    let ip = dir.join("inputs.jsonl");
+    if ip.exists() {
+        match crate::inputs::read_file(&ip) {
+            Ok((recs, chunks)) => {
+                let (m, head, errs) = crate::inputs::verify_chunks(&recs, &chunks);
+                r.errors.extend(errs); r.input_chunks = chunks.len() as u64; r.input_head = Some(head); input_by_seg = Some(m);
+            }
+            Err(e) => r.errors.push(e),
+        }
+    }
+    let empty_input = crate::inputs::empty_hash();
+    let mut committed = 0usize;
     if let Ok(cps) = lines(&dir.join("checkpoints.jsonl")) {
         let mut prev = GENESIS.to_string();
         for (i, c) in cps.iter().enumerate() {
             match ev::check_checkpoint(c, &prev) { Ok(h) => prev = h, Err(e) => { r.errors.push(format!("checkpoint {i}: {e}")); prev = c["hash"].as_str().unwrap_or("").into(); } }
             if c["seq"].as_u64() != Some(i as u64) { r.errors.push(format!("checkpoint {i}: seq gap")); }
             if let Some(h) = c["qorcap"]["chain_head"].as_str() { if !heads.contains(h) { r.errors.push(format!("checkpoint {i}: refers to unknown video chain head")); } }
+            if let (Some(seg), Some(m)) = (c["qorcap"]["input_seg"].as_u64(), input_by_seg.as_ref()) {
+                let want = m.get(&seg).cloned().unwrap_or_else(|| empty_input.clone());
+                if c["input_hash"].as_str() != Some(want.as_str()) { r.errors.push(format!("checkpoint {i}: input_hash does not match inputs.jsonl chunk for segment {seg}")); }
+                if m.contains_key(&seg) { committed += 1; }
+            }
             r.checkpoints += 1;
         }
     }
+    if let Some(m) = input_by_seg.as_ref() { if committed < m.len() { r.errors.push(format!("inputs: {} chunk(s) not committed by any checkpoint", m.len() - committed)); } }
     Ok(r)
 }
 

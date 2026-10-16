@@ -155,6 +155,46 @@ placeholders, and `checkpoints` and `signatures` are empty. It will **FAIL** `qo
 QorTime agent/referee fills in keys, co-signed checkpoints, challenge verdicts and signatures. QorTime
 currently has no `qortime sign` command. Signing happens in its agent/referee flow.
 
+## Controller input proof (v0.3.0)
+
+Setup this is built for: the DualSense / DualSense Edge plays the PS5 over **Bluetooth** while the same pad is
+**USB-plugged into the laptop**, so the laptop reads its HID reports. Both links at once is intended.
+
+* **Self-test:** double-click **Input Test.cmd** (or `qorcap input-test [--secs 30]`). It prints `[ OK ] HID is being
+  read: DualSense Edge (USB)`, the report rate, each press (`PRESS CROSS`), triggers and sticks live, then a summary.
+  If the pad is not visible over USB it says so plainly and exits with code 1.
+* **During a match** (`record`, Start Match): QorCap reads the pad on a background thread and stamps every report
+  with `t_us` from the **same monotonic clock** as the `mono_ms` of the 2-second video segments. Each time a
+  segment is hashed, the inputs received so far are sealed into a chunk: `input_hash = SHA-256(JCS([records]))`
+  goes into that segment's checkpoint (so it is part of the checkpoint hash chain), and chunks are chained like
+  the video (`head_n = SHA-256(JCS({prev, seq, sha256}))`). Records go to `inputs.jsonl` in the bundle.
+  Buttons are always logged; analog-only changes at most every 4 ms.
+* **Missing / unplugged controller:** recording never stops. A `WARN CONTROLLER: ...` line is logged, `/status`
+  shows `input.state` = `missing` / `unplugged` / `stalled` with a warning, and the state change is itself a
+  record in `inputs.jsonl` (absence is committed, not hidden). `--no-controller` turns logging off.
+* **At bundle write** (and `qorcap input-proof DIR`): `input_proof.json` (schema `qorcap-input-proof/v0`) with
+  * `human`: human-likeness 50..950 permille (never 0 or 1000), label, confidence (`none`/`low`/`medium`, never
+    high) and reasons, from press-timing jitter, hold-duration jitter, stick ramps, stick micro-drift and
+    trigger pressure ramps. Metronomic turbo/macro patterns score low. It is a heuristic and says so.
+  * `alignment`: frame differencing (48x27 gray, 30 fps) after up to 60 sampled key presses: did the picture
+    change within N frames (default 15)? `match_permille`, the same test at `chance_permille` times with no
+    input nearby, `offset_ms` (median press->change lag: game response + capture latency + clock offset),
+    and scorebug score events with controller activity in the 30 s before.
+  * `inputs_sha256`, `inputs_chain_head`, warnings, and the limit.
+* **Receipt (backward-compatible):** `receipt.draft.json` gains `signals.input` = `{status, device,
+  human_permille, human_label, match_permille, chance_permille, offset_ms, inputs_sha256, inputs_chain_head,
+  claims}` (integers only, inside QorTime's JCS profile; `signals` allows extra keys in `receipt.v0.json`).
+  `bundle.json` gains the same block as `input`. Older readers ignore both. Bundles with no controller keep the
+  pre-0.3.0 `input_hash` (= hash of `[]`).
+* **`verify-bundle`** re-hashes `inputs.jsonl` chunks and checks each against its checkpoint's `input_hash`.
+
+**Limit, plainly:** this shows the inputs came from the controller plugged into this laptop, in sync with this
+video. It does **not** show who was holding the controller.
+
+For `qortime referee-ai`: read `input_proof.json` (or `bundle.json.input`). Treat `status != "ok"` as "no input
+evidence", compare `match_permille` against `chance_permille` rather than reading it alone, and treat
+`human.score_permille` as a soft signal with its reasons.
+
 ## Commands
 
 ```
@@ -168,6 +208,9 @@ qorcap save-replay [--out clip.mp4]
 qorcap status
 qorcap stop
 qorcap verify-bundle DIR
+qorcap input-test [--secs N]
+qorcap input-proof DIR [--frames 15] [--no-video]
+qorcap record ... [--no-controller]
 ```
 Global: `--port 8788`, `--ffmpeg PATH`, `--log FILE` (default `qorcap.log`, or `DIR\qorcap.log` with `--bundle`).
 `--bundle` turns on `--out DIR\video.mp4` and `--replay 90` by default.
@@ -234,7 +277,9 @@ written, `verify-bundle` OK, and a single flipped byte reported as FAIL.
 - `receipt.draft.json` stays unsigned (see above). `Start Match` writes the signed, self-attested `receipt.json`. Signing by an independent referee needs a QorTime referee server, which does not exist yet.
 - A device outage longer than 10 s leaves a checkpoint gap, and `qortime verify` then reports `gap_too_long` (FAIL). This is the intended behaviour: the gap is real.
 - No `final_screen` detector (QorTime doesn't ship one yet). The hook is wired.
-- No HID input in QorCap, so `input_hash` is the hash of an empty list.
+- Controller input proof (v0.3.0) is tested with synthetic HID reports and a synthetic video only. It has not
+  yet read a real DualSense on MyTurn (run Input Test.cmd first). The last <2 s of inputs after the final
+  segment are not sealed. The human-likeness weights are hand-set, not trained on real Madden sessions.
 - No PR to qortime yet for ingesting bundles.
 
 ## Build
