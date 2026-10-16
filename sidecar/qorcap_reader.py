@@ -36,6 +36,32 @@ def prep(img):
     return cv2.resize(img, READER_SIZE, interpolation=cv2.INTER_AREA)
 
 
+def madden_final_screen(img) -> bool:
+    """Madden's end-of-game menu (FINISH GAME / VIEW HIGHLIGHTS / ... over the final score panel).
+
+    Same panel as the pause menu (white highlighted menu bar top-left, score panel, KEY PLAYERS), but
+    the background is solid black and the menu has only ~6 items, so the column below y=120 (640x360)
+    is empty; the pause menu lists ~10 items there over the faded game. Calibrated on a real Madden 27
+    capture (match-20261016-125430): pause/halftime menus give 1.1-2.3% bright pixels in that column
+    and a bottom std ~18; the end menu gives 0.0% and std ~9. Only used behind QorTime's Q4-low-clock
+    gate (``final_screen`` basis), so a halftime menu cannot end a game.
+    """
+    import numpy as np
+    if img is None:
+        return False
+    g = img.mean(axis=2) if img.ndim == 3 else img.astype(float)
+    h, w = g.shape[:2]
+    sy, sx = h / 360.0, w / 640.0
+    ys = lambda a, b: slice(int(a * sy), int(b * sy))  # noqa: E731
+    xs = lambda a, b: slice(int(a * sx), int(b * sx))  # noqa: E731
+    bottom = g[ys(200, 345), :]
+    bar = g[ys(22, 42), xs(20, 150)]
+    under_bar = g[ys(42, 140), xs(20, 150)]
+    menu_tail = g[ys(120, 260), xs(20, 150)]
+    return bool(bottom.mean() < 8 and (bottom > 60).mean() < 0.02 and bottom.std() < 14
+                and bar.mean() > 120 and under_bar.mean() < 60 and (menu_tail > 90).mean() < 0.004)
+
+
 class ReaderCore:
     """Frame -> agreed reads / obs spans -> events. Pure logic; I/O injected (unit-testable)."""
 
@@ -43,7 +69,7 @@ class ReaderCore:
                  final_screen_detector=None) -> None:
         self.post, self.reader, self.agree, self.pause = post, reader, agree, pause
         self.detect_final = detect_final
-        self.final_screen_detector = final_screen_detector  # QorTime ships none yet
+        self.final_screen_detector = final_screen_detector  # QorTime ships none; QorCap: madden_final_screen
         self.timeline: list[dict] = []
         self._absent: dict | None = None
         self._screen: dict | None = None
@@ -52,6 +78,11 @@ class ReaderCore:
 
     def on_frame(self, t_ms: int, img) -> None:
         self.stats["frames"] += 1
+        # The end-of-game menu is static, so the pause detector would swallow it; check it first.
+        if self.final_screen_detector is not None and self.final_screen_detector(img):
+            self.stats["final_screen"] = self.stats.get("final_screen", 0) + 1
+            self._observe(t_ms, img, True, screen=True)
+            return
         if self.pause is not None:
             self.pause.update(t_ms, img)
             if self.pause.paused:
@@ -83,7 +114,7 @@ class ReaderCore:
         self._close_spans()  # a fresh score read ends any absence span
         self._check_final(t_ms)
 
-    def _observe(self, t_ms: int, img, absent: bool) -> None:
+    def _observe(self, t_ms: int, img, absent: bool, screen: bool | None = None) -> None:
         def span(cur, name, on):
             if not on:
                 if cur is not None:
@@ -95,7 +126,8 @@ class ReaderCore:
             cur["until_ms"], cur["n"] = t_ms, cur["n"] + 1
             return cur
         self._absent = span(self._absent, "scorebug_absent", absent)
-        screen = bool(absent and self.final_screen_detector and self.final_screen_detector(img))
+        if screen is None:
+            screen = bool(absent and self.final_screen_detector and self.final_screen_detector(img))
         self._screen = span(self._screen, "final_screen", screen)
         if absent:
             self._check_final(t_ms)
@@ -143,7 +175,8 @@ def main(argv=None) -> int:
     from qor_receipt.agent.pause_detect import PauseDetector
     from qor_receipt.final_detect import detect_final
 
-    core = ReaderCore(lambda b: http_post(a.qorcap, b), ScorebugReader(), AgreementWindow(), PauseDetector(), detect_final)
+    core = ReaderCore(lambda b: http_post(a.qorcap, b), ScorebugReader(), AgreementWindow(), PauseDetector(), detect_final,
+                      final_screen_detector=madden_final_screen)
     last, period, t_print = None, 1.0 / a.hz, time.monotonic()
     print(f"qorcap scorebug sidecar -> {a.qorcap}", file=sys.stderr)
     while True:

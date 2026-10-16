@@ -109,6 +109,10 @@ def test_end_to_end_test_pattern(tmp_path):
     from qor_receipt.receipt import verify_receipt
     v = verify_receipt(rec, referee_pub=(b / "referee.pub").read_text().strip())
     assert v["errors"] == [] and len(rec["checkpoints"]["home"]) >= 4
+    first = json.loads((b / "checkpoints.jsonl").read_text().splitlines()[0])
+    assert first["qorcap"]["trigger"] == "start"  # genesis checkpoint before the first segment (0.3.2)
+    signed = [json.loads(x) for x in (b / "countersigned.jsonl").read_text().splitlines()]
+    assert all(c["referee_ts_ms"] - c["t_ms"] < 3000 for c in signed)  # tail signed live, not after exit
     assert subprocess.run([str(_qorcap_bin()), "verify-bundle", str(b)]).returncode == 0
     assert list((b / "clips").glob("*.mp4"))
 
@@ -257,3 +261,55 @@ def test_status_line_shows_warning_and_disk():
         {"score": {"home": 7, "away": 6, "quarter": 4, "clock_s": 0}, "segments": 2, "clips": 0}, 1)
     assert "REC" in s and "AWAY 6 - HOME 7" in s and "disk 1500MB" in s and "AUDIO FAILED" in s
     assert "DISK FULL" in qm.status_line({"state": "disk_full"}, {}, 0)
+
+
+def test_shutdown_checkpoints_countersigned_while_qorcap_finishes(tmp_path):
+    """Regression (live match 2026-10-16): QorCap's last checkpoints were countersigned only after the
+    process exited (~28 s of input-proof work), giving clock_skew + gap_too_long on the tail."""
+    import threading
+    import time as _t
+    from qor_receipt.checkpoints import Chain, verify_chain
+    dev, ref = qm.load_keys(tmp_path / "keys")
+    cs = qm.Countersigner(ref, "local-1", "home")
+    path = tmp_path / "checkpoints.jsonl"
+    ch = Chain()
+    start = int(_t.time() * 1000)
+
+    class Proc:  # QorCap: writes its final checkpoints right away, then keeps "analysing" for a while
+        returncode = None
+
+        def poll(self):
+            return self.returncode
+
+        def kill(self):
+            self.returncode = -9
+
+    proc = Proc()
+
+    def qorcap():
+        with open(path, "a", encoding="utf-8") as f:
+            for _ in range(3):
+                f.write(json.dumps(ch.next(int(_t.time() * 1000), "a" * 64, "b" * 64)) + "\n")
+                f.flush()
+        _t.sleep(1.5)  # input proof etc.
+        proc.returncode = 0
+
+    th = threading.Thread(target=qorcap)
+    th.start()
+    assert qm.wait_and_countersign(proc, path, cs, timeout=10, poll_s=0.05)
+    th.join()
+    assert len(cs.signed) == 3
+    assert all(c["referee_ts_ms"] - c["t_ms"] < 1000 for c in cs.signed)
+    end = cs.signed[-1]["referee_ts_ms"]
+    assert verify_chain(cs.signed, match_id="local-1", role="home", referee_pub=ref.pubkey_hex,
+                        start_ms=start, end_ms=end, max_skew_ms=1000) == []
+
+
+def test_partial_checkpoint_line_is_not_signed(tmp_path):
+    from qor_receipt.checkpoints import Chain
+    dev, ref = qm.load_keys(tmp_path / "keys")
+    cs = qm.Countersigner(ref, "local-1", "home")
+    ch = Chain()
+    p = tmp_path / "checkpoints.jsonl"
+    p.write_text(json.dumps(ch.next(1, "a" * 64, "b" * 64)) + "\n" + '{"seq": 1, "t_ms"', encoding="utf-8")
+    assert qm.countersign_new_from_file(p, cs) == 1 and len(cs.signed) == 1

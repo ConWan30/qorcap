@@ -59,18 +59,61 @@ pub fn list_devices(ffmpeg: &str) -> std::io::Result<Vec<Device>> {
 
 /// Choose the audio device that belongs to the capture card.
 pub fn pick_audio(video: &str, want: &str, devs: &[Device]) -> Option<String> {
+    pick_audio_device(video, want, devs).map(|d| d.name)
+}
+
+/// Like [`pick_audio`] but returns the enumerated device (with its DirectShow alternative name).
+/// Only devices that ffmpeg listed as *audio* are returned for `auto`; an explicit name is matched
+/// case-insensitively against the audio list (exact, then substring) so a slightly different spelling
+/// still resolves to the real enumerated name. An explicit name not in the list is passed through.
+pub fn pick_audio_device(video: &str, want: &str, devs: &[Device]) -> Option<Device> {
+    let audio: Vec<&Device> = devs.iter().filter(|d| d.kind == "audio").collect();
     match want {
         "none" | "off" => None,
         "auto" => {
-            let audio: Vec<&Device> = devs.iter().filter(|d| d.kind == "audio").collect();
             let stem = video.split_whitespace().next().unwrap_or(video).to_lowercase(); // "usb3.0"
             audio.iter().find(|d| d.name.to_lowercase().contains(&video.to_lowercase()))
                 .or_else(|| audio.iter().find(|d| d.name.to_lowercase().contains(&stem)))
                 .or_else(|| audio.iter().find(|d| { let n = d.name.to_lowercase(); n.contains("capture") || n.contains("hdmi") || n.contains("digital audio interface") }))
-                .map(|d| d.name.clone())
+                .map(|d| (*d).clone())
         }
-        n => Some(n.to_string()),
+        n => {
+            let l = n.to_lowercase();
+            audio.iter().find(|d| d.name == n)
+                .or_else(|| audio.iter().find(|d| d.name.to_lowercase() == l))
+                .copied()
+                .or_else(|| {
+                    // unambiguous substring only (e.g. "USB3.0 Audio" -> "Digital Audio Interface (USB3.0 Audio)")
+                    let c: Vec<&&Device> = audio.iter().filter(|d| { let dn = d.name.to_lowercase(); dn.contains(&l) || l.contains(&dn) }).collect();
+                    if l.len() >= 6 && c.len() == 1 { Some(*c[0]) } else { None }
+                })
+                .cloned()
+                .or_else(|| Some(Device { name: n.to_string(), kind: "audio".into(), alt: None }))
+        }
     }
+}
+
+/// How the card's audio is opened. Tried in order; after the last one fails QorCap records video-only.
+/// Many USB capture cards (MS2130 "USB3.0 Video" + "Digital Audio Interface (USB3.0 Audio)") fail pin
+/// negotiation when the audio endpoint is opened as a second, independent dshow graph
+/// ("Could not find output pin from audio only capture device"), but work as one graph.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AudioStrategy {
+    /// `-f dshow -i video=V` + `-f dshow -i audio=A` (default; best sync control)
+    Separate,
+    /// one dshow graph: `-i video=V:audio=A`
+    Combined,
+    /// second input by DirectShow alternative name (`@device_cm_...`), default buffer size
+    SeparateAlt,
+}
+pub const AUDIO_STRATEGIES: [AudioStrategy; 3] = [AudioStrategy::Separate, AudioStrategy::Combined, AudioStrategy::SeparateAlt];
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AudioSpec { pub name: String, pub alt: Option<String>, pub strategy: AudioStrategy }
+
+/// Strategies worth trying for this device (SeparateAlt only if an alternative name is known).
+pub fn audio_strategies(d: &Device) -> Vec<AudioStrategy> {
+    AUDIO_STRATEGIES.iter().copied().filter(|s| *s != AudioStrategy::SeparateAlt || d.alt.is_some()).collect()
 }
 
 /// Escape a path for use inside an ffmpeg filter option value.
@@ -183,12 +226,18 @@ pub fn capture_apps_running() -> Vec<String> {
 /// (auto/mjpeg/<pixel_format>). Video and audio are separate dshow inputs (a capture card's
 /// audio is its own DirectShow audio device), both wall-clock stamped and resampled to sync.
 pub fn capture_args(a: &RecordArgs, input_format: &str, audio: Option<&str>, snapshot: &str, stamp_file: Option<&str>) -> Vec<String> {
+    let spec = audio.map(|n| AudioSpec { name: n.to_string(), alt: None, strategy: AudioStrategy::Separate });
+    capture_args_with(a, input_format, spec.as_ref(), snapshot, stamp_file)
+}
+
+pub fn capture_args_with(a: &RecordArgs, input_format: &str, audio: Option<&AudioSpec>, snapshot: &str, stamp_file: Option<&str>) -> Vec<String> {
     let (w, h) = a.res;
     let fps = a.fps.to_string();
     let mut v: Vec<String> = ["-hide_banner", "-nostdin", "-loglevel", "warning", "-stats_period", "1", "-progress", "pipe:2"]
         .iter().map(|s| s.to_string()).collect();
     let push = |v: &mut Vec<String>, xs: &[&str]| v.extend(xs.iter().map(|s| s.to_string()));
     let has_audio;
+    let mut audio_idx = "1:a";
     if a.device == "testpattern" {
         push(&mut v, &["-re", "-f", "lavfi", "-i", &format!("testsrc2=size={w}x{h}:rate={fps}")]);
         if audio.is_some() { push(&mut v, &["-re", "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000"]); }
@@ -201,15 +250,26 @@ pub fn capture_args(a: &RecordArgs, input_format: &str, audio: Option<&str>, sna
             "mjpeg" => push(&mut v, &["-vcodec", "mjpeg"]),
             pf => push(&mut v, &["-pixel_format", pf]),
         }
-        push(&mut v, &["-i", &format!("video={}", a.device)]);
-        if let Some(au) = audio {
-            push(&mut v, &["-f", "dshow", "-thread_queue_size", "1024", "-use_wallclock_as_timestamps", "1", "-audio_buffer_size", "50",
-                "-i", &format!("audio={au}")]);
+        match audio {
+            Some(au) if au.strategy == AudioStrategy::Combined => {
+                push(&mut v, &["-i", &format!("video={}:audio={}", a.device, au.name)]);
+                audio_idx = "0:a";
+            }
+            Some(au) => {
+                push(&mut v, &["-i", &format!("video={}", a.device)]);
+                push(&mut v, &["-f", "dshow", "-thread_queue_size", "1024", "-use_wallclock_as_timestamps", "1"]);
+                let name = match (au.strategy, &au.alt) {
+                    (AudioStrategy::SeparateAlt, Some(alt)) => alt.clone(),
+                    _ => { push(&mut v, &["-audio_buffer_size", "50"]); au.name.clone() }
+                };
+                push(&mut v, &["-i", &format!("audio={name}")]);
+            }
+            None => push(&mut v, &["-i", &format!("video={}", a.device)]),
         }
         has_audio = audio.is_some();
     }
     push(&mut v, &["-map", "0:v"]);
-    if has_audio { push(&mut v, &["-map", "1:a"]); }
+    if has_audio { push(&mut v, &["-map", audio_idx]); }
     let mut vf = format!("fps={fps}");
     if let Some(t) = stamp_file {
         let font = if cfg!(windows) { ":fontfile='C\\:/Windows/Fonts/consola.ttf'" } else { "" };
@@ -277,6 +337,27 @@ dummy: Immediate exit requested"#;
         assert_eq!(pick_audio("USB3.0 Video", "none", &d), None);
         assert_eq!(pick_audio("X", "Mic", &d).as_deref(), Some("Mic"));
         assert_eq!(pick_audio("Elgato", "auto", &d[3..]), None);
+        // explicit names resolve to the enumerated audio device (case-insensitive / substring)
+        assert_eq!(pick_audio("X", "digital audio interface (usb3.0 audio)", &d).as_deref(), Some("Digital Audio Interface (USB3.0 Audio)"));
+        assert_eq!(pick_audio("X", "USB3.0 Audio", &d).as_deref(), Some("Digital Audio Interface (USB3.0 Audio)"));
+        // never pick a video device as audio
+        assert_eq!(pick_audio("Integrated Camera", "auto", &d[..2]), None);
+        let dev = pick_audio_device("USB3.0 Video", "auto", &d).unwrap();
+        assert_eq!(dev.alt.as_deref(), Some(r"@device_cm_{33D9A762}\wave_{X}"));
+        assert_eq!(audio_strategies(&dev), vec![AudioStrategy::Separate, AudioStrategy::Combined, AudioStrategy::SeparateAlt]);
+    }
+    #[test]
+    fn audio_strategy_args() {
+        use clap::Parser;
+        let c = crate::cli::Cli::try_parse_from(["q", "record"]).unwrap();
+        let crate::cli::Cmd::Record(r) = c.cmd else { panic!() };
+        let mk = |s| AudioSpec { name: "Digital Audio Interface (USB3.0 Audio)".into(), alt: Some("@device_cm_X".into()), strategy: s };
+        let comb = capture_args_with(&r, "mjpeg", Some(&mk(AudioStrategy::Combined)), "s.jpg", None).join(" ");
+        assert!(comb.contains("-i video=USB3.0 Video:audio=Digital Audio Interface (USB3.0 Audio)"), "{comb}");
+        assert!(comb.contains("-map 0:v -map 0:a") && comb.contains("-c:a aac"), "{comb}");
+        assert_eq!(comb.matches("-f dshow").count(), 1);
+        let alt = capture_args_with(&r, "mjpeg", Some(&mk(AudioStrategy::SeparateAlt)), "s.jpg", None).join(" ");
+        assert!(alt.contains("-i audio=@device_cm_X") && !alt.contains("-audio_buffer_size") && alt.contains("-map 1:a"), "{alt}");
     }
     #[test]
     fn args_shape() {
