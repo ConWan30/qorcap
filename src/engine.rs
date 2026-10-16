@@ -202,6 +202,20 @@ impl Engine {
         info!("recording started -> {}", r.path);
         let p = r.path.clone();
         *g = Some(r);
+        drop(g);
+        // Genesis checkpoint right away: the first segment checkpoint can be 5-10 s away (device open,
+        // audio fallback retry, encoder warm-up) and the referee must see the chain start promptly.
+        self.checkpoint("start", json!({}));
+        // Until the first video segment exists (device open, audio fallbacks, encoder warm-up), keep the
+        // referee fed every 4 s. Stops for good at the first segment, so mid-match gaps are still gaps.
+        { let me = self.clone(); std::thread::spawn(move || {
+            let t0 = Instant::now();
+            while t0.elapsed() < Duration::from_secs(120) {
+                std::thread::sleep(Duration::from_millis(4000));
+                if me.shutdown.load(Ordering::SeqCst) || me.ev.lock().unwrap().seg.seq > 0 || me.rec.lock().unwrap().is_none() { break; }
+                me.checkpoint("startup", json!({}));
+            }
+        }); }
         Ok(p)
     }
     fn spawn_recorder(self: &Arc<Self>, base: &str, part: u32, deadline: Option<Instant>) -> Result<Recorder, String> {
@@ -323,9 +337,13 @@ impl Engine {
         let mut fmt: Option<String> = None; // resolved input format (probed once per device appearance)
         let mut audio_off = false;          // audio failed to open: continue video-only
         let mut audio_fails = 0u32;
+        let mut audio_try = 0usize;         // index into the audio open strategies for this device
         while !self.shutdown.load(Ordering::SeqCst) {
-            let mut audio = None;
-            if self.args.device == "testpattern" && self.args.audio != "none" && self.args.audio != "off" && !audio_off { audio = Some("sine".to_string()); }
+            let mut audio: Option<ffmpeg::AudioSpec> = None;
+            if self.args.device == "testpattern" && self.args.audio != "none" && self.args.audio != "off" && !audio_off {
+                audio = Some(ffmpeg::AudioSpec { name: "sine".into(), alt: None, strategy: ffmpeg::AudioStrategy::Separate });
+            }
+            let mut n_strategies = 1usize;
             if self.args.device != "testpattern" {
                 match ffmpeg::list_devices(&self.ffmpeg) {
                     Err(e) => { self.set_state("waiting_for_device", Some(format!("cannot run ffmpeg `{}`: {e}", self.ffmpeg))); error!("cannot run ffmpeg `{}`: {e}", self.ffmpeg); self.sleep(5); continue; }
@@ -339,7 +357,19 @@ impl Engine {
                             self.sleep(1);
                             continue;
                         }
-                        audio = if audio_off { None } else { ffmpeg::pick_audio(&self.args.device, &self.args.audio, &devs) };
+                        audio = if audio_off { None } else {
+                            ffmpeg::pick_audio_device(&self.args.device, &self.args.audio, &devs).and_then(|d| {
+                                let strats = ffmpeg::audio_strategies(&d);
+                                n_strategies = strats.len();
+                                if audio_try == 0 {
+                                    let names: Vec<&str> = devs.iter().filter(|x| x.kind == "audio").map(|x| x.name.as_str()).collect();
+                                    if !names.iter().any(|n| *n == d.name) {
+                                        warn!("audio device \"{}\" is not in the DirectShow audio list ({}); trying anyway", d.name, names.join(", "));
+                                    }
+                                }
+                                strats.get(audio_try).map(|s| ffmpeg::AudioSpec { name: d.name.clone(), alt: d.alt.clone(), strategy: *s })
+                            })
+                        };
                         if self.args.audio != "none" && self.args.audio != "off" && audio.is_none() && !audio_off {
                             warn!("no audio device for \"{}\" found; recording video-only", self.args.device);
                             audio_off = true;
@@ -360,7 +390,7 @@ impl Engine {
                     }
                 }
             }
-            self.status.lock().unwrap().audio = audio.clone();
+            self.status.lock().unwrap().audio = audio.as_ref().map(|a| a.name.clone());
             // Disk guard: stop cleanly when critically low — never keep writing into ENOSPC.
             let probe = self.args.out.as_deref().or(self.args.bundle.as_deref()).unwrap_or(".");
             if let Some((crit, free)) = crate::disk::is_critical(Path::new(probe)) {
@@ -380,7 +410,7 @@ impl Engine {
                 }
             }
             let t0 = Instant::now();
-            let (ok, why) = self.run_capture_once(fmt.as_deref().unwrap_or("auto"), audio.as_deref());
+            let (ok, why) = self.run_capture_once(fmt.as_deref().unwrap_or("auto"), audio.as_ref());
             if self.shutdown.load(Ordering::SeqCst) { self.ring.lock().unwrap().clear(); break; }
             if why == ffmpeg::Failure::Snapshot && ok {
                 // Snapshot mux path failed but video kept flowing — recreate dir, do not burn reopen budget.
@@ -390,9 +420,17 @@ impl Engine {
                 continue;
             }
             if !ok && audio.is_some() {
+                if why == ffmpeg::Failure::AudioOpen && audio_try + 1 < n_strategies {
+                    let cur = audio.as_ref().map(|a| a.strategy);
+                    audio_try += 1;
+                    warn!("audio device {:?} failed to open with {:?}; retrying with another DirectShow open strategy", audio.as_ref().map(|a| &a.name), cur);
+                    self.ring.lock().unwrap().clear();
+                    self.set_state("reopening", Some("audio open failed; trying another audio open method".into()));
+                    continue; // immediate retry, no backoff / no reopen_count
+                }
                 audio_fails = if why == ffmpeg::Failure::AudioOpen { 99 } else { audio_fails + 1 };
                 if audio_fails >= 2 {
-                    warn!("audio device {:?} could not be opened{}; falling back to VIDEO-ONLY recording", audio,
+                    warn!("audio device {:?} could not be opened{}; falling back to VIDEO-ONLY recording", audio.as_ref().map(|a| &a.name),
                         if why == ffmpeg::Failure::AudioOpen { "" } else { " (two failed opens with audio)" });
                     audio_off = true;
                     {
@@ -427,13 +465,13 @@ impl Engine {
     }
 
     /// One capture session. Returns true if it produced data.
-    fn run_capture_once(self: &Arc<Self>, input_format: &str, audio: Option<&str>) -> (bool, ffmpeg::Failure) {
+    fn run_capture_once(self: &Arc<Self>, input_format: &str, audio: Option<&ffmpeg::AudioSpec>) -> (bool, ffmpeg::Failure) {
         // Snapshot lives under the bundle / LOCALAPPDATA run dir — recreate every open (TEMP clear bug).
         if let Some(d) = self.snapshot.parent() { let _ = std::fs::create_dir_all(d); }
         if self.args.stamp && !self.stamp_file.exists() { let _ = std::fs::write(&self.stamp_file, "QorCap  no referee nonce yet"); }
         let stamp = if self.args.stamp { Some(self.stamp_file.to_string_lossy().into_owned()) } else { None };
-        let args = ffmpeg::capture_args(&self.args, input_format, audio, &self.snapshot.to_string_lossy(), stamp.as_deref());
-        info!("opening \"{}\" format={input_format} audio={:?} {}x{}@{} enc={}", self.args.device, audio, self.args.res.0, self.args.res.1, self.args.fps, self.args.encoder);
+        let args = ffmpeg::capture_args_with(&self.args, input_format, audio, &self.snapshot.to_string_lossy(), stamp.as_deref());
+        info!("opening \"{}\" format={input_format} audio={:?} ({:?}) {}x{}@{} enc={}", self.args.device, audio.map(|a| &a.name), audio.map(|a| a.strategy), self.args.res.0, self.args.res.1, self.args.fps, self.args.encoder);
         let child = ffmpeg::command(&self.ffmpeg).args(&args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn();
         let mut child = match child { Ok(c) => c, Err(e) => { let m = format!("cannot start ffmpeg `{}`: {e}", self.ffmpeg); error!("{m}"); self.set_state("reopening", Some(m)); return (false, ffmpeg::Failure::Other); } };
         let mut stdout = child.stdout.take().unwrap();
@@ -783,7 +821,7 @@ impl Engine {
                 r.insert("final_confirmed".into(), json!(false));
                 r.insert("method".into(), json!("last_scorebug_read_unconfirmed"));
             }
-            info!("draft receipt uses last scorebug read {}-{} (final not confirmed)", fin["away"], fin["home"]);
+            info!("draft receipt uses last scorebug read AWAY {} - HOME {} (final not confirmed)", fin["away"], fin["home"]);
         }
         let bundle = json!({
             "schema": "qorcap-bundle/v0", "qorcap_version": env!("CARGO_PKG_VERSION"),

@@ -176,10 +176,16 @@ Setup this is built for: the DualSense / DualSense Edge plays the PS5 over **Blu
   * `human`: human-likeness 50..950 permille (never 0 or 1000), label, confidence (`none`/`low`/`medium`, never
     high) and reasons, from press-timing jitter, hold-duration jitter, stick ramps, stick micro-drift and
     trigger pressure ramps. Metronomic turbo/macro patterns score low. It is a heuristic and says so.
-  * `alignment`: frame differencing (48x27 gray, 30 fps) after up to 60 sampled key presses: did the picture
-    change within N frames (default 15)? `match_permille`, the same test at `chance_permille` times with no
-    input nearby, `offset_ms` (median press->change lag: game response + capture latency + clock offset),
-    and scorebug score events with controller activity in the 30 s before.
+  * `alignment` (v2, 0.3.2): one decode pass of the whole video at 96x54 gray (2-frame motion energy). The
+    video clock comes from a least-squares fit of every media segment's (`mono_ms`, `frames`), not the init
+    segment (which lands seconds after frame 0 on a real card). A key press is scored only when the screen was
+    still for the 20 frames before it (play-call, pre-snap, menus): it matches if motion energy jumps to >= 5x
+    that baseline within 100-667 ms. The residual offset is searched in +/-3 s on half the presses and scored on
+    the other half (2-fold), so `match_permille` is never measured at an offset fitted to the same presses.
+    `chance_permille` = the same presses shifted 3-8 s (>= 700 ms from any press) through the same filter and
+    offsets. Also `z_x100` (two-proportion z x100), `offset_ms`/`offset_iqr_ms` (press -> onset, includes
+    capture + game latency), `calibration_offsets_ms`, `presses_spaced`/`presses_tested`, and scorebug score
+    events with controller activity in the 30 s before. Mid-play presses (camera already moving) are not scored.
   * `inputs_sha256`, `inputs_chain_head`, warnings, and the limit.
 * **Receipt (backward-compatible):** `receipt.draft.json` gains `signals.input` = `{status, device,
   human_permille, human_label, match_permille, chance_permille, offset_ms, inputs_sha256, inputs_chain_head,
@@ -277,6 +283,18 @@ written, `verify-bundle` OK, and a single flipped byte reported as FAIL.
 
 **Tested on Windows (v0.2.0–v0.2.1 era, MyTurn, USB3.0 Video):** `--input-format mjpeg` 1280x720@30 with `h264_mf` at 29.7 fps. v0.2.1 fixed audio / auto-format / OBS.
 
+**v0.3.2 (first real live match, 2026-10-16, Madden 27 14-7):** (1) input-video alignment v2 (above): on that
+match v1 gave 383 vs chance 345 permille (60 presses); v2 gives 737 vs chance 434 (76 still-screen presses of 476,
+held-out offset, z = 4.29), and inputs time-shifted by 37/61/143 s fall to chance (320/336, 304/435, 248/246).
+(2) `qortime verify` gap/skew at start and stop: a `start` checkpoint is written the moment recording starts
+(plus `startup` checkpoints every 4 s until the first segment), and Start Match now countersigns QorCap's
+shutdown checkpoints as they hit disk instead of after QorCap exits (input-proof work had delayed them ~28 s).
+Mid-match gap/skew checks are unchanged. (3) The static end-of-game menu was swallowed by the pause detector, so
+the final was never confirmed; the end menu is now detected before the pause gate -> `final_screen` final + final
+clip. Log lines print `AWAY a - HOME h`. (4) Card audio: explicit names resolve against the DirectShow audio list,
+and on "Could not find output pin" QorCap retries as one combined `video=..:audio=..` graph, then by the audio
+device's alternative name, then video-only.
+
 **v0.2.2 (2026-10-15 MyTurn failure):** ENOSPC mid-game overwrote ~467 MB of `video.mp4` on resume; `%TEMP%` snapshot deletion caused ffmpeg image2 reopen storms; live draft receipt used **0–0** despite last scorebug 7–6; one corrupt `manifest.jsonl` line broke `verify-bundle`. This release adds: disk-space guard (`--min-free-gb`, default 2; clean `disk_full` stop); never overwrite existing `video*.mp4` (always new `video.partN.mp4`); snapshots under the match bundle / `%LOCALAPPDATA%\QorCap\run-<pid>` (not `%TEMP%`); draft score falls back to last timeline read with `final_confirmed: false`; durable JSONL appends + bad-line salvage in verify/finalize; persistent video-only audio warning in `/status`; single-instance lock; `start-match.ps1` tolerates native stderr under `$ErrorActionPreference = "Stop"`.
 
 **Not tested in v0.2.2 on Windows yet:** the full Start Match path on MyTurn after this fix, real ENOSPC recovery, card audio video-only fallback in the wild, OBS close offer, Finalize Last Match on a real long match, DirectShow/`h264_mf` on this build, and the sidecar on live PS5 frames. The `.exe` was cross-compiled on Linux.
@@ -284,7 +302,8 @@ written, `verify-bundle` OK, and a single flipped byte reported as FAIL.
 ## Stubbed / not done
 - `receipt.draft.json` stays unsigned (see above). `Start Match` writes the signed, self-attested `receipt.json`. Signing by an independent referee needs a QorTime referee server, which does not exist yet.
 - A device outage longer than 10 s leaves a checkpoint gap, and `qortime verify` then reports `gap_too_long` (FAIL). This is the intended behaviour: the gap is real.
-- No `final_screen` detector (QorTime doesn't ship one yet). The hook is wired.
+- `final_screen`: QorCap ships a Madden 27 end-of-game menu detector (`madden_final_screen`, 0.3.2), calibrated on
+  one real match at 360p/720p. It only counts behind QorTime's Q4-low-clock gate. Other games: none.
 - Controller input proof (v0.3.0) is tested with synthetic HID reports and a synthetic video only. It has not
   yet read a real DualSense on MyTurn (run Input Test.cmd first). The last <2 s of inputs after the final
   segment are not sealed. The human-likeness weights are hand-set, not trained on real Madden sessions.

@@ -170,6 +170,42 @@ class Countersigner:
         return True
 
 
+SHUTDOWN_TIMEOUT_S = 900  # input proof decodes the whole video once; never kill QorCap mid-bundle
+
+
+def countersign_new_from_file(path: Path, cs: "Countersigner") -> int:
+    """Offer every not-yet-signed checkpoint in QorCap's checkpoints.jsonl (tolerates a partial last line)."""
+    n = 0
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return 0
+    for line in lines:
+        if not line.strip():
+            continue
+        try:
+            c = json.loads(line)
+        except ValueError:
+            break  # line still being written
+        if c.get("seq", -1) >= len(cs.signed) and cs.offer(c):
+            n += 1
+    return n
+
+
+def wait_and_countersign(proc, path: Path, cs: "Countersigner", timeout: float = SHUTDOWN_TIMEOUT_S,
+                         poll_s: float = 0.2) -> bool:
+    """Wait for QorCap to exit, countersigning its shutdown checkpoints the moment they hit disk."""
+    deadline = time.monotonic() + timeout
+    while proc.poll() is None:
+        countersign_new_from_file(path, cs)
+        if time.monotonic() > deadline:
+            proc.kill()
+            break
+        time.sleep(poll_s)
+    countersign_new_from_file(path, cs)
+    return proc.returncode == 0
+
+
 def build_receipt(draft: dict, cps: list[dict], device, referee, *, match_id: str, role: str, started_ms: int,
                   referee_kind: str = REFEREE_KIND) -> dict:
     """QorTime's receipt.build + sign_referee + sign_player on what QorCap observed."""
@@ -199,7 +235,7 @@ def start_reader(api: Api, stop: threading.Event, state: dict) -> threading.Thre
     from qor_receipt.final_detect import detect_final
 
     sys.path.insert(0, str(HERE))
-    from qorcap_reader import ReaderCore, prep
+    from qorcap_reader import ReaderCore, madden_final_screen, prep
 
     def post(b):
         try:
@@ -210,7 +246,8 @@ def start_reader(api: Api, stop: threading.Event, state: dict) -> threading.Thre
             state["final"] = b
         return r
 
-    core = ReaderCore(post, ScorebugReader(), AgreementWindow(), PauseDetector(), detect_final)
+    core = ReaderCore(post, ScorebugReader(), AgreementWindow(), PauseDetector(), detect_final,
+                      final_screen_detector=madden_final_screen)
 
     def loop():
         last = None
@@ -533,10 +570,10 @@ def main(argv=None) -> int:
         api.post("/shutdown")
     except Exception:
         pass
-    try:
-        proc.wait(timeout=30)
-    except subprocess.TimeoutExpired:
-        proc.kill()
+    # Keep countersigning while QorCap shuts down. Its last checkpoints are written within a second of
+    # the stop, but the process then spends tens of seconds on input-proof analysis before exiting;
+    # signing only after exit stamped them ~28 s late (clock_skew + gap_too_long on the tail).
+    wait_and_countersign(proc, bundle / "checkpoints.jsonl", cs, timeout=SHUTDOWN_TIMEOUT_S)
     log.close()
 
     # Countersign anything QorCap wrote while shutting down (still within seconds of t_ms).
@@ -728,9 +765,10 @@ def default_core_factory(post):
     from qor_receipt.final_detect import detect_final
 
     sys.path.insert(0, str(HERE))
-    from qorcap_reader import ReaderCore
+    from qorcap_reader import ReaderCore, madden_final_screen
 
-    return ReaderCore(post, ScorebugReader(), AgreementWindow(), PauseDetector(), detect_final)
+    return ReaderCore(post, ScorebugReader(), AgreementWindow(), PauseDetector(), detect_final,
+                      final_screen_detector=madden_final_screen)
 
 
 def finalize(bundle: Path, *, qt: Path, qorcap: str, ffmpeg: str, key_dir: Path, no_open: bool = True,
@@ -813,6 +851,8 @@ def finalize(bundle: Path, *, qt: Path, qorcap: str, ffmpeg: str, key_dir: Path,
     draft = dict(draft, result=res)
     say(f"  {len(reads)} score reads, {len(scps)} score checkpoints, final: "
         + (f"{fin['basis']} AWAY {fin['away']} - HOME {fin['home']}" if fin else "not detected"))
+    if not fin:
+        say("  The receipt uses the last score read: this is NOT a confirmed final.")
 
     live = read_jsonl(bundle / "countersigned.jsonl")
     if live and len(live) >= len(qcps) and all(a["hash"] == b["hash"] for a, b in zip(live, qcps)):
