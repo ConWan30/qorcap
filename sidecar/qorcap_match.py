@@ -40,7 +40,7 @@ import urllib.request
 import zipfile
 from pathlib import Path
 
-QORTIME_PIN = "f0d532ae31e0d3ad442d3b8bea0e34bbc2298f68"
+QORTIME_PIN = "5e3e4cda0a8c356b1918520e2a7f961100b8bfac"
 QORTIME_ZIP = f"https://github.com/ConWan30/qortime/archive/{QORTIME_PIN}.zip"
 VERIFY_URL = "https://conwan30.github.io/qortime/verify/"
 REFEREE_KIND = "local-self-attested"
@@ -170,6 +170,7 @@ class Countersigner:
         return True
 
 
+STATIC_FRAME_S = 1.0
 SHUTDOWN_TIMEOUT_S = 900  # input proof decodes the whole video once; never kill QorCap mid-bundle
 
 
@@ -193,11 +194,31 @@ def countersign_new_from_file(path: Path, cs: "Countersigner") -> int:
 
 
 def wait_and_countersign(proc, path: Path, cs: "Countersigner", timeout: float = SHUTDOWN_TIMEOUT_S,
-                         poll_s: float = 0.2) -> bool:
-    """Wait for QorCap to exit, countersigning its shutdown checkpoints the moment they hit disk."""
+                         poll_s: float = 0.2, sweep=None, report=None, on_tick=None) -> bool:
+    """Wait for QorCap to exit, countersigning its stop checkpoints the moment they appear.
+
+    v0.3.3: QorCap seals its chain with a ``stop`` checkpoint right after the video is finalised and keeps its
+    API up while it computes the input proof. ``sweep`` pulls new checkpoints over the API (the path that
+    worked live); the file is a fallback. ``report(seq)`` tells QorCap how far we have signed so it can start
+    the slow bundle work only after the tail carries fresh referee stamps.
+    """
     deadline = time.monotonic() + timeout
+    reported = -1
     while proc.poll() is None:
+        if sweep is not None:
+            try:
+                sweep()
+            except Exception:
+                pass
         countersign_new_from_file(path, cs)
+        if report is not None and len(cs.signed) - 1 > reported:
+            try:
+                report(len(cs.signed) - 1)
+                reported = len(cs.signed) - 1
+            except Exception:
+                pass
+        if on_tick is not None:
+            on_tick()
         if time.monotonic() > deadline:
             proc.kill()
             break
@@ -250,7 +271,7 @@ def start_reader(api: Api, stop: threading.Event, state: dict) -> threading.Thre
                       final_screen_detector=madden_final_screen)
 
     def loop():
-        last = None
+        last, last_t = None, 0.0
         while not stop.is_set():
             try:
                 with urllib.request.urlopen(api.base + "/snapshot.jpg", timeout=3) as r:
@@ -259,11 +280,16 @@ def start_reader(api: Api, stop: threading.Event, state: dict) -> threading.Thre
                 time.sleep(0.5)
                 continue
             h = hashlib.sha256(data).digest()
-            if h != last:
-                last = h
+            # A perfectly static screen (end-of-game menu) can produce byte-identical snapshots; still feed
+            # it about once a second so time-based spans (final_screen >= 3 s) can grow.
+            if h != last or time.monotonic() - last_t >= STATIC_FRAME_S:
+                last, last_t = h, time.monotonic()
                 img = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
                 if img is not None:
-                    core.on_frame(int(time.time() * 1000), prep(img))
+                    try:
+                        core.on_frame(int(time.time() * 1000), prep(img))
+                    except Exception as e:  # never let one bad frame kill the reader thread
+                        state["reader_error"] = f"{type(e).__name__}: {e}"
             time.sleep(0.25)
 
     t = threading.Thread(target=loop, daemon=True)
@@ -345,7 +371,52 @@ def offer_close_capture_apps(ask=input) -> bool:
     return ok
 
 
-# ------------------------------------------------------------------ console
+# ------------------------------------------------------------------ robustness
+def ignore_ctrl_c() -> None:
+    import signal
+    try:
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+    except Exception:
+        pass
+
+
+MIC_KEY = r"Software\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\microphone"
+
+
+def mic_privacy_blocked(read=None) -> str | None:
+    """Windows privacy switches that silently block the capture card's audio (DirectShow 'I/O error').
+
+    Returns which switch is off ('desktop' / 'all') or None. ``read(subkey) -> Value str | None`` is injectable."""
+    if read is None:
+        if not WIN:
+            return None
+
+        def read(sub):
+            import winreg
+            try:
+                with winreg.OpenKey(winreg.HKEY_CURRENT_USER, sub) as k:
+                    return str(winreg.QueryValueEx(k, "Value")[0])
+            except OSError:
+                return None
+    if (read(MIC_KEY) or "").lower() == "deny":
+        return "all"
+    if (read(MIC_KEY + r"\NonPackaged") or "").lower() == "deny":
+        return "desktop"
+    return None
+
+
+def mic_hint(which: str | None) -> list[str]:
+    if not which:
+        return []
+    what = ("'Microphone access'" if which == "all" else "'Let desktop apps access your microphone'")
+    return ["",
+            f"  NOTE: Windows privacy blocks the microphone ({what} is Off).",
+            "        The capture card's game audio counts as a microphone, so the match would record WITHOUT sound.",
+            "        Fix: Start > Settings > Privacy & security > Microphone > turn ON 'Microphone access'",
+            "        and 'Let desktop apps access your microphone'. Then close this window and start again.",
+            "        (Recording still works video-only if you continue.)", ""]
+
+
 def key_watcher(stop: threading.Event, state: dict) -> None:
     def loop():
         try:
@@ -445,6 +516,9 @@ def main(argv=None) -> int:
         return 3
     qorcap = find_qorcap(a.qorcap)
     device, referee = load_keys(Path(a.key_dir) if a.key_dir else data_dir() / "keys")
+    if not a.test_pattern and a.audio != "none":
+        for line in mic_hint(mic_privacy_blocked()):
+            say(line)
 
     root = Path(a.out) if a.out else Path.home() / "Documents" / "QorCap Matches"
     stamp = time.strftime("%Y%m%d-%H%M%S")
@@ -495,7 +569,10 @@ def main(argv=None) -> int:
         offer_close_capture_apps()
     log = open(bundle / "console.log", "w", encoding="utf-8")
     started_ms = int(time.time() * 1000)
-    proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT)
+    # Own process group on Windows: a Ctrl+C in this window reaches only this script, which then stops QorCap
+    # cleanly over its API (instead of both racing, and cmd.exe asking 'Terminate batch job (Y/N)?' mid-bundle).
+    flags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) if WIN else 0
+    proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, creationflags=flags)
     for _ in range(50):
         try:
             api.get("/status", timeout=1)
@@ -520,7 +597,8 @@ def main(argv=None) -> int:
 
     say(f"Recording to: {bundle}")
     say("Play your game. Recording stops by itself at the final whistle.")
-    say("Press ENTER (or Q, or Ctrl+C) to stop early.\n")
+    say("Press ENTER (or Q) to stop early. Keep this window open until it says RESULT.")
+    say("(Ctrl+C also stops it; if Windows then asks 'Terminate batch job (Y/N)?', answer N.)\n")
     stop, state = threading.Event(), {}
     cs = Countersigner(referee, match_id, a.role, sink=bundle / "countersigned.jsonl")
     if a.test_pattern:
@@ -529,6 +607,12 @@ def main(argv=None) -> int:
         start_reader(api, stop, state)
     key_watcher(stop, state)
 
+    reported = {"seq": -1}
+
+    def report(seq: int) -> None:
+        api.post("/countersigned", {"seq": seq}, timeout=2)
+        reported["seq"] = seq
+
     def sweep():
         try:
             got = api.get(f"/checkpoints?since={len(cs.signed)}")
@@ -536,6 +620,11 @@ def main(argv=None) -> int:
             return None
         for c in got.get("checkpoints", []):
             cs.offer(c)
+        if len(cs.signed) - 1 > reported["seq"]:
+            try:
+                report(len(cs.signed) - 1)
+            except Exception:
+                pass
         return got
 
     final_seen_at = None
@@ -565,15 +654,31 @@ def main(argv=None) -> int:
     except KeyboardInterrupt:
         say("\n\nStopping (Ctrl+C) ...")
     stop.set()
+    ignore_ctrl_c()  # from here on, a Ctrl+C must not abort signing (it caused 'receipt failed' + Y/N prompt)
+    say("\n\nStopping QorCap: sealing and countersigning the final checkpoints ...")
     sweep()
     try:
         api.post("/shutdown")
     except Exception:
         pass
-    # Keep countersigning while QorCap shuts down. Its last checkpoints are written within a second of
-    # the stop, but the process then spends tens of seconds on input-proof analysis before exiting;
-    # signing only after exit stamped them ~28 s late (clock_skew + gap_too_long on the tail).
-    wait_and_countersign(proc, bundle / "checkpoints.jsonl", cs, timeout=SHUTDOWN_TIMEOUT_S)
+    # Countersign the stop checkpoints over the API while QorCap is still up; QorCap waits for our report
+    # before the input-proof analysis (v0.3.2 stamped the tail ~105 s late: gap_too_long + clock_skew).
+    phase = {"last": None}
+
+    def tick():
+        try:
+            st = api.get("/status", timeout=1)
+        except Exception:
+            return
+        s_ = st.get("state")
+        if s_ != phase["last"]:
+            phase["last"] = s_
+            msg = {"countersigning": "  final checkpoints: countersigning ...",
+                   "finishing": f"  final checkpoints countersigned ({len(cs.signed)}). Checking controller input against the video (1-2 minutes, please wait) ...",
+                   "stopped": "  QorCap finished the match bundle."}.get(s_)
+            if msg:
+                say(msg)
+    wait_and_countersign(proc, bundle / "checkpoints.jsonl", cs, timeout=SHUTDOWN_TIMEOUT_S, sweep=sweep, on_tick=tick)
     log.close()
 
     # Countersign anything QorCap wrote while shutting down (still within seconds of t_ms).
@@ -589,6 +694,8 @@ def main(argv=None) -> int:
         say(f"FAIL: QorCap did not write the bundle. See {bundle / 'qorcap.log'}")
         return 2
     draft = json.loads(draft_p.read_text(encoding="utf-8"))
+    if not a.test_pattern and draft["result"].get("final_basis") is None and a.ffmpeg:
+        draft = tail_final_check(bundle, draft, ffmpeg=a.ffmpeg)
     return sign_and_report(bundle, draft, cs.signed, device, referee, match_id=match_id, role=a.role,
                            started_ms=started_ms, qt=qt, qorcap=qorcap, no_open=a.no_open)
 
@@ -771,6 +878,86 @@ def default_core_factory(post):
                       final_screen_detector=madden_final_screen)
 
 
+TAIL_SECS = 240
+TAIL_HZ = 2.0
+
+
+def tail_final_check(bundle: Path, draft: dict, *, ffmpeg: str, secs: int = TAIL_SECS, hz: float = TAIL_HZ,
+                     core_factory=None, frames=None) -> dict:
+    """Live final missed: read the last ``secs`` of the recorded video (end-of-game menu) with the same reader,
+    seeded with the live timeline, and confirm the final from recorded frames. Saves clips/final-recorded.mp4
+    and final.tail.json. Checkpoints are untouched (the chain is sealed at stop); only the draft result changes."""
+    live = [r for r in read_jsonl(bundle / "timeline.jsonl") if "obs" not in r and "home" in r]
+    if not live:
+        return draft
+    vids = video_files(bundle)
+    manifest = [m for m in read_jsonl(bundle / "manifest.jsonl") if m.get("type") == "segment"]
+    if not vids or not manifest:
+        return draft
+    end_ms = int(manifest[-1]["wall_ms"])
+    say(f"Final not seen live; checking the last {secs // 60} minutes of the recording for the end-of-game screen ...")
+    events: list[dict] = []
+    core = (core_factory or default_core_factory)(lambda b: events.append(b) or {})
+    core.timeline = [dict(r) for r in live]
+    last_t = live[-1]["t_ms"]
+    if frames is None:
+        frames = decode_frames_tail(ffmpeg, vids[-1], secs, hz)
+    pts = list(frames)
+    if not pts:
+        return draft
+    span = pts[-1][0]
+    for vms, img in pts:
+        t = end_ms - span + vms
+        if t <= last_t:
+            continue
+        core.on_frame(t, img)
+        if core.final is not None:
+            break
+    fin = core.final
+    out = {"final": fin, "frames": core.stats, "window_secs": secs, "video": vids[-1].name,
+           "method": "tail: QorCap end-of-game menu detector + QorTime detect_final over the recorded last minutes, seeded with the live timeline"}
+    (bundle / "final.tail.json").write_text(json.dumps(out, indent=2), encoding="utf-8")
+    if not fin:
+        say("  no end-of-game screen in the recording's last minutes; final stays NOT confirmed.")
+        return draft
+    say(f"  FINAL ({fin['basis']}, from recorded frames): AWAY {fin['away']} - HOME {fin['home']}")
+    clip = bundle / "clips" / "final-recorded.mp4"
+    try:
+        clip.parent.mkdir(exist_ok=True)
+        subprocess.run([ffmpeg, "-hide_banner", "-nostdin", "-loglevel", "error", "-y", "-sseof", "-60", "-i", str(vids[-1]),
+                        "-c", "copy", str(clip)], check=False, timeout=120)
+        if clip.exists():
+            say(f"  final clip saved: {clip}")
+    except Exception as e:
+        say(f"  (final clip not saved: {e})")
+    res = dict(draft["result"], home_score=fin["home"], away_score=fin["away"], quarter=max(4, fin["quarter"]),
+               final_t_ms=fin["t_ms"], winner="home" if fin["home"] > fin["away"] else "away", final_basis=fin["basis"])
+    res.pop("final_confirmed", None)
+    res["method"] = "agreed_scorebug_final"  # QorTime schema const; provenance is in final.tail.json
+    return dict(draft, result=res)
+
+
+def decode_frames_tail(ffmpeg: str, video: Path, secs: int, hz: float, size=(640, 360)):
+    """Like decode_frames, but only the last ``secs`` of the file (fast: input seek from the end)."""
+    import numpy as np
+
+    w, h = size
+    p = subprocess.Popen([ffmpeg, "-hide_banner", "-nostdin", "-loglevel", "error", "-sseof", f"-{secs}", "-i", str(video),
+                          "-an", "-vf", f"fps={hz},scale={w}:{h}", "-f", "rawvideo", "-pix_fmt", "bgr24", "pipe:1"],
+                         stdout=subprocess.PIPE)
+    n, fb = 0, w * h * 3
+    try:
+        while True:
+            buf = p.stdout.read(fb)
+            if len(buf) < fb:
+                break
+            yield int(n * 1000 / hz), np.frombuffer(buf, np.uint8).reshape(h, w, 3)
+            n += 1
+    finally:
+        p.stdout.close()
+        p.wait()
+
+
 def finalize(bundle: Path, *, qt: Path, qorcap: str, ffmpeg: str, key_dir: Path, no_open: bool = True,
              core_factory=None, hz: float = FIN_HZ) -> int:
     bundle = bundle.resolve()
@@ -900,5 +1087,24 @@ def finalize_main(argv) -> int:
                     key_dir=Path(a.key_dir) if a.key_dir else data_dir() / "keys", no_open=a.no_open, hz=a.hz)
 
 
+def run_main(argv=None) -> int:
+    """Entry point for Start Match: never ends in a bare traceback; always a plain PROBLEM line."""
+    try:
+        return main(argv)
+    except SystemExit:
+        raise
+    except KeyboardInterrupt:
+        say("\nStopped before the match started. Nothing was signed.")
+        return 130
+    except Exception as e:
+        import traceback
+        say("")
+        say(f"PROBLEM: QorCap hit an unexpected error: {type(e).__name__}: {e}")
+        say("  Your recording (if any) is safe in Documents\\QorCap Matches. Double-click 'Finalize Last Match'")
+        say("  to read the score and sign it now. Please send this window's text to Con.")
+        traceback.print_exc()
+        return 6
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(run_main())

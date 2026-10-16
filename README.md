@@ -72,9 +72,10 @@ produce a self-attested receipt. An independent referee is needed for more than 
 
 Files in the match folder: `video.mp4`, `clips/`, `manifest.jsonl`, `checkpoints.jsonl`, `receipt.json` (signed),
 `receipt.draft.json`, `referee.pub`, `verify.txt`, `qorcap.log`, `console.log`, `countersigned.jsonl` (live
-referee countersignatures); after finalize also `timeline.offline.jsonl`, `score_checkpoints.jsonl`, `final.offline.json`.
+referee countersignatures); after finalize also `timeline.offline.jsonl`, `score_checkpoints.jsonl`, `final.offline.json`; when the final was
+confirmed from the recording's last minutes at stop, `final.tail.json` and `clips/final-recorded.mp4`.
 
-QorTime code: the zip bundles a pinned copy (`qortime/`, commit `f0d532a`). If it is missing, the launcher downloads that
+QorTime code: the zip bundles a pinned copy (`qortime/`, commit `5e3e4cd`, includes `qortime referee-ai`). If it is missing, the launcher downloads that
 pinned commit's zip once into `%LOCALAPPDATA%\QorCap`.
 
 ## Stack and why
@@ -282,6 +283,22 @@ continues), replay save, challenge stamp visible in the video, score/final event
 written, `verify-bundle` OK, and a single flipped byte reported as FAIL.
 
 **Tested on Windows (v0.2.0–v0.2.1 era, MyTurn, USB3.0 Video):** `--input-format mjpeg` 1280x720@30 with `h264_mf` at 29.7 fps. v0.2.1 fixed audio / auto-format / OBS.
+
+**v0.3.3 (second live match, 2026-10-16, match-20261016-143212):** (1) Stop order: QorCap finalises the video,
+writes a `stop` checkpoint and **seals** the chain (any later checkpoint is refused), keeps its API up, and waits up
+to `--countersign-wait` (20 s) for Start Match to report `POST /countersigned {seq}` before the input proof runs.
+Start Match countersigns the tail over the API (file as fallback). On that match the last two checkpoints were
+stamped 113 s late (`cp[661]:gap_too_long`, `clock_skew`) because they were countersigned only after the ~105 s
+input proof. (2) End-of-game menu detector is now independent of the menu cursor: the cursor sat on RESTART, and
+v0.3.2 required the highlight on FINISH GAME, so live play never confirmed the final (599 of 600 frames went to the
+pause gate when replayed). The reader also feeds a static screen once a second (identical snapshots were skipped).
+If the final is still missed live, Start Match reads the recording's last 4 minutes at stop, confirms the final
+from the end menu, and saves `clips/final-recorded.mp4`. (3) Start Match: QorCap runs in its own process group,
+Ctrl+C after the stop is ignored until the receipt is signed, errors end in a plain PROBLEM line, and a startup
+check warns when Windows privacy blocks the microphone (`...\ConsentStore\microphone[\NonPackaged] Value=Deny`),
+which silently removes card audio. (4) `qorcap input-proof` refuses while a recorder is still writing the bundle
+(`.qorcap-run/recording.lock` touched every segment; `--force` adds a warning), and a live `final` no longer runs the
+input proof mid-recording.
 
 **v0.3.2 (first real live match, 2026-10-16, Madden 27 14-7):** (1) input-video alignment v2 (above): on that
 match v1 gave 383 vs chance 345 permille (60 presses); v2 gives 737 vs chance 434 (76 still-screen presses of 476,

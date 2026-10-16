@@ -37,7 +37,17 @@ pub fn route(e: &Arc<Engine>, method: &str, url: &str, body: &str) -> Resp {
         }
         ("GET", "/timeline") => { let st = e.ev.lock().unwrap(); j(200, json!({"timeline": st.timeline, "score": st.score, "challenges": st.challenges, "clips": st.clips, "final": st.final_})) }
         ("POST", "/bundle/write") => match e.write_bundle() { Some(d) => j(200, json!({"ok": true, "dir": d})), None => j(500, json!({"ok": false})) },
-        ("POST", "/shutdown") => { e.shutdown.store(true, Ordering::SeqCst); j(200, json!({"ok": true})) }
+        ("POST", "/shutdown") => {
+            e.shutdown.store(true, Ordering::SeqCst);
+            if !e.running.load(Ordering::SeqCst) { e.api_closed.store(true, Ordering::SeqCst); }
+            j(200, json!({"ok": true}))
+        }
+        // Local referee progress: "I have countersigned every checkpoint through seq". Lets the stop path
+        // hold the slow bundle work until the final checkpoints carry fresh referee stamps.
+        ("POST", "/countersigned") => match b["seq"].as_i64() {
+            Some(n) if n >= 0 => { e.countersigned.fetch_max(n, Ordering::SeqCst); j(200, json!({"ok": true, "through": e.countersigned.load(Ordering::SeqCst)})) }
+            _ => j(400, json!({"ok": false, "error": "seq must be a non-negative integer"})),
+        },
         _ => j(404, json!({"ok": false, "error": format!("no route {method} {path}")})),
     }
 }
@@ -46,7 +56,7 @@ pub fn serve(e: Arc<Engine>, port: u16) -> Result<std::thread::JoinHandle<()>, S
     let srv = tiny_http::Server::http(("127.0.0.1", port)).map_err(|err| format!("cannot bind 127.0.0.1:{port} (another qorcap running?): {err}"))?;
     info!("control API on http://127.0.0.1:{port}");
     Ok(std::thread::spawn(move || {
-        while !e.shutdown.load(Ordering::SeqCst) {
+        while !e.api_closed.load(Ordering::SeqCst) {
             let Ok(Some(rq)) = srv.recv_timeout(std::time::Duration::from_millis(200)) else { continue };
             let e = e.clone();
             std::thread::spawn(move || handle(e, rq));
@@ -182,5 +192,53 @@ mod tests {
         assert_eq!(call(port, "POST", "/shutdown", "").unwrap().0, 200);
         h.join().unwrap();
         assert!(call(port, "GET", "/status", "").is_err());
+    }
+    #[test]
+    fn stop_seals_chain_and_waits_for_referee() {
+        let e = engine(&["--match-id", "m7"]);
+        e.checkpoint("start", json!({}));
+        // no referee attached: seal returns at once
+        let t = std::time::Instant::now();
+        let last = e.seal_and_wait_countersign(std::time::Duration::from_secs(5)).unwrap();
+        assert!(t.elapsed() < std::time::Duration::from_secs(1));
+        assert_eq!(last, 1);
+        let all: Value = serde_json::from_slice(&route(&e, "GET", "/checkpoints", "").body).unwrap();
+        assert_eq!(all["checkpoints"].as_array().unwrap().last().unwrap()["qorcap"]["trigger"], "stop");
+        // nothing may be appended after the stop checkpoint (input proof, late scorebug reads)
+        assert!(e.checkpoint("late", json!({})).is_null());
+        let r = route(&e, "POST", "/events", r#"{"type":"score","home":3,"away":0,"quarter":4,"clock_s":0}"#);
+        assert_eq!(r.code, 200);
+        let all: Value = serde_json::from_slice(&route(&e, "GET", "/checkpoints", "").body).unwrap();
+        assert_eq!(all["checkpoints"].as_array().unwrap().len(), 2);
+        assert!(e.seal_and_wait_countersign(std::time::Duration::from_secs(1)).is_none());
+
+        // referee attached: waits until it reports the stop checkpoint countersigned
+        let e = engine(&[]);
+        e.checkpoint("start", json!({}));
+        assert_eq!(route(&e, "POST", "/countersigned", r#"{"seq":0}"#).code, 200);
+        assert_eq!(route(&e, "POST", "/countersigned", r#"{"seq":-1}"#).code, 400);
+        let e2 = e.clone();
+        let h = std::thread::spawn(move || { std::thread::sleep(std::time::Duration::from_millis(300)); route(&e2, "POST", "/countersigned", r#"{"seq":1}"#).code });
+        let t = std::time::Instant::now();
+        assert_eq!(e.seal_and_wait_countersign(std::time::Duration::from_secs(10)), Some(1));
+        let waited = t.elapsed();
+        assert!(waited >= std::time::Duration::from_millis(250) && waited < std::time::Duration::from_secs(5), "{waited:?}");
+        assert_eq!(h.join().unwrap(), 200);
+        assert_eq!(e.status().final_checkpoint_seq, Some(1));
+    }
+    #[test]
+    fn recording_marker_guards_input_proof() {
+        let d = std::env::temp_dir().join(format!("qorcap-marker-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        assert!(!crate::inputproof::recorder_running(&d));
+        crate::inputproof::touch_recording_marker(Some(&d));
+        assert!(crate::inputproof::recorder_running(&d));
+        let p = crate::inputproof::apply(&d, None, 15).unwrap();
+        assert_eq!(p["recorder_running"], true);
+        assert!(p["warnings"].as_array().unwrap().iter().any(|w| w.as_str().unwrap().contains("recorder was still running")));
+        crate::inputproof::clear_recording_marker(Some(&d));
+        assert!(!crate::inputproof::recorder_running(&d));
+        let _ = std::fs::remove_dir_all(&d);
     }
 }
