@@ -111,14 +111,16 @@ fn input_test(secs: Option<u64>) -> i32 {
     use std::sync::{atomic::AtomicBool, Arc, Mutex};
     use std::time::{Duration, Instant};
     println!("QorCap input test: reading the DualSense / DualSense Edge over the laptop's USB cable.");
-    println!("Keep playing on the PS5 as normal (Bluetooth); press buttons, move sticks, pull triggers. Ctrl+C to stop.\n");
+    println!("Keep playing on the PS5 as normal (Bluetooth); press buttons, move sticks, pull triggers. Ctrl+C to stop.");
+    println!("Haptics: put the controller down or HOLD IT STILL for the first 3 s (IMU baseline calibration).");
+    println!("Then make the PS5 rumble the pad (play a moment that vibrates: a hit, a tackle, a crash)\n");
     let log = Arc::new(Mutex::new(InputLog::new(None, true, 0)));
     let stop = Arc::new(AtomicBool::new(false));
     { let s = stop.clone(); let _ = ctrlc::set_handler(move || s.store(true, Ordering::SeqCst)); }
     let clock = Instant::now();
     let h = spawn_logger(log.clone(), clock, stop.clone());
     let (mut last_state, mut prev_btn, mut last_reports, mut last_tick) = (String::new(), Vec::<String>::new(), 0u64, Instant::now());
-    let mut rate = 0u64; let mut ever_ok = false;
+    let mut rate = 0u64; let mut ever_ok = false; let mut seen_haptic = 0u64; let mut calib_said = false;
     while !stop.load(Ordering::SeqCst) && secs.map(|s| clock.elapsed() < Duration::from_secs(s)).unwrap_or(true) {
         std::thread::sleep(Duration::from_millis(50));
         let lv = log.lock().unwrap().live.clone();
@@ -136,6 +138,19 @@ fn input_test(secs: Option<u64>) -> i32 {
             println!("\r{:>8.2}s  PRESS {}{}", clock.elapsed().as_secs_f64(), newly.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("+"), " ".repeat(40));
         }
         prev_btn = lv.buttons.clone();
+        if lv.haptic.imu_present && !lv.haptic.calibrating && !calib_said {
+            calib_said = true;
+            println!("\r{:>8.2}s  IMU baseline calibrated; haptic detection is live{}", clock.elapsed().as_secs_f64(), " ".repeat(40));
+        }
+        if lv.haptic.events > seen_haptic {
+            let pend = log.lock().unwrap().pending().iter().rev().find(|r| r["type"] == "haptic").cloned();
+            if let Some(e) = pend {
+                println!("\r{:>8.2}s  HAPTIC  peak={}x dur={}ms energy={} confidence={} ({}){}{}", e["t_us"].as_u64().unwrap_or(0) as f64 / 1e6,
+                    e["peak"], e["duration_ms"], e["energy"], e["confidence"], e["confidence_label"].as_str().unwrap_or(""),
+                    if e["flags"].as_array().map(|a| !a.is_empty()).unwrap_or(false) { " [near a button press]" } else { "" }, " ".repeat(20));
+            }
+            seen_haptic = lv.haptic.events;
+        }
         if lv.state == "connected" {
             print!("\r  {rate:>4} reports/s | held: {:<18} | L2 {:>3} R2 {:>3} | LS {:>3},{:>3} RS {:>3},{:>3} | presses {}   ",
                 if lv.buttons.is_empty() { "-".into() } else { lv.buttons.join("+") }, lv.l2, lv.r2, lv.sticks[0], lv.sticks[1], lv.sticks[2], lv.sticks[3], lv.presses);
@@ -149,6 +164,18 @@ fn input_test(secs: Option<u64>) -> i32 {
     if l.live.reports == 0 {
         println!("RESULT: FAIL. No HID reports were read. {}", if ever_ok { "The controller was found but sent nothing." } else { "The DualSense was not visible over USB on this laptop. Check the USB cable into the laptop; the PS5 Bluetooth link stays as is." });
         return 1;
+    }
+    let hl = &l.live.haptic;
+    println!("\nIMU / haptics:");
+    if hl.imu_present {
+        println!("[ OK ] IMU readable: {} IMU reports at {} reports/s (band seen: 20..{} Hz)", hl.imu_reports, hl.imu_rate_hz,
+            ((hl.imu_rate_hz as f64 * 0.45) as u32).min(qorcap::haptics::BAND_TOP_HZ as u32));
+        if hl.imu_rate_hz < 150 { println!("[WARN] IMU rate is low; short or high-pitched vibrations may be missed."); }
+        if hl.calibrating { println!("[WARN] Test ended before the 3 s still-baseline finished; run it longer."); }
+        println!("       haptic events: {} ({} low-confidence, near a button press)", hl.events, hl.low_confidence);
+        if hl.events == 0 && !hl.calibrating { println!("       No vibration seen. If the PS5 was rumbling, note it: detection is advisory and varies by game."); }
+    } else {
+        println!("[WARN] IMU not readable: reports carried no gyro/accelerometer data, so haptic detection is OFF.");
     }
     let hs = qorcap::humanlike::score(l.pending());
     println!("RESULT: OK. The laptop is reading the controller over USB HID.");

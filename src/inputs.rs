@@ -13,7 +13,14 @@
 //! A chunk with no records hashes to SHA-256(JCS([])), exactly what QorCap <= 0.2.2 wrote, so bundles without a
 //! controller stay byte-compatible. Controller presence changes (`connected` / `missing` / `unplugged` /
 //! `stalled`) are themselves records, so absence is committed rather than hidden.
+//!
+//! Since 0.3.1 the IMU haptic detector (`haptics.rs`) runs on the same reports. Its events are `{"type":"haptic"}`
+//! records in the same chunks (so they are covered by `input_hash` and the inputs chain exactly like button
+//! records), and `{"type":"imu"}` records commit whether IMU data was present and its measured rate. The same
+//! haptic records (with `chunk_index`) are also appended to `haptics.jsonl` next to `inputs.jsonl` for easy
+//! reading; `input_proof.json` records its SHA-256 and checks it against the committed records.
 use crate::evidence::{self as ev, GENESIS};
+use crate::haptics::{Detector, HapticLive};
 use crate::hid::{self, Pad, ReportSource};
 use log::{info, warn};
 use serde_json::{json, Value};
@@ -45,6 +52,8 @@ pub struct Live {
     pub sticks: [u8; 4],
     pub warning: Option<String>,
     pub last_report_mono_ms: Option<u64>,
+    /// IMU haptic detector state (since 0.3.1).
+    pub haptic: HapticLive,
 }
 
 pub struct InputLog {
@@ -55,16 +64,22 @@ pub struct InputLog {
     pub total_records: u64,
     last_logged: Option<(u64, Pad)>,
     pub live: Live,
+    pub detector: Detector,
+    haptic_path: Option<PathBuf>,
+    wall_anchor_ms: u64,
+    imu_committed: Option<(bool, u32)>,
 }
 
 impl InputLog {
     pub fn new(path: Option<PathBuf>, enabled: bool, wall_anchor_ms: u64) -> Self {
+        let haptic_path = path.as_ref().map(|p| p.with_file_name(haptics_file_name(p)));
         let mut l = InputLog { path, pending: vec![], head: GENESIS.into(), chunks: 0, total_records: 0, last_logged: None,
-            live: Live { enabled, state: if enabled { "searching".into() } else { "off".into() }, ..Default::default() } };
+            live: Live { enabled, state: if enabled { "searching".into() } else { "off".into() }, ..Default::default() },
+            detector: Detector::new(wall_anchor_ms), haptic_path, wall_anchor_ms, imu_committed: None };
         if enabled {
             l.pending.push(json!({"type": "header", "schema": SCHEMA, "t_us": 0,
                 "clock": "qorcap-mono-us (same Instant as manifest/checkpoint mono_ms)", "wall_anchor_ms": wall_anchor_ms,
-                "transport": "usb-hid", "limit": "Proves inputs came from the USB-connected controller in sync with the video, not who held it."}));
+                "transport": "usb-hid", "haptics": Detector::params(), "limit": "Proves inputs came from the USB-connected controller in sync with the video, not who held it."}));
         }
         l
     }
@@ -75,6 +90,9 @@ impl InputLog {
         self.live.last_report_mono_ms = Some(t_us / 1000);
         self.live.l2 = p.l2; self.live.r2 = p.r2; self.live.sticks = [p.lx, p.ly, p.rx, p.ry];
         self.live.buttons = hid::names(p.buttons).into_iter().map(String::from).collect();
+        let ev = self.detector.feed(t_us, p);
+        self.pending.extend(ev);
+        self.live.haptic = self.detector.live.clone();
         let log = match self.last_logged {
             None => true,
             Some((t0, q)) => {
@@ -105,7 +123,13 @@ impl InputLog {
             "stalled" => Some("Controller connected but no HID reports for 2 s: input proof paused.".into()),
             _ => None,
         };
-        if state == "connected" { self.live.device = Some(detail.into()); }
+        if state == "connected" {
+            self.live.device = Some(detail.into());
+            // Fresh filters + calibration after every (re)connect; keep the run's event counters.
+            let (e, lc) = (self.detector.live.events, self.detector.live.low_confidence);
+            self.detector = Detector::new(self.wall_anchor_ms);
+            self.detector.live.events = e; self.detector.live.low_confidence = lc;
+        }
         self.pending.push(json!({"type": "status", "t_us": t_us, "state": state, "detail": detail}));
         if state != "connected" { self.last_logged = None; }
     }
@@ -115,8 +139,22 @@ impl InputLog {
 
     /// Seal everything pending into chunk `seg`. Returns (chunk_sha256, chain_head, n_records).
     pub fn seal(&mut self, seg: u64, t_us: u64) -> (String, String, usize) {
+        if self.live.reports > 0 {
+            let now = (self.detector.live.imu_present, self.detector.live.imu_rate_hz);
+            let changed = match self.imu_committed {
+                None => true,
+                Some((p, r)) => p != now.0 || (r as i64 - now.1 as i64).abs() * 10 > r.max(1) as i64,
+            };
+            if changed {
+                self.pending.push(json!({"type": "imu", "t_us": t_us, "present": now.0, "rate_hz": now.1, "reports": self.detector.live.imu_reports}));
+                self.imu_committed = Some(now);
+            }
+        }
         let mut recs = std::mem::take(&mut self.pending);
-        for r in recs.iter_mut() { r["seg"] = json!(seg); }
+        for r in recs.iter_mut() {
+            r["seg"] = json!(seg);
+            if r["type"] == "haptic" { r["chunk_index"] = json!(seg); }
+        }
         let sha = ev::jcs_sha(&Value::Array(recs.clone()));
         let n = recs.len();
         if n == 0 { return (sha, self.head.clone(), 0); }
@@ -135,6 +173,15 @@ impl InputLog {
                 Err(e) => warn!("cannot open {}: {e}", p.display()),
             }
         }
+        if let Some(hp) = &self.haptic_path {
+            let hs: String = recs.iter().filter(|r| r["type"] == "haptic").map(|r| format!("{r}\n")).collect();
+            if !hs.is_empty() {
+                match std::fs::OpenOptions::new().create(true).append(true).open(hp) {
+                    Ok(mut f) => { if let Err(e) = f.write_all(hs.as_bytes()) { warn!("cannot write {}: {e}", hp.display()); } let _ = f.sync_all(); }
+                    Err(e) => warn!("cannot open {}: {e}", hp.display()),
+                }
+            }
+        }
         self.head = head.clone(); self.chunks += 1; self.total_records += n as u64;
         (sha, head, n)
     }
@@ -143,6 +190,12 @@ impl InputLog {
 pub fn record(t_us: u64, p: &Pad) -> Value {
     json!({"type": "in", "t_us": t_us, "b": p.buttons, "lx": p.lx, "ly": p.ly, "rx": p.rx, "ry": p.ry, "l2": p.l2, "r2": p.r2,
            "c": p.counter, "hw": p.sensor_ts})
+}
+
+/// `inputs.jsonl` -> `haptics.jsonl`; `<out>.inputs.jsonl` -> `<out>.haptics.jsonl`.
+pub fn haptics_file_name(inputs: &Path) -> String {
+    let n = inputs.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+    match n.strip_suffix("inputs.jsonl") { Some(pre) => format!("{pre}haptics.jsonl"), None => format!("{n}.haptics.jsonl") }
 }
 
 /// Background reader: opens the pad, stamps reports on `clock`, retries forever while `stop` is false.
@@ -259,12 +312,13 @@ mod tests {
         assert!(!l.on_report(4_000, &pad(hid::CROSS, 5)), "analog change within 4 ms is decimated");
         assert!(l.on_report(8_000, &pad(hid::CROSS, 9)));
         let (sha0, head0, n0) = l.seal(1, 9_000);
-        assert_eq!(n0, 5); // header, status, 3 records
+        assert_eq!(n0, 6); // header, status, 3 records, imu presence
         assert_ne!(sha0, empty_hash());
         let (sha1, head1, n1) = l.seal(2, 11_000);
         assert_eq!((sha1.as_str(), head1.as_str(), n1), (empty_hash().as_str(), head0.as_str(), 0), "empty chunk = legacy hash, chain unchanged");
         let (recs, chunks) = read_file(&p).unwrap();
-        assert_eq!((recs.len(), chunks.len()), (5, 1));
+        assert_eq!((recs.len(), chunks.len()), (6, 1));
+        assert_eq!((recs[5]["type"].as_str(), recs[5]["present"].as_bool()), (Some("imu"), Some(false)));
         let (m, head, errs) = verify_chunks(&recs, &chunks);
         assert!(errs.is_empty(), "{errs:?}");
         assert_eq!((m[&1].as_str(), head.as_str()), (sha0.as_str(), head0.as_str()));

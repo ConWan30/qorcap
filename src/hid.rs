@@ -6,7 +6,14 @@
 //! talks to the PS5 over Bluetooth; that dual path is the intended setup.
 //!
 //! USB offsets: lx=1 ly=2 rx=3 ry=4 l2=5 r2=6 counter=7 buttons_0=8 (low nibble = d-pad hat)
-//! buttons_1=9 buttons_2=10 sensor_timestamp=28..32 (u32 LE, 0.33 us ticks).
+//! buttons_1=9 buttons_2=10 gyro=16..22 (3 x i16 LE: pitch, yaw, roll) accel=22..28 (3 x i16 LE: x, y, z)
+//! sensor_timestamp=28..32 (u32 LE, 0.33 us ticks).
+//!
+//! IMU offsets (since 0.3.1) follow Linux `drivers/hid/hid-playstation.c` `struct dualsense_input_report`
+//! (x, y, rx, ry, z, rz, seq_number, buttons[4], reserved[4], gyro[3] __le16, accel[3] __le16,
+//! sensor_timestamp __le32, ...) which starts right after the report id; DS4Windows' DualSense reader uses the
+//! same layout. Identical for DualSense (0x0CE6) and DualSense Edge (0x0DF2). Values are raw, uncalibrated
+//! counts (QorCap only looks at vibration *changes*, so per-pad calibration is not needed).
 
 pub const SONY_VID: u16 = 0x054C;
 pub const PID_DUALSENSE: u16 = 0x0CE6;
@@ -64,6 +71,9 @@ pub struct Pad {
     pub counter: u8,
     /// Controller sensor timestamp (0.33 us ticks, wraps); 0 if absent.
     pub sensor_ts: u32,
+    /// Raw gyro (pitch, yaw, roll) and accelerometer (x, y, z) counts; all zero when the report carries no IMU data.
+    pub gyro: [i16; 3],
+    pub accel: [i16; 3],
 }
 
 const B0_SQUARE: u8 = 0x10; const B0_CROSS: u8 = 0x20; const B0_CIRCLE: u8 = 0x40; const B0_TRIANGLE: u8 = 0x80;
@@ -90,8 +100,11 @@ pub fn parse(raw: &[u8]) -> Option<Pad> {
         if b2 & bit != 0 { m |= v; }
     }
     let ts = u32::from_le_bytes([raw[28 + o], raw[29 + o], raw[30 + o], raw[31 + o]]);
+    let i16at = |i: usize| i16::from_le_bytes([raw[i + o], raw[i + 1 + o]]);
+    let gyro = [i16at(16), i16at(18), i16at(20)];
+    let accel = [i16at(22), i16at(24), i16at(26)];
     Some(Pad { transport, lx: raw[1 + o], ly: raw[2 + o], rx: raw[3 + o], ry: raw[4 + o], l2: raw[5 + o], r2: raw[6 + o],
-        buttons: m, counter: raw[7 + o], sensor_ts: ts })
+        buttons: m, counter: raw[7 + o], sensor_ts: ts, gyro, accel })
 }
 
 /// Build a synthetic USB 0x01 report (tests, `input-test --demo`).
@@ -110,12 +123,18 @@ pub fn pack_usb(p: &Pad) -> Vec<u8> {
     let mut b2 = 0u8;
     for (bit, v) in [(0x01, PS), (0x02, TOUCHPAD), (0x04, MUTE), (0x10, FN_LEFT), (0x20, FN_RIGHT), (0x40, BACK_LEFT), (0x80, BACK_RIGHT)] { if b & v != 0 { b2 |= bit; } }
     r[8] = b0; r[9] = b1; r[10] = b2;
+    for k in 0..3 {
+        r[16 + 2 * k..18 + 2 * k].copy_from_slice(&p.gyro[k].to_le_bytes());
+        r[22 + 2 * k..24 + 2 * k].copy_from_slice(&p.accel[k].to_le_bytes());
+    }
     r[28..32].copy_from_slice(&p.sensor_ts.to_le_bytes());
     r
 }
 
 impl Pad {
-    pub fn neutral() -> Self { Pad { transport: Transport::Usb, lx: 128, ly: 128, rx: 128, ry: 128, l2: 0, r2: 0, buttons: 0, counter: 0, sensor_ts: 0 } }
+    pub fn neutral() -> Self { Pad { transport: Transport::Usb, lx: 128, ly: 128, rx: 128, ry: 128, l2: 0, r2: 0, buttons: 0, counter: 0, sensor_ts: 0, gyro: [0; 3], accel: [0; 3] } }
+    /// True when the report carries any non-zero IMU value (a real pad at rest still reports gravity on accel).
+    pub fn has_imu(&self) -> bool { self.gyro != [0; 3] || self.accel != [0; 3] }
 }
 
 // ------------------------------------------------------------------------------------------- devices
@@ -216,6 +235,18 @@ mod tests {
         assert_eq!(p.buttons, CROSS | R1 | UP | RIGHT);
         assert_eq!(names(p.buttons), vec!["CROSS", "R1", "UP", "RIGHT"]);
         assert_eq!(parse(&pack_usb(&p)).unwrap(), p);
+    }
+    #[test]
+    fn imu_offsets_usb_and_bt() {
+        let mut r = [0u8; 64]; r[0] = 0x01; r[8] = 0x08;
+        r[16..18].copy_from_slice(&(-3i16).to_le_bytes()); r[20..22].copy_from_slice(&1234i16.to_le_bytes());
+        r[22..24].copy_from_slice(&(-8192i16).to_le_bytes()); r[26..28].copy_from_slice(&300i16.to_le_bytes());
+        let p = parse(&r).unwrap();
+        assert_eq!((p.gyro, p.accel), ([-3, 0, 1234], [-8192, 0, 300]));
+        assert!(p.has_imu() && !Pad::neutral().has_imu());
+        assert_eq!(parse(&pack_usb(&p)).unwrap(), p);
+        let mut b = [0u8; 78]; b[0] = 0x31; b[9] = 0x08; b[23..25].copy_from_slice(&777i16.to_le_bytes());
+        assert_eq!(parse(&b).unwrap().accel[0], 777);
     }
     #[test]
     fn neutral_hat_and_edge_buttons() {

@@ -12,3 +12,4 @@ pub mod inputs;
 pub mod humanlike;
 pub mod align;
 pub mod inputproof;
+pub mod haptics;
