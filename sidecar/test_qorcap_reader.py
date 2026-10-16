@@ -133,3 +133,55 @@ def test_final_screen_bypasses_pause_and_confirms_final():
     for k in range(20):
         core2.on_frame(5000 + k * 250, _menu_frame(10, 2))
     assert not [p for p in posts2 if p.get("type") == "final"]
+
+
+FIX = Path(__file__).parent / "fixtures"
+
+
+def _fixture(name):
+    import cv2
+    img = cv2.imread(str(FIX / name))
+    assert img is not None, name
+    return img
+
+
+def test_end_menu_detector_is_cursor_independent_on_real_frames():
+    """match-20261016-143212: cursor on RESTART (missed live by v0.3.2); match 125430: cursor on FINISH GAME."""
+    from qorcap_reader import madden_final_screen
+    assert madden_final_screen(_fixture("m27_end_menu_restart.jpg"))
+    assert madden_final_screen(_fixture("m27_end_menu_finish.jpg"))
+    assert not madden_final_screen(_fixture("m27_pause_menu.jpg"))
+    assert not madden_final_screen(_fixture("m27_pause_menu_start.jpg"))
+    import numpy as np
+    big = np.repeat(np.repeat(_fixture("m27_end_menu_restart.jpg"), 2, 0), 2, 1)  # card resolution 1280x720
+    assert madden_final_screen(big)
+
+
+def test_menu_cursor_on_last_item_synthetic():
+    import numpy as np
+    from qorcap_reader import madden_final_screen
+    img = _menu_frame(6, 2)
+    img[22:42, 20:150] = 2
+    img[22:28, 25:110] = 200            # first item as plain text
+    img[98:125, 20:150] = 230           # highlight + description box on the 6th item
+    assert madden_final_screen(img)
+
+
+def test_real_end_menu_confirms_final_through_pause_gate():
+    from qorcap_reader import ReaderCore, madden_final_screen
+
+    class Paused:
+        paused = True
+        def update(self, t, img): pass
+
+    posts = []
+    core = ReaderCore(posts.append, None, None, Paused(), detect_final, final_screen_detector=madden_final_screen)
+    # live timeline tail of match-20261016-143212
+    core.timeline = [{"t_ms": t, "home": 17, "away": 0, "quarter": 4, "clock_s": c, "clock_red": True}
+                     for t, c in [(1792180043566, 3), (1792180044735, 2), (1792180045623, None), (1792180046539, 0)]]
+    core.timeline.append({"t_ms": 1792180050062, "until_ms": 1792180067515, "obs": "scorebug_absent", "n": 60})
+    end = _fixture("m27_end_menu_restart.jpg")
+    for k in range(8):
+        core.on_frame(1792180070000 + k * 1000, end)  # static screen fed ~1/s
+    fin = [p for p in posts if p.get("type") == "final"]
+    assert fin and fin[0]["basis"] == "final_screen" and (fin[0]["away"], fin[0]["home"]) == (0, 17)

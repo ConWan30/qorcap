@@ -75,8 +75,34 @@ pub fn receipt_fields(proof: &Value) -> Value {
 
 /// Compute the proof and write it into the bundle: input_proof.json, receipt.draft.json `signals.input`,
 /// bundle.json `input` (+ refreshed `receipt_draft_sha256`). Existing fields are untouched.
+/// `<bundle>/.qorcap-run/recording.lock`: touched by the recorder on every video segment (~2 s), removed
+/// the moment recording stops. A fresh marker means inputs.jsonl / haptics.jsonl / video are still growing.
+pub const RECORDING_MARKER: &str = ".qorcap-run/recording.lock";
+const MARKER_FRESH_SECS: u64 = 30;
+
+pub fn touch_recording_marker(dir: Option<&Path>) {
+    if let Some(d) = dir {
+        let p = d.join(RECORDING_MARKER);
+        if let Some(pd) = p.parent() { let _ = std::fs::create_dir_all(pd); }
+        let _ = std::fs::write(&p, format!("{}\n", std::process::id()));
+    }
+}
+pub fn clear_recording_marker(dir: Option<&Path>) {
+    if let Some(d) = dir { let _ = std::fs::remove_file(d.join(RECORDING_MARKER)); }
+}
+/// True while a recorder is (very likely) still writing this bundle.
+pub fn recorder_running(dir: &Path) -> bool {
+    std::fs::metadata(dir.join(RECORDING_MARKER)).ok().and_then(|m| m.modified().ok())
+        .and_then(|t| t.elapsed().ok()).map(|age| age.as_secs() < MARKER_FRESH_SECS).unwrap_or(false)
+}
+
 pub fn apply(dir: &Path, ffmpeg: Option<&str>, n_frames: usize) -> Result<Value, String> {
-    let proof = build(dir, ffmpeg, n_frames);
+    let mut proof = build(dir, ffmpeg, n_frames);
+    if recorder_running(dir) {
+        let w = "computed while the recorder was still running: inputs.jsonl, haptics.jsonl and the video were still growing, so file hashes and the haptics cross-check can mismatch. Re-run `qorcap input-proof` after the match stops.";
+        if let Some(a) = proof["warnings"].as_array_mut() { a.push(json!(w)); } else { proof["warnings"] = json!([w]); }
+        proof["recorder_running"] = json!(true);
+    }
     let w = |n: &str, v: &Value| std::fs::write(dir.join(n), serde_json::to_string_pretty(v).unwrap()).map_err(|e| format!("write {n}: {e}"));
     w("input_proof.json", &proof)?;
     let fields = receipt_fields(&proof);

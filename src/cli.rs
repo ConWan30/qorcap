@@ -65,6 +65,9 @@ pub enum Cmd {
         /// Skip frame differencing (no ffmpeg)
         #[arg(long)]
         no_video: bool,
+        /// Run even though a recorder still seems to be writing this bundle (result gets a warning)
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -104,6 +107,10 @@ pub struct RecordArgs {
     /// Seconds without data before the device is considered frozen and reopened
     #[arg(long, default_value_t = 4)]
     pub watchdog: u64,
+    /// At stop: seconds to wait for the local referee (Start Match) to countersign the final checkpoints
+    /// before the input proof runs. No referee attached -> no wait.
+    #[arg(long, default_value_t = 20)]
+    pub countersign_wait: u64,
     /// QorTime match bundle folder (video.mp4, manifest.jsonl, checkpoints.jsonl, clips/, receipt.draft.json)
     #[arg(long)]
     pub bundle: Option<String>,

@@ -213,8 +213,14 @@ fn main() {
         },
         Cmd::Finalize { bundle, python, rest } => finalize(bundle, python, rest, &ff),
         Cmd::InputTest { secs } => input_test(secs),
-        Cmd::InputProof { dir, frames, no_video } => {
+        Cmd::InputProof { dir, frames, no_video, force } => {
             let d = std::path::Path::new(&dir);
+            if qorcap::inputproof::recorder_running(d) && !force {
+                eprintln!("error: QorCap is still recording into {dir} (inputs, haptics and video are still growing).");
+                eprintln!("       Stop the match first; Start Match writes input_proof.json itself after the stop.");
+                eprintln!("       (Pass --force to compute a provisional proof anyway; it will carry a warning.)");
+                std::process::exit(3);
+            }
             match qorcap::inputproof::apply(d, if no_video { None } else { Some(ff.as_str()) }, frames) {
                 Ok(p) => { println!("{}", serde_json::to_string_pretty(&p).unwrap()); if p["status"] == "ok" { 0 } else { 1 } }
                 Err(e) => { eprintln!("error: {e}"); 2 }

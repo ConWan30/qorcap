@@ -37,14 +37,20 @@ def prep(img):
 
 
 def madden_final_screen(img) -> bool:
-    """Madden's end-of-game menu (FINISH GAME / VIEW HIGHLIGHTS / ... over the final score panel).
+    """Madden's end-of-game menu (FINISH GAME / VIEW HIGHLIGHTS / ... / RESTART over the final score panel).
 
-    Same panel as the pause menu (white highlighted menu bar top-left, score panel, KEY PLAYERS), but
-    the background is solid black and the menu has only ~6 items, so the column below y=120 (640x360)
-    is empty; the pause menu lists ~10 items there over the faded game. Calibrated on a real Madden 27
-    capture (match-20261016-125430): pause/halftime menus give 1.1-2.3% bright pixels in that column
-    and a bottom std ~18; the end menu gives 0.0% and std ~9. Only used behind QorTime's Q4-low-clock
-    gate (``final_screen`` basis), so a halftime menu cannot end a game.
+    v0.3.3: independent of where the menu cursor is. v0.3.2 required the white highlight bar on the FIRST
+    item; on match-20261016-143212 the cursor sat on RESTART (6th item, expanded with a description line)
+    for minutes, so the end menu was never seen live and the static screen was swallowed by the pause
+    detector. Features (640x360 coordinates, any input size):
+
+    * bottom (y 200-345) is near-black and flat: end menu mean ~0.5, std ~9; pause menus over the faded
+      field std ~18;
+    * a white highlight box (>= 8 rows that are >70% bright) somewhere in the menu column x 20-150,
+      y 15-130, plus menu text in that column;
+    * the column under the menu (y 132-175) is empty: the end menu has 6 items (last one, even highlighted
+      and expanded, ends by y~126); the pause menu has 8 (QUIT GAME at y~140).
+    Only used behind QorTime's Q4-low-clock gate (``final_screen`` basis), so a halftime menu cannot end a game.
     """
     import numpy as np
     if img is None:
@@ -55,11 +61,15 @@ def madden_final_screen(img) -> bool:
     ys = lambda a, b: slice(int(a * sy), int(b * sy))  # noqa: E731
     xs = lambda a, b: slice(int(a * sx), int(b * sx))  # noqa: E731
     bottom = g[ys(200, 345), :]
-    bar = g[ys(22, 42), xs(20, 150)]
-    under_bar = g[ys(42, 140), xs(20, 150)]
-    menu_tail = g[ys(120, 260), xs(20, 150)]
-    return bool(bottom.mean() < 8 and (bottom > 60).mean() < 0.02 and bottom.std() < 14
-                and bar.mean() > 120 and under_bar.mean() < 60 and (menu_tail > 90).mean() < 0.004)
+    if not (bottom.mean() < 8 and (bottom > 60).mean() < 0.02 and bottom.std() < 14):
+        return False
+    col = g[ys(15, 130), xs(20, 150)]
+    box_rows = int((((col > 190).mean(axis=1)) > 0.7).sum())
+    if box_rows < int(8 * sy):
+        return False
+    text = (col > 150).mean()
+    below = (g[ys(132, 175), xs(20, 150)] > 90).mean()
+    return bool(text > 0.05 and below < 0.004)
 
 
 class ReaderCore:

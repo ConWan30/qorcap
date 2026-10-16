@@ -18,7 +18,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct Status {
-    pub state: String, // starting | waiting_for_device | capturing | reopening | stopped | disk_full
+    pub state: String, // starting | waiting_for_device | capturing | reopening | countersigning | finishing | stopped | disk_full
+    /// seq of the sealed `stop` checkpoint once recording has stopped
+    pub final_checkpoint_seq: Option<u64>,
     pub device: String,
     pub audio: Option<String>,
     pub res: String,
@@ -59,6 +61,14 @@ pub struct Engine {
     pub subs: Mutex<Vec<Sender<String>>>,
     pub stamp_file: PathBuf,
     pub input: Arc<Mutex<crate::inputs::InputLog>>,
+    /// The supervisor loop (`run`) is active; the API keeps serving until it has finished the bundle.
+    pub running: AtomicBool,
+    /// Set when `run` has returned (or /shutdown arrives while not running): the API thread exits.
+    pub api_closed: AtomicBool,
+    /// After the stop checkpoint: no further checkpoints may be appended (input proof / bundle work).
+    pub sealed: AtomicBool,
+    /// Highest checkpoint seq the local referee (Start Match) reports as countersigned; -1 = none attached.
+    pub countersigned: std::sync::atomic::AtomicI64,
 }
 
 /// QorTime evidence state for this run.
@@ -163,7 +173,9 @@ impl Engine {
         Arc::new(Self { ffmpeg, ring: Mutex::new(ReplayRing::new(window, cap)), rec: Mutex::new(None), status: Mutex::new(st), shutdown: AtomicBool::new(false),
             ev: Mutex::new(MatchState { started_wall_ms: wall_ms(), score: Value::Null, ..Default::default() }), subs: Mutex::new(vec![]),
             stamp_file: dir.join("stamp.txt"),
-            snapshot: dir.join("snapshot.jpg"), exit_when_recording_ends: AtomicBool::new(false), started: Instant::now(), last_data_ms: AtomicU64::new(0), input, args })
+            snapshot: dir.join("snapshot.jpg"), exit_when_recording_ends: AtomicBool::new(false), started: Instant::now(), last_data_ms: AtomicU64::new(0), input,
+            running: AtomicBool::new(false), api_closed: AtomicBool::new(false), sealed: AtomicBool::new(false),
+            countersigned: std::sync::atomic::AtomicI64::new(-1), args })
     }
     fn ms(&self) -> u64 { self.started.elapsed().as_millis() as u64 }
     /// The monotonic clock behind every mono_ms (manifest, checkpoints) and inputs.jsonl t_us.
@@ -333,6 +345,13 @@ impl Engine {
 
     /// Main supervisor loop. Returns when shutdown is requested.
     pub fn run(self: &Arc<Self>) {
+        self.running.store(true, Ordering::SeqCst);
+        self.run_loop();
+        self.finish_stop();
+        self.running.store(false, Ordering::SeqCst);
+        self.api_closed.store(true, Ordering::SeqCst);
+    }
+    fn run_loop(self: &Arc<Self>) {
         let mut backoff = 1u64;
         let mut fmt: Option<String> = None; // resolved input format (probed once per device appearance)
         let mut audio_off = false;          // audio failed to open: continue video-only
@@ -453,10 +472,42 @@ impl Engine {
             warn!("capture ended; reopening in {backoff}s");
             self.sleep(backoff);
         }
+    }
+
+    /// Stop order (v0.3.3): finalise the video (its last segment checkpoints are written by the reader
+    /// thread), write the `stop` checkpoint, seal the chain, give the local referee a few seconds to
+    /// countersign everything, and only then run the slow input-proof / bundle work. Nothing after the
+    /// seal adds checkpoints, so the referee stamps the tail within seconds of its t_ms.
+    fn finish_stop(self: &Arc<Self>) {
         if let Some(p) = self.stop_recording() { info!("finalised {p}"); }
-        if self.args.bundle.is_some() { self.write_bundle(); }
+        crate::inputproof::clear_recording_marker(self.bundle_dir().as_deref());
+        self.seal_and_wait_countersign(Duration::from_secs(self.args.countersign_wait));
+        if self.args.bundle.is_some() {
+            self.set_state("finishing", Some("checking controller input against the video (1-2 minutes)".into()));
+            self.write_bundle();
+        }
         self.set_state("stopped", None);
         let _ = std::fs::remove_file(&self.snapshot);
+    }
+
+    /// Write the final `stop` checkpoint, refuse any later checkpoint, and wait (bounded) until the local
+    /// referee reports it countersigned through that seq. No referee attached -> no wait.
+    pub fn seal_and_wait_countersign(&self, wait: Duration) -> Option<u64> {
+        if self.sealed.load(Ordering::SeqCst) { return None; }
+        let cp = self.checkpoint("stop", json!({}));
+        self.sealed.store(true, Ordering::SeqCst);
+        let last = cp["seq"].as_u64()?;
+        self.status.lock().unwrap().final_checkpoint_seq = Some(last);
+        info!("stop checkpoint {last} written; checkpoint chain sealed");
+        if self.countersigned.load(Ordering::SeqCst) < 0 { return Some(last); }
+        self.set_state("countersigning", Some("waiting for the referee to countersign the final checkpoints".into()));
+        let end = Instant::now() + wait;
+        while Instant::now() < end {
+            if self.countersigned.load(Ordering::SeqCst) >= last as i64 { info!("final checkpoints countersigned through {last}"); return Some(last); }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        warn!("referee did not confirm countersigning through checkpoint {last} within {}s (got {})", wait.as_secs(), self.countersigned.load(Ordering::SeqCst));
+        Some(last)
     }
 
     fn sleep(&self, secs: u64) {
@@ -675,6 +726,7 @@ impl Engine {
             "device": self.args.device, "device_id": st.device_id});
         drop(st);
         append_jsonl(&self.ev_path("manifest.jsonl"), &m);
+        crate::inputproof::touch_recording_marker(self.bundle_dir().as_deref());
         self.broadcast("segment", &m);
         // Seal controller inputs received up to now into this segment's chunk (same clock, same checkpoint).
         let (ih, ihead, n) = self.input.lock().unwrap().seal(seq, self.started.elapsed().as_micros() as u64);
@@ -685,6 +737,10 @@ impl Engine {
     /// Append a QorTime-shaped checkpoint binding the current chain head + score/clock state.
     pub fn checkpoint(&self, trigger: &str, extra: Value) -> Value { self.checkpoint_with(trigger, extra, None) }
     fn checkpoint_with(&self, trigger: &str, extra: Value, input_hash: Option<String>) -> Value {
+        if self.sealed.load(Ordering::SeqCst) {
+            warn!("checkpoint '{trigger}' after the stop checkpoint refused (chain is sealed)");
+            return Value::Null;
+        }
         let mut st = self.ev.lock().unwrap();
         let mut ext = json!({"trigger": trigger, "segment_seq": st.seg.seq, "segment_hash": st.last_seg_sha, "chain_head": st.seg.head,
             "score": st.score, "mono_ms": self.ms(), "match_id": self.args.match_id, "role": self.args.role});
@@ -772,7 +828,8 @@ impl Engine {
                 info!("FINAL via {basis}: away {a} - home {h} (Q{q})");
                 self.auto_clip("final", self.args.replay.unwrap_or(60));
                 let me = self.clone();
-                std::thread::spawn(move || { std::thread::sleep(Duration::from_millis(500)); me.write_bundle(); });
+                // Draft only: the input proof decodes the whole video and must wait for the recorder to stop.
+                std::thread::spawn(move || { std::thread::sleep(Duration::from_millis(500)); me.write_bundle_opts(false); });
                 Ok(json!({"ok": true, "final": fin, "checkpoint": cp}))
             }
             _ => Err(format!("unknown event type {ty}")),
@@ -799,7 +856,8 @@ impl Engine {
 
     /// Write bundle.json + receipt.draft.json (unsigned).
     /// If no `final` event, use the last timeline scorebug read (not 0–0) and label final unconfirmed.
-    pub fn write_bundle(&self) -> Option<PathBuf> {
+    pub fn write_bundle(&self) -> Option<PathBuf> { self.write_bundle_opts(true) }
+    pub fn write_bundle_opts(&self, input_proof: bool) -> Option<PathBuf> {
         let st = self.ev.lock().unwrap();
         let unconfirmed = st.final_.is_none();
         let fin = st.final_.clone().unwrap_or_else(|| {
@@ -838,7 +896,9 @@ impl Engine {
         let w = |n: &str, v: &Value| std::fs::write(dir.join(n), serde_json::to_string_pretty(v).unwrap()).map_err(|e| error!("write {n}: {e}"));
         let _ = w("receipt.draft.json", &receipt);
         let _ = w("bundle.json", &bundle);
-        if self.bundle_dir().is_some() && !self.args.no_controller {
+        // Test hook: simulate the slow input-proof decode (a full match takes ~105 s on MyTurn).
+        if input_proof { if let Some(ms) = std::env::var("QORCAP_TEST_BUNDLE_DELAY_MS").ok().and_then(|v| v.parse::<u64>().ok()) { std::thread::sleep(Duration::from_millis(ms)); } }
+        if input_proof && self.bundle_dir().is_some() && !self.args.no_controller {
             match crate::inputproof::apply(&dir, Some(&self.ffmpeg), crate::align::DEFAULT_N_FRAMES) {
                 Ok(p) => {
                     let h = &p["human"]; let a = &p["alignment"];

@@ -97,7 +97,8 @@ def _qorcap_bin():
 
 @pytest.mark.skipif(shutil.which("ffmpeg") is None or _qorcap_bin() is None, reason="needs ffmpeg + built qorcap")
 def test_end_to_end_test_pattern(tmp_path):
-    env = dict(os.environ, QORCAP_HOME=str(tmp_path / "home"))
+    # 8 s of simulated input-proof work after the stop: the tail must still be countersigned within ~1 s.
+    env = dict(os.environ, QORCAP_HOME=str(tmp_path / "home"), QORCAP_TEST_BUNDLE_DELAY_MS="8000")
     p = subprocess.run([sys.executable, str(HERE / "qorcap_match.py"), "--test-pattern", "--test-secs", "10",
                         "--qortime", str(QT), "--qorcap", str(_qorcap_bin()), "--out", str(tmp_path / "m"),
                         "--port", "8795", "--no-open"], capture_output=True, text=True, env=env, timeout=180,
@@ -112,7 +113,11 @@ def test_end_to_end_test_pattern(tmp_path):
     first = json.loads((b / "checkpoints.jsonl").read_text().splitlines()[0])
     assert first["qorcap"]["trigger"] == "start"  # genesis checkpoint before the first segment (0.3.2)
     signed = [json.loads(x) for x in (b / "countersigned.jsonl").read_text().splitlines()]
-    assert all(c["referee_ts_ms"] - c["t_ms"] < 3000 for c in signed)  # tail signed live, not after exit
+    assert all(c["referee_ts_ms"] - c["t_ms"] < 1500 for c in signed), [c["referee_ts_ms"] - c["t_ms"] for c in signed][-3:]
+    cps = [json.loads(x) for x in (b / "checkpoints.jsonl").read_text().splitlines()]
+    assert cps[-1]["qorcap"]["trigger"] == "stop" and len(signed) == len(cps)  # sealed tail, nothing after
+    log = (b / "qorcap.log").read_text()
+    assert log.index("final checkpoints countersigned through") < log.rindex("match bundle written")
     assert subprocess.run([str(_qorcap_bin()), "verify-bundle", str(b)]).returncode == 0
     assert list((b / "clips").glob("*.mp4"))
 
@@ -313,3 +318,75 @@ def test_partial_checkpoint_line_is_not_signed(tmp_path):
     p = tmp_path / "checkpoints.jsonl"
     p.write_text(json.dumps(ch.next(1, "a" * 64, "b" * 64)) + "\n" + '{"seq": 1, "t_ms"', encoding="utf-8")
     assert qm.countersign_new_from_file(p, cs) == 1 and len(cs.signed) == 1
+
+
+def test_wait_and_countersign_reports_progress_via_api_sweep(tmp_path):
+    from qor_receipt.checkpoints import Chain
+    dev, ref = qm.load_keys(tmp_path / "keys")
+    cs = qm.Countersigner(ref, "local-1", "home")
+    ch = Chain()
+    cps = [ch.next(1000 + i, "a" * 64, "b" * 64) for i in range(3)]
+    reports, ticks = [], []
+
+    class Proc:
+        returncode = None
+        n = 0
+        def poll(self):
+            self.n += 1
+            if self.n > 5:
+                self.returncode = 0
+            return self.returncode
+        def kill(self): self.returncode = -9
+
+    def sweep():  # QorCap's API serves the sealed tail (file may lag/miss on Windows)
+        for c in cps:
+            cs.offer(c)
+    assert qm.wait_and_countersign(Proc(), tmp_path / "missing.jsonl", cs, timeout=10, poll_s=0.01, sweep=sweep,
+                                   report=reports.append, on_tick=lambda: ticks.append(1))
+    assert len(cs.signed) == 3 and reports == [2] and ticks
+
+
+def test_mic_privacy_check():
+    reg = {}
+    assert qm.mic_privacy_blocked(lambda k: reg.get(k)) is None
+    reg[qm.MIC_KEY + r"\NonPackaged"] = "Deny"
+    assert qm.mic_privacy_blocked(lambda k: reg.get(k)) == "desktop"
+    assert any("Let desktop apps access your microphone" in l for l in qm.mic_hint("desktop"))
+    reg[qm.MIC_KEY] = "Deny"
+    assert qm.mic_privacy_blocked(lambda k: reg.get(k)) == "all"
+    reg = {qm.MIC_KEY: "Allow", qm.MIC_KEY + r"\NonPackaged": "Allow"}
+    assert qm.mic_privacy_blocked(lambda k: reg.get(k)) is None
+    assert qm.mic_hint(None) == []
+
+
+def test_tail_final_check_confirms_from_recorded_frames(tmp_path):
+    import cv2
+    from qor_receipt.final_detect import detect_final
+    from qorcap_reader import ReaderCore, madden_final_screen
+
+    class Paused:
+        paused = True
+        def update(self, t, img): pass
+
+    b = tmp_path
+    reads = [{"t_ms": 1000 + i * 1000, "home": 17, "away": 0, "quarter": 4, "clock_s": c, "clock_red": True}
+             for i, c in enumerate([3, 2, 0])]
+    (b / "timeline.jsonl").write_text("".join(json.dumps(r) + "\n" for r in reads))
+    (b / "manifest.jsonl").write_text(json.dumps({"type": "segment", "seq": 1, "file": "video.mp4", "wall_ms": 60_000}) + "\n")
+    (b / "video.mp4").write_bytes(b"x")
+    end = cv2.imread(str(HERE / "fixtures" / "m27_end_menu_restart.jpg"))
+    frames = [(k * 500, end) for k in range(20)]
+    draft = _draft()
+    draft["result"] = {"home_score": 17, "away_score": 0, "quarter": 4, "final_t_ms": 60_000, "winner": "home",
+                       "method": "last_scorebug_read_unconfirmed", "final_confirmed": False}
+    fac = lambda post: ReaderCore(post, None, None, Paused(), detect_final, final_screen_detector=madden_final_screen)  # noqa: E731
+    out = qm.tail_final_check(b, draft, ffmpeg="ffmpeg-missing", core_factory=fac, frames=frames)
+    r = out["result"]
+    assert r["final_basis"] == "final_screen" and (r["away_score"], r["home_score"]) == (0, 17)
+    assert r["method"] == "agreed_scorebug_final" and "final_confirmed" not in r
+    assert json.loads((b / "final.tail.json").read_text())["final"]["basis"] == "final_screen"
+    # no end screen in the tail -> draft unchanged
+    (b / "final.tail.json").unlink()
+    black = end * 0
+    out2 = qm.tail_final_check(b, draft, ffmpeg="ffmpeg-missing", core_factory=fac, frames=[(k * 500, black) for k in range(20)])
+    assert out2["result"].get("final_confirmed") is False
