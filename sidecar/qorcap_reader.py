@@ -76,7 +76,7 @@ class ReaderCore:
     """Frame -> agreed reads / obs spans -> events. Pure logic; I/O injected (unit-testable)."""
 
     def __init__(self, post: Callable[[dict], Any], reader=None, agree=None, pause=None, detect_final=None,
-                 final_screen_detector=None) -> None:
+                 final_screen_detector=None, end_menu_reader=None, end_menu_agree=None) -> None:
         self.post, self.reader, self.agree, self.pause = post, reader, agree, pause
         self.detect_final = detect_final
         self.final_screen_detector = final_screen_detector  # QorTime ships none; QorCap: madden_final_screen
@@ -85,6 +85,14 @@ class ReaderCore:
         self._screen: dict | None = None
         self.final: dict | None = None
         self.stats = {"frames": 0, "agreed": 0, "errors": 0, "paused": 0}
+        # v0.3.4: the end-of-game menu's score panel is the authoritative final (qorcap_endmenu).
+        self.end_menu_reader = end_menu_reader
+        if end_menu_reader is not None and end_menu_agree is None:
+            from qorcap_endmenu import EndMenuAgreement
+            end_menu_agree = EndMenuAgreement()
+        self.end_menu_agree = end_menu_agree
+        self.end_menu: dict | None = None
+        self.end_menu_rejected: dict | None = None
 
     def on_frame(self, t_ms: int, img) -> None:
         self.stats["frames"] += 1
@@ -92,6 +100,7 @@ class ReaderCore:
         if self.final_screen_detector is not None and self.final_screen_detector(img):
             self.stats["final_screen"] = self.stats.get("final_screen", 0) + 1
             self._observe(t_ms, img, True, screen=True)
+            self._end_menu(t_ms, img)
             return
         if self.pause is not None:
             self.pause.update(t_ms, img)
@@ -148,6 +157,57 @@ class ReaderCore:
                 self.post({"type": "obs", **s})
         self._absent = self._screen = None
 
+    def last_scorebug(self) -> dict | None:
+        return next((r for r in reversed(self.timeline) if "obs" not in r and "home" in r), None)
+
+    def _end_menu(self, t_ms: int, img) -> None:
+        """Read the end-menu score panel; once stable over consecutive frames, post it as the final."""
+        if self.end_menu_reader is None:
+            return
+        try:
+            rd = self.end_menu_reader.read(img)
+        except Exception as e:  # never silent
+            self.stats["errors"] += 1
+            print(f"end-menu reader error: {type(e).__name__}: {e}", file=sys.stderr)
+            return
+        k = "end_menu_reads" if rd.ok else "end_menu_unreadable"
+        self.stats[k] = self.stats.get(k, 0) + 1
+        st = self.end_menu_agree.offer(t_ms, rd)
+        if st is None or (self.end_menu and (self.end_menu["away"], self.end_menu["home"]) == (st["away"], st["home"])):
+            if st is not None and self.end_menu is not None:
+                self.end_menu.update(until_ms=st["until_ms"], frames=st["frames"])
+            return
+        last = self.last_scorebug()
+        # Q4 gate (same intent as QorTime's final_screen basis): a game must have reached the 4th quarter.
+        if last is None or (last.get("quarter") or 0) < 4:
+            self.end_menu_rejected = dict(st, why="no Q4 scorebug read before the end-of-game menu")
+            return
+        why = end_menu_consistency(st, last)
+        if why:
+            self.end_menu_rejected = dict(st, why=why)
+            print(f"END MENU read AWAY {st['away']} - HOME {st['home']} rejected: {why}", file=sys.stderr)
+            return
+        if st["home"] == st["away"]:
+            self.end_menu_rejected = dict(st, why="tied score on the end-of-game menu")
+            return
+        self.end_menu = dict(st)
+        sb = {"home": last["home"], "away": last["away"], "quarter": last["quarter"], "clock_s": last.get("clock_s"),
+              "t_ms": last["t_ms"]}
+        notes = []
+        if (sb["away"], sb["home"]) != (st["away"], st["home"]):
+            notes.append(f"final play score not shown on scorebug: last scorebug read AWAY {sb['away']} - HOME {sb['home']}"
+                         f", end-of-game menu AWAY {st['away']} - HOME {st['home']}")
+        prev = self.final
+        self.final = {"type": "final", "basis": "end_menu", "method": "end_menu_read", "home": st["home"], "away": st["away"],
+                      "quarter": max(4, int(last["quarter"])), "t_ms": st["t_ms"], "end_menu": st, "scorebug_last": sb,
+                      "notes": notes}
+        if prev is not None:
+            self.final["amends"] = {k: prev.get(k) for k in ("basis", "home", "away", "t_ms")}
+        self._close_spans()
+        print(f"FINAL (end-of-game menu, {st['frames']} frames): away {st['away']} - home {st['home']}"
+              + (f"  [{notes[0]}]" if notes else ""), file=sys.stderr)
+        self.post(self.final)
+
     def _check_final(self, t_ms: int) -> None:
         if self.final is not None:
             return
@@ -156,8 +216,25 @@ class ReaderCore:
             self._close_spans()
             self.final = {"type": "final", "basis": fin.basis, "home": fin.home, "away": fin.away,
                           "quarter": fin.quarter, "t_ms": fin.t_ms}
-            print(f"FINAL ({fin.basis}): away {fin.away} - home {fin.home}", file=sys.stderr)
+            print(f"FINAL ({fin.basis}): away {fin.away} - home {fin.home}"
+                  + ("  (scorebug; waiting for the end-of-game menu to confirm)" if self.end_menu_reader else ""), file=sys.stderr)
             self.post(self.final)
+
+
+LEGAL_STEPS = {1, 2, 3, 6, 7, 8}  # same as qortime referee_ai.integrity.LEGAL_STEPS
+
+
+def end_menu_consistency(st: dict, last: dict | None) -> str | None:
+    """None when the end-menu score equals the last scorebug read or is ONE legal scoring play past it on one side
+    (the final play's points are often never drawn on the scorebug). Mirrors qortime ``check_final`` for
+    ``end_menu_read``; anything else is treated as a misread and the final stays unconfirmed."""
+    if last is None:
+        return None
+    d = [st["away"] - last["away"], st["home"] - last["home"]]
+    if d == [0, 0] or (min(d) >= 0 and sorted(d)[0] == 0 and max(d) in LEGAL_STEPS):
+        return None
+    return (f"end-of-game menu AWAY {st['away']} - HOME {st['home']} is not one legal scoring play past the last "
+            f"scorebug read AWAY {last['away']} - HOME {last['home']}")
 
 
 def http_post(base: str, body: dict) -> dict:
@@ -178,6 +255,7 @@ def main(argv=None) -> int:
     a = ap.parse_args(argv)
     if a.qortime:
         sys.path.insert(0, str(Path(a.qortime).resolve()))
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
     import cv2
     import numpy as np
     from qor_receipt._vendor.qoresence.vision.local_scorebug.agreement import AgreementWindow
@@ -185,8 +263,9 @@ def main(argv=None) -> int:
     from qor_receipt.agent.pause_detect import PauseDetector
     from qor_receipt.final_detect import detect_final
 
+    from qorcap_endmenu import EndMenuReader
     core = ReaderCore(lambda b: http_post(a.qorcap, b), ScorebugReader(), AgreementWindow(), PauseDetector(), detect_final,
-                      final_screen_detector=madden_final_screen)
+                      final_screen_detector=madden_final_screen, end_menu_reader=EndMenuReader())
     last, period, t_print = None, 1.0 / a.hz, time.monotonic()
     print(f"qorcap scorebug sidecar -> {a.qorcap}", file=sys.stderr)
     while True:

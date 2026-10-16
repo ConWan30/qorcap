@@ -379,12 +379,23 @@ def test_tail_final_check_confirms_from_recorded_frames(tmp_path):
     draft = _draft()
     draft["result"] = {"home_score": 17, "away_score": 0, "quarter": 4, "final_t_ms": 60_000, "winner": "home",
                        "method": "last_scorebug_read_unconfirmed", "final_confirmed": False}
-    fac = lambda post: ReaderCore(post, None, None, Paused(), detect_final, final_screen_detector=madden_final_screen)  # noqa: E731
+    # v0.3.3 (scorebug only) took 0-17 from the last scorebug read; v0.3.4 reads the end menu's 0-20.
+    fac0 = lambda post: ReaderCore(post, None, None, Paused(), detect_final, final_screen_detector=madden_final_screen)  # noqa: E731
+    r = qm.tail_final_check(b, draft, ffmpeg="ffmpeg-missing", core_factory=fac0, frames=frames)["result"]
+    assert r["final_basis"] == "final_screen" and (r["away_score"], r["home_score"]) == (0, 17)
+    assert r["method"] == "agreed_scorebug_final" and r["final_confirmed"] is False
+    from qorcap_endmenu import EndMenuReader
+    em = EndMenuReader()
+    fac = lambda post: ReaderCore(post, None, None, Paused(), detect_final, final_screen_detector=madden_final_screen,  # noqa: E731
+                                  end_menu_reader=em)
     out = qm.tail_final_check(b, draft, ffmpeg="ffmpeg-missing", core_factory=fac, frames=frames)
     r = out["result"]
-    assert r["final_basis"] == "final_screen" and (r["away_score"], r["home_score"]) == (0, 17)
-    assert r["method"] == "agreed_scorebug_final" and "final_confirmed" not in r
-    assert json.loads((b / "final.tail.json").read_text())["final"]["basis"] == "final_screen"
+    assert (r["away_score"], r["home_score"]) == (0, 20) and r["winner"] == "home"
+    assert r["method"] == "end_menu_read" and r["final_basis"] == "end_menu" and r["final_confirmed"] is True
+    assert r["scorebug_last"] == {"home_score": 17, "away_score": 0, "quarter": 4, "t_ms": 3000}
+    assert r["notes"] and r["notes"][0].startswith("final play score not shown on scorebug")
+    tail = json.loads((b / "final.tail.json").read_text())
+    assert tail["final"]["basis"] == "end_menu" and tail["end_menu"]["frames"] >= 3
     # no end screen in the tail -> draft unchanged
     (b / "final.tail.json").unlink()
     black = end * 0
