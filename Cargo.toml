@@ -1,6 +1,6 @@
 [package]
 name = "qorcap"
-version = "0.2.2"
+version = "0.3.0"
 edition = "2021"
 license = "MIT"
 description = "Lean, self-healing USB capture-card recorder for Windows (ffmpeg dshow backend)"
@@ -15,6 +15,10 @@ simplelog = "0.12"
 ctrlc = "3"
 sha2 = "0.10"
 libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+# Pure-Rust Windows HID backend (no C toolchain needed); used only to read the DualSense over USB.
+hidapi = { version = "2.6", default-features = false, features = ["windows-native"] }
 
 [features]
 # Enables the `testpattern` pseudo-device (ffmpeg lavfi testsrc + sine) so the

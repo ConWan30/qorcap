@@ -49,6 +49,23 @@ pub enum Cmd {
         #[arg(last = true)]
         rest: Vec<String>,
     },
+    /// Live controller check: confirms the laptop is reading the DualSense over USB HID and shows presses
+    InputTest {
+        /// Stop after N seconds (default: until Ctrl+C)
+        #[arg(long)]
+        secs: Option<u64>,
+    },
+    /// (Re)compute a bundle's controller-input proof: human-likeness, input-video match rate and offset;
+    /// writes input_proof.json and adds signals.input to receipt.draft.json
+    InputProof {
+        dir: String,
+        /// A screen change must follow a key press within this many frames (30 fps)
+        #[arg(long, default_value_t = 15)]
+        frames: usize,
+        /// Skip frame differencing (no ffmpeg)
+        #[arg(long)]
+        no_video: bool,
+    },
 }
 
 #[derive(clap::Args, Debug, Clone, PartialEq)]
@@ -108,6 +125,9 @@ pub struct RecordArgs {
     /// Pass 0 to disable the start-time check.
     #[arg(long, default_value_t = 2.0)]
     pub min_free_gb: f64,
+    /// Do not read the DualSense over USB HID (no inputs.jsonl / input proof)
+    #[arg(long)]
+    pub no_controller: bool,
 }
 
 impl RecordArgs {
@@ -165,6 +185,9 @@ mod tests {
         assert!(matches!(Cli::try_parse_from(["qorcap", "devices"]).unwrap().cmd, Cmd::Devices));
         assert!(matches!(Cli::try_parse_from(["qorcap", "stop"]).unwrap().cmd, Cmd::Stop));
         assert!(matches!(Cli::try_parse_from(["qorcap", "save-replay"]).unwrap().cmd, Cmd::SaveReplay { out: None }));
+        assert!(matches!(Cli::try_parse_from(["qorcap", "input-test"]).unwrap().cmd, Cmd::InputTest { secs: None }));
+        assert!(matches!(Cli::try_parse_from(["qorcap", "input-proof", "b", "--frames", "10"]).unwrap().cmd, Cmd::InputProof { frames: 10, .. }));
+        if let Cmd::Record(r) = Cli::try_parse_from(["qorcap", "record", "--no-controller"]).unwrap().cmd { assert!(r.no_controller); } else { panic!() }
     }
     #[test]
     fn rejects_bad_input() {

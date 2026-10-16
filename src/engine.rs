@@ -38,6 +38,8 @@ pub struct Status {
     pub replay_window: u64,
     pub uptime_secs: f64,
     pub disk_free_mb: Option<u64>,
+    /// Controller (USB HID) input logger state; None when --no-controller.
+    pub input: Option<crate::inputs::Live>,
 }
 
 pub struct Recorder { reader: Option<std::thread::JoinHandle<()>>, child: Child, stdin: Option<ChildStdin>, pub path: String, started: Instant, deadline: Option<Instant>, wait_key: bool, base: String, part: u32 }
@@ -56,6 +58,7 @@ pub struct Engine {
     pub ev: Mutex<MatchState>,
     pub subs: Mutex<Vec<Sender<String>>>,
     pub stamp_file: PathBuf,
+    pub input: Arc<Mutex<crate::inputs::InputLog>>,
 }
 
 /// QorTime evidence state for this run.
@@ -153,18 +156,30 @@ impl Engine {
         let bps = parse_bitrate(&args.bitrate).unwrap_or(8_000_000) + 200_000;
         let cap = ((bps / 8) as usize * window as usize * 3 / 2).max(64 << 20);
         let dir = run_dir(&args);
+        let input_path = args.bundle.as_ref().map(|b| PathBuf::from(b).join("inputs.jsonl"))
+            .or_else(|| args.out.as_ref().map(|o| PathBuf::from(format!("{o}.inputs.jsonl"))));
+        let input = Arc::new(Mutex::new(crate::inputs::InputLog::new(input_path, !args.no_controller, wall_ms())));
         let st = Status { state: "starting".into(), device: args.device.clone(), res: format!("{}x{}", args.res.0, args.res.1), fps_target: args.fps, replay_window: args.replay.unwrap_or(0), ..Default::default() };
         Arc::new(Self { ffmpeg, ring: Mutex::new(ReplayRing::new(window, cap)), rec: Mutex::new(None), status: Mutex::new(st), shutdown: AtomicBool::new(false),
             ev: Mutex::new(MatchState { started_wall_ms: wall_ms(), score: Value::Null, ..Default::default() }), subs: Mutex::new(vec![]),
             stamp_file: dir.join("stamp.txt"),
-            snapshot: dir.join("snapshot.jpg"), exit_when_recording_ends: AtomicBool::new(false), started: Instant::now(), last_data_ms: AtomicU64::new(0), args })
+            snapshot: dir.join("snapshot.jpg"), exit_when_recording_ends: AtomicBool::new(false), started: Instant::now(), last_data_ms: AtomicU64::new(0), input, args })
     }
     fn ms(&self) -> u64 { self.started.elapsed().as_millis() as u64 }
+    /// The monotonic clock behind every mono_ms (manifest, checkpoints) and inputs.jsonl t_us.
+    pub fn clock(&self) -> Instant { self.started }
+    /// Start the USB HID controller logger (no-op with --no-controller).
+    pub fn start_input_logger(&self) -> Option<std::thread::JoinHandle<()>> {
+        if self.args.no_controller { return None; }
+        let stop = Arc::new(AtomicBool::new(false));
+        Some(crate::inputs::spawn_logger(self.input.clone(), self.started, stop))
+    }
 
     pub fn status(&self) -> Status {
         let mut s = self.status.lock().unwrap().clone();
         { let r = self.ring.lock().unwrap(); s.replay_bytes = r.len_bytes(); s.replay_secs_buffered = r.span_ms() as f64 / 1000.0; }
         if self.args.replay.is_none() { s.replay_bytes = 0; s.replay_secs_buffered = 0.0; }
+        if !self.args.no_controller { s.input = Some(self.input.lock().unwrap().live.clone()); }
         if let Some(r) = self.rec.lock().unwrap().as_ref() { s.recording = Some(r.path.clone()); s.recording_secs = r.started.elapsed().as_secs_f64(); }
         s.uptime_secs = self.started.elapsed().as_secs_f64();
         let probe = self.args.out.as_deref().or(self.args.bundle.as_deref()).unwrap_or(".");
@@ -623,16 +638,20 @@ impl Engine {
         drop(st);
         append_jsonl(&self.ev_path("manifest.jsonl"), &m);
         self.broadcast("segment", &m);
-        self.checkpoint("segment", json!({}));
+        // Seal controller inputs received up to now into this segment's chunk (same clock, same checkpoint).
+        let (ih, ihead, n) = self.input.lock().unwrap().seal(seq, self.started.elapsed().as_micros() as u64);
+        if self.args.no_controller { self.checkpoint("segment", json!({})); }
+        else { self.checkpoint_with("segment", json!({"input_seg": seq, "input_n": n, "input_head": ihead}), Some(ih)); }
     }
 
     /// Append a QorTime-shaped checkpoint binding the current chain head + score/clock state.
-    pub fn checkpoint(&self, trigger: &str, extra: Value) -> Value {
+    pub fn checkpoint(&self, trigger: &str, extra: Value) -> Value { self.checkpoint_with(trigger, extra, None) }
+    fn checkpoint_with(&self, trigger: &str, extra: Value, input_hash: Option<String>) -> Value {
         let mut st = self.ev.lock().unwrap();
         let mut ext = json!({"trigger": trigger, "segment_seq": st.seg.seq, "segment_hash": st.last_seg_sha, "chain_head": st.seg.head,
             "score": st.score, "mono_ms": self.ms(), "match_id": self.args.match_id, "role": self.args.role});
         if let (Value::Object(e), Value::Object(x)) = (&mut ext, extra) { e.extend(x); }
-        let cp = st.cps.next(wall_ms(), ext);
+        let cp = st.cps.next_with_input(wall_ms(), ext, input_hash);
         st.checkpoints.push(cp.clone());
         drop(st);
         append_jsonl(&self.ev_path("checkpoints.jsonl"), &cp);
@@ -781,6 +800,17 @@ impl Engine {
         let w = |n: &str, v: &Value| std::fs::write(dir.join(n), serde_json::to_string_pretty(v).unwrap()).map_err(|e| error!("write {n}: {e}"));
         let _ = w("receipt.draft.json", &receipt);
         let _ = w("bundle.json", &bundle);
+        if self.bundle_dir().is_some() && !self.args.no_controller {
+            match crate::inputproof::apply(&dir, Some(&self.ffmpeg), crate::align::DEFAULT_N_FRAMES) {
+                Ok(p) => {
+                    let h = &p["human"]; let a = &p["alignment"];
+                    info!("input proof: status {} | human-likeness {} ({}, confidence {}) | input-video match {} permille (chance {}) | offset {} ms",
+                        p["status"], h["score_permille"], h["label"], h["confidence"], a["match_permille"], a["chance_permille"], a["offset_ms"]);
+                    for w in p["warnings"].as_array().into_iter().flatten() { warn!("input proof: {}", w.as_str().unwrap_or("")); }
+                }
+                Err(e) => warn!("input proof not written: {e}"),
+            }
+        }
         info!("match bundle written to {}", dir.display());
         Some(dir)
     }

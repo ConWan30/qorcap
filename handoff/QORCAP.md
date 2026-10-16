@@ -39,3 +39,10 @@ python -m pytest sidecar
 5. Bundle: `C:\Users\Contr\Documents\QorCap Matches\live-20261014-164312`
 6. The last frame read **NO 12, NYG 22, 4th 0:21**. The clock never reached 0:00, so **no signed receipt** was produced. That is correct fail-closed behavior.
 7. **v0.2.1 is NOT on MyTurn yet.** v0.2.0 is unzipped at `C:\QorCap\qorcap-v0.2.0-windows-x64`. Next: copy the v0.2.1 release zip there and use Start Match for a full game.
+
+## v0.3.0: controller input proof (2026-10-16)
+- New modules: `src/hid.rs` (DualSense/Edge USB 0x01 + BT 0x31 parser ported from Qoresence `sync/hid_report.py`; Windows via `hidapi` windows-native, Linux via hidraw), `src/inputs.rs` (logger on the engine's monotonic clock, per-segment chunk hash -> checkpoint `input_hash`, `inputs.jsonl`), `src/humanlike.rs`, `src/align.rs`, `src/inputproof.rs`.
+- `qorcap input-test` / **Input Test.cmd**: live HID check. `qorcap input-proof DIR`: recompute `input_proof.json` + `signals.input`.
+- Con's setup: pad on PS5 over Bluetooth AND USB into MyTurn at the same time (intended). Never tell him to unplug USB.
+- Not yet run against a real DualSense. First step at MyTurn: Input Test.cmd.
+- Proposed CI: `handoff/ci.yml.example` -> copy to `.github/workflows/ci.yml` (push needs a token with `workflow` scope; the bot token lacks it).
