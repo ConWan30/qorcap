@@ -189,6 +189,11 @@ class ReaderCore:
         if last is None or (last.get("quarter") or 0) < 4:
             self.end_menu_rejected = dict(st, why="no Q4 scorebug read before the end-of-game menu")
             return
+        # Clock gate: the end-of-game menu is only authoritative once the scorebug has shown 0:00 in Q4.
+        # Without this, a doctored end-menu-looking frame matching the current mid-Q4 score ends the match early.
+        if last.get("clock_s") != 0:
+            self.end_menu_rejected = dict(st, why="scorebug clock not 0:00 before the end-of-game menu")
+            return
         why = end_menu_consistency(st, last)
         if why:
             self.end_menu_rejected = dict(st, why=why)

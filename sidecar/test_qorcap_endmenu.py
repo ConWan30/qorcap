@@ -114,3 +114,12 @@ def test_apply_final_fields():
     assert r["final_confirmed"] is False and r["final_basis"] == "clock_zero"
     r = qm.apply_final(base, None, fallback={"home": 17, "away": 0, "quarter": 4, "t_ms": 3})
     assert r["final_confirmed"] is False and r["method"] == "last_scorebug_read_unconfirmed" and "final_basis" not in r
+
+
+def test_core_rejects_end_menu_before_clock_zero():
+    """Doctored end-menu frames matching a mid-Q4 score must not end the match early."""
+    core, posts = _core({"t_ms": 0, "home": 20, "away": 0, "quarter": 4, "clock_s": 30, "clock_red": False})
+    for k in range(6):
+        core.on_frame(10_000 + k * 500, RST)  # real end-menu fixture reading 0-20
+    assert not any(p.get("basis") == "end_menu" for p in posts)
+    assert core.end_menu_rejected and "clock not 0:00" in core.end_menu_rejected["why"]
