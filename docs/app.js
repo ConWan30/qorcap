@@ -126,10 +126,10 @@ function drawPipe(p,t){const {x,w,h}=fit(pcv);x.clearRect(0,0,w,h);const S=Math.
   x.textAlign='left';x.fillStyle='rgba(238,243,255,.95)';x.font=`700 ${3.4*u}px JetBrains Mono,monospace`;x.fillText('qor-receipt/v0',X0+5*u,Y0+9*u);
   // mini tiles inside
   for(let i=0;i<12;i++){x.fillStyle=`rgba(${vf>.5?GD:CY},.5)`;x.fillRect(X0+12*u+(i%4)*8*u-2*u,Y0+20*u+Math.floor(i/4)*5*u-2*u,4*u,4*u)}
-  const lines=[['match_id','m-0001'],['segments','12'],['chain_head',tileHex[11]+'…'],['final_basis','clock_zero'],['signature',vf>.5?'referee ✓':'— none —']];
+  const lines=[['match_id','m-0001'],['segments','12'],['chain_head',tileHex[11]+'…'],['final_basis','clock_zero'],['signature',vf>.5?'signed ✓':'— none —']];
   x.font=`500 ${2.4*u}px JetBrains Mono,monospace`;lines.forEach((l,i)=>{const yy=Y0+40*u+i*4.8*u;x.fillStyle='rgba(151,160,186,.95)';x.fillText(l[0],X0+5*u,yy);x.fillStyle=i===4?(vf>.5?`rgba(${GD},1)`:'rgba(255,140,151,.95)'):'rgba(238,243,255,.95)';x.textAlign='right';x.fillText(l[1],X0+W-5*u,yy);x.textAlign='left'});
   // stamp
-  x.save();x.translate(X0+W*.5,Y0+H-8*u);x.rotate(-.06);const lab=vf>.5?'SIGNED · VERIFIED':'UNSIGNED DRAFT';x.font=`800 ${3.1*u}px JetBrains Mono,monospace`;const tw=x.measureText(lab).width+5*u;
+  x.save();x.translate(X0+W*.5,Y0+H-8*u);x.rotate(-.06);const lab=vf>.5?'SIGNED · CHAIN OK':'UNSIGNED DRAFT';x.font=`800 ${3.1*u}px JetBrains Mono,monospace`;const tw=x.measureText(lab).width+5*u;
   x.strokeStyle=vf>.5?`rgba(${GD},1)`:'rgba(151,160,186,.9)';x.lineWidth=1.6;x.setLineDash(vf>.5?[]:[3,3]);rr(x,-tw/2,-3.4*u,tw,6.4*u,1.2*u);x.stroke();x.setLineDash([]);x.fillStyle=x.strokeStyle;x.textAlign='center';x.fillText(lab,0,1.1*u);x.restore();
   x.restore();
   // verify seal
@@ -234,3 +234,17 @@ else (function L(now){if(seen(wcv)&&!document.hidden)wdDraw(now);else lastT=0;re
 /* ---------- copy ---------- */
 $('#copy').addEventListener('click',async e=>{const t=$('#ps').innerText;try{await navigator.clipboard.writeText(t);e.target.textContent='Copied ✓'}catch(_){e.target.textContent='Select & copy'}setTimeout(()=>e.target.textContent='Copy',1600)});
 })();
+/* ---------- version: one source (meta), refreshed from GitHub's latest release ---------- */
+(()=>{const REPO='https://github.com/ConWan30/qorcap';const m=document.querySelector('meta[name="qorcap-version"]');
+ function apply(v,zip){if(!v)return;document.querySelectorAll('[data-ver]').forEach(e=>e.textContent=v);
+  document.querySelectorAll('[data-zipname]').forEach(e=>e.textContent=`qorcap-${v}-windows-x64.zip`);
+  document.querySelectorAll('a[data-zip]').forEach(a=>a.href=zip||`${REPO}/releases/download/${v}/qorcap-${v}-windows-x64.zip`)}
+ apply(m&&m.content);
+ if(window.fetch)fetch('https://api.github.com/repos/ConWan30/qorcap/releases/latest',{headers:{Accept:'application/vnd.github+json'}}).then(r=>r.ok?r.json():null).then(j=>{
+  if(!j||!/^v\d+(\.\d+)*$/.test(j.tag_name||''))return;const a=(j.assets||[]).find(x=>/windows-x64\.zip$/.test(x.name));apply(j.tag_name,a&&a.browser_download_url)}).catch(()=>{})})();
+/* ---------- final-read ladder ---------- */
+(()=>{const L=document.getElementById('ladder');if(!L)return;const li=[...L.querySelectorAll('li')];
+ if(matchMedia('(prefers-reduced-motion: reduce)').matches){li.forEach(e=>e.classList.add('on'));return}
+ let vis=false,i=0,tm=null;new IntersectionObserver(es=>{vis=es[0].isIntersecting;if(vis&&!tm)step()},{threshold:.3}).observe(L);
+ function step(){if(!vis){tm=null;return}if(i>li.length){li.forEach(e=>e.classList.remove('on'));i=0;tm=setTimeout(step,900);return}
+  if(i<li.length)li[i].classList.add('on');i++;tm=setTimeout(step,i>li.length?3200:1100)}})();
