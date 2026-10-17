@@ -104,7 +104,7 @@ def test_end_to_end_test_pattern(tmp_path):
                         "--port", "8795", "--no-open"], capture_output=True, text=True, env=env, timeout=180,
                        stdin=subprocess.DEVNULL)
     assert p.returncode == 0, p.stdout + p.stderr
-    assert "RESULT: PARTIAL" in p.stdout and "SELF-ATTESTED" in p.stdout and "final via clock_zero" in p.stdout
+    assert "RESULT: SELF_ATTESTED" in p.stdout and "SELF-ATTESTED" in p.stdout and "final via clock_zero" in p.stdout
     b = next((tmp_path / "m").iterdir())
     rec = json.loads((b / "receipt.json").read_text())
     from qor_receipt.receipt import verify_receipt
@@ -218,7 +218,7 @@ def test_finalize_cli_real_reader_on_test_pattern(tmp_path):
                        capture_output=True, text=True, env=env, timeout=300, stdin=subprocess.DEVNULL)
     assert p.returncode == 0, p.stdout + p.stderr
     assert "Finalize Match (offline)" in p.stdout and "final: not detected" in p.stdout
-    assert "NOT a confirmed final" in p.stdout and "RESULT: PARTIAL" in p.stdout
+    assert "NOT a confirmed final" in p.stdout and "RESULT: SELF_ATTESTED" in p.stdout
     rec = json.loads((b / "receipt.json").read_text())
     assert "final_basis" not in rec["result"] and len(rec["checkpoints"]["home"]) >= 2
 

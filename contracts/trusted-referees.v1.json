@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://conwan30.github.io/qortime/schema/contracts/trusted-referees.v1.json",
+  "title": "QorTime trusted referee allowlist",
+  "type": "object",
+  "required": ["schema", "version", "referees"],
+  "properties": {
+    "schema": {"const": "qortime-trusted-referees/v1"},
+    "version": {"type": "integer", "minimum": 1},
+    "referees": {"type": "array", "items": {
+      "type": "object", "required": ["id", "pubkey", "key_id", "status"],
+      "properties": {"id": {"type": "string"}, "pubkey": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+                     "key_id": {"type": "string", "pattern": "^[0-9a-f]{16}$"}, "status": {"enum": ["active", "revoked"]}}}}
+  }
+}

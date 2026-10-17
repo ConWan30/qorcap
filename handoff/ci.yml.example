@@ -14,7 +14,9 @@ jobs:
       - uses: actions/setup-python@v5
         with: { python-version: "3.12" }
       - run: pip install pytest numpy
-      - run: python -m pytest -q sidecar
+      - run: git clone --depth 1 https://github.com/ConWan30/qortime ../qortime && pip install -e "../qortime[dev,vision]"
+      - run: cargo build --release --locked
+      - run: QORTIME=../qortime python -m pytest -q sidecar   # includes sidecar/test_contracts.py (real-writer E2E)
   windows:
     runs-on: windows-latest
     steps:

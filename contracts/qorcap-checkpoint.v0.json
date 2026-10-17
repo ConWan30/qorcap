@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://conwan30.github.io/qortime/schema/contracts/qorcap-checkpoint.v0.json",
+  "title": "QorCap checkpoints.jsonl line (QorTime checkpoint body + optional qorcap extras)",
+  "type": "object",
+  "required": ["seq", "t_ms", "frames_hash", "input_hash", "prev", "hash"],
+  "properties": {
+    "seq": {"type": "integer", "minimum": 0},
+    "t_ms": {"type": "integer", "minimum": 0},
+    "frames_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "input_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "prev": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "referee_ts_ms": {"type": "integer", "minimum": 0},
+    "referee_sig": {"type": "string", "pattern": "^[0-9a-f]{128}$"},
+    "qorcap": {"type": "object", "properties": {"trigger": {"enum": ["start", "startup", "segment", "challenge", "score_change", "clock_state", "final", "stop"]}}}
+  }
+}

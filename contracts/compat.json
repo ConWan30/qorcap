@@ -1,0 +1,53 @@
+{
+  "schema": "qortime-contracts/v0",
+  "version": 1,
+  "about": "Canonical QorCap <-> QorTime contract registry. QorTime owns it; QorCap vendors a byte-identical copy (contracts/ + CONTRACTS_PIN) and its tests fail on drift. Change it here first, then re-vendor.",
+  "receipt_schemas": ["qor-receipt/v0"],
+  "bundle_schemas": ["qorcap-bundle/v0"],
+  "inputs_schemas": ["qorcap-inputs/v0"],
+  "input_proof_schemas": ["qorcap-input-proof/v0"],
+  "trusted_referees_schemas": ["qortime-trusted-referees/v1"],
+  "review_type": "qortime-bundle-review/v1",
+  "challenge_token_type": "qortime-challenge/v1",
+  "bundle_files": {
+    "required": ["bundle.json", "manifest.jsonl", "checkpoints.jsonl", "receipt.json"],
+    "meta": ["bundle.json", "manifest.jsonl", "checkpoints.jsonl", "countersigned.jsonl", "inputs.jsonl",
+             "haptics.jsonl", "input_proof.json", "receipt.json", "receipt.draft.json", "timeline.jsonl",
+             "challenges.jsonl", "official_challenges.jsonl", "anchors.jsonl", "referee.pub"]
+  },
+  "hash_chain": {
+    "canonical_json": "RFC 8785 JCS, integers only (|n| <= 2^53-1), no floats",
+    "genesis": "0000000000000000000000000000000000000000000000000000000000000000",
+    "segment_link": "head_n = sha256(JCS({prev, seq, sha256}))",
+    "checkpoint_hash": "sha256(JCS({seq, t_ms, frames_hash, input_hash, prev}))",
+    "countersign_payload": "JCS({type:'checkpoint', match_id, role, hash, referee_ts_ms})",
+    "signature": "Ed25519 over JCS(receipt minus signatures); {key_id, sig}; key_id = 16 hex"
+  },
+  "checkpoint_timing": {
+    "max_gap_ms": 10000,
+    "max_skew_ms": 3000,
+    "rules": [
+      "first referee_ts_ms - match.started_ms <= max_gap_ms",
+      "each referee_ts_ms - previous referee_ts_ms <= max_gap_ms",
+      "|referee_ts_ms - t_ms| <= max_skew_ms for every checkpoint, INCLUDING the last (stop) checkpoint",
+      "match.ended_ms - last referee_ts_ms <= max_gap_ms"
+    ],
+    "stop_checkpoint": "QorCap >= 0.3.3 writes a 'stop' checkpoint after finalising the video, seals the chain, and waits for the local referee (POST /countersigned) before the slow input-proof work. QorCap <= 0.3.2 had no seal: the tail was countersigned only after the bundle work, tens of seconds late -> gap_too_long + clock_skew on the last checkpoints. The verifiers are right; those recordings cannot be repaired honestly."
+  },
+  "recorder_versions": {
+    "tail_timing_sound_from": "0.3.3",
+    "current": "0.3.9",
+    "known_bad_tail": ["0.3.0", "0.3.1", "0.3.2"]
+  },
+  "verdicts": ["VERIFIED", "PARTIAL", "SELF_ATTESTED", "FAIL"],
+  "cli_exit_codes": {
+    "qortime verify": {"VERIFIED": 0, "SELF_ATTESTED": 0, "PARTIAL": 1, "FAIL": 2},
+    "qorcap submit": {"VERIFIED": 0, "PARTIAL": 1, "SELF_ATTESTED": 1, "other": 2},
+    "qorcap verify-bundle": {"ok": 0, "errors": 2}
+  },
+  "result_methods": ["agreed_scorebug_final", "end_menu_read", "last_scorebug_read_unconfirmed"],
+  "final_basis": ["clock_zero", "scorebug_gone", "final_screen", "end_menu"],
+  "scorebug_profiles": ["madden27_standard", "madden27_monday_night"],
+  "official_referee": {"id": "qortime-v1", "key_id": "53eea1b5d23b1ff0",
+                       "pubkey": "a5aa0c9121db2c517284bf1c49eeec199829ca832a2b665f26e872e01192feea"}
+}
