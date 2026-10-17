@@ -23,6 +23,65 @@ from pathlib import Path
 from typing import Any, Callable
 
 NOT_VISIBLE = {"layout_unknown", "frame_invalid", "frame_too_small", "frame_aspect"}
+QUARTER_SOFT = {"quarter_unsure", "quarter_missing"}
+
+
+class ScoreClockLock:
+    """Lock (left score, right score) when the quarter glyph failed.
+
+    Per-digit NCC gates have already run inside the reader. This window is the same shape as QorTime's
+    ``AgreementWindow`` except the key does not include a quarter: 3 agreeing samples, >=200 ms apart,
+    spanning >=400 ms, gap <=2 s. A clock that runs backwards resets the run. An implausible jump off the
+    last locked pair needs 9 samples over 2 s. The quarter on the posted read stays unknown.
+    """
+
+    def __init__(self) -> None:
+        self.samples: list[tuple[int, Any]] = []
+        self.key: tuple[int, int] | None = None
+        self.last_pair: tuple[int, int] | None = None
+        self.last_pair_ns = 0
+
+    def remember(self, pair, clock_ns: int) -> None:
+        if pair is None:
+            return
+        self.last_pair = (int(pair[0]), int(pair[1]))
+        self.last_pair_ns = int(clock_ns)
+
+    def offer(self, read, *, clock_ns: int):
+        from types import SimpleNamespace
+        from qor_receipt._vendor.qoresence.sync.digit_integrity import implausible_transition_reason
+        from qor_receipt._vendor.qoresence.vision.local_scorebug.agreement import AgreementConfig
+        cfg = AgreementConfig()
+        pair = getattr(read, "pair", None)
+        if pair is None:
+            self.samples, self.key = [], None
+            return SimpleNamespace(agreed=False, read=None, reason=getattr(read, "reason", None) or "blank")
+        key = (int(pair[0]), int(pair[1]))
+        last = self.samples[-1] if self.samples else None
+        restart = (
+            self.key != key or last is None or clock_ns - last[0] > cfg.max_gap_ns or clock_ns < last[0]
+            or (read.clock_seconds is not None and last[1].clock_seconds is not None
+                and read.clock_seconds > last[1].clock_seconds)
+        )
+        if restart:
+            self.key = key
+            self.samples = [(clock_ns, read)]
+        elif clock_ns - last[0] >= cfg.min_interval_ns:
+            self.samples.append((clock_ns, read))
+        run = len(self.samples)
+        span = self.samples[-1][0] - self.samples[0][0]
+        suspicious = bool(
+            self.last_pair is not None and self.last_pair != key
+            and clock_ns - self.last_pair_ns <= cfg.jump_memory_ns
+            and implausible_transition_reason(*self.last_pair, *key)
+        )
+        need = cfg.need_suspicious if suspicious else cfg.need
+        need_span = cfg.min_span_suspicious_ns if suspicious else cfg.min_span_ns
+        if run < need or span < need_span:
+            return SimpleNamespace(agreed=False, read=None, reason="recheck" if suspicious else "agreeing", run=run)
+        self.last_pair = key
+        self.last_pair_ns = self.samples[-1][0]
+        return SimpleNamespace(agreed=True, read=self.samples[-1][1], reason="agreed", run=run)
 
 
 READER_SIZE = (640, 360)  # QorTime's reader/profile is calibrated on 640x360 frames
@@ -62,7 +121,9 @@ def madden_final_screen(img) -> bool:
     xs = lambda a, b: slice(int(a * sx), int(b * sx))  # noqa: E731
     # v0.3.5: rows 295-328 skipped: online matches draw the two gamertag banners there (match-20261016-170000)
     bottom = np.vstack([g[ys(200, 295), :], g[ys(328, 345), :]])
-    if not (bottom.mean() < 8 and (bottom > 60).mean() < 0.02 and bottom.std() < 14):
+    # v0.3.12: Thursday Night's end screen is the stadium, not a black void (mean ~19, std ~12 on
+    # match-20261017-091651). Still flat. A faded field (std ~18, or a flat grey of 40) stays rejected.
+    if not (bottom.mean() < 25 and (bottom > 60).mean() < 0.02 and bottom.std() < 14):
         return False
     col = g[ys(15, 130), xs(20, 150)]
     box_rows = int((((col > 190).mean(axis=1)) > 0.7).sum())
@@ -97,6 +158,7 @@ class ReaderCore:
         self.end_menu_agree = end_menu_agree
         self.end_menu: dict | None = None
         self.end_menu_rejected: dict | None = None
+        self.score_lock = ScoreClockLock()
         # External corroboration for one-legal-step end-menu deltas (set by match runner):
         # each entry: {"kind": "scorebug_final_play"|"score_change_clip"|"input_activity"|"haptic",
         #              "t_ms": int, ...optional "home","away","sha256"}
@@ -145,9 +207,25 @@ class ReaderCore:
         absent = (not fr.ok) and fr.reason in NOT_VISIBLE
         self._observe(t_ms, img, absent)
         ch = hashlib.sha256(band.tobytes()).hexdigest()[:16] if band is not None else ""
-        res = self.agree.offer(fr, clock_ns=t_ms * 1_000_000, crop_hash=ch, session_id="qorcap")
+        # A failed quarter must not be offered to AgreementWindow: that call resets a good run, which is why a
+        # whole Thursday Night game produced no score rows. Scores (already per-digit gated) lock on their own.
+        soft = (not fr.ok) and fr.reason in QUARTER_SOFT and getattr(fr, "pair", None) is not None
+        try:
+            if soft:
+                res = self.score_lock.offer(fr, clock_ns=t_ms * 1_000_000)
+            else:
+                res = self.agree.offer(fr, clock_ns=t_ms * 1_000_000, crop_hash=ch, session_id="qorcap")
+        except Exception as e:  # never silent
+            self.stats["errors"] += 1
+            print(f"score agreement error: {type(e).__name__}: {e}", file=sys.stderr)
+            return
         if not (res.agreed and res.read is not None):
             return
+        if soft and hasattr(self.agree, "last_agreed"):
+            self.agree.last_agreed = res.read.pair
+            self.agree.last_agreed_ns = t_ms * 1_000_000
+        elif not soft:
+            self.score_lock.remember(getattr(res.read, "pair", None), t_ms * 1_000_000)
         self.stats["agreed"] += 1
         rd = {"t_ms": t_ms, "away": res.read.left_score, "home": res.read.right_score,  # Madden: AWAY on the LEFT
               "quarter": res.read.quarter, "clock_s": res.read.clock_seconds,
@@ -215,7 +293,16 @@ class ReaderCore:
             return
         # Clock gate: the end-of-game menu is only authoritative once the scorebug has shown 0:00 in Q4.
         # Without this, a doctored end-menu-looking frame matching the current mid-Q4 score ends the match early.
-        if last.get("clock_s") != 0:
+        period = None
+        if hasattr(self.end_menu_reader, "period"):
+            try:
+                period = self.end_menu_reader.period(img)
+            except Exception as e:  # never silent
+                print(f"end-menu period error: {type(e).__name__}: {e}", file=sys.stderr)
+        # OT can end on a walk-off with time still on the clock (match-20261017-091651: 10-16 at OT 1:55).
+        # A Q4 menu with the clock still running is unchanged: it is rejected.
+        q_last = last.get("quarter")
+        if last.get("clock_s") != 0 and not (isinstance(q_last, int) and q_last >= 5):
             self.end_menu_rejected = dict(st, why="scorebug clock not 0:00 before the end-of-game menu")
             return
         why = end_menu_consistency(st, last)
@@ -247,8 +334,11 @@ class ReaderCore:
                              "score-change clip / input-haptic near scoring): final_confirmed=false")
                 confirmed = False
         prev = self.final
+        quarter = max(4, int(q_last) if isinstance(q_last, int) else 4)
+        if period == "OT" or (isinstance(q_last, int) and q_last >= 5):
+            quarter = max(quarter, 5)
         self.final = {"type": "final", "basis": "end_menu", "method": "end_menu_read", "home": st["home"], "away": st["away"],
-                      "quarter": max(4, int(last["quarter"])), "t_ms": st["t_ms"], "end_menu": st, "scorebug_last": sb,
+                      "quarter": quarter, "t_ms": st["t_ms"], "end_menu": st, "scorebug_last": sb,
                       "notes": notes, "final_confirmed": confirmed,
                       "delta_corroboration": corr}
         if prev is not None:
@@ -281,6 +371,9 @@ class ReaderCore:
     def _check_final(self, t_ms: int) -> None:
         if self.final is not None:
             return
+        last = self.last_scorebug()
+        if last is not None and last.get("quarter") is None:
+            return  # a quarter-less lock is not evidence the game ended, and detect_final compares quarter as an int
         fin = self.detect_final(self.timeline)
         if fin.final:
             self._close_spans()

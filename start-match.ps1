@@ -63,5 +63,13 @@ $qt = Join-Path $here "qortime"
 $qtArgs = @(); if (Test-Path (Join-Path $qt "qor_receipt\receipt.py")) { $qtArgs = @("--qortime", $qt) }
 Write-Host ""
 
-& $vpy (Join-Path $here "sidecar\qorcap_match.py") --qorcap (Join-Path $here "qorcap.exe") --ffmpeg (Join-Path $here "ffmpeg.exe") @qtArgs @args
+# Official challenges are on for a double-clicked match. Pass --no-official-challenges to opt out.
+# Tests call qorcap_match.py directly and do not get this flag.
+$fwd = @($args)
+$hasChallengeFlag = $false
+foreach ($x in $fwd) {
+  if ($x -eq "--official-challenges" -or $x -eq "--no-official-challenges") { $hasChallengeFlag = $true }
+}
+if (-not $hasChallengeFlag) { $fwd = @("--official-challenges") + $fwd }
+& $vpy (Join-Path $here "sidecar\qorcap_match.py") --qorcap (Join-Path $here "qorcap.exe") --ffmpeg (Join-Path $here "ffmpeg.exe") @qtArgs @fwd
 Done $LASTEXITCODE

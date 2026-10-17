@@ -1,4 +1,4 @@
-"""Madden 27 *Thursday Night* (primetime "TNP") scorebug profile ``madden27_thursday_night`` (QorCap 0.3.11).
+"""Madden 27 *Thursday Night* (primetime "TNP") scorebug profile ``madden27_thursday_night`` (QorCap 0.3.12).
 
 A compact two-row bar at the bottom centre: away (left) and home (right) team panels with big white scores either side
 of a silver "TNP" shield; below, on black, down & distance, the quarter ordinal (grey "1ST"), the game clock (white),
@@ -33,7 +33,7 @@ SCORE_H, CLOCK_H, QUARTER_H = (24, 36), (10, 18), (7, 14)
 SCORE_MAX_W, CLOCK_MAX_W = 24, 15
 INK, CLOCK_INK, QUARTER_INK = 150, 205, 100
 GATE = {"score": (0.80, 0.08), "clock": (0.75, 0.10), "quarter": (0.75, 0.12)}
-QUARTERS = {"1": 1, "2": 2, "3": 3, "4": 4}
+QUARTERS = {"1": 1, "2": 2, "3": 3, "4": 4, "OT": 5}  # 2ND has no crop from match-20261017-091651 (templates stay the 010703 ones)
 
 
 def _fr(**kw):
@@ -186,28 +186,43 @@ class ThursdayNightReader:
                 return _fr(ok=False, reason=f"score_{side}_leading_zero")
             scores[side] = int(txt)
         partial = dict(left_score=scores["away"], right_score=scores["home"])
+        # Quarter is not a gate for the clock. A missing/unknown ordinal (no 2ND sample this broadcast, a future
+        # glyph the pack has not seen) still returns the scores and, when the clock glyphs clear their own gates,
+        # the clock. ``ok`` stays false so the normal agreement key, which includes the quarter, is not used.
+        q_reason = None
         q = quarter_glyph(hsv)
         if q is None or not quarter_suffix(hsv):
-            return _fr(ok=False, reason="quarter_missing", **partial)
-        qlab, _, _ = self.classify("quarter", skeleton(q), QUARTER_SIZE)
-        if qlab is None or qlab not in QUARTERS:
-            return _fr(ok=False, reason="quarter_unsure", **partial)
-        partial["quarter"] = QUARTERS[qlab]   # score + quarter are read; a clock failure below still fails the frame
+            q_reason = "quarter_missing"
+        else:
+            qlab, _, _ = self.classify("quarter", skeleton(q), QUARTER_SIZE)
+            if qlab is None or qlab not in QUARTERS:
+                q_reason = "quarter_unsure"
+            else:
+                partial["quarter"] = QUARTERS[qlab]
+        clock, clock_reason = {}, None
         cg = clock_glyphs(hsv)
         if not 3 <= len(cg) <= 4 or any(g is None for g in cg):
-            return _fr(ok=False, reason="clock_glyph_count", **partial)
-        cd = ""
-        for g in cg:
-            lab, b, m = self.classify("clock", g, CLOCK_SIZE)
-            if lab is None:
-                return _fr(ok=False, reason="clock_unsure", **partial)
-            cd += lab
-        mm, ss = cd[:-2], cd[-2:]
-        if int(ss) > 59 or (len(mm) == 2 and mm[0] == "0") or int(mm) > 15:
-            return _fr(ok=False, reason="clock_invalid", **partial)
-        cx = hsv[CLOCK_Y[0]:CLOCK_Y[1], CLOCK_X[0]:CLOCK_X[1]]
-        ink = clock_mask(hsv)[1]
-        red = bool(ink.any() and (((cx[..., 0] < 10) | (cx[..., 0] > 165)) & (cx[..., 1] > 120))[ink].mean() > 0.5)
-        return _fr(ok=True, reason="ok", clock_seconds=int(mm) * 60 + int(ss),
-                   clock_text=f"{int(mm)}:{ss}", clock_red=red, score_conf=round(conf, 3), score_margin=round(margin, 3),
-                   **partial)
+            clock_reason = "clock_glyph_count"
+        else:
+            cd = ""
+            for g in cg:
+                lab, _, _ = self.classify("clock", g, CLOCK_SIZE)
+                if lab is None:
+                    clock_reason = "clock_unsure"
+                    break
+                cd += lab
+            else:
+                mm, ss = cd[:-2], cd[-2:]
+                if int(ss) > 59 or (len(mm) == 2 and mm[0] == "0") or int(mm) > 15:
+                    clock_reason = "clock_invalid"
+                else:
+                    cx = hsv[CLOCK_Y[0]:CLOCK_Y[1], CLOCK_X[0]:CLOCK_X[1]]
+                    ink = clock_mask(hsv)[1]
+                    red = bool(ink.any() and (((cx[..., 0] < 10) | (cx[..., 0] > 165)) & (cx[..., 1] > 120))[ink].mean() > 0.5)
+                    clock = dict(clock_seconds=int(mm) * 60 + int(ss), clock_text=f"{int(mm)}:{ss}", clock_red=red)
+        if q_reason:
+            return _fr(ok=False, reason=q_reason, score_conf=round(conf, 3), score_margin=round(margin, 3),
+                       **partial, **clock)
+        if clock_reason:
+            return _fr(ok=False, reason=clock_reason, score_conf=round(conf, 3), score_margin=round(margin, 3), **partial)
+        return _fr(ok=True, reason="ok", score_conf=round(conf, 3), score_margin=round(margin, 3), **partial, **clock)

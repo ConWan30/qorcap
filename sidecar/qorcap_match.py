@@ -656,10 +656,15 @@ def main(argv=None) -> int:
     ap.add_argument("--no-anchors", action="store_true", help="do not timestamp the video chain with the official referee")
     ap.add_argument("--official-challenges", action="store_true",
                     help="fetch official challenge nonces at the first pause-capable moment (after a kickoff and a play call) "
-                         "in Q1, Q3 and Q4 (press the shown pattern; needed for VERIFIED)")
+                         "in Q1, Q3 and Q4 (press the shown pattern; needed for VERIFIED). Start Match.cmd passes this "
+                         "unless --no-official-challenges is set.")
+    ap.add_argument("--no-official-challenges", action="store_true",
+                    help="do not fetch official challenge nonces (overrides --official-challenges)")
     ap.add_argument("--submit", action="store_true", help="submit for verification at the end without asking")
     ap.add_argument("--no-submit-prompt", action="store_true", help="do not offer 'Submit for Verification' at the end")
     a = ap.parse_args(argv)
+    if a.no_official_challenges:
+        a.official_challenges = False
 
     say("=" * 64)
     say("  QorCap  -  Start Match" + ("   (TEST PATTERN, no capture card)" if a.test_pattern else ""))

@@ -29,6 +29,7 @@ REF = (1280, 720)
 BAR_Y = (684, 720)
 LOGO = (40, 210)                    # orange "MNP" wordmark, bar rows
 LOGO_MIN_ORANGE = 0.035             # measured 0.06-0.08 when the bar is up, <= 0.02 otherwise
+LOGO_MAX_ORANGE = 0.25              # the mark is a small patch; a Broncos-orange endzone fills the box (~0.99, match-20261017-091651)
 SCORE_X = {"away": (400, 490), "home": (516, 606)}
 CLOCK_X = (876, 940)
 QUARTER_X, QUARTER_Y = (836, 882), (688, 710)
@@ -178,14 +179,14 @@ class MondayNightReader:
 
     def present(self, frame) -> bool:
         hsv = bar_hsv(frame)
-        return hsv is not None and logo_orange(hsv) >= LOGO_MIN_ORANGE
+        return hsv is not None and LOGO_MIN_ORANGE <= logo_orange(hsv) <= LOGO_MAX_ORANGE
 
     def read(self, frame) -> Any:
         hsv = bar_hsv(frame)
         if hsv is None:
             return _fr(ok=False, reason="frame_invalid")
         orange = logo_orange(hsv)
-        if orange < LOGO_MIN_ORANGE:
+        if not LOGO_MIN_ORANGE <= orange <= LOGO_MAX_ORANGE:
             return _fr(ok=False, reason="layout_unknown", detail={"mnp_orange": round(orange, 3)})
         v = hsv[..., 2]
         scores, conf, margin = {}, 1.0, 1.0
@@ -274,8 +275,11 @@ class AutoProfileReader:
             if first is None:
                 first = (i, fr)
             if fr.ok or fr.reason not in NOT_VISIBLE:
-                if fr.ok:
-                    pid = self._pid(r)
+                pid = self._pid(r)
+                # A primetime frame whose digits cleared the per-digit gates is that presentation, even when the
+                # quarter glyph did not. Counting only fr.ok left match-20261017-091651 as madden27_standard.
+                scored = fr.ok or (getattr(fr, "left_score", None) is not None and pid != "madden27_standard")
+                if scored:
                     self.profile_counts[pid] = self.profile_counts.get(pid, 0) + 1
                     self.active = i
                 self._last = i

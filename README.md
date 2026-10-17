@@ -2,7 +2,7 @@
 
 # QorCap
 
-**Website:** https://conwan30.github.io/qorcap/ · **Download:** [v0.3.11](https://github.com/ConWan30/qorcap/releases/tag/v0.3.11) ([latest release](https://github.com/ConWan30/qorcap/releases/latest))
+**Website:** https://conwan30.github.io/qorcap/ · **Download:** [v0.3.12](https://github.com/ConWan30/qorcap/releases/tag/v0.3.12) ([latest release](https://github.com/ConWan30/qorcap/releases/latest))
 
 A small Windows recorder for a USB HDMI capture card (built for a generic **"USB3.0 Video"** card carrying a PS5),
 made for **[QorTime](https://github.com/ConWan30/qortime)** match receipts. It does two jobs:
@@ -26,7 +26,7 @@ with a local control surface). QorCap copies only that design idea, no code. No 
 
 ## Quickstart: double-click Start Match
 
-1. Download `qorcap-v0.3.11-windows-x64.zip` from the [latest release](https://github.com/ConWan30/qorcap/releases/latest)
+1. Download `qorcap-v0.3.12-windows-x64.zip` from the [latest release](https://github.com/ConWan30/qorcap/releases/latest)
    and unzip it, for example to `C:\QorCap` (right-click the zip, *Extract All*).
 2. Connect PS5 HDMI out to the **USB3.0 Video** card, and the card to a blue USB 3 port. Close OBS or the Camera app.
 3. Double-click **`Start Match`**. On the first run it downloads ffmpeg, installs Python 3.12 through winget if it
@@ -225,7 +225,7 @@ the end of Start Match, or run `qorcap submit "<bundle dir>"` (`--full` uploads 
    `verify.official.txt` in the bundle.
 
 During a match QorCap stamps the chain head with the referee every 60 s (turn off with `--no-anchors`). For
-**VERIFIED** also start the match with `--official-challenges` (e.g. `"Start Match.cmd" --official-challenges`): the
+**VERIFIED:** Start Match passes `--official-challenges` unless you add `--no-official-challenges`. The
 referee then issues three timed challenges (game start, second half, Q4) that you answer on the pad. Without them the
 best result is **PARTIAL**: the
 referee can prove the bytes are what you recorded, not that they were recorded live. Spot-check mode is a sampled
@@ -317,7 +317,7 @@ Global: `--port 8788`, `--ffmpeg PATH`, `--log FILE` (default `qorcap.log`, or `
 ## Run on Windows by hand (PowerShell, advanced)
 
 ```powershell
-# 1. unzip qorcap-v0.3.11-windows-x64.zip to C:\QorCap, then:
+# 1. unzip qorcap-v0.3.12-windows-x64.zip to C:\QorCap, then:
 cd C:\QorCap
 Unblock-File .\qorcap.exe, .\get-ffmpeg.ps1
 powershell -ExecutionPolicy Bypass -File .\get-ffmpeg.ps1     # puts ffmpeg.exe next to qorcap.exe
@@ -354,6 +354,8 @@ continues), replay save, challenge stamp visible in the video, score/final event
 written, `verify-bundle` OK, and a single flipped byte reported as FAIL.
 
 **Tested on Windows (v0.2.0–v0.2.1 era, MyTurn, USB3.0 Video):** `--input-format mjpeg` 1280x720@30 with `h264_mf` at 29.7 fps. v0.2.1 fixed audio / auto-format / OBS.
+
+**v0.3.12 (Thursday Night match-20261017-091651, SEA 10 – DEN 16 OT):** a failed quarter glyph no longer blocks the score and the clock (a lock is still 3 agreeing per-digit reads). Real quarter templates for 1ST, 3RD, 4TH (including the red final minute) and OT from that match; no 2ND crop, and no score 5/8/9 (Sunday Night's 5 and 9 are synthetic and were not copied). The Thursday Night end screen (stadium behind FINISH GAME, OT, 10–16) is recognised, and Start Match passes `--official-challenges` unless `--no-official-challenges` is set.
 
 **v0.3.8:** Start Match auto-wires live haptics / input activity / score-change clip hashes into `ReaderCore.delta_corroboration` (and the stop-time tail fallback), so a one-legal-step end-menu final can be confirmed live with the same rules as offline. Rust `write_bundle` honors sidecar `final_confirmed` + `delta_corroboration`.
 
