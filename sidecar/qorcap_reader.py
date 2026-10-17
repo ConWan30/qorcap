@@ -335,6 +335,133 @@ def end_menu_delta_corroborated(st: dict, last: dict | None, timeline: list[dict
     return None
 
 
+
+def collect_delta_corroboration(*, clips: list[dict] | None = None,
+                                haptic_records: list[dict] | None = None,
+                                input_records: list[dict] | None = None) -> list[dict]:
+    """Build ``ReaderCore.delta_corroboration`` entries from live API clips and bundle logs.
+
+    Same kinds as ``end_menu_delta_corroborated`` accepts:
+    - score_change_clip (needs sha256; t_ms from wall_ms or t_ms)
+    - haptic (t_ms from t_wall_ms / t_mono_ms / t_us)
+    - input_activity (significant button presses near scoring)
+    """
+    out: list[dict] = []
+    for c in clips or []:
+        if not isinstance(c, dict):
+            continue
+        name = str(c.get("name") or "")
+        sha = c.get("sha256")
+        if not sha or len(str(sha)) < 32:
+            continue
+        # score-* auto clips and explicit score_change names
+        if not (name.startswith("score") or name in ("score_change", "score-change") or "score-" in name):
+            continue
+        t_ms = c.get("t_ms")
+        if t_ms is None:
+            t_ms = c.get("wall_ms")
+        if t_ms is None:
+            continue
+        out.append({"kind": "score_change_clip", "t_ms": int(t_ms), "sha256": str(sha).lower(),
+                    "name": name, "file": c.get("file")})
+    for h in haptic_records or []:
+        if not isinstance(h, dict):
+            continue
+        if h.get("type") not in (None, "haptic"):
+            continue
+        t_ms = h.get("t_ms")
+        if t_ms is None and h.get("t_wall_ms") is not None:
+            t_ms = h["t_wall_ms"]
+        if t_ms is None and h.get("t_mono_ms") is not None:
+            t_ms = h["t_mono_ms"]
+        if t_ms is None and h.get("t_us") is not None:
+            t_ms = int(h["t_us"]) // 1000
+        if t_ms is None:
+            continue
+        out.append({"kind": "haptic", "t_ms": int(t_ms),
+                    "confidence": h.get("confidence") or h.get("high_confidence")})
+    for r in input_records or []:
+        if not isinstance(r, dict) or r.get("type") not in ("in", "press", "buttons"):
+            continue
+        # Prefer records that look like discrete presses (not stick noise)
+        t_ms = r.get("t_ms")
+        if t_ms is None and r.get("t_us") is not None:
+            t_ms = int(r["t_us"]) // 1000
+        if t_ms is None:
+            continue
+        buttons = r.get("buttons") if r.get("buttons") is not None else r.get("b")
+        if buttons is None:
+            buttons = r.get("pressed") or r.get("pad")
+        if buttons in (None, 0, [], {}, ""):
+            continue
+        out.append({"kind": "input_activity", "t_ms": int(t_ms)})
+    return out
+
+
+def load_delta_corroboration_from_bundle(bundle) -> list[dict]:
+    """Read clips (manifest/bundle.json) + haptics.jsonl + inputs.jsonl from a match bundle dir."""
+    from pathlib import Path
+    b = Path(bundle)
+    clips: list[dict] = []
+    # Prefer live-written clips on bundle.json; fall back to manifest.jsonl clip lines
+    bj = b / "bundle.json"
+    if bj.exists():
+        try:
+            import json
+            clips.extend(json.loads(bj.read_text(encoding="utf-8")).get("clips") or [])
+        except Exception:
+            pass
+    man = b / "manifest.jsonl"
+    if man.exists():
+        for line in man.read_text(encoding="utf-8", errors="replace").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                import json
+                o = json.loads(line)
+            except Exception:
+                continue
+            if o.get("type") == "clip":
+                clips.append(o)
+    # Also scan clips/ directory for score-*.mp4 and hash if missing sha
+    cdir = b / "clips"
+    if cdir.is_dir():
+        import hashlib
+        known = {c.get("file") for c in clips if isinstance(c, dict)}
+        for f in sorted(cdir.glob("*.mp4")):
+            if not (f.name.startswith("score") or "score-" in f.name):
+                continue
+            if str(f) in known or any(str(f.name) in str(c.get("file") or "") for c in clips):
+                continue
+            try:
+                sha = hashlib.sha256(f.read_bytes()).hexdigest()
+            except Exception:
+                continue
+            # mtime as rough t_ms fallback (wall clock ms)
+            t_ms = int(f.stat().st_mtime * 1000)
+            clips.append({"type": "clip", "name": f.stem, "file": str(f), "sha256": sha, "wall_ms": t_ms})
+
+    def _jsonl(name: str) -> list[dict]:
+        p = b / name
+        if not p.exists():
+            return []
+        import json
+        rows = []
+        for line in p.read_text(encoding="utf-8", errors="replace").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rows.append(json.loads(line))
+            except Exception:
+                continue
+        return rows
+
+    return collect_delta_corroboration(clips=clips, haptic_records=_jsonl("haptics.jsonl"),
+                                      input_records=_jsonl("inputs.jsonl"))
+
+
 def http_post(base: str, body: dict) -> dict:
     rq = urllib.request.Request(base + "/events", data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
     try:

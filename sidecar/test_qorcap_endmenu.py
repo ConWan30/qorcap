@@ -1,6 +1,8 @@
 """End-of-game menu score reader (v0.3.4). Fixtures are real frames from Con's 2026-10-16 matches:
 m27_end_menu_finish.jpg = match-20261016-125430 (AWAY 7 Saints - HOME 14 Giants, cursor FINISH GAME),
 m27_end_menu_restart.jpg = match-20261016-143212 (AWAY 0 - HOME 20, cursor RESTART; scorebug last read 0-17)."""
+
+import json
 import os
 import sys
 from pathlib import Path
@@ -154,3 +156,94 @@ def test_core_rejects_end_menu_before_clock_zero():
         core.on_frame(10_000 + k * 500, RST)  # real end-menu fixture reading 0-20
     assert not any(p.get("basis") == "end_menu" for p in posts)
     assert core.end_menu_rejected and "clock not 0:00" in core.end_menu_rejected["why"]
+
+
+def test_collect_delta_corroboration_from_clips_haptics_inputs():
+    from qorcap_reader import collect_delta_corroboration
+    clips = [
+        {"name": "score-123", "sha256": "a" * 64, "wall_ms": 40_000},
+        {"name": "final", "sha256": "b" * 64, "wall_ms": 50_000},  # ignored (not score*)
+        {"name": "score_change", "sha256": "c" * 64, "t_ms": 41_000},
+    ]
+    haptics = [
+        {"type": "haptic", "t_wall_ms": 41_500, "confidence": True},
+        {"type": "status", "t_wall_ms": 1},  # ignored
+    ]
+    inputs = [
+        {"type": "in", "t_us": 42_000_000, "b": 16},
+        {"type": "in", "t_us": 43_000_000, "b": 0},  # no buttons
+        {"type": "chunk", "t_us": 1},
+    ]
+    out = collect_delta_corroboration(clips=clips, haptic_records=haptics, input_records=inputs)
+    kinds = [e["kind"] for e in out]
+    assert kinds.count("score_change_clip") == 2
+    assert "haptic" in kinds and "input_activity" in kinds
+    assert all(e.get("sha256") for e in out if e["kind"] == "score_change_clip")
+
+
+def test_load_delta_corroboration_from_bundle(tmp_path):
+    from qorcap_reader import load_delta_corroboration_from_bundle, end_menu_delta_corroborated
+    b = tmp_path / "bundle"
+    b.mkdir()
+    (b / "haptics.jsonl").write_text(
+        json.dumps({"type": "haptic", "t_wall_ms": 3500, "t_mono_ms": 3500}) + "\n", encoding="utf-8")
+    (b / "inputs.jsonl").write_text(
+        json.dumps({"type": "in", "t_us": 3600_000, "b": 32}) + "\n", encoding="utf-8")
+    (b / "manifest.jsonl").write_text(
+        json.dumps({"type": "clip", "name": "score-1", "sha256": "d" * 64, "wall_ms": 3400, "file": "clips/score-1.mp4"}) + "\n",
+        encoding="utf-8")
+    corr = load_delta_corroboration_from_bundle(b)
+    kinds = {e["kind"] for e in corr}
+    assert kinds >= {"haptic", "input_activity", "score_change_clip"}
+    # Match-2 style: 0-17 -> 0-20 with haptic confirms
+    st = {"away": 0, "home": 20, "t_ms": 5000}
+    last = {"away": 0, "home": 17, "t_ms": 3000}
+    got = end_menu_delta_corroborated(st, last, [], corr)
+    assert got and got["kind"] in ("haptic", "score_change_clip", "input_activity")
+
+
+def test_tail_loads_bundle_haptics_when_core_has_no_corr(tmp_path):
+    """Stop-time fallback: tail_final_check auto-loads haptics.jsonl into ReaderCore.delta_corroboration."""
+    import qorcap_match as qm
+    b = tmp_path / "match-live"
+    b.mkdir()
+    reads = [{"t_ms": 1000 + i * 1000, "home": 17, "away": 0, "quarter": 4, "clock_s": c, "clock_red": True}
+             for i, c in enumerate([3, 2, 0])]
+    (b / "timeline.jsonl").write_text("".join(json.dumps(r) + "\n" for r in reads))
+    (b / "manifest.jsonl").write_text(json.dumps({"type": "segment", "seq": 1, "file": "video.mp4", "wall_ms": 60_000}) + "\n")
+    (b / "video.mp4").write_bytes(b"x")
+    # Haptic near last scorebug (t_ms=3000) — same window as match-2 0-17→0-20
+    (b / "haptics.jsonl").write_text(json.dumps({"type": "haptic", "t_wall_ms": 3000}) + "\n")
+    frames = [(k * 500, RST) for k in range(20)]
+    draft = {"result": {"home_score": 17, "away_score": 0, "quarter": 4, "final_t_ms": 60_000, "winner": "home",
+                        "method": "last_scorebug_read_unconfirmed", "final_confirmed": False}}
+
+    class Paused:
+        paused = True
+        def update(self, *_):
+            pass
+
+    def fac(post):
+        # No pre-seeded delta_corroboration — must come from the bundle via load_delta_corroboration_from_bundle
+        return ReaderCore(post, None, None, Paused(), detect_final, final_screen_detector=madden_final_screen,
+                          end_menu_reader=R)
+
+    out = qm.tail_final_check(b, draft, ffmpeg="ffmpeg-missing", core_factory=fac, frames=frames)
+    r = out["result"]
+    assert r["method"] == "end_menu_read"
+    assert (r["away_score"], r["home_score"]) == (0, 20)
+    assert r["final_confirmed"] is True, r
+    assert r.get("delta_corroboration", {}).get("kind") == "haptic"
+
+
+def test_collect_feeds_live_match2_window():
+    """Live Start Match wiring: collect_delta_corroboration + end_menu_delta_corroborated for 0-17→0-20."""
+    from qorcap_reader import collect_delta_corroboration, end_menu_delta_corroborated
+    corr = collect_delta_corroboration(
+        clips=[{"name": "score-finalplay", "sha256": "e" * 64, "wall_ms": 2900}],
+        haptic_records=[{"type": "haptic", "t_wall_ms": 3100}],
+        input_records=[{"type": "in", "t_us": 3_200_000, "b": 8}],
+    )
+    st, last = {"away": 0, "home": 20, "t_ms": 5000}, {"away": 0, "home": 17, "t_ms": 3000}
+    got = end_menu_delta_corroborated(st, last, [], corr)
+    assert got and got["kind"] in ("haptic", "score_change_clip", "input_activity")
