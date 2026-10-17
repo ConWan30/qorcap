@@ -1168,6 +1168,27 @@ def is_end_menu_final(f: dict | None) -> bool:
     return bool(f) and (f.get("basis") == "end_menu" or f.get("method") == "end_menu_read")
 
 
+def _as_quarter(q):
+    """A posted quarter, or None. Bool is an int subclass and is not a quarter."""
+    if isinstance(q, bool) or not isinstance(q, int):
+        return None
+    return q if q >= 1 else None
+
+
+def last_reliable_read(reads: list[dict]) -> dict | None:
+    """Last score event. A trailing lock with a null quarter keeps the last quarter that was actually read."""
+    if not reads:
+        return None
+    last = dict(reads[-1])
+    if _as_quarter(last.get("quarter")) is None:
+        for e in reversed(reads):
+            q = _as_quarter(e.get("quarter"))
+            if q is not None:
+                last["quarter"] = q
+                break
+    return last
+
+
 def apply_final(res: dict, fin: dict | None, *, fallback: dict | None = None) -> dict:
     """Result fields from a reader final. Only an end-of-game-menu final is ``final_confirmed``; a scorebug final
     (clock_zero / scorebug_gone / final_screen) keeps its basis but stays unconfirmed; no final -> last read."""
@@ -1364,12 +1385,16 @@ def finalize(bundle: Path, *, qt: Path, qorcap: str, ffmpeg: str, key_dir: Path,
          "method": "offline: QorTime ScorebugReader + AgreementWindow + detect_final over recorded video",
          "finalized_ms": int(time.time() * 1000)}, indent=2), encoding="utf-8")
 
-    res = apply_final(draft["result"], fin, fallback=reads[-1] if reads else None)
+    res = apply_final(draft["result"], fin, fallback=last_reliable_read(reads))
     draft = dict(draft, result=res)
     rdr = getattr(shared["core"], "reader", None)
     if getattr(rdr, "profile_counts", None):  # v0.3.5: which scorebug layout was actually read
         draft["match"] = dict(draft["match"], scorebug_profile=rdr.active_profile)
         say(f"  scorebug profile: {rdr.active_profile} (agreed-quality reads per profile: {rdr.profile_counts})")
+    rejected = getattr(shared["core"], "end_menu_rejected", None)
+    if stats.get("end_menu_reads") and not is_end_menu_final(fin):
+        why = (rejected or {}).get("why") or "readable end-menu frames never agreed"
+        say(f"  END MENU rejected: {why}")
     say(f"  {len(reads)} score reads, {len(scps)} score checkpoints, final: "
         + (f"{fin['basis']} AWAY {fin['away']} - HOME {fin['home']}" if fin else "not detected"))
     for n in res.get("notes") or []:

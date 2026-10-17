@@ -219,3 +219,41 @@ def test_start_match_passes_official_challenges_by_default():
 def test_reference_band_is_the_bar(tnp):
     band, why = tnp.reference_band(img("m27_tnp_q2_7_14.jpg"))
     assert why == "ok" and band.shape == (T.BAR_Y[1] - T.BAR_Y[0], 1280)
+
+
+def test_quarter_digit_is_cut_from_the_suffix_and_a_fused_ordinal_fails_closed(tnp):
+    """match-20261017-091651 draws 1ST as one blob. Classifying that whole blob matched the 1ST template
+    closely enough to label 2ND frames as Q1. The digit is cut off; the fused blob itself does not clear the gate."""
+    import cv2
+    hsv = T.hsv_of(img("m27_tnp_091651_q1_0_0.jpg"))
+    g = T.quarter_glyph(hsv)
+    assert g is not None and g.shape[1] <= T.QUARTER_DIGIT_MAX_W
+    m = T.quarter_mask(hsv).astype(np.uint8)
+    n, lab, st, _ = cv2.connectedComponentsWithStats(m, connectivity=8)
+    best = min((i for i in range(1, n) if T.QUARTER_H[0] <= st[i][3] <= T.QUARTER_H[1] + 4), key=lambda i: st[i][0])
+    x, y, w, h = (int(t) for t in st[best][:4])
+    assert w > T.QUARTER_BLOB_MAX_W  # the uncut ordinal is wider than a digit or OT
+    blob = (lab[y:y + h, x:x + w] == best).astype(np.uint8)
+    assert tnp.classify("quarter", T.skeleton(blob), T.QUARTER_SIZE)[0] is None
+    assert T.GATE["quarter"][1] >= 0.30
+    # The real 2ND templates from match-20261017-010703 still win on that broadcast.
+    fr = tnp.read(img("m27_tnp_q2_7_14.jpg"))
+    assert fr.ok and fr.quarter == 2
+
+
+def test_quarter_does_not_go_backwards():
+    from types import SimpleNamespace as NS
+    from qor_receipt._vendor.qoresence.vision.local_scorebug.agreement import AgreementWindow
+    from qorcap_reader import ReaderCore
+    posts = []
+    core = ReaderCore(posts.append, T.ThursdayNightReader(), AgreementWindow(), None, lambda tl: NS(final=False))
+    q3 = img("m27_tnp_091651_q3_3_0.png")
+    q1 = img("m27_tnp_q1_6_0.jpg")
+    for i in range(3):
+        core.on_frame(i * 250, q3)
+    assert [p for p in posts if p["type"] == "score"][-1]["quarter"] == 3
+    for i in range(3):
+        core.on_frame(2000 + i * 250, q1)
+    last = [p for p in posts if p["type"] == "score"][-1]
+    assert (last["away"], last["home"], last["quarter"]) == (6, 0, None)
+    assert core._max_quarter == 3

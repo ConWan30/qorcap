@@ -1,4 +1,4 @@
-"""Madden 27 *Thursday Night* (primetime "TNP") scorebug profile ``madden27_thursday_night`` (QorCap 0.3.12).
+"""Madden 27 *Thursday Night* (primetime "TNP") scorebug profile ``madden27_thursday_night`` (QorCap 0.3.13).
 
 A compact two-row bar at the bottom centre: away (left) and home (right) team panels with big white scores either side
 of a silver "TNP" shield; below, on black, down & distance, the quarter ordinal (grey "1ST"), the game clock (white),
@@ -32,8 +32,15 @@ SCORE_SIZE, CLOCK_SIZE, QUARTER_SIZE = (12, 24), (8, 14), (8, 14)
 SCORE_H, CLOCK_H, QUARTER_H = (24, 36), (10, 18), (7, 14)
 SCORE_MAX_W, CLOCK_MAX_W = 24, 15
 INK, CLOCK_INK, QUARTER_INK = 150, 205, 100
-GATE = {"score": (0.80, 0.08), "clock": (0.75, 0.10), "quarter": (0.75, 0.12)}
+# Quarter must win by a clear margin. 0.12 let a fused "1ST" blob (digit touching the suffix) beat the real
+# 2ND digit templates from match-20261017-010703 and label that quarter as Q1. Known-good quarters on these
+# packs clear 0.41 (2 vs 3 is the tightest). Below that, the quarter stays unknown.
+GATE = {"score": (0.80, 0.08), "clock": (0.75, 0.10), "quarter": (0.75, 0.30)}
 QUARTERS = {"1": 1, "2": 2, "3": 3, "4": 4, "OT": 5}  # 2ND has no crop from match-20261017-091651 (templates stay the 010703 ones)
+# A digit is 5–8 px wide. "OT" is the whole ordinal (~9). A "1ST" whose suffix touches the digit is ~12 and must
+# be cut back to the digit; classifying that fused blob is what made 2ND read as 1ST.
+QUARTER_DIGIT_MAX_W = 8
+QUARTER_BLOB_MAX_W = 10
 
 
 def _fr(**kw):
@@ -107,8 +114,38 @@ def quarter_mask(hsv):
 
 
 def quarter_glyph(hsv):
-    gs = components(quarter_mask(hsv), QUARTER_H, min_area=6)
-    return gs[0] if gs else None
+    """The quarter digit only. A thin bridge to the ordinal suffix (1ST on match-20261017-091651) is cut, and a blob
+    that is still wider than a digit or "OT" is refused so it cannot match another quarter's template."""
+    import cv2
+    m = quarter_mask(hsv).astype(np.uint8)
+    n, lab, st, _ = cv2.connectedComponentsWithStats(m, connectivity=8)
+    cands = []
+    for i in range(1, n):
+        x, y, w, h, a = (int(t) for t in st[i])
+        if QUARTER_H[0] <= h <= QUARTER_H[1] + 4 and a >= 6:
+            cands.append((x, y, w, h, i))
+    if not cands:
+        return None
+    x, y, w, h, i = min(cands)
+    g = lab[y:y + h, x:x + w] == i
+    col = g.sum(axis=0)
+    peak = 0
+    cut = None
+    for c, v in enumerate(int(t) for t in col):
+        peak = max(peak, v)
+        rest = col[c + 1:]
+        if c >= 4 and peak >= 4 and v <= 2 and rest.size and int(rest.max()) >= 4:
+            cut = c
+            break
+    if cut is not None:
+        g = g[:, :cut]
+        cols, rows = np.nonzero(g.any(axis=0))[0], np.nonzero(g.any(axis=1))[0]
+        if len(cols) == 0:
+            return None
+        g = g[rows[0]:rows[-1] + 1, cols[0]:cols[-1] + 1]
+    if g.shape[1] > (QUARTER_DIGIT_MAX_W if cut is not None else QUARTER_BLOB_MAX_W):
+        return None
+    return g.astype(np.uint8)
 
 
 def quarter_suffix(hsv) -> bool:
@@ -195,7 +232,9 @@ class ThursdayNightReader:
             q_reason = "quarter_missing"
         else:
             qlab, _, _ = self.classify("quarter", skeleton(q), QUARTER_SIZE)
-            if qlab is None or qlab not in QUARTERS:
+            # A label with no real template in this pack is not a quarter we can emit (2ND stays the 010703
+            # digit templates; if those do not win clearly, the quarter is unknown rather than borrowed from 1ST).
+            if qlab is None or qlab not in QUARTERS or f"quarter:{qlab}" not in self.source:
                 q_reason = "quarter_unsure"
             else:
                 partial["quarter"] = QUARTERS[qlab]

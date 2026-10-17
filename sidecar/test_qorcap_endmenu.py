@@ -306,3 +306,53 @@ def test_result_winner():
     import qorcap_match as qm
     assert [qm.result_winner(*p) for p in [(3, 1), (1, 3), (2, 2), (None, None), (0, None)]] == \
         ["home", "away", "tie", "unknown", "unknown"]
+
+
+def test_finalize_aggregates_091651_end_menu_to_confirmed_ot_final(capsys):
+    """The 31 handoff end screens, through the same aggregation finalize uses.
+
+    The live timeline ended on a score lock whose quarter glyph had failed (null) after a real OT 10-16 read.
+    That null quarter used to drop the menu with no log line and leave result.quarter null.
+    """
+    import qorcap_match as qm
+    from qor_receipt.final_detect import detect_final
+    folder = HERE / "fixtures" / "tnp_091651_end_menu"
+    paths = sorted(folder.glob("*.jpg"))
+    assert len(paths) == 31, len(paths)
+    frames = [(i * 250, cv2.imread(str(p))) for i, p in enumerate(paths)]
+
+    def factory(post):
+        core = ReaderCore(post, None, None, Paused(), detect_final, final_screen_detector=madden_final_screen,
+                          end_menu_reader=R)
+        core.timeline = [
+            {"t_ms": 1_000, "home": 16, "away": 10, "quarter": 5, "clock_s": 115, "clock_red": False},
+            {"t_ms": 2_000, "home": 16, "away": 10, "quarter": None, "clock_s": 115, "clock_red": False},
+        ]
+        return core
+
+    events, stats = qm.run_offline_reader(frames, 0, factory)
+    assert stats["end_menu_reads"] == 31 and stats["final_screen"] == 31 and stats["errors"] == 0
+    fin = next(e for e in events if qm.is_end_menu_final(e))
+    assert (fin["away"], fin["home"], fin["quarter"], fin["final_confirmed"]) == (10, 16, 5, True)
+    reads = [
+        {"t_ms": 1_000, "home": 16, "away": 10, "quarter": 5, "clock_s": 115},
+        {"t_ms": 2_000, "home": 16, "away": 10, "quarter": None, "clock_s": 115},
+    ]
+    res = qm.apply_final({"home_score": None, "away_score": None, "quarter": None, "final_t_ms": 1,
+                          "winner": "unknown", "method": "last_scorebug_read_unconfirmed"}, fin,
+                         fallback=qm.last_reliable_read(reads))
+    assert res["method"] == "end_menu_read" and res["final_confirmed"] is True
+    assert (res["away_score"], res["home_score"], res["quarter"], res["winner"]) == (10, 16, 5, "home")
+    # No menu final: the receipt quarter still comes from the last read that had one.
+    bare = qm.apply_final({"quarter": None, "final_t_ms": 1}, None, fallback=qm.last_reliable_read(reads))
+    assert bare["quarter"] == 5 and bare["method"] == "last_scorebug_read_unconfirmed"
+    assert "END MENU rejected" not in capsys.readouterr().err
+
+
+def test_end_menu_rejection_is_logged(capsys):
+    core, posts = _core({"t_ms": 0, "home": 20, "away": 0, "quarter": 4, "clock_s": 30, "clock_red": False})
+    for k in range(6):
+        core.on_frame(10_000 + k * 500, RST)
+    err = capsys.readouterr().err
+    assert "END MENU rejected:" in err and "clock not 0:00" in err
+    assert not any(p.get("basis") == "end_menu" for p in posts)
