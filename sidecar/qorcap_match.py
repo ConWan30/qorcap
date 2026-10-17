@@ -929,8 +929,9 @@ def offer_submit(bundle: Path, referee_url: str | None, *, auto: bool = False, a
 def fill_challenge_results(bundle: Path, draft: dict, *, ffmpeg: str | None = None, decode: bool = True) -> dict:
     """v0.3.11: re-run every challenge on this bundle before signing.
 
-    v0.3.14 uses the recorder's capture-path pause bound (see ``qorcap_challenge``). The official referee
-    still uses 600 ms; nothing here is submitted to it.
+    v0.3.14 uses the recorder's capture-path pause bound (see ``qorcap_challenge``). v0.3.15 stamps the
+    pause frame from the fragment PTS, not the segment close. The official referee still uses 600 ms
+    and ``segment_ranges``; nothing here is submitted to it.
 
     QorCap <= 0.3.10 always signed ``result: null``, so a correctly answered challenge still verified as
     ``challenge_unanswered`` (match 2026-10-17 #4, 44b8d01f). An ok result goes into the receipt
