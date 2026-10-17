@@ -40,7 +40,7 @@ import urllib.request
 import zipfile
 from pathlib import Path
 
-QORTIME_PIN = "e9c5c952098cc41d7b9636922d93c1edafd2c274"
+QORTIME_PIN = "a67279d6962c6c06249a24edd07f858f663a6884"
 QORTIME_ZIP = f"https://github.com/ConWan30/qortime/archive/{QORTIME_PIN}.zip"
 VERIFY_URL = "https://conwan30.github.io/qortime/verify/"
 REFEREE_KIND = "local-self-attested"
@@ -604,6 +604,9 @@ def open_folder(p: Path) -> None:
         pass
 
 
+EXIT_CODES = {"VERIFIED": 0, "SELF_ATTESTED": 0, "PARTIAL": 0, "FAIL": 2}  # verdicts: contracts/compat.json
+
+
 def overall(qt_status: str, bundle_ok: bool) -> str:
     if not bundle_ok or qt_status == "FAIL":
         return "FAIL"
@@ -954,7 +957,8 @@ def sign_and_report(bundle: Path, draft: dict, cps: list[dict], device, referee,
     say("                It runs in your browser; nothing is uploaded.")
     if not no_open:
         open_folder(bundle)
-    return {"VERIFIED": 0, "PARTIAL": 0, "FAIL": 2}[result]
+    # SELF_ATTESTED is the normal local result since QorTime's trusted-referee allowlist; unknown -> FAIL code.
+    return EXIT_CODES.get(result, 2)
 
 
 # ------------------------------------------------------------------ offline finalize

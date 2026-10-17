@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://conwan30.github.io/qortime/schema/contracts/qorcap-bundle.v0.json",
+  "title": "QorCap bundle.json (fields QorTime reads; extra fields allowed)",
+  "type": "object",
+  "required": ["schema", "qorcap_version"],
+  "properties": {
+    "schema": {"const": "qorcap-bundle/v0"},
+    "qorcap_version": {"type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+"},
+    "match_id": {"type": ["string", "null"]},
+    "role": {"enum": ["home", "away"]},
+    "receipt_draft_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "input_proof_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  }
+}
