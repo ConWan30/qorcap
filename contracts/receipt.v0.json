@@ -40,9 +40,9 @@
       "type": "object", "additionalProperties": false,
       "required": ["home_score", "away_score", "quarter", "final_t_ms", "winner", "method"],
       "properties": {
-        "home_score": {"type": "integer", "minimum": 0}, "away_score": {"type": "integer", "minimum": 0},
-        "quarter": {"type": "integer", "minimum": 4}, "final_t_ms": {"$ref": "#/$defs/ms"},
-        "winner": {"$ref": "#/$defs/role"},
+        "home_score": {"type": ["integer", "null"], "minimum": 0}, "away_score": {"type": ["integer", "null"], "minimum": 0},
+        "quarter": {"type": ["integer", "null"], "minimum": 1}, "final_t_ms": {"$ref": "#/$defs/ms"},
+        "winner": {"enum": ["home", "away", "tie", "unknown"]},
         "method": {"enum": ["agreed_scorebug_final", "end_menu_read", "last_scorebug_read_unconfirmed"]},
         "final_basis": {"enum": ["clock_zero", "scorebug_gone", "final_screen", "end_menu"]},
         "final_confirmed": {"type": "boolean"},

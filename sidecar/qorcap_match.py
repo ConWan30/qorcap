@@ -933,7 +933,9 @@ def sign_and_report(bundle: Path, draft: dict, cps: list[dict], device, referee,
     say(f"  RESULT: {result}")
     say("=" * 64)
     unconfirmed = no_final or draft["result"].get("final_confirmed") is not True
-    say(f"  Score:        AWAY {r['away_score']} - HOME {r['home_score']}" + (
+    score_txt = ("not read (no scorebug read during the match)" if r.get("home_score") is None else
+                 f"AWAY {r['away_score']} - HOME {r['home_score']}" + ("  (tie)" if r.get("winner") == "tie" else ""))
+    say(f"  Score:        {score_txt}" + (
         "   (final NOT confirmed — last scorebug read)" if no_final else
         f"   (scorebug final via {r.get('final_basis')}; end-of-game menu not read: NOT confirmed)" if unconfirmed else
         "   (final read from the end-of-game menu)"))
@@ -1093,6 +1095,14 @@ def default_core_factory(post):
 END_MENU_WAIT_S = 120  # after a scorebug final, keep recording this long for the end-of-game menu (authoritative)
 
 
+def result_winner(home, away) -> str:
+    """``result.winner``: "home" / "away", "tie" on equal scores, "unknown" when no score was read (QorTime
+    receipt.v0 from 2026-10-17; before that a tie or a no-read 0-0 was drafted as an "away" win)."""
+    if home is None or away is None:
+        return "unknown"
+    return "home" if home > away else "away" if away > home else "tie"
+
+
 def is_end_menu_final(f: dict | None) -> bool:
     return bool(f) and (f.get("basis") == "end_menu" or f.get("method") == "end_menu_read")
 
@@ -1103,9 +1113,15 @@ def apply_final(res: dict, fin: dict | None, *, fallback: dict | None = None) ->
     res = {k: v for k, v in res.items() if k not in ("final_basis", "final_confirmed", "scorebug_last", "notes")}
     src = fin or fallback
     if src:
-        q = max(4, int(src["quarter"])) if fin else max(1, int(src["quarter"]))
+        if fin:
+            q = max(4, int(src["quarter"]))           # a final is in the 4th quarter or later (OT = 5)
+        else:
+            q = int(src["quarter"]) if src.get("quarter") is not None and int(src["quarter"]) >= 1 else None
         res.update(home_score=src["home"], away_score=src["away"], quarter=q, final_t_ms=src["t_ms"],
-                   winner="home" if src["home"] > src["away"] else "away")
+                   winner=result_winner(src["home"], src["away"]))
+    else:
+        # keep QorCap's drafted last read (null scores/quarter when nothing was read); winner from those scores
+        res["winner"] = result_winner(res.get("home_score"), res.get("away_score"))
     if is_end_menu_final(fin):
         # Respect ReaderCore's corroboration gate for one-legal-step deltas.
         confirmed = fin.get("final_confirmed")

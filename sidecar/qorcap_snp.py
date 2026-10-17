@@ -24,7 +24,7 @@ from typing import Any
 
 import numpy as np
 
-from qorcap_mnp import _fr as _mnp_fr, norm_vec, split_pair, to_ref
+from qorcap_mnp import _fr as _mnp_fr, norm_vec, to_ref
 
 PROFILE_ID = "madden27_sunday_night"
 PACK = Path(__file__).resolve().parent / "packs" / "madden27_sunday_night_v1.npz"
@@ -39,13 +39,13 @@ SCORE_X = {"away": (499, 564), "home": (716, 787)}   # excludes the field gaps a
 SCORE_Y = (662, 704)
 QUARTER_X, QUARTER_Y = (583, 611), (684, 702)
 CLOCK_X, CLOCK_Y = (609, 654), (684, 702)
-SCORE_SIZE, CLOCK_SIZE, QUARTER_SIZE = (12, 20), (8, 14), (24, 12)
+SCORE_SIZE, CLOCK_SIZE, QUARTER_SIZE = (12, 20), (8, 14), (8, 14)
 SCORE_H, CLOCK_H = (18, 27), (10, 16)
 SCORE_MAX_W, CLOCK_MAX_W = 16, 10
 INK, SAT = 150, 90                   # white digits (low saturation) on black or team-colour panels
-QUARTER_INK = 100                    # ordinal suffix is grey
-GATE = {"score": (0.80, 0.08), "clock": (0.75, 0.10), "quarter": (0.85, 0.08)}
-QUARTERS = {"1ST": 1, "2ND": 2, "3RD": 3, "4TH": 4, "OT": 5}
+QUARTER_INK = 100                    # quarter ordinal: thin digit + grey superscript suffix
+GATE = {"score": (0.80, 0.08), "clock": (0.75, 0.10), "quarter": (0.75, 0.12)}
+QUARTERS = {"1": 1, "2": 2, "3": 3, "4": 4}   # "OT" has no digit -> quarter_unsure (fail closed)
 NOT_VISIBLE = {"layout_unknown", "frame_invalid", "frame_too_small", "frame_aspect"}
 
 
@@ -114,13 +114,35 @@ def clear_colons(m):
     return out
 
 
-def components(mask, hrange, max_w=None, min_area=12):
-    """Glyph masks (left to right) with heights in ``hrange``; None entries = clipped/oversize blobs."""
+def _split(mask, patch, max_w):
+    """Two touching glyphs -> split at the weakest ink column of the middle third (same rule as the Monday Night
+    reader's split_pair); returns (mask, patch) pairs trimmed to their ink."""
+    w = mask.shape[1]
+    if max_w is None or w <= max_w:
+        return [(mask, patch)]
+    a, b = w // 3, w - w // 3
+    c = a + int(np.argmin(mask[:, a:b].sum(axis=0)))
+    out = []
+    for lo, hi in ((0, c), (c + 1 if mask[:, c].any() else c, w)):
+        pm = mask[:, lo:hi]
+        cols, rows = np.nonzero(pm.any(axis=0))[0], np.nonzero(pm.any(axis=1))[0]
+        if len(cols) == 0:
+            return [(mask, patch)]
+        sl = (slice(rows[0], rows[-1] + 1), slice(lo + cols[0], lo + cols[-1] + 1))
+        out.append((mask[sl], patch[sl]))
+    return out
+
+
+def components(mask, hrange, max_w=None, min_area=12, gray=None):
+    """Glyph patches (left to right) with heights in ``hrange``; None entries = clipped/oversize blobs. With ``gray``
+    (a 0..255 map of the same region) a patch is the grey glyph (gray/255 inside the 1-px-dilated component), which
+    keeps the partly filled counters of the heavy primetime font (5 vs 6, 3 vs 8); else the binary mask."""
     import cv2
     m = mask.astype(np.uint8)
     n, lab, st, _ = cv2.connectedComponentsWithStats(m, connectivity=8)
     out = []
     W = m.shape[1]
+    k = np.ones((3, 3), np.uint8)
     for i in range(1, n):
         x, y, w, h, a = (int(t) for t in st[i])
         if h < hrange[0] or a < min_area:
@@ -129,28 +151,67 @@ def components(mask, hrange, max_w=None, min_area=12):
             out.append((x, None))
             continue
         g = (lab[y:y + h, x:x + w] == i).astype(np.uint8)
-        for k, part in enumerate(split_pair(g, max_w) if max_w else [g]):
-            if part.shape[0] >= hrange[0]:
-                out.append((x + k * 0.5, part))
+        if gray is not None:
+            sel = cv2.dilate((lab == i).astype(np.uint8), k)[y:y + h, x:x + w]
+            patch = np.asarray(gray, np.float32)[y:y + h, x:x + w] / 255.0 * sel
+        else:
+            patch = g
+        for j, (pm, pp) in enumerate(_split(g, patch, max_w)):
+            if pm.shape[0] >= hrange[0]:
+                out.append((x + j * 0.5, pp))
     return [g for _, g in sorted(out, key=lambda t: t[0])]
 
 
 def score_glyphs(hsv, side):
     x0, x1 = SCORE_X[side]
-    return components(white(hsv)[SCORE_Y[0]:SCORE_Y[1], x0:x1], SCORE_H, max_w=SCORE_MAX_W)
+    reg = hsv[SCORE_Y[0]:SCORE_Y[1], x0:x1]
+    # grey = whiteness (value scaled down by saturation) so the red/colour panel itself stays dark
+    grey = (reg[..., 2].astype(np.float32) * (1.0 - reg[..., 1].astype(np.float32) / 255.0)).clip(0, 255)
+    return components(white(reg), SCORE_H, max_w=SCORE_MAX_W, gray=grey)
 
 
 def clock_glyphs(hsv):
-    m = hsv[CLOCK_Y[0]:CLOCK_Y[1], CLOCK_X[0]:CLOCK_X[1], 2] > clock_thr(hsv)   # black box: value only (red clock)
-    return components(clear_colons(m), CLOCK_H, max_w=CLOCK_MAX_W)
+    v = hsv[CLOCK_Y[0]:CLOCK_Y[1], CLOCK_X[0]:CLOCK_X[1], 2]
+    m = clear_colons(v > clock_thr(hsv))   # black box: value only (a red final-minute clock still reads)
+    return components(m, CLOCK_H, max_w=CLOCK_MAX_W, gray=v * (m.any(axis=0)[None, :] > 0))
+
+
+def skeleton(mask):
+    """1-px morphological skeleton (the quarter digit is a thin font; templates for unseen quarters come from
+    skeletonised clock digits, so both sides are compared as skeletons)."""
+    import cv2
+    img = (np.asarray(mask) > 0).astype(np.uint8)
+    img = cv2.copyMakeBorder(img, 1, 1, 1, 1, cv2.BORDER_CONSTANT, value=0)
+    k = cv2.getStructuringElement(cv2.MORPH_CROSS, (3, 3))
+    sk = np.zeros_like(img)
+    while img.any():
+        er = cv2.erode(img, k)
+        sk |= img - cv2.dilate(er, k)
+        img = er
+    sk = sk[1:-1, 1:-1]
+    ys, xs = np.nonzero(sk)
+    return sk if len(xs) == 0 else sk[ys.min():ys.max() + 1, xs.min():xs.max() + 1]
 
 
 def quarter_glyph(hsv):
+    """The quarter digit: the leftmost tall component in the quarter box (the ordinal suffix is superscript-small)."""
     q = hsv[QUARTER_Y[0]:QUARTER_Y[1], QUARTER_X[0]:QUARTER_X[1], 2] > QUARTER_INK
-    ys, xs = np.nonzero(q)
-    if len(xs) < 15:
-        return None
-    return q[ys.min():ys.max() + 1, xs.min():xs.max() + 1].astype(np.uint8)
+    gs = components(q, CLOCK_H, min_area=8)
+    return gs[0] if gs else None
+
+
+def quarter_suffix(hsv) -> bool:
+    """Ordinal suffix present right of the digit (small grey glyphs in the upper half): guards against reading a
+    stray clock-like digit as the quarter."""
+    q = hsv[QUARTER_Y[0]:QUARTER_Y[1], QUARTER_X[0]:QUARTER_X[1], 2] > QUARTER_INK
+    cols = np.nonzero(q.any(axis=0))[0]
+    if len(cols) == 0:
+        return False
+    rows = np.nonzero(q.any(axis=1))[0]
+    mid = (int(rows[0]) + int(rows[-1])) // 2
+    first_gap = next((c for c in range(int(cols[0]), q.shape[1]) if not q[:, c].any()), q.shape[1])
+    right = q[:, first_gap:]
+    return bool(right[:mid + 1].sum() >= 8 and right[mid + 3:].sum() <= 2)
 
 
 class SundayNightReader:
@@ -214,10 +275,10 @@ class SundayNightReader:
             scores[side] = int(txt)
         partial = dict(left_score=scores["away"], right_score=scores["home"])
         q = quarter_glyph(hsv)
-        if q is None:
+        if q is None or not quarter_suffix(hsv):
             return _fr(ok=False, reason="quarter_missing", **partial)
-        qlab, _, _ = self.classify("quarter", q, QUARTER_SIZE)
-        if qlab is None:
+        qlab, _, _ = self.classify("quarter", skeleton(q), QUARTER_SIZE)
+        if qlab is None or qlab not in QUARTERS:
             return _fr(ok=False, reason="quarter_unsure", **partial)
         cg = clock_glyphs(hsv)
         if not 3 <= len(cg) <= 4 or any(g is None for g in cg):

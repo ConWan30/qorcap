@@ -163,12 +163,27 @@ impl Mp4Splitter {
     }
 }
 
+/// `result.winner` for a score pair: "home" / "away", "tie" on equal scores, "unknown" when no score was read.
+/// (Until v0.3.11 a tie, and "no read at all" as 0-0, were drafted as an "away" win.)
+pub fn result_winner(home: Option<i64>, away: Option<i64>) -> &'static str {
+    match (home, away) {
+        (Some(h), Some(a)) if h > a => "home",
+        (Some(h), Some(a)) if a > h => "away",
+        (Some(_), Some(_)) => "tie",
+        _ => "unknown",
+    }
+}
+
 /// Build a draft, UNSIGNED `qor-receipt/v0` receipt from what QorCap observed.
 /// Keys, referee countersignatures, challenge verdicts and signatures are left
 /// for QorTime (agent/referee) to fill; placeholders are all-zero / null.
 pub fn draft_receipt(match_id: &str, role: &str, player_id: &str, started_ms: u64, ended_ms: u64, fin: &Value, challenges: &[Value]) -> Value {
-    let (h, a) = (fin["home"].as_i64().unwrap_or(0), fin["away"].as_i64().unwrap_or(0));
-    let winner = if h > a { "home" } else { "away" };
+    let (h, a) = (fin["home"].as_i64(), fin["away"].as_i64());
+    let winner = result_winner(h, a);
+    // A final (clock 0:00 / end menu) is in the 4th quarter or later; an unconfirmed last read keeps the quarter it
+    // actually showed (or null when nothing was read) instead of being forced to 4.
+    let quarter = if fin["unconfirmed"] == true { fin["quarter"].as_i64().filter(|q| *q >= 1).map(Value::from).unwrap_or(Value::Null) }
+                  else { json!(fin["quarter"].as_i64().unwrap_or(4).max(4)) };
     let ch: Vec<Value> = challenges.iter().map(|c| json!({
         "id": c["id"], "role": c["role"], "phase": c["phase"], "nonce": c["nonce"], "pattern": c["pattern"],
         "issued_ms": c["issued_ms"], "deadline_ms": c["deadline_ms"], "result": Value::Null })).collect();
@@ -176,7 +191,7 @@ pub fn draft_receipt(match_id: &str, role: &str, player_id: &str, started_ms: u6
         "schema": "qor-receipt/v0",
         "match": {"match_id": match_id, "game": "madden27", "platform": "ps5", "scorebug_profile": "madden27_standard",
                   "mode": "single", "started_ms": started_ms, "ended_ms": ended_ms},
-        "result": {"home_score": h, "away_score": a, "quarter": fin["quarter"].as_i64().unwrap_or(4).max(4),
+        "result": {"home_score": h, "away_score": a, "quarter": quarter,
                    "final_t_ms": fin["t_ms"], "winner": winner, "method": "agreed_scorebug_final", "final_basis": fin["basis"]},
         "players": [{"role": role, "player_id": player_id, "pubkey": GENESIS, "key_kind": "software"}],
         "referee": {"pubkey": GENESIS, "key_id": "0000000000000000", "key_kind": "unset"},
@@ -192,6 +207,22 @@ pub fn draft_receipt(match_id: &str, role: &str, player_id: &str, started_ms: u6
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn draft_winner_tie_and_unknown_are_not_away() {
+        assert_eq!(result_winner(Some(7), Some(3)), "home");
+        assert_eq!(result_winner(Some(3), Some(7)), "away");
+        assert_eq!(result_winner(Some(7), Some(7)), "tie");
+        assert_eq!(result_winner(None, None), "unknown");
+        let tie = draft_receipt("m1", "home", "p", 1, 2, &json!({"home": 7, "away": 7, "quarter": 1, "t_ms": 2, "basis": null, "unconfirmed": true}), &[]);
+        assert_eq!(tie["result"]["winner"], "tie");
+        assert_eq!(tie["result"]["quarter"], 1); // real quarter kept, not forced to 4
+        let none = draft_receipt("m1", "home", "p", 1, 2, &json!({"home": null, "away": null, "quarter": null, "t_ms": 2, "basis": null, "unconfirmed": true}), &[]);
+        assert_eq!((none["result"]["winner"].as_str(), none["result"]["quarter"].is_null()), (Some("unknown"), true));
+        assert!(none["result"]["home_score"].is_null() && none["result"]["away_score"].is_null());
+        let fin = draft_receipt("m1", "home", "p", 1, 2, &json!({"home": 21, "away": 21, "quarter": 5, "t_ms": 2, "basis": "end_menu"}), &[]);
+        assert_eq!((fin["result"]["winner"].as_str(), fin["result"]["quarter"].as_i64()), (Some("tie"), Some(5)));
+    }
+
     #[test]
     fn jcs_matches_qortime_vector() {
         let v: Value = serde_json::from_str(include_str!("../tests/vectors/jcs_vector.json")).unwrap();

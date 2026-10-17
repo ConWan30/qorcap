@@ -12,8 +12,9 @@ vendored reader: binary glyph components, ``norm_vec`` (resize, zero-mean, L2) a
 real frames of that match (``packs/madden27_monday_night_v1.npz``, tools/make_monday_night_pack.py), best/margin
 gate, fail closed. AWAY is on the LEFT, HOME on the right (as in the standard bug).
 
-Only the Monday Night variant is verified. Sunday Night / Thursday Night primetime overlays are NOT verified and
-read as ``layout_unknown`` here (fail closed).
+Only the Monday Night variant is read here; other primetime overlays read as ``layout_unknown`` (fail closed). The
+Sunday Night overlay has its own profile (qorcap_snp.py, ``madden27_sunday_night``) and so does Thursday Night
+(qorcap_tnp.py, ``madden27_thursday_night``); AutoProfileReader tries both.
 """
 from __future__ import annotations
 
@@ -230,15 +231,22 @@ class MondayNightReader:
                    score_conf=round(conf, 3), score_margin=round(margin, 3))
 
 
+def default_extra_readers() -> list:
+    """Primetime profiles tried after QorTime's standard reader, in order: Monday Night, Sunday Night (v0.3.11)."""
+    from qorcap_snp import SundayNightReader
+    from qorcap_tnp import ThursdayNightReader
+    return [MondayNightReader(), SundayNightReader(), ThursdayNightReader()]
+
+
 class AutoProfileReader:
     """Reads with QorTime's ``madden27_standard`` reader unchanged; when that layout is not on screen, tries the
-    Monday Night profile. Whichever profile yields agreed-quality reads becomes ``active`` (sticky, so the other is
+    primetime profiles (Monday Night, then Sunday Night). Whichever profile yields agreed-quality reads becomes ``active`` (sticky, so the other is
     only tried when the active one stops seeing its layout). ``profile_counts`` is reported in the bundle."""
 
     wants_full_res = True
 
     def __init__(self, standard, extra: list | None = None, prep=None) -> None:
-        self.readers = [standard] + list(extra if extra is not None else [MondayNightReader()])
+        self.readers = [standard] + list(extra if extra is not None else default_extra_readers())
         self.prep = prep  # downscale applied to frames for the standard reader (keeps it bit-identical to before)
         self.active = 0
         self.profile_counts: dict[str, int] = {}

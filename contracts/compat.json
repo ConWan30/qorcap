@@ -47,7 +47,12 @@
   },
   "result_methods": ["agreed_scorebug_final", "end_menu_read", "last_scorebug_read_unconfirmed"],
   "final_basis": ["clock_zero", "scorebug_gone", "final_screen", "end_menu"],
-  "scorebug_profiles": ["madden27_standard", "madden27_monday_night"],
+  "scorebug_profiles": ["madden27_standard", "madden27_monday_night", "madden27_sunday_night", "madden27_thursday_night"],
+  "result_rules": {"winner": ["home", "away", "tie", "unknown"],
+                   "rules": ["equal scores -> tie (legacy receipts with away on a tie still verify)",
+                             "last_scorebug_read_unconfirmed with no score read -> scores null, winner unknown",
+                             "last_scorebug_read_unconfirmed keeps the real quarter (>= 1) or null; never forced to 4",
+                             "agreed_scorebug_final / end_menu_read need quarter >= 4"]},
   "official_referee": {"id": "qortime-v1", "key_id": "53eea1b5d23b1ff0",
                        "pubkey": "a5aa0c9121db2c517284bf1c49eeec199829ca832a2b665f26e872e01192feea",
                        "role": "offline root (can_delegate); the service signs with a delegated online key"},
@@ -59,5 +64,5 @@
                   "request_type": "qortime-submit/v1", "pow_prefix": "qortime-pow/v1|", "min_client": "0.3.10",
                   "legacy_status": 426, "install_key": "the bundle's device (recorder) key"},
   "referee_image": {"qorcap_sidecar_sha": "739efbf3cc71cfce6a828c4c3b5a8eb8fd8433b5",
-                    "scorebug_profiles": ["madden27_standard", "madden27_monday_night"]}
+                    "scorebug_profiles": ["madden27_standard", "madden27_monday_night", "madden27_sunday_night", "madden27_thursday_night"]}
 }

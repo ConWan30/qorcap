@@ -325,7 +325,8 @@ def submit(bundle: Path, *, base: str, full: bool = False, key_path: Path | None
     say("\n" + "=" * 64)
     say(f"  OFFICIAL RESULT: {v['status']}   (QorTime referee {v.get('referee_id') or final['referee']['pubkey'][:16]})")
     say("=" * 64)
-    say(f"  Score:     AWAY {res['away_score']} - HOME {res['home_score']}  ({res.get('method')})")
+    sc = "not read" if res.get("home_score") is None else f"AWAY {res['away_score']} - HOME {res['home_score']}"
+    say(f"  Score:     {sc}  ({res.get('method')})")
     say(f"  Basis:     {(final.get('review') or {}).get('scope')}")
     if v.get("partial"):
         say(f"  Missing:   {', '.join(v['partial'][:6])}")
