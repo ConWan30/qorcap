@@ -62,6 +62,7 @@ def _env(tmp_path, tokens=True, core=None):
             toks.append(ref.issue_challenge(ph, "home", "local-test-review"))
     fx = F.build(tmp_path / "match-1", challenge_tokens=toks or None)
     clock["t"] = F.W0 + 120_000
+    os.environ["QORTIME_POW_BITS_UNKNOWN"] = "8"  # keep the hashcash cheap in tests (production: 20 bits)
     tc = TestClient(create_app(ref))
     return F, key, fx, qs.Client("http://referee.test", opener=_opener(tc))
 
@@ -142,3 +143,73 @@ def test_offer_submit_needs_explicit_yes(tmp_path, capsys):
 
     assert qm.offer_submit(tmp_path, None, ask=lambda _p: "") is None
     assert "Not submitted" in capsys.readouterr().out
+
+
+def test_submit_is_install_key_signed_and_unsigned_is_refused(tmp_path, capsys):
+    """0.3.10: the POST carries X-Qor-Submit signed by the device (recorder) key; an unsigned POST (<= 0.3.9) gets 426."""
+    F, key, fx, client = _env(tmp_path)
+    seen = []
+    inner = client._open
+
+    def spy(rq, timeout=None):
+        seen.append((rq.get_method(), rq.full_url, dict(rq.header_items())))
+        return inner(rq, timeout=timeout)
+    client._open = spy
+    assert qs.submit(tmp_path / "match-1", base="http://referee.test", client=client, device=fx["device"]) == 1
+    post = next(h for m, u, h in seen if m == "POST" and "/v1/submissions?" in u)
+    hv = next(v for k, v in post.items() if k.lower() == "x-qor-submit")
+    import base64
+    h = json.loads(base64.urlsafe_b64decode(hv + "=" * (-len(hv) % 4)))
+    assert h["pub"] == fx["device"].pubkey_hex
+    legacy = qs.Client("http://referee.test", opener=inner)
+    with pytest.raises(qs.RefereeError) as ei:
+        legacy.call("POST", "/v1/submissions?mode=spot-check", qs.meta_zip(tmp_path / "match-1"), "application/zip")
+    assert ei.value.code == 426 and "0.3.10" in json.dumps(ei.value.body)
+
+
+def test_submit_from_another_pc_key_is_rejected(tmp_path, capsys):
+    from qor_receipt.keys import SoftwareKey
+
+    F, key, fx, client = _env(tmp_path)
+    code = qs.submit(tmp_path / "match-1", base="http://referee.test", client=client, device=SoftwareKey())
+    out = capsys.readouterr().out
+    assert code == 2 and "REJECTED" in out and "recorder" in out
+
+
+def test_client_signature_matches_qortime_guard():
+    """Contract: QorCap's own X-Qor-Submit encoder verifies under QorTime's SubmitGuard (no drift)."""
+    from qor_receipt.keys import SoftwareKey
+    from qor_receipt.referee_service import submit_auth as A
+
+    assert qs.SUBMIT_TYPE == A.SUBMIT_TYPE and qs.POW_PREFIX == A.POW_PREFIX
+    k = SoftwareKey()
+    g = A.SubmitGuard(require_recorder_match=False)
+    g.pow_unknown = 6
+    ch = g.challenge(k.pubkey_hex)
+    body, head = b"zip-bytes", "ab" * 32
+    hv = qs.submit_auth_header(k, path="/v1/submissions?mode=full", body=body, bundle_head=head, nonce=ch["nonce"],
+                               pow_=qs.solve_pow(ch["nonce"], k.pubkey_hex, 6))
+    h = g.precheck(hv)
+    files = {"manifest.jsonl": b""}
+    with pytest.raises(A.AuthError):  # head mismatch caught (manifest bytes differ)
+        g.verify_body(h, method="POST", path="/v1/submissions?mode=full", body=body, files=files)
+    import hashlib
+    hv2 = qs.submit_auth_header(k, path="/p", body=body, bundle_head=hashlib.sha256(b"m").hexdigest(),
+                                nonce=g.challenge(k.pubkey_hex)["nonce"], pow_="0")
+    g.pow_unknown = 0
+    g.verify_body(g.precheck(hv2), method="POST", path="/p", body=body, files={"manifest.jsonl": b"m"})
+
+
+def test_official_key_status_accepts_only_root_or_valid_delegation():
+    from qor_receipt import delegation as D
+    from qor_receipt.keys import SoftwareKey
+
+    assert qs.official_key_status({"pubkey": qs.OFFICIAL_PUB})[0]
+    other = SoftwareKey()
+    ok, why = qs.official_key_status({"pubkey": other.pubkey_hex})
+    assert not ok
+    fake_root = SoftwareKey()
+    cert = D.make_delegation(fake_root, root_id="qortime-v1", delegate_pubkey=other.pubkey_hex, delegate_id="x",
+                             serial=1, not_before_ms=0, not_after_ms=10**13 // 100)
+    ok, why = qs.official_key_status({"pubkey": other.pubkey_hex, "delegation": cert})
+    assert not ok and "delegation" in why

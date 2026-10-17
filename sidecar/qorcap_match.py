@@ -40,7 +40,7 @@ import urllib.request
 import zipfile
 from pathlib import Path
 
-QORTIME_PIN = "a67279d6962c6c06249a24edd07f858f663a6884"
+QORTIME_PIN = "a57aa3db47be5261b99b0b2c5968faee2a221cde"
 QORTIME_ZIP = f"https://github.com/ConWan30/qortime/archive/{QORTIME_PIN}.zip"
 VERIFY_URL = "https://conwan30.github.io/qortime/verify/"
 REFEREE_KIND = "local-self-attested"

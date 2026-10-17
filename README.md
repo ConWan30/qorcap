@@ -232,6 +232,32 @@ referee can prove the bytes are what you recorded, not that they were recorded l
 check: a doctored region of fraction f slips through with probability about (1-f)^16 plus the tail and challenge
 segments. Details: QorTime `docs/REFEREE_SERVICE.md`.
 
+### Signed submissions (v0.3.10)
+
+From v0.3.10 every submission is signed by this PC's **install key**. That is the same Ed25519 device key that
+recorded the match, stored in the QorCap data folder as `keys/device.key`. You don't need an account.
+
+How a submission works:
+
+1. QorCap asks the referee for a single-use nonce.
+2. It solves a small proof-of-work, which takes about a second.
+3. It signs the timestamp, the nonce, the zip hash and the bundle's manifest hash.
+
+What the referee enforces:
+
+- It rejects replayed requests.
+- It rate-limits each install key (new keys get a low quota) and caps the total number of submissions.
+- It accepts the submission only when the signing key is the bundle's recorder key.
+
+**v0.3.9 and older can no longer submit.** They get `HTTP 426: QorCap 0.3.10 or newer is required`.
+
+The referee now signs with a short-lived online key that the offline QorTime root key `qortime-v1` delegates to.
+QorCap checks that delegation locally before uploading. Each countersigned receipt is also added to the referee's
+public transparency log, and QorCap prints the entry number. See QorTime `docs/REFEREE_KEYS.md`.
+
+v0.3.10 also includes the v0.3.9 crash fix: Start Match and Finalize no longer exit with code 6 on a SELF_ATTESTED
+verdict (#14).
+
 ## Commands
 
 ```
