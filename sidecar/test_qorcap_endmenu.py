@@ -247,3 +247,35 @@ def test_collect_feeds_live_match2_window():
     st, last = {"away": 0, "home": 20, "t_ms": 5000}, {"away": 0, "home": 17, "t_ms": 3000}
     got = end_menu_delta_corroborated(st, last, [], corr)
     assert got and got["kind"] in ("haptic", "score_change_clip", "input_activity")
+
+
+# ---- v0.3.11: no invented winner/quarter in unconfirmed drafts
+def test_apply_final_tie_is_tie_and_keeps_real_quarter():
+    import qorcap_match as qm
+    base = {"home_score": 0, "away_score": 0, "quarter": 4, "final_t_ms": 1, "winner": "away", "method": "agreed_scorebug_final"}
+    r = qm.apply_final(base, None, fallback={"home": 7, "away": 7, "quarter": 1, "t_ms": 3})
+    assert (r["home_score"], r["away_score"], r["quarter"], r["winner"]) == (7, 7, 1, "tie")
+    assert r["method"] == "last_scorebug_read_unconfirmed" and r["final_confirmed"] is False
+
+
+def test_apply_final_without_any_read_says_unknown():
+    import qorcap_match as qm
+    drafted = {"home_score": None, "away_score": None, "quarter": None, "final_t_ms": 1, "winner": "unknown",
+               "method": "last_scorebug_read_unconfirmed"}
+    r = qm.apply_final(drafted, None)
+    assert (r["home_score"], r["away_score"], r["quarter"], r["winner"]) == (None, None, None, "unknown")
+    legacy = dict(drafted, home_score=0, away_score=0, quarter=4, winner="away")   # pre-0.3.11 placeholder draft
+    assert qm.apply_final(legacy, None)["winner"] == "tie"
+
+
+def test_apply_final_overtime_tie_final():
+    import qorcap_match as qm
+    em = {"basis": "end_menu", "method": "end_menu_read", "home": 24, "away": 24, "quarter": 5, "t_ms": 5}
+    r = qm.apply_final({"final_t_ms": 1}, em)
+    assert (r["winner"], r["quarter"], r["final_confirmed"]) == ("tie", 5, True)
+
+
+def test_result_winner():
+    import qorcap_match as qm
+    assert [qm.result_winner(*p) for p in [(3, 1), (1, 3), (2, 2), (None, None), (0, None)]] == \
+        ["home", "away", "tie", "unknown", "unknown"]

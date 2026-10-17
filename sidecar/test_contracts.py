@@ -46,8 +46,10 @@ def test_sidecar_constants_match_registry():
     assert qs.OFFICIAL_PUB == COMPAT["official_referee"]["pubkey"]
     assert list(qs.META_FILES) == COMPAT["bundle_files"]["meta"]
     src = (HERE / "qorcap_match.py").read_text(encoding="utf-8")
+    for f in ("qorcap_mnp.py", "qorcap_snp.py", "qorcap_tnp.py"):
+        src += (HERE / f).read_text(encoding="utf-8")
     for prof in COMPAT["scorebug_profiles"]:
-        assert prof in src + (HERE / "qorcap_mnp.py").read_text(encoding="utf-8")
+        assert prof in src
 
 
 def test_every_verdict_has_an_exit_code():

@@ -974,12 +974,13 @@ impl Engine {
             if let Some((h, a, q)) = st.last_score {
                 json!({"home": h, "away": a, "quarter": q, "t_ms": wall_ms(), "basis": Value::Null, "unconfirmed": true})
             } else if let Some(sc) = st.score.as_object() {
-                json!({"home": sc.get("home").and_then(|v| v.as_i64()).unwrap_or(0),
-                       "away": sc.get("away").and_then(|v| v.as_i64()).unwrap_or(0),
-                       "quarter": sc.get("quarter").and_then(|v| v.as_i64()).unwrap_or(4),
+                json!({"home": sc.get("home").and_then(|v| v.as_i64()),
+                       "away": sc.get("away").and_then(|v| v.as_i64()),
+                       "quarter": sc.get("quarter").and_then(|v| v.as_i64()),
                        "t_ms": wall_ms(), "basis": Value::Null, "unconfirmed": true})
             } else {
-                json!({"home": 0, "away": 0, "quarter": 4, "t_ms": wall_ms(), "basis": Value::Null, "unconfirmed": true})
+                // Nothing was read: say so (scores/quarter null, winner "unknown") instead of inventing 0-0 in Q4.
+                json!({"home": Value::Null, "away": Value::Null, "quarter": Value::Null, "t_ms": wall_ms(), "basis": Value::Null, "unconfirmed": true})
             }
         });
         let mut receipt = ev::draft_receipt(&self.args.match_id, &self.args.role, &self.args.player_id, st.started_wall_ms, wall_ms(), &fin, &st.challenges);
