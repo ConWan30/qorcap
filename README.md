@@ -2,7 +2,7 @@
 
 # QorCap
 
-**Website:** https://conwan30.github.io/qorcap/ · **Download:** [v0.3.13](https://github.com/ConWan30/qorcap/releases/tag/v0.3.13) ([latest release](https://github.com/ConWan30/qorcap/releases/latest))
+**Website:** https://conwan30.github.io/qorcap/ · **Download:** [v0.3.14](https://github.com/ConWan30/qorcap/releases/tag/v0.3.14) ([latest release](https://github.com/ConWan30/qorcap/releases/latest))
 
 A small Windows recorder for a USB HDMI capture card (built for a generic **"USB3.0 Video"** card carrying a PS5),
 made for **[QorTime](https://github.com/ConWan30/qortime)** match receipts. It does two jobs:
@@ -26,7 +26,7 @@ with a local control surface). QorCap copies only that design idea, no code. No 
 
 ## Quickstart: double-click Start Match
 
-1. Download `qorcap-v0.3.13-windows-x64.zip` from the [latest release](https://github.com/ConWan30/qorcap/releases/latest)
+1. Download `qorcap-v0.3.14-windows-x64.zip` from the [latest release](https://github.com/ConWan30/qorcap/releases/latest)
    and unzip it, for example to `C:\QorCap` (right-click the zip, *Extract All*).
 2. Connect PS5 HDMI out to the **USB3.0 Video** card, and the card to a blue USB 3 port. Close OBS or the Camera app.
 3. Double-click **`Start Match`**. On the first run it downloads ffmpeg, installs Python 3.12 through winget if it
@@ -317,7 +317,7 @@ Global: `--port 8788`, `--ffmpeg PATH`, `--log FILE` (default `qorcap.log`, or `
 ## Run on Windows by hand (PowerShell, advanced)
 
 ```powershell
-# 1. unzip qorcap-v0.3.13-windows-x64.zip to C:\QorCap, then:
+# 1. unzip qorcap-v0.3.14-windows-x64.zip to C:\QorCap, then:
 cd C:\QorCap
 Unblock-File .\qorcap.exe, .\get-ffmpeg.ps1
 powershell -ExecutionPolicy Bypass -File .\get-ffmpeg.ps1     # puts ffmpeg.exe next to qorcap.exe
@@ -354,6 +354,8 @@ continues), replay save, challenge stamp visible in the video, score/final event
 written, `verify-bundle` OK, and a single flipped byte reported as FAIL.
 
 **Tested on Windows (v0.2.0–v0.2.1 era, MyTurn, USB3.0 Video):** `--input-format mjpeg` 1280x720@30 with `h264_mf` at 29.7 fps. v0.2.1 fixed audio / auto-format / OBS.
+
+**v0.3.14:** the standard bottom scorebug keeps reading when the score uses a 2 or a 3 (those glyphs on the London HOU–JAX bar were under the old template gate, so the timeline went blank for several minutes). A "1ST DOWNS" stat banner in the score cells stays unreadable. The standard end-of-game menu reads the final and confirms it once the scorebug clock is 0:00 or already red in the last five seconds. The recorder's challenge recheck accepts the pause menu up to 2.5 seconds after OPTIONS: on a USB capture card with the controller on Bluetooth the menu is on the video at about 1.75 seconds, and the previous luma cap missed the brighter end-of-game pause screen. A quarter labeled 1 after the game clock has already run down fails closed. `inputs.jsonl` is opened so other readers can share it, and a sharing violation is retried instead of dropping an input chunk.
 
 **v0.3.13:** the Thursday Night end screen confirms 10–16 OT when the last score lock has no quarter (that lock no longer erases the OT read, and a rejected end-menu candidate is logged). A quarter glyph is emitted only when its own template wins by a clear margin — a fused ordinal is not labeled as another quarter — and a quarter never goes backwards. The receipt quarter comes from that confirmed final, or from the last read that had one.
 

@@ -349,6 +349,29 @@ def test_finalize_aggregates_091651_end_menu_to_confirmed_ot_final(capsys):
     assert "END MENU rejected" not in capsys.readouterr().err
 
 
+def test_standard_end_menu_reads_and_confirms_hou_30_jax_6():
+    """match-20261017-110028: standard end menu, last scorebug clock 0:03 red, exact 30-6."""
+    import qorcap_match as qm
+    im = cv2.imread(str(HERE / "fixtures" / "m27_std_110028_end_menu.jpg"))
+    assert madden_final_screen(prep(im))
+    rd = R.read(im)
+    assert rd.ok and (rd.away, rd.home) == (30, 6), rd
+    core, posts = _core({"t_ms": 0, "home": 6, "away": 30, "quarter": 4, "clock_s": 3, "clock_red": True})
+    for k in range(6):
+        core.on_frame(10_000 + k * 500, im)
+    f = [p for p in posts if p.get("basis") == "end_menu"][0]
+    assert (f["away"], f["home"], f["quarter"], f["final_confirmed"]) == (30, 6, 4, True)
+    assert f["delta_corroboration"]["kind"] == "exact_match"
+    res = qm.apply_final({"final_t_ms": 1}, f)
+    assert (res["away_score"], res["home_score"], res["quarter"], res["winner"]) == (30, 6, 4, "away")
+    # A red 0:14 is still a running quarter.
+    core, posts = _core({"t_ms": 0, "home": 6, "away": 30, "quarter": 4, "clock_s": 14, "clock_red": True})
+    for k in range(6):
+        core.on_frame(10_000 + k * 500, im)
+    assert not any(p.get("basis") == "end_menu" for p in posts)
+    assert "clock not 0:00" in core.end_menu_rejected["why"]
+
+
 def test_end_menu_rejection_is_logged(capsys):
     core, posts = _core({"t_ms": 0, "home": 20, "away": 0, "quarter": 4, "clock_s": 30, "clock_red": False})
     for k in range(6):
