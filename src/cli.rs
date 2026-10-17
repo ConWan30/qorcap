@@ -45,6 +45,10 @@ pub enum Cmd {
         /// Python interpreter (default: QorCap's venv, then py/python3/python)
         #[arg(long)]
         python: Option<String>,
+        /// Rebuild receipt.draft.json and bundle.json from the on-disk hash chain, checkpoints,
+        /// inputs, challenges and timeline. Video bytes after the last hashed segment are excluded.
+        #[arg(long)]
+        recover: bool,
         /// Extra arguments passed to the finalizer (e.g. --qortime DIR)
         #[arg(last = true)]
         rest: Vec<String>,

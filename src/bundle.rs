@@ -32,6 +32,63 @@ fn lines_resilient(p: &Path, salvage: bool) -> Result<Vec<Value>, String> {
     Ok(out)
 }
 
+struct ExcludedTail { file: String, covered: u64, tail_bytes: u64, sha: String }
+
+fn recorded_tails(dir: &Path) -> Vec<ExcludedTail> {
+    let Ok(s) = std::fs::read_to_string(dir.join("bundle.json")) else { return vec![] };
+    let Ok(v) = serde_json::from_str::<Value>(&s) else { return vec![] };
+    let Some(arr) = v.get("excluded_tails").and_then(|x| x.as_array()) else { return vec![] };
+    arr.iter().filter_map(|t| {
+        Some(ExcludedTail {
+            file: t.get("file")?.as_str()?.to_string(),
+            covered: t.get("covered_bytes")?.as_u64()?,
+            tail_bytes: t.get("tail_bytes")?.as_u64()?,
+            sha: t.get("tail_sha256")?.as_str()?.to_string(),
+        })
+    }).collect()
+}
+
+/// Bytes past the last hashed segment of each video file. The tail is named and hashed so
+/// `verify` can accept exactly those bytes and reject anything else. Nothing is added to the chain.
+pub fn measure_excluded_tails(dir: &Path) -> Vec<Value> {
+    let Ok(man) = lines(&dir.join("manifest.jsonl")) else { return vec![] };
+    let mut end: std::collections::BTreeMap<String, u64> = Default::default();
+    for m in man.iter().filter(|m| m["type"] == "segment") {
+        let file = match m["file"].as_str() { Some(f) if !f.is_empty() => f, _ => continue };
+        let e = m["offset"].as_u64().unwrap_or(0).saturating_add(m["bytes"].as_u64().unwrap_or(0));
+        end.entry(file.to_string()).and_modify(|x| *x = (*x).max(e)).or_insert(e);
+    }
+    let mut out = Vec::new();
+    for (file, covered) in end {
+        let path = dir.join(&file);
+        let real = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        if real <= covered { continue; }
+        let extra = real - covered;
+        let Ok(sha) = sha256_range(&path, covered, extra) else { continue };
+        out.push(serde_json::json!({
+            "file": file, "covered_bytes": covered, "tail_bytes": extra, "tail_sha256": sha,
+        }));
+    }
+    out
+}
+
+fn sha256_range(path: &Path, start: u64, len: u64) -> Result<String, String> {
+    use sha2::{Digest, Sha256};
+    let mut f = std::fs::File::open(path).map_err(|e| e.to_string())?;
+    f.seek(SeekFrom::Start(start)).map_err(|e| e.to_string())?;
+    let mut hasher = Sha256::new();
+    let mut left = len;
+    let mut buf = [0u8; 1 << 16];
+    while left > 0 {
+        let want = std::cmp::min(buf.len(), left as usize);
+        let n = f.read(&mut buf[..want]).map_err(|e| e.to_string())?;
+        if n == 0 { return Err("unexpected end of file".into()); }
+        hasher.update(&buf[..n]);
+        left -= n as u64;
+    }
+    Ok(ev::hex(hasher.finalize().as_slice()))
+}
+
 pub struct Report { pub segments: u64, pub bytes: u64, pub checkpoints: u64, pub chain_head: String, pub errors: Vec<String>,
     /// Controller input chunks verified (0 when the bundle has no inputs.jsonl).
     pub input_chunks: u64, pub input_head: Option<String> }
@@ -64,9 +121,26 @@ pub fn verify(dir: &Path) -> Result<Report, String> {
         heads.insert(head);
         r.segments += 1; r.bytes += len;
     }
+    let tails = recorded_tails(dir);
     for (f, end) in &expect_off {
         let real = std::fs::metadata(dir.join(f)).map(|m| m.len()).unwrap_or(0);
-        if real != *end { r.errors.push(format!("{f}: {real} bytes on disk but manifest covers {end} (unhashed tail or truncation)")); }
+        if real == *end { continue; }
+        if real > *end {
+            let extra = real - *end;
+            if let Some(t) = tails.iter().find(|t| t.file == *f) {
+                if t.covered == *end && t.tail_bytes == extra {
+                    match sha256_range(&dir.join(f), *end, extra) {
+                        Ok(h) if h == t.sha => continue,
+                        Ok(_) => r.errors.push(format!("{f}: excluded tail SHA-256 does not match bundle.json")),
+                        Err(e) => r.errors.push(format!("{f}: cannot read excluded tail: {e}")),
+                    }
+                    continue;
+                }
+            }
+            r.errors.push(format!("{f}: {real} bytes on disk but manifest covers {end} (unhashed tail or truncation)"));
+        } else {
+            r.errors.push(format!("{f}: {real} bytes on disk but manifest covers {end} (truncated)"));
+        }
     }
     // Controller inputs: re-hash chunks + chain, and tie each chunk to the checkpoint that committed it.
     let mut input_by_seg: Option<std::collections::HashMap<u64, String>> = None;
@@ -118,6 +192,40 @@ mod tests {
         assert_eq!(v.len(), 2);
         assert_eq!(v[0]["type"], "reopen");
         assert_eq!(v[1]["type"], "segment");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn excluded_tail_is_accepted_only_when_the_record_matches() {
+        let dir = std::env::temp_dir().join(format!("qorcap-tail-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let body = b"abcdef";
+        let mut file = body.to_vec();
+        file.extend_from_slice(b"TAIL");
+        std::fs::write(dir.join("video.mp4"), &file).unwrap();
+        let sha = ev::sha256_hex(body);
+        let head = ev::link(GENESIS, 0, &sha);
+        let line = serde_json::json!({"type":"segment","seq":0,"file":"video.mp4","offset":0,"bytes": body.len(),
+            "sha256": sha, "prev": GENESIS, "chain_head": head});
+        std::fs::write(dir.join("manifest.jsonl"), format!("{line}\n")).unwrap();
+        let bare = verify(&dir).unwrap();
+        assert!(bare.errors.iter().any(|e| e.contains("unhashed tail")), "{:?}", bare.errors);
+        let tails = measure_excluded_tails(&dir);
+        assert_eq!(tails[0]["tail_bytes"], 4);
+        assert_eq!(tails[0]["covered_bytes"], body.len() as u64);
+        std::fs::write(dir.join("bundle.json"), serde_json::to_string(&serde_json::json!({"excluded_tails": tails})).unwrap()).unwrap();
+        let ok = verify(&dir).unwrap();
+        assert!(ok.errors.is_empty(), "{:?}", ok.errors);
+        let mut wrong: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("bundle.json")).unwrap()).unwrap();
+        wrong["excluded_tails"][0]["tail_bytes"] = serde_json::json!(3);
+        std::fs::write(dir.join("bundle.json"), wrong.to_string()).unwrap();
+        let mismatch = verify(&dir).unwrap();
+        assert!(mismatch.errors.iter().any(|e| e.contains("unhashed tail")), "{:?}", mismatch.errors);
+        std::fs::write(dir.join("video.mp4"), &body[..body.len() - 1]).unwrap();
+        std::fs::write(dir.join("bundle.json"), "{}").unwrap();
+        let short = verify(&dir).unwrap();
+        assert!(short.errors.iter().any(|e| e.contains("truncated") || e.contains("cannot read")), "{:?}", short.errors);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
