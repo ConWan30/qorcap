@@ -47,6 +47,13 @@ def test_not_monday_night_is_layout_unknown(mnp, name):
     assert mnp.read(img(name)).reason == "layout_unknown"
 
 
+def test_broncos_orange_endzone_is_not_monday_night(mnp):
+    """match-20261017-091651 OT walk-off: the logo box is ~99% orange. A real Monday Night mark is ~0.06."""
+    assert mnp.read(img("m27_tnp_091651_ot_10_16.jpg")).reason == "layout_unknown"
+    for name in ("m27_mnp_q1.jpg", "m27_mnp_q2.jpg", "m27_mnp_q4_final.jpg"):
+        assert M.LOGO_MIN_ORANGE <= M.logo_orange(M.bar_hsv(img(name))) <= M.LOGO_MAX_ORANGE
+
+
 def test_pack_provenance(mnp):
     assert mnp.source["score:5"].startswith("synthetic")
     assert all(mnp.source[f"score:{d}"].startswith("real") for d in "012346789")

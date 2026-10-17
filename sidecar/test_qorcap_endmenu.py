@@ -14,7 +14,7 @@ HERE = Path(__file__).parent
 sys.path.insert(0, str(HERE))
 sys.path.insert(0, os.environ.get("QORTIME", "/workspace/qortime-src"))
 from qorcap_endmenu import EndMenuAgreement, EndMenuRead, EndMenuReader  # noqa: E402
-from qorcap_reader import ReaderCore, end_menu_consistency, madden_final_screen  # noqa: E402
+from qorcap_reader import ReaderCore, end_menu_consistency, madden_final_screen, prep  # noqa: E402
 from qor_receipt.final_detect import detect_final  # noqa: E402
 
 FIN = cv2.imread(str(HERE / "fixtures" / "m27_end_menu_finish.jpg"))
@@ -147,6 +147,33 @@ def test_apply_final_fields():
     assert r["final_confirmed"] is False and r["final_basis"] == "clock_zero"
     r = qm.apply_final(base, None, fallback={"home": 17, "away": 0, "quarter": 4, "t_ms": 3})
     assert r["final_confirmed"] is False and r["method"] == "last_scorebug_read_unconfirmed" and "final_basis" not in r
+
+
+def test_tnp_ot_end_menu_reads_walkoff_and_sets_quarter():
+    ot = cv2.imread(str(HERE / "fixtures" / "m27_tnp_091651_end_menu.jpg"))
+    assert madden_final_screen(prep(ot))
+    rd = R.read(ot)
+    assert rd.ok and (rd.away, rd.home) == (10, 16), rd
+    assert R.period(ot) == "OT"
+    assert all(d["source"] == "real" for d in rd.digits)
+    # Walk-off: last scorebug is OT 1:55, same score. Clock is not 0:00; the menu still confirms.
+    core, posts = _core({"t_ms": 0, "home": 16, "away": 10, "quarter": 5, "clock_s": 115, "clock_red": False})
+    for k in range(6):
+        core.on_frame(10_000 + k * 500, ot)
+    f = [p for p in posts if p.get("basis") == "end_menu"][0]
+    assert (f["away"], f["home"], f["quarter"], f["final_confirmed"]) == (10, 16, 5, True)
+    # Regulation ended 10-10; the menu is one touchdown later and says OT, so the final quarter is 5.
+    core, posts = _core({"t_ms": 0, "home": 10, "away": 10, "quarter": 4, "clock_s": 0})
+    for k in range(6):
+        core.on_frame(10_000 + k * 500, ot)
+    f = [p for p in posts if p.get("basis") == "end_menu"][0]
+    assert f["quarter"] == 5 and f["final_confirmed"] is False
+    # A Q4 menu with the clock still running does not end the match, OT paint or not.
+    core, posts = _core({"t_ms": 0, "home": 16, "away": 10, "quarter": 4, "clock_s": 30})
+    for k in range(6):
+        core.on_frame(10_000 + k * 500, ot)
+    assert not any(p.get("basis") == "end_menu" for p in posts)
+    assert "clock not 0:00" in core.end_menu_rejected["why"]
 
 
 def test_core_rejects_end_menu_before_clock_zero():

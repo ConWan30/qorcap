@@ -43,7 +43,7 @@ META_FILES = ("bundle.json", "manifest.jsonl", "checkpoints.jsonl", "countersign
               "challenges.jsonl", "official_challenges.jsonl", "anchors.jsonl", "referee.pub",
               "challenge_gates.jsonl", "challenge_results.jsonl")
 HERE = Path(__file__).resolve().parent
-CLIENT_VERSION = "0.3.11"
+CLIENT_VERSION = "0.3.12"
 SUBMIT_TYPE = "qortime-submit/v1"   # = QorTime contracts compat.json submit_auth.request_type
 POW_PREFIX = "qortime-pow/v1|"      # = compat.json submit_auth.pow_prefix
 

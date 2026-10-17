@@ -81,7 +81,7 @@ pub struct MatchState {
     pub timeline: Vec<Value>,
     pub clips: Vec<Value>,
     pub last_seg_sha: Option<String>,
-    pub last_score: Option<(i64, i64, i64)>,
+    pub last_score: Option<(i64, i64, Option<i64>)>,
     pub last_clock: Option<(bool, bool)>, // (at_zero, red)
     pub score: Value,
     pub final_: Option<Value>,
@@ -683,6 +683,25 @@ mod tests {
     }
 
     #[test]
+    fn score_event_accepts_null_quarter() {
+        use clap::Parser;
+        let dir = std::env::temp_dir().join(format!("qorcap-qnull-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let d = dir.to_string_lossy().into_owned();
+        let crate::cli::Cmd::Record(r) = crate::cli::Cli::try_parse_from(["q", "record", "--device", "testpattern", "--bundle", &d]).unwrap().cmd else { panic!() };
+        let e = Engine::new(r, "ffmpeg-x".into());
+        e.event(&serde_json::json!({"type":"score","home":7,"away":3,"quarter":Value::Null,"clock_s":65})).unwrap();
+        let out = e.write_bundle().unwrap();
+        let draft: Value = serde_json::from_str(&std::fs::read_to_string(out.join("receipt.draft.json")).unwrap()).unwrap();
+        assert_eq!(draft["result"]["home_score"], 7);
+        assert_eq!(draft["result"]["away_score"], 3);
+        assert!(draft["result"]["quarter"].is_null());
+        assert_eq!(draft["result"]["final_confirmed"], false);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn end_menu_final_amends_scorebug_final_and_confirms() {
         use clap::Parser;
         let dir = std::env::temp_dir().join(format!("qorcap-endmenu-{}", std::process::id()));
@@ -879,13 +898,20 @@ impl Engine {
         let int = |k: &str| b[k].as_i64().ok_or(format!("{k} must be an integer"));
         match ty {
             "score" => {
-                let (h, a, q) = (int("home")?, int("away")?, int("quarter")?);
+                let (h, a) = (int("home")?, int("away")?);
+                // Quarter may be null when the ordinal glyph failed and the score locked without it (v0.3.12).
+                let q = match b.get("quarter") {
+                    Some(v) if v.is_null() => None,
+                    Some(v) => Some(v.as_i64().ok_or("quarter must be an integer")?),
+                    None => return Err("quarter must be an integer".into()),
+                };
+                let q_json = match q { Some(n) => Value::from(n), None => Value::Null };
                 let clock_s = b["clock_s"].as_i64();
                 let red = b["clock_red"].as_bool().unwrap_or(false);
-                let read = json!({"t_ms": t_ms, "home": h, "away": a, "quarter": q, "clock_s": clock_s, "clock_red": red});
+                let read = json!({"t_ms": t_ms, "home": h, "away": a, "quarter": q_json, "clock_s": clock_s, "clock_red": red});
                 let mut st = self.ev.lock().unwrap();
                 st.timeline.push(read.clone());
-                st.score = json!({"home": h, "away": a, "quarter": q, "clock_s": clock_s, "clock_red": red});
+                st.score = json!({"home": h, "away": a, "quarter": q_json.clone(), "clock_s": clock_s, "clock_red": red});
                 let score_changed = st.last_score.map(|p| p != (h, a, q)).unwrap_or(true);
                 let prev_score = st.last_score;
                 st.last_score = Some((h, a, q));
@@ -896,10 +922,16 @@ impl Engine {
                 append_jsonl(&self.ev_path("timeline.jsonl"), &read);
                 let mut out = json!({"ok": true});
                 if score_changed {
-                    let cp = self.checkpoint("score_change", json!({"prev_score": prev_score.map(|p| json!({"home": p.0, "away": p.1, "quarter": p.2}))}));
+                    let cp = self.checkpoint("score_change", json!({"prev_score": prev_score.map(|p| {
+                        let pq = match p.2 { Some(n) => Value::from(n), None => Value::Null };
+                        json!({"home": p.0, "away": p.1, "quarter": pq})
+                    })}));
                     out["checkpoint"] = cp;
                     // Only clip actual scoring plays (not the first read or a quarter change).
-                    if let Some(p) = prev_score { if (p.0, p.1) != (h, a) { self.auto_clip(&format!("score-a{a}-h{h}-q{q}"), self.args.clip_secs); } }
+                    if let Some(p) = prev_score { if (p.0, p.1) != (h, a) {
+                        let ql = q.map(|n| n.to_string()).unwrap_or_else(|| "unk".into());
+                        self.auto_clip(&format!("score-a{a}-h{h}-q{ql}"), self.args.clip_secs);
+                    } }
                 } else if clock_changed {
                     out["checkpoint"] = self.checkpoint("clock_state", json!({}));
                 }
@@ -979,7 +1011,8 @@ impl Engine {
         let unconfirmed = st.final_.is_none();
         let fin = st.final_.clone().unwrap_or_else(|| {
             if let Some((h, a, q)) = st.last_score {
-                json!({"home": h, "away": a, "quarter": q, "t_ms": wall_ms(), "basis": Value::Null, "unconfirmed": true})
+                let qv = match q { Some(n) => Value::from(n), None => Value::Null };
+                json!({"home": h, "away": a, "quarter": qv, "t_ms": wall_ms(), "basis": Value::Null, "unconfirmed": true})
             } else if let Some(sc) = st.score.as_object() {
                 json!({"home": sc.get("home").and_then(|v| v.as_i64()),
                        "away": sc.get("away").and_then(|v| v.as_i64()),

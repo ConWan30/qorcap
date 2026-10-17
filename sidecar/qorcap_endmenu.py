@@ -36,7 +36,13 @@ GLYPH_MAX_W = 26
 INK = 150                              # HSV value threshold: white digits on the near-black panel
 MIN_SCORE = 0.70   # leave-one-out (real digit vs its synthetic template): best >= 0.754
 MIN_MARGIN = 0.20  # leave-one-out margin >= 0.387
+# QorTime's scorebug pack is a different font. Veto only when its best score is actually confident.
+# Measured: the online end-menu "9" (kept failing closed) scores 0.416 as "0"; the real TNP "6" scores 0.276 as "0".
+XCHECK_MIN = 0.40
 HOLES = {"0": {"1c"}, "4": {"1c", "0"}, "6": {"1l"}, "9": {"1u"}, "8": {"2+"}}
+# "OT" under the score panel on the Thursday Night end screen (640x360). Real crop, not a drawn letter.
+OT_BOX = (slice(90, 112), slice(290, 330))
+OT_MIN = 0.80
 NO_HOLE = set("12357")
 
 
@@ -92,7 +98,13 @@ def side_glyphs(img, side: str) -> list[np.ndarray]:
         x, y, w, h, a = (int(t) for t in st[i])
         if a < GLYPH_MIN_AREA or h < GLYPH_H[0]:
             continue
-        if h > GLYPH_H[1] or w > GLYPH_MAX_W or x == 0 or x + w >= x1 - x0:
+        clipped = x == 0 or x + w >= x1 - x0
+        # A team logo that just clips the box edge (Thursday Night end screen: 7px sliver touching the bottom
+        # of the away box). A wide clip, or a clip that sits in the digit rows, still makes the side unreadable
+        # — that is what keeps a covered online score from being guessed.
+        if clipped and w <= 8 and y + h >= m.shape[0] - 1:
+            continue
+        if h > GLYPH_H[1] or w > GLYPH_MAX_W or clipped:
             out.append((x, None))  # oversized / clipped blob: make the side unreadable
             continue
         out.append((x, (lab[y:y + h, x:x + w] == i).astype(np.uint8) * 255))
@@ -118,7 +130,11 @@ class EndMenuReader:
         d = np.load(str(pack))
         self.labels = [str(x) for x in d["labels"]]
         self.vecs = d["vecs"].astype(np.float32)
-        self.source = dict(zip(self.labels, (str(x) for x in d["source"])))
+        self.sources = [str(x) for x in d["source"]]
+        self.source = {}
+        for lab, src in zip(self.labels, self.sources):
+            self.source[lab] = src  # last vector wins; digit info below uses the vector that actually matched
+        self.ot_vec = d["ot_vec"].astype(np.float32).ravel() if "ot_vec" in d.files else None
         if scorebug_pack is None:
             scorebug_pack = load_scorebug_pack()
         self.xpack = scorebug_pack  # QorTime TemplatePack (or None: cross-check skipped and reported)
@@ -129,10 +145,11 @@ class EndMenuReader:
             return None, {"why": "flat"}
         s = self.vecs @ v
         order = np.argsort(-s)
-        lab, best, second = self.labels[order[0]], float(s[order[0]]), float(s[order[1]])
+        idx = int(order[0])
+        lab, best, second = self.labels[idx], float(s[order[0]]), float(s[order[1]])
         holes = hole_signature(g)
         info = {"label": lab, "best": round(best, 3), "margin": round(best - second, 3), "holes": holes,
-                "source": self.source[lab].split(":")[0]}
+                "source": self.sources[idx].split(":")[0]}
         if best < MIN_SCORE or best - second < MIN_MARGIN:
             return None, dict(info, why="unsure")
         if (lab in HOLES and holes not in HOLES[lab]) or (lab in NO_HOLE and holes != "0"):
@@ -144,7 +161,9 @@ class EndMenuReader:
             # QorTime's score pack has no "8" (it uses the two-hole topology instead).
             xl = "8" if (xm is None or lab == "8") and holes == "2+" else (xm.label if xm else None)
             info["xcheck"] = xl
-            if xl != lab:
+            xb = float(xm.best) if xm is not None else 1.0
+            info["xcheck_best"] = None if xm is None else round(xb, 3)
+            if xl != lab and xb >= XCHECK_MIN:
                 return None, dict(info, why="xcheck_disagrees")
         else:
             info["xcheck"] = "skipped"
@@ -171,6 +190,19 @@ class EndMenuReader:
                 return EndMenuRead(False, reason=f"{side}_leading_zero", digits=digits)
             vals[side] = int(txt)
         return EndMenuRead(True, vals["away"], vals["home"], "ok", conf, margin, digits)
+
+    def period(self, img) -> str | None:
+        """``OT`` when the end screen draws that ordinal under the score panel. Other screens score <= ~0.31."""
+        if self.ot_vec is None or img is None:
+            return None
+        import cv2
+        img = _prep(img)
+        g = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)[OT_BOX].astype(np.float32).ravel()
+        g = g - float(g.mean())
+        n = float(np.linalg.norm(g))
+        if n < 1e-6:
+            return None
+        return "OT" if float(self.ot_vec @ (g / n)) >= OT_MIN else None
 
 
 def load_scorebug_pack():
