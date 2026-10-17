@@ -92,6 +92,43 @@ def test_gate_second_half_needs_its_own_kickoff():
     assert [e.phase for e in ev] == ["halftime"]
 
 
+def test_gate_unknown_quarter_uses_clock_reset_and_not_q1_for_the_end():
+    """No quarter: a running clock after two period resets opens halftime. Q1 never opens the end."""
+    g = PauseCapableGate(proxy_after_ms=1_000)
+    _read(g, 0, None, 900)
+    _read(g, 1_000, None, 880)
+    assert [g.on_frame(t, False) for t in range(1_000, 20_000, 500)] == [None] * 38
+
+    g = PauseCapableGate(proxy_after_ms=1_000)
+    _read(g, 0, 1, 1)                         # Q1 ran out
+    _read(g, 2_000, None, 900)                # Q2 at 15:00, quarter glyph missed
+    _read(g, 3_000, None, 880)
+    early = [e for e in (g.on_frame(t, False) for t in range(3_000, 8_000, 500)) if e]
+    assert [e.phase for e in early] == ["kickoff"]
+    _read(g, 9_000, None, 0)                  # Q2 ran out
+    _read(g, 10_000, None, 900)               # Q3
+    _read(g, 11_000, None, 880)
+    evs = [e for e in (g.on_frame(t, False) for t in range(11_000, 16_000, 500)) if e]
+    assert len(evs) == 1 and evs[0].basis == "clock_proxy" and evs[0].phase == "halftime" and evs[0].quarter == 3
+
+
+def test_gate_elapsed_fallback_when_the_clock_dies_at_the_quarter_break():
+    """Clock empty after Q1 0:00: halftime then end by elapsed time. Nothing before the clock runs out."""
+    from qorcap_reader import ELAPSED_PERIOD_MS
+
+    g = PauseCapableGate()
+    _read(g, 0, None, None)
+    assert g.on_frame(4 * ELAPSED_PERIOD_MS, False) is None
+    g = PauseCapableGate()
+    _read(g, 0, 1, 1)
+    _read(g, 1_000, None, None)
+    assert g.on_frame(1_000 + ELAPSED_PERIOD_MS, False) is None          # one period later is still Q2
+    half = g.on_frame(1_000 + 2 * ELAPSED_PERIOD_MS, False)
+    assert half is not None and half.basis == "elapsed" and half.phase == "halftime"
+    end = g.on_frame(1_000 + 3 * ELAPSED_PERIOD_MS, False)
+    assert end is not None and end.basis == "elapsed" and end.phase == "end" and end.quarter == 4
+
+
 def test_gate_clock_proxy_fallback_once_per_quarter():
     g = PauseCapableGate(proxy_after_ms=45_000)
     _read(g, 0, 4, 900)

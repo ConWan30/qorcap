@@ -737,6 +737,29 @@ mod tests {
     }
 
     #[test]
+    fn null_quarter_score_change_does_not_freeze_the_score() {
+        // match-20261017-162055: after Q1 the live reads kept the digits and lost the quarter.
+        // The draft follows the digits. It does not stay on the last read that had a quarter.
+        use clap::Parser;
+        let dir = std::env::temp_dir().join(format!("qorcap-qscore-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let d = dir.to_string_lossy().into_owned();
+        let crate::cli::Cmd::Record(r) = crate::cli::Cli::try_parse_from(["q", "record", "--device", "testpattern", "--bundle", &d]).unwrap().cmd else { panic!() };
+        let e = Engine::new(r, "ffmpeg-x".into());
+        e.event(&serde_json::json!({"type":"score","home":0,"away":0,"quarter":1,"clock_s":0})).unwrap();
+        e.event(&serde_json::json!({"type":"score","home":14,"away":0,"quarter":Value::Null,"clock_s":Value::Null})).unwrap();
+        e.event(&serde_json::json!({"type":"score","home":21,"away":6,"quarter":Value::Null,"clock_s":Value::Null})).unwrap();
+        let out = e.write_bundle().unwrap();
+        let draft: Value = serde_json::from_str(&std::fs::read_to_string(out.join("receipt.draft.json")).unwrap()).unwrap();
+        assert_eq!(draft["result"]["home_score"], 21);
+        assert_eq!(draft["result"]["away_score"], 6);
+        assert_eq!(draft["result"]["quarter"], 1); // last reliable ordinal; the digits still moved
+        assert_ne!(draft["result"]["winner"], "tie");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn null_quarter_keeps_last_reliable_and_does_not_go_backwards() {
         use clap::Parser;
         let dir = std::env::temp_dir().join(format!("qorcap-qkeep-{}", std::process::id()));
