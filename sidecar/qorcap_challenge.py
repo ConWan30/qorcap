@@ -1,7 +1,8 @@
 """Recorder-side challenge recheck for a USB capture card and a Bluetooth pad (QorCap 0.3.15).
 
-QorTime's contract still wants the pause menu 0..600 ms after OPTIONS (``contracts/compat.json``).
-That bound does not fit this capture path. On match-20261017-110028 the frames are 0.25 s apart and
+QorTime rule v1 still wants the pause menu 0..600 ms after OPTIONS (``contracts/compat.json``
+``pause_latency_ms``). That bound does not fit this capture path. On match-20261017-110028 the frames
+are 0.25 s apart and
 the OPTIONS time is the HID press:
 
 * kickoff: the dark pause menu is stable at +1750 ms (full luma 16.6, lower 6.7). The detector's
@@ -42,8 +43,11 @@ The recorder recheck keeps the same rule shape and a hard bound:
 
 Live challenge gating does not use this mapping. ``PauseCapableGate`` / ``OfficialLive`` see the
 live frame clock passed to ``ReaderCore.on_frame`` (wall time while recording). The recording path
-only writes the close stamp. The official referee's ``review.engine`` still uses ``segment_ranges``
-and 600 ms. Nothing here is submitted to it. An ok result is ``reverified_by: recorder`` only.
+only writes the close stamp. The official referee uses this same PTS clock only for challenge rule
+v2 (``bundle.json`` ``challenge_rule`` = 2): pause 0..2500 ms, and the successful latencies within
+±300 ms of their median. A bundle with no ``challenge_rule`` stays on rule v1 (``segment_ranges``,
+0..600 ms). Nothing here is submitted to the referee. An ok result is ``reverified_by: recorder``
+and carries no ``rule`` field, so a local receipt keeps the v1 evidence check.
 """
 from __future__ import annotations
 

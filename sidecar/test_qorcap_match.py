@@ -18,6 +18,19 @@ sys.path.insert(0, str(HERE))
 import qorcap_match as qm  # noqa: E402
 
 
+def test_old_bundle_opts_into_challenge_rule_v2(tmp_path):
+    bundle = tmp_path / "match"
+    bundle.mkdir()
+    (bundle / "bundle.json").write_text(json.dumps({"schema": "qorcap-bundle/v0", "qorcap_version": "0.3.15", "role": "home"}) + "\n")
+    qm.opt_in_challenge_rule(bundle)
+    meta = json.loads((bundle / "bundle.json").read_text())
+    assert meta["challenge_rule"] == 2 and meta["role"] == "home" and meta["qorcap_version"] == "0.3.15"
+    qm.opt_in_challenge_rule(bundle)
+    assert json.loads((bundle / "bundle.json").read_text())["challenge_rule"] == 2
+    shutil.rmtree(bundle)
+    qm.opt_in_challenge_rule(bundle)  # no bundle.json yet: nothing to write
+
+
 def _draft(mid="x"):
     return {"schema": "qor-receipt/v0",
             "match": {"match_id": mid, "game": "madden27", "platform": "ps5", "scorebug_profile": "madden27_standard",

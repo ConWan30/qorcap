@@ -930,8 +930,10 @@ def fill_challenge_results(bundle: Path, draft: dict, *, ffmpeg: str | None = No
     """v0.3.11: re-run every challenge on this bundle before signing.
 
     v0.3.14 uses the recorder's capture-path pause bound (see ``qorcap_challenge``). v0.3.15 stamps the
-    pause frame from the fragment PTS, not the segment close. The official referee still uses 600 ms
-    and ``segment_ranges``; nothing here is submitted to it.
+    pause frame from the fragment PTS, not the segment close. The official referee uses that same
+    clock only when ``bundle.json`` ``challenge_rule`` is 2 (rule v2: 0..2500 ms and ±300 ms
+    consistency). A bundle without that field stays on the referee's rule v1, 600 ms and
+    ``segment_ranges``. Nothing here is submitted to it.
 
     QorCap <= 0.3.10 always signed ``result: null``, so a correctly answered challenge still verified as
     ``challenge_unanswered`` (match 2026-10-17 #4, 44b8d01f). An ok result goes into the receipt
@@ -967,10 +969,36 @@ def fill_challenge_results(bundle: Path, draft: dict, *, ffmpeg: str | None = No
     return dict(draft, challenges=new)
 
 
+CHALLENGE_RULE_V2 = 2
+
+
+def opt_in_challenge_rule(bundle: Path, rule: int = CHALLENGE_RULE_V2) -> None:
+    """Ask the official referee to measure this bundle with challenge rule v2.
+
+    Rule v1 (no field, or anything other than the integer 2) dates frames from the segment close
+    stamps and requires the pause menu within 600 ms. Rule v2 dates the pause from the fragment
+    PTS, accepts 0..2500 ms, and requires the successful latencies within ±300 ms of their median.
+    An old recording opts in when it is signed again. The score, the draft hash, and the video
+    are unchanged.
+    """
+    p = Path(bundle) / "bundle.json"
+    if not p.exists():
+        return
+    try:
+        meta = json.loads(p.read_text(encoding="utf-8"))
+    except ValueError:
+        return
+    if not isinstance(meta, dict) or meta.get("challenge_rule") == rule:
+        return
+    meta["challenge_rule"] = rule
+    p.write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
+
+
 def sign_and_report(bundle: Path, draft: dict, cps: list[dict], device, referee, *, match_id: str, role: str,
                     started_ms: int, qt: Path, qorcap: str, no_open: bool, referee_kind: str = REFEREE_KIND,
                     note: str | None = None) -> int:
     """Shared by Start Match and finalize: build + sign receipt.json, run both verifiers, print the summary."""
+    opt_in_challenge_rule(bundle)
     draft = fill_challenge_results(bundle, draft)
     no_final = "final_basis" not in draft["result"] or draft["result"].get("final_basis") is None
     if no_final:
