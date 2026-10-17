@@ -284,6 +284,18 @@ written, `verify-bundle` OK, and a single flipped byte reported as FAIL.
 
 **Tested on Windows (v0.2.0–v0.2.1 era, MyTurn, USB3.0 Video):** `--input-format mjpeg` 1280x720@30 with `h264_mf` at 29.7 fps. v0.2.1 fixed audio / auto-format / OBS.
 
+**v0.3.6:** (1) **Game-audio level checks**: Start Match records 4 s of the card's audio before the match
+(`audio_precheck.json`), and Start Match/Finalize measure the recorded audio (`audio_check.json`); a silent card
+(max <= -70 dB) prints a loud warning with the fixes (PS5 Audio Output / 'Output to Headphones' = Chat Audio, Windows
+input level). match-20261016-170000's card audio was digital silence (-90 dB) although the capture worked, and the two
+earlier matches recorded no audio track at all. (2) **Covered end-of-game menu**: on online matches the name tags
+cover the top of the away score; the panel can now **corroborate** (never read) the scorebug's Q4 final: the lower
+part of the digits must match the scorebug value clearly better (margin >= 0.15) than every one-legal-play alternative,
+on both sides, on 3 consecutive frames; then `end_menu_read` / `final_confirmed` with a note. (3) `input-proof` uses
+Finalize's `timeline.offline.jsonl` for score-change checks when the live timeline has no score reads
+(`score_source`). (4) The end-of-recording `gap_too_long`/`clock_skew` failures were v0.3.2 recordings; v0.3.5's
+recorder seals and countersigns the tail within ~150 ms (verified on MyTurn, verify errors: none).
+
 **v0.3.5 (Monday Night primetime scorebug, `madden27_monday_night`):** match-20261016-170000 (HOU at CHI/"QOR",
 online H2H) used Madden's **Monday Night** presentation, whose scorebug is a different overlay (orange `MNP` wordmark,
 `--- HOU 34 < 29 QOR ---`, then `4TH 0:00 [:39]`). QorTime's `madden27_standard` reader answered `layout_unknown` on
