@@ -59,7 +59,8 @@
                                "pubkey": {"$ref": "#/$defs/hex64"}, "key_kind": {"enum": ["software", "software-file", "tpm"]}}}
     },
     "referee": {"type": "object", "additionalProperties": false, "required": ["pubkey", "key_id", "key_kind"],
-                "properties": {"pubkey": {"$ref": "#/$defs/hex64"}, "key_id": {"$ref": "#/$defs/keyid"}, "key_kind": {"type": "string"}}},
+                "properties": {"pubkey": {"$ref": "#/$defs/hex64"}, "key_id": {"$ref": "#/$defs/keyid"}, "key_kind": {"type": "string"},
+        "delegation": {"type": "object", "description": "Root-signed qortime-referee-delegation/v1 certificate for this (online) key; see docs/REFEREE_KEYS.md.", "required": ["type", "serial", "root_key_id", "delegate_pubkey", "scope", "not_before_ms", "not_after_ms", "sig"]}}},
     "challenges": {
       "type": "array",
       "items": {

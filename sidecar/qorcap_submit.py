@@ -13,11 +13,19 @@ What happens (nothing is trusted just because this PC says so):
      raw controller log, and only if every check passes countersigns with the official QorTime key.
   4. This PC's device key co-signs the same receipt. Result: receipt.official.json next to receipt.json.
 
+Since QorCap 0.3.10 every submission is signed by this PC's install key, which is the same device key that recorded
+the match. No account is needed. The client fetches a single-use nonce from /v1/submit/challenge, solves a small
+proof-of-work (about 1 s), and signs {method, path, timestamp, nonce, pow, sha256(zip), sha256(manifest.jsonl)}.
+The referee rejects replays, enforces per-key and global quotas, and requires the signer to be the bundle's
+recorder key. QorCap 0.3.9 and older get HTTP 426 ("upgrade required").
+
 The official private key never touches this PC. Stdlib only (+ QorTime's qor_receipt for the device signature).
 """
 from __future__ import annotations
 
 import argparse
+import base64
+import hashlib
 import io
 import json
 import os
@@ -34,6 +42,9 @@ META_FILES = ("bundle.json", "manifest.jsonl", "checkpoints.jsonl", "countersign
               "haptics.jsonl", "input_proof.json", "receipt.json", "receipt.draft.json", "timeline.jsonl",
               "challenges.jsonl", "official_challenges.jsonl", "anchors.jsonl", "referee.pub")
 HERE = Path(__file__).resolve().parent
+CLIENT_VERSION = "0.3.10"
+SUBMIT_TYPE = "qortime-submit/v1"   # = QorTime contracts compat.json submit_auth.request_type
+POW_PREFIX = "qortime-pow/v1|"      # = compat.json submit_auth.pow_prefix
 
 
 def say(msg: str = "") -> None:
@@ -54,8 +65,8 @@ class Client:
         self._open = opener or urllib.request.urlopen
 
     def call(self, method: str, path: str, data: bytes | None = None, ctype: str = "application/json",
-             timeout: float | None = None):
-        h = {"Content-Type": ctype, "User-Agent": "qorcap-submit"}
+             timeout: float | None = None, headers: dict | None = None):
+        h = {"Content-Type": ctype, "User-Agent": f"qorcap-submit/{CLIENT_VERSION}", **(headers or {})}
         if self.token:
             h["Authorization"] = f"Bearer {self.token}"
         rq = urllib.request.Request(self.base + path, data=data, headers=h, method=method)
@@ -73,6 +84,63 @@ class Client:
 
     def post_json(self, path: str, body: dict, timeout: float | None = None):
         return self.call("POST", path, json.dumps(body).encode(), timeout=timeout)
+
+
+def pow_ok(nonce: str, pub: str, pow_: str, bits: int) -> bool:
+    d = hashlib.sha256(f"{POW_PREFIX}{nonce}|{pub}|{pow_}".encode()).digest()
+    return bits <= 0 or int.from_bytes(d, "big") >> (256 - bits) == 0
+
+
+def solve_pow(nonce: str, pub: str, bits: int) -> str:
+    i = 0
+    while not pow_ok(nonce, pub, str(i), bits):
+        i += 1
+    return str(i)
+
+
+def submit_auth_header(device, *, path: str, body: bytes, bundle_head: str, nonce: str, pow_: str,
+                       ts_ms: int | None = None) -> str:
+    """X-Qor-Submit value: install (device) key signature over JCS of the request summary."""
+    from qor_receipt.jcs import canonicalize
+
+    ts = int(time.time() * 1000) if ts_ms is None else ts_ms
+    msg = canonicalize({"type": SUBMIT_TYPE, "method": "POST", "path": path, "pub": device.pubkey_hex.lower(),
+                        "ts_ms": ts, "nonce": nonce, "pow": pow_, "body_sha256": hashlib.sha256(body).hexdigest(),
+                        "bundle_head": bundle_head})
+    h = {"v": 1, "pub": device.pubkey_hex.lower(), "ts_ms": ts, "nonce": nonce, "pow": pow_, "bundle_head": bundle_head,
+         "sig": device.sign(msg)}
+    return base64.urlsafe_b64encode(json.dumps(h, separators=(",", ":")).encode()).decode().rstrip("=")
+
+
+def official_key_status(info: dict) -> tuple[bool, str]:
+    """Is the referee's signing key the official one? Either the root itself (legacy) or an online key with a valid,
+    unrevoked delegation from the root (checked locally with QorTime's verifier code, not taken from the server)."""
+    pub = str(info.get("pubkey") or "")
+    if pub == OFFICIAL_PUB:
+        return True, "official root key"
+    cert = info.get("delegation")
+    if not cert:
+        return False, "not the official key and no delegation certificate"
+    try:
+        from qor_receipt import delegation as D
+        from qor_receipt.trusted_referees import load_allowlist
+    except ImportError:
+        return False, "this QorTime copy cannot check delegations (update QorCap)"
+    now = int(time.time() * 1000)
+    ok, probs = D.check_delegation(cert, pub, now, allowlist=load_allowlist(), revocations=D.load_revocations(),
+                                   now_ms=now)
+    if ok:
+        return True, f"online key {ok.get('id')} (delegation serial {ok.get('serial')} from {ok.get('delegated_by')})"
+    return False, f"delegation not valid: {', '.join(probs)}"
+
+
+def load_device(key_path: Path | None):
+    from qor_receipt.keys import FileKey
+
+    kp = key_path or (data_dir() / "keys" / "device.key")
+    if not kp.exists():
+        return None, kp
+    return FileKey(kp), kp
 
 
 def meta_zip(bundle: Path) -> bytes:
@@ -149,21 +217,45 @@ def submit(bundle: Path, *, base: str, full: bool = False, key_path: Path | None
     except Exception as e:
         say(f"PROBLEM: cannot reach the QorTime referee at {base} ({e}). Check the internet and try again.")
         return 3
-    if info.get("pubkey") != OFFICIAL_PUB:
-        say(f"  note: this referee's key {str(info.get('pubkey'))[:16]}... is NOT the official QorTime key; "
+    official, why = official_key_status(info)
+    if not official:
+        say(f"  note: this referee's key {str(info.get('pubkey'))[:16]}... is NOT the official QorTime key ({why}); "
             "its receipts will verify as SELF_ATTESTED at most.")
-    say(f"Referee: {base}  (key {str(info.get('pubkey'))[:16]}..., allowlist {(info.get('allowlist') or {}).get('id')})")
+    say(f"Referee: {base}  (key {str(info.get('pubkey'))[:16]}..., {why if official else 'unofficial'})")
+    if device is None:
+        device, kp = load_device(key_path)
+        if device is None:
+            say(f"PROBLEM: device key not found at {kp} (it is created by the first Start Match on this PC)")
+            return 2
     mode = "full" if full else "spot-check"
-    say(f"1/4  Sending match files (no video yet) for an independent re-check ... [{mode}]")
+    path = f"/v1/submissions?mode={mode}"
     z = meta_zip(bundle)
+    hdrs: dict = {}
     try:
-        sub = c.call("POST", f"/v1/submissions?mode={mode}", z, "application/zip", timeout=300)
+        ch = c.call("GET", f"/v1/submit/challenge?pub={device.pubkey_hex}", timeout=30)
+    except RefereeError as e:
+        ch = None
+        if e.code != 404:
+            say(f"PROBLEM: the referee refused a submit nonce (HTTP {e.code}): {e.body}")
+            return 3
+    if ch:
+        t0 = time.monotonic()
+        pw = solve_pow(ch["nonce"], device.pubkey_hex, int(ch.get("pow_bits", 0)))
+        head = hashlib.sha256((bundle / "manifest.jsonl").read_bytes()).hexdigest()
+        hdrs["X-Qor-Submit"] = submit_auth_header(device, path=path, body=z, bundle_head=head, nonce=ch["nonce"], pow_=pw)
+        say(f"     signed with this PC's install key {device.pubkey_hex[:16]}... (proof-of-work {ch.get('pow_bits')} bits, "
+            f"{time.monotonic() - t0:.1f} s)")
+    say(f"1/4  Sending match files (no video yet) for an independent re-check ... [{mode}]")
+    try:
+        sub = c.call("POST", path, z, "application/zip", timeout=300, headers=hdrs)
     except RefereeError as e:
         body = e.body if isinstance(e.body, dict) else {"errors": [str(e.body)]}
         say(f"  REJECTED by the referee (HTTP {e.code}). Nothing was signed. Reasons:")
         for x in (body.get("errors") or [])[:15]:
             say(f"    - {x}")
-        save({"state": "rejected", "errors": body.get("errors")})
+        if e.code == 429:
+            say("  (rate limit: new installs get a few submissions per hour/day; try again later)")
+        save({"state": "rejected", "http": e.code, "errors": body.get("errors")})
         return 2
     c.token = sub["upload_token"]
     save({"submission": sub["id"], "state": sub["state"], "commit": sub.get("commit"), "required": len(sub["required"])})
@@ -213,15 +305,10 @@ def submit(bundle: Path, *, base: str, full: bool = False, key_path: Path | None
         save({"state": rv.get("state"), "review": rv.get("review")})
         return 2
     rec = rv["receipt"]
+    if rv.get("log_entry"):
+        say(f"     logged in the referee's public transparency log (entry #{rv['log_entry'].get('seq')})")
+        save({"log_entry": rv["log_entry"]})
     say("4/4  Co-signing the referee's receipt with this PC's device key ...")
-    if device is None:
-        from qor_receipt.keys import FileKey
-
-        kp = key_path or (data_dir() / "keys" / "device.key")
-        if not kp.exists():
-            say(f"PROBLEM: device key not found at {kp}")
-            return 2
-        device = FileKey(kp)
     from qor_receipt import receipt as R
 
     if rec["players"][0]["pubkey"] != device.pubkey_hex:
