@@ -20,6 +20,8 @@ score_checkpoints.jsonl (QorTime-shaped hash chain bound to QorCap's video chain
 signs receipt.json exactly like Start Match. If Start Match countersigned live (countersigned.jsonl), those
 signatures are reused; otherwise the local referee countersigns QorCap's checkpoints now, stamping each with
 QorCap's own recording time, and the referee ``key_kind`` says ``local-self-attested-offline``.
+``finalize --recover`` rebuilds receipt.draft.json and bundle.json from the files already on disk when the
+recorder was killed before it could write them. Bytes after the last hashed segment are excluded.
 
 Trust: both keys live on this PC, so the result is SELF-ATTESTED. The receipt's computed QorTime tier is
 ``single-attested`` and ``referee.key_kind`` is ``local-self-attested`` so any reader can see that the
@@ -559,6 +561,38 @@ def report_recording_audio(bundle: Path, ffmpeg: str | None) -> dict | None:
     return res
 
 
+# Windows process flags. DETACHED_PROCESS: qorcap has no console, so CTRL_CLOSE from this window
+# does not reach it. CREATE_NEW_PROCESS_GROUP: Ctrl+C stays in this script. CREATE_BREAKAWAY_FROM_JOB:
+# leave a kill-on-close job when the job allows it.
+DETACHED_PROCESS = 0x00000008
+CREATE_BREAKAWAY_FROM_JOB = 0x01000000
+
+
+def qorcap_spawn_flags() -> int:
+    if not WIN:
+        return 0
+    group = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
+    return DETACHED_PROCESS | group | CREATE_BREAKAWAY_FROM_JOB
+
+
+def spawn_qorcap(cmd: list[str], stdout):
+    """Start qorcap. If the launcher job refuses breakaway, start again without that flag."""
+    flags = qorcap_spawn_flags()
+    try:
+        return subprocess.Popen(cmd, stdout=stdout, stderr=subprocess.STDOUT, creationflags=flags)
+    except OSError:
+        if not flags or not (flags & CREATE_BREAKAWAY_FROM_JOB):
+            raise
+        say("QorCap stays in this window's job. If the window is killed before the bundle is written, "
+            "run finalize --recover on the match folder.")
+        flags &= ~CREATE_BREAKAWAY_FROM_JOB
+        return subprocess.Popen(cmd, stdout=stdout, stderr=subprocess.STDOUT, creationflags=flags)
+
+
+def shutdown_body(reason: str) -> dict:
+    return {"reason": reason}
+
+
 def key_watcher(stop: threading.Event, state: dict) -> None:
     def loop():
         try:
@@ -741,10 +775,10 @@ def main(argv=None) -> int:
                     say(line)
     log = open(bundle / "console.log", "w", encoding="utf-8")
     started_ms = int(time.time() * 1000)
-    # Own process group on Windows: a Ctrl+C in this window reaches only this script, which then stops QorCap
-    # cleanly over its API (instead of both racing, and cmd.exe asking 'Terminate batch job (Y/N)?' mid-bundle).
-    flags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) if WIN else 0
-    proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, creationflags=flags)
+    # Detach from this console and, when the job allows it, from the launcher job. Closing the
+    # PowerShell window then does not deliver CTRL_CLOSE to qorcap. Enter still stops the match:
+    # this process watches the keyboard and posts /shutdown.
+    proc = spawn_qorcap(cmd, log)
     for _ in range(50):
         try:
             api.get("/status", timeout=1)
@@ -814,6 +848,7 @@ def main(argv=None) -> int:
         return got
 
     final_seen_at = None
+    stop_reason = "final"
     try:
         while proc.poll() is None:
             got = sweep()
@@ -838,19 +873,21 @@ def main(argv=None) -> int:
                 say(f"\n\nFINAL on the scorebug ({f['basis']}): AWAY {f['away']} - HOME {f['home']}. Waiting up to "
                     f"{END_MENU_WAIT_S} s for the end-of-game menu to confirm it (stay on that menu; do not RESTART) ...")
             if state.get("user_stop"):
+                stop_reason = "enter"
                 say("\n\nStopping (you pressed a key) ...")
                 break
             if final_seen_at and time.monotonic() - final_seen_at > (4 if state.get("end_menu_seen") else END_MENU_WAIT_S):
                 break
             time.sleep(0.5)
     except KeyboardInterrupt:
+        stop_reason = "ctrl_c"
         say("\n\nStopping (Ctrl+C) ...")
     stop.set()
     ignore_ctrl_c()  # from here on, a Ctrl+C must not abort signing (it caused 'receipt failed' + Y/N prompt)
     say("\n\nStopping QorCap: sealing and countersigning the final checkpoints ...")
     sweep()
     try:
-        api.post("/shutdown")
+        api.post("/shutdown", shutdown_body(stop_reason))
     except Exception:
         pass
     # Countersign the stop checkpoints over the API while QorCap is still up; QorCap waits for our report
@@ -1064,14 +1101,50 @@ def video_files(bundle: Path) -> list[Path]:
     return files or ([bundle / "video.mp4"] if (bundle / "video.mp4").exists() else [])
 
 
-def decode_frames(ffmpeg: str, video: Path, hz: float = FIN_HZ, size=(1280, 720)):
-    """Yields (video_ms, BGR ndarray) at `hz`, full 1280x720 (v0.3.5; ReaderCore downsizes for the 640x360 readers)."""
+def hashed_decode_limit(video: Path, max_bytes: int | None) -> int | None:
+    """Byte cap for a video that is longer than the hashed prefix. None means decode the whole file."""
+    if max_bytes is None:
+        return None
+    try:
+        size = video.stat().st_size
+    except OSError:
+        return None
+    if size > max_bytes:
+        return max_bytes
+    return None
+
+
+def decode_frames(ffmpeg: str, video: Path, hz: float = FIN_HZ, size=(1280, 720), max_bytes: int | None = None):
+    """Yields (video_ms, BGR ndarray) at `hz`, full 1280x720 (v0.3.5; ReaderCore downsizes for the 640x360 readers).
+
+    ``max_bytes`` limits decoding to the hashed prefix. Bytes after that are an excluded tail and are not frames.
+    """
     import numpy as np
 
     w, h = size
-    p = subprocess.Popen([ffmpeg, "-hide_banner", "-nostdin", "-loglevel", "error", "-i", str(video), "-an",
-                          "-vf", f"fps={hz},scale={w}:{h}", "-f", "rawvideo", "-pix_fmt", "bgr24", "pipe:1"],
-                         stdout=subprocess.PIPE)
+    cap = hashed_decode_limit(video, max_bytes)
+    cmd = [ffmpeg, "-hide_banner", "-nostdin", "-loglevel", "error", "-i", "pipe:0" if cap is not None else str(video),
+           "-an", "-vf", f"fps={hz},scale={w}:{h}", "-f", "rawvideo", "-pix_fmt", "bgr24", "pipe:1"]
+    p = subprocess.Popen(cmd, stdin=subprocess.PIPE if cap is not None else None, stdout=subprocess.PIPE)
+    if cap is not None:
+        def feed(proc=p, path=video, n=cap):
+            try:
+                with path.open("rb") as f:
+                    left = n
+                    while left:
+                        chunk = f.read(min(1 << 20, left))
+                        if not chunk:
+                            break
+                        proc.stdin.write(chunk)
+                        left -= len(chunk)
+            except Exception:
+                pass
+            finally:
+                try:
+                    proc.stdin.close()
+                except Exception:
+                    pass
+        threading.Thread(target=feed, daemon=True).start()
     n, fb = 0, w * h * 3
     try:
         while True:
@@ -1191,6 +1264,20 @@ def last_reliable_read(reads: list[dict]) -> dict | None:
                 last["quarter"] = q
                 break
     return last
+
+
+def keep_recovery_notes(res: dict, draft: dict) -> dict:
+    """Keep the recover notes after the score read replaces ``result``. A normal draft is unchanged."""
+    if not draft.get("recovered"):
+        return res
+    kept = [n for n in ((draft.get("result") or {}).get("notes") or []) if isinstance(n, str)]
+    notes = list(res.get("notes") or [])
+    for n in kept:
+        if n not in notes:
+            notes.append(n)
+    if not notes:
+        return res
+    return dict(res, notes=notes)
 
 
 def apply_final(res: dict, fin: dict | None, *, fallback: dict | None = None) -> dict:
@@ -1319,12 +1406,283 @@ def decode_frames_tail(ffmpeg: str, video: Path, secs: int, hz: float, size=(128
         p.wait()
 
 
+_LOG_REASONS = (
+    ("pipe_broken", ("recorder pipe broken", "os error 232", "stop reason: pipe_broken")),
+    ("ctrl_c", ("ctrl+c", "stop reason: ctrl_c")),
+    ("console_close", ("stop reason: console_close", "console_close")),
+    ("launcher_gone", ("launcher process", "stop reason: launcher_gone")),
+    ("disk_full", ("disk space critically low", "stop reason: disk_full")),
+    ("duration", ("--duration reached", "stop reason: duration")),
+)
+_GENESIS = "0" * 64
+_PLAYER_DEFAULT = "local:player"
+
+
+def stop_reason_from_log(text: str | None) -> str:
+    """The earliest stop cause actually written in qorcap.log. No log line means the cause was not recorded."""
+    if not text:
+        return "not_recorded"
+    low = text.lower()
+    found_at = None
+    found = None
+    for reason, needles in _LOG_REASONS:
+        for needle in needles:
+            i = low.find(needle)
+            if i >= 0 and (found_at is None or i < found_at):
+                found, found_at = reason, i
+    return found or "not_recorded"
+
+
+def _int_pair(obj: dict):
+    """(home, away, quarter or None, t_ms or None) from an on-disk object. Booleans are not scores."""
+    if not isinstance(obj, dict):
+        return None
+    h, a = obj.get("home"), obj.get("away")
+    if isinstance(h, bool) or isinstance(a, bool) or not isinstance(h, int) or not isinstance(a, int):
+        return None
+    q = obj.get("quarter")
+    q = q if isinstance(q, int) and not isinstance(q, bool) else None
+    t = obj.get("t_ms")
+    t = t if isinstance(t, int) and not isinstance(t, bool) else None
+    return h, a, q, t
+
+
+def _winner(home, away) -> str:
+    if home is None or away is None:
+        return "unknown"
+    if home > away:
+        return "home"
+    if away > home:
+        return "away"
+    return "tie"
+
+
+def _challenge_row(c: dict, role_fallback: str) -> dict | None:
+    nonce = c.get("nonce")
+    if not isinstance(nonce, str) or len(nonce) != 32 or any(ch not in "0123456789abcdef" for ch in nonce):
+        return None
+    phase = c.get("phase")
+    role = c.get("role") or role_fallback
+    pattern = c.get("pattern")
+    if phase not in ("kickoff", "halftime", "end") or role not in ("home", "away"):
+        return None
+    if not isinstance(pattern, list) or len(pattern) < 2 or not all(isinstance(x, str) for x in pattern):
+        return None
+    issued, deadline = c.get("issued_ms"), c.get("deadline_ms")
+    if isinstance(issued, bool) or isinstance(deadline, bool) or not isinstance(issued, int) or not isinstance(deadline, int):
+        return None
+    cid = c.get("id") if isinstance(c.get("id"), str) and c.get("id") else nonce[:8]
+    return {"id": cid, "role": role, "phase": phase, "nonce": nonce, "pattern": pattern,
+            "issued_ms": issued, "deadline_ms": deadline, "result": None}
+
+
+def recover_bundle(bundle: Path) -> dict | None:
+    """Rebuild receipt.draft.json and bundle.json from the files the recorder already wrote.
+
+    Scores, challenges, match id and the stop reason come only from those files. A video tail
+    past the last hashed segment is recorded and excluded. No segment is invented for it.
+    """
+    import hashlib
+
+    from qorcap_submit import CLIENT_VERSION
+    from qor_receipt.jcs import sha256_hex
+
+    bundle = bundle.resolve()
+    manifest = read_jsonl(bundle / "manifest.jsonl")
+    cps = read_jsonl(bundle / "checkpoints.jsonl")
+    timeline = read_jsonl(bundle / "timeline.jsonl")
+    challenges = read_jsonl(bundle / "challenges.jsonl")
+    official = read_jsonl(bundle / "official_challenges.jsonl")
+    inputs = read_jsonl(bundle / "inputs.jsonl")
+    segs = sorted((m for m in manifest if m.get("type") == "segment"), key=lambda m: m.get("seq") if isinstance(m.get("seq"), int) else 0)
+    if not segs and not cps:
+        say(f"{bundle} has no manifest.jsonl segments or checkpoints to recover")
+        return None
+
+    match_id = role = device = device_id = None
+    for c in cps:
+        q = c.get("qorcap") if isinstance(c.get("qorcap"), dict) else {}
+        if match_id is None and isinstance(q.get("match_id"), str) and q["match_id"]:
+            match_id = q["match_id"]
+        if role is None and q.get("role") in ("home", "away"):
+            role = q["role"]
+    for m in segs:
+        if device is None and isinstance(m.get("device"), str):
+            device = m["device"]
+        if device_id is None and isinstance(m.get("device_id"), str):
+            device_id = m["device_id"]
+    notes = ["player_id was not on disk; recorder default local:player"]
+    if match_id is None:
+        match_id = "unassigned"
+        notes.append("match_id was not on disk; recorder default unassigned")
+    if role is None:
+        role = "home"
+        notes.append("role was not on disk; recorder default home")
+
+    times = []
+    for m in segs:
+        if isinstance(m.get("wall_ms"), int) and not isinstance(m.get("wall_ms"), bool):
+            times.append(m["wall_ms"])
+    for c in cps:
+        if isinstance(c.get("t_ms"), int) and not isinstance(c.get("t_ms"), bool):
+            times.append(c["t_ms"])
+    started = min(times) if times else 0
+    ended = max(times) if times else started
+
+    fin = None
+    for c in cps:
+        q = c.get("qorcap") if isinstance(c.get("qorcap"), dict) else {}
+        if q.get("trigger") == "final" and isinstance(q.get("final"), dict):
+            fin = q["final"]
+    last = None
+    for t in timeline:
+        if _int_pair(t):
+            last = t
+    cp_score = None
+    for c in reversed(cps):
+        q = c.get("qorcap") if isinstance(c.get("qorcap"), dict) else {}
+        if _int_pair(q.get("score") if isinstance(q.get("score"), dict) else None):
+            cp_score = q["score"]
+            break
+
+    confirmed = False
+    basis = None
+    if fin and _int_pair(fin):
+        home, away, quarter, final_t = _int_pair(fin)
+        final_t = final_t if final_t is not None else ended
+        basis = fin.get("basis") if fin.get("basis") in ("clock_zero", "scorebug_gone", "final_screen", "end_menu") else None
+        if basis == "end_menu":
+            method = "end_menu_read"
+            confirmed = fin.get("final_confirmed") is True
+        elif basis:
+            method = "agreed_scorebug_final"
+        else:
+            method = "last_scorebug_read_unconfirmed"
+            notes.append("final checkpoint had no basis; score is unconfirmed")
+    elif last and _int_pair(last):
+        home, away, quarter, final_t = _int_pair(last)
+        final_t = final_t if final_t is not None else ended
+        method = "last_scorebug_read_unconfirmed"
+        notes.append("final not on disk; last timeline score is unconfirmed")
+    elif cp_score and _int_pair(cp_score):
+        home, away, quarter, final_t = _int_pair(cp_score)
+        final_t = ended
+        method = "last_scorebug_read_unconfirmed"
+        notes.append("no timeline score; last checkpoint score is unconfirmed")
+    else:
+        home = away = quarter = None
+        final_t = ended
+        method = "last_scorebug_read_unconfirmed"
+        notes.append("no score on disk; scores left null")
+
+    chs = []
+    seen = set()
+    for src in (challenges, official):
+        for c in src:
+            if not isinstance(c, dict):
+                continue
+            row = _challenge_row(c, role)
+            if row is None or row["id"] in seen:
+                continue
+            chs.append(row)
+            seen.add(row["id"])
+    unusable = 0
+    for src in (challenges, official):
+        for c in src:
+            if isinstance(c, dict) and _challenge_row(c, role) is None:
+                unusable += 1
+    if unusable:
+        notes.append(f"{unusable} challenge record(s) skipped: required fields were not on disk")
+
+    log_p = bundle / "qorcap.log"
+    stop_reason = stop_reason_from_log(log_p.read_text(encoding="utf-8", errors="replace") if log_p.exists() else None)
+    notes.append(f"recording stopped: {stop_reason}")
+    notes.append("recovered from on-disk evidence; unhashed video bytes are excluded")
+
+    covered: dict[str, int] = {}
+    for m in segs:
+        f = m.get("file")
+        if not isinstance(f, str):
+            continue
+        off = m.get("offset") if isinstance(m.get("offset"), int) and not isinstance(m.get("offset"), bool) else 0
+        n = m.get("bytes") if isinstance(m.get("bytes"), int) and not isinstance(m.get("bytes"), bool) else 0
+        covered[f] = max(covered.get(f, 0), off + n)
+    tails = []
+    for f, end in covered.items():
+        p = bundle / f
+        if not p.is_file():
+            continue
+        real = p.stat().st_size
+        if real > end:
+            with p.open("rb") as fh:
+                fh.seek(end)
+                tail = fh.read()
+            tails.append({"file": f, "covered_bytes": end, "tail_bytes": real - end,
+                          "tail_sha256": hashlib.sha256(tail).hexdigest()})
+            notes.append(f"unhashed tail excluded: {f} {real - end} bytes after byte {end}")
+
+    chunks = [r for r in inputs if isinstance(r, dict) and r.get("type") == "chunk"]
+    if chunks:
+        notes.append(f"inputs.jsonl: {len(chunks)} chunk(s) on disk")
+
+    result = {"home_score": home, "away_score": away, "quarter": quarter, "final_t_ms": final_t,
+              "winner": _winner(home, away), "method": method, "final_confirmed": confirmed, "notes": notes}
+    if basis:
+        result["final_basis"] = basis
+    draft = {
+        "schema": "qor-receipt/v0",
+        "match": {"match_id": match_id, "game": "madden27", "platform": "ps5", "scorebug_profile": "madden27_standard",
+                  "mode": "single", "started_ms": started, "ended_ms": ended},
+        "result": result,
+        "players": [{"role": role, "player_id": _PLAYER_DEFAULT, "pubkey": _GENESIS, "key_kind": "software"}],
+        "referee": {"pubkey": _GENESIS, "key_id": "0" * 16, "key_kind": "unset"},
+        "challenges": chs,
+        "checkpoints": {},
+        "agreement": {"timelines_agree": None, "mismatches": []},
+        "signals": {"motion_permille": {role: None}, "stop_reason": stop_reason, "recovered": True},
+        "trust_tier": "single-attested",
+        "signatures": {"players": {}, "referee": None},
+        "stop_reason": stop_reason,
+        "recovered": True,
+    }
+    clips = [m for m in manifest if m.get("type") == "clip"]
+    bundle_doc = {
+        "schema": "qorcap-bundle/v0",
+        "qorcap_version": CLIENT_VERSION,
+        "match_id": match_id,
+        "role": role,
+        "device": device,
+        "device_id": device_id,
+        "segments": len(segs),
+        "chain_head": segs[-1].get("chain_head") if segs else None,
+        "checkpoints": len(cps),
+        "checkpoint_head": cps[-1].get("hash") if cps else None,
+        "challenges": len(chs),
+        "clips": clips,
+        "final": fin,
+        "final_confirmed": confirmed,
+        "receipt_draft_sha256": sha256_hex(draft),
+        "recovered": True,
+        "stop_reason": stop_reason,
+        "inputs_on_disk": {"chunks": len(chunks), "head": chunks[-1].get("head") if chunks else None},
+        "claims": "Proves the integrity and timing of these video bytes (hash chain + checkpoints, referee co-signable). Does NOT prove who was playing.",
+    }
+    if tails:
+        bundle_doc["excluded_tails"] = tails
+    (bundle / "receipt.draft.json").write_text(json.dumps(draft, indent=2) + "\n", encoding="utf-8")
+    (bundle / "bundle.json").write_text(json.dumps(bundle_doc, indent=2) + "\n", encoding="utf-8")
+    say(f"recovered bundle ({stop_reason}); {len(segs)} hashed segment(s), {len(tails)} excluded tail(s)")
+    return draft
+
+
 def finalize(bundle: Path, *, qt: Path, qorcap: str, ffmpeg: str, key_dir: Path, no_open: bool = True,
-             core_factory=None, hz: float = FIN_HZ) -> int:
+             core_factory=None, hz: float = FIN_HZ, recover: bool = False) -> int:
     bundle = bundle.resolve()
     vids = video_files(bundle)
     if not vids:
         say(f"No video.mp4 in {bundle}")
+        return 2
+    if recover and recover_bundle(bundle) is None:
         return 2
     draft_p = bundle / "receipt.draft.json"
     if not draft_p.exists():
@@ -1358,11 +1716,16 @@ def finalize(bundle: Path, *, qt: Path, qorcap: str, ffmpeg: str, key_dir: Path,
         sys.stdout.write(f"\r  {vms // 60000:02d}:{vms // 1000 % 60:02d} of video read, {core.stats['agreed']} agreed reads ")
         sys.stdout.flush()
 
+    caps = {}
+    for t in meta.get("excluded_tails") or []:
+        if isinstance(t, dict) and isinstance(t.get("file"), str) and isinstance(t.get("covered_bytes"), int):
+            caps[t["file"]] = t["covered_bytes"]
+            say(f"  excluding {t.get('tail_bytes')} unhashed bytes of {t['file']} (after byte {t['covered_bytes']})")
     for v in vids:
         last = [0]
 
-        def frames(v=v):
-            for vms, img in decode_frames(ffmpeg, v, hz):
+        def frames(v=v, cap=caps.get(v.name)):
+            for vms, img in decode_frames(ffmpeg, v, hz, max_bytes=cap):
                 last[0] = vms
                 yield offset + vms, img
         ev, st = run_offline_reader(frames(), started_ms, fac, prog)
@@ -1390,6 +1753,7 @@ def finalize(bundle: Path, *, qt: Path, qorcap: str, ffmpeg: str, key_dir: Path,
          "finalized_ms": int(time.time() * 1000)}, indent=2), encoding="utf-8")
 
     res = apply_final(draft["result"], fin, fallback=last_reliable_read(reads))
+    res = keep_recovery_notes(res, draft)
     draft = dict(draft, result=res)
     rdr = getattr(shared["core"], "reader", None)
     if getattr(rdr, "profile_counts", None):  # v0.3.5: which scorebug layout was actually read
@@ -1433,6 +1797,8 @@ def finalize_main(argv) -> int:
     ap.add_argument("--key-dir")
     ap.add_argument("--hz", type=float, default=FIN_HZ)
     ap.add_argument("--no-open", action="store_true")
+    ap.add_argument("--recover", action="store_true",
+                    help="rebuild receipt.draft.json and bundle.json from manifest, checkpoints, inputs, challenges and timeline")
     a = ap.parse_args(argv)
     say("=" * 64)
     say("  QorCap  -  Finalize Match (offline)")
@@ -1450,7 +1816,8 @@ def finalize_main(argv) -> int:
         return 3
     ff = a.ffmpeg or next((str(c) for c in [HERE.parent / ("ffmpeg.exe" if WIN else "ffmpeg")] if c.exists()), None) or shutil.which("ffmpeg") or "ffmpeg"
     return finalize(bundle, qt=qt, qorcap=find_qorcap(a.qorcap), ffmpeg=ff,
-                    key_dir=Path(a.key_dir) if a.key_dir else data_dir() / "keys", no_open=a.no_open, hz=a.hz)
+                    key_dir=Path(a.key_dir) if a.key_dir else data_dir() / "keys", no_open=a.no_open, hz=a.hz,
+                    recover=a.recover)
 
 
 def run_main(argv=None) -> int:

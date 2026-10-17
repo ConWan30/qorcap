@@ -69,6 +69,12 @@ pub struct Engine {
     pub sealed: AtomicBool,
     /// Highest checkpoint seq the local referee (Start Match) reports as countersigned; -1 = none attached.
     pub countersigned: std::sync::atomic::AtomicI64,
+    /// Why recording stopped. The first reason wins (a later Ctrl+C must not overwrite a broken pipe).
+    pub stop_reason: Mutex<Option<String>>,
+    /// Serializes receipt.draft.json / bundle.json writes.
+    bundle_write: Mutex<()>,
+    /// Set once the full stop write (including the input proof) has finished, so a late fast write cannot replace it.
+    bundle_finalized: AtomicBool,
 }
 
 /// QorTime evidence state for this run.
@@ -182,7 +188,8 @@ impl Engine {
             stamp_file: dir.join("stamp.txt"),
             snapshot: dir.join("snapshot.jpg"), exit_when_recording_ends: AtomicBool::new(false), started: Instant::now(), last_data_ms: AtomicU64::new(0), input,
             running: AtomicBool::new(false), api_closed: AtomicBool::new(false), sealed: AtomicBool::new(false),
-            countersigned: std::sync::atomic::AtomicI64::new(-1), args })
+            countersigned: std::sync::atomic::AtomicI64::new(-1),
+            stop_reason: Mutex::new(None), bundle_write: Mutex::new(()), bundle_finalized: AtomicBool::new(false), args })
     }
     fn ms(&self) -> u64 { self.started.elapsed().as_millis() as u64 }
     /// The monotonic clock behind every mono_ms (manifest, checkpoints) and inputs.jsonl t_us.
@@ -330,6 +337,7 @@ impl Engine {
         let (pat, pmt) = { let mut r = self.ring.lock().unwrap(); r.push(t, data); r.tables() };
         let mut g = self.rec.lock().unwrap();
         let mut done = false;
+        let mut stop_why: Option<&str> = None;
         if let Some(r) = g.as_mut() {
             let mut slice = data;
             if r.wait_key {
@@ -340,13 +348,31 @@ impl Engine {
                 }
             }
             if !slice.is_empty() {
-                if let Some(w) = r.stdin.as_mut() { if let Err(e) = w.write_all(slice) { error!("recorder pipe broken ({e}); stopping recording {}", r.path); done = true; } }
+                if let Some(w) = r.stdin.as_mut() {
+                    if let Err(e) = w.write_all(slice) {
+                        error!("recorder pipe broken ({e}); stopping recording {}", r.path);
+                        done = true;
+                        if stop_why.is_none() { stop_why = Some("pipe_broken"); }
+                    }
+                }
             }
-            if r.deadline.map(|d| Instant::now() >= d).unwrap_or(false) { info!("--duration reached"); done = true; }
+            if r.deadline.map(|d| Instant::now() >= d).unwrap_or(false) {
+                info!("--duration reached");
+                done = true;
+                if stop_why.is_none() { stop_why = Some("duration"); }
+            }
         }
         if done {
+            let why = stop_why.unwrap_or("shutdown");
             if let Some(r) = g.take() { finish(r); }
-            if self.exit_when_recording_ends.load(Ordering::Relaxed) { self.shutdown.store(true, Ordering::SeqCst); }
+            drop(g);
+            // Start Match always passes --replay, so the old path left the supervisor running with no
+            // recorder and never reached finish_stop. Any bundle recording ends here and writes the draft.
+            if self.args.bundle.is_some() || self.exit_when_recording_ends.load(Ordering::Relaxed) {
+                self.request_stop(why);
+            } else {
+                self.note_stop(why);
+            }
         }
     }
 
@@ -430,6 +456,11 @@ impl Engine {
                     self.set_state("disk_full", Some(msg.clone()));
                     self.status.lock().unwrap().warning = Some(msg);
                     if let Some(p) = self.stop_recording() { info!("finalised {p} due to low disk"); }
+                    if self.args.bundle.is_some() {
+                        self.request_stop("disk_full");
+                        break;
+                    }
+                    self.note_stop("disk_full");
                     self.sleep(5);
                     if self.shutdown.load(Ordering::SeqCst) { break; }
                     continue;
@@ -486,8 +517,12 @@ impl Engine {
     /// countersign everything, and only then run the slow input-proof / bundle work. Nothing after the
     /// seal adds checkpoints, so the referee stamps the tail within seconds of its t_ms.
     fn finish_stop(self: &Arc<Self>) {
+        if self.stop_reason.lock().unwrap().is_none() { self.note_stop("shutdown"); }
         if let Some(p) = self.stop_recording() { info!("finalised {p}"); }
         crate::inputproof::clear_recording_marker(self.bundle_dir().as_deref());
+        // Draft and bundle exist before the countersign wait and the slow input proof, so a kill
+        // during either still leaves receipt.draft.json for finalize.
+        if self.args.bundle.is_some() { let _ = self.persist_stop_bundle(); }
         self.seal_and_wait_countersign(Duration::from_secs(self.args.countersign_wait));
         if self.args.bundle.is_some() {
             self.set_state("finishing", Some("checking controller input against the video (1-2 minutes)".into()));
@@ -827,6 +862,50 @@ mod tests {
         assert!(err.contains("not enough free disk space"), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn stop_writes_draft_and_bundle_and_keeps_the_first_reason() {
+        use clap::Parser;
+        let dir = std::env::temp_dir().join(format!("qorcap-stop-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let d = dir.to_string_lossy().into_owned();
+        let video = dir.join("video.mp4");
+        let bytes = b"hashed-segment";
+        std::fs::write(&video, bytes).unwrap();
+        let crate::cli::Cmd::Record(r) = crate::cli::Cli::try_parse_from([
+            "q", "record", "--device", "testpattern", "--bundle", &d, "--no-controller", "--match-id", "m-stop",
+        ]).unwrap().cmd else { panic!() };
+        let e = Engine::new(r, "ffmpeg-x".into());
+        e.on_segment(video.to_str().unwrap(), 0, bytes);
+        let mut body = bytes.to_vec();
+        body.extend_from_slice(b"TAIL");
+        std::fs::write(&video, body).unwrap();
+        e.note_stop("pipe_broken");
+        e.note_stop("ctrl_c");
+        let out = e.persist_stop_bundle().unwrap();
+        let draft: Value = serde_json::from_str(&std::fs::read_to_string(out.join("receipt.draft.json")).unwrap()).unwrap();
+        let bundle: Value = serde_json::from_str(&std::fs::read_to_string(out.join("bundle.json")).unwrap()).unwrap();
+        assert_eq!(draft["stop_reason"], "pipe_broken");
+        assert_eq!(draft["signals"]["stop_reason"], "pipe_broken");
+        assert!(draft["result"]["notes"].as_array().unwrap().iter().any(|n| n == "recording stopped: pipe_broken"));
+        assert_eq!(bundle["stop_reason"], "pipe_broken");
+        assert_eq!(bundle["excluded_tails"][0]["file"], "video.mp4");
+        assert_eq!(bundle["excluded_tails"][0]["covered_bytes"], bytes.len() as u64);
+        assert_eq!(bundle["excluded_tails"][0]["tail_bytes"], 4);
+        let report = crate::bundle::verify(&dir).unwrap();
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        // A later fast write must not replace a finished bundle (the input-proof copy of the draft).
+        e.write_bundle_opts(true).unwrap();
+        let mut marked: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("receipt.draft.json")).unwrap()).unwrap();
+        marked["signals"]["input"] = json!({"status": "ok"});
+        std::fs::write(dir.join("receipt.draft.json"), serde_json::to_string_pretty(&marked).unwrap()).unwrap();
+        e.persist_stop_bundle().unwrap();
+        let kept: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("receipt.draft.json")).unwrap()).unwrap();
+        assert_eq!(kept["signals"]["input"]["status"], "ok");
+        assert_eq!(kept["stop_reason"], "pipe_broken");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 impl Engine {
@@ -1032,10 +1111,37 @@ impl Engine {
         });
     }
 
+    /// Record why the match stopped. The first call wins.
+    pub fn note_stop(&self, reason: &str) {
+        let mut g = self.stop_reason.lock().unwrap_or_else(|e| e.into_inner());
+        if g.is_none() {
+            info!("stop reason: {reason}");
+            *g = Some(reason.to_string());
+        }
+    }
+
+    /// Note the reason, write the draft and bundle immediately (no input proof), and ask the supervisor to exit.
+    pub fn request_stop(&self, reason: &str) {
+        self.note_stop(reason);
+        let _ = self.persist_stop_bundle();
+        self.shutdown.store(true, Ordering::SeqCst);
+        if !self.running.load(Ordering::SeqCst) { self.api_closed.store(true, Ordering::SeqCst); }
+    }
+
+    /// Fast bundle write used on every stop path. A completed full write is left as it is.
+    pub fn persist_stop_bundle(&self) -> Option<PathBuf> {
+        if self.args.bundle.is_none() { return None; }
+        self.write_bundle_opts(false)
+    }
+
     /// Write bundle.json + receipt.draft.json (unsigned).
     /// If no `final` event, use the last timeline scorebug read (not 0–0) and label final unconfirmed.
     pub fn write_bundle(&self) -> Option<PathBuf> { self.write_bundle_opts(true) }
     pub fn write_bundle_opts(&self, input_proof: bool) -> Option<PathBuf> {
+        let _files = self.bundle_write.lock().unwrap_or_else(|e| e.into_inner());
+        if !input_proof && self.bundle_finalized.load(Ordering::SeqCst) {
+            return self.bundle_dir();
+        }
         let st = self.ev.lock().unwrap();
         let unconfirmed = st.final_.is_none();
         let fin = st.final_.clone().unwrap_or_else(|| {
@@ -1088,7 +1194,21 @@ impl Engine {
             }
             info!("draft receipt uses last scorebug read AWAY {} - HOME {} (final not confirmed)", fin["away"], fin["home"]);
         }
-        let bundle = json!({
+        let reason = self.stop_reason.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if let Some(reason) = reason.as_deref() {
+            receipt["stop_reason"] = json!(reason);
+            if let Some(sig) = receipt["signals"].as_object_mut() {
+                sig.insert("stop_reason".into(), json!(reason));
+            }
+            let note = format!("recording stopped: {reason}");
+            if let Some(r) = receipt["result"].as_object_mut() {
+                match r.get_mut("notes").and_then(|n| n.as_array_mut()) {
+                    Some(a) => a.push(json!(note)),
+                    None => { r.insert("notes".into(), json!([note])); }
+                }
+            }
+        }
+        let mut bundle = json!({
             "schema": "qorcap-bundle/v0", "qorcap_version": env!("CARGO_PKG_VERSION"),
             "match_id": self.args.match_id, "role": self.args.role, "device": self.args.device, "device_id": st.device_id,
             "segments": st.seg.seq, "chain_head": st.seg.head, "checkpoints": st.checkpoints.len(),
@@ -1097,9 +1217,24 @@ impl Engine {
             "receipt_draft_sha256": ev::jcs_sha(&receipt),
             "claims": "Proves the integrity and timing of these video bytes (hash chain + checkpoints, referee co-signable). Does NOT prove who was playing.",
         });
+        if let Some(reason) = reason.as_deref() { bundle["stop_reason"] = json!(reason); }
         drop(st);
         let dir = self.bundle_dir().unwrap_or_else(|| PathBuf::from("."));
         let _ = std::fs::create_dir_all(&dir);
+        let tails = crate::bundle::measure_excluded_tails(&dir);
+        if !tails.is_empty() {
+            bundle["excluded_tails"] = json!(tails);
+            if let Some(r) = receipt["result"].as_object_mut() {
+                let note = "unhashed video tail excluded: only hashed segments are part of the match";
+                match r.get_mut("notes").and_then(|n| n.as_array_mut()) {
+                    Some(a) => a.push(json!(note)),
+                    None => { r.insert("notes".into(), json!([note])); }
+                }
+            }
+            if let Some(obj) = bundle.as_object_mut() {
+                obj.insert("receipt_draft_sha256".into(), json!(ev::jcs_sha(&receipt)));
+            }
+        }
         let w = |n: &str, v: &Value| std::fs::write(dir.join(n), serde_json::to_string_pretty(v).unwrap()).map_err(|e| error!("write {n}: {e}"));
         let _ = w("receipt.draft.json", &receipt);
         let _ = w("bundle.json", &bundle);
@@ -1116,6 +1251,7 @@ impl Engine {
                 Err(e) => warn!("input proof not written: {e}"),
             }
         }
+        if input_proof { self.bundle_finalized.store(true, Ordering::SeqCst); }
         info!("match bundle written to {}", dir.display());
         Some(dir)
     }

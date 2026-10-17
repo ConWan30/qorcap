@@ -38,9 +38,11 @@ pub fn route(e: &Arc<Engine>, method: &str, url: &str, body: &str) -> Resp {
         ("GET", "/timeline") => { let st = e.ev.lock().unwrap(); j(200, json!({"timeline": st.timeline, "score": st.score, "challenges": st.challenges, "clips": st.clips, "final": st.final_})) }
         ("POST", "/bundle/write") => match e.write_bundle() { Some(d) => j(200, json!({"ok": true, "dir": d})), None => j(500, json!({"ok": false})) },
         ("POST", "/shutdown") => {
-            e.shutdown.store(true, Ordering::SeqCst);
-            if !e.running.load(Ordering::SeqCst) { e.api_closed.store(true, Ordering::SeqCst); }
-            j(200, json!({"ok": true}))
+            let reason = b["reason"].as_str().map(str::trim).filter(|s| {
+                !s.is_empty() && s.len() <= 64 && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+            }).unwrap_or("shutdown");
+            e.request_stop(reason);
+            j(200, json!({"ok": true, "reason": e.stop_reason.lock().unwrap().clone()}))
         }
         // Local referee progress: "I have countersigned every checkpoint through seq". Lets the stop path
         // hold the slow bundle work until the final checkpoints carry fresh referee stamps.
@@ -125,6 +127,13 @@ mod tests {
         assert_eq!(route(&e, "GET", "/nope", "").code, 404);
         assert_eq!(route(&e, "POST", "/record/stop", "").code, 409);
         assert_eq!(route(&e, "GET", "/snapshot.jpg", "").code, 503);
+        let shut = route(&e, "POST", "/shutdown", r#"{"reason":"enter"}"#);
+        assert_eq!(shut.code, 200);
+        assert_eq!(e.stop_reason.lock().unwrap().as_deref(), Some("enter"));
+        assert!(e.bundle_dir().unwrap().join("receipt.draft.json").is_file());
+        assert!(e.bundle_dir().unwrap().join("bundle.json").is_file());
+        route(&e, "POST", "/shutdown", r#"{"reason":"ctrl_c"}"#);
+        assert_eq!(e.stop_reason.lock().unwrap().as_deref(), Some("enter"));
     }
     #[test]
     fn replay_rules_and_ts_written() {
