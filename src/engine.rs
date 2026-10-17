@@ -714,6 +714,57 @@ mod tests {
     }
 
     #[test]
+    fn end_menu_final_respects_sidecar_final_confirmed_false() {
+        use clap::Parser;
+        let dir = std::env::temp_dir().join(format!("qorcap-uncorroborated-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let d = dir.to_string_lossy().into_owned();
+        let crate::cli::Cmd::Record(r) = crate::cli::Cli::try_parse_from(["q", "record", "--device", "testpattern", "--bundle", &d]).unwrap().cmd else { panic!() };
+        let e = Engine::new(r, "ffmpeg-x".into());
+        let ev = |s: &str| e.event(&serde_json::from_str::<Value>(s).unwrap());
+        ev(r#"{"type":"score","home":17,"away":0,"quarter":4,"clock_s":0}"#).unwrap();
+        ev(r#"{"type":"final","basis":"end_menu","method":"end_menu_read","home":20,"away":0,"quarter":4,"t_ms":2000,
+               "final_confirmed":false,
+               "delta_corroboration":null,
+               "scorebug_last":{"home":17,"away":0,"quarter":4,"t_ms":900},
+               "notes":["one-legal-step delta NOT corroborated"]}"#).unwrap();
+        let out = e.write_bundle().unwrap();
+        let draft: Value = serde_json::from_str(&std::fs::read_to_string(out.join("receipt.draft.json")).unwrap()).unwrap();
+        assert_eq!(draft["result"]["method"], "end_menu_read");
+        assert_eq!(draft["result"]["final_confirmed"], false);
+        assert_eq!(draft["result"]["home_score"], 20);
+        assert_eq!(draft["result"]["notes"][0], "one-legal-step delta NOT corroborated");
+        let bundle: Value = serde_json::from_str(&std::fs::read_to_string(out.join("bundle.json")).unwrap()).unwrap();
+        assert_eq!(bundle["final_confirmed"], false);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn end_menu_final_with_haptic_corroboration_confirms() {
+        use clap::Parser;
+        let dir = std::env::temp_dir().join(format!("qorcap-haptic-corr-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let d = dir.to_string_lossy().into_owned();
+        let crate::cli::Cmd::Record(r) = crate::cli::Cli::try_parse_from(["q", "record", "--device", "testpattern", "--bundle", &d]).unwrap().cmd else { panic!() };
+        let e = Engine::new(r, "ffmpeg-x".into());
+        let ev = |s: &str| e.event(&serde_json::from_str::<Value>(s).unwrap());
+        ev(r#"{"type":"final","basis":"end_menu","method":"end_menu_read","home":20,"away":0,"quarter":4,"t_ms":2000,
+               "final_confirmed":true,
+               "delta_corroboration":{"kind":"haptic","t_ms":1500},
+               "scorebug_last":{"home":17,"away":0,"quarter":4,"t_ms":900},
+               "notes":["one-legal-step delta corroborated via haptic"]}"#).unwrap();
+        let out = e.write_bundle().unwrap();
+        let draft: Value = serde_json::from_str(&std::fs::read_to_string(out.join("receipt.draft.json")).unwrap()).unwrap();
+        assert_eq!(draft["result"]["final_confirmed"], true);
+        assert_eq!(draft["result"]["delta_corroboration"]["kind"], "haptic");
+        let bundle: Value = serde_json::from_str(&std::fs::read_to_string(out.join("bundle.json")).unwrap()).unwrap();
+        assert_eq!(bundle["final_confirmed"], true);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn disk_guard_refuses_start_when_min_free_huge() {
         use clap::Parser;
         let dir = std::env::temp_dir().join(format!("qorcap-disk-{}", std::process::id()));
@@ -868,7 +919,9 @@ impl Engine {
                 let mut fin = json!({"home": h, "away": a, "quarter": q, "t_ms": t_ms, "basis": basis});
                 if end_menu {
                     fin["method"] = json!("end_menu_read");
-                    for k in ["end_menu", "scorebug_last", "notes"] { if !b[k].is_null() { fin[k] = b[k].clone(); } }
+                    for k in ["end_menu", "scorebug_last", "notes", "final_confirmed", "delta_corroboration"] {
+                        if !b[k].is_null() { fin[k] = b[k].clone(); }
+                    }
                 }
                 let amended = {
                     let mut st = self.ev.lock().unwrap();
@@ -930,16 +983,29 @@ impl Engine {
             }
         });
         let mut receipt = ev::draft_receipt(&self.args.match_id, &self.args.role, &self.args.player_id, st.started_wall_ms, wall_ms(), &fin, &st.challenges);
-        // Only an end-of-game-menu read confirms a final (v0.3.4); a scorebug final keeps its basis, unconfirmed.
-        let confirmed = !unconfirmed && fin["basis"] == "end_menu";
+        // End-of-game-menu read is required to confirm (v0.3.4). From v0.3.8 the sidecar may set
+        // final_confirmed=false when a one-legal-step delta lacks corroboration; honor that field.
+        let is_end_menu = !unconfirmed && fin["basis"] == "end_menu";
+        let confirmed = if is_end_menu {
+            match fin.get("final_confirmed") {
+                Some(v) if v.is_boolean() => v.as_bool().unwrap_or(true),
+                _ => true, // legacy posts without the field: confirm (exact-match / pre-gate behavior)
+            }
+        } else {
+            false
+        };
         if let (false, Some(r)) = (unconfirmed, receipt["result"].as_object_mut()) {
             r.insert("final_confirmed".into(), json!(confirmed));
-            if confirmed {
+            if is_end_menu {
                 r.insert("method".into(), json!("end_menu_read"));
+                r.insert("final_basis".into(), json!("end_menu"));
                 if let Some(sb) = fin.get("scorebug_last").filter(|v| v.is_object()) {
                     r.insert("scorebug_last".into(), json!({"home_score": sb["home"], "away_score": sb["away"], "quarter": sb["quarter"], "t_ms": sb["t_ms"]}));
                 }
                 if let Some(n) = fin.get("notes").filter(|v| v.as_array().map(|a| !a.is_empty()).unwrap_or(false)) { r.insert("notes".into(), n.clone()); }
+                if let Some(d) = fin.get("delta_corroboration").filter(|v| !v.is_null()) {
+                    r.insert("delta_corroboration".into(), d.clone());
+                }
             } else {
                 r.insert("notes".into(), json!(["end-of-game menu score not read: scorebug final only, NOT confirmed"]));
             }

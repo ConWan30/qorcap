@@ -284,6 +284,8 @@ written, `verify-bundle` OK, and a single flipped byte reported as FAIL.
 
 **Tested on Windows (v0.2.0–v0.2.1 era, MyTurn, USB3.0 Video):** `--input-format mjpeg` 1280x720@30 with `h264_mf` at 29.7 fps. v0.2.1 fixed audio / auto-format / OBS.
 
+**v0.3.8:** Start Match auto-wires live haptics / input activity / score-change clip hashes into `ReaderCore.delta_corroboration` (and the stop-time tail fallback), so a one-legal-step end-menu final can be confirmed live with the same rules as offline. Rust `write_bundle` honors sidecar `final_confirmed` + `delta_corroboration`.
+
 **v0.3.7:** End-menu one-legal-step deltas need corroboration (`final_confirmed`); QorTime pin includes trusted-referee allowlist + challenge evidence re-validation + `input_advisory`. Local QorCap referee stays SELF_ATTESTED.
 
 **v0.3.6:** (1) **Game-audio level checks**: Start Match records 4 s of the card's audio before the match

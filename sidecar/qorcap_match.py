@@ -245,7 +245,7 @@ def build_receipt(draft: dict, cps: list[dict], device, referee, *, match_id: st
 
 
 # ------------------------------------------------------------------ scorebug sources
-def start_reader(api: Api, stop: threading.Event, state: dict) -> threading.Thread:
+def start_reader(api: Api, stop: threading.Event, state: dict, bundle: Path | None = None) -> threading.Thread:
     import hashlib
 
     import cv2
@@ -269,13 +269,51 @@ def start_reader(api: Api, stop: threading.Event, state: dict) -> threading.Thre
         return r
 
     from qorcap_mnp import AutoProfileReader
+    from qorcap_reader import collect_delta_corroboration, load_delta_corroboration_from_bundle
     core = ReaderCore(post, AutoProfileReader(ScorebugReader(), prep=prep), AgreementWindow(), PauseDetector(), detect_final,
                       final_screen_detector=madden_final_screen, end_menu_reader=EndMenuReader())
     state["core"] = core
+    if bundle is not None:
+        try:
+            core.delta_corroboration = load_delta_corroboration_from_bundle(bundle)
+        except Exception:
+            core.delta_corroboration = []
+
+    def _refresh_corr():
+        """Pull score-change clip hashes from /timeline + re-read haptics/inputs from the live bundle."""
+        clips = []
+        try:
+            tl = api.get("/timeline", timeout=1)
+            clips = list(tl.get("clips") or []) if isinstance(tl, dict) else []
+        except Exception:
+            pass
+        from_bundle = []
+        if bundle is not None:
+            try:
+                from_bundle = load_delta_corroboration_from_bundle(bundle)
+            except Exception:
+                from_bundle = []
+        live_clips = collect_delta_corroboration(clips=clips)
+        # Prefer richer bundle-derived list; merge unique clip sha256s from live API
+        seen = {(e.get("kind"), e.get("sha256") or e.get("t_ms")) for e in from_bundle}
+        merged = list(from_bundle)
+        for e in live_clips:
+            key = (e.get("kind"), e.get("sha256") or e.get("t_ms"))
+            if key not in seen:
+                merged.append(e)
+                seen.add(key)
+        core.delta_corroboration = merged
 
     def loop():
-        last, last_t = None, 0.0
+        last, last_t, last_corr = None, 0.0, 0.0
         while not stop.is_set():
+            now = time.monotonic()
+            if now - last_corr >= 1.0:
+                last_corr = now
+                try:
+                    _refresh_corr()
+                except Exception as e:
+                    state["corr_error"] = f"{type(e).__name__}: {e}"
             try:
                 with urllib.request.urlopen(api.base + "/snapshot.jpg", timeout=3) as r:
                     data = r.read()
@@ -708,7 +746,7 @@ def main(argv=None) -> int:
     if a.test_pattern:
         start_fake_scores(api, stop, state, a.test_secs)
     else:
-        start_reader(api, stop, state)
+        start_reader(api, stop, state, bundle=bundle)
     key_watcher(stop, state)
 
     reported = {"seq": -1}
@@ -804,7 +842,14 @@ def main(argv=None) -> int:
         say(f"FAIL: QorCap did not write the bundle. See {bundle / 'qorcap.log'}")
         return 2
     draft = json.loads(draft_p.read_text(encoding="utf-8"))
+    # Prefer the live ReaderCore final (includes final_confirmed + delta_corroboration) when present.
+    live_fin = state.get("final")
+    if live_fin and is_end_menu_final(live_fin):
+        draft = dict(draft, result=apply_final(draft["result"], live_fin))
     if not a.test_pattern and draft["result"].get("method") != "end_menu_read" and a.ffmpeg:
+        draft = tail_final_check(bundle, draft, ffmpeg=a.ffmpeg)
+    elif not a.test_pattern and draft["result"].get("method") == "end_menu_read" and draft["result"].get("final_confirmed") is not True and a.ffmpeg:
+        # Stop-time fallback: re-read with bundle haptics/clips so a live-uncorroborated delta can still confirm.
         draft = tail_final_check(bundle, draft, ffmpeg=a.ffmpeg)
     if not a.test_pattern and a.audio != "none":
         report_recording_audio(bundle, a.ffmpeg or next((str(c) for c in [HERE.parent / ("ffmpeg.exe" if WIN else "ffmpeg")]
@@ -1055,6 +1100,13 @@ def tail_final_check(bundle: Path, draft: dict, *, ffmpeg: str, secs: int = TAIL
     events: list[dict] = []
     core = (core_factory or default_core_factory)(lambda b: events.append(b) or {})
     core.timeline = [dict(r) for r in live]
+    try:
+        from qorcap_reader import load_delta_corroboration_from_bundle
+        # Preserve any corroboration the test/core_factory already set; else load from bundle.
+        if not getattr(core, "delta_corroboration", None):
+            core.delta_corroboration = load_delta_corroboration_from_bundle(bundle)
+    except Exception:
+        pass
     last_t = live[-1]["t_ms"]
     if frames is None:
         frames = decode_frames_tail(ffmpeg, vids[-1], secs, hz)
