@@ -2,7 +2,8 @@
 <html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <title>QorCap — signal to seal</title>
-<meta name="description" content="QorCap is a lean Windows capture-card recorder for QorTime. Every 2 s segment is SHA-256 hash-chained, checkpointed, and bundled into a draft receipt ready for QorTime signing.">
+<meta name="description" content="QorCap is a lean Windows capture-card recorder for QorTime. Every ~2 s segment is SHA-256 hash-chained and checkpointed, and a finished match can be submitted to the official QorTime referee for an independent verdict.">
+<meta name="qorcap-version" content="v0.3.10">
 <meta name="theme-color" content="#04050a"><meta name="color-scheme" content="dark">
 <link rel="icon" href="assets/favicon.svg" type="image/svg+xml"><link rel="icon" href="assets/favicon-32.png" sizes="32x32" type="image/png"><link rel="apple-touch-icon" href="assets/apple-touch-icon.png">
 <meta property="og:title" content="QorCap — signal to seal"><meta property="og:type" content="website"><meta property="og:url" content="https://conwan30.github.io/qorcap/"><meta property="og:image" content="https://conwan30.github.io/qorcap/assets/og-image.png"><meta property="og:image:width" content="1200"><meta property="og:image:height" content="630"><meta property="og:image:alt" content="QorCap — HDMI in. Hash chain out."><meta name="twitter:card" content="summary_large_image"><meta name="twitter:title" content="QorCap — signal to seal"><meta name="twitter:description" content="HDMI in. Hash chain out. Hash-chained capture-card recording for QorTime match receipts."><meta name="twitter:image" content="https://conwan30.github.io/qorcap/assets/og-image.png"><meta property="og:description" content="Hash-chained capture-card recording for QorTime match receipts.">
@@ -12,18 +13,18 @@
 </head><body>
 <div class="grain" aria-hidden="true"></div><div class="glow-cursor" aria-hidden="true"></div>
 <header class="nav glass"><a class="brand" href="#top" aria-label="QorCap home"><img src="assets/logo-mark.svg" alt="" width="34" height="34"><b>Qor<span>Cap</span></b></a>
-<nav><a href="#pipeline">Pipeline</a><a href="#api">Live API</a><a href="#challenge">Challenge</a><a href="#tamper">Tamper</a><a href="#limits">Limits</a><a class="btn sm" href="https://github.com/ConWan30/qorcap/releases/tag/v0.2.0">Download</a></nav></header>
+<nav><a href="#pipeline">Pipeline</a><a href="#final">Final read</a><a href="#submit">Submit</a><a href="#referee">Referee</a><a href="#evidence">Evidence</a><a href="#limits">Limits</a><a class="btn sm" href="https://github.com/ConWan30/qorcap/releases/latest">Download</a></nav></header>
 <main>
 
 <section class="hero" id="top">
  <canvas id="sig" aria-hidden="true"></canvas>
  <div class="wrap">
-  <p class="kicker"><span class="dot"></span> v0.2.0 · capture-card recorder for QorTime</p>
+  <p class="kicker"><span class="dot"></span> <span data-ver>latest release</span> · capture-card recorder for QorTime</p>
   <h1 class="wordmark" aria-label="QorCap"><span aria-hidden="true">QORCAP</span></h1>
   <p class="tag">HDMI in. <span>Hash chain</span> out.</p>
-  <p class="lede">A lean Windows recorder for your capture card. Every <b>~2 s segment is SHA-256 chained</b>, checkpointed in QorTime's format, and sealed into a match bundle with a <b>draft receipt</b> ready for QorTime signing. If the card freezes or gets replugged, it reopens itself.</p>
-  <div class="ctas"><a class="btn" href="https://github.com/ConWan30/qorcap/releases/tag/v0.2.0">Download for Windows <small>v0.2.0 · zip</small></a><a class="btn ghost" href="https://github.com/ConWan30/qorcap">View on GitHub</a></div>
-  <div class="chips"><span class="chip"><b>1.6 MB</b> exe</span><span class="chip">Rust + ffmpeg child</span><span class="chip">API on <b>127.0.0.1:8788</b></span><span class="chip">Windows x64</span></div>
+  <p class="lede">A lean Windows recorder for your capture card. Every <b>~2 s segment is SHA-256 chained</b> and checkpointed in QorTime's format. It reads the Madden 27 scorebug, confirms the final from the end-of-game menu, and can <b>submit the match to the official QorTime referee</b>, which re-checks it on its own before it signs anything. If the card freezes or gets replugged, it reopens itself.</p>
+  <div class="ctas"><a class="btn" href="https://github.com/ConWan30/qorcap/releases/latest">Download for Windows <small><span data-ver>latest</span> · zip</small></a><a class="btn ghost" href="https://github.com/ConWan30/qorcap">View on GitHub</a></div>
+  <div class="chips"><span class="chip">Madden 27 · PS5</span><span class="chip">Rust + ffmpeg child</span><span class="chip">API on <b>127.0.0.1:8788</b></span><span class="chip">Windows x64</span></div>
  </div>
  <div class="hero-head glass" aria-hidden="true">
   <div class="row"><span>segment</span><b id="hSeq">#0000</b></div>
@@ -34,8 +35,8 @@
 </section>
 
 <div class="marq" aria-hidden="true"><div>
-<span>Signal</span><b>◆</b><span>Segment</span><b>◆</b><span>SHA-256</span><b>◆</b><span>Chain</span><b>◆</b><span>Checkpoint</span><b>◆</b><span>Challenge</span><b>◆</b><span>Clip</span><b>◆</b><span>Bundle</span><b>◆</b><span>Verify</span><b>◆</b>
-<span>Signal</span><b>◆</b><span>Segment</span><b>◆</b><span>SHA-256</span><b>◆</b><span>Chain</span><b>◆</b><span>Checkpoint</span><b>◆</b><span>Challenge</span><b>◆</b><span>Clip</span><b>◆</b><span>Bundle</span><b>◆</b><span>Verify</span><b>◆</b>
+<span>Signal</span><b>◆</b><span>Segment</span><b>◆</b><span>SHA-256</span><b>◆</b><span>Chain</span><b>◆</b><span>Challenge</span><b>◆</b><span>Final read</span><b>◆</b><span>Submit</span><b>◆</b><span>Referee</span><b>◆</b><span>Verify</span><b>◆</b>
+<span>Signal</span><b>◆</b><span>Segment</span><b>◆</b><span>SHA-256</span><b>◆</b><span>Chain</span><b>◆</b><span>Challenge</span><b>◆</b><span>Final read</span><b>◆</b><span>Submit</span><b>◆</b><span>Referee</span><b>◆</b><span>Verify</span><b>◆</b>
 </div></div>
 
 <section class="pad pipe-intro" id="pipeline"><div class="wrap rv">
@@ -53,12 +54,12 @@
     <div class="step"><span class="n">STAGE 2 / 6</span><h3>Segments</h3><p>The stream is cut into fragmented MP4 segments of about 2 seconds, flushed as they're written. A power cut loses at most the last fragment.</p></div>
     <div class="step"><span class="n">STAGE 3 / 6</span><h3>The chain</h3><p>Each segment's exact bytes get a SHA-256, linked to the previous head and appended to <code>manifest.jsonl</code>. Change one byte anywhere and every later link stops matching.</p></div>
     <div class="step"><span class="n">STAGE 4 / 6</span><h3>Checkpoints</h3><p>On segments, score changes and finals, QorCap emits checkpoints in QorTime's format, served at <code>/checkpoints</code> and streamed over SSE, ready for a referee to co-sign.</p></div>
-    <div class="step"><span class="n">STAGE 5 / 6</span><h3>Draft receipt</h3><p>At the whistle it writes a match bundle: <code>bundle.json</code>, clips and a <code>receipt.draft.json</code>. It stays <b>unsigned</b> until QorTime's referee step signs it.</p></div>
-    <div class="step"><span class="n">STAGE 6 / 6</span><h3>Verify</h3><p><code>qorcap verify-bundle</code> rehashes everything and catches any changed byte. The signed receipt is checked on QorTime's browser verifier.</p></div>
+    <div class="step"><span class="n">STAGE 5 / 6</span><h3>Receipt</h3><p>At the whistle it writes a match bundle (<code>bundle.json</code>, clips, <code>receipt.draft.json</code>) and Start Match signs <code>receipt.json</code> on this PC. Signed locally, it verifies as <b>SELF_ATTESTED</b>.</p></div>
+    <div class="step"><span class="n">STAGE 6 / 6</span><h3>Verify</h3><p><code>qorcap verify-bundle</code> rehashes everything and catches any changed byte. For an independent verdict, <code>qorcap submit</code> sends the bundle to the official QorTime referee.</p></div>
    </div>
    <div class="prog" id="prog"><i><b></b></i><i><b></b></i><i><b></b></i><i><b></b></i><i><b></b></i><i><b></b></i></div>
   </div>
-  <div class="stage"><canvas id="pipeCv" aria-label="Animated pipeline from capture card to verified receipt"></canvas></div>
+  <div class="stage"><canvas id="pipeCv" role="img" aria-label="Animated pipeline from capture card to verified receipt"></canvas></div>
  </div></div>
 </section>
 
@@ -78,7 +79,7 @@
  <div class="term glass rv">
   <div class="bar"><i></i><i></i><i></i><span class="sp">curl -N 127.0.0.1:8788/checkpoints</span><span class="sim">SIMULATION</span></div>
   <pre id="sse" aria-live="off"></pre>
-  <div class="cmd"><button data-ev="score">score change</button><button data-ev="nonce">referee nonce</button><button data-ev="final">final</button><button data-ev="pause">pause</button></div>
+  <div class="cmd"><button type="button" data-ev="score">score change</button><button type="button" data-ev="nonce">referee nonce</button><button type="button" data-ev="final">final</button><button type="button" data-ev="pause">pause</button></div>
  </div>
 </div>
 <div class="wrap"><p class="note rv">Simulated in your browser with real SHA-256 (WebCrypto). The field layout is illustrative, not byte-for-byte QorCap output. No data leaves this page.</p></div>
@@ -86,26 +87,35 @@
 
 <section class="pad" id="challenge"><div class="wrap two">
  <div class="chal glass rv">
-  <div class="chal-top"><span class="kicker">Referee challenge</span><button class="btn sm" id="chalBtn">Issue nonce</button></div>
+  <div class="chal-top"><span class="kicker">Referee challenge</span><button type="button" class="btn sm" id="chalBtn">Issue nonce</button></div>
   <div class="nonce" id="nonce" aria-live="polite">waiting for referee…</div>
   <div class="pattern" id="pattern" aria-hidden="true"><span>△</span><span>○</span><span>✕</span><span>□</span><span>L1</span><span>R1</span></div>
   <div class="chal-chain" id="chalChain" aria-hidden="true"></div>
   <dl class="kv" id="chalKv"><dt>received_wall_ms</dt><dd>—</dd><dt>segment_seq_at_receipt</dt><dd>—</dd><dt>chain_head_at_receipt</dt><dd>—</dd><dt>stamped</dt><dd>—</dd></dl>
+  <div class="phases" role="group" aria-label="Official challenge phases"><span class="ph"><i></i>Kickoff</span><span class="ph"><i></i>Halftime</span><span class="ph"><i></i>Q4</span><span class="anc" aria-hidden="true"></span></div>
   <p class="note"><span class="sim">SIMULATION</span>&nbsp; The button pattern here is illustrative; QorCap uses a port of QorTime's <code>pattern_for(nonce)</code>.</p>
  </div>
  <div class="rv">
-  <p class="kicker">03 · Not pre-recorded</p>
-  <h2>A nonce, <em>burned</em> into the footage.</h2>
-  <p class="lede">A QorTime referee sends a random nonce to <b>POST /challenge</b>. QorCap records when it arrived, which segment was being written and the chain head at that instant, and adds a checkpoint containing the nonce.</p>
-  <p class="lede" style="margin-top:14px">With <b>--stamp</b>, the nonce and its button pattern are drawn into the recorded video itself. Footage after that point could not have existed before the nonce did.</p>
+  <p class="kicker">03 · Live official challenges</p>
+  <h2>A nonce, <em>pressed</em> on the pad.</h2>
+  <p class="lede">Start the match with <code>--official-challenges</code> and the QorTime referee issues three signed, timed challenges: <b>kickoff, halftime and Q4</b>. You answer each one with a button pattern on the controller. The pattern can't be known before the referee issues its nonce, and each challenge carries a chain-head anchor showing the earlier video already existed.</p>
+  <p class="lede" style="margin-top:14px">Between challenges, QorCap has the referee <b>timestamp the chain head every 60 s</b> (<code>--no-anchors</code> turns it off). Without official challenges the best official result is <b>PARTIAL</b>: the referee can show the bytes are what you recorded, not that they were recorded live.</p>
+  <p class="lede" style="margin-top:14px"><small>QorCap's 2026-10-16 sync report lists official challenges on a real DualSense as not yet exercised in a real match. Local challenges still work too: a nonce sent to <code>POST /challenge</code> is checkpointed, and with <code>--stamp</code> it's burned into the video itself.</small></p>
  </div>
 </div></section>
 
 <section class="pad" id="clips"><div class="wrap two">
  <div class="rv">
-  <p class="kicker">04 · Auto-clips</p>
+  <p class="kicker">04 · Scorebug profiles</p>
   <h2>The scorebug <em>calls</em> the clips.</h2>
-  <p class="lede">QorTime's own scorebug reader runs inline on a 4 fps snapshot. Each confirmed score change saves a clip from the in-RAM replay ring. At the end it saves a final clip and records why it thinks the game ended: <b>final_basis</b> = <code>clock_zero</code> or <code>scorebug_gone</code>.</p>
+  <p class="lede">QorTime's own scorebug reader runs inline on a 4 fps snapshot, and each agreed score change saves a clip from the in-RAM replay ring. When the standard layout isn't on screen, QorCap tries its <b>Monday Night</b> reader; whichever reads becomes the active profile, and the receipt records it as <code>match.scorebug_profile</code>.</p>
+  <div class="prof">
+   <div><code>madden27_standard</code><span class="pill ok">supported</span></div>
+   <div><code>madden27_monday_night</code><span class="pill ok">supported · v0.3.5</span></div>
+   <div><code>Sunday Night</code><span class="pill un">untested</span></div>
+   <div><code>Thursday Night</code><span class="pill un">untested</span></div>
+  </div>
+  <p class="note">Sunday Night and Thursday Night presentations are not verified. They read as <code>layout_unknown</code>, so no score is recorded from them. Other games: none.</p>
  </div>
  <div class="clips glass rv">
   <div class="screen" id="screen"><div class="yard"></div><div class="rec">REC · mock match</div><div class="roi"></div>
@@ -117,37 +127,120 @@
  </div>
 </div></section>
 
+<section class="pad" id="final"><div class="wrap two">
+ <div class="ladder glass rv" id="ladder">
+  <div class="chal-top"><span class="kicker">End-of-game final read</span><span class="sim">SIMULATION</span></div>
+  <ol>
+   <li><b>01</b><span>Scorebug reads Q4 <code>0:00</code></span><em>candidate final</em></li>
+   <li><b>02</b><span>Madden end-of-game menu detected</span><em>panel beside FINISH GAME</em></li>
+   <li><b>03</b><span>3 consecutive menu frames agree</span><em>≥ 400 ms</em></li>
+   <li><b>04</b><span>Equals the last scorebug read, or one legal scoring play past it</span><em>else unconfirmed</em></li>
+   <li class="lock"><b>◆</b><span>Final score locked</span><em><code>final_confirmed: true</code></em></li>
+  </ol>
+  <p class="note">Illustrative sequence of the rules QorCap applies. No real match data.</p>
+ </div>
+ <div class="rv">
+  <p class="kicker">05 · Final read, confirmed</p>
+  <h2>The final is <em>read</em>, not guessed.</h2>
+  <p class="lede">The scorebug can vanish before the last play's points are drawn, so QorCap reads the final from Madden's <b>end-of-game menu</b>, with the same template-digit method as QorTime's reader and every digit cross-checked. Only a stable read sets <code>result.method = "end_menu_read"</code> and <code>final_confirmed: true</code>.</p>
+  <p class="lede" style="margin-top:14px">A scorebug-only final stays <b>unconfirmed</b>, and Start Match keeps recording up to 120 s for the menu. On online matches the name tags cover the away score, so the menu can only <b>corroborate</b> the scorebug's final, never read a new one. A one-play jump past the last scorebug read needs corroborating evidence (a score-change clip, haptics or inputs near the score). If the live read misses it, Start Match checks the recording's last minutes at stop, and <code>Finalize Last Match</code> can redo it offline.</p>
+ </div>
+</div></section>
+
+<section class="pad" id="submit"><div class="wrap two">
+ <div class="rv">
+  <p class="kicker">06 · Submit for Verification</p>
+  <h2>Metadata, then <em>video</em> on request.</h2>
+  <p class="lede">A bundle signed only by your laptop is <b>SELF_ATTESTED</b>. To aim for <b>VERIFIED</b>, double-click <code>Submit for Verification</code>, answer <code>y</code> at the end of Start Match, or run <code>qorcap submit</code>. No account is needed: the request is signed with this PC's <b>install key</b>, the same device key that recorded the match.</p>
+  <ol class="steps2">
+   <li><b>1</b><p>QorCap fetches a single-use nonce, solves a small proof-of-work and signs the request and the bundle's manifest hash with the install key.</p></li>
+   <li><b>2</b><p>It uploads the small metadata only: manifest, checkpoints, inputs, receipts. No video yet.</p></li>
+   <li><b>3</b><p>The referee re-checks every chain and signature itself, commits to them, <em>then</em> picks segments: the init segment, the last 240 s, segments around each challenge and 16 random ones.</p></li>
+   <li><b>4</b><p>QorCap uploads those. The referee hashes the bytes against the chain, re-reads the final with QorCap's own readers and re-runs the challenges. Only if every check passes does it countersign.</p></li>
+  </ol>
+ </div>
+ <div class="code glass rv"><pre><span class="c"># from the match folder, or double-click</span>
+<span class="f">Submit for Verification.cmd</span>
+
+<span class="c"># or by hand</span>
+<span class="p">qorcap submit</span> "&lt;bundle dir&gt;"
+<span class="c">#   --full   upload every segment, not a spot-check</span>
+<span class="c">#   --yes    skip the confirmation prompt</span>
+
+<span class="c"># on success the bundle gains</span>
+receipt.official.json
+verify.official.txt
+<span class="c"># plus the referee's transparency-log entry number</span>
+
+<span class="c"># QorCap 0.3.9 and older can no longer submit:</span>
+<span class="c"># HTTP 426  QorCap 0.3.10 or newer is required</span></pre></div>
+</div></section>
+
+<section class="pad" id="referee"><div class="wrap">
+ <div class="rv"><p class="kicker">07 · The official referee</p>
+ <h2>One root, kept <em>offline</em>.</h2>
+ <p class="lede">The QorTime referee's root key <code>qortime-v1</code> stays offline. It signs a short-lived delegation for an online key, and that online key does the countersigning. Every countersigned receipt goes into a public, hash-chained transparency log. QorCap checks the delegation and the revocation list locally before it uploads anything.</p></div>
+ <div class="kc glass rv">
+  <div class="node"><span class="ic">Offline root</span><h3>qortime-v1</h3><p>Signs delegation certificates and the revocation list. Never online.</p></div>
+  <div class="wire" aria-hidden="true"></div>
+  <div class="node"><span class="ic">Delegation cert</span><h3>≤ 90 days</h3><p>Scope <code>official-review</code>. Caps the verdict at VERIFIED or PARTIAL. Revocable with one root-signed entry.</p></div>
+  <div class="wire" aria-hidden="true"></div>
+  <div class="node"><span class="ic">Online key</span><h3>Countersigns</h3><p>Signs only after its own review passes. Refuses to sign outside the cert's window.</p></div>
+  <div class="wire" aria-hidden="true"></div>
+  <div class="node"><span class="ic">Transparency log</span><h3>Append-only</h3><p>Each receipt is logged before release. The log head is anchored in the QorTime repo.</p></div>
+ </div>
+ <div class="verd">
+  <div class="v ok rv"><b>VERIFIED</b><p>Official key, every check passes, and the kickoff, halftime and Q4 official challenges re-verify, with enough motion.</p></div>
+  <div class="v pa rv"><b>PARTIAL</b><p>Official key, but a check is only partial, a phase has no passed official challenge, or motion is too low.</p></div>
+  <div class="v se rv"><b>SELF_ATTESTED</b><p>The referee key isn't on QorTime's allowlist, or is revoked. Every local Start Match receipt lands here.</p></div>
+  <div class="v fa rv"><b>FAIL</b><p>Any failed check, a missing or forged review, a bad chain signature, or any normal verify failure.</p></div>
+ </div>
+ <p class="note rv">Rules from QorTime's <a href="https://github.com/ConWan30/qortime/blob/main/docs/REFEREE_SERVICE.md">REFEREE_SERVICE.md</a>, <a href="https://github.com/ConWan30/qortime/blob/main/docs/REFEREE_KEYS.md">REFEREE_KEYS.md</a> and <a href="https://github.com/ConWan30/qortime/blob/main/docs/TRUSTED_REFEREES.md">TRUSTED_REFEREES.md</a>. The Python and browser verifiers apply the same rules.</p>
+</div></section>
+
+<section class="pad" id="evidence"><div class="wrap">
+ <div class="rv"><p class="kicker">08 · Supporting evidence</p>
+ <h2>Extra signals, <em>labelled</em>.</h2>
+ <p class="lede">Alongside the video chain, QorCap records evidence that helps a reviewer, and says plainly what each piece is worth.</p></div>
+ <div class="lims">
+  <div class="lim glass rv"><span class="ic">Audio precheck</span><h3>Game audio levels</h3><p>Start Match records 4 s of the card's audio before the match (<code>audio_precheck.json</code>), and Start Match and Finalize measure the recorded audio (<code>audio_check.json</code>). A silent card gets a loud warning with the likely fixes.</p></div>
+  <div class="lim glass rv"><span class="ic">Controller input</span><h3>Inputs on the video clock</h3><p>With the DualSense on the PS5 over Bluetooth and USB-plugged into the laptop, QorCap logs its HID reports to <code>inputs.jsonl</code>. Each chunk's hash goes into that segment's checkpoint, so the inputs are part of the chain. <span class="adv">Advisory evidence, not proof</span></p></div>
+  <div class="lim glass rv"><span class="ic">Haptics</span><h3>Rumble from the IMU</h3><p>The PS5 sends rumble over Bluetooth, which the laptop can't see, so QorCap watches the pad's gyro and accelerometer for vibration bursts (<code>haptics.jsonl</code>). <span class="adv">Advisory evidence, not proof</span></p></div>
+ </div>
+ <p class="note rv">The input proof's human-likeness score is a hand-set heuristic, and input-video alignment is reported against a chance baseline. Neither shows who held the controller.</p>
+</div></section>
+
 <section class="pad" id="tamper"><div class="wrap">
- <div class="rv"><p class="kicker">05 · Tamper demo</p>
+ <div class="rv"><p class="kicker">09 · Tamper demo</p>
  <h2>Flip <em>one</em> byte. Break the chain.</h2>
  <p class="lede">These are six tiny "segments" hashed live in your browser. <b>Tap any byte</b> to flip it, then watch <code>verify-bundle</code> find the exact break. Gold means sealed and matching.</p></div>
  <div class="tamp glass rv">
   <div class="segs" id="segs"></div>
-  <div class="verdict" id="verdict"><span class="ic">◆</span><span id="vText">verify-bundle: OK · 6 segments · chain intact</span><span class="sp"></span><button class="btn ghost sm" id="reset">Reset</button></div>
+  <div class="verdict" id="verdict"><span class="ic">◆</span><span id="vText">verify-bundle: OK · 6 segments · chain intact</span><span class="sp"></span><button type="button" class="btn ghost sm" id="reset">Reset</button></div>
  </div>
 </div></section>
 
 <section class="pad" id="obs"><div class="wrap two">
  <div class="rv">
-  <p class="kicker">06 · Why not OBS</p>
+  <p class="kicker">10 · Why not OBS</p>
   <h2>Freezes are <em>survivable</em> now.</h2>
   <p class="lede">The usual failure: a cheap capture card's driver hangs, and the recorder sits on a frozen device forever. QorCap runs ffmpeg as a <b>child process</b>, so a hung driver can only freeze ffmpeg, never QorCap. A watchdog kills the child after 4 s without data and reopens the card. The recording continues in <code>video.part2.mp4</code>, and the chain carries on across parts.</p>
   <div class="vs">
    <div><h4>Typical recorder</h4><ul><li>Hangs with the driver</li><li>Replug often needs restart</li><li>No integrity record</li><li>Big general-purpose install</li></ul></div>
-   <div class="us"><h4>QorCap</h4><ul><li>Watchdog kills & reopens</li><li>Polls for replugged card</li><li>Chain continues across parts</li><li>One 1.6 MB exe + ffmpeg</li></ul></div>
+   <div class="us"><h4>QorCap</h4><ul><li>Watchdog kills &amp; reopens</li><li>Polls for replugged card</li><li>Chain continues across parts</li><li>One small exe + ffmpeg</li></ul></div>
   </div>
  </div>
  <div class="wd glass rv">
   <div class="chal-top"><span class="kicker">Watchdog</span><span class="sim">SIMULATION</span></div>
-  <canvas id="wdCv" aria-label="Animation of byte flow, a freeze, the watchdog firing and the device reopening"></canvas>
+  <canvas id="wdCv" role="img" aria-label="Animation of byte flow, a freeze, the watchdog firing and the device reopening"></canvas>
   <div class="wd-log" id="wdLog"></div>
  </div>
 </div></section>
 
 <section class="pad fit" id="fit"><div class="wrap">
- <div class="rv"><p class="kicker">07 · How it fits QorTime</p>
+ <div class="rv"><p class="kicker">11 · How it fits QorTime</p>
  <h2>QorCap records. <em>QorTime</em> signs.</h2>
- <p class="lede">QorCap is the capture half. It produces evidence; QorTime's agent and referee add keys and signatures, and anyone can check the result on the <a href="https://conwan30.github.io/qortime/verify/">QorTime verifier</a>.</p></div>
+ <p class="lede">QorCap is the capture half. It produces evidence; QorTime's referee re-checks it and signs, and anyone can check the result on the <a href="https://conwan30.github.io/qortime/verify/">QorTime verifier</a>. More on the <a href="https://conwan30.github.io/qortime/">QorTime site</a> and in the <a href="https://github.com/ConWan30/qortime">QorTime repo</a>.</p></div>
  <div class="glass rv" style="padding:clamp(14px,3vw,30px);margin-top:30px">
  <svg class="fit-d" viewBox="0 0 1100 360" role="img" aria-label="Diagram: PS5 to capture card to qorcap.exe, producing video, manifest and checkpoints; referee challenges and co-signs; bundle goes to QorTime and its verifier">
   <defs><linearGradient id="gC" x1="0" x2="1"><stop offset="0" stop-color="#2ef2ff" stop-opacity=".25"/><stop offset="1" stop-color="#2ef2ff" stop-opacity=".05"/></linearGradient>
@@ -184,52 +277,60 @@
  </svg>
  <div class="legend"><span><i></i>QorCap evidence</span><span><i class="g"></i>signed / verified (QorTime)</span></div>
  </div>
+ <div class="compat glass rv">
+  <span class="kicker">Compatibility</span>
+  <p>QorCap and QorTime share one <b>contracts registry</b>. The canonical copy lives in QorTime's <a href="https://github.com/ConWan30/qortime/tree/main/schema/contracts"><code>schema/contracts/</code></a> (<code>compat.json</code> plus JSON Schemas), and QorCap vendors a byte-identical copy in <a href="https://github.com/ConWan30/qorcap/tree/main/contracts"><code>contracts/</code></a> with <code>SHA256SUMS</code> and <code>CONTRACTS_PIN</code>. Tests on both sides fail on drift. Each release zip bundles a pinned QorTime copy, and the official referee accepts submissions only from QorCap 0.3.10 or newer. Details in the <a href="https://github.com/ConWan30/qorcap/blob/main/SYNC_REPORT.md">sync report</a>.</p>
+ </div>
 </div></section>
 
 <section class="pad" id="quick"><div class="wrap two">
  <div class="rv">
-  <p class="kicker">08 · Quickstart</p>
+  <p class="kicker">12 · Quickstart</p>
   <h2>Double-click <em>Start Match</em>.</h2>
-  <p class="lede">Unzip, plug the PS5 into the USB3.0 Video card, double-click <code>Start Match</code>. The first run downloads ffmpeg and sets up Python by itself. One window shows the score, clock, segments and clips; it stops at the final whistle (or press Enter), signs the receipt, verifies it and opens the match folder. No card handy? Double-click <code>Test Without Card</code>.</p>
-  <p class="lede"><small>Trust level today: <b>self-attested</b>. The receipt is signed by a key on your PC and a local referee key, because no public QorTime referee server exists yet. It proves the video was not changed after recording, not who held the controller.</small></p>
-  <div class="dl"><a class="btn" href="https://github.com/ConWan30/qorcap/releases/download/v0.2.0/qorcap-v0.2.0-windows-x64.zip">Download zip</a><a class="btn ghost" href="https://github.com/ConWan30/qorcap#readme">Full README</a></div>
+  <p class="lede">Unzip, plug the PS5 into the USB3.0 Video card, double-click <code>Start Match</code>. On its initial run it downloads ffmpeg and sets up Python by itself. One window shows the score, clock, segments and clips; it stops when the final is read from the end-of-game menu (or press Enter), signs the receipt, verifies it, offers to submit it and opens the match folder. No card handy? Double-click <code>Test Without Card</code>.</p>
+  <p class="lede"><small>Trust level: a receipt signed only on your PC is <b>SELF_ATTESTED</b>. It proves the video wasn't changed after recording, not who held the controller. For an official verdict, submit it to the QorTime referee.</small></p>
+  <div class="dl"><a class="btn" href="https://github.com/ConWan30/qorcap/releases/latest" data-zip>Download zip</a><a class="btn ghost" href="https://github.com/ConWan30/qorcap#readme">Full README</a></div>
  </div>
- <div class="code glass rv"><button class="btn ghost sm copy" id="copy">Copy</button>
-<pre id="ps"><span class="c"># 1. unzip qorcap-v0.2.0-windows-x64.zip (e.g. to C:\QorCap)</span>
+ <div class="code glass rv"><button type="button" class="btn ghost sm copy" id="copy">Copy</button>
+<pre id="ps"><span class="c"># 1. unzip <span data-zipname>the release zip</span> (e.g. to C:\QorCap)</span>
 <span class="c"># 2. PS5 HDMI -&gt; USB3.0 Video card -&gt; blue USB 3 port</span>
-<span class="c"># 3. double-click</span>
+<span class="c"># 3. double-click (add --official-challenges to aim for VERIFIED)</span>
 <span class="f">Start Match.cmd</span>
 
-<span class="c"># the window shows, then finishes with:</span>
-[REC] 12:41 | AWAY 10 - HOME 14  Q4 0:00 | segments 380 | signed 395 | clips 6
-  RESULT: PARTIAL   (self-attested)
-  Video check:  OK
+<span class="c"># the window ends with</span>
+  RESULT: SELF_ATTESTED
+  Video check:  OK - every video byte matches the hash chain
+  Submit for Verification: ...
+  Submit now? [y/N]
 
-<span class="c"># view it: conwan30.github.io/qortime/verify/</span>
-<span class="c"># choose receipt.json, paste referee.pub, Verify</span>
+<span class="c"># later, from any match folder</span>
+<span class="f">Submit for Verification.cmd</span>
 
 <span class="c"># no card? dry run with a test pattern</span>
 <span class="f">Test Without Card.cmd</span></pre></div>
 </div></section>
 
 <section class="pad" id="limits"><div class="wrap">
- <div class="rv"><p class="kicker">09 · Honest limits</p>
+ <div class="rv"><p class="kicker">13 · Honest limits</p>
  <h2>What it <em>doesn't</em> prove.</h2>
  <p class="lede">QorCap is evidence about footage, not about people. Here is exactly where the line is.</p></div>
  <div class="lims">
-  <div class="lim glass rv"><span class="ic">Proves</span><h3>Integrity & timing</h3><p>Which exact video bytes, in what order, seen when, and (once a referee co-signs) no later than the referee's clock.</p></div>
-  <div class="lim glass rv no"><span class="ic">Does not prove</span><h3>Who is playing</h3><p>No proof of player identity. Player keys, the HID nonce response and dual-attested mode are QorTime's job.</p></div>
-  <div class="lim glass rv no"><span class="ic">Status</span><h3>v0.2.0, untested on hardware</h3><p>Cross-compiled and tested on Linux with a test-pattern source. Not yet run on Windows with a real card.</p></div>
-  <div class="lim glass rv no"><span class="ic">Receipt</span><h3>Unsigned draft</h3><p><code>receipt.draft.json</code> carries no signatures until QorTime's referee step fills in keys and signs it.</p></div>
-  <div class="lim glass rv no"><span class="ic">Scope</span><h3>No chain, no token</h3><p>Nothing goes on a blockchain. The "chain" is a local SHA-256 hash chain in a text file.</p></div>
+  <div class="lim glass rv"><span class="ic">Proves</span><h3>Integrity &amp; timing</h3><p>Which exact video bytes, in what order, seen when. With official challenges and anchors, the official referee ties the chain to real time.</p></div>
+  <div class="lim glass rv no"><span class="ic">Does not prove</span><h3>Who is playing</h3><p>No proof of player identity. Inputs and haptics show a controller plugged into this laptop was in use, not who held it.</p></div>
+  <div class="lim glass rv no"><span class="ic">No attestation</span><h3>Software keys</h3><p>Install keys are software Ed25519 keys with no hardware attestation. They bind a submission to the recorder and deter floods; they don't prove a genuine device.</p></div>
+  <div class="lim glass rv no"><span class="ic">Sampled</span><h3>Spot-check</h3><p>By default the referee inspects the tail, the challenge windows and 16 random segments. A laptop missing a fraction <i>f</i> of segments passes the random part with probability (1−<i>f</i>)<sup>16</sup>. Unsampled content isn't inspected. <code>--full</code> uploads everything.</p></div>
+  <div class="lim glass rv no"><span class="ic">Before hashing</span><h3>Pre-capture edits</h3><p>Footage fabricated or edited before QorCap hashed it, outside anchored windows, isn't detected. The local countersignatures on your PC don't prove liveness.</p></div>
+  <div class="lim glass rv no"><span class="ic">Platform</span><h3>Windows only</h3><p>Windows x64, DirectShow, tuned on one generic "USB3.0 Video" card. Madden 27 only; Sunday Night and Thursday Night scorebugs are untested.</p></div>
+  <div class="lim glass rv no"><span class="ic">Advisory</span><h3>Heuristics</h3><p>The human-likeness score and haptic thresholds are hand-set, not trained. The referee re-checks input hashes and counts, but doesn't re-run that model.</p></div>
+  <div class="lim glass rv no"><span class="ic">Scope</span><h3>No chain, no token</h3><p>Nothing goes on a blockchain. The "chain" is a SHA-256 hash chain in local files; the referee's transparency log is a hash-chained file it publishes.</p></div>
   <div class="lim glass rv"><span class="ic">This page</span><h3>Simulations, labelled</h3><p>Every live-looking demo here runs in your browser. No stats, no testimonials, no real match data.</p></div>
  </div>
 </div></section>
 </main>
 <footer><div class="wrap">
  <div class="big" aria-hidden="true">QorCap</div>
- <div>QorCap v0.2.0 · MIT · built for <a href="https://conwan30.github.io/qortime/">QorTime</a></div>
- <nav><a href="https://github.com/ConWan30/qorcap">GitHub</a><a href="https://github.com/ConWan30/qorcap/releases/tag/v0.2.0">Release</a><a href="https://conwan30.github.io/qortime/">QorTime</a><a href="https://conwan30.github.io/qortime/verify/">Verifier</a></nav>
+ <div>QorCap <span data-ver>latest</span> · MIT · built for <a href="https://conwan30.github.io/qortime/">QorTime</a></div>
+ <nav aria-label="Footer"><a href="https://github.com/ConWan30/qorcap">GitHub</a><a href="https://github.com/ConWan30/qorcap/releases/latest">Latest release</a><a href="https://conwan30.github.io/qortime/">QorTime site</a><a href="https://github.com/ConWan30/qortime">QorTime repo</a><a href="https://conwan30.github.io/qortime/verify/">Verifier</a></nav>
 </div></footer>
 <script src="app.js"></script>
 </body></html>
