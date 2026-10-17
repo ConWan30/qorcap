@@ -4,6 +4,15 @@ Audited: QorCap main `9909a00` (v0.3.9, PR #13), QorTime main `9d94877` (after #
 The canonical contract registry now lives in **qortime `schema/contracts/`** (`compat.json` plus JSON Schemas). QorCap
 vendors a byte-identical copy in `contracts/` (`SHA256SUMS`, `CONTRACTS_PIN`). Tests on both sides fail on drift.
 
+## v0.3.11 update (2026-10-17)
+
+Vendored from QorTime `ad3d0da` (#33); `compat.json` is byte-identical (`cmp` + `test_vendored_contracts_equal_qortime_checkout`).
+New in the registry: `challenge_rules` (phases open at pause-capable moments: after the kickoff of that half/quarter
+and a play call; 90 s window, max 120 s; answering press = first OPTIONS followed by the pattern; recorder re-run at
+finalize), meta files `challenge_gates.jsonl` and `challenge_results.jsonl`, recorder current `0.3.11`.
+`sidecar/qorcap_match.py` `QORTIME_PIN` = `ad3d0da`. Golden fixtures `v0311_challenges_answered`,
+`v0310_challenge_result_null`, `v0310_legacy_20s_window`, `v0311_challenge_window_too_long` pin both verifiers.
+
 ## Contracts: where each side defines them, and status
 
 | Contract | QorTime | QorCap | Status |

@@ -77,8 +77,11 @@ class ReaderCore:
     """Frame -> agreed reads / obs spans -> events. Pure logic; I/O injected (unit-testable)."""
 
     def __init__(self, post: Callable[[dict], Any], reader=None, agree=None, pause=None, detect_final=None,
-                 final_screen_detector=None, end_menu_reader=None, end_menu_agree=None) -> None:
+                 final_screen_detector=None, end_menu_reader=None, end_menu_agree=None, playcall=None, gate=None) -> None:
         self.post, self.reader, self.agree, self.pause = post, reader, agree, pause
+        # v0.3.11: pause-capable moments for the official challenges (qorcap_playcall). Optional: the referee's
+        # re-read and old callers pass neither.
+        self.playcall, self.gate = playcall, gate
         self.detect_final = detect_final
         self.final_screen_detector = final_screen_detector  # QorTime ships none; QorCap: madden_final_screen
         self.timeline: list[dict] = []
@@ -116,7 +119,22 @@ class ReaderCore:
             if self.pause.paused:
                 self.stats["paused"] += 1
                 self._close_spans()
+                if self.gate is not None:
+                    self.gate.on_frame(t_ms, False, paused=True)
                 return
+        if self.gate is not None:
+            pc = False
+            if self.playcall is not None:
+                try:
+                    pc = self.playcall.detect(img)
+                except Exception as e:  # never silent, never fatal
+                    print(f"play-call detector error: {type(e).__name__}: {e}", file=sys.stderr)
+            if pc:
+                self.stats["play_call"] = self.stats.get("play_call", 0) + 1
+            ev = self.gate.on_frame(t_ms, pc)
+            if ev is not None:
+                self.stats["pause_capable"] = self.stats.get("pause_capable", 0) + 1
+                print(f"pause-capable moment ({ev.basis}): Q{ev.quarter} -> {ev.phase} challenge may open", file=sys.stderr)
         try:
             fr = self.reader.read(rimg)
             band, _ = self.reader.reference_band(rimg) if hasattr(self.reader, "reference_band") else (None, None)
@@ -136,6 +154,8 @@ class ReaderCore:
               "clock_red": bool(getattr(res.read, "clock_red", False))}
         prev = next((r for r in reversed(self.timeline) if "obs" not in r), None)
         key = lambda r: (r["home"], r["away"], r["quarter"], r["clock_s"])  # noqa: E731
+        if self.gate is not None:
+            self.gate.on_read(rd)
         if prev is None or key(prev) != key(rd) or rd["t_ms"] - prev["t_ms"] >= 1_000:
             self.timeline.append(rd)
             self.post({"type": "score", **rd})

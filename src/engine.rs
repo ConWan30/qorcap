@@ -851,7 +851,7 @@ impl Engine {
         let (seq, head) = { let st = self.ev.lock().unwrap(); (st.seg.seq, st.seg.head.clone()) };
         let c = json!({"id": b["id"].as_str().map(String::from).unwrap_or_else(|| nonce[..8].to_string()),
             "role": b["role"].as_str().unwrap_or(&self.args.role), "phase": b["phase"].as_str().unwrap_or("kickoff"),
-            "nonce": nonce, "pattern": pattern, "issued_ms": issued, "deadline_ms": b["deadline_ms"].as_u64().unwrap_or(issued + 20_000),
+            "nonce": nonce, "pattern": pattern, "issued_ms": issued, "deadline_ms": b["deadline_ms"].as_u64().unwrap_or(issued + 90_000),
             "received_wall_ms": now, "received_mono_ms": self.ms(), "segment_seq_at_receipt": seq, "chain_head_at_receipt": head});
         if self.args.stamp {
             let text = format!("QorCap nonce {}  {}", &nonce[..12], pattern.join(" "));

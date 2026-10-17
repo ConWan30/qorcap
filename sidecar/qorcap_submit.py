@@ -40,9 +40,10 @@ OFFICIAL_URL = os.getenv("QORTIME_REFEREE_URL", "https://qortime-referee-product
 OFFICIAL_PUB = "a5aa0c9121db2c517284bf1c49eeec199829ca832a2b665f26e872e01192feea"
 META_FILES = ("bundle.json", "manifest.jsonl", "checkpoints.jsonl", "countersigned.jsonl", "inputs.jsonl",
               "haptics.jsonl", "input_proof.json", "receipt.json", "receipt.draft.json", "timeline.jsonl",
-              "challenges.jsonl", "official_challenges.jsonl", "anchors.jsonl", "referee.pub")
+              "challenges.jsonl", "official_challenges.jsonl", "anchors.jsonl", "referee.pub",
+              "challenge_gates.jsonl", "challenge_results.jsonl")
 HERE = Path(__file__).resolve().parent
-CLIENT_VERSION = "0.3.10"
+CLIENT_VERSION = "0.3.11"
 SUBMIT_TYPE = "qortime-submit/v1"   # = QorTime contracts compat.json submit_auth.request_type
 POW_PREFIX = "qortime-pow/v1|"      # = compat.json submit_auth.pow_prefix
 
@@ -377,22 +378,37 @@ if __name__ == "__main__":
 
 # ------------------------------------------------------------------ live helpers used by Start Match
 class OfficialLive:
-    """During Start Match: timestamp the video chain with the official referee (anchors) and, if enabled, fetch
-    official challenge nonces at kickoff / halftime (Q3) / Q4. Network failures never disturb the recording."""
+    """During Start Match: timestamp the video chain with the official referee (anchors) and, if enabled, fetch the
+    three official challenge nonces. Network failures never disturb the recording.
+
+    v0.3.11: a challenge is requested only at a pause-capable moment (``qorcap_playcall.PauseCapableGate``: after
+    the kickoff of that half/quarter and a play call), never on a timer. Online Madden 27 cannot pause during a
+    kickoff or a kickoff return, which is why every v0.3.10 ``kickoff`` challenge (issued ~10 s into the recording)
+    failed. Phases: ``kickoff`` in Q1-Q2, ``halftime`` in Q3, ``end`` in Q4/OT; at most one open window at a time; a
+    phase whose quarter has passed is skipped (logged), never issued late at a kickoff. Each opened window is logged
+    in ``challenge_gates.jsonl`` with its gate basis."""
 
     ANCHOR_EVERY_S = 60.0
+    RETRY_S = 15.0
 
     def __init__(self, base: str, bundle: Path, match_id: str, role: str, api, *, challenges: bool = False,
-                 client: Client | None = None, clock=time.monotonic, wall=lambda: int(time.time() * 1000)) -> None:
+                 client: Client | None = None, clock=time.monotonic, wall=lambda: int(time.time() * 1000),
+                 gate=None, beep=None) -> None:
         self.c = client or Client(base, timeout=8)
         self.bundle, self.match_id, self.role, self.api = bundle, match_id, role, api
         self.challenges = challenges
         self.clock, self.wall = clock, wall
+        self.gate = gate or (lambda: None)
+        self.beep = beep if beep is not None else _beep
         self.last_anchor = None
         self.issued: set[str] = set()
+        self.skipped: set[str] = set()
         self.anchors = 0
         self.failures = 0
         self.prompts: list[str] = []
+        self.open_until_ms = 0      # wall ms: deadline of the window currently open
+        self.used_event_ms = 0      # gate events at or before this were already used (or failed)
+        self.retry_at = 0.0
 
     def _append(self, name: str, obj: dict) -> None:
         with open(self.bundle / name, "a", encoding="utf-8") as f:
@@ -419,40 +435,69 @@ class OfficialLive:
             except Exception:
                 self.failures += 1
         if self.challenges:
-            phase = self._due_phase(got)
-            if phase:
-                self._challenge(phase, got)
+            due = self._due_phase()
+            if due:
+                self._challenge(due[0], got, due[1])
 
-    def _due_phase(self, got: dict) -> str | None:
-        q = None
-        try:
-            sc = (self.api.get("/timeline", timeout=2) or {}).get("score") or {}
-            q = int(sc.get("quarter")) if sc.get("quarter") is not None else None
-        except Exception:
-            pass
-        if "kickoff" not in self.issued and int(got.get("segments") or 0) >= 5:
-            return "kickoff"
-        if "halftime" not in self.issued and "kickoff" in self.issued and q is not None and q >= 3:
-            return "halftime"
-        if "end" not in self.issued and "halftime" in self.issued and q is not None and q >= 4:
-            return "end"
-        return None
+    def _due_phase(self):
+        """(phase, gate event) when a pause-capable moment for a not-yet-issued phase has just happened."""
+        gate = self.gate()
+        if gate is None or self.wall() < self.open_until_ms or self.clock() < self.retry_at:
+            return None
+        ev = gate.latest(self.used_event_ms)
+        if ev is None:
+            return None
+        self.used_event_ms = ev.t_ms
+        if ev.phase in self.issued:
+            return None
+        order = ["kickoff", "halftime", "end"]
+        for earlier in order[: order.index(ev.phase)]:
+            if earlier not in self.issued and earlier not in self.skipped:
+                self.skipped.add(earlier)
+                self._append("challenge_gates.jsonl", {"phase": earlier, "skipped": True, "why":
+                              f"no pause-capable moment seen before Q{ev.quarter}", "t_ms": ev.t_ms})
+        return ev.phase, ev
 
-    def _challenge(self, phase: str, got: dict) -> None:
-        self.issued.add(phase)
+    def _challenge(self, phase: str, got: dict, ev=None) -> None:
         try:
             t = self.c.post_json("/v1/challenges", {"phase": phase, "role": self.role, "match_id": self.match_id,
                                                     "anchor": self._anchor_body(got)})
-            self._append("official_challenges.jsonl", t)
-            self.api.post("/challenge", {"nonce": t["nonce"], "phase": phase, "role": self.role, "id": t["nonce"][:8],
-                                         "issued_ms": t["issued_ms"], "deadline_ms": t["deadline_ms"]}, timeout=3)
-            msg = (f"\n\n  >>> QORTIME CHALLENGE ({phase}): press OPTIONS, then {' '.join(t['pattern'][1:])} "
-                   f"within 20 seconds, then resume play. <<<\n")
-            self.prompts.append(msg)
-            say(msg)
         except Exception as e:
             self.failures += 1
-            say(f"\n  (official {phase} challenge unavailable: {e}; the match continues, it just cannot reach VERIFIED)")
+            self.retry_at = self.clock() + self.RETRY_S
+            say(f"\n  (official {phase} challenge unavailable: {e}; will retry at the next play call)")
+            return
+        self.issued.add(phase)
+        self.open_until_ms = int(t.get("deadline_ms") or 0)
+        self._append("official_challenges.jsonl", t)
+        gate_line = {"phase": phase, "nonce_id": t["nonce"][:8], "issued_ms": t["issued_ms"], "deadline_ms": t["deadline_ms"],
+                     "prompt_wall_ms": self.wall()}
+        if ev is not None:
+            gate_line["gate"] = ev.to_dict()
+        self._append("challenge_gates.jsonl", gate_line)
+        try:
+            self.api.post("/challenge", {"nonce": t["nonce"], "phase": phase, "role": self.role, "id": t["nonce"][:8],
+                                         "issued_ms": t["issued_ms"], "deadline_ms": t["deadline_ms"]}, timeout=3)
+        except Exception as e:
+            self.failures += 1
+            say(f"  (QorCap did not record the {phase} challenge: {e})")
+        secs = max(1, (int(t["deadline_ms"]) - int(t["issued_ms"])) // 1000)
+        label = {"kickoff": "game start", "halftime": "second half", "end": "4th quarter"}.get(phase, phase)
+        msg = (f"\n\n  >>> QORTIME CHALLENGE ({label}): at the line, before the snap, press OPTIONS, then "
+               f"{' '.join(t['pattern'][1:])}, then resume. You have {secs} seconds; if the snap comes first, "
+               f"do it at the next play. <<<\n")
+        self.prompts.append(msg)
+        say(msg)
+        try:
+            self.beep()
+        except Exception:
+            pass
+
+
+def _beep() -> None:
+    if os.name == "nt":
+        import winsound
+        winsound.MessageBeep(winsound.MB_ICONASTERISK)
 
 
 def start_official_live(live: OfficialLive, stop, interval: float = 1.0):

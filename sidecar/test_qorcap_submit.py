@@ -100,40 +100,104 @@ def test_submit_rejected_bundle(tmp_path, capsys):
 
 
 def test_official_live_anchors_and_challenges(tmp_path):
+    """v0.3.11: challenges open only at pause-capable moments from the gate (never on a timer / at a kickoff),
+    one phase per quarter band, one open window at a time; anchors keep their 60 s cadence."""
+    from qorcap_playcall import GateEvent
     F, key, fx, client = _env(tmp_path, tokens=False)
 
     class Api:
-        q = 1
         posted = []
 
         def get(self, path, timeout=3):
-            if path.startswith("/checkpoints"):
-                return {"chain_head": "c" * 64, "segments": 7, "checkpoint_head": "d" * 64}
-            return {"score": {"quarter": self.q}}
+            return {"chain_head": "c" * 64, "segments": 7, "checkpoint_head": "d" * 64}
 
         def post(self, path, body=None, timeout=5):
             self.posted.append((path, body))
             return {"ok": True}
 
-    t = [0.0]
+    class Gate:
+        events = []
+
+        def latest(self, after_ms=0):
+            e = self.events[-1] if self.events else None
+            return e if e is not None and e.t_ms > after_ms else None
+
+    t, wall, gate = [0.0], [1_000_000], Gate()
     api = Api()
     live = qs.OfficialLive("http://referee.test", tmp_path, "m1", "home", api, challenges=True, client=client,
-                           clock=lambda: t[0])
+                           clock=lambda: t[0], wall=lambda: wall[0], gate=lambda: gate, beep=lambda: None)
     live.step()
-    assert live.anchors == 1 and "kickoff" in live.issued
-    api.q = 3
-    t[0] = 30
+    assert live.anchors == 1 and live.issued == set()          # recording started: no challenge before a play call
+    gate.events.append(GateEvent(1_000_100, "play_call", 1, "kickoff", 300))
     live.step()
-    assert "halftime" in live.issued and live.anchors == 1  # next anchor only after 60 s
-    api.q = 4
+    assert live.issued == {"kickoff"} and "at the line, before the snap" in live.prompts[0]
+    tok = json.loads((tmp_path / "official_challenges.jsonl").read_text().splitlines()[0])
+    assert tok["deadline_ms"] - tok["issued_ms"] == 90_000 and live.open_until_ms == tok["deadline_ms"]
+    gate.events.append(GateEvent(1_000_200, "play_call", 3, "halftime", 300))
+    live.step()
+    assert live.issued == {"kickoff"}                           # kickoff window still open: wait
+    wall[0] = tok["deadline_ms"] + 1
+    gate.events.append(GateEvent(wall[0] + 5, "play_call", 3, "halftime", 290))
     t[0] = 61
     live.step()
-    assert live.issued == {"kickoff", "halftime", "end"} and live.anchors == 2
+    assert live.issued == {"kickoff", "halftime"} and live.anchors == 2
+    wall[0] += 200_000
+    gate.events.append(GateEvent(wall[0], "clock_proxy", 4, "end", 800))
+    live.step()
+    assert live.issued == {"kickoff", "halftime", "end"}
     toks = [json.loads(x) for x in (tmp_path / "official_challenges.jsonl").read_text().splitlines()]
     assert [x["phase"] for x in toks] == ["kickoff", "halftime", "end"]
     assert toks[0]["anchor"]["chain_head"] == "c" * 64
     assert [p for p, _ in api.posted] == ["/challenge"] * 3
+    gates = [json.loads(x) for x in (tmp_path / "challenge_gates.jsonl").read_text().splitlines()]
+    assert [g["gate"]["basis"] for g in gates] == ["play_call", "play_call", "clock_proxy"]
     assert len((tmp_path / "anchors.jsonl").read_text().splitlines()) == 2
+
+
+def test_official_live_skips_a_missed_phase_and_retries_after_network_error(tmp_path):
+    from qorcap_playcall import GateEvent
+
+    class Api:
+        def get(self, path, timeout=3):
+            return {"chain_head": "c" * 64, "segments": 7}
+
+        def post(self, path, body=None, timeout=5):
+            return {"ok": True}
+
+    class Flaky:
+        n = 0
+
+        def post_json(self, path, body):
+            if path == "/v1/anchors":
+                return {"type": "anchor"}
+            self.n += 1
+            if self.n == 1:
+                raise OSError("network down")
+            return {"nonce": "ab" * 16, "pattern": ["OPTIONS", "CROSS", "UP", "LEFT", "SQUARE"], "issued_ms": 5,
+                    "deadline_ms": 90_005, "phase": body["phase"]}
+
+    class Gate:
+        events = []
+
+        def latest(self, after_ms=0):
+            e = self.events[-1] if self.events else None
+            return e if e is not None and e.t_ms > after_ms else None
+
+    t, gate = [0.0], Gate()
+    live = qs.OfficialLive("http://x", tmp_path, "m1", "home", Api(), challenges=True, client=Flaky(),
+                           clock=lambda: t[0], wall=lambda: 100_000, gate=lambda: gate, beep=lambda: None)
+    gate.events.append(GateEvent(10, "play_call", 3, "halftime", 300))
+    live.step()
+    assert live.issued == set() and live.failures == 1 and live.skipped == {"kickoff"}
+    gate.events.append(GateEvent(20, "play_call", 3, "halftime", 290))
+    live.step()
+    assert live.issued == set()                                 # retry cool-down
+    t[0] = 20
+    gate.events.append(GateEvent(30, "play_call", 3, "halftime", 280))
+    live.step()
+    assert live.issued == {"halftime"}
+    lines = [json.loads(x) for x in (tmp_path / "challenge_gates.jsonl").read_text().splitlines()]
+    assert lines[0]["skipped"] is True and lines[0]["phase"] == "kickoff"
 
 
 def test_offer_submit_needs_explicit_yes(tmp_path, capsys):
@@ -213,3 +277,29 @@ def test_official_key_status_accepts_only_root_or_valid_delegation():
                              serial=1, not_before_ms=0, not_after_ms=10**13 // 100)
     ok, why = qs.official_key_status({"pubkey": other.pubkey_hex, "delegation": cert})
     assert not ok and "delegation" in why
+
+
+def test_fill_challenge_results_on_real_fmp4(tmp_path, capsys):
+    """v0.3.11 fix for match 4 (44b8d01f): the receipt carried result=null although the presses matched. Finalize now
+    re-runs the referee's rules on the bundle's own video + controller log: answered challenges become ok."""
+    import review_fixture as F
+
+    import qorcap_match as qm
+    fx = F.build(tmp_path / "m")
+    draft = json.loads((tmp_path / "m" / "receipt.draft.json").read_text()) if (tmp_path / "m" / "receipt.draft.json").exists() \
+        else {"challenges": json.loads((tmp_path / "m" / "receipt.json").read_text())["challenges"]}
+    chs = [dict(c, result=None) for c in draft["challenges"]]
+    assert len(chs) == 3
+    out = qm.fill_challenge_results(tmp_path / "m", {"challenges": chs})
+    res = [c["result"] for c in out["challenges"]]
+    assert all(r and r["ok"] and r["reverified_by"] == "recorder" and 0 <= r["latency_ms"] <= 600 for r in res), res
+    lines = [json.loads(x) for x in (tmp_path / "m" / "challenge_results.jsonl").read_text().splitlines()]
+    assert [x["phase"] for x in lines] == ["kickoff", "halftime", "end"]
+    assert "PASSED" in capsys.readouterr().out
+    # a window that saw no presses stays unanswered (never a FAIL on the player's own receipt)
+    late = [dict(c, issued_ms=c["issued_ms"] + 200_000, deadline_ms=c["deadline_ms"] + 200_000) for c in chs]
+    out2 = qm.fill_challenge_results(tmp_path / "m", {"challenges": late})
+    assert [c["result"] for c in out2["challenges"]] == [None] * 3
+    assert all(json.loads(x)["reason"] == "no_pause_press"
+               for x in (tmp_path / "m" / "challenge_results.jsonl").read_text().splitlines())
+    assert fx is not None

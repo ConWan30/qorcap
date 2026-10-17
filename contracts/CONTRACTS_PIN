@@ -1,1 +1,1 @@
-31dcc98c8f419915db659b423cd779723733256d  (ConWan30/qortime schema/contracts + schema/receipt.v0.json; re-vendor with: cp ../qortime/schema/contracts/*.json ../qortime/schema/receipt.v0.json contracts/ && (cd contracts && sha256sum *.json > SHA256SUMS))
+ad3d0da51f4b453251c12b28fe7b8e11a61a2dc5  (ConWan30/qortime schema/contracts + schema/receipt.v0.json; re-vendor with: cp ../qortime/schema/contracts/*.json ../qortime/schema/receipt.v0.json contracts/ && (cd contracts && sha256sum *.json > SHA256SUMS))
