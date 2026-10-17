@@ -290,3 +290,11 @@ footer nav{display:flex;gap:18px;flex-wrap:wrap}footer a{color:var(--mute)}foote
 @media (prefers-reduced-motion:reduce){.ladder li{opacity:1}.phases .anc{display:none}}
 .phases{flex-wrap:wrap}.two>*{min-width:0}
 @media (max-width:560px){.phases .ph{padding:6px 8px;font-size:10px;letter-spacing:.06em}}
+/* mobile QA 2026-10-17: 44px touch targets, >=11px labels, 320px fit */
+@media (pointer:coarse),(max-width:640px){
+ .btn,.btn.sm,.nav .brand,.cmd button{min-height:44px}
+ .bytes button{min-height:44px}
+ footer nav a{display:inline-flex;align-items:center;min-height:44px}
+ .ph,.pill,.adv,.st{font-size:11px}
+}
+@media (max-width:360px){.pill{white-space:normal}}
