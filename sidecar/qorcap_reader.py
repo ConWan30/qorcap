@@ -175,6 +175,8 @@ class ReaderCore:
             self.stats["errors"] += 1
             print(f"end-menu reader error: {type(e).__name__}: {e}", file=sys.stderr)
             return
+        if not rd.ok and hasattr(self.end_menu_reader, "corroborate"):
+            rd = self._corroborate(img, rd)
         k = "end_menu_reads" if rd.ok else "end_menu_unreadable"
         self.stats[k] = self.stats.get(k, 0) + 1
         st = self.end_menu_agree.offer(t_ms, rd)
@@ -196,9 +198,14 @@ class ReaderCore:
             self.end_menu_rejected = dict(st, why="tied score on the end-of-game menu")
             return
         self.end_menu = dict(st)
+        if "corroborated" in (st.get("template_sources") or []):
+            notes_c = [("end-of-game menu score partly covered (online name tags): the scorebug final was corroborated "
+                        "from the lower part of the end-menu digits against every one-play alternative")]
+        else:
+            notes_c = []
         sb = {"home": last["home"], "away": last["away"], "quarter": last["quarter"], "clock_s": last.get("clock_s"),
               "t_ms": last["t_ms"]}
-        notes = []
+        notes = list(notes_c)
         if (sb["away"], sb["home"]) != (st["away"], st["home"]):
             notes.append(f"final play score not shown on scorebug: last scorebug read AWAY {sb['away']} - HOME {sb['home']}"
                          f", end-of-game menu AWAY {st['away']} - HOME {st['home']}")
@@ -212,6 +219,25 @@ class ReaderCore:
         print(f"FINAL (end-of-game menu, {st['frames']} frames): away {st['away']} - home {st['home']}"
               + (f"  [{notes[0]}]" if notes else ""), file=sys.stderr)
         self.post(self.final)
+
+    def _corroborate(self, img, rd):
+        """v0.3.6: a covered end-menu panel can only CONFIRM the scorebug's Q4 final (never read a new score)."""
+        last = self.last_scorebug()
+        if last is None or (last.get("quarter") or 0) < 4 or self.final is None:
+            return rd
+        try:
+            c = self.end_menu_reader.corroborate(img, {"away": last["away"], "home": last["home"]})
+        except Exception as e:  # never silent
+            print(f"end-menu corroboration error: {type(e).__name__}: {e}", file=sys.stderr)
+            return rd
+        self.end_menu_corroboration = c
+        if not c.get("ok"):
+            return rd
+        from qorcap_endmenu import EndMenuRead
+        sc = min(v["score"] for v in c["sides"].values())
+        mg = min(v["score"] - v["alt_score"] for v in c["sides"].values())
+        return EndMenuRead(True, last["away"], last["home"], "corroborated", sc, mg,
+                           [dict(side=k, source="corroborated", xcheck="n/a", **v) for k, v in c["sides"].items()])
 
     def _check_final(self, t_ms: int) -> None:
         if self.final is not None:

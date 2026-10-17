@@ -110,3 +110,40 @@ def test_end_menu_real_9_template_still_xchecked():
     assert d9[1]["label"] == "9" and d9[1]["source"] == "real" and d9[1]["best"] > 0.9
     # QorTime's scorebug pack calls this glyph "0": the cross-check still fails it closed (v0.3.4 rule kept)
     assert d9[0] is None and d9[1]["why"] == "xcheck_disagrees"
+
+
+# ---- v0.3.6: covered end-menu panel corroborates (never reads) the scorebug final
+@pytest.mark.parametrize("exp,ok", [
+    ({"away": 34, "home": 29}, True),
+    ({"away": 34, "home": 22}, False), ({"away": 28, "home": 29}, False), ({"away": 35, "home": 29}, False),
+    ({"away": 40, "home": 29}, False), ({"away": 34, "home": 35}, False), ({"away": 27, "home": 29}, False),
+])
+def test_corroborate_online_end_menu(exp, ok):
+    from qorcap_endmenu import EndMenuReader
+    assert EndMenuReader().corroborate(img("m27_mnp_end_menu_online.jpg"), exp)["ok"] is ok
+
+
+def test_reader_core_confirms_covered_end_menu_only_with_q4_scorebug_final():
+    from qorcap_endmenu import EndMenuReader
+    from qorcap_reader import ReaderCore
+
+    class R:
+        def read(self, im):
+            return NS(ok=False, reason="layout_unknown")
+
+    class A:
+        def offer(self, fr, **_):
+            return NS(agreed=False, read=None)
+
+    def core(final):
+        c = ReaderCore([].append, R(), A(), None, lambda tl: NS(final=False), final_screen_detector=madden_final_screen,
+                       end_menu_reader=EndMenuReader())
+        c.timeline = [{"t_ms": 0, "away": 34, "home": 29, "quarter": 4, "clock_s": 0}]
+        c.final = final
+        for i in range(4):
+            c.on_frame(1000 + i * 500, img("m27_mnp_end_menu_online.jpg"))
+        return c
+    c = core({"type": "final", "basis": "clock_zero", "home": 29, "away": 34, "quarter": 4, "t_ms": 0})
+    assert c.final["method"] == "end_menu_read" and (c.final["away"], c.final["home"]) == (34, 29)
+    assert c.end_menu["template_sources"] == ["corroborated"] and "partly covered" in c.final["notes"][0]
+    assert core(None).end_menu is None  # no scorebug final yet: nothing to corroborate
