@@ -75,7 +75,7 @@ Files in the match folder: `video.mp4`, `clips/`, `manifest.jsonl`, `checkpoints
 referee countersignatures); after finalize also `timeline.offline.jsonl`, `score_checkpoints.jsonl`, `final.offline.json`; when the final was
 confirmed from the recording's last minutes at stop, `final.tail.json` and `clips/final-recorded.mp4`.
 
-QorTime code: the zip bundles a pinned copy (`qortime/`, commit `d3f92ae`, includes `qortime referee-ai` and `end_menu_read` support). If it is missing, the launcher downloads that
+QorTime code: the zip bundles a pinned copy (`qortime/`, commit `b61bbbc`, includes `qortime referee-ai` and `end_menu_read` support). If it is missing, the launcher downloads that
 pinned commit's zip once into `%LOCALAPPDATA%\QorCap`.
 
 ## Stack and why
@@ -284,6 +284,8 @@ written, `verify-bundle` OK, and a single flipped byte reported as FAIL.
 
 **Tested on Windows (v0.2.0–v0.2.1 era, MyTurn, USB3.0 Video):** `--input-format mjpeg` 1280x720@30 with `h264_mf` at 29.7 fps. v0.2.1 fixed audio / auto-format / OBS.
 
+**v0.3.7:** End-menu one-legal-step deltas need corroboration (`final_confirmed`); QorTime pin includes trusted-referee allowlist + challenge evidence re-validation + `input_advisory`. Local QorCap referee stays SELF_ATTESTED.
+
 **v0.3.6:** (1) **Game-audio level checks**: Start Match records 4 s of the card's audio before the match
 (`audio_precheck.json`), and Start Match/Finalize measure the recorded audio (`audio_check.json`); a silent card
 (max <= -70 dB) prints a loud warning with the fixes (PS5 Audio Output / 'Output to Headphones' = Chat Audio, Windows
@@ -326,7 +328,7 @@ equals the last scorebug read or is one legal scoring play past it on one side; 
 Used live (it amends an earlier scorebug final; Rust accepts `basis:"end_menu"`), in the stop-time tail check, and in
 Finalize Last Match. `result.method = "end_menu_read"`, `final_basis = "end_menu"`, `final_confirmed = true` only
 then; `scorebug_last` and `notes` (e.g. "final play score not shown on scorebug ...") are recorded when they differ.
-A scorebug-only final keeps its basis with `final_confirmed: false`. QorTime pin `d3f92ae` (qortime PR #17: schema +
+A scorebug-only final keeps its basis with `final_confirmed: false`. QorTime pin `b61bbbc` (qortime PR #17: schema +
 referee-ai accept `end_menu_read`).
 
 **v0.3.3 (second live match, 2026-10-16, match-20261016-143212):** (1) Stop order: QorCap finalises the video,
