@@ -42,6 +42,7 @@ CLOCK_X, CLOCK_Y = (609, 654), (684, 702)
 SCORE_SIZE, CLOCK_SIZE, QUARTER_SIZE = (12, 20), (8, 14), (8, 14)
 SCORE_H, CLOCK_H = (18, 27), (10, 16)
 SCORE_MAX_W, CLOCK_MAX_W = 16, 10
+SCORE_SAT = 60                       # digits S<25; pale gold/silver team panels S>=90
 INK, SAT = 150, 90                   # white digits (low saturation) on black or team-colour panels
 QUARTER_INK = 100                    # quarter ordinal: thin digit + grey superscript suffix
 GATE = {"score": (0.80, 0.08), "clock": (0.75, 0.10), "quarter": (0.75, 0.12)}
@@ -167,7 +168,18 @@ def score_glyphs(hsv, side):
     reg = hsv[SCORE_Y[0]:SCORE_Y[1], x0:x1]
     # grey = whiteness (value scaled down by saturation) so the red/colour panel itself stays dark
     grey = (reg[..., 2].astype(np.float32) * (1.0 - reg[..., 1].astype(np.float32) / 255.0)).clip(0, 255)
-    return components(white(reg), SCORE_H, max_w=SCORE_MAX_W, gray=grey)
+    m = white(reg) & (reg[..., 1] < SCORE_SAT)   # stricter: light team panels (gold S~100) are not ink
+    return components(drop_borders(m), SCORE_H, max_w=SCORE_MAX_W, gray=grey)
+
+
+def drop_borders(m):
+    """Zero columns whose longest vertical ink run is taller than any score digit: team panels with a light frame
+    (e.g. a gold-bordered away panel) put a full-height line inside the score box. Digits never span that high."""
+    m = np.asarray(m, bool).copy()
+    for c in range(m.shape[1]):
+        if any(e - b + 1 > SCORE_H[1] + 2 for b, e in _runs(m[:, c])):
+            m[:, c] = False
+    return m
 
 
 def clock_glyphs(hsv):
@@ -280,6 +292,7 @@ class SundayNightReader:
         qlab, _, _ = self.classify("quarter", skeleton(q), QUARTER_SIZE)
         if qlab is None or qlab not in QUARTERS:
             return _fr(ok=False, reason="quarter_unsure", **partial)
+        partial["quarter"] = QUARTERS[qlab]   # score + quarter are read; a clock failure below still fails the frame
         cg = clock_glyphs(hsv)
         if not 3 <= len(cg) <= 4 or any(g is None for g in cg):
             return _fr(ok=False, reason="clock_glyph_count", **partial)
@@ -295,6 +308,6 @@ class SundayNightReader:
         cx = hsv[CLOCK_Y[0]:CLOCK_Y[1], CLOCK_X[0]:CLOCK_X[1]]
         ink = cx[..., 2] > clock_thr(hsv)
         red = bool(ink.any() and (((cx[..., 0] < 10) | (cx[..., 0] > 165)) & (cx[..., 1] > 120))[ink].mean() > 0.5)
-        return _fr(ok=True, reason="ok", quarter=QUARTERS[qlab], clock_seconds=int(mm) * 60 + int(ss),
+        return _fr(ok=True, reason="ok", clock_seconds=int(mm) * 60 + int(ss),
                    clock_text=f"{int(mm)}:{ss}", clock_red=red, score_conf=round(conf, 3), score_margin=round(margin, 3),
                    **partial)

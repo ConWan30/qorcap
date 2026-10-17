@@ -192,6 +192,7 @@ class ThursdayNightReader:
         qlab, _, _ = self.classify("quarter", skeleton(q), QUARTER_SIZE)
         if qlab is None or qlab not in QUARTERS:
             return _fr(ok=False, reason="quarter_unsure", **partial)
+        partial["quarter"] = QUARTERS[qlab]   # score + quarter are read; a clock failure below still fails the frame
         cg = clock_glyphs(hsv)
         if not 3 <= len(cg) <= 4 or any(g is None for g in cg):
             return _fr(ok=False, reason="clock_glyph_count", **partial)
@@ -207,6 +208,6 @@ class ThursdayNightReader:
         cx = hsv[CLOCK_Y[0]:CLOCK_Y[1], CLOCK_X[0]:CLOCK_X[1]]
         ink = clock_mask(hsv)[1]
         red = bool(ink.any() and (((cx[..., 0] < 10) | (cx[..., 0] > 165)) & (cx[..., 1] > 120))[ink].mean() > 0.5)
-        return _fr(ok=True, reason="ok", quarter=QUARTERS[qlab], clock_seconds=int(mm) * 60 + int(ss),
+        return _fr(ok=True, reason="ok", clock_seconds=int(mm) * 60 + int(ss),
                    clock_text=f"{int(mm)}:{ss}", clock_red=red, score_conf=round(conf, 3), score_margin=round(margin, 3),
                    **partial)

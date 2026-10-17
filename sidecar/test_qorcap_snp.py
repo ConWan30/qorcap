@@ -89,11 +89,13 @@ def test_clear_colons_keeps_digits():
 
 def test_pack_provenance_marks_synthetic_digits(snp):
     real_score = {d for d in "0123456789" if snp.source[f"score:{d}"].startswith("real")}
-    assert real_score == {"0", "1", "3", "4", "6", "7"}
-    assert all(snp.source[f"score:{d}"] == "synthetic:clock_font_resized" for d in "2589")
+    # 2 was harvested live from match-20261017-021003 (eye-checked); 5/9 have not been seen on a real score yet
+    assert real_score == {"0", "1", "2", "3", "4", "6", "7", "8"}
+    assert all(snp.source[f"score:{d}"] == "synthetic:clock_font_resized" for d in "59")
     assert all(snp.source[f"clock:{d}"].startswith("real") for d in "0123456789")
     assert snp.source["quarter:1"].startswith("real") and snp.source["quarter:2"].startswith("real")
-    assert all(snp.source[f"quarter:{d}"] == "synthetic:clock_font_skeleton" for d in "34")
+    assert snp.source["quarter:3"].startswith("real")             # harvested live from match-20261017-021003
+    assert snp.source["quarter:4"].startswith("real")             # harvested live from match-20261017-021003
     assert set(snp.groups["quarter"][0]) == {"1", "2", "3", "4"}
 
 
