@@ -40,7 +40,7 @@ import urllib.request
 import zipfile
 from pathlib import Path
 
-QORTIME_PIN = "b61bbbc35915241e06fc84139bce12f48dfd1e5a"
+QORTIME_PIN = "e9c5c952098cc41d7b9636922d93c1edafd2c274"
 QORTIME_ZIP = f"https://github.com/ConWan30/qortime/archive/{QORTIME_PIN}.zip"
 VERIFY_URL = "https://conwan30.github.io/qortime/verify/"
 REFEREE_KIND = "local-self-attested"
@@ -616,6 +616,10 @@ def main(argv=None) -> int:
     if "finalize" in argv:  # `qorcap_match.py [--qorcap X ...] finalize [BUNDLE] [opts]` (launcher puts its opts first)
         argv.remove("finalize")
         return finalize_main(argv)
+    if "submit" in argv:  # `qorcap_match.py [--qorcap X ...] submit [BUNDLE] [--full]` -> QorTime official referee
+        argv.remove("submit")
+        from qorcap_submit import main as submit_main
+        return submit_main(argv)
     ap = argparse.ArgumentParser(description="QorCap one-click match")
     ap.add_argument("--test-pattern", action="store_true", help="no capture card: synthetic video + scripted scores")
     ap.add_argument("--test-secs", type=float, default=20.0, help="test-pattern game length")
@@ -634,6 +638,12 @@ def main(argv=None) -> int:
     ap.add_argument("--input-format", default="mjpeg", help="mjpeg works on USB3.0 Video at 720p30; 'auto' probes the card")
     ap.add_argument("--audio", default="auto", help="card audio device ('auto'), a device name, or 'none'")
     ap.add_argument("--no-open", action="store_true")
+    ap.add_argument("--referee-url", default=None, help="QorTime official referee (default: the public service)")
+    ap.add_argument("--no-anchors", action="store_true", help="do not timestamp the video chain with the official referee")
+    ap.add_argument("--official-challenges", action="store_true",
+                    help="fetch official challenge nonces at kickoff / Q3 / Q4 (press the shown pattern; needed for VERIFIED)")
+    ap.add_argument("--submit", action="store_true", help="submit for verification at the end without asking")
+    ap.add_argument("--no-submit-prompt", action="store_true", help="do not offer 'Submit for Verification' at the end")
     a = ap.parse_args(argv)
 
     say("=" * 64)
@@ -748,6 +758,16 @@ def main(argv=None) -> int:
     else:
         start_reader(api, stop, state, bundle=bundle)
     key_watcher(stop, state)
+    live = None
+    if not a.no_anchors or a.official_challenges:
+        try:
+            from qorcap_submit import OFFICIAL_URL, OfficialLive, start_official_live
+            live = OfficialLive(a.referee_url or OFFICIAL_URL, bundle, match_id, a.role, api, challenges=a.official_challenges)
+            start_official_live(live, stop)
+            if a.official_challenges:
+                say("Official QorTime challenges are ON: when a CHALLENGE line appears, press OPTIONS and the shown buttons.\n")
+        except Exception as e:  # never block a recording on the network helper
+            say(f"(official referee link unavailable: {e})")
 
     reported = {"seq": -1}
 
@@ -854,8 +874,32 @@ def main(argv=None) -> int:
     if not a.test_pattern and a.audio != "none":
         report_recording_audio(bundle, a.ffmpeg or next((str(c) for c in [HERE.parent / ("ffmpeg.exe" if WIN else "ffmpeg")]
                                                          if c.exists()), None) or shutil.which("ffmpeg"))
-    return sign_and_report(bundle, draft, cs.signed, device, referee, match_id=match_id, role=a.role,
+    code = sign_and_report(bundle, draft, cs.signed, device, referee, match_id=match_id, role=a.role,
                            started_ms=started_ms, qt=qt, qorcap=qorcap, no_open=a.no_open)
+    if live is not None:
+        say(f"  Official anchors: {live.anchors} (link failures: {live.failures})")
+    if code != 2 and (a.submit or not a.no_submit_prompt) and not a.test_pattern:
+        offer_submit(bundle, a.referee_url, auto=a.submit, ask=input)
+    return code
+
+
+def offer_submit(bundle: Path, referee_url: str | None, *, auto: bool = False, ask=input) -> int | None:
+    """End-of-match 'Submit for Verification' prompt. Uploading needs an explicit yes (or --submit)."""
+    from qorcap_submit import OFFICIAL_URL, submit
+
+    say("")
+    say("Submit for Verification: send this match to the QorTime official referee. It re-checks everything")
+    say("independently (uploads the match files and ~10-20% of the video) and, if every check passes,")
+    say("countersigns with the official key so the receipt can show VERIFIED instead of SELF-ATTESTED.")
+    if not auto:
+        try:
+            ans = ask("Submit now? [y/N] ").strip().lower()
+        except EOFError:
+            ans = ""
+        if ans not in ("y", "yes"):
+            say("Not submitted. You can do it later: double-click 'Submit for Verification' or run 'qorcap submit'.")
+            return None
+    return submit(bundle, base=referee_url or OFFICIAL_URL)
 
 
 def sign_and_report(bundle: Path, draft: dict, cps: list[dict], device, referee, *, match_id: str, role: str,
@@ -898,9 +942,9 @@ def sign_and_report(bundle: Path, draft: dict, cps: list[dict], device, referee,
         say(f"  Problems:     {', '.join(v['errors'][:6])}")
     if v.get("partial"):
         say(f"  Not checked:  {', '.join(v['partial'][:6])}")
-    say("  Trust level:  SELF-ATTESTED. Signed by this PC's device key and a LOCAL referee key")
-    say("                (no independent QorTime referee server exists yet). It proves the video was")
-    say("                not changed after recording; it does not prove who was playing.")
+    say("  Trust level:  SELF-ATTESTED. Signed by this PC's device key and a LOCAL referee key. It proves the")
+    say("                video was not changed after recording; it does not prove who was playing.")
+    say("                For VERIFIED, use 'Submit for Verification' (QorTime official referee re-checks it).")
     if note:
         say(f"  Offline:      {note}")
     say(f"\n  Folder:       {bundle}")

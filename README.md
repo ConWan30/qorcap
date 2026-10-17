@@ -75,7 +75,7 @@ Files in the match folder: `video.mp4`, `clips/`, `manifest.jsonl`, `checkpoints
 referee countersignatures); after finalize also `timeline.offline.jsonl`, `score_checkpoints.jsonl`, `final.offline.json`; when the final was
 confirmed from the recording's last minutes at stop, `final.tail.json` and `clips/final-recorded.mp4`.
 
-QorTime code: the zip bundles a pinned copy (`qortime/`, commit `b61bbbc`, includes `qortime referee-ai` and `end_menu_read` support). If it is missing, the launcher downloads that
+QorTime code: the zip bundles a pinned copy (`qortime/`, commit `e9c5c95`, includes `qortime referee-ai`, `end_menu_read` and official-review (verified uploads) support). If it is missing, the launcher downloads that
 pinned commit's zip once into `%LOCALAPPDATA%\QorCap`.
 
 ## Stack and why
@@ -210,6 +210,28 @@ calibration). Events go into `inputs.jsonl` (committed by `input_hash`), a copy 
 summary into `input_proof.json` `haptics`. Input Test shows `HAPTIC peak=.. dur=..ms` lines and
 `[ OK ] IMU readable`. **Advisory corroborating evidence only.** See [docs/HAPTICS.md](docs/HAPTICS.md).
 
+## Submit for Verification (v0.3.9)
+
+A bundle signed only by your laptop is **SELF_ATTESTED**. To get **VERIFIED**, submit it to the QorTime official
+referee (`https://qortime-referee-production.up.railway.app`): double-click **Submit for Verification**, answer `y` at
+the end of Start Match, or run `qorcap submit "<bundle dir>"` (`--full` uploads every segment; `--yes` skips the prompt).
+
+1. QorCap uploads the small metadata (manifest, checkpoints, inputs, receipts, no video).
+2. The referee re-checks every chain and signature on its own, *then* picks which video segments it wants:
+   the init segment, the last 240 s, the segments around each challenge, and 16 random ones (about 150-300 MB).
+3. QorCap uploads those; the referee hashes the bytes against the manifest chain, re-reads the final score with
+   QorCap's own readers, re-checks pause/motion/input evidence and the official challenges.
+4. Only if every check passes does it countersign with the official key. You get `receipt.official.json` and
+   `verify.official.txt` in the bundle.
+
+During a match QorCap stamps the chain head with the referee every 60 s (turn off with `--no-anchors`). For
+**VERIFIED** also start the match with `--official-challenges` (e.g. `"Start Match.cmd" --official-challenges`): the
+referee then issues three timed challenges (kickoff, halftime, Q4) that you answer on the pad. Without them the best
+result is **PARTIAL**: the
+referee can prove the bytes are what you recorded, not that they were recorded live. Spot-check mode is a sampled
+check: a doctored region of fraction f slips through with probability about (1-f)^16 plus the tail and challenge
+segments. Details: QorTime `docs/REFEREE_SERVICE.md`.
+
 ## Commands
 
 ```
@@ -225,6 +247,7 @@ qorcap stop
 qorcap verify-bundle DIR
 qorcap input-test [--secs N]
 qorcap input-proof DIR [--frames 15] [--no-video]
+qorcap submit DIR [--full] [--referee URL] [--yes]
 qorcap record ... [--no-controller]
 ```
 Global: `--port 8788`, `--ffmpeg PATH`, `--log FILE` (default `qorcap.log`, or `DIR\qorcap.log` with `--bundle`).

@@ -49,6 +49,25 @@ pub enum Cmd {
         #[arg(last = true)]
         rest: Vec<String>,
     },
+    /// Submit for Verification: send a signed match bundle to the QorTime official referee, which re-checks it
+    /// independently (hash chains, video bytes, end-of-game re-read, challenges) and countersigns with the
+    /// official key. Spot-check by default (init + recorded tail + random segments); --full uploads every segment.
+    Submit {
+        /// Match bundle folder (contains receipt.json). Default: the newest folder in Documents/QorCap Matches
+        bundle: Option<String>,
+        /// Python interpreter (default: QorCap's venv, then py/python3/python)
+        #[arg(long)]
+        python: Option<String>,
+        /// Upload every video segment (1-3 GB) instead of the referee's spot-check sample
+        #[arg(long)]
+        full: bool,
+        /// Referee service URL (default: the official QorTime referee)
+        #[arg(long)]
+        referee: Option<String>,
+        /// Do not ask before uploading
+        #[arg(long)]
+        yes: bool,
+    },
     /// Live controller check: confirms the laptop is reading the DualSense over USB HID and shows presses
     InputTest {
         /// Stop after N seconds (default: until Ctrl+C)
@@ -193,6 +212,8 @@ mod tests {
         assert!(matches!(Cli::try_parse_from(["qorcap", "stop"]).unwrap().cmd, Cmd::Stop));
         assert!(matches!(Cli::try_parse_from(["qorcap", "save-replay"]).unwrap().cmd, Cmd::SaveReplay { out: None }));
         assert!(matches!(Cli::try_parse_from(["qorcap", "input-test"]).unwrap().cmd, Cmd::InputTest { secs: None }));
+        assert!(matches!(Cli::try_parse_from(["qorcap", "submit", "b", "--full"]).unwrap().cmd, Cmd::Submit { full: true, .. }));
+        assert!(matches!(Cli::try_parse_from(["qorcap", "submit"]).unwrap().cmd, Cmd::Submit { bundle: None, full: false, yes: false, .. }));
         assert!(matches!(Cli::try_parse_from(["qorcap", "input-proof", "b", "--frames", "10"]).unwrap().cmd, Cmd::InputProof { frames: 10, .. }));
         if let Cmd::Record(r) = Cli::try_parse_from(["qorcap", "record", "--no-controller"]).unwrap().cmd { assert!(r.no_controller); } else { panic!() }
     }

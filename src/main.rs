@@ -20,7 +20,10 @@ fn print_resp(r: Result<(u16, String), String>) -> i32 {
 }
 
 /// `qorcap finalize`: hand off to the Python finalizer shipped in sidecar/ next to the exe.
-fn finalize(bundle: Option<String>, python: Option<String>, rest: Vec<String>, ff: &str) -> i32 {
+fn finalize(bundle: Option<String>, python: Option<String>, rest: Vec<String>, ff: &str) -> i32 { sidecar("finalize", bundle, python, rest, ff) }
+
+/// Run `sidecar/qorcap_match.py <sub>` (finalize | submit) with QorCap's Python.
+fn sidecar(sub: &str, bundle: Option<String>, python: Option<String>, rest: Vec<String>, ff: &str) -> i32 {
     let me = std::env::current_exe().unwrap_or_default();
     let base = me.parent().map(|p| p.to_path_buf()).unwrap_or_default();
     let roots = [base.clone(), base.join("..").join(".."), std::env::current_dir().unwrap_or_default()];
@@ -37,7 +40,7 @@ fn finalize(bundle: Option<String>, python: Option<String>, rest: Vec<String>, f
         if v.exists() { cands.push(vec![v.to_string_lossy().into_owned()]); }
     }
     if cfg!(windows) { cands.push(vec!["py".into(), "-3".into()]); cands.push(vec!["python".into()]); } else { cands.push(vec!["python3".into()]); cands.push(vec!["python".into()]); }
-    let mut args = vec![script.to_string_lossy().into_owned(), "finalize".into()];
+    let mut args = vec![script.to_string_lossy().into_owned(), sub.to_string()];
     if let Some(b) = bundle { args.push(b); }
     args.extend(["--qorcap".into(), me.to_string_lossy().into_owned(), "--ffmpeg".into(), ff.to_string()]);
     let qt = base.join("qortime");
@@ -212,6 +215,13 @@ fn main() {
             Err(e) => { eprintln!("error: {e}"); 2 }
         },
         Cmd::Finalize { bundle, python, rest } => finalize(bundle, python, rest, &ff),
+        Cmd::Submit { bundle, python, full, referee, yes } => {
+            let mut rest = Vec::new();
+            if full { rest.push("--full".to_string()); }
+            if yes { rest.push("--yes".to_string()); }
+            if let Some(r) = referee { rest.extend(["--referee".to_string(), r]); }
+            sidecar("submit", bundle, python, rest, &ff)
+        }
         Cmd::InputTest { secs } => input_test(secs),
         Cmd::InputProof { dir, frames, no_video, force } => {
             let d = std::path::Path::new(&dir);
