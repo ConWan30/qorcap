@@ -462,6 +462,7 @@ def mic_hint(which: str | None) -> list[str]:
 
 
 # ------------------------------------------------------------------ audio level checks (v0.3.6)
+DIGITAL_SILENCE_DB = -88.0  # max level at/below this = all-zero samples (no +-1 LSB noise either)
 SILENT_MAX_DB = -70.0  # a capture card passing no sound gives ~-90 dB mean / -80 dB max (+-1 LSB noise)
 
 
@@ -521,9 +522,16 @@ def audio_silence_hint(res: dict | None, *, when: str) -> list[str]:
     if not res or not res.get("silent"):
         return []
     lvl = "no audio track" if res.get("no_audio_stream") else f"max {res['max_db']:.1f} dB, mean {res['mean_db']:.1f} dB"
+    # Pure digital silence (every sample ~0, about -90 dB): the card is receiving an HDMI audio stream that carries
+    # no PCM sound, which is what a Bitstream (Dolby/DTS) Audio Format looks like to a stereo-PCM USB capture card.
+    digital = not res.get("no_audio_stream") and isinstance(res.get("max_db"), (int, float)) and res["max_db"] <= DIGITAL_SILENCE_DB
+    first = (["  This is pure digital silence (all samples zero). If the PS5 already outputs to HDMI, check FIRST:",
+              "   PS5 Settings > Sound > Audio Output > Audio Format (Priority) = Linear PCM",
+              "   (Bitstream / Dolby / DTS reaches the capture card as silence)."] if digital else [])
     return ["",
             "  !" * 21,
             f"  WARNING: the capture card's audio is SILENT {when} ({lvl}).",
+            *first,
             "  The match video will have NO GAME SOUND. Usual causes, in order:",
             "   1. PS5: Settings > Sound > Audio Output > Output Device = your TV/HDMI device, and",
             "      'Output to Headphones' = 'Chat Audio' (with 'All Audio' the PS5 sends NO sound over HDMI",
