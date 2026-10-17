@@ -1014,12 +1014,18 @@ def apply_final(res: dict, fin: dict | None, *, fallback: dict | None = None) ->
         res.update(home_score=src["home"], away_score=src["away"], quarter=q, final_t_ms=src["t_ms"],
                    winner="home" if src["home"] > src["away"] else "away")
     if is_end_menu_final(fin):
-        res.update(method="end_menu_read", final_basis="end_menu", final_confirmed=True)
+        # Respect ReaderCore's corroboration gate for one-legal-step deltas.
+        confirmed = fin.get("final_confirmed")
+        if confirmed is None:
+            confirmed = True
+        res.update(method="end_menu_read", final_basis="end_menu", final_confirmed=bool(confirmed))
         sb = fin.get("scorebug_last")
         if sb:
             res["scorebug_last"] = {"home_score": sb["home"], "away_score": sb["away"], "quarter": sb["quarter"], "t_ms": sb["t_ms"]}
         if fin.get("notes"):
             res["notes"] = list(fin["notes"])
+        if fin.get("delta_corroboration"):
+            res["delta_corroboration"] = fin["delta_corroboration"]
     elif fin:
         res.update(method="agreed_scorebug_final", final_basis=fin["basis"], final_confirmed=False)
         res["notes"] = ["end-of-game menu score not read: scorebug final only, NOT confirmed"]

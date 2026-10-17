@@ -49,7 +49,7 @@ def test_signed_receipt_verifies_and_is_honest(tmp_path):
     from qor_receipt.receipt import verify_receipt
     rec, ref = _signed(tmp_path)
     v = verify_receipt(rec, referee_pub=ref.pubkey_hex)
-    assert v["errors"] == [] and v["status"] == "PARTIAL"   # no referee challenges / motion: honestly partial
+    assert v["errors"] == [] and v["status"] == "SELF_ATTESTED"  # QorCap local referee is never allowlisted VERIFIED
     assert v["trust_tier"] == "single-attested"
     assert rec["referee"]["key_kind"] == qm.REFEREE_KIND
     assert rec["players"][0]["key_kind"] == "software-file"
@@ -391,9 +391,19 @@ def test_tail_final_check_confirms_from_recorded_frames(tmp_path):
     out = qm.tail_final_check(b, draft, ffmpeg="ffmpeg-missing", core_factory=fac, frames=frames)
     r = out["result"]
     assert (r["away_score"], r["home_score"]) == (0, 20) and r["winner"] == "home"
-    assert r["method"] == "end_menu_read" and r["final_basis"] == "end_menu" and r["final_confirmed"] is True
+    assert r["method"] == "end_menu_read" and r["final_basis"] == "end_menu" and r["final_confirmed"] is False
     assert r["scorebug_last"] == {"home_score": 17, "away_score": 0, "quarter": 4, "t_ms": 3000}
     assert r["notes"] and r["notes"][0].startswith("final play score not shown on scorebug")
+    assert any("NOT corroborated" in n for n in r["notes"])
+    # With haptic corroboration near last scorebug, match-2 style 0-17→0-20 confirms:
+    draft2 = dict(draft); draft2["result"] = dict(draft["result"])
+    def fac_h(post):
+        c = ReaderCore(post, None, None, Paused(), detect_final, final_screen_detector=madden_final_screen,
+                       end_menu_reader=em)
+        c.delta_corroboration = [{"kind": "haptic", "t_ms": 3000}]
+        return c
+    r2 = qm.tail_final_check(b, draft2, ffmpeg="ffmpeg-missing", core_factory=fac_h, frames=frames)["result"]
+    assert r2["final_confirmed"] is True
     tail = json.loads((b / "final.tail.json").read_text())
     assert tail["final"]["basis"] == "end_menu" and tail["end_menu"]["frames"] >= 3
     # no end screen in the tail -> draft unchanged

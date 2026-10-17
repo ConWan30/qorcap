@@ -56,6 +56,20 @@ def test_consistency_rule():
     assert end_menu_consistency({"away": 0, "home": 27}, {"away": 0, "home": 17})      # >1 play
 
 
+def test_delta_corroboration_gate():
+    from qorcap_reader import end_menu_delta_corroborated
+    st, last = {"away": 0, "home": 20, "t_ms": 50_000}, {"away": 0, "home": 17, "t_ms": 40_000}
+    assert end_menu_delta_corroborated(st, last, [], []) is None  # one-legal-step, no evidence
+    assert end_menu_delta_corroborated({"away": 7, "home": 14, "t_ms": 1}, {"away": 7, "home": 14, "t_ms": 0}, [], [])["kind"] == "exact_match"
+    # timeline scorebug already shows end-menu score
+    tl = [{"t_ms": 45_000, "home": 20, "away": 0, "quarter": 4, "clock_s": 0}]
+    assert end_menu_delta_corroborated(st, last, tl, [])["kind"] == "scorebug_final_play"
+    # external haptic near window
+    assert end_menu_delta_corroborated(st, last, [], [{"kind": "haptic", "t_ms": 41_000}])["kind"] == "haptic"
+    assert end_menu_delta_corroborated(st, last, [], [{"kind": "score_change_clip", "t_ms": 41_000}]) is None  # no sha256
+    assert end_menu_delta_corroborated(st, last, [], [{"kind": "score_change_clip", "t_ms": 41_000, "sha256": "a"*64}])["kind"] == "score_change_clip"
+
+
 class Paused:
     paused = True
 
@@ -72,6 +86,7 @@ def _core(last):
 
 
 def test_core_end_menu_final_overrides_scorebug_and_notes():
+    """Match 2 (0-20 end menu vs 0-17 scorebug): accepted as end_menu_read but NOT confirmed without corroboration."""
     core, posts = _core({"t_ms": 0, "home": 17, "away": 0, "quarter": 4, "clock_s": 0, "clock_red": True})
     for k in range(6):
         core.on_frame(10_000 + k * 500, RST)
@@ -81,7 +96,18 @@ def test_core_end_menu_final_overrides_scorebug_and_notes():
     f = em[0]
     assert (f["away"], f["home"], f["method"]) == (0, 20, "end_menu_read")
     assert f["scorebug_last"]["home"] == 17 and "final play score not shown on scorebug" in f["notes"][0]
+    assert f["final_confirmed"] is False
+    assert "NOT corroborated" in " ".join(f["notes"])
     assert f["end_menu"]["frames"] >= 3
+
+
+def test_core_end_menu_match2_confirms_with_haptic_corroboration():
+    core, posts = _core({"t_ms": 0, "home": 17, "away": 0, "quarter": 4, "clock_s": 0, "clock_red": True})
+    core.delta_corroboration = [{"kind": "haptic", "t_ms": 500}]
+    for k in range(6):
+        core.on_frame(10_000 + k * 500, RST)
+    f = [p for p in posts if p.get("basis") == "end_menu"][0]
+    assert f["final_confirmed"] is True and f["delta_corroboration"]["kind"] == "haptic"
 
 
 def test_core_end_menu_match1_no_note():
@@ -90,6 +116,7 @@ def test_core_end_menu_match1_no_note():
         core.on_frame(10_000 + k * 500, FIN)
     f = [p for p in posts if p["type"] == "final" and p["basis"] == "end_menu"][0]
     assert (f["away"], f["home"]) == (7, 14) and f["notes"] == []
+    assert f["final_confirmed"] is True and f["delta_corroboration"]["kind"] == "exact_match"
 
 
 def test_core_rejects_inconsistent_or_pre_q4():
@@ -107,9 +134,13 @@ def test_apply_final_fields():
     import qorcap_match as qm
     base = {"home_score": 17, "away_score": 0, "quarter": 4, "final_t_ms": 1, "winner": "home", "method": "agreed_scorebug_final"}
     em = {"basis": "end_menu", "method": "end_menu_read", "home": 20, "away": 0, "quarter": 4, "t_ms": 5,
-          "scorebug_last": {"home": 17, "away": 0, "quarter": 4, "t_ms": 2}, "notes": ["final play score not shown on scorebug"]}
+          "scorebug_last": {"home": 17, "away": 0, "quarter": 4, "t_ms": 2},
+          "notes": ["final play score not shown on scorebug"], "final_confirmed": False}
     r = qm.apply_final(base, em)
-    assert r["final_confirmed"] is True and r["method"] == "end_menu_read" and r["home_score"] == 20
+    assert r["final_confirmed"] is False and r["method"] == "end_menu_read" and r["home_score"] == 20
+    em2 = dict(em, final_confirmed=True, delta_corroboration={"kind": "haptic", "t_ms": 2})
+    r = qm.apply_final(base, em2)
+    assert r["final_confirmed"] is True and r["delta_corroboration"]["kind"] == "haptic"
     r = qm.apply_final(base, {"basis": "clock_zero", "home": 17, "away": 0, "quarter": 4, "t_ms": 3})
     assert r["final_confirmed"] is False and r["final_basis"] == "clock_zero"
     r = qm.apply_final(base, None, fallback={"home": 17, "away": 0, "quarter": 4, "t_ms": 3})

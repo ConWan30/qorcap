@@ -94,6 +94,10 @@ class ReaderCore:
         self.end_menu_agree = end_menu_agree
         self.end_menu: dict | None = None
         self.end_menu_rejected: dict | None = None
+        # External corroboration for one-legal-step end-menu deltas (set by match runner):
+        # each entry: {"kind": "scorebug_final_play"|"score_change_clip"|"input_activity"|"haptic",
+        #              "t_ms": int, ...optional "home","away","sha256"}
+        self.delta_corroboration: list[dict] = []
 
     def on_frame(self, t_ms: int, full) -> None:
         """``full`` may be a full-resolution frame (v0.3.5): the scorebug reader gets it when it asks for it
@@ -211,17 +215,27 @@ class ReaderCore:
         sb = {"home": last["home"], "away": last["away"], "quarter": last["quarter"], "clock_s": last.get("clock_s"),
               "t_ms": last["t_ms"]}
         notes = list(notes_c)
+        corr = end_menu_delta_corroborated(st, last, self.timeline, self.delta_corroboration)
+        confirmed = corr is not None and corr.get("kind") != "no_scorebug"
         if (sb["away"], sb["home"]) != (st["away"], st["home"]):
             notes.append(f"final play score not shown on scorebug: last scorebug read AWAY {sb['away']} - HOME {sb['home']}"
                          f", end-of-game menu AWAY {st['away']} - HOME {st['home']}")
+            if confirmed and corr:
+                notes.append(f"one-legal-step delta corroborated via {corr.get('kind')}")
+            else:
+                notes.append("one-legal-step delta NOT corroborated (no scorebug final-play read / "
+                             "score-change clip / input-haptic near scoring): final_confirmed=false")
+                confirmed = False
         prev = self.final
         self.final = {"type": "final", "basis": "end_menu", "method": "end_menu_read", "home": st["home"], "away": st["away"],
                       "quarter": max(4, int(last["quarter"])), "t_ms": st["t_ms"], "end_menu": st, "scorebug_last": sb,
-                      "notes": notes}
+                      "notes": notes, "final_confirmed": confirmed,
+                      "delta_corroboration": corr}
         if prev is not None:
             self.final["amends"] = {k: prev.get(k) for k in ("basis", "home", "away", "t_ms")}
         self._close_spans()
-        print(f"FINAL (end-of-game menu, {st['frames']} frames): away {st['away']} - home {st['home']}"
+        tag = "CONFIRMED" if confirmed else "UNCONFIRMED"
+        print(f"FINAL (end-of-game menu, {st['frames']} frames, {tag}): away {st['away']} - home {st['home']}"
               + (f"  [{notes[0]}]" if notes else ""), file=sys.stderr)
         self.post(self.final)
 
@@ -260,17 +274,65 @@ class ReaderCore:
 LEGAL_STEPS = {1, 2, 3, 6, 7, 8}  # same as qortime referee_ai.integrity.LEGAL_STEPS
 
 
-def end_menu_consistency(st: dict, last: dict | None) -> str | None:
-    """None when the end-menu score equals the last scorebug read or is ONE legal scoring play past it on one side
-    (the final play's points are often never drawn on the scorebug). Mirrors qortime ``check_final`` for
-    ``end_menu_read``; anything else is treated as a misread and the final stays unconfirmed."""
+def end_menu_delta(st: dict, last: dict | None) -> list[int] | None:
+    """Return [d_away, d_home] or None if last is missing."""
     if last is None:
         return None
-    d = [st["away"] - last["away"], st["home"] - last["home"]]
-    if d == [0, 0] or (min(d) >= 0 and sorted(d)[0] == 0 and max(d) in LEGAL_STEPS):
+    return [st["away"] - last["away"], st["home"] - last["home"]]
+
+
+def end_menu_one_legal_step(d: list[int]) -> bool:
+    return min(d) >= 0 and sorted(d)[0] == 0 and max(d) in LEGAL_STEPS
+
+
+def end_menu_consistency(st: dict, last: dict | None) -> str | None:
+    """None when the end-menu score equals the last scorebug read or is ONE legal scoring play past it on one side.
+    A one-legal-step *delta* still needs corroboration before ``final_confirmed`` (see ``end_menu_delta_corroborated``);
+    this function only rejects impossible jumps (digit-splice outside one play)."""
+    if last is None:
+        return None
+    d = end_menu_delta(st, last)
+    assert d is not None
+    if d == [0, 0] or end_menu_one_legal_step(d):
         return None
     return (f"end-of-game menu AWAY {st['away']} - HOME {st['home']} is not one legal scoring play past the last "
             f"scorebug read AWAY {last['away']} - HOME {last['home']}")
+
+
+def end_menu_delta_corroborated(st: dict, last: dict | None, timeline: list[dict] | None,
+                                external: list[dict] | None) -> dict | None:
+    """For a one-legal-step end-menu delta, return a corroboration record or None.
+
+    Acceptable evidence (any one):
+    - a prior scorebug timeline read that already equals the end-menu score (final play briefly drawn)
+    - an external score-change clip hash bound near the scoring time
+    - input / haptic activity flagged near the last scorebug / end-menu window
+    Exact match (no delta) needs no corroboration and returns {"kind": "exact_match"}.
+    """
+    if last is None:
+        return {"kind": "no_scorebug"}
+    d = end_menu_delta(st, last)
+    assert d is not None
+    if d == [0, 0]:
+        return {"kind": "exact_match"}
+    if not end_menu_one_legal_step(d):
+        return None
+    # Timeline: any agreed scorebug read matching end-menu scores
+    for r in reversed(timeline or []):
+        if "home" in r and "obs" not in r and (r.get("home"), r.get("away")) == (st["home"], st["away"]):
+            return {"kind": "scorebug_final_play", "t_ms": r.get("t_ms"), "home": r["home"], "away": r["away"]}
+    lo = int(last.get("t_ms") or 0) - 30_000
+    hi = int(st.get("t_ms") or last.get("t_ms") or 0) + 120_000
+    for ev in external or []:
+        kind = ev.get("kind") or ""
+        t = ev.get("t_ms")
+        if t is not None and not (lo <= int(t) <= hi):
+            continue
+        if kind in ("score_change_clip", "input_activity", "haptic", "scorebug_final_play"):
+            if kind == "score_change_clip" and not ev.get("sha256"):
+                continue
+            return {"kind": kind, **{k: ev[k] for k in ev if k != "kind"}}
+    return None
 
 
 def http_post(base: str, body: dict) -> dict:
