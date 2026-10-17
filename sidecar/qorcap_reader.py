@@ -27,8 +27,89 @@ QUARTER_SOFT = {"quarter_unsure", "quarter_missing"}
 # A game clock that has already reached the final seconds means that period is over. A later "1"
 # is not the 1st quarter (match-20261017-091651: 2ND matched the "1" template after the clock reset).
 PERIOD_END_CLOCK_S = 5
+# 10:00 or higher is a new period (a quarter opens at 15:00). 2:00 is not: that is the 091651 misread.
+QUARTER_RESET_CLOCK_S = 10 * 60
+# How long a "1" stays unknown after the clock runs down. The window ends on its own, and a real
+# quarter of 2 or higher ends it immediately. It must not stay shut for the rest of the match
+# (match-20261017-162055: from the Q1/Q2 boundary every read was quarter null).
+QUARTER_ONE_SUPPRESS_MS = 15_000
+# Wall-clock stand-in for one period when the game clock never comes back after a rundown.
+ELAPSED_PERIOD_MS = 12 * 60 * 1000
 # Q4 end menu: the scorebug's last red clock in the final 5 seconds (110028 locked 0:03, then the menu).
 END_MENU_RED_CLOCK_S = 5
+
+
+class PeriodTrack:
+    """Clock rundowns and the resets that follow them.
+
+    A posted clock at or under ``PERIOD_END_CLOCK_S`` opens a short window in which a quarter glyph of
+    "1" is unknown. A later read of 10:00+ counts as the next period starting. The window expires on
+    its own so a stuck "1" cannot blank the quarter for the rest of the game. Three rundowns, or a
+    long stretch with no clock after the first rundown, is evidence the match reached the fourth quarter.
+    """
+
+    def __init__(self) -> None:
+        self.saw_low = False
+        self.period_ended = False
+        self.period_end_ms: int | None = None
+        self.first_period_end_ms: int | None = None
+        self.periods_completed = 0
+        self.clock_unreadable = False
+        self.suppress_until_ms: int | None = None
+
+    def note(self, t_ms: int, clock_s) -> None:
+        if isinstance(clock_s, bool) or not isinstance(clock_s, int):
+            if self.first_period_end_ms is not None:
+                self.clock_unreadable = True
+            return
+        self.clock_unreadable = False
+        if clock_s <= PERIOD_END_CLOCK_S:
+            if not self.saw_low:
+                self.suppress_until_ms = int(t_ms) + QUARTER_ONE_SUPPRESS_MS
+                self.period_end_ms = int(t_ms)
+                if self.first_period_end_ms is None:
+                    self.first_period_end_ms = int(t_ms)
+            self.saw_low = True
+            self.period_ended = True
+            return
+        if clock_s >= QUARTER_RESET_CLOCK_S and self.saw_low:
+            self.periods_completed += 1
+            self.saw_low = False
+            self.period_ended = False
+            self.period_end_ms = int(t_ms)
+
+    def one_suppressed(self, t_ms: int) -> bool:
+        """True while a glyph of "1" must stay unknown. The window is bounded."""
+        until = self.suppress_until_ms
+        if until is None:
+            return False
+        if int(t_ms) > until:
+            self.suppress_until_ms = None
+            self.period_ended = False
+            return False
+        return True
+
+    def release_for_new_quarter(self) -> None:
+        """A quarter of 2 or higher was actually read. Stop blanking a later "1" for the old window."""
+        self.suppress_until_ms = None
+        self.period_ended = False
+
+    def inferred_quarter(self, t_ms: int) -> int | None:
+        """Quarter implied by completed resets, or by wall time when the clock stayed unreadable."""
+        n = self.periods_completed
+        if self.clock_unreadable and self.first_period_end_ms is not None and t_ms >= self.first_period_end_ms:
+            n = max(n, int((int(t_ms) - self.first_period_end_ms) // ELAPSED_PERIOD_MS))
+        if n <= 0:
+            return None
+        return min(1 + n, 5)
+
+    def reached_end_of_game(self, t_ms: int) -> bool:
+        """The fourth quarter has run down, or the clock died at the Q1/Q2 break and enough time has passed."""
+        if self.periods_completed >= 3 and self.saw_low:
+            return True
+        if self.clock_unreadable and self.periods_completed <= 1 and self.first_period_end_ms is not None:
+            return int(t_ms) - self.first_period_end_ms >= 3 * ELAPSED_PERIOD_MS
+        return False
 
 
 class ScoreClockLock:
@@ -165,7 +246,7 @@ class ReaderCore:
         self.end_menu_rejected: dict | None = None
         self.score_lock = ScoreClockLock()
         self._max_quarter: int | None = None  # highest quarter actually posted; a later read may not go backwards
-        self._period_ended = False  # a posted clock at or under PERIOD_END_CLOCK_S; quarter 1 after that is unknown
+        self.periods = PeriodTrack()
         self._quarter_reject: str | None = None
         # External corroboration for one-legal-step end-menu deltas (set by match runner):
         # each entry: {"kind": "scorebug_final_play"|"score_change_clip"|"input_activity"|"haptic",
@@ -212,7 +293,7 @@ class ReaderCore:
             self.stats["errors"] += 1
             print(f"scorebug reader error: {type(e).__name__}: {e}", file=sys.stderr)
             return
-        fr = self._hold_quarter(fr)
+        fr = self._hold_quarter(fr, t_ms)
         absent = (not fr.ok) and fr.reason in NOT_VISIBLE
         self._observe(t_ms, img, absent)
         ch = hashlib.sha256(band.tobytes()).hexdigest()[:16] if band is not None else ""
@@ -249,9 +330,9 @@ class ReaderCore:
             q = rd.get("quarter")
             if isinstance(q, int) and not isinstance(q, bool) and q >= 1:
                 self._max_quarter = q if self._max_quarter is None else max(self._max_quarter, q)
-            ck = rd.get("clock_s")
-            if isinstance(ck, int) and not isinstance(ck, bool) and ck <= PERIOD_END_CLOCK_S:
-                self._period_ended = True
+            if isinstance(q, int) and not isinstance(q, bool) and q >= 2:
+                self.periods.release_for_new_quarter()
+            self.periods.note(t_ms, rd.get("clock_s"))
         self._close_spans()  # a fresh score read ends any absence span
         self._check_final(t_ms)
 
@@ -293,17 +374,23 @@ class ReaderCore:
             fr.ok, fr.reason, fr.quarter = False, "quarter_unsure", None
             return fr
 
-    def _hold_quarter(self, fr):
-        """A quarter that goes backwards, or a "1" after the clock has already run down, is unknown.
+    @property
+    def _period_ended(self) -> bool:
+        return self.periods.period_ended
+
+    def _hold_quarter(self, fr, t_ms: int):
+        """A quarter that goes backwards, or a "1" just after the clock has run down, is unknown.
 
         The score and clock stay, so the lock can continue. match-20261017-091651 posted 27 reads as Q1
         during the real 2nd quarter: the clock had already hit 0:01 with no quarter label, then reset,
-        and the 2ND glyph still matched the "1" template. That "1" fails closed.
+        and the 2ND glyph still matched the "1" template. That "1" fails closed, for a bounded window.
+        A clock that resets to 15:00, or a quarter of 2 or higher, releases the window. The window also
+        expires on its own: match-20261017-162055 left it shut from the Q1/Q2 whistle to the final.
         """
         q = getattr(fr, "quarter", None)
         if isinstance(q, int) and not isinstance(q, bool) and self._max_quarter is not None and q < self._max_quarter:
             return self._blank_quarter(fr, f"quarter {q} rejected: already saw Q{self._max_quarter} (quarters do not go backwards)")
-        if isinstance(q, int) and not isinstance(q, bool) and q == 1 and self._period_ended:
+        if isinstance(q, int) and not isinstance(q, bool) and q == 1 and self.periods.one_suppressed(t_ms):
             return self._blank_quarter(fr, "quarter 1 rejected: the game clock already ran down (a new period is not the 1st quarter)")
         return fr
 
@@ -332,14 +419,25 @@ class ReaderCore:
                     last["clock_s"] = prev.get("clock_s")
         return last
 
-    def _clock_ready_for_end_menu(self, last: dict) -> bool:
+    def _quarter_ready_for_end_menu(self, last: dict, t_ms: int) -> bool:
+        """Q4 or OT from a scorebug read, or from the period track when the quarter glyph stayed unknown."""
+        q_last = last.get("quarter")
+        if isinstance(q_last, int) and not isinstance(q_last, bool) and q_last >= 4:
+            return True
+        return self.periods.reached_end_of_game(t_ms)
+
+    def _clock_ready_for_end_menu(self, last: dict, t_ms: int | None = None) -> bool:
         """Q4 menu once the scorebug clock is 0:00, or already red inside the final 5 seconds.
 
         OT is ready whenever the quarter is (a walk-off can leave time on the clock). A red 0:14 is
         still a running quarter: match-20261017-110028's menu arrived after the last lock of 0:03 red.
+        When the quarter and the clock both died at the Q1/Q2 break, a menu after three period-lengths
+        of wall time (or after the fourth-quarter clock has itself run down) is the same gate.
         """
         q_last = last.get("quarter")
         if isinstance(q_last, int) and not isinstance(q_last, bool) and q_last >= 5:
+            return True
+        if t_ms is not None and self.periods.reached_end_of_game(t_ms):
             return True
         if last.get("clock_s") == 0:
             return True
@@ -377,7 +475,9 @@ class ReaderCore:
             return
         last = self._scorebug_for_final()
         # Q4 gate (same intent as QorTime's final_screen basis): a game must have reached the 4th quarter.
-        if last is None or (last.get("quarter") or 0) < 4:
+        # A trailing lock with a null quarter does not erase an earlier Q4, and a clock that died at the
+        # Q1/Q2 break can still reach this gate on elapsed time (match-20261017-162055).
+        if last is None or not self._quarter_ready_for_end_menu(last, t_ms):
             self._reject_end_menu(st, "no Q4 scorebug read before the end-of-game menu")
             return
         # Clock gate: the end-of-game menu is only authoritative once the scorebug has shown 0:00 in Q4.
@@ -391,7 +491,7 @@ class ReaderCore:
         # OT can end on a walk-off with time still on the clock (match-20261017-091651: 10-16 at OT 1:55).
         # A Q4 menu with the clock still running is unchanged: it is rejected.
         q_last = last.get("quarter")
-        if not self._clock_ready_for_end_menu(last):
+        if not self._clock_ready_for_end_menu(last, t_ms):
             self._reject_end_menu(st, "scorebug clock not 0:00 before the end-of-game menu")
             return
         why = end_menu_consistency(st, last)

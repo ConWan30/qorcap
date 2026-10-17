@@ -372,6 +372,58 @@ def test_standard_end_menu_reads_and_confirms_hou_30_jax_6():
     assert "clock not 0:00" in core.end_menu_rejected["why"]
 
 
+def test_end_menu_after_the_clock_dies_at_the_q1_q2_break():
+    """match-20261017-162055: quarter and clock went null at the Q1/Q2 whistle. The menu still confirms.
+
+    A menu one period-length after that whistle is too early. Three period-lengths is the fourth quarter.
+    """
+    from types import SimpleNamespace as NS
+
+    from qorcap_reader import ELAPSED_PERIOD_MS
+
+    im = cv2.imread(str(HERE / "fixtures" / "m27_std_110028_end_menu.jpg"))
+    assert madden_final_screen(prep(im))
+    posts = []
+
+    class Rdr:
+        def __init__(self):
+            self.next = None
+
+        def read(self, _img):
+            return self.next
+
+    class Agree:
+        def offer(self, fr, **_):
+            return NS(agreed=fr.ok, read=fr if fr.ok else None)
+
+    class FR(NS):
+        @property
+        def pair(self):
+            if self.left_score is None or self.right_score is None:
+                return None
+            return (self.left_score, self.right_score)
+
+    rd = Rdr()
+    blank = np.zeros((360, 640, 3), np.uint8)
+    core = ReaderCore(posts.append, rd, Agree(), None, detect_final, final_screen_detector=madden_final_screen,
+                      end_menu_reader=R)
+    rd.next = FR(ok=True, reason="ok", left_score=30, right_score=6, quarter=1, clock_seconds=1, clock_red=False)
+    core.on_frame(0, blank)
+    rd.next = FR(ok=False, reason="quarter_unsure", left_score=30, right_score=6, quarter=None,
+                 clock_seconds=None, clock_red=False)
+    for t in (1_000, 1_250, 1_500):
+        core.on_frame(t, blank)
+    assert core.periods.clock_unreadable and core.periods.first_period_end_ms == 0
+    for k in range(6):
+        core.on_frame(ELAPSED_PERIOD_MS + k * 500, im)
+    assert not any(p.get("basis") == "end_menu" for p in posts)
+    assert core.end_menu_rejected and "no Q4" in core.end_menu_rejected["why"]
+    for k in range(6):
+        core.on_frame(3 * ELAPSED_PERIOD_MS + k * 500, im)
+    f = [p for p in posts if p.get("basis") == "end_menu"][0]
+    assert (f["away"], f["home"], f["quarter"], f["final_confirmed"]) == (30, 6, 4, True)
+
+
 def test_end_menu_rejection_is_logged(capsys):
     core, posts = _core({"t_ms": 0, "home": 20, "away": 0, "quarter": 4, "clock_s": 30, "clock_red": False})
     for k in range(6):

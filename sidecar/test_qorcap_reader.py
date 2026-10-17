@@ -78,6 +78,67 @@ def test_quarter_one_after_the_clock_runs_down_fails_closed():
     assert (last["away"], last["home"], last["quarter"]) == (3, 0, 2)
 
 
+def test_q1_to_q2_on_the_standard_bar_releases_when_the_clock_resets_to_15_00():
+    """match-20261017-162055: Q1 ended, Q2 opened at 15:00, and every later read lost quarter and clock.
+
+    A "1" inside the suppression window stays unknown (091651), including at 15:00. A real 2ND at
+    15:00 posts as Q2 with the clock. Scores lock with no quarter. The window does not last the game.
+    """
+    from qorcap_reader import QUARTER_ONE_SUPPRESS_MS
+
+    posts, rd = [], Reader()
+    core = ReaderCore(posts.append, rd, Agree(), None, detect_final)
+
+    def feed(t, left, right, q, clock, *, ok=True, reason="ok"):
+        rd.next = FR(ok=ok, reason=reason, left_score=left, right_score=right, quarter=q,
+                     clock_seconds=clock, clock_red=False)
+        core.on_frame(t, None)
+
+    def score():
+        return [p for p in posts if p["type"] == "score"][-1]
+
+    feed(0, 0, 0, 1, 30)
+    feed(1_000, 0, 0, 1, 0)
+    assert (score()["quarter"], score()["clock_s"], core._period_ended) == (1, 0, True)
+    for t in (2_000, 2_250, 2_500):
+        feed(t, 0, 0, 1, 900)  # 2ND still matching "1" at the 15:00 reset: fail closed, clock kept
+    assert (score()["away"], score()["home"], score()["quarter"], score()["clock_s"]) == (0, 0, None, 900)
+    assert core.periods.periods_completed == 1
+    for t in (4_000, 4_250, 4_500):
+        feed(t, 0, 0, 2, 900)  # the standard bar's 2ND, clock 0:00 -> 15:00
+    assert (score()["away"], score()["home"], score()["quarter"], score()["clock_s"]) == (0, 0, 2, 900)
+    assert core._period_ended is False
+    # True final was away 6, home 21. The quarter glyph is gone; the digits still lock.
+    for i in range(9):
+        feed(20_000 + i * 250, 6, 21, None, None, ok=False, reason="quarter_unsure")
+    assert (score()["away"], score()["home"], score()["quarter"], score()["clock_s"]) == (6, 21, None, None)
+    # A "1" after a real 2nd quarter is still unknown. The window expiring must not relabel Q2 as Q1.
+    for t in (30_000, 30_250, 30_500):
+        feed(t, 6, 21, 1, 400)
+    assert score()["quarter"] is None and score()["clock_s"] == 400
+
+
+def test_quarter_one_suppression_window_closes_on_its_own():
+    """The rundown guard is not a latch. Once the window ends, and no later quarter was read, a "1" posts."""
+    from qorcap_reader import QUARTER_ONE_SUPPRESS_MS
+
+    posts, rd = [], Reader()
+    core = ReaderCore(posts.append, rd, Agree(), None, detect_final)
+
+    def feed(t, q, clock):
+        rd.next = FR(ok=True, reason="ok", left_score=0, right_score=0, quarter=q,
+                     clock_seconds=clock, clock_red=False)
+        core.on_frame(t, None)
+
+    feed(0, 1, 1)
+    for t in (1_000, 1_250, 1_500):
+        feed(t, 1, 120)
+    assert [p for p in posts if p["type"] == "score"][-1]["quarter"] is None
+    feed(QUARTER_ONE_SUPPRESS_MS + 1_000, 1, 400)
+    last = [p for p in posts if p["type"] == "score"][-1]
+    assert (last["quarter"], last["clock_s"]) == (1, 400) and core._period_ended is False
+
+
 def test_open_shared_text_reads_on_this_platform(tmp_path):
     from qorcap_reader import open_shared_text
     p = tmp_path / "inputs.jsonl"
