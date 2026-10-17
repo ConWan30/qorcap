@@ -24,6 +24,11 @@ from typing import Any, Callable
 
 NOT_VISIBLE = {"layout_unknown", "frame_invalid", "frame_too_small", "frame_aspect"}
 QUARTER_SOFT = {"quarter_unsure", "quarter_missing"}
+# A game clock that has already reached the final seconds means that period is over. A later "1"
+# is not the 1st quarter (match-20261017-091651: 2ND matched the "1" template after the clock reset).
+PERIOD_END_CLOCK_S = 5
+# Q4 end menu: the scorebug's last red clock in the final 5 seconds (110028 locked 0:03, then the menu).
+END_MENU_RED_CLOCK_S = 5
 
 
 class ScoreClockLock:
@@ -160,7 +165,8 @@ class ReaderCore:
         self.end_menu_rejected: dict | None = None
         self.score_lock = ScoreClockLock()
         self._max_quarter: int | None = None  # highest quarter actually posted; a later read may not go backwards
-        self._quarter_reject: tuple | None = None
+        self._period_ended = False  # a posted clock at or under PERIOD_END_CLOCK_S; quarter 1 after that is unknown
+        self._quarter_reject: str | None = None
         # External corroboration for one-legal-step end-menu deltas (set by match runner):
         # each entry: {"kind": "scorebug_final_play"|"score_change_clip"|"input_activity"|"haptic",
         #              "t_ms": int, ...optional "home","away","sha256"}
@@ -243,6 +249,9 @@ class ReaderCore:
             q = rd.get("quarter")
             if isinstance(q, int) and not isinstance(q, bool) and q >= 1:
                 self._max_quarter = q if self._max_quarter is None else max(self._max_quarter, q)
+            ck = rd.get("clock_s")
+            if isinstance(ck, int) and not isinstance(ck, bool) and ck <= PERIOD_END_CLOCK_S:
+                self._period_ended = True
         self._close_spans()  # a fresh score read ends any absence span
         self._check_final(t_ms)
 
@@ -273,20 +282,30 @@ class ReaderCore:
     def last_scorebug(self) -> dict | None:
         return next((r for r in reversed(self.timeline) if "obs" not in r and "home" in r), None)
 
-    def _hold_quarter(self, fr):
-        """A quarter that goes backwards is unknown. The score and clock stay, so the lock can continue."""
-        q = getattr(fr, "quarter", None)
-        if not (isinstance(q, int) and not isinstance(q, bool) and self._max_quarter is not None and q < self._max_quarter):
-            return fr
-        if self._quarter_reject != (q, self._max_quarter):
-            print(f"quarter {q} rejected: already saw Q{self._max_quarter} (quarters do not go backwards)", file=sys.stderr)
-            self._quarter_reject = (q, self._max_quarter)
+    def _blank_quarter(self, fr, why: str):
+        if self._quarter_reject != why:
+            print(why, file=sys.stderr)
+            self._quarter_reject = why
         try:
             from dataclasses import replace
             return replace(fr, ok=False, reason="quarter_unsure", quarter=None)
         except TypeError:  # local stand-in used when QorTime is not imported
             fr.ok, fr.reason, fr.quarter = False, "quarter_unsure", None
             return fr
+
+    def _hold_quarter(self, fr):
+        """A quarter that goes backwards, or a "1" after the clock has already run down, is unknown.
+
+        The score and clock stay, so the lock can continue. match-20261017-091651 posted 27 reads as Q1
+        during the real 2nd quarter: the clock had already hit 0:01 with no quarter label, then reset,
+        and the 2ND glyph still matched the "1" template. That "1" fails closed.
+        """
+        q = getattr(fr, "quarter", None)
+        if isinstance(q, int) and not isinstance(q, bool) and self._max_quarter is not None and q < self._max_quarter:
+            return self._blank_quarter(fr, f"quarter {q} rejected: already saw Q{self._max_quarter} (quarters do not go backwards)")
+        if isinstance(q, int) and not isinstance(q, bool) and q == 1 and self._period_ended:
+            return self._blank_quarter(fr, "quarter 1 rejected: the game clock already ran down (a new period is not the 1st quarter)")
+        return fr
 
     def _scorebug_for_final(self) -> dict | None:
         """Latest score, with the quarter taken from the last read that actually had one.
@@ -312,6 +331,24 @@ class ReaderCore:
                 if last.get("clock_s") is None:
                     last["clock_s"] = prev.get("clock_s")
         return last
+
+    def _clock_ready_for_end_menu(self, last: dict) -> bool:
+        """Q4 menu once the scorebug clock is 0:00, or already red inside the final 5 seconds.
+
+        OT is ready whenever the quarter is (a walk-off can leave time on the clock). A red 0:14 is
+        still a running quarter: match-20261017-110028's menu arrived after the last lock of 0:03 red.
+        """
+        q_last = last.get("quarter")
+        if isinstance(q_last, int) and not isinstance(q_last, bool) and q_last >= 5:
+            return True
+        if last.get("clock_s") == 0:
+            return True
+        rows = [r for r in self.timeline if "obs" not in r and "home" in r
+                and isinstance(r.get("clock_s"), int) and not isinstance(r.get("clock_s"), bool)]
+        if not rows:
+            return False
+        c = rows[-1]
+        return bool(c.get("clock_red")) and int(c["clock_s"]) <= END_MENU_RED_CLOCK_S
 
     def _reject_end_menu(self, st: dict, why: str) -> None:
         prev = (self.end_menu_rejected or {}).get("why")
@@ -354,7 +391,7 @@ class ReaderCore:
         # OT can end on a walk-off with time still on the clock (match-20261017-091651: 10-16 at OT 1:55).
         # A Q4 menu with the clock still running is unchanged: it is rejected.
         q_last = last.get("quarter")
-        if last.get("clock_s") != 0 and not (isinstance(q_last, int) and not isinstance(q_last, bool) and q_last >= 5):
+        if not self._clock_ready_for_end_menu(last):
             self._reject_end_menu(st, "scorebug clock not 0:00 before the end-of-game menu")
             return
         why = end_menu_consistency(st, last)
@@ -562,6 +599,32 @@ def collect_delta_corroboration(*, clips: list[dict] | None = None,
     return out
 
 
+def open_shared_text(path, encoding="utf-8"):
+    """Read a file without denying writers.
+
+    The live sidecar re-reads ``inputs.jsonl`` every second while the engine appends it. On Windows a
+    read that does not share writes makes the append fail with a sharing violation (os error 32) and
+    the input hash chain breaks. ``FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE`` lets the
+    append through. Other platforms use a normal text open.
+    """
+    import os
+    if os.name != "nt":
+        return open(path, "r", encoding=encoding, errors="replace")
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+    share = 0x1 | 0x2 | 0x4  # FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE
+    k = ctypes.WinDLL("kernel32", use_last_error=True)
+    k.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p,
+                              wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+    k.CreateFileW.restype = wintypes.HANDLE
+    h = k.CreateFileW(os.fspath(path), 0x80000000, share, None, 3, 0x80, None)
+    if h is None or int(ctypes.cast(h, ctypes.c_void_p).value or 0) in (0, 0xFFFFFFFF, -1):
+        raise OSError(ctypes.get_last_error(), f"cannot open {path}")
+    fd = msvcrt.open_osfhandle(int(ctypes.cast(h, ctypes.c_void_p).value), os.O_RDONLY | os.O_BINARY)
+    return open(fd, "r", encoding=encoding, errors="replace", closefd=True)
+
+
 def load_delta_corroboration_from_bundle(bundle) -> list[dict]:
     """Read clips (manifest/bundle.json) + haptics.jsonl + inputs.jsonl from a match bundle dir."""
     from pathlib import Path
@@ -572,12 +635,15 @@ def load_delta_corroboration_from_bundle(bundle) -> list[dict]:
     if bj.exists():
         try:
             import json
-            clips.extend(json.loads(bj.read_text(encoding="utf-8")).get("clips") or [])
+            with open_shared_text(bj) as fh:
+                clips.extend(json.loads(fh.read()).get("clips") or [])
         except Exception:
             pass
     man = b / "manifest.jsonl"
     if man.exists():
-        for line in man.read_text(encoding="utf-8", errors="replace").splitlines():
+        with open_shared_text(man) as fh:
+            man_text = fh.read()
+        for line in man_text.splitlines():
             line = line.strip()
             if not line:
                 continue
@@ -612,7 +678,9 @@ def load_delta_corroboration_from_bundle(bundle) -> list[dict]:
             return []
         import json
         rows = []
-        for line in p.read_text(encoding="utf-8", errors="replace").splitlines():
+        with open_shared_text(p) as fh:
+            text = fh.read()
+        for line in text.splitlines():
             line = line.strip()
             if not line:
                 continue
@@ -648,13 +716,13 @@ def main(argv=None) -> int:
     import cv2
     import numpy as np
     from qor_receipt._vendor.qoresence.vision.local_scorebug.agreement import AgreementWindow
-    from qor_receipt._vendor.qoresence.vision.local_scorebug.reader import ScorebugReader
     from qor_receipt.agent.pause_detect import PauseDetector
     from qor_receipt.final_detect import detect_final
 
     from qorcap_endmenu import EndMenuReader
     from qorcap_mnp import AutoProfileReader
-    core = ReaderCore(lambda b: http_post(a.qorcap, b), AutoProfileReader(ScorebugReader(), prep=prep), AgreementWindow(),
+    from qorcap_standard import standard_reader
+    core = ReaderCore(lambda b: http_post(a.qorcap, b), AutoProfileReader(standard_reader(), prep=prep), AgreementWindow(),
                       PauseDetector(), detect_final,
                       final_screen_detector=madden_final_screen, end_menu_reader=EndMenuReader())
     last, period, t_print = None, 1.0 / a.hz, time.monotonic()

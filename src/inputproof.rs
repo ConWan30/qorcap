@@ -11,7 +11,7 @@ pub const SCHEMA: &str = "qorcap-input-proof/v0";
 pub const LIMIT: &str = "Shows these inputs came from the USB-connected controller in sync with this video. It does not show who was holding the controller.";
 
 fn jsonl(p: &Path) -> Vec<Value> {
-    std::fs::read_to_string(p).map(|s| s.lines().filter_map(|l| serde_json::from_str(l).ok()).collect()).unwrap_or_default()
+    inputs::read_shared_string(p).map(|s| s.lines().filter_map(|l| serde_json::from_str(l).ok()).collect()).unwrap_or_default()
 }
 
 /// Build the proof for bundle `dir`. `ffmpeg = None` skips frame differencing.
@@ -22,7 +22,7 @@ pub fn build(dir: &Path, ffmpeg: Option<&str>, n_frames: usize) -> Value {
     }
     let (recs, chunks) = match inputs::read_file(&p) { Ok(x) => x, Err(e) => return json!({"schema": SCHEMA, "status": "unreadable", "warning": e, "limit": LIMIT}) };
     let (_, head, errs) = inputs::verify_chunks(&recs, &chunks);
-    let file_sha = std::fs::read(&p).map(|b| ev::sha256_hex(&b)).unwrap_or_default();
+    let file_sha = inputs::read_shared_bytes(&p).map(|b| ev::sha256_hex(&b)).unwrap_or_default();
     let header = recs.iter().find(|r| r["type"] == "header");
     let anchor = header.and_then(|h| h["wall_anchor_ms"].as_u64());
     let n_in = recs.iter().filter(|r| r["type"] == "in").count();

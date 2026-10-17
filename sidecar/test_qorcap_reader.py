@@ -36,6 +36,56 @@ def run(frames):
     return core, posts
 
 
+class FR(NS):
+    """Stand-in FrameRead with the pair the quarter-soft lock needs."""
+
+    @property
+    def pair(self):
+        if self.left_score is None or self.right_score is None:
+            return None
+        return (self.left_score, self.right_score)
+
+
+def test_quarter_one_after_the_clock_runs_down_fails_closed():
+    """match-20261017-091651: 27 reads labelled Q1 during the real 2nd quarter.
+
+    The clock had already posted 0:01. A later glyph that still matches "1" is unknown. The score stays.
+    A real 2nd quarter after that still posts, and a 1st quarter with no prior expiry still posts.
+    """
+    posts, rd = [], Reader()
+    core = ReaderCore(posts.append, rd, Agree(), None, detect_final)
+
+    def feed(t, left, right, q, clock):
+        rd.next = FR(ok=True, reason="ok", left_score=left, right_score=right, quarter=q,
+                     clock_seconds=clock, clock_red=False)
+        core.on_frame(t, None)
+
+    feed(0, 0, 0, 1, 120)
+    assert posts[-1]["quarter"] == 1 and core._period_ended is False
+    feed(1000, 0, 0, 1, 1)
+    assert (posts[-1]["quarter"], posts[-1]["clock_s"]) == (1, 1) and core._period_ended
+    for t in (3000, 3250, 3500):
+        feed(t, 0, 0, 1, 120)
+    last = [p for p in posts if p["type"] == "score"][-1]
+    assert (last["away"], last["home"], last["quarter"], last["clock_s"]) == (0, 0, None, 120)
+    for t in (3600, 3850, 4100):
+        feed(t, 3, 0, 1, 40)
+    last = [p for p in posts if p["type"] == "score"][-1]
+    assert (last["away"], last["home"], last["quarter"]) == (3, 0, None)
+    for t in (6000, 6250, 6500):
+        feed(t, 3, 0, 2, 80)
+    last = [p for p in posts if p["type"] == "score"][-1]
+    assert (last["away"], last["home"], last["quarter"]) == (3, 0, 2)
+
+
+def test_open_shared_text_reads_on_this_platform(tmp_path):
+    from qorcap_reader import open_shared_text
+    p = tmp_path / "inputs.jsonl"
+    p.write_text('{"type":"in"}\n', encoding="utf-8")
+    with open_shared_text(p) as fh:
+        assert '"type":"in"' in fh.read()
+
+
 def test_left_is_away_and_score_events():
     _, posts = run([(0, fr(3, 7, 1, 600)), (250, fr(3, 7, 1, 600))])
     assert posts[0] == {"type": "score", "t_ms": 0, "away": 3, "home": 7, "quarter": 1, "clock_s": 600, "clock_red": False}

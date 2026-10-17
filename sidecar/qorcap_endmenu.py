@@ -105,10 +105,16 @@ def side_glyphs(img, side: str) -> list[np.ndarray]:
         if clipped and w <= 8 and y + h >= m.shape[0] - 1:
             continue
         if h > GLYPH_H[1] or w > GLYPH_MAX_W or clipped:
-            out.append((x, None))  # oversized / clipped blob: make the side unreadable
+            # A 4px edge speck is the team logo on the standard end menu (match-20261017-110028, HOU 30).
+            # Drop it only once two clean digits are already in the box. One clean glyph plus a speck stays
+            # unreadable, which is the covered online score (a partial digit must not be read on its own).
+            out.append((x, None, bool(clipped and w <= 4)))
             continue
-        out.append((x, (lab[y:y + h, x:x + w] == i).astype(np.uint8) * 255))
-    return [g for _, g in sorted(out, key=lambda t: t[0])]
+        out.append((x, (lab[y:y + h, x:x + w] == i).astype(np.uint8) * 255, False))
+    clean = [g for _, g, _ in out if g is not None]
+    if len(clean) >= 2:
+        out = [t for t in out if not t[2]]
+    return [g for _, g, _ in sorted(out, key=lambda t: t[0])]
 
 
 @dataclass
@@ -144,9 +150,16 @@ class EndMenuReader:
         if v is None:
             return None, {"why": "flat"}
         s = self.vecs @ v
-        order = np.argsort(-s)
-        idx = int(order[0])
-        lab, best, second = self.labels[idx], float(s[order[0]]), float(s[order[1]])
+        # Several variants can share a label (the 091651 "6" plus the standard-menu "6"). The margin is
+        # over the runner-up *label*, so a second copy of the winner does not shrink the margin to ~0.
+        by: dict[str, tuple[float, int]] = {}
+        for i, name in enumerate(self.labels):
+            sc = float(s[i])
+            if name not in by or sc > by[name][0]:
+                by[name] = (sc, i)
+        ranked = sorted(by.items(), key=lambda kv: -kv[1][0])
+        lab, (best, idx) = ranked[0]
+        second = ranked[1][1][0] if len(ranked) > 1 else -1.0
         holes = hole_signature(g)
         info = {"label": lab, "best": round(best, 3), "margin": round(best - second, 3), "holes": holes,
                 "source": self.sources[idx].split(":")[0]}

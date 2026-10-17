@@ -24,7 +24,7 @@ use crate::haptics::{Detector, HapticLive};
 use crate::hid::{self, Pad, ReportSource};
 use log::{info, warn};
 use serde_json::{json, Value};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -35,6 +35,73 @@ pub const SCHEMA: &str = "qorcap-inputs/v0";
 pub const ANALOG_MIN_GAP_US: u64 = 4_000;
 
 pub fn empty_hash() -> String { ev::jcs_sha(&json!([])) }
+
+/// Windows `ERROR_SHARING_VIOLATION`. A reader that does not share writes (the live sidecar re-reads
+/// `inputs.jsonl` every second) makes the append fail; retrying keeps the hash chain intact.
+pub fn sharing_violation(err: &std::io::Error) -> bool { err.raw_os_error() == Some(32) }
+
+#[cfg(windows)]
+const FILE_SHARE_READ_WRITE_DELETE: u32 = 0x1 | 0x2 | 0x4;
+
+fn open_append(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut o = std::fs::OpenOptions::new();
+    o.create(true).append(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        o.share_mode(FILE_SHARE_READ_WRITE_DELETE);
+    }
+    o.open(path)
+}
+
+fn open_read(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut o = std::fs::OpenOptions::new();
+    o.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        o.share_mode(FILE_SHARE_READ_WRITE_DELETE);
+    }
+    o.open(path)
+}
+
+/// Read bytes without denying a concurrent append (Windows share read+write+delete).
+pub fn read_shared_bytes(path: &Path) -> std::io::Result<Vec<u8>> {
+    let mut f = open_read(path)?;
+    let mut buf = Vec::new();
+    f.read_to_end(&mut buf)?;
+    Ok(buf)
+}
+
+pub fn read_shared_string(path: &Path) -> std::io::Result<String> {
+    Ok(String::from_utf8_lossy(&read_shared_bytes(path)?).into_owned())
+}
+
+/// Run `op` until it succeeds. A sharing violation waits and tries again; any other error returns immediately.
+fn retry_sharing<T>(mut op: impl FnMut() -> std::io::Result<T>, attempts: u32, mut pause: impl FnMut(Duration)) -> std::io::Result<T> {
+    let mut delay = Duration::from_millis(25);
+    let mut last = None;
+    for i in 0..attempts {
+        match op() {
+            Ok(v) => return Ok(v),
+            Err(e) if sharing_violation(&e) && i + 1 < attempts => {
+                last = Some(e);
+                pause(delay);
+                delay = (delay * 2).min(Duration::from_millis(200));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Err(last.unwrap_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "sharing violation")))
+}
+
+fn append_bytes(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    // Retry the open only. A sharing violation is raised by CreateFile, before any byte is written.
+    // Retrying a write that already appended would duplicate the chunk.
+    let mut f = retry_sharing(|| open_append(path), 8, |d| std::thread::sleep(d))?;
+    f.write_all(bytes)?;
+    f.sync_all()
+}
 
 /// Live controller state for /status and `input-test`.
 #[derive(Debug, Clone, Default, serde::Serialize)]
@@ -161,24 +228,23 @@ impl InputLog {
         let prev = self.head.clone();
         let head = ev::link(&prev, self.chunks, &sha);
         let chunk = json!({"type": "chunk", "seq": self.chunks, "seg": seg, "n": n, "sha256": sha, "prev": prev, "head": head, "t_us": t_us});
+        let mut body = String::new();
+        for r in recs.iter().chain(std::iter::once(&chunk)) { body.push_str(&r.to_string()); body.push('\n'); }
         if let Some(p) = &self.path {
             if let Some(d) = p.parent() { let _ = std::fs::create_dir_all(d); }
-            match std::fs::OpenOptions::new().create(true).append(true).open(p) {
-                Ok(mut f) => {
-                    let mut s = String::new();
-                    for r in recs.iter().chain(std::iter::once(&chunk)) { s.push_str(&r.to_string()); s.push('\n'); }
-                    if let Err(e) = f.write_all(s.as_bytes()) { warn!("cannot write {}: {e}", p.display()); }
-                    let _ = f.sync_all();
-                }
-                Err(e) => warn!("cannot open {}: {e}", p.display()),
+            if let Err(e) = append_bytes(p, body.as_bytes()) {
+                // The chunk is not on disk, so the chain must not move. The records stay pending and
+                // the next segment seals them. A checkpoint for this segment then commits the empty hash.
+                warn!("cannot write {}: {e}; input chunk not sealed (chain unchanged)", p.display());
+                self.pending = recs;
+                return (empty_hash(), self.head.clone(), 0);
             }
         }
         if let Some(hp) = &self.haptic_path {
             let hs: String = recs.iter().filter(|r| r["type"] == "haptic").map(|r| format!("{r}\n")).collect();
             if !hs.is_empty() {
-                match std::fs::OpenOptions::new().create(true).append(true).open(hp) {
-                    Ok(mut f) => { if let Err(e) = f.write_all(hs.as_bytes()) { warn!("cannot write {}: {e}", hp.display()); } let _ = f.sync_all(); }
-                    Err(e) => warn!("cannot open {}: {e}", hp.display()),
+                if let Err(e) = append_bytes(hp, hs.as_bytes()) {
+                    warn!("cannot write {}: {e}", hp.display());
                 }
             }
         }
@@ -263,7 +329,7 @@ fn sleep_unless(stop: &AtomicBool, ms: u64) {
 
 /// Parse inputs.jsonl into (records, chunks). Tolerates up to 3 corrupt lines like the other bundle files.
 pub fn read_file(p: &Path) -> Result<(Vec<Value>, Vec<Value>), String> {
-    let s = std::fs::read_to_string(p).map_err(|e| format!("{}: {e}", p.display()))?;
+    let s = read_shared_string(p).map_err(|e| format!("{}: {e}", p.display()))?;
     let (mut recs, mut chunks, mut bad) = (vec![], vec![], 0);
     for l in s.lines().filter(|l| !l.trim().is_empty()) {
         match serde_json::from_str::<Value>(l) {
@@ -325,6 +391,41 @@ mod tests {
         // tamper: change one button value
         let mut bad = recs.clone(); bad[3]["b"] = json!(0);
         assert!(!verify_chunks(&bad, &chunks).2.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sharing_violation_retries_then_other_errors_do_not() {
+        let e = std::io::Error::from_raw_os_error(32);
+        assert!(sharing_violation(&e));
+        assert!(!sharing_violation(&std::io::Error::new(std::io::ErrorKind::NotFound, "missing")));
+        let mut n = 0u32;
+        let mut waits = 0u32;
+        let got = retry_sharing(|| {
+            n += 1;
+            if n < 3 { Err(std::io::Error::from_raw_os_error(32)) } else { Ok(7u8) }
+        }, 8, |_| { waits += 1; });
+        assert_eq!((got.unwrap(), n, waits), (7, 3, 2));
+        let mut once = 0u32;
+        let err = retry_sharing(|| { once += 1; Err::<(), _>(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "no")) }, 8, |_| {});
+        assert!(err.is_err());
+        assert_eq!(once, 1);
+    }
+
+    #[test]
+    fn failed_seal_keeps_the_chain_and_the_records() {
+        let dir = std::env::temp_dir().join(format!("qorcap-inputs-busy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // A directory where the file should be: the append fails, and it is not a sharing violation.
+        let bad = dir.join("inputs.jsonl");
+        std::fs::create_dir(&bad).unwrap();
+        let mut l = InputLog::new(Some(bad), true, 0);
+        l.on_status(1, "connected", "DualSense");
+        let pending_before = l.pending().len();
+        let (sha, head, n) = l.seal(1, 10);
+        assert_eq!((n, l.chunks, sha.as_str(), head.as_str()), (0, 0, empty_hash().as_str(), GENESIS));
+        assert_eq!(l.pending().len(), pending_before, "records stay pending for the next seal");
         let _ = std::fs::remove_dir_all(&dir);
     }
     #[test]

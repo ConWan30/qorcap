@@ -11,7 +11,9 @@ fn lines(p: &Path) -> Result<Vec<Value>, String> {
 }
 
 fn lines_resilient(p: &Path, salvage: bool) -> Result<Vec<Value>, String> {
-    let s = std::fs::read_to_string(p).map_err(|e| format!("{}: {e}", p.display()))?;
+    // Share the file with the recorder. verify-bundle reads inputs.jsonl / manifest.jsonl while a match
+    // is still appending them; an exclusive read is the sharing violation that used to drop input chunks.
+    let s = crate::inputs::read_shared_string(p).map_err(|e| format!("{}: {e}", p.display()))?;
     let mut out = Vec::new();
     let mut bad = 0usize;
     for (i, l) in s.lines().filter(|l| !l.trim().is_empty()).enumerate() {

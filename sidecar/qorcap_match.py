@@ -251,13 +251,13 @@ def start_reader(api: Api, stop: threading.Event, state: dict, bundle: Path | No
     import cv2
     import numpy as np
     from qor_receipt._vendor.qoresence.vision.local_scorebug.agreement import AgreementWindow
-    from qor_receipt._vendor.qoresence.vision.local_scorebug.reader import ScorebugReader
     from qor_receipt.agent.pause_detect import PauseDetector
     from qor_receipt.final_detect import detect_final
 
     sys.path.insert(0, str(HERE))
     from qorcap_endmenu import EndMenuReader
     from qorcap_reader import ReaderCore, madden_final_screen, prep
+    from qorcap_standard import standard_reader
 
     def post(b):
         try:
@@ -271,7 +271,7 @@ def start_reader(api: Api, stop: threading.Event, state: dict, bundle: Path | No
     from qorcap_mnp import AutoProfileReader
     from qorcap_reader import collect_delta_corroboration, load_delta_corroboration_from_bundle
     from qorcap_playcall import PauseCapableGate, PlayCallDetector
-    core = ReaderCore(post, AutoProfileReader(ScorebugReader(), prep=prep), AgreementWindow(), PauseDetector(), detect_final,
+    core = ReaderCore(post, AutoProfileReader(standard_reader(), prep=prep), AgreementWindow(), PauseDetector(), detect_final,
                       final_screen_detector=madden_final_screen, end_menu_reader=EndMenuReader(),
                       playcall=PlayCallDetector(), gate=PauseCapableGate())
     state["core"] = core
@@ -927,7 +927,10 @@ def offer_submit(bundle: Path, referee_url: str | None, *, auto: bool = False, a
 
 
 def fill_challenge_results(bundle: Path, draft: dict, *, ffmpeg: str | None = None, decode: bool = True) -> dict:
-    """v0.3.11: re-run every challenge on this bundle before signing (QorTime ``review.local``, the referee's rules).
+    """v0.3.11: re-run every challenge on this bundle before signing.
+
+    v0.3.14 uses the recorder's capture-path pause bound (see ``qorcap_challenge``). The official referee
+    still uses 600 ms; nothing here is submitted to it.
 
     QorCap <= 0.3.10 always signed ``result: null``, so a correctly answered challenge still verified as
     ``challenge_unanswered`` (match 2026-10-17 #4, 44b8d01f). An ok result goes into the receipt
@@ -941,7 +944,7 @@ def fill_challenge_results(bundle: Path, draft: dict, *, ffmpeg: str | None = No
     try:
         if ff:
             os.environ["QORTIME_FFMPEG"] = ff
-        from qor_receipt.review.local import challenge_results
+        from qorcap_challenge import challenge_results
         outs = challenge_results(bundle, chs, decode=decode)
     except Exception as e:  # never block signing; unanswered is the honest fallback
         say(f"  Challenges:   could not re-check ({type(e).__name__}: {e}); left unanswered")
@@ -1138,7 +1141,6 @@ def run_offline_reader(frames, t0_ms: int, core_factory, progress=None) -> tuple
 
 def default_core_factory(post):
     from qor_receipt._vendor.qoresence.vision.local_scorebug.agreement import AgreementWindow
-    from qor_receipt._vendor.qoresence.vision.local_scorebug.reader import ScorebugReader
     from qor_receipt.agent.pause_detect import PauseDetector
     from qor_receipt.final_detect import detect_final
 
@@ -1146,9 +1148,10 @@ def default_core_factory(post):
     from qorcap_endmenu import EndMenuReader
     from qorcap_mnp import AutoProfileReader
     from qorcap_reader import ReaderCore, madden_final_screen, prep
+    from qorcap_standard import standard_reader
 
     from qorcap_playcall import PauseCapableGate, PlayCallDetector
-    return ReaderCore(post, AutoProfileReader(ScorebugReader(), prep=prep), AgreementWindow(), PauseDetector(), detect_final,
+    return ReaderCore(post, AutoProfileReader(standard_reader(), prep=prep), AgreementWindow(), PauseDetector(), detect_final,
                       final_screen_detector=madden_final_screen, end_menu_reader=EndMenuReader(),
                       playcall=PlayCallDetector(), gate=PauseCapableGate())
 
