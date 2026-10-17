@@ -159,6 +159,8 @@ class ReaderCore:
         self.end_menu: dict | None = None
         self.end_menu_rejected: dict | None = None
         self.score_lock = ScoreClockLock()
+        self._max_quarter: int | None = None  # highest quarter actually posted; a later read may not go backwards
+        self._quarter_reject: tuple | None = None
         # External corroboration for one-legal-step end-menu deltas (set by match runner):
         # each entry: {"kind": "scorebug_final_play"|"score_change_clip"|"input_activity"|"haptic",
         #              "t_ms": int, ...optional "home","away","sha256"}
@@ -204,6 +206,7 @@ class ReaderCore:
             self.stats["errors"] += 1
             print(f"scorebug reader error: {type(e).__name__}: {e}", file=sys.stderr)
             return
+        fr = self._hold_quarter(fr)
         absent = (not fr.ok) and fr.reason in NOT_VISIBLE
         self._observe(t_ms, img, absent)
         ch = hashlib.sha256(band.tobytes()).hexdigest()[:16] if band is not None else ""
@@ -237,6 +240,9 @@ class ReaderCore:
         if prev is None or key(prev) != key(rd) or rd["t_ms"] - prev["t_ms"] >= 1_000:
             self.timeline.append(rd)
             self.post({"type": "score", **rd})
+            q = rd.get("quarter")
+            if isinstance(q, int) and not isinstance(q, bool) and q >= 1:
+                self._max_quarter = q if self._max_quarter is None else max(self._max_quarter, q)
         self._close_spans()  # a fresh score read ends any absence span
         self._check_final(t_ms)
 
@@ -267,6 +273,52 @@ class ReaderCore:
     def last_scorebug(self) -> dict | None:
         return next((r for r in reversed(self.timeline) if "obs" not in r and "home" in r), None)
 
+    def _hold_quarter(self, fr):
+        """A quarter that goes backwards is unknown. The score and clock stay, so the lock can continue."""
+        q = getattr(fr, "quarter", None)
+        if not (isinstance(q, int) and not isinstance(q, bool) and self._max_quarter is not None and q < self._max_quarter):
+            return fr
+        if self._quarter_reject != (q, self._max_quarter):
+            print(f"quarter {q} rejected: already saw Q{self._max_quarter} (quarters do not go backwards)", file=sys.stderr)
+            self._quarter_reject = (q, self._max_quarter)
+        try:
+            from dataclasses import replace
+            return replace(fr, ok=False, reason="quarter_unsure", quarter=None)
+        except TypeError:  # local stand-in used when QorTime is not imported
+            fr.ok, fr.reason, fr.quarter = False, "quarter_unsure", None
+            return fr
+
+    def _scorebug_for_final(self) -> dict | None:
+        """Latest score, with the quarter taken from the last read that actually had one.
+
+        A later lock whose ordinal glyph failed (quarter null) must not erase Q4/OT. That is what dropped the
+        Thursday Night end menu on match-20261017-091651: 463 end-menu reads, final null, no rejection line.
+        """
+        rows = [r for r in self.timeline if "obs" not in r and "home" in r]
+        if not rows:
+            return None
+        last = dict(rows[-1])
+
+        def qof(r):
+            q = r.get("quarter")
+            if isinstance(q, bool) or not isinstance(q, int):
+                return None
+            return q if q >= 1 else None
+
+        if qof(last) is None:
+            prev = next((r for r in reversed(rows) if qof(r) is not None), None)
+            if prev is not None:
+                last["quarter"] = qof(prev)
+                if last.get("clock_s") is None:
+                    last["clock_s"] = prev.get("clock_s")
+        return last
+
+    def _reject_end_menu(self, st: dict, why: str) -> None:
+        prev = (self.end_menu_rejected or {}).get("why")
+        self.end_menu_rejected = dict(st, why=why)
+        if prev != why:
+            print(f"END MENU rejected: AWAY {st['away']} - HOME {st['home']}: {why}", file=sys.stderr)
+
     def _end_menu(self, t_ms: int, img) -> None:
         """Read the end-menu score panel; once stable over consecutive frames, post it as the final."""
         if self.end_menu_reader is None:
@@ -286,10 +338,10 @@ class ReaderCore:
             if st is not None and self.end_menu is not None:
                 self.end_menu.update(until_ms=st["until_ms"], frames=st["frames"])
             return
-        last = self.last_scorebug()
+        last = self._scorebug_for_final()
         # Q4 gate (same intent as QorTime's final_screen basis): a game must have reached the 4th quarter.
         if last is None or (last.get("quarter") or 0) < 4:
-            self.end_menu_rejected = dict(st, why="no Q4 scorebug read before the end-of-game menu")
+            self._reject_end_menu(st, "no Q4 scorebug read before the end-of-game menu")
             return
         # Clock gate: the end-of-game menu is only authoritative once the scorebug has shown 0:00 in Q4.
         # Without this, a doctored end-menu-looking frame matching the current mid-Q4 score ends the match early.
@@ -302,16 +354,15 @@ class ReaderCore:
         # OT can end on a walk-off with time still on the clock (match-20261017-091651: 10-16 at OT 1:55).
         # A Q4 menu with the clock still running is unchanged: it is rejected.
         q_last = last.get("quarter")
-        if last.get("clock_s") != 0 and not (isinstance(q_last, int) and q_last >= 5):
-            self.end_menu_rejected = dict(st, why="scorebug clock not 0:00 before the end-of-game menu")
+        if last.get("clock_s") != 0 and not (isinstance(q_last, int) and not isinstance(q_last, bool) and q_last >= 5):
+            self._reject_end_menu(st, "scorebug clock not 0:00 before the end-of-game menu")
             return
         why = end_menu_consistency(st, last)
         if why:
-            self.end_menu_rejected = dict(st, why=why)
-            print(f"END MENU read AWAY {st['away']} - HOME {st['home']} rejected: {why}", file=sys.stderr)
+            self._reject_end_menu(st, why)
             return
         if st["home"] == st["away"]:
-            self.end_menu_rejected = dict(st, why="tied score on the end-of-game menu")
+            self._reject_end_menu(st, "tied score on the end-of-game menu")
             return
         self.end_menu = dict(st)
         if "corroborated" in (st.get("template_sources") or []):

@@ -702,6 +702,26 @@ mod tests {
     }
 
     #[test]
+    fn null_quarter_keeps_last_reliable_and_does_not_go_backwards() {
+        use clap::Parser;
+        let dir = std::env::temp_dir().join(format!("qorcap-qkeep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let d = dir.to_string_lossy().into_owned();
+        let crate::cli::Cmd::Record(r) = crate::cli::Cli::try_parse_from(["q", "record", "--device", "testpattern", "--bundle", &d]).unwrap().cmd else { panic!() };
+        let e = Engine::new(r, "ffmpeg-x".into());
+        e.event(&serde_json::json!({"type":"score","home":16,"away":10,"quarter":5,"clock_s":115})).unwrap();
+        e.event(&serde_json::json!({"type":"score","home":16,"away":10,"quarter":Value::Null,"clock_s":115})).unwrap();
+        e.event(&serde_json::json!({"type":"score","home":16,"away":10,"quarter":1,"clock_s":3})).unwrap();
+        let out = e.write_bundle().unwrap();
+        let draft: Value = serde_json::from_str(&std::fs::read_to_string(out.join("receipt.draft.json")).unwrap()).unwrap();
+        assert_eq!(draft["result"]["quarter"], 5);
+        assert_eq!(draft["result"]["home_score"], 16);
+        assert_eq!(draft["result"]["away_score"], 10);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn end_menu_final_amends_scorebug_final_and_confirms() {
         use clap::Parser;
         let dir = std::env::temp_dir().join(format!("qorcap-endmenu-{}", std::process::id()));
@@ -905,16 +925,25 @@ impl Engine {
                     Some(v) => Some(v.as_i64().ok_or("quarter must be an integer")?),
                     None => return Err("quarter must be an integer".into()),
                 };
-                let q_json = match q { Some(n) => Value::from(n), None => Value::Null };
+                let raw_q = match q { Some(n) => Value::from(n), None => Value::Null };
                 let clock_s = b["clock_s"].as_i64();
                 let red = b["clock_red"].as_bool().unwrap_or(false);
-                let read = json!({"t_ms": t_ms, "home": h, "away": a, "quarter": q_json, "clock_s": clock_s, "clock_red": red});
+                let read = json!({"t_ms": t_ms, "home": h, "away": a, "quarter": raw_q, "clock_s": clock_s, "clock_red": red});
                 let mut st = self.ev.lock().unwrap();
                 st.timeline.push(read.clone());
-                st.score = json!({"home": h, "away": a, "quarter": q_json.clone(), "clock_s": clock_s, "clock_red": red});
-                let score_changed = st.last_score.map(|p| p != (h, a, q)).unwrap_or(true);
+                // Receipt quarter follows the last reliable read: a null ordinal does not wipe OT, and a
+                // quarter never moves backwards (a 2ND glyph misread as Q1 must not replace Q3).
+                let prev_q = st.last_score.and_then(|p| p.2);
+                let stored_q = match q {
+                    Some(n) if prev_q.is_some_and(|prev| n < prev) => prev_q,
+                    Some(n) => Some(n),
+                    None => prev_q,
+                };
+                let q_json = match stored_q { Some(n) => Value::from(n), None => Value::Null };
+                st.score = json!({"home": h, "away": a, "quarter": q_json, "clock_s": clock_s, "clock_red": red});
+                let score_changed = st.last_score.map(|p| p != (h, a, stored_q)).unwrap_or(true);
                 let prev_score = st.last_score;
-                st.last_score = Some((h, a, q));
+                st.last_score = Some((h, a, stored_q));
                 let clock_state = (clock_s == Some(0), red);
                 let clock_changed = st.last_clock.map(|c| c != clock_state).unwrap_or(false);
                 st.last_clock = Some(clock_state);
