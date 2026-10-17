@@ -401,3 +401,26 @@ def test_tail_final_check_confirms_from_recorded_frames(tmp_path):
     black = end * 0
     out2 = qm.tail_final_check(b, draft, ffmpeg="ffmpeg-missing", core_factory=fac, frames=[(k * 500, black) for k in range(20)])
     assert out2["result"].get("final_confirmed") is False
+
+
+# ---- v0.3.6 audio level checks
+def test_parse_volumedetect_silent_and_ok():
+    import qorcap_match as Q
+    silent = "[Parsed_volumedetect_0 @ 0] mean_volume: -90.3 dB\n[Parsed_volumedetect_0 @ 0] max_volume: -80.8 dB\n"
+    ok = "mean_volume: -24.1 dB\nmax_volume: -1.2 dB\n"
+    assert Q.parse_volumedetect(silent) == {"mean_db": -90.3, "max_db": -80.8, "silent": True}
+    assert Q.parse_volumedetect(ok)["silent"] is False
+    assert Q.parse_volumedetect("mean_volume: -inf dB\nmax_volume: -inf dB")["silent"] is True
+    assert Q.parse_volumedetect("nothing") is None
+
+
+def test_pick_card_audio_and_hint():
+    import qorcap_match as Q
+    devs = ["Headset Microphone (DualSense Edge Wireless Controller)", "Digital Audio Interface (USB3.0 Audio)",
+            "Microphone Array (Intel Smart Sound)"]
+    assert Q.pick_card_audio("USB3.0 Video", "auto", devs) == "Digital Audio Interface (USB3.0 Audio)"
+    assert Q.pick_card_audio("USB3.0 Video", "My Card", devs) == "My Card"
+    assert Q.pick_card_audio("Other Cam", "auto", devs) is None
+    assert Q.audio_silence_hint({"silent": False, "max_db": -3, "mean_db": -20}, when="x") == []
+    txt = "\n".join(Q.audio_silence_hint({"silent": True, "max_db": -80.8, "mean_db": -90.3}, when="now"))
+    assert "SILENT" in txt and "Chat Audio" in txt and "unplug" not in txt.lower()

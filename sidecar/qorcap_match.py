@@ -420,6 +420,96 @@ def mic_hint(which: str | None) -> list[str]:
             "        (Recording still works video-only if you continue.)", ""]
 
 
+# ------------------------------------------------------------------ audio level checks (v0.3.6)
+SILENT_MAX_DB = -70.0  # a capture card passing no sound gives ~-90 dB mean / -80 dB max (+-1 LSB noise)
+
+
+def parse_volumedetect(text: str) -> dict | None:
+    import re
+    mean = re.findall(r"mean_volume:\s*(-?[\d.]+|-inf) dB", text)
+    mx = re.findall(r"max_volume:\s*(-?[\d.]+|-inf) dB", text)
+    if not mean or not mx:
+        return None
+    f = lambda v: -200.0 if v == "-inf" else float(v)  # noqa: E731
+    return {"mean_db": f(mean[-1]), "max_db": f(mx[-1]), "silent": f(mx[-1]) <= SILENT_MAX_DB}
+
+
+def dshow_audio_devices(ffmpeg: str) -> list[str]:
+    import re
+    try:
+        out = subprocess.run([ffmpeg, "-hide_banner", "-list_devices", "true", "-f", "dshow", "-i", "dummy"],
+                             capture_output=True, text=True, timeout=20, errors="replace")
+    except Exception:
+        return []
+    return re.findall(r'"([^"]+)" \(audio\)', out.stderr or "")
+
+
+def pick_card_audio(video: str, want: str, devs: list[str]) -> str | None:
+    """Same intent as the recorder's pick: an explicit name, else the audio device sharing the card's name tag
+    (e.g. 'USB3.0' for 'USB3.0 Video' -> 'Digital Audio Interface (USB3.0 Audio)')."""
+    if want not in ("auto", "", None):
+        return want
+    tag = video.split()[0].lower() if video else ""
+    return next((d for d in devs if tag and tag in d.lower()), None)
+
+
+def probe_card_audio(ffmpeg: str, device: str, secs: float = 4.0) -> dict | None:
+    """Short DirectShow capture of the card's audio through volumedetect (run BEFORE the recorder opens the card)."""
+    try:
+        out = subprocess.run([ffmpeg, "-hide_banner", "-nostdin", "-f", "dshow", "-i", f"audio={device}", "-t", str(secs),
+                              "-af", "volumedetect", "-f", "null", "-"], capture_output=True, text=True,
+                             timeout=secs + 25, errors="replace")
+    except Exception as e:
+        return {"error": str(e)}
+    r = parse_volumedetect(out.stderr or "")
+    return r if r else {"error": (out.stderr or "")[-300:]}
+
+
+def recording_audio_level(ffmpeg: str, video: Path) -> dict | None:
+    try:
+        out = subprocess.run([ffmpeg, "-hide_banner", "-nostdin", "-i", str(video), "-vn", "-af", "volumedetect", "-f", "null", "-"],
+                             capture_output=True, text=True, timeout=900, errors="replace")
+    except Exception as e:
+        return {"error": str(e)}
+    if "Audio:" not in (out.stderr or ""):
+        return {"no_audio_stream": True, "silent": True}
+    return parse_volumedetect(out.stderr or "") or {"error": "volumedetect gave no result"}
+
+
+def audio_silence_hint(res: dict | None, *, when: str) -> list[str]:
+    if not res or not res.get("silent"):
+        return []
+    lvl = "no audio track" if res.get("no_audio_stream") else f"max {res['max_db']:.1f} dB, mean {res['mean_db']:.1f} dB"
+    return ["",
+            "  !" * 21,
+            f"  WARNING: the capture card's audio is SILENT {when} ({lvl}).",
+            "  The match video will have NO GAME SOUND. Usual causes, in order:",
+            "   1. PS5: Settings > Sound > Audio Output > Output Device = your TV/HDMI device, and",
+            "      'Output to Headphones' = 'Chat Audio' (with 'All Audio' the PS5 sends NO sound over HDMI",
+            "      while a headset is plugged into the controller).",
+            "   2. PS5 is on the home screen/muted, or the game volume is 0.",
+            "   3. Windows: Settings > System > Sound > Input > 'Digital Audio Interface (USB3.0 Audio)' >",
+            "      Input volume 100 and not muted (More sound settings > Recording > Properties > Levels).",
+            "   4. The capture card's HDMI-out passthrough/TV path: some cards only carry audio over USB when",
+            "      the PS5 outputs stereo PCM: PS5 Settings > Sound > Audio Output > Audio Format = Linear PCM.",
+            "  (Recording continues; fix the setting and restart the match to get sound.)",
+            "  !" * 21, ""]
+
+
+def report_recording_audio(bundle: Path, ffmpeg: str | None) -> dict | None:
+    """Level of the recorded game audio -> audio_check.json + a loud warning when silent."""
+    vids = video_files(bundle)
+    if not ffmpeg or not vids:
+        return None
+    res = recording_audio_level(ffmpeg, vids[0])
+    (bundle / "audio_check.json").write_text(json.dumps(dict(res or {}, video=vids[0].name), indent=2), encoding="utf-8")
+    if res and "max_db" in res:
+        say(f"  recorded game audio: max {res['max_db']:.1f} dB, mean {res['mean_db']:.1f} dB" + ("  SILENT" if res["silent"] else "  OK"))
+    for line in audio_silence_hint(res, when="in this recording"):
+        say(line)
+    return res
+
+
 def key_watcher(stop: threading.Event, state: dict) -> None:
     def loop():
         try:
@@ -570,6 +660,17 @@ def main(argv=None) -> int:
     else:
         cmd += ["--input-format", a.input_format, "--audio", a.audio]
         offer_close_capture_apps()
+        if WIN and a.audio != "none":  # v0.3.6: pre-match card audio level check (loud warning when silent)
+            ff = a.ffmpeg or next((str(c) for c in [HERE.parent / "ffmpeg.exe"] if c.exists()), None) or shutil.which("ffmpeg")
+            dev = pick_card_audio(a.device, a.audio, dshow_audio_devices(ff)) if ff else None
+            if dev:
+                say(f"Checking game audio on '{dev}' (4 s) ...")
+                res = probe_card_audio(ff, dev)
+                (bundle / "audio_precheck.json").write_text(json.dumps(dict(res or {}, device=dev), indent=2), encoding="utf-8")
+                if res and "max_db" in res:
+                    say(f"  level: max {res['max_db']:.1f} dB, mean {res['mean_db']:.1f} dB" + ("  SILENT" if res["silent"] else "  OK"))
+                for line in audio_silence_hint(res, when="right now"):
+                    say(line)
     log = open(bundle / "console.log", "w", encoding="utf-8")
     started_ms = int(time.time() * 1000)
     # Own process group on Windows: a Ctrl+C in this window reaches only this script, which then stops QorCap
@@ -705,6 +806,9 @@ def main(argv=None) -> int:
     draft = json.loads(draft_p.read_text(encoding="utf-8"))
     if not a.test_pattern and draft["result"].get("method") != "end_menu_read" and a.ffmpeg:
         draft = tail_final_check(bundle, draft, ffmpeg=a.ffmpeg)
+    if not a.test_pattern and a.audio != "none":
+        report_recording_audio(bundle, a.ffmpeg or next((str(c) for c in [HERE.parent / ("ffmpeg.exe" if WIN else "ffmpeg")]
+                                                         if c.exists()), None) or shutil.which("ffmpeg"))
     return sign_and_report(bundle, draft, cs.signed, device, referee, match_id=match_id, role=a.role,
                            started_ms=started_ms, qt=qt, qorcap=qorcap, no_open=a.no_open)
 
@@ -1101,6 +1205,7 @@ def finalize(bundle: Path, *, qt: Path, qorcap: str, ffmpeg: str, key_dir: Path,
         cps, kind = cs.signed, REFEREE_KIND_OFFLINE
         note = ("no live countersignatures; the local referee signed QorCap's checkpoints after the fact, "
                 "stamped with QorCap's recording times (referee key_kind local-self-attested-offline).")
+    report_recording_audio(bundle, ffmpeg)
     say("\nSigning the receipt ...")
     return sign_and_report(bundle, draft, cps, device, referee, match_id=match_id, role=role, started_ms=started_ms,
                            qt=qt, qorcap=qorcap, no_open=no_open, referee_kind=kind, note=note)
