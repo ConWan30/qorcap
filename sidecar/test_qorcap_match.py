@@ -434,3 +434,7 @@ def test_pick_card_audio_and_hint():
     assert Q.audio_silence_hint({"silent": False, "max_db": -3, "mean_db": -20}, when="x") == []
     txt = "\n".join(Q.audio_silence_hint({"silent": True, "max_db": -80.8, "mean_db": -90.3}, when="now"))
     assert "SILENT" in txt and "Chat Audio" in txt and "unplug" not in txt.lower()
+    assert "pure digital silence" not in txt
+    txt = "\n".join(Q.audio_silence_hint({"silent": True, "max_db": -91.0, "mean_db": -91.0}, when="now"))
+    assert "pure digital silence" in txt and "Linear PCM" in txt and txt.index("Linear PCM") < txt.index("Chat Audio")
+    assert "pure digital silence" not in "\n".join(Q.audio_silence_hint({"silent": True, "no_audio_stream": True}, when="now"))
