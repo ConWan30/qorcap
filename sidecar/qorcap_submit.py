@@ -1,0 +1,382 @@
+"""Submit a recorded QorCap match bundle to the QorTime official referee for verification.
+
+    qorcap submit [BUNDLE] [--referee URL] [--full] [--yes]
+    python sidecar/qorcap_submit.py [BUNDLE] ...
+
+What happens (nothing is trusted just because this PC says so):
+  1. The bundle's small files (manifest, checkpoints, controller log, receipt.json, ...) are zipped and sent.
+     The referee recomputes every hash chain and checks the laptop's own receipt before going further.
+  2. The referee then picks which video segments it wants: the start (init), the recorded tail with the
+     end-of-game menu, any challenge windows, and N random segments drawn only after step 1 committed the
+     manifest. (--full sends every segment instead: 1-3 GB.) Each segment is hashed against the manifest.
+  3. The referee decodes those segments itself, re-reads the final score, re-runs challenge patterns from the
+     raw controller log, and only if every check passes countersigns with the official QorTime key.
+  4. This PC's device key co-signs the same receipt. Result: receipt.official.json next to receipt.json.
+
+The official private key never touches this PC. Stdlib only (+ QorTime's qor_receipt for the device signature).
+"""
+from __future__ import annotations
+
+import argparse
+import io
+import json
+import os
+import sys
+import time
+import urllib.error
+import urllib.request
+import zipfile
+from pathlib import Path
+
+OFFICIAL_URL = os.getenv("QORTIME_REFEREE_URL", "https://qortime-referee-production.up.railway.app")
+OFFICIAL_PUB = "a5aa0c9121db2c517284bf1c49eeec199829ca832a2b665f26e872e01192feea"
+META_FILES = ("bundle.json", "manifest.jsonl", "checkpoints.jsonl", "countersigned.jsonl", "inputs.jsonl",
+              "haptics.jsonl", "input_proof.json", "receipt.json", "receipt.draft.json", "timeline.jsonl",
+              "challenges.jsonl", "official_challenges.jsonl", "anchors.jsonl", "referee.pub")
+HERE = Path(__file__).resolve().parent
+
+
+def say(msg: str = "") -> None:
+    print(msg, flush=True)
+
+
+class RefereeError(Exception):
+    def __init__(self, code: int, body):
+        super().__init__(f"HTTP {code}: {body}")
+        self.code, self.body = code, body
+
+
+class Client:
+    def __init__(self, base: str, timeout: float = 120.0, opener=None) -> None:
+        self.base = base.rstrip("/")
+        self.timeout = timeout
+        self.token: str | None = None
+        self._open = opener or urllib.request.urlopen
+
+    def call(self, method: str, path: str, data: bytes | None = None, ctype: str = "application/json",
+             timeout: float | None = None):
+        h = {"Content-Type": ctype, "User-Agent": "qorcap-submit"}
+        if self.token:
+            h["Authorization"] = f"Bearer {self.token}"
+        rq = urllib.request.Request(self.base + path, data=data, headers=h, method=method)
+        try:
+            with self._open(rq, timeout=timeout or self.timeout) as r:
+                raw = r.read()
+                return json.loads(raw) if raw.strip() else {}
+        except urllib.error.HTTPError as e:
+            raw = e.read()
+            try:
+                body = json.loads(raw).get("detail", raw.decode("utf-8", "replace"))
+            except ValueError:
+                body = raw.decode("utf-8", "replace")[:500]
+            raise RefereeError(e.code, body) from None
+
+    def post_json(self, path: str, body: dict, timeout: float | None = None):
+        return self.call("POST", path, json.dumps(body).encode(), timeout=timeout)
+
+
+def meta_zip(bundle: Path) -> bytes:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        for n in META_FILES:
+            p = bundle / n
+            if p.exists():
+                z.write(p, n)
+    return buf.getvalue()
+
+
+def read_manifest(bundle: Path) -> list[dict]:
+    out = []
+    for line in (bundle / "manifest.jsonl").read_text(encoding="utf-8").splitlines():
+        try:
+            m = json.loads(line)
+        except ValueError:
+            continue
+        if m.get("type") == "segment":
+            out.append(m)
+    return out
+
+
+def segment_bytes(bundle: Path, m: dict) -> bytes:
+    with open(bundle / m["file"], "rb") as f:
+        f.seek(int(m["offset"]))
+        return f.read(int(m["bytes"]))
+
+
+def latest_bundle(root: Path) -> Path | None:
+    c = [d for d in root.glob("match-*") if (d / "receipt.json").exists()] if root.exists() else []
+    return max(c, key=lambda d: d.stat().st_mtime) if c else None
+
+
+def data_dir() -> Path:
+    base = os.getenv("QORCAP_HOME")
+    if base:
+        return Path(base)
+    if sys.platform == "win32":
+        return Path(os.getenv("LOCALAPPDATA") or Path.home()) / "QorCap"
+    return Path.home() / ".qorcap"
+
+
+def fmt_mb(n: int) -> str:
+    return f"{n / 1e6:.0f} MB" if n >= 10e6 else f"{n / 1e6:.1f} MB"
+
+
+def print_checks(review: dict | None) -> None:
+    for name, c in ((review or {}).get("checks") or {}).items():
+        st = c.get("state", "?")
+        d = c.get("detail")
+        if isinstance(d, dict):
+            d = d.get("notes") or d.get("note") or d.get("errors") or {k: d[k] for k in list(d)[:4]}
+        say(f"    {st.upper():8s} {name}: {d}")
+
+
+def submit(bundle: Path, *, base: str, full: bool = False, key_path: Path | None = None, client: Client | None = None,
+           device=None, out_name: str = "receipt.official.json") -> int:
+    bundle = bundle.resolve()
+    for need in ("manifest.jsonl", "checkpoints.jsonl", "receipt.json", "bundle.json"):
+        if not (bundle / need).exists():
+            say(f"PROBLEM: {bundle} has no {need}. Run Start Match (or 'qorcap finalize') first so receipt.json exists.")
+            return 2
+    c = client or Client(base)
+    log: dict = {"referee": base, "bundle": str(bundle), "started": int(time.time())}
+
+    def save(extra: dict) -> None:
+        log.update(extra)
+        (bundle / "submission.json").write_text(json.dumps(log, indent=2), encoding="utf-8")
+
+    try:
+        info = c.call("GET", "/v1/referee", timeout=30)
+    except Exception as e:
+        say(f"PROBLEM: cannot reach the QorTime referee at {base} ({e}). Check the internet and try again.")
+        return 3
+    if info.get("pubkey") != OFFICIAL_PUB:
+        say(f"  note: this referee's key {str(info.get('pubkey'))[:16]}... is NOT the official QorTime key; "
+            "its receipts will verify as SELF_ATTESTED at most.")
+    say(f"Referee: {base}  (key {str(info.get('pubkey'))[:16]}..., allowlist {(info.get('allowlist') or {}).get('id')})")
+    mode = "full" if full else "spot-check"
+    say(f"1/4  Sending match files (no video yet) for an independent re-check ... [{mode}]")
+    z = meta_zip(bundle)
+    try:
+        sub = c.call("POST", f"/v1/submissions?mode={mode}", z, "application/zip", timeout=300)
+    except RefereeError as e:
+        body = e.body if isinstance(e.body, dict) else {"errors": [str(e.body)]}
+        say(f"  REJECTED by the referee (HTTP {e.code}). Nothing was signed. Reasons:")
+        for x in (body.get("errors") or [])[:15]:
+            say(f"    - {x}")
+        save({"state": "rejected", "errors": body.get("errors")})
+        return 2
+    c.token = sub["upload_token"]
+    save({"submission": sub["id"], "state": sub["state"], "commit": sub.get("commit"), "required": len(sub["required"])})
+    man = read_manifest(bundle)
+    need = sub["required"]
+    total = sum(int(man[s]["bytes"]) for s in need)
+    say(f"  accepted (commit {str(sub.get('commit'))[:12]}). The referee asked for {len(need)} of {len(man)} video "
+        f"segments ({fmt_mb(total)}).")
+    say(f"2/4  Uploading those segments; each is hashed against the manifest ...")
+    sent, t0 = 0, time.monotonic()
+    for i, s in enumerate(need):
+        data = segment_bytes(bundle, man[s])
+        for attempt in range(4):
+            try:
+                r = c.call("PUT", f"/v1/submissions/{sub['id']}/segments/{s}", data, "application/octet-stream",
+                           timeout=300)
+                break
+            except (RefereeError, OSError) as e:
+                if isinstance(e, RefereeError) and e.code in (401, 404, 409):
+                    say(f"\n  PROBLEM: segment {s}: {e}")
+                    save({"state": "upload_failed", "error": str(e)})
+                    return 2
+                if attempt == 3:
+                    say(f"\n  PROBLEM: segment {s} failed 4 times ({e}). Run 'qorcap submit' again.")
+                    save({"state": "upload_failed", "error": str(e)})
+                    return 3
+                time.sleep(2 * (attempt + 1))
+        if not r.get("ok"):
+            say(f"\n  Segment {s}: {r.get('error')}  (the video file no longer matches what was recorded)")
+        sent += len(data)
+        rate = sent / max(0.1, time.monotonic() - t0)
+        sys.stdout.write(f"\r  {i + 1}/{len(need)} segments, {fmt_mb(sent)} of {fmt_mb(total)} ({rate / 1e6:.1f} MB/s)   ")
+        sys.stdout.flush()
+    say("")
+    say("3/4  Referee review: decoding the recorded tail, re-reading the final, re-running challenges ...")
+    try:
+        rv = c.call("POST", f"/v1/submissions/{sub['id']}/review", b"", timeout=900)
+    except RefereeError as e:
+        say(f"  PROBLEM: review failed: {e}")
+        save({"state": "review_error", "error": str(e)})
+        return 3
+    print_checks(rv.get("review"))
+    if rv.get("state") != "awaiting_player_signature":
+        say("\n  NOT VERIFIED: the referee refused to countersign (see the FAIL lines above). Nothing was signed.")
+        for x in ((rv.get("review") or {}).get("post_sign_errors") or [])[:10]:
+            say(f"    - {x}")
+        save({"state": rv.get("state"), "review": rv.get("review")})
+        return 2
+    rec = rv["receipt"]
+    say("4/4  Co-signing the referee's receipt with this PC's device key ...")
+    if device is None:
+        from qor_receipt.keys import FileKey
+
+        kp = key_path or (data_dir() / "keys" / "device.key")
+        if not kp.exists():
+            say(f"PROBLEM: device key not found at {kp}")
+            return 2
+        device = FileKey(kp)
+    from qor_receipt import receipt as R
+
+    if rec["players"][0]["pubkey"] != device.pubkey_hex:
+        say("PROBLEM: the receipt's player key is not this PC's device key (bundle signed on another PC?).")
+        return 2
+    done = c.post_json(f"/v1/submissions/{sub['id']}/player-signature", {"sig": device.sign(R.signing_bytes(rec))})
+    final = done["receipt"]
+    (bundle / out_name).write_text(json.dumps(final, indent=2), encoding="utf-8")
+    (bundle / "referee.official.pub").write_text(final["referee"]["pubkey"] + "\n", encoding="ascii")
+    v = R.verify_receipt(final, referee_pub=final["referee"]["pubkey"])
+    (bundle / "verify.official.txt").write_text(json.dumps(v, indent=2), encoding="utf-8")
+    save({"state": "complete", "verify": v})
+    res = final["result"]
+    say("\n" + "=" * 64)
+    say(f"  OFFICIAL RESULT: {v['status']}   (QorTime referee {v.get('referee_id') or final['referee']['pubkey'][:16]})")
+    say("=" * 64)
+    say(f"  Score:     AWAY {res['away_score']} - HOME {res['home_score']}  ({res.get('method')})")
+    say(f"  Basis:     {(final.get('review') or {}).get('scope')}")
+    if v.get("partial"):
+        say(f"  Missing:   {', '.join(v['partial'][:6])}")
+    if v.get("errors"):
+        say(f"  Problems:  {', '.join(v['errors'][:6])}")
+    say("  Not proven: " + "; ".join((final.get("review") or {}).get("not_proven") or []))
+    say(f"  Saved:     {bundle / out_name}")
+    say("  Check it:  https://conwan30.github.io/qortime/verify/  (open receipt.official.json; no key needed)")
+    return {"VERIFIED": 0, "PARTIAL": 1, "SELF_ATTESTED": 1}.get(v["status"], 2)
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(prog="qorcap submit", description="Submit a match bundle to the QorTime official referee")
+    ap.add_argument("bundle", nargs="?", help="match bundle folder (default: newest in Documents/QorCap Matches)")
+    ap.add_argument("--referee", default=OFFICIAL_URL, help="referee service URL")
+    ap.add_argument("--full", action="store_true", help="upload every video segment (1-3 GB) instead of a spot-check")
+    ap.add_argument("--out", help="matches folder used to find the newest bundle")
+    ap.add_argument("--qortime", help="QorTime checkout (default: the one Start Match uses)")
+    ap.add_argument("--key", help="device key file (default: QorCap data folder keys/device.key)")
+    ap.add_argument("--yes", action="store_true", help="do not ask before uploading")
+    ap.add_argument("--qorcap", help=argparse.SUPPRESS)  # passed by the launchers; unused here
+    ap.add_argument("--ffmpeg", help=argparse.SUPPRESS)
+    a = ap.parse_args(argv)
+    sys.path.insert(0, str(HERE))
+    from qorcap_match import find_qortime  # same pinned QorTime as Start Match
+
+    qt = find_qortime(a.qortime)
+    sys.path.insert(0, str(qt))
+    root = Path(a.out) if a.out else Path.home() / "Documents" / "QorCap Matches"
+    bundle = Path(a.bundle) if a.bundle else latest_bundle(root)
+    if bundle is None or not bundle.exists():
+        say(f"No signed match found in {root}. Pass the bundle folder: qorcap submit <folder>")
+        return 2
+    say("=" * 64)
+    say("  QorCap  -  Submit for Verification (QorTime official referee)")
+    say("=" * 64)
+    say(f"Match: {bundle}")
+    if not a.yes:
+        say("This uploads the match files and part of the video (or all of it with --full) to the QorTime referee.")
+        if input("Continue? [Y/n] ").strip().lower() in ("n", "no"):
+            return 1
+    return submit(bundle, base=a.referee, full=a.full, key_path=Path(a.key) if a.key else None)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+
+
+# ------------------------------------------------------------------ live helpers used by Start Match
+class OfficialLive:
+    """During Start Match: timestamp the video chain with the official referee (anchors) and, if enabled, fetch
+    official challenge nonces at kickoff / halftime (Q3) / Q4. Network failures never disturb the recording."""
+
+    ANCHOR_EVERY_S = 60.0
+
+    def __init__(self, base: str, bundle: Path, match_id: str, role: str, api, *, challenges: bool = False,
+                 client: Client | None = None, clock=time.monotonic, wall=lambda: int(time.time() * 1000)) -> None:
+        self.c = client or Client(base, timeout=8)
+        self.bundle, self.match_id, self.role, self.api = bundle, match_id, role, api
+        self.challenges = challenges
+        self.clock, self.wall = clock, wall
+        self.last_anchor = None
+        self.issued: set[str] = set()
+        self.anchors = 0
+        self.failures = 0
+        self.prompts: list[str] = []
+
+    def _append(self, name: str, obj: dict) -> None:
+        with open(self.bundle / name, "a", encoding="utf-8") as f:
+            f.write(json.dumps(obj) + "\n")
+
+    def _anchor_body(self, got: dict) -> dict:
+        return {"chain_head": got.get("chain_head"), "segment_seq": max(0, int(got.get("segments") or 0) - 1),
+                "checkpoint_head": got.get("checkpoint_head")}
+
+    def step(self) -> None:
+        try:
+            got = self.api.get("/checkpoints?since=999999999", timeout=2)
+        except Exception:
+            return
+        if not isinstance(got.get("chain_head"), str) or set(got["chain_head"]) == {"0"}:
+            return
+        now = self.clock()
+        if self.last_anchor is None or now - self.last_anchor >= self.ANCHOR_EVERY_S:
+            self.last_anchor = now
+            try:
+                a = self.c.post_json("/v1/anchors", {"match_id": self.match_id, "anchor": self._anchor_body(got)})
+                self._append("anchors.jsonl", a)
+                self.anchors += 1
+            except Exception:
+                self.failures += 1
+        if self.challenges:
+            phase = self._due_phase(got)
+            if phase:
+                self._challenge(phase, got)
+
+    def _due_phase(self, got: dict) -> str | None:
+        q = None
+        try:
+            sc = (self.api.get("/timeline", timeout=2) or {}).get("score") or {}
+            q = int(sc.get("quarter")) if sc.get("quarter") is not None else None
+        except Exception:
+            pass
+        if "kickoff" not in self.issued and int(got.get("segments") or 0) >= 5:
+            return "kickoff"
+        if "halftime" not in self.issued and "kickoff" in self.issued and q is not None and q >= 3:
+            return "halftime"
+        if "end" not in self.issued and "halftime" in self.issued and q is not None and q >= 4:
+            return "end"
+        return None
+
+    def _challenge(self, phase: str, got: dict) -> None:
+        self.issued.add(phase)
+        try:
+            t = self.c.post_json("/v1/challenges", {"phase": phase, "role": self.role, "match_id": self.match_id,
+                                                    "anchor": self._anchor_body(got)})
+            self._append("official_challenges.jsonl", t)
+            self.api.post("/challenge", {"nonce": t["nonce"], "phase": phase, "role": self.role, "id": t["nonce"][:8],
+                                         "issued_ms": t["issued_ms"], "deadline_ms": t["deadline_ms"]}, timeout=3)
+            msg = (f"\n\n  >>> QORTIME CHALLENGE ({phase}): press OPTIONS, then {' '.join(t['pattern'][1:])} "
+                   f"within 20 seconds, then resume play. <<<\n")
+            self.prompts.append(msg)
+            say(msg)
+        except Exception as e:
+            self.failures += 1
+            say(f"\n  (official {phase} challenge unavailable: {e}; the match continues, it just cannot reach VERIFIED)")
+
+
+def start_official_live(live: OfficialLive, stop, interval: float = 1.0):
+    import threading
+
+    def loop():
+        while not stop.is_set():
+            try:
+                live.step()
+            except Exception:
+                live.failures += 1
+            stop.wait(interval)
+    t = threading.Thread(target=loop, daemon=True)
+    t.start()
+    return t
