@@ -31,7 +31,14 @@ pub fn build(dir: &Path, ffmpeg: Option<&str>, n_frames: usize) -> Value {
     let gaps = states.iter().filter(|s| s["state"] != "connected").count();
     let human = humanlike::score(&recs);
     let manifest = jsonl(&dir.join("manifest.jsonl"));
-    let timeline = jsonl(&dir.join("timeline.jsonl"));
+    // v0.3.6: when the live scorebug saw nothing (e.g. an unsupported overlay), use Finalize's offline reads.
+    let live = jsonl(&dir.join("timeline.jsonl"));
+    let (timeline, score_source) = if live.iter().any(|r| r.get("home").is_some()) {
+        (live, "timeline.jsonl (live)")
+    } else {
+        let off = jsonl(&dir.join("timeline.offline.jsonl"));
+        if off.iter().any(|r| r.get("home").is_some()) { (off, "timeline.offline.jsonl (Finalize)") } else { (live, "none") }
+    };
     let alignment = if n_in > 0 { align::align_bundle(dir, &recs, &manifest, &timeline, anchor, ffmpeg, n_frames) } else { Value::Null };
     // Haptics (0.3.1+): records live in inputs.jsonl chunks (committed by input_hash); haptics.jsonl is a copy.
     let hp = dir.join("haptics.jsonl");
@@ -55,7 +62,7 @@ pub fn build(dir: &Path, ffmpeg: Option<&str>, n_frames: usize) -> Value {
         "schema": SCHEMA, "status": status, "device": device,
         "inputs_file": "inputs.jsonl", "inputs_sha256": file_sha, "inputs_chain_head": head, "chunks": chunks.len(), "reports_logged": n_in,
         "clock": "inputs t_us and manifest/checkpoint mono_ms come from the same QorCap monotonic clock",
-        "human": human, "alignment": alignment, "haptics": haptics_v, "warnings": warnings, "limit": LIMIT,
+        "human": human, "alignment": alignment, "haptics": haptics_v, "score_source": score_source, "warnings": warnings, "limit": LIMIT,
     })
 }
 
@@ -190,6 +197,16 @@ mod tests {
         assert_eq!(h["imu_present"], true);
         assert_eq!(h["imu_rate_hz"], 250);
         assert_eq!((h["score_changes"].as_u64(), h["score_changes_with_haptic"].as_u64()), (Some(1), Some(1)));
+        assert_eq!(p["score_source"], "timeline.jsonl (live)");
+        // live timeline with no score reads -> Finalize's offline reads are used
+        std::fs::rename(dir.join("timeline.jsonl"), dir.join("timeline.offline.jsonl")).unwrap();
+        std::fs::write(dir.join("timeline.jsonl"), format!("{{\"obs\":\"scorebug_absent\",\"t_ms\":{}}}\n", anchor)).unwrap();
+        let p2 = build(&dir, None, 15);
+        assert_eq!(p2["score_source"], "timeline.offline.jsonl (Finalize)");
+        assert_eq!((p2["haptics"]["score_changes"].as_u64(), p2["haptics"]["score_changes_with_haptic"].as_u64()), (Some(1), Some(1)));
+        std::fs::remove_file(dir.join("timeline.offline.jsonl")).unwrap();
+        std::fs::rename(dir.join("timeline.jsonl"), dir.join("timeline.live.bak")).unwrap();
+        std::fs::write(dir.join("timeline.jsonl"), format!("{{\"home\":0,\"away\":0,\"t_ms\":{}}}\n{{\"home\":7,\"away\":0,\"t_ms\":{}}}\n", anchor + 1000, anchor + 11_500)).unwrap();
         assert_eq!(h["haptics_sha256"], ev::sha256_hex(&hb));
         assert_eq!(h["haptics_file_matches_inputs"], true);
         assert_eq!(p["status"], "ok", "{p:#}");

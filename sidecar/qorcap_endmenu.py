@@ -111,6 +111,9 @@ class EndMenuRead:
 
 
 class EndMenuReader:
+    def corroborate(self, img, expected: dict) -> dict:
+        return corroborate(img, expected, self)
+
     def __init__(self, pack: str | Path | None = PACK, scorebug_pack=None) -> None:
         d = np.load(str(pack))
         self.labels = [str(x) for x in d["labels"]]
@@ -206,7 +209,79 @@ class EndMenuAgreement:
                 self.stable = {"away": rd.away, "home": rd.home, "t_ms": self.streak[0][0], "until_ms": t_ms,
                                "frames": len(self.streak), "conf": round(rd.conf, 3), "margin": round(rd.margin, 3),
                                "template_sources": srcs,
-                               "xcheck": "skipped" if any(d.get("xcheck") == "skipped" for d in rd.digits) else "qortime_scorebug_pack"}
+                               "xcheck": ("skipped" if any(d.get("xcheck") == "skipped" for d in rd.digits) else
+                                         "n/a (corroboration)" if rd.reason == "corroborated" else "qortime_scorebug_pack")}
             else:
                 self.stable.update(until_ms=t_ms, frames=len(self.streak))
         return self.stable
+
+
+# ------------------------------------------------------------------ v0.3.6: corroboration of a covered panel
+# Online matches draw the two players' name tags over the TOP of the away score on this screen
+# (match-20261016-170000: "34" covered down to its middle bar), so a full read fails closed. ``corroborate`` does
+# NOT read the score: it tests the scorebug's final against every alternative that one more legal scoring play
+# could have produced, using only the LOWER part of the digits (below the name tags), and passes only when the
+# scorebug's value explains the visible ink clearly better than every alternative, on BOTH sides.
+LOWER_FROM = 0.55        # fraction of the digit height from which rows are compared
+LOWER_ROWS = (38, 56)    # digit rows on the panel (640x360)
+CORROB_MIN = 0.55        # mean NCC of the expected digits' lower parts
+CORROB_MARGIN = 0.15     # over the best alternative hypothesis
+
+
+def _lower_tpl(vec, f=LOWER_FROM):
+    t = np.asarray(vec, np.float32).reshape(GLYPH[1], GLYPH[0])[int(round(GLYPH[1] * f)):]
+    t = t - t.mean()
+    n = float(np.linalg.norm(t))
+    return None if n < 1e-6 else t.ravel() / n
+
+
+def lower_glyphs(img, side: str, f=LOWER_FROM) -> list[np.ndarray]:
+    import cv2
+    img = _prep(img)
+    x0, x1 = SIDES[side]
+    h = LOWER_ROWS[1] - LOWER_ROWS[0]
+    y0 = LOWER_ROWS[0] + int(round(h * f))
+    v = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)[..., 2][y0:LOWER_ROWS[1] + 1, x0:x1]
+    m = (v > INK).astype(np.uint8)
+    n, lab, st, _ = cv2.connectedComponentsWithStats(m, connectivity=8)
+    out = []
+    for i in range(1, n):
+        x, y, w, hh, a = (int(t) for t in st[i])
+        if a < 12 or hh < 0.7 * m.shape[0] or w > GLYPH_MAX_W:
+            continue
+        out.append((x, (lab[:, x:x + w] == i).astype(np.float32)))
+    return [g for _, g in sorted(out, key=lambda t: t[0])]
+
+
+def corroborate(img, expected: dict, reader: "EndMenuReader", steps=(1, 2, 3, 6, 7, 8)) -> dict:
+    """{'ok', 'sides': {side: {expected, score, best_alt, alt_score}}} -- see the block comment above."""
+    import cv2
+    tpl = {lab: _lower_tpl(v) for lab, v in zip(reader.labels, reader.vecs)}
+    res = {"ok": True, "sides": {}}
+    for side in ("away", "home"):
+        e = int(expected[side])
+        gs = lower_glyphs(img, side)
+        rows = None
+
+        def score(val):
+            txt = str(val)
+            if len(txt) != len(gs):
+                return -1.0
+            s = []
+            for g, ch in zip(gs, txt):
+                gv = cv2.resize(g, (GLYPH[0], GLYPH[1] - int(round(GLYPH[1] * LOWER_FROM))), interpolation=cv2.INTER_AREA).ravel()
+                gv = gv - gv.mean()
+                n = float(np.linalg.norm(gv))
+                if n < 1e-6 or tpl.get(ch) is None:
+                    return -1.0
+                s.append(float(tpl[ch] @ (gv / n)))
+            return float(np.mean(s))
+        se = score(e)
+        alts = {e + k: score(e + k) for k in steps}
+        best_alt = max(alts, key=alts.get)
+        ok = se >= CORROB_MIN and se - alts[best_alt] >= CORROB_MARGIN
+        res["sides"][side] = {"expected": e, "glyphs": len(gs), "score": round(se, 3), "best_alt": best_alt,
+                              "alt_score": round(alts[best_alt], 3), "ok": ok}
+        res["ok"] = res["ok"] and ok
+        del rows
+    return res
