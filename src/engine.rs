@@ -92,11 +92,18 @@ pub struct MatchState {
 pub fn wall_ms() -> u64 { SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64 }
 
 fn append_jsonl(path: &Path, v: &Value) {
+    use std::io::Write as _;
     use std::fs::OpenOptions;
     if let Some(d) = path.parent() { if !d.as_os_str().is_empty() { let _ = std::fs::create_dir_all(d); } }
+    // v0.3.11: one write_all of the whole line under a process-wide lock. `writeln!(f, "{v}")` on an unbuffered
+    // File issues many small writes, so a score clip appended to manifest.jsonl at the same moment as a segment
+    // interleaved the two lines (seen in the test-pattern run: "corrupt JSONL line" -> unknown chain heads).
+    static APPEND: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let line = format!("{v}\n");
+    let _g = APPEND.lock().unwrap_or_else(|e| e.into_inner());
     match OpenOptions::new().create(true).append(true).open(path) {
         Ok(mut f) => {
-            if let Err(e) = writeln!(f, "{v}") { error!("cannot write {}: {e}", path.display()); return; }
+            if let Err(e) = f.write_all(line.as_bytes()) { error!("cannot write {}: {e}", path.display()); return; }
             let _ = f.flush();
             let _ = f.sync_all(); // durable append: a crash leaves at most one torn line
         }
