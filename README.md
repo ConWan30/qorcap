@@ -2,7 +2,7 @@
 
 # QorCap
 
-**Website:** https://conwan30.github.io/qorcap/ · **Download:** [v0.3.10](https://github.com/ConWan30/qorcap/releases/tag/v0.3.10) ([latest release](https://github.com/ConWan30/qorcap/releases/latest))
+**Website:** https://conwan30.github.io/qorcap/ · **Download:** [v0.3.11](https://github.com/ConWan30/qorcap/releases/tag/v0.3.11) ([latest release](https://github.com/ConWan30/qorcap/releases/latest))
 
 A small Windows recorder for a USB HDMI capture card (built for a generic **"USB3.0 Video"** card carrying a PS5),
 made for **[QorTime](https://github.com/ConWan30/qortime)** match receipts. It does two jobs:
@@ -26,7 +26,7 @@ with a local control surface). QorCap copies only that design idea, no code. No 
 
 ## Quickstart: double-click Start Match
 
-1. Download `qorcap-v0.3.10-windows-x64.zip` from the [latest release](https://github.com/ConWan30/qorcap/releases/latest)
+1. Download `qorcap-v0.3.11-windows-x64.zip` from the [latest release](https://github.com/ConWan30/qorcap/releases/latest)
    and unzip it, for example to `C:\QorCap` (right-click the zip, *Extract All*).
 2. Connect PS5 HDMI out to the **USB3.0 Video** card, and the card to a blue USB 3 port. Close OBS or the Camera app.
 3. Double-click **`Start Match`**. On the first run it downloads ffmpeg, installs Python 3.12 through winget if it
@@ -226,11 +226,33 @@ the end of Start Match, or run `qorcap submit "<bundle dir>"` (`--full` uploads 
 
 During a match QorCap stamps the chain head with the referee every 60 s (turn off with `--no-anchors`). For
 **VERIFIED** also start the match with `--official-challenges` (e.g. `"Start Match.cmd" --official-challenges`): the
-referee then issues three timed challenges (kickoff, halftime, Q4) that you answer on the pad. Without them the best
-result is **PARTIAL**: the
+referee then issues three timed challenges (game start, second half, Q4) that you answer on the pad. Without them the
+best result is **PARTIAL**: the
 referee can prove the bytes are what you recorded, not that they were recorded live. Spot-check mode is a sampled
 check: a doctored region of fraction f slips through with probability about (1-f)^16 plus the tail and challenge
 segments. Details: QorTime `docs/REFEREE_SERVICE.md`.
+
+### Official challenges: only when you can pause (v0.3.11)
+
+Online Madden 27 does not let you pause during a kickoff or a kickoff return. OPTIONS only works once a play has been
+called. Up to v0.3.10 the "kickoff" challenge appeared about 10 seconds into the recording, before the kickoff, with
+20 seconds to answer. It could not be passed. The halftime and Q4 challenges were tied to the first Q3/Q4 scorebug read,
+which is the second-half kickoff itself (and on Sunday/Thursday Night presentations no quarter was read at all).
+
+From v0.3.11:
+
+- **What you see:** nothing at kickoff. After the kickoff of each half (and in Q4), once the game clock has started
+  and a play-call screen has come and gone, QorCap beeps and prints
+  `>>> QORTIME CHALLENGE (game start): at the line, before the snap, press OPTIONS, then CROSS UP LEFT SQUARE, then resume. You have 90 seconds ... <<<`.
+- **What you do:** at the line before the snap, press OPTIONS (the pause menu opens), press the four buttons, resume.
+  If your opponent snaps first, do it at the next play. A dead OPTIONS press during a live play doesn't void it.
+- **Still checked:** the pattern is only known after the referee issues it, every press must be inside the window,
+  and the pause menu must appear on the video 0–600 ms after the OPTIONS press that starts the pattern. There are
+  still exactly 3 challenges (Q1–Q2, Q3, Q4/OT), one window open at a time. If no play-call screen is detected, the
+  window opens 45 s after the clock starts running in that quarter. Every opening is logged in `challenge_gates.jsonl`.
+- **Receipt fix:** at the end QorCap re-runs each challenge on its own video and controller log (QorTime's rules).
+  Answered challenges are written into the receipt as passed. Up to v0.3.10 they always stayed empty
+  (`challenge_unanswered`). Misses stay empty and the reason is in `challenge_results.jsonl`.
 
 ### Signed submissions (v0.3.10)
 
@@ -295,7 +317,7 @@ Global: `--port 8788`, `--ffmpeg PATH`, `--log FILE` (default `qorcap.log`, or `
 ## Run on Windows by hand (PowerShell, advanced)
 
 ```powershell
-# 1. unzip qorcap-v0.3.10-windows-x64.zip to C:\QorCap, then:
+# 1. unzip qorcap-v0.3.11-windows-x64.zip to C:\QorCap, then:
 cd C:\QorCap
 Unblock-File .\qorcap.exe, .\get-ffmpeg.ps1
 powershell -ExecutionPolicy Bypass -File .\get-ffmpeg.ps1     # puts ffmpeg.exe next to qorcap.exe

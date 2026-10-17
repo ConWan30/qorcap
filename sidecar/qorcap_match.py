@@ -40,7 +40,7 @@ import urllib.request
 import zipfile
 from pathlib import Path
 
-QORTIME_PIN = "a57aa3db47be5261b99b0b2c5968faee2a221cde"
+QORTIME_PIN = "ad3d0da51f4b453251c12b28fe7b8e11a61a2dc5"
 QORTIME_ZIP = f"https://github.com/ConWan30/qortime/archive/{QORTIME_PIN}.zip"
 VERIFY_URL = "https://conwan30.github.io/qortime/verify/"
 REFEREE_KIND = "local-self-attested"
@@ -270,9 +270,12 @@ def start_reader(api: Api, stop: threading.Event, state: dict, bundle: Path | No
 
     from qorcap_mnp import AutoProfileReader
     from qorcap_reader import collect_delta_corroboration, load_delta_corroboration_from_bundle
+    from qorcap_playcall import PauseCapableGate, PlayCallDetector
     core = ReaderCore(post, AutoProfileReader(ScorebugReader(), prep=prep), AgreementWindow(), PauseDetector(), detect_final,
-                      final_screen_detector=madden_final_screen, end_menu_reader=EndMenuReader())
+                      final_screen_detector=madden_final_screen, end_menu_reader=EndMenuReader(),
+                      playcall=PlayCallDetector(), gate=PauseCapableGate())
     state["core"] = core
+    state["gate"] = core.gate
     if bundle is not None:
         try:
             core.delta_corroboration = load_delta_corroboration_from_bundle(bundle)
@@ -644,7 +647,8 @@ def main(argv=None) -> int:
     ap.add_argument("--referee-url", default=None, help="QorTime official referee (default: the public service)")
     ap.add_argument("--no-anchors", action="store_true", help="do not timestamp the video chain with the official referee")
     ap.add_argument("--official-challenges", action="store_true",
-                    help="fetch official challenge nonces at kickoff / Q3 / Q4 (press the shown pattern; needed for VERIFIED)")
+                    help="fetch official challenge nonces at the first pause-capable moment (after a kickoff and a play call) "
+                         "in Q1, Q3 and Q4 (press the shown pattern; needed for VERIFIED)")
     ap.add_argument("--submit", action="store_true", help="submit for verification at the end without asking")
     ap.add_argument("--no-submit-prompt", action="store_true", help="do not offer 'Submit for Verification' at the end")
     a = ap.parse_args(argv)
@@ -765,10 +769,14 @@ def main(argv=None) -> int:
     if not a.no_anchors or a.official_challenges:
         try:
             from qorcap_submit import OFFICIAL_URL, OfficialLive, start_official_live
-            live = OfficialLive(a.referee_url or OFFICIAL_URL, bundle, match_id, a.role, api, challenges=a.official_challenges)
+            live = OfficialLive(a.referee_url or OFFICIAL_URL, bundle, match_id, a.role, api, challenges=a.official_challenges,
+                                gate=lambda: state.get("gate"))
             start_official_live(live, stop)
             if a.official_challenges:
-                say("Official QorTime challenges are ON: when a CHALLENGE line appears, press OPTIONS and the shown buttons.\n")
+                say("Official QorTime challenges are ON (3 per game: game start, second half, 4th quarter).")
+                say("A CHALLENGE line appears only when Madden lets you pause: after the kickoff, once a play is called.")
+                say("Then, at the line before the snap, press OPTIONS and the shown buttons (90 seconds; if the snap")
+                say("comes first, do it at the next play). Kickoffs never count: you cannot pause during them.\n")
         except Exception as e:  # never block a recording on the network helper
             say(f"(official referee link unavailable: {e})")
 
@@ -905,10 +913,48 @@ def offer_submit(bundle: Path, referee_url: str | None, *, auto: bool = False, a
     return submit(bundle, base=referee_url or OFFICIAL_URL)
 
 
+def fill_challenge_results(bundle: Path, draft: dict, *, ffmpeg: str | None = None, decode: bool = True) -> dict:
+    """v0.3.11: re-run every challenge on this bundle before signing (QorTime ``review.local``, the referee's rules).
+
+    QorCap <= 0.3.10 always signed ``result: null``, so a correctly answered challenge still verified as
+    ``challenge_unanswered`` (match 2026-10-17 #4, 44b8d01f). An ok result goes into the receipt
+    (``reverified_by: recorder``); a miss stays null and its reason is written to challenge_results.jsonl and shown."""
+    chs = list(draft.get("challenges") or [])
+    if not chs:
+        return draft
+    ff = ffmpeg or os.getenv("QORTIME_FFMPEG") or next(
+        (str(c) for c in [HERE.parent / ("ffmpeg.exe" if WIN else "ffmpeg")] if c.exists()), None) or shutil.which("ffmpeg")
+    old_env = os.environ.get("QORTIME_FFMPEG")
+    try:
+        if ff:
+            os.environ["QORTIME_FFMPEG"] = ff
+        from qor_receipt.review.local import challenge_results
+        outs = challenge_results(bundle, chs, decode=decode)
+    except Exception as e:  # never block signing; unanswered is the honest fallback
+        say(f"  Challenges:   could not re-check ({type(e).__name__}: {e}); left unanswered")
+        return draft
+    finally:
+        if old_env is None:
+            os.environ.pop("QORTIME_FFMPEG", None)
+        else:
+            os.environ["QORTIME_FFMPEG"] = old_env
+    new = []
+    with open(bundle / "challenge_results.jsonl", "w", encoding="utf-8") as f:
+        for c, o in zip(chs, outs):
+            f.write(json.dumps(o["local"]) + "\n")
+            new.append(dict(c, result=o["result"]) if o["result"] is not None else c)
+            loc = o["local"]
+            tag = "PASSED" if o["result"] is not None else f"not passed ({loc.get('reason')})"
+            lat = f", pause on video {loc['latency_ms']} ms after OPTIONS" if loc.get("latency_ms") is not None else ""
+            say(f"  Challenge {c.get('phase')} {str(c.get('id'))[:8]}: {tag}{lat}" + (f"  [{loc['note']}]" if loc.get("note") else ""))
+    return dict(draft, challenges=new)
+
+
 def sign_and_report(bundle: Path, draft: dict, cps: list[dict], device, referee, *, match_id: str, role: str,
                     started_ms: int, qt: Path, qorcap: str, no_open: bool, referee_kind: str = REFEREE_KIND,
                     note: str | None = None) -> int:
     """Shared by Start Match and finalize: build + sign receipt.json, run both verifiers, print the summary."""
+    draft = fill_challenge_results(bundle, draft)
     no_final = "final_basis" not in draft["result"] or draft["result"].get("final_basis") is None
     if no_final:
         draft = dict(draft, result={k: v for k, v in draft["result"].items() if k != "final_basis"})
@@ -1088,8 +1134,10 @@ def default_core_factory(post):
     from qorcap_mnp import AutoProfileReader
     from qorcap_reader import ReaderCore, madden_final_screen, prep
 
+    from qorcap_playcall import PauseCapableGate, PlayCallDetector
     return ReaderCore(post, AutoProfileReader(ScorebugReader(), prep=prep), AgreementWindow(), PauseDetector(), detect_final,
-                      final_screen_detector=madden_final_screen, end_menu_reader=EndMenuReader())
+                      final_screen_detector=madden_final_screen, end_menu_reader=EndMenuReader(),
+                      playcall=PlayCallDetector(), gate=PauseCapableGate())
 
 
 END_MENU_WAIT_S = 120  # after a scorebug final, keep recording this long for the end-of-game menu (authoritative)

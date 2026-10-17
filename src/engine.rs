@@ -92,11 +92,18 @@ pub struct MatchState {
 pub fn wall_ms() -> u64 { SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64 }
 
 fn append_jsonl(path: &Path, v: &Value) {
+    use std::io::Write as _;
     use std::fs::OpenOptions;
     if let Some(d) = path.parent() { if !d.as_os_str().is_empty() { let _ = std::fs::create_dir_all(d); } }
+    // v0.3.11: one write_all of the whole line under a process-wide lock. `writeln!(f, "{v}")` on an unbuffered
+    // File issues many small writes, so a score clip appended to manifest.jsonl at the same moment as a segment
+    // interleaved the two lines (seen in the test-pattern run: "corrupt JSONL line" -> unknown chain heads).
+    static APPEND: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let line = format!("{v}\n");
+    let _g = APPEND.lock().unwrap_or_else(|e| e.into_inner());
     match OpenOptions::new().create(true).append(true).open(path) {
         Ok(mut f) => {
-            if let Err(e) = writeln!(f, "{v}") { error!("cannot write {}: {e}", path.display()); return; }
+            if let Err(e) = f.write_all(line.as_bytes()) { error!("cannot write {}: {e}", path.display()); return; }
             let _ = f.flush();
             let _ = f.sync_all(); // durable append: a crash leaves at most one torn line
         }
@@ -851,7 +858,7 @@ impl Engine {
         let (seq, head) = { let st = self.ev.lock().unwrap(); (st.seg.seq, st.seg.head.clone()) };
         let c = json!({"id": b["id"].as_str().map(String::from).unwrap_or_else(|| nonce[..8].to_string()),
             "role": b["role"].as_str().unwrap_or(&self.args.role), "phase": b["phase"].as_str().unwrap_or("kickoff"),
-            "nonce": nonce, "pattern": pattern, "issued_ms": issued, "deadline_ms": b["deadline_ms"].as_u64().unwrap_or(issued + 20_000),
+            "nonce": nonce, "pattern": pattern, "issued_ms": issued, "deadline_ms": b["deadline_ms"].as_u64().unwrap_or(issued + 90_000),
             "received_wall_ms": now, "received_mono_ms": self.ms(), "segment_seq_at_receipt": seq, "chain_head_at_receipt": head});
         if self.args.stamp {
             let text = format!("QorCap nonce {}  {}", &nonce[..12], pattern.join(" "));

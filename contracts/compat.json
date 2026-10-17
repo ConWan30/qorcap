@@ -13,7 +13,8 @@
     "required": ["bundle.json", "manifest.jsonl", "checkpoints.jsonl", "receipt.json"],
     "meta": ["bundle.json", "manifest.jsonl", "checkpoints.jsonl", "countersigned.jsonl", "inputs.jsonl",
              "haptics.jsonl", "input_proof.json", "receipt.json", "receipt.draft.json", "timeline.jsonl",
-             "challenges.jsonl", "official_challenges.jsonl", "anchors.jsonl", "referee.pub"]
+             "challenges.jsonl", "official_challenges.jsonl", "anchors.jsonl", "referee.pub",
+             "challenge_gates.jsonl", "challenge_results.jsonl"]
   },
   "hash_chain": {
     "canonical_json": "RFC 8785 JCS, integers only (|n| <= 2^53-1), no floats",
@@ -36,8 +37,27 @@
   },
   "recorder_versions": {
     "tail_timing_sound_from": "0.3.3",
-    "current": "0.3.10",
+    "current": "0.3.11",
     "known_bad_tail": ["0.3.0", "0.3.1", "0.3.2"]
+  },
+  "challenge_rules": {
+    "phases": ["kickoff", "halftime", "end"],
+    "count": "one official challenge per phase per role (3); all three answered + re-verified for VERIFIED",
+    "open_at": {
+      "kickoff": "first pause-capable moment of the game: quarter 1+ read, game clock seen running (opening kickoff fielded), then a play-call screen came and went (pre-snap)",
+      "halftime": "same, in quarter 3+ (after the second-half kickoff)",
+      "end": "same, in quarter 4+"
+    },
+    "why": "online Madden 27 cannot pause during a kickoff or kickoff return; OPTIONS works only after a play call",
+    "fallback": "if no play-call screen is detected, the recorder opens the window 45 s after the game clock started running in that quarter (gate basis clock_proxy)",
+    "window_ms": 90000,
+    "legacy_window_ms": 20000,
+    "max_window_ms": 120000,
+    "pattern": "OPTIONS then 4 face/d-pad buttons from sha256(nonce)",
+    "response": "first OPTIONS press inside [issued_ms, deadline_ms] followed by exactly the pattern",
+    "pause_latency_ms": [0, 600],
+    "recorder_result": "QorCap >= 0.3.11 re-runs each challenge on its own bundle at finalize; an ok result is written to the receipt (reverified_by recorder), anything else stays null with the reason in challenge_results.jsonl",
+    "gate_log": "challenge_gates.jsonl: one line per opened window with the gate basis and scorebug state"
   },
   "verdicts": ["VERIFIED", "PARTIAL", "SELF_ATTESTED", "FAIL"],
   "cli_exit_codes": {
