@@ -135,6 +135,95 @@ class PeriodTrack:
         return False
 
 
+# v0.3.22: a touchdown that the bar shows only briefly. match-20261018-002316 ended on a TD at 2ND 0:07 (21-31 ->
+# 21-37): the bar showed 21-37 on 8 of 24 frames between a TOUCHDOWN banner and the menus, and only 2 consecutive
+# frames read the clock, so neither window locked and the offline receipt fell back to 21-31.
+TD_DELTAS = (6, 7, 8)
+TD_NEED = 4                 # reads of the new pair
+TD_MIN_SPAN_MS = 750
+TD_WINDOW_MS = 8_000        # first to last read of the new pair
+TD_MIN_INTERVAL_MS = 200
+
+
+class TouchdownJump:
+    """Lock a +6/+7/+8 on one side, other side unchanged, from fewer agreeing reads, only when corroborated.
+
+    Every frame that shows the bar must agree: any read of the old pair or of a third pair after the new pair
+    appeared cancels it, as does a quarter that differs from the posted quarter or a clock above the last posted
+    clock (or rising between the new reads); a cancelled pair stays on the normal windows until the next normal
+    lock. Frames with no bar (banner, replay) neither count nor cancel. Needs
+    ``TD_NEED`` reads >= ``TD_MIN_INTERVAL_MS`` apart spanning ``TD_MIN_SPAN_MS`` within ``TD_WINDOW_MS``.
+    Only consulted when the normal windows did not agree on the frame.
+    """
+
+    def __init__(self) -> None:
+        self.cand: tuple[int, int] | None = None
+        self.reads: list[tuple[int, Any]] = []
+        self.blocked: set[tuple[int, int]] = set()   # contradicted once: normal windows only until the next lock
+
+    def reset(self) -> None:
+        """A normal lock happened: start over."""
+        self.cand, self.reads, self.blocked = None, [], set()
+
+    def _cancel(self) -> None:
+        if self.cand is not None:
+            self.blocked.add(self.cand)
+        self.cand, self.reads = None, []
+
+    @staticmethod
+    def _int(v):
+        return v if isinstance(v, int) and not isinstance(v, bool) else None
+
+    def offer(self, fr, t_ms: int, last: dict | None, posted_quarter: int | None):
+        pair = getattr(fr, "pair", None)
+        if pair is None:
+            return None
+        if last is None or self._int(last.get("away")) is None or self._int(last.get("home")) is None:
+            self._cancel()
+            return None
+        a, h = int(pair[0]), int(pair[1])
+        la, lh = int(last["away"]), int(last["home"])
+        da, dh = a - la, h - lh
+        if not ((da == 0 and dh in TD_DELTAS) or (dh == 0 and da in TD_DELTAS)):
+            self._cancel()                    # the old pair, or anything else: the bar disagrees
+            return None
+        if (a, h) in self.blocked:
+            return None
+        if self.cand is not None and self.cand != (a, h):
+            self._cancel()                    # a second candidate pair: neither is corroborated
+            self.blocked.add((a, h))
+            return None
+        q = self._int(getattr(fr, "quarter", None))
+        if q is not None and posted_quarter is not None and q != posted_quarter:
+            self.cand = (a, h)
+            self._cancel()
+            return None
+        c, lc = self._int(getattr(fr, "clock_seconds", None)), self._int(last.get("clock_s"))
+        if c is not None and lc is not None and c > lc:
+            self.cand = (a, h)
+            self._cancel()
+            return None
+        if self.reads and t_ms - self.reads[0][0] > TD_WINDOW_MS:
+            self._cancel()                    # too slow to be one brief showing: normal windows only
+            return None
+        if self.cand is None:
+            self.cand, self.reads = (a, h), []
+        if self.reads:
+            pc = next((self._int(r.clock_seconds) for _, r in reversed(self.reads)
+                       if self._int(getattr(r, "clock_seconds", None)) is not None), None)
+            if c is not None and pc is not None and c > pc:
+                self._cancel()
+                return None
+            if t_ms - self.reads[-1][0] < TD_MIN_INTERVAL_MS:
+                return None
+        self.reads.append((t_ms, fr))
+        if len(self.reads) >= TD_NEED and self.reads[-1][0] - self.reads[0][0] >= TD_MIN_SPAN_MS:
+            got = self.reads[-1][1]
+            self.cand, self.reads = None, []
+            return got
+        return None
+
+
 class ScoreClockLock:
     """Lock (left score, right score) when the quarter glyph failed.
 
@@ -268,6 +357,7 @@ class ReaderCore:
         self.end_menu: dict | None = None
         self.end_menu_rejected: dict | None = None
         self.score_lock = ScoreClockLock()
+        self.touchdown: TouchdownJump | None = TouchdownJump()
         self._max_quarter: int | None = None  # highest quarter actually posted; a later read may not go backwards
         self.periods = PeriodTrack()
         self._quarter_reject: str | None = None
@@ -332,7 +422,20 @@ class ReaderCore:
             self.stats["errors"] += 1
             print(f"score agreement error: {type(e).__name__}: {e}", file=sys.stderr)
             return
-        if not (res.agreed and res.read is not None):
+        td = False
+        if res.agreed and res.read is not None:
+            if self.touchdown is not None:
+                self.touchdown.reset()
+        elif self.touchdown is not None:
+            got = self.touchdown.offer(fr, t_ms, self.last_scorebug(), self._max_quarter)
+            if got is None:
+                return
+            from types import SimpleNamespace
+            res, soft, td = SimpleNamespace(agreed=True, read=got, reason="touchdown_jump"), True, True
+            self.stats["touchdown_jump"] = self.stats.get("touchdown_jump", 0) + 1
+            print(f"touchdown jump locked: away {got.left_score} - home {got.right_score}", file=sys.stderr)
+            self.score_lock.remember(got.pair, t_ms * 1_000_000)
+        else:
             return
         if soft and hasattr(self.agree, "last_agreed"):
             self.agree.last_agreed = res.read.pair
