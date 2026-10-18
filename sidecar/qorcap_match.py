@@ -1847,8 +1847,42 @@ def recover_bundle(bundle: Path) -> dict | None:
     return draft
 
 
+def recorded_role(qcps: list[dict], meta: dict, draft: dict) -> str:
+    """The side QorCap was set to while recording: the hash-chained checkpoints carry it (qorcap.role), and the live
+    countersignatures and official challenge tokens were signed for it. Falls back to the bundle metadata."""
+    for c in qcps:
+        q = c.get("qorcap") if isinstance(c.get("qorcap"), dict) else {}
+        if q.get("role") in ("home", "away"):
+            return q["role"]
+    corr = meta.get("role_correction") if isinstance(meta.get("role_correction"), dict) else {}
+    return corr.get("from") or meta.get("role") or draft["players"][0]["role"]
+
+
+def correct_role(bundle: Path, meta: dict, *, recorded: str, role: str, reason: str) -> dict:
+    """Side correction after recording (the recorder was set to the wrong side). Recorded evidence is never edited: the
+    checkpoints, challenges and video keep the recorded side. bundle.json gets the corrected ``role`` plus a
+    ``role_correction`` record (from, to, reason, when) so the change is visible; receipt.json is then built and signed
+    again for the corrected side by finalize. Setting the recorded side again removes the record."""
+    if role not in ("home", "away"):
+        raise ValueError(f"role must be home or away, not {role!r}")
+    meta = dict(meta)
+    if role == recorded:
+        if "role_correction" not in meta and meta.get("role") == role:
+            return meta
+        meta.pop("role_correction", None)
+    else:
+        prev = meta.get("role_correction") if isinstance(meta.get("role_correction"), dict) else {}
+        if meta.get("role") == role and prev.get("to") == role and prev.get("reason") == reason:
+            return meta
+        meta["role_correction"] = {"from": recorded, "to": role, "reason": reason, "corrected_ms": int(time.time() * 1000)}
+    meta["role"] = role
+    (bundle / "bundle.json").write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
+    return meta
+
+
 def finalize(bundle: Path, *, qt: Path, qorcap: str, ffmpeg: str, key_dir: Path, no_open: bool = True,
-             core_factory=None, hz: float = FIN_HZ, recover: bool = False) -> int:
+             core_factory=None, hz: float = FIN_HZ, recover: bool = False, role: str | None = None,
+             role_reason: str | None = None) -> int:
     bundle = bundle.resolve()
     vids = video_files(bundle)
     if not vids:
@@ -1864,7 +1898,14 @@ def finalize(bundle: Path, *, qt: Path, qorcap: str, ffmpeg: str, key_dir: Path,
     meta = json.loads((bundle / "bundle.json").read_text(encoding="utf-8")) if (bundle / "bundle.json").exists() else {}
     manifest = read_jsonl(bundle / "manifest.jsonl")
     qcps = read_jsonl(bundle / "checkpoints.jsonl")
+    rec_role = recorded_role(qcps, meta, draft)
+    if role is not None:
+        meta = correct_role(bundle, meta, recorded=rec_role, role=role, reason=role_reason or "set with finalize --role")
     role = meta.get("role") or draft["players"][0]["role"]
+    if role != rec_role:
+        corr = meta.get("role_correction") if isinstance(meta.get("role_correction"), dict) else {}
+        say(f"  Side corrected after recording: QorCap was set to {rec_role}, signing as {role}"
+            + (f" ({corr['reason']})" if corr.get("reason") else ""))
     match_id = meta.get("match_id") or draft["match"]["match_id"]
     if match_id in ("", "unassigned"):
         match_id = f"local-{bundle.name.removeprefix('match-')}"
@@ -1926,6 +1967,17 @@ def finalize(bundle: Path, *, qt: Path, qorcap: str, ffmpeg: str, key_dir: Path,
 
     res = apply_final(draft["result"], fin, fallback=game_segment_score(events))
     res = keep_recovery_notes(res, draft)
+    if role != rec_role:
+        corr = meta.get("role_correction") if isinstance(meta.get("role_correction"), dict) else {}
+        res = dict(res, notes=list(res.get("notes") or []) + [
+            f"side corrected after recording: QorCap was set to {rec_role}, signed as {role}"
+            + (f" ({corr['reason']})" if corr.get("reason") else "")
+            + f"; checkpoints and challenges keep the recorded side {rec_role}"])
+        sig = dict(draft.get("signals") or {})
+        mp = dict(sig.get("motion_permille") or {})
+        if rec_role in mp and role not in mp:
+            mp[role] = mp.pop(rec_role)
+        draft = dict(draft, signals=dict(sig, motion_permille=mp or {role: None}))
     draft = dict(draft, result=res)
     rdr = getattr(shared["core"], "reader", None)
     if getattr(rdr, "profile_counts", None):  # v0.3.5: which scorebug layout was actually read
@@ -1943,7 +1995,9 @@ def finalize(bundle: Path, *, qt: Path, qorcap: str, ffmpeg: str, key_dir: Path,
         say("  The receipt uses the last score read: this is NOT a confirmed final.")
 
     live = read_jsonl(bundle / "countersigned.jsonl")
-    if live and len(live) >= len(qcps) and all(a["hash"] == b["hash"] for a, b in zip(live, qcps)):
+    if role != rec_role and live:
+        say(f"  The live countersignatures were signed for side {rec_role}; re-signing the checkpoints for {role} offline.")
+    if live and role == rec_role and len(live) >= len(qcps) and all(a["hash"] == b["hash"] for a, b in zip(live, qcps)):
         cps, kind, note = live[:len(qcps)], REFEREE_KIND, "scores read after the fact; checkpoint signatures are the live ones from Start Match."
     else:
         cs = Countersigner(referee, match_id, role)
@@ -1951,7 +2005,9 @@ def finalize(bundle: Path, *, qt: Path, qorcap: str, ffmpeg: str, key_dir: Path,
         for c in qcps:
             cs.offer(c)
         cps, kind = cs.signed, REFEREE_KIND_OFFLINE
-        note = ("no live countersignatures; the local referee signed QorCap's checkpoints after the fact, "
+        note = (f"the live countersignatures are bound to the recorded side {rec_role}; " if role != rec_role and live
+                else "no live countersignatures; ") + (
+                "the local referee signed QorCap's checkpoints after the fact, "
                 "stamped with QorCap's recording times (referee key_kind local-self-attested-offline).")
     report_recording_audio(bundle, ffmpeg)
     say("\nSigning the receipt ...")
@@ -1971,6 +2027,10 @@ def finalize_main(argv) -> int:
     ap.add_argument("--no-open", action="store_true")
     ap.add_argument("--recover", action="store_true",
                     help="rebuild receipt.draft.json and bundle.json from manifest, checkpoints, inputs, challenges and timeline")
+    ap.add_argument("--role", choices=["home", "away"],
+                    help="correct the side after recording (QorCap was set to the wrong side): bundle.json records the "
+                         "correction and the receipt is signed for this side; the recorded evidence is not edited")
+    ap.add_argument("--role-reason", help="why the side was corrected (stored in bundle.json role_correction)")
     ap.add_argument("--psn-names", action="store_true",
                     help="opt-in: before signing, read the PSN names Madden showed (online games) into the receipt as "
                          "match.observed_handles (on-screen evidence, not account proof)")
@@ -1996,7 +2056,7 @@ def finalize_main(argv) -> int:
         post_match_psn_names(bundle, ff)
     rc = finalize(bundle, qt=qt, qorcap=find_qorcap(a.qorcap), ffmpeg=ff,
                   key_dir=Path(a.key_dir) if a.key_dir else data_dir() / "keys", no_open=a.no_open, hz=a.hz,
-                  recover=a.recover)
+                  recover=a.recover, role=a.role, role_reason=a.role_reason)
     if a.highlights:
         post_match_highlights(bundle, ff)
     return rc

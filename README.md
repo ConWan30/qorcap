@@ -315,6 +315,13 @@ qorcap psn-names "C:\Users\you\Documents\QorCap Matches\match-...-021003"
 python sidecar\qorcap_match.py finalize DIR --psn-names ...     # read names, then sign them into the receipt
 ```
 
+If QorCap was set to the wrong side while recording (the banners show you on the other side), correct it at
+finalize: `finalize DIR --role away --role-reason "..."`. bundle.json keeps a `role_correction` record (from, to,
+reason, when), the receipt is signed again for the corrected side (checkpoints re-signed offline, because the live
+countersignatures are bound to the recorded side), and `result.notes` states the correction. The video,
+checkpoints and challenges are not edited and keep the recorded side. A later `finalize --recover` rebuilds bundle.json
+from the recorded side, so pass `--role` again after it.
+
 It refuses to run while QorCap is recording (exit 3). Exit 4 means no video. This is **on-screen evidence, not
 account proof**. Look-alike characters (0/O/Q, 1/l/I, g/y) can't be told apart, and a name made of characters the
 pack has never seen in real footage usually reads as unverified. Rebuild the pack with `tools/make_psn_pack.py` from
