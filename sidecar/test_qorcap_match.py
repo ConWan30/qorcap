@@ -598,3 +598,17 @@ def test_post_game_reset_after_the_scorebug_leaves_keeps_the_legal_score():
         {"type": "score", "t_ms": 13_000, "away": 0, "home": 0, "quarter": 1, "clock_s": 240},
     ]
     assert qm.game_segment_score(flicker)["home"] == 0
+
+
+def test_post_game_reset_keeps_a_third_quarter_when_one_was_read():
+    """162055 never reaches the 4th quarter. A 3RD read before the reset is the receipt quarter."""
+    events = [
+        {"type": "score", "t_ms": 1, "away": 0, "home": 0, "quarter": 1, "clock_s": 247},
+        {"type": "score", "t_ms": 2, "away": 6, "home": 21, "quarter": 2, "clock_s": 20},
+        {"type": "score", "t_ms": 3, "away": 6, "home": 21, "quarter": 3, "clock_s": 237},
+        {"type": "obs", "t_ms": 5_000, "until_ms": 98_000, "obs": "scorebug_absent", "n": 180},
+        {"type": "score", "t_ms": 99_000, "away": 0, "home": 0, "quarter": 1, "clock_s": 240},
+    ]
+    kept = qm.game_segment_score(events)
+    assert (kept["away"], kept["home"], kept["quarter"]) == (6, 21, 3)
+    assert "post-game score reset" in kept["notes"][0]

@@ -43,6 +43,10 @@ QUARTER_INK = 90                    # quarter word is grey
 CLOCK_BRIGHT = 160
 CLOCK_LEAD = 28                     # a 10:00–15:00 minute digit sits this far left of the one-digit box
 GATE = {"score": (0.80, 0.08), "clock": (0.75, 0.12), "quarter": (0.85, 0.08)}
+# Thick grey paint on match-20261017-162055 scores 0.65–0.77 against the thin 170000 templates.
+# A word that still leads by a wide gap is accepted. 3RD vs 1ST at 22:33 is only 0.03 apart and stays unknown
+# unless a real template of that word is in the pack. Holding that template out must not flip the label.
+QUARTER_SURE = (0.73, 0.30)
 QUARTERS = {"1ST": 1, "2ND": 2, "3RD": 3, "4TH": 4, "OT": 5}
 NOT_VISIBLE = {"layout_unknown", "frame_invalid", "frame_too_small", "frame_aspect"}
 
@@ -110,6 +114,32 @@ def quarter_crop(v):
     return q[ys.min():ys.max() + 1, xs.min():xs.max() + 1]
 
 
+def _rank(labels, vecs, v, group: str):
+    """(accepted label or None, argmax label, best score, margin vs the next different label)."""
+    s = vecs @ v
+    o = np.argsort(-s)
+    raw = labels[int(o[0])]
+    best = float(s[o[0]])
+    second = max((float(s[j]) for j in o[1:] if labels[j] != raw), default=-1.0)
+    margin = best - second
+    return (raw if accept_match(group, best, margin) else None), raw, best, margin
+
+
+def accept_match(group: str, best: float, margin: float) -> bool:
+    """True when a classified glyph is sure enough to emit. Clock and score stay on ``GATE``.
+
+    Quarter also accepts a lower score when the next word is far behind (``QUARTER_SURE``). That is how
+    a blurry 1ST still reads, while a 3RD that only leads 1ST by a few hundredths does not.
+    """
+    lo, mg = GATE[group]
+    if best >= lo and margin >= mg:
+        return True
+    if group == "quarter":
+        slo, smg = QUARTER_SURE
+        return best >= slo and margin >= smg
+    return False
+
+
 def clock_from_digits(digits: str | None):
     """(seconds, text) for M:SS or for MM:SS when the minute is 10–15. Anything else is not a clock."""
     if not digits or not digits.isdigit():
@@ -143,6 +173,31 @@ def split_pair(mask, max_w):
             return [mask]
         parts.append(p[rows[0]:rows[-1] + 1, cols[0]:cols[-1] + 1])
     return parts
+
+
+def score_glyphs(v, side):
+    """Interior digit masks in one score box, left to right.
+
+    On match-20261017-162055 the teal away panel and the chevron between the scores reach into the
+    box. They touch the left or right edge, and the chevron is often taller than a digit. They are
+    not a clipped digit: counting them made every away ``0`` and ``6`` fail closed. An interior
+    digit (the score itself) does not touch the edge. A box whose only ink touches the edge still
+    returns nothing, so a digit cut off by the box is not guessed.
+    """
+    import cv2
+    x0, x1 = SCORE_X[side]
+    m = (v[:, x0:x1] > INK).astype(np.uint8)
+    n, lab, st, _ = cv2.connectedComponentsWithStats(m, connectivity=8)
+    clean = []
+    width = x1 - x0
+    for i in range(1, n):
+        x, y, w, h, a = (int(t) for t in st[i])
+        if h < SCORE_H[0] or h > SCORE_H[1] or a < 15:
+            continue
+        if x == 0 or x + w >= width:
+            continue
+        clean.append((x, (lab[y:y + h, x:x + w] == i).astype(np.uint8)))
+    return [g for _, g in sorted(clean, key=lambda t: t[0])]
 
 
 def components(v, x0, x1, hrange, thr=INK, max_w=None):
@@ -198,24 +253,52 @@ class MondayNightReader:
         for g in ("score", "clock", "quarter"):
             self.groups[g] = ([str(x) for x in d[f"{g}_labels"]], d[f"{g}_vecs"].astype(np.float32))
         self.source = {str(k): str(v) for k, v in zip(d["source_keys"], d["source_vals"])}
+        self.ids: dict[str, list[str]] = {}
+        for g in ("score", "clock", "quarter"):
+            key = f"{g}_src"
+            n = len(self.groups[g][0])
+            if key in d.files:
+                self.ids[g] = [str(x) for x in d[key]]
+            else:
+                self.ids[g] = [""] * n
 
     @property
     def model_id(self) -> str:
         return f"qorcap_{PROFILE_ID}_v1"
 
-    def classify(self, group: str, mask, size) -> tuple[str | None, float, float]:
+    def classify(self, group: str, mask, size, *, drop_src: str | None = None) -> tuple[str | None, float, float]:
+        """Best label, score, and margin. ``drop_src`` skips templates whose id starts with that prefix
+        (leave-one-out: a frame is not scored against the template cut from itself).
+
+        Templates tagged ``162055:`` are the thick grey paint from match-20261017-162055. They fill glyphs
+        the thin strip.mp4 pack misses. A word the original pack already accepted stays accepted: the thick
+        ``6`` sits close enough to some ``0`` and ``8`` glyphs to shrink their margin under the gate without
+        changing the winner, and that must not blank a clock that already read. A footage template that
+        actually outscores a different accepted label is a conflict and fails closed.
+        """
         v = norm_vec(mask, size)
         if v is None:
             return None, 0.0, 0.0
         labels, vecs = self.groups[group]
-        s = vecs @ v
-        o = np.argsort(-s)
-        best = float(s[o[0]])
-        second = max((float(s[j]) for j in o[1:] if labels[j] != labels[o[0]]), default=-1.0)
-        lo, mg = GATE[group]
-        if best < lo or best - second < mg:
-            return None, best, best - second
-        return labels[o[0]], best, best - second
+        ids = self.ids.get(group) or [""] * len(labels)
+        if drop_src:
+            keep = [i for i, s in enumerate(ids) if not str(s).startswith(drop_src)]
+            if not keep:
+                return None, 0.0, 0.0
+            labels = [labels[i] for i in keep]
+            vecs = vecs[keep]
+            ids = [ids[i] for i in keep]
+        acc, raw, best, margin = _rank(labels, vecs, v, group)
+        legacy = [i for i, s in enumerate(ids) if not str(s).startswith("162055:")]
+        if legacy and len(legacy) < len(labels):
+            lacc, _, lbest, lmargin = _rank([labels[i] for i in legacy], vecs[legacy], v, group)
+            if lacc is not None:
+                if raw != lacc and best > lbest:
+                    return None, best, best - lbest
+                return lacc, lbest, lmargin
+        if acc is None:
+            return None, best, margin
+        return acc, best, margin
 
     def reference_band(self, frame):
         hsv = bar_hsv(frame)
@@ -225,7 +308,12 @@ class MondayNightReader:
         hsv = bar_hsv(frame)
         return hsv is not None and LOGO_MIN_ORANGE <= logo_orange(hsv) <= LOGO_MAX_ORANGE
 
-    def read(self, frame) -> Any:
+    def read(self, frame, *, drop_src: str | None = None) -> Any:
+        """Read one frame. ``drop_src`` skips templates whose id starts with that prefix.
+
+        The live path leaves it unset. Tests pass a video-minute prefix so a template cut from that
+        minute is not scored against the frames it was cut from. Offline labels never enter this method.
+        """
         hsv = bar_hsv(frame)
         if hsv is None:
             return _fr(ok=False, reason="frame_invalid")
@@ -235,12 +323,12 @@ class MondayNightReader:
         v = hsv[..., 2]
         scores, conf, margin = {}, 1.0, 1.0
         for side in ("away", "home"):
-            gs = components(v, *SCORE_X[side], SCORE_H)
-            if not 1 <= len(gs) <= 2 or any(g is None for g in gs):
+            gs = score_glyphs(v, side)
+            if not 1 <= len(gs) <= 2:
                 return _fr(ok=False, reason=f"score_{side}_glyph_count")
             txt = ""
             for g in gs:
-                lab, b, m = self.classify("score", g, SCORE_SIZE)
+                lab, b, m = self.classify("score", g, SCORE_SIZE, drop_src=drop_src)
                 if lab is None:
                     return _fr(ok=False, reason=f"score_{side}_unsure", detail={"best": round(b, 3), "margin": round(m, 3)})
                 conf, margin = min(conf, b), min(margin, m)
@@ -253,10 +341,10 @@ class MondayNightReader:
         crop = quarter_crop(v)
         qlab = None
         if crop is not None:
-            lab, _, _ = self.classify("quarter", crop, QUARTER_SIZE)
+            lab, _, _ = self.classify("quarter", crop, QUARTER_SIZE, drop_src=drop_src)
             if lab in QUARTERS:
                 qlab = lab
-        clock = self._clock(v, hsv)
+        clock = self._clock(v, hsv, drop_src=drop_src)
         partial = {"left_score": scores["away"], "right_score": scores["home"],
                    "score_conf": round(conf, 3), "score_margin": round(margin, 3)}
         if clock is not None and clock[0] is not None:
@@ -269,14 +357,14 @@ class MondayNightReader:
             return _fr(ok=False, reason=why, quarter=QUARTERS[qlab], **partial)
         return _fr(ok=True, reason="ok", quarter=QUARTERS[qlab], **partial)
 
-    def _digits(self, v, x0: int, x1: int, thr: float) -> str | None:
+    def _digits(self, v, x0: int, x1: int, thr: float, drop_src: str | None = None) -> str | None:
         """Digit string, ``""`` when a glyph is present but does not classify, None when the count is wrong."""
         gs = components(v, x0, x1, CLOCK_H, thr=thr, max_w=CLOCK_MAX_W)
         if any(g is None for g in gs) or not 3 <= len(gs) <= 4:
             return None
         out = ""
         for g in gs:
-            lab, _, _ = self.classify("clock", g, CLOCK_SIZE)
+            lab, _, _ = self.classify("clock", g, CLOCK_SIZE, drop_src=drop_src)
             if lab is None:
                 return ""
             out += lab
@@ -295,18 +383,18 @@ class MondayNightReader:
             return None if digits is None else (None, "clock_invalid")
         return (*parsed, self._red_clock(hsv, x0, x1, red_thr))
 
-    def _clock(self, v, hsv):
+    def _clock(self, v, hsv, drop_src: str | None = None):
         """(seconds, text, red) or (None, reason). 10:00–15:00 is four digits; the leading 1 is left of CLOCK_X.
 
         None (not a pair) means the glyph count was wrong. A pair with seconds None carries the reason.
         """
         thr = clock_thr(v)
-        tight = self._clock_from(self._digits(v, CLOCK_X[0], CLOCK_X[1], thr), hsv, CLOCK_X[0], CLOCK_X[1], INK)
+        tight = self._clock_from(self._digits(v, CLOCK_X[0], CLOCK_X[1], thr, drop_src), hsv, CLOCK_X[0], CLOCK_X[1], INK)
         if tight is not None:
             return tight
         bright = max(thr, float(CLOCK_BRIGHT))
         return self._clock_from(
-            self._digits(v, CLOCK_X[0] - CLOCK_LEAD, CLOCK_X[1], bright),
+            self._digits(v, CLOCK_X[0] - CLOCK_LEAD, CLOCK_X[1], bright, drop_src),
             hsv, CLOCK_X[0] - CLOCK_LEAD, CLOCK_X[1], bright)
 
 

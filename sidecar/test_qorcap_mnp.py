@@ -262,3 +262,153 @@ def test_reader_core_confirms_covered_end_menu_only_with_q4_scorebug_final():
     assert c.final["method"] == "end_menu_read" and (c.final["away"], c.final["home"]) == (34, 29)
     assert c.end_menu["template_sources"] == ["corroborated"] and "partly covered" in c.final["notes"][0]
     assert core(None).end_menu is None  # no scorebug final yet: nothing to corroborate
+
+
+# ---- v0.3.19: thick paint from match-20261017-162055
+# labeled_candidates.csv is an offline agreement between an advisory vision pass and a human check.
+# MondayNightReader.read does not open it. Templates are ordinary pack rows, held out by video minute.
+import csv
+
+
+def _labels162():
+    rows = list(csv.DictReader((FX / "mnp162055" / "labeled_candidates.csv").open()))
+    meta, by = {}, {}
+    for r in rows:
+        meta[r["frame_path"]] = r
+        by.setdefault(r["frame_path"], {})[r["field"]] = r["value"]
+    return meta, by
+
+
+def _frame162(fp):
+    im = cv2.imread(str(FX / "mnp162055" / "frames" / Path(fp).name))
+    assert im is not None and im.shape[:2] == (720, 1280)
+    return im
+
+
+def _got(fr, field, row):
+    if field == "score":
+        return None if fr.left_score is None else f"{fr.left_score}-{fr.right_score}"
+    if field == "quarter":
+        return None if fr.quarter is None else str(fr.quarter)
+    return fr.clock_text
+
+
+# Fields that stay unknown when every template from that video minute is removed.
+# Unknown is allowed. A different value is not. Minute 22 is the only 3RD sample.
+HOLDOUT_UNKNOWN = {
+    "8:50.000": {"quarter"},
+    "12:10.000": {"score", "clock", "quarter"},
+    "18:56.750": {"clock"},
+    "19:30.000": {"clock"},
+    "20:30.000": {"clock"},
+    "20:50.000": {"clock"},
+    "21:50.000": {"quarter"},
+    "22:10.000": {"quarter"},
+    "22:30.000": {"quarter"},
+    "22:33.500": {"quarter"},
+}
+
+
+def test_162055_pack_reads_the_labeled_frames_and_holds_out_by_minute(mnp):
+    meta, by = _labels162()
+    assert len(meta) == 90
+    wrong = []
+    for fp, row in meta.items():
+        im = _frame162(fp)
+        minute = int(row["video_time"].split(":")[0])
+        full = mnp.read(im)
+        held = mnp.read(im, drop_src=f"162055:m{minute:02d}:")
+        unknown = HOLDOUT_UNKNOWN.get(row["video_time"], set())
+        for field, exp in (("score", f"{row['away']}-{row['home']}"),):
+            if _got(full, field, row) != exp:
+                wrong.append((row["video_time"], field, exp, _got(full, field, row), "full"))
+            h = _got(held, field, row)
+            if field in unknown:
+                assert h is None, (row["video_time"], field, h)
+            elif h != exp:
+                wrong.append((row["video_time"], field, exp, h, "holdout"))
+        for field in ("quarter", "clock"):
+            if field not in by[fp]:
+                continue
+            exp = by[fp][field]
+            if _got(full, field, row) != exp:
+                wrong.append((row["video_time"], field, exp, _got(full, field, row), "full"))
+            h = _got(held, field, row)
+            if field in unknown:
+                assert h is None, (row["video_time"], field, h)
+            elif h != exp:
+                wrong.append((row["video_time"], field, exp, h, "holdout"))
+    assert wrong == []
+
+
+@pytest.mark.parametrize("video_time,away,home,q,clock,red", [
+    ("12:31.750", 6, 14, 2, "2:16", False),
+    ("18:50.000", 6, 20, 2, "0:20", True),   # the snap before the extra point
+    ("18:56.750", 6, 21, 2, "0:20", True),
+    ("21:51.250", 6, 21, 2, "0:00", True),
+    ("22:33.500", 6, 21, 3, "3:57", False),
+    ("24:11.750", 0, 0, 1, "4:00", False),   # post-game session, on the glass; the receipt keeps 6-21 Q3
+])
+def test_162055_named_moments(mnp, video_time, away, home, q, clock, red):
+    meta, _ = _labels162()
+    row = next(r for r in meta.values() if r["video_time"] == video_time)
+    fr = mnp.read(_frame162(row["frame_path"]))
+    assert fr.ok, fr.reason
+    assert (fr.left_score, fr.right_score, fr.quarter, fr.clock_text, fr.clock_red) == (away, home, q, clock, red)
+
+
+def test_162055_third_quarter_held_out_does_not_become_first_or_second(mnp):
+    meta, by = _labels162()
+    for row in meta.values():
+        if by[row["frame_path"]].get("quarter") != "3":
+            continue
+        im = _frame162(row["frame_path"])
+        assert mnp.read(im).quarter == 3
+        held = mnp.read(im, drop_src=f"162055:m{int(row['video_time'].split(':')[0]):02d}:")
+        assert held.quarter is None
+
+
+def test_162055_teal_six_the_thin_pack_called_eight_stays_six(mnp):
+    """13:10 and 19:50: the strip.mp4 templates rank the away 6 as 8, under the gate. A sibling 6 reads it."""
+    meta, _ = _labels162()
+    for video_time in ("13:10.000", "19:50.000"):
+        row = next(r for r in meta.values() if r["video_time"] == video_time)
+        fr = mnp.read(_frame162(row["frame_path"]))
+        assert (fr.left_score, fr.right_score) == (6, int(row["home"]))
+        assert fr.left_score != 8
+
+
+def test_162055_templates_are_the_crops_they_name(mnp):
+    """Each footage template equals the glyph of the frame named in its id, not a neighbour."""
+    labels_by = {g: mnp.groups[g][0] for g in ("score", "clock", "quarter")}
+    vecs = {g: mnp.groups[g][1] for g in ("score", "clock", "quarter")}
+    n = 0
+    for group, ids in mnp.ids.items():
+        for i, src in enumerate(ids):
+            if not src.startswith("162055:"):
+                continue
+            n += 1
+            parts = src.split(":")
+            # 162055:mMM:group:label:stem[:index]
+            assert parts[2] == group and parts[3] == labels_by[group][i]
+            im = _frame162(parts[4] + ".jpg")
+            v = M.bar_hsv(im)[..., 2]
+            if group == "quarter":
+                glyph = M.quarter_crop(v)
+            elif group == "score":
+                glyph = M.score_glyphs(v, "away")[int(parts[5])]
+            else:
+                gs = M.components(v, *M.CLOCK_X, M.CLOCK_H, thr=M.clock_thr(v), max_w=M.CLOCK_MAX_W)
+                glyph = gs[int(parts[5])]
+            size = {"score": M.SCORE_SIZE, "clock": M.CLOCK_SIZE, "quarter": M.QUARTER_SIZE}[group]
+            assert np.allclose(vecs[group][i], M.norm_vec(glyph, size), atol=1e-5)
+    assert n == 8 + 53 + 17
+
+
+def test_162055_templates_do_not_add_a_quarter_word(mnp):
+    assert set(mnp.groups["quarter"][0]) == {"1ST", "2ND", "3RD", "4TH"}
+    assert mnp.source["qtr:162055"].startswith("real")
+    assert mnp.source["clk:162055"].startswith("real")
+    assert mnp.source["scr:162055"].startswith("real")
+    assert mnp.source["score:5"].startswith("synthetic")
+    assert "labeled_candidates" not in Path(M.__file__).read_text()
