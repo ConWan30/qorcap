@@ -278,6 +278,13 @@ def start_reader(api: Api, stop: threading.Event, state: dict, bundle: Path | No
                       playcall=PlayCallDetector(), gate=PauseCapableGate())
     state["core"] = core
     state["gate"] = core.gate
+    try:  # Glimpse second opinion on held touchdown jumps: shadow log only unless QORCAP_GLIMPSE_TD_VETO=1
+        from qorcap_reader import wire_touchdown_glimpse
+        mode = wire_touchdown_glimpse(core, bundle.name if bundle is not None else None)
+        if mode == "enforcing":
+            print("  Glimpse touchdown veto: ENFORCING (QORCAP_GLIMPSE_TD_VETO=1; can only cancel or delay a fast-path lock)")
+    except Exception as e:  # never fatal
+        print(f"touchdown shadow log not started: {type(e).__name__}: {e}", file=sys.stderr)
     if bundle is not None:
         try:
             core.delta_corroboration = load_delta_corroboration_from_bundle(bundle)

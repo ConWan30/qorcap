@@ -324,3 +324,55 @@ def test_start_match_launches_the_watcher_safely():
         assert s in blk, s
     assert "Write-Host" in blk and not any("OPENROUTER_API_KEY" in ln for ln in blk.splitlines() if "Write-Host" in ln)
     assert "Wait-Process" not in blk and "-Wait" not in blk
+
+
+# ---- v0.1.3: second opinion on held touchdown jumps (shadow) --------------------------------------------------------
+def test_td_verdict_table():
+    sb = lambda a, h: {"region": "SCOREBUG", "away_score": a, "home_score": h}  # noqa: E731
+    assert W.td_verdict(sb(13, 8), [13, 8], [13, 0]) == "agree"
+    assert W.td_verdict(sb(13, 0), [13, 8], [13, 0]) == "disagree_old"
+    assert W.td_verdict(sb(13, 6), [13, 8], [13, 0]) == "disagree_other"
+    assert W.td_verdict({"region": "OTHER", "away_score": None, "home_score": None}, [13, 8], [13, 0]) == "no_read"
+    assert W.td_verdict(None, [13, 8], [13, 0]) == "no_read"
+
+
+def test_second_opinion_is_logged_and_never_touches_the_match(tmp_path):
+    clock = SimClock()
+    t0 = int(clock.time() * 1000)
+    rows = [{"t_ms": t0 + 1000, "away": 13, "home": 0, "quarter": 2, "clock_s": 330, "clock_red": False}]
+    md = make_match(tmp_path, rows)
+    before = tree_hash(md)
+    out = tmp_path / "glimpse-out" / md.name
+    out.mkdir(parents=True)
+    # the sidecar holds 13-0 -> 13-8 (the 021003 misread) and writes it to the watcher's own folder
+    (out / "td_jumps.jsonl").write_text(json.dumps({"event": "pending", "id": "td1", "t_ms": t0 + 4000, "cand": [13, 8],
+                                                    "old": [13, 0], "confusable": True}) + "\n", encoding="utf-8")
+    frames = [(t0 + 1000, FRAME), (t0 + 4200, FRAME2)]
+    post = fake_post(lambda n: reply(a=13, h=0, q=2, clock="5:29"))
+    w = W.Watcher(args(tmp_path, md, max_minutes=0.2, idle_exit_s=999, min_interval=6.0, confirm_hold=0), tap=FakeTap(clock, frames),
+                  clock=clock, post=post, key_reader=lambda: 0.5, printer=lambda *_: None)
+    c = w.run()
+    assert c["td_asked"] == 1 and c["td_disagree"] == 1
+    task = post.calls[0]["messages"][1]["content"][0]["text"]
+    assert "not given for this crop" in task and "13" not in task.split("Last score")[1].split("\n")[0]
+    recs = [json.loads(x) for x in (out / "advisory.jsonl").read_text().splitlines()]
+    so = [r for r in recs if r["kind"] == "td_second_opinion"]
+    assert len(so) == 1 and so[0]["verdict"] == "disagree_old" and so[0]["feeds_lock"] is False and so[0]["advisory_only"]
+    assert json.loads((out / "td_verdicts.jsonl").read_text())["verdict"] == "disagree_old"
+    W.POLICY.active = False
+    assert tree_hash(md) == before
+
+
+def test_old_candidates_expire_without_a_call(tmp_path):
+    clock = SimClock()
+    t0 = int(clock.time() * 1000)
+    md = make_match(tmp_path, [{"t_ms": t0, "away": 0, "home": 0, "quarter": 1, "clock_s": 800, "clock_red": False}])
+    out = tmp_path / "glimpse-out" / md.name
+    out.mkdir(parents=True)
+    (out / "td_jumps.jsonl").write_text(json.dumps({"event": "pending", "id": "old", "t_ms": t0 - 60_000, "cand": [0, 6],
+                                                    "old": [0, 0]}) + "\n", encoding="utf-8")
+    post = fake_post(lambda n: reply(a=0, h=0))
+    w = W.Watcher(args(tmp_path, md, max_minutes=0.1, idle_exit_s=999, confirm_hold=0), tap=FakeTap(clock, [(t0, FRAME)]),
+                  clock=clock, post=post, key_reader=lambda: 0.5, printer=lambda *_: None)
+    c = w.run()
+    assert c["td_expired"] == 1 and c["td_asked"] == 0

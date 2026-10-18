@@ -62,3 +62,17 @@ watcher by itself just before recording begins:
 
 Set `QORCAP_GLIMPSE_FRAME=0` (or remove it) to turn both the frame tap and the watcher off.
 Caps stay in force: $0.50 per game, $10 per week (`budget.py`). Glimpse remains ADVISORY_AI only.
+
+## Second opinion on touchdown jumps (v0.3.23, watcher 0.1.3) — shadow only
+
+QorCap's fast path can lock a +6/+7/+8 from a few reads (held 1 s, 2 s for look-alike digits). While a jump is
+held, the live sidecar appends it to `td_jumps.jsonl` in the watcher's own folder (never the match folder). The
+watcher reads the next frame with Glimpse **without** any score hint and logs a `td_second_opinion` record
+(`agree`, `disagree_old`, `disagree_other`, `no_read`) to `advisory.jsonl`, plus `td_verdicts.jsonl`. Same model,
+prompts, budget and caps as every other Glimpse call ($0.50/game, $10/week). Nothing is fed back: in shadow mode
+QorCap never reads the verdicts.
+
+**Enforcing mode** (`QORCAP_GLIMPSE_TD_VETO=1`) is OFF by default and needs the owner's explicit OK before it is
+turned on. When on, a held fast-path lock waits up to 4 s for the verdict: `disagree` cancels that fast-path lock
+(the normal 3/9-read windows still apply), `agree` posts it, no verdict posts it after the wait. Glimpse can only
+veto or delay a fast-path lock; it can never create a lock, and offline finalize never uses it.
