@@ -683,11 +683,11 @@ class Watcher:
                 if now - ref > limit:
                     self.say(f"[glimpse] QorCap not reachable for {limit:.0f} s; stopping.")
                     break
+            else:
+                self.c["tap_503"] += 1
             if self.stop_reason:
                 self.say(f"[glimpse] {self.stop_reason}; stopping.")
                 break
-            else:
-                self.c["tap_503"] += 1
             if self.out is not None and self.c["refused"] and self.budget is not None and self._budget_exhausted():
                 self.say("[glimpse] budget reached; stopping (recording is unaffected).")
                 break
