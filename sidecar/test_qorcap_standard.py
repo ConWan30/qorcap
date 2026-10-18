@@ -109,3 +109,30 @@ def test_standard_bar_reads_23_and_30_and_refuses_the_downs_banner():
     assert banner.reason in ("score_panel_covered", "score_slot_ink", "score_unsure", "layout_unknown")
     assert (banner.left_score, banner.right_score) != (6, 4)
     assert (banner.left_score, banner.right_score) != (61, 4)
+
+
+def test_standard_bar_reads_the_red_14_of_084523():
+    """match-20261018-084523 (CHI–ATL): the QorTime "4" scored 0.57-0.64 under the 0.70 gate, so 0-14 and 6-14
+    were score_unsure and the draft stopped at 0-13 Q2. The real-glyph "4" variant reads both; 0-13 is unchanged."""
+    from qorcap_reader import prep
+    r = standard_reader()
+    for name, pair, q in (("m27_std_084523_q2_0_13.jpg", (0, 13), 2), ("m27_std_084523_q2_0_14.jpg", (0, 14), 2),
+                          ("m27_std_084523_q4_6_14.jpg", (6, 14), 4)):
+        fr = r.read(prep(img(name)))
+        assert fr.ok, (name, fr.reason)
+        assert tuple(fr.pair) == pair and fr.quarter == q, (name, fr.pair, fr.quarter)
+        assert fr.score_margin >= 0.15
+
+
+def test_without_the_four_variant_084523_stays_unread():
+    """Guard that the fixture really exercises the new template (plain QorTime pack fails closed)."""
+    from qorcap_reader import prep
+    fr = ScorebugReader().read(prep(img("m27_std_084523_q4_6_14.jpg")))
+    assert not fr.ok and fr.reason == "score_unsure"
+
+
+def test_human_label_for_084523_matches_the_q4_fixture():
+    import json
+    rows = [json.loads(x) for x in (HERE / "eval" / "human_labels.jsonl").read_text().splitlines() if x.strip()]
+    lab = next(x for x in rows if x["match"] == "match-20261018-084523")
+    assert (lab["away"], lab["home"], lab["quarter"], lab["source"]) == (6, 14, 4, "human")
