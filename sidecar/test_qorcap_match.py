@@ -655,3 +655,43 @@ def test_observed_handles_go_into_the_signed_receipt(tmp_path):
     assert verify_receipt(rec, referee_pub=ref.pubkey_hex)["status"] == "FAIL"
     (bundle / "manifest.jsonl").write_text('{"other": 1}\n')  # file from another recording: ignored
     assert "observed_handles" not in qm.with_observed_handles(bundle, _draft())["match"]
+
+
+@needs_bin
+def test_finalize_role_correction_resigns_for_the_corrected_side(tmp_path):
+    """QorCap was left on home but the player was away: finalize --role away records the correction in bundle.json,
+    re-signs the checkpoints offline for away (the live countersignatures are bound to home) and never edits the
+    recorded evidence."""
+    pytest.importorskip("numpy")
+    from qor_receipt.receipt import verify_receipt
+    env = dict(os.environ, QORCAP_HOME=str(tmp_path / "home"))
+    p = subprocess.run([sys.executable, str(HERE / "qorcap_match.py"), "--test-pattern", "--test-secs", "8",
+                        "--qortime", str(QT), "--qorcap", str(_qorcap_bin()), "--out", str(tmp_path / "m"),
+                        "--port", "8803", "--no-open"], capture_output=True, text=True, env=env, timeout=180,
+                       stdin=subprocess.DEVNULL)
+    assert p.returncode == 0, p.stdout + p.stderr
+    b = next((tmp_path / "m").iterdir())
+    evidence = {f: (b / f).read_bytes() for f in ("checkpoints.jsonl", "countersigned.jsonl", "manifest.jsonl")}
+    kw = dict(qt=QT, qorcap=str(_qorcap_bin()), ffmpeg=shutil.which("ffmpeg"), key_dir=tmp_path / "home" / "keys",
+              core_factory=_ScriptCore)
+    assert qm.finalize(b, role="away", role_reason="on-screen banners show the recorder owner on the away side", **kw) == 0
+    meta = json.loads((b / "bundle.json").read_text())
+    assert meta["role"] == "away" and meta["role_correction"]["from"] == "home" and meta["role_correction"]["to"] == "away"
+    assert "away side" in meta["role_correction"]["reason"]
+    rec = json.loads((b / "receipt.json").read_text())
+    assert [x["role"] for x in rec["players"]] == ["away"] and list(rec["checkpoints"]) == ["away"]
+    assert rec["referee"]["key_kind"] == qm.REFEREE_KIND_OFFLINE  # live sigs were for home
+    assert any("side corrected after recording" in n for n in rec["result"]["notes"])
+    assert (rec["result"]["away_score"], rec["result"]["home_score"]) == (10, 14)
+    v = verify_receipt(rec, referee_pub=(b / "referee.pub").read_text().strip())
+    assert v["errors"] == [], v
+    assert {f: (b / f).read_bytes() for f in evidence} == evidence
+    when = meta["role_correction"]["corrected_ms"]
+    assert qm.finalize(b, **kw) == 0  # a later plain finalize keeps the corrected side
+    meta2 = json.loads((b / "bundle.json").read_text())
+    assert meta2["role"] == "away" and meta2["role_correction"]["corrected_ms"] == when
+    assert list(json.loads((b / "receipt.json").read_text())["checkpoints"]) == ["away"]
+    assert qm.finalize(b, role="home", **kw) == 0  # back to the recorded side: record removed, live sigs reused
+    meta3 = json.loads((b / "bundle.json").read_text())
+    assert meta3["role"] == "home" and "role_correction" not in meta3
+    assert json.loads((b / "receipt.json").read_text())["referee"]["key_kind"] == qm.REFEREE_KIND
