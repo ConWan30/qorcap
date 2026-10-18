@@ -158,6 +158,10 @@ pub struct RecordArgs {
     /// Do not read the DualSense over USB HID (no inputs.jsonl / input proof)
     #[arg(long)]
     pub no_controller: bool,
+    /// Opt-in: serve the reader's newest snapshot at GET /frame/scorebug for the advisory Glimpse
+    /// shadow watcher (read-only, rate-limited, never touches capture). Also on with QORCAP_GLIMPSE_FRAME=1.
+    #[arg(long)]
+    pub glimpse_frame: bool,
 }
 
 impl RecordArgs {

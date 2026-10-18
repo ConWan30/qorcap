@@ -54,6 +54,8 @@ pub struct Engine {
     pub status: Mutex<Status>,
     pub shutdown: AtomicBool,
     pub snapshot: PathBuf,
+    /// Opt-in read-only frame tap for the advisory Glimpse watcher (GET /frame/scorebug).
+    pub tap: crate::glimpse::FrameTap,
     pub exit_when_recording_ends: AtomicBool,
     started: Instant,
     last_data_ms: AtomicU64,
@@ -203,7 +205,7 @@ impl Engine {
         Arc::new(Self { ffmpeg, ring: Mutex::new(ReplayRing::new(window, cap)), rec: Mutex::new(None), status: Mutex::new(st), shutdown: AtomicBool::new(false),
             ev: Mutex::new(MatchState { started_wall_ms: wall_ms(), score: Value::Null, ..Default::default() }), subs: Mutex::new(vec![]),
             stamp_file: dir.join("stamp.txt"),
-            snapshot: dir.join("snapshot.jpg"), exit_when_recording_ends: AtomicBool::new(false), started: Instant::now(), last_data_ms: AtomicU64::new(0), input,
+            snapshot: dir.join("snapshot.jpg"), tap: crate::glimpse::FrameTap::new(args.glimpse_frame || crate::glimpse::env_enabled()), exit_when_recording_ends: AtomicBool::new(false), started: Instant::now(), last_data_ms: AtomicU64::new(0), input,
             running: AtomicBool::new(false), api_closed: AtomicBool::new(false), sealed: AtomicBool::new(false),
             countersigned: std::sync::atomic::AtomicI64::new(-1),
             stop_reason: Mutex::new(None), bundle_write: Mutex::new(()), bundle_finalized: AtomicBool::new(false), args })

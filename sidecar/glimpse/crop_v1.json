@@ -1,0 +1,11 @@
+{"$id": "glimpse-shadow/crop/v1", "type": "object", "additionalProperties": false,
+ "required": ["region", "stat_title", "stat_values", "away_score", "home_score", "quarter", "clock", "notes"],
+ "properties": {
+  "region": {"type": "string", "enum": ["SCOREBUG", "STATS_OVERLAY", "OTHER"]},
+  "stat_title": {"type": ["string", "null"], "maxLength": 48},
+  "stat_values": {"type": ["array", "null"], "minItems": 2, "maxItems": 2, "items": {"type": "string", "maxLength": 12}},
+  "away_score": {"type": ["integer", "null"], "minimum": 0, "maximum": 199},
+  "home_score": {"type": ["integer", "null"], "minimum": 0, "maximum": 199},
+  "quarter": {"type": ["integer", "null"], "minimum": 1, "maximum": 5},
+  "clock": {"type": ["string", "null"], "pattern": "^([0-9]|1[0-5]):[0-5][0-9]$"},
+  "notes": {"type": "string", "maxLength": 300}}}
