@@ -187,7 +187,7 @@ def test_live_loop_sends_only_unknown_frames_and_never_writes_the_match(tmp_path
     before = tree_hash(md)
     frames = [(t0 + 2000, FRAME), (t0 + 20000, FRAME2), (t0 + 40000, FRAME), (t0 + 44500, FRAME), (t0 + 60000, FRAME2)]
     post = fake_post(lambda n: [reply(a=0, h=7, q=1), "not json", reply(a=0, h=7), reply(a=0, h=13)][min(n - 1, 3)])
-    w = W.Watcher(args(tmp_path, md, max_minutes=1.5, idle_exit_s=999, min_interval=6.0), tap=FakeTap(clock, frames), clock=clock, post=post,
+    w = W.Watcher(args(tmp_path, md, max_minutes=1.5, idle_exit_s=999, min_interval=6.0, confirm_hold=0), tap=FakeTap(clock, frames), clock=clock, post=post,
                   key_reader=lambda: 0.5, printer=lambda *_: None)
     c = w.run()
     assert c["known_skipped"] == 1 and c["quarter_unknown"] == 1 and c["score_unknown"] == 3
@@ -209,7 +209,7 @@ def test_game_cap_and_no_key(tmp_path, monkeypatch):
     md = make_match(tmp_path, [{"t_ms": t0, "away": 0, "home": 0, "quarter": None, "clock_s": None, "clock_red": False}])
     frames = [(t0 + i * 5000, FRAME if i % 2 else FRAME2) for i in range(40)]
     post = fake_post(lambda n: reply(a=0, h=0), cost=0.01)
-    w = W.Watcher(args(tmp_path, md, game_cap=0.05, dedupe_threshold=-1, idle_exit_s=999), tap=FakeTap(clock, frames), clock=clock,
+    w = W.Watcher(args(tmp_path, md, game_cap=0.05, dedupe_threshold=-1, idle_exit_s=999, confirm_hold=0), tap=FakeTap(clock, frames), clock=clock,
                   post=post, key_reader=lambda: 0.5, printer=lambda *_: None)
     w.run()
     assert w.budget.game_spent() <= 0.05 and len(post.calls) == 5  # the 6th would pass $0.05
@@ -247,3 +247,18 @@ def test_frame_tap_client_against_a_stub_server():
     assert tap.get()[0] == 429 and hits == ["/frame/scorebug", "/frame/scorebug"]
     srv.shutdown()
     assert W.FrameTap("http://127.0.0.1:1").get()[0] == 0
+
+
+def test_confirm_hold_skips_until_the_lock_changes(tmp_path):
+    clock = SimClock()
+    t0 = int(clock.time() * 1000)
+    rows = [{"t_ms": t0 + i * 1000, "away": 0, "home": 0 if i < 30 else 6, "quarter": None, "clock_s": 800 - i, "clock_red": False} for i in range(60)]
+    md = make_match(tmp_path, rows)
+    frames = [(t0 + i * 2500, FRAME if i % 2 else FRAME2) for i in range(24)]
+    post = fake_post(lambda n: reply(a=0, h=0 if n < 3 else 6, q=1))
+    w = W.Watcher(args(tmp_path, md, dedupe_threshold=-1, idle_exit_s=999, min_interval=0.0, confirm_hold=20.0, max_minutes=1.0),
+                  tap=FakeTap(clock, frames), clock=clock, post=post, key_reader=lambda: 0.5, printer=lambda *_: None)
+    c = w.run()
+    assert c["quarter_unknown"] == c["frames_seen"] and c["hold_skipped"] > 0
+    # one confirmation per 20 s on 0-0, and the lock change to 0-6 at +30 s releases the hold at once
+    assert len(post.calls) <= 5 and any("HOME 6" in b["messages"][1]["content"][0]["text"] for b in post.calls)

@@ -31,7 +31,7 @@ holding the snapshot open made ffmpeg's atomic rename fail). So QorCap hands it 
   step from it (single side, +1/2/3/6/7/8, +1 only after a +6, no decrease, no swapped sides).
 * Budget: $0.50 per game (worst case checked before each call; failed calls are booked at worst case), $10/week
   (OpenRouter `/key` usage_weekly, the local ledger and a floor; +$0.50 margin when `/key` is unreadable), at most one
-  request per 4 s, 15 s after three "no scorebug" replies in a row, near-identical crops deduped for 30 s, 500 calls.
+  request per 6 s, none for 20 s after Glimpse confirms the lock (unless the lock changes), 15 s after three "no scorebug" replies in a row, near-identical crops deduped for 30 s, 500 calls.
 * Output (default `%LOCALAPPDATA%\QorCapGlimpse\<match>\`): `advisory.jsonl`, live `REPORT.md` with the game cost,
   `watch.log`, `crops/`. Ledger: `%LOCALAPPDATA%\QorCapGlimpse\ledger.jsonl`. The key comes from
   `OPENROUTER_API_KEY` only and is never printed.

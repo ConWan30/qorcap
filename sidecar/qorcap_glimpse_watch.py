@@ -18,7 +18,7 @@ the timeline, or anything QorCap writes, and it never touches recording:
   consistent sides (QorTime/Jev ``implausible_transition_reason`` rules, plus +1 only after a +6).
 * Budget: hard $0.50 per game (local ledger, worst case checked before every call) and a $10/week limit
   (OpenRouter /key usage_weekly, local ledger, floor; +margin if /key is unreadable). At most one request per
-  ``--min-interval`` seconds (default 4), similar frames deduped, call cap per game, circuit breaker.
+  ``--min-interval`` seconds (default 6), a 20 s hold after Glimpse confirms the lock, similar frames deduped, call cap per game, circuit breaker.
 * Output: its own folder (default %LOCALAPPDATA%\\QorCapGlimpse\\<match>\\): advisory.jsonl, REPORT.md, crops/.
   Every record is tagged ADVISORY_AI / AI-assisted, advisory_only, feeds_lock=false.
 
@@ -40,7 +40,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-VERSION = "glimpse-watch/0.1.0"
+VERSION = "glimpse-watch/0.1.1"
 ROLE_VERSION = "glimpse-shadow/role-v1"
 TAG = "ADVISORY_AI"
 LABEL = "AI-assisted advisory (Glimpse shadow). Not a score lock; QorCap's local reader decides."
@@ -608,8 +608,9 @@ class Watcher:
         self.last_thumb = None
         self.last_thumb_t = -1e18
         self.other_streak = 0
+        self.confirmed = None  # (lock, t) of Glimpse's last read that agreed with the lock and read a quarter
         self.c = {k: 0 for k in ("frames_seen", "known_skipped", "score_unknown", "quarter_unknown", "sent", "rate_skipped",
-                                 "dup_skipped", "refused", "errors", "rejected", "scorebug", "stats_overlay", "other",
+                                 "dup_skipped", "hold_skipped", "refused", "errors", "rejected", "scorebug", "stats_overlay", "other",
                                  "plausible", "agrees_with_lock", "legal_change", "implausible", "tap_off", "tap_429",
                                  "tap_503", "tap_down")}
         self.regions_seen: list = []
@@ -712,6 +713,12 @@ class Watcher:
         now = self.clock.time()
         # Three "no scorebug" replies in a row (replay, menu, pause): slow down until the picture changes state.
         interval = self.a.min_interval if self.other_streak < 3 else max(self.a.min_interval, self.a.other_backoff)
+        # Glimpse just confirmed the reader's lock: hold off until the lock changes or the hold runs out. A frame
+        # whose state is unknown all game (162055: quarter null from 8:12) would otherwise cost a call every few s.
+        lock_now = (locks[-1]["away"], locks[-1]["home"]) if locks else None
+        if self.confirmed is not None and self.confirmed[0] == lock_now and now - self.confirmed[1] < self.a.confirm_hold:
+            self.c["hold_skipped"] += 1
+            return
         if now - self.last_call_t < interval:
             self.c["rate_skipped"] += 1
             return
@@ -748,6 +755,8 @@ class Watcher:
             k = {"SCOREBUG": "scorebug", "STATS_OVERLAY": "stats_overlay", "OTHER": "other"}.get(res["region"])
             if k:
                 self.c[k] += 1
+            agree = res["plausible"] and "agrees_with_lock" in res["flags"] and res["advisory_quarter"] is not None
+            self.confirmed = (lock_now, now) if agree else None
             if res["plausible"]:
                 self.c["plausible"] += 1
                 self.c["agrees_with_lock" if "agrees_with_lock" in res["flags"] else "legal_change"] += 1
@@ -788,9 +797,9 @@ class Watcher:
                  f"- Updated: {_dt.datetime.now().astimezone().strftime('%Y-%m-%d %H:%M:%S %Z')}{' (final)' if final else ' (live)'}",
                  f"- **Cost this game: ${g:.4f}** of ${self.a.game_cap:.2f} cap; week ${week if week is None else round(week, 4)} of ${self.a.weekly_limit:.2f}"
                  f"{'' if remote is not None else ' (OpenRouter /key unreadable: local ledger + margin)'}", "",
-                 "| Frames from the tap | Known (skipped) | Score unknown | Quarter unknown | Sent to Glimpse | Rate-skipped | Deduped | Refused | Errors | Bad replies |",
-                 "|---|---|---|---|---|---|---|---|---|---|",
-                 f"| {c['frames_seen']} | {c['known_skipped']} | {c['score_unknown']} | {c['quarter_unknown']} | {c['sent']} | {c['rate_skipped']} | {c['dup_skipped']} | {c['refused']} | {c['errors']} | {c['rejected']} |", "",
+                 "| Frames from the tap | Known (skipped) | Score unknown | Quarter unknown | Sent to Glimpse | Rate-skipped | Deduped | Held (just confirmed) | Refused | Errors | Bad replies |",
+                 "|---|---|---|---|---|---|---|---|---|---|---|",
+                 f"| {c['frames_seen']} | {c['known_skipped']} | {c['score_unknown']} | {c['quarter_unknown']} | {c['sent']} | {c['rate_skipped']} | {c['dup_skipped']} | {c['hold_skipped']} | {c['refused']} | {c['errors']} | {c['rejected']} |", "",
                  f"Regions: scorebug {c['scorebug']}, stats box {c['stats_overlay']}, other {c['other']}. "
                  f"Plausible scores {c['plausible']} ({c['agrees_with_lock']} agree with the lock, {c['legal_change']} legal changes); implausible {c['implausible']}.", "",
                  "## Latest advisory reads", "", "| Frame time | Reader state | Region | Glimpse read | Suggestion | Flags |", "|---|---|---|---|---|---|"]
@@ -842,7 +851,8 @@ def build_parser():
     ap.add_argument("--game-cap", type=float, default=0.50)
     ap.add_argument("--weekly-limit", type=float, default=10.0)
     ap.add_argument("--weekly-floor", type=float, default=0.67, help="known spend this week if /key is unreadable")
-    ap.add_argument("--min-interval", type=float, default=4.0, help="seconds between Glimpse requests")
+    ap.add_argument("--min-interval", type=float, default=6.0, help="seconds between Glimpse requests")
+    ap.add_argument("--confirm-hold", type=float, default=20.0, help="after Glimpse agrees with the lock (with a quarter), seconds to wait unless the lock changes")
     ap.add_argument("--poll", type=float, default=2.5, help="seconds between frame-tap polls")
     ap.add_argument("--read-grace", type=float, default=0.8, help="wait before checking the reader's row for a frame")
     ap.add_argument("--dedupe-threshold", type=float, default=2.0, help="mean abs grey diff (0-255) below which a crop is a repeat")
