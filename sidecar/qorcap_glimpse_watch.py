@@ -40,7 +40,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-VERSION = "glimpse-watch/0.1.1"
+VERSION = "glimpse-watch/0.1.2"
 ROLE_VERSION = "glimpse-shadow/role-v1"
 TAG = "ADVISORY_AI"
 LABEL = "AI-assisted advisory (Glimpse shadow). Not a score lock; QorCap's local reader decides."
@@ -60,6 +60,8 @@ LAYOUTS = {
     "primetime": "primetime bar (Sunday Night / Thursday Night)",
     "monday_night": "Monday Night bar (teal away panel)",
     "london": "London game bar",
+    "thursday_night": "Thursday Night primetime bar (silver TNP shield between the scores)",
+    "auto": "not specified; tell it from the image (recent games used the Thursday Night TNP bar)",
     "unknown": "not specified",
 }
 FOOTBALL_SCORE_DELTAS = frozenset({1, 2, 3, 6, 7, 8})  # qor_receipt digit_integrity / QorCap football_step
@@ -616,6 +618,7 @@ class Watcher:
         self.regions_seen: list = []
         self.week = None
         self.started = clock.time()
+        self.stop_reason = None
 
     def say(self, msg):
         self._print(msg)
@@ -676,11 +679,15 @@ class Watcher:
             elif code == 0:
                 self.c["tap_down"] += 1
                 ref = last_ok if last_ok is not None else self.started
-                if now - ref > self.a.idle_exit_s:
-                    self.say(f"[glimpse] QorCap not reachable for {self.a.idle_exit_s:.0f} s; stopping.")
+                limit = self.a.idle_exit_s if last_ok is not None else (self.a.wait_start_s if self.a.wait_start_s is not None else self.a.idle_exit_s)
+                if now - ref > limit:
+                    self.say(f"[glimpse] QorCap not reachable for {limit:.0f} s; stopping.")
                     break
             else:
                 self.c["tap_503"] += 1
+            if self.stop_reason:
+                self.say(f"[glimpse] {self.stop_reason}; stopping.")
+                break
             if self.out is not None and self.c["refused"] and self.budget is not None and self._budget_exhausted():
                 self.say("[glimpse] budget reached; stopping (recording is unaffected).")
                 break
@@ -701,6 +708,10 @@ class Watcher:
         except (TypeError, ValueError):
             frame_ms = int(self.clock.time() * 1000)
         if self.match_dir is None and not self._open_match(hdr.get("x-qorcap-bundle")):
+            return
+        b = hdr.get("x-qorcap-bundle")
+        if b and not self.a.match_dir and Path(b).is_dir() and Path(b).resolve() != self.match_dir:
+            self.stop_reason = f"QorCap moved on to another match ({Path(b).name})"  # one watcher per match
             return
         self.c["frames_seen"] += 1
         self.clock.sleep(self.a.read_grace)  # let the reader's row for this frame land
@@ -850,7 +861,7 @@ def build_parser():
     ap.add_argument("--out", help="output root (default %%LOCALAPPDATA%%\\QorCapGlimpse); must be outside the match folder")
     ap.add_argument("--game-cap", type=float, default=0.50)
     ap.add_argument("--weekly-limit", type=float, default=10.0)
-    ap.add_argument("--weekly-floor", type=float, default=0.67, help="known spend this week if /key is unreadable")
+    ap.add_argument("--weekly-floor", type=float, default=0.82, help="known spend this week if /key is unreadable")
     ap.add_argument("--min-interval", type=float, default=6.0, help="seconds between Glimpse requests")
     ap.add_argument("--confirm-hold", type=float, default=20.0, help="after Glimpse agrees with the lock (with a quarter), seconds to wait unless the lock changes")
     ap.add_argument("--poll", type=float, default=2.5, help="seconds between frame-tap polls")
@@ -862,6 +873,7 @@ def build_parser():
     ap.add_argument("--timeout", type=float, default=12.0)
     ap.add_argument("--max-minutes", type=float, default=180)
     ap.add_argument("--idle-exit-s", type=float, default=300, help="stop when QorCap has been unreachable this long")
+    ap.add_argument("--wait-start-s", type=float, default=None, help="before the first frame, wait this long for QorCap (default: --idle-exit-s)")
     ap.add_argument("--no-save-crops", dest="save_crops", action="store_false")
     return ap
 

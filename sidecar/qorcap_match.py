@@ -945,8 +945,53 @@ def main(argv=None) -> int:
     if live is not None:
         say(f"  Official anchors: {live.anchors} (link failures: {live.failures})")
     if code != 2 and (a.submit or not a.no_submit_prompt) and not a.test_pattern:
-        offer_submit(bundle, a.referee_url, auto=a.submit, ask=input)
+        offer_submit(bundle, a.referee_url, auto=a.submit, ask=ask_with_timeout)
     return code
+
+
+SUBMIT_PROMPT_TIMEOUT_S = 600
+
+
+def ask_with_timeout(prompt: str, timeout_s: float = SUBMIT_PROMPT_TIMEOUT_S, *, stdin=None, clock=time.monotonic) -> str:
+    """input() that gives up after ``timeout_s`` and answers "" (= No).
+
+    v0.3.23: after match-20261018-084523 the Start Match sidecar sat at "Submit now? [y/N]" for over an hour
+    after the match ended (qorcap.exe and the Glimpse watcher had exited). An unattended prompt should not
+    keep the process alive or wait for a stray "y". Timeout means not submitted."""
+    stdin = stdin or sys.stdin
+    sys.stdout.write(prompt)
+    sys.stdout.flush()
+    end = clock() + timeout_s
+    if WIN and stdin is sys.stdin and sys.stdin.isatty():
+        import msvcrt
+        buf = ""
+        while clock() < end:
+            if msvcrt.kbhit():
+                ch = msvcrt.getwche()
+                if ch in ("\r", "\n"):
+                    sys.stdout.write("\n")
+                    return buf
+                if ch == "\b":
+                    buf = buf[:-1]
+                else:
+                    buf += ch
+            else:
+                time.sleep(0.05)
+    else:
+        import select
+        try:
+            while clock() < end:
+                r, _, _ = select.select([stdin], [], [], min(0.5, max(0.0, end - clock())))
+                if r:
+                    line = stdin.readline()
+                    if line == "":
+                        raise EOFError
+                    return line.rstrip("\r\n")
+        except (OSError, ValueError, TypeError):
+            return input() if stdin is sys.stdin else stdin.readline().rstrip("\r\n")
+    sys.stdout.write("\n")
+    say(f"No answer in {int(timeout_s // 60)} min.")
+    return ""
 
 
 def offer_submit(bundle: Path, referee_url: str | None, *, auto: bool = False, ask=input) -> int | None:

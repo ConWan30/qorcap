@@ -2,7 +2,7 @@
 
 # QorCap
 
-**Website:** https://conwan30.github.io/qorcap/ · **Download:** [v0.3.21](https://github.com/ConWan30/qorcap/releases/tag/v0.3.21) ([latest release](https://github.com/ConWan30/qorcap/releases/latest))
+**Website:** https://conwan30.github.io/qorcap/ · **Download:** [v0.3.23](https://github.com/ConWan30/qorcap/releases/tag/v0.3.23) ([latest release](https://github.com/ConWan30/qorcap/releases/latest))
 
 A small Windows recorder for a USB HDMI capture card (built for a generic **"USB3.0 Video"** card carrying a PS5),
 made for **[QorTime](https://github.com/ConWan30/qortime)** match receipts. It does two jobs:
@@ -26,7 +26,7 @@ with a local control surface). QorCap copies only that design idea, no code. No 
 
 ## Quickstart: double-click Start Match
 
-1. Download `qorcap-v0.3.21-windows-x64.zip` from the [latest release](https://github.com/ConWan30/qorcap/releases/latest)
+1. Download `qorcap-v0.3.23-windows-x64.zip` from the [latest release](https://github.com/ConWan30/qorcap/releases/latest)
    and unzip it, for example to `C:\QorCap` (right-click the zip, *Extract All*).
 2. Connect PS5 HDMI out to the **USB3.0 Video** card, and the card to a blue USB 3 port. Close OBS or the Camera app.
 3. Double-click **`Start Match`**. On the first run it downloads ffmpeg, installs Python 3.12 through winget if it
@@ -327,7 +327,7 @@ Global: `--port 8788`, `--ffmpeg PATH`, `--log FILE` (default `qorcap.log`, or `
 ## Run on Windows by hand (PowerShell, advanced)
 
 ```powershell
-# 1. unzip qorcap-v0.3.21-windows-x64.zip to C:\QorCap, then:
+# 1. unzip qorcap-v0.3.23-windows-x64.zip to C:\QorCap, then:
 cd C:\QorCap
 Unblock-File .\qorcap.exe, .\get-ffmpeg.ps1
 powershell -ExecutionPolicy Bypass -File .\get-ffmpeg.ps1     # puts ffmpeg.exe next to qorcap.exe
@@ -364,6 +364,8 @@ continues), replay save, challenge stamp visible in the video, score/final event
 written, `verify-bundle` OK, and a single flipped byte reported as FAIL.
 
 **Tested on Windows (v0.2.0–v0.2.1 era, MyTurn, USB3.0 Video):** `--input-format mjpeg` 1280x720@30 with `h264_mf` at 29.7 fps. v0.2.1 fixed audio / auto-format / OBS.
+
+**v0.3.23:** standard bar red "4". On match-20261018-084523 (CHI at ATL, standard bar) the red home "14" scored 0.57-0.64 against the QorTime "4" template (gate 0.70), so every read from 0-14 on was dropped and the draft stopped at 0-13 Q2 while the game ended 6-14 (confirmed by the player; `sidecar/eval/human_labels.jsonl`). A real-glyph "4" variant from that match (`packs/madden27_standard_score_084523.npz`, 111 glyphs, `tools/add_standard_four_084523.py`) now reads 0-14 and 6-14 through Q4; the gate is unchanged. On all 101 fixture and sample images only that match's frames change, each to the correct score. The end-of-match "Submit now? [y/N]" prompt answers No by itself after 10 minutes, so an unattended Start Match window exits (after 084523 it sat at that prompt for over an hour). Start Match auto-starts the advisory Glimpse watcher 0.1.2 when `QORCAP_GLIMPSE_FRAME=1` (detached, minimized, BelowNormal, fail-soft; `--no-glimpse` opts out); it never feeds a lock or a receipt. Includes `qorcap highlights` (#36). v0.3.22 (touchdown fast path) was never released; that work continues separately.
 
 **v0.3.21:** Thursday Night (primetime "TNP") quarters on real footage, and a conservative challenge fallback for short quarters. On match-20261017-232726 and match-20261018-002316 the bar was Thursday Night (the receipt said `madden27_standard` only because no read reached agreed quality), and the 010703 quarter digits scored 0.36–0.70 against the real 1ST/2ND/3RD (gate 0.75): 1,303 of 1,471 sampled bars with a sure score had no quarter. The pack gains 240 real quarter skeletons from those two matches (`tools/add_tnp_quarter_232726_002316.py`, labels in `tools/thursday_night_labels/quarter_232726_002316.json`: clock-reset segments, matching k-means clusters, Glimpse crop reads 88/88, eye check); sampled bars now read the quarter 1,460 of 1,471 times, 0 wrong. Gates unchanged. The period track now also counts a reset back to within 30 s of the longest clock seen (6:00 quarters never reached the 10:00 rule), but only after a real rundown; a 0-0 running clock before any rundown is the opening quarter for the kickoff challenge; the elapsed-time fallback needs a scorebug read in the last 30 s (002316 issued "halftime" in the post-game menus). Bundles the advisory Glimpse watcher (`Glimpse Watch.cmd`, `sidecar/qorcap_glimpse_watch.py`, `sidecar/glimpse/`, PRs #32/#33).
 
