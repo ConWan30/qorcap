@@ -805,6 +805,31 @@ mod tests {
     }
 
     #[test]
+    fn third_quarter_read_survives_the_post_game_reset() {
+        // 162055's last on-screen quarter is the 3rd. A later 0-0 must not put the receipt back on Q1.
+        use clap::Parser;
+        let dir = std::env::temp_dir().join(format!("qorcap-q3-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let d = dir.to_string_lossy().into_owned();
+        let crate::cli::Cmd::Record(r) = crate::cli::Cli::try_parse_from(["q", "record", "--device", "testpattern", "--bundle", &d]).unwrap().cmd else { panic!() };
+        let e = Engine::new(r, "ffmpeg-x".into());
+        e.event(&serde_json::json!({"type":"score","home":0,"away":0,"quarter":1,"clock_s":247})).unwrap();
+        e.event(&serde_json::json!({"type":"score","home":21,"away":6,"quarter":2,"clock_s":20})).unwrap();
+        e.event(&serde_json::json!({"type":"score","home":21,"away":6,"quarter":3,"clock_s":237})).unwrap();
+        e.event(&serde_json::json!({"type":"obs","obs":"scorebug_absent","t_ms":1000,"until_ms":94000,"n":180})).unwrap();
+        let ignored = e.event(&serde_json::json!({"type":"score","home":0,"away":0,"quarter":1,"clock_s":240})).unwrap();
+        assert_eq!(ignored["new_session"], true);
+        let out = e.write_bundle().unwrap();
+        let draft: Value = serde_json::from_str(&std::fs::read_to_string(out.join("receipt.draft.json")).unwrap()).unwrap();
+        assert_eq!(draft["result"]["home_score"], 21);
+        assert_eq!(draft["result"]["away_score"], 6);
+        assert_eq!(draft["result"]["quarter"], 3);
+        assert_eq!(draft["result"]["final_confirmed"], false);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn legal_score_after_a_long_absence_still_counts() {
         use clap::Parser;
         let dir = std::env::temp_dir().join(format!("qorcap-abs-{}", std::process::id()));
