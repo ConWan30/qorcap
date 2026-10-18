@@ -29,6 +29,10 @@ from typing import Any
 from qorcap_reader import PeriodTrack
 
 PHASE_QUARTERS = (("kickoff", 1), ("halftime", 3), ("end", 4))
+# v0.3.21: the elapsed fallback only fires while the scorebug is still on screen. match-20261018-002316 was quit at
+# the half; its "halftime" challenge was issued from the elapsed clock in the post-game menus, 5 min 47 s after the
+# last scorebug read, with no Q3 being played.
+ELAPSED_READ_FRESH_MS = 30_000
 
 
 def phase_for_quarter(q: int | None) -> str | None:
@@ -140,9 +144,15 @@ class PauseCapableGate:
         """Quarter glyph missing: keep the score, and arm from a clock reset or from elapsed time.
 
         A null quarter during the opening quarter does not open halftime or the end challenge.
+        v0.3.21: before any period has ended, a running clock with the score still 0-0 is the 1st quarter (the
+        kickoff phase only). A quarter already inferred is kept until a reset moves it on.
         """
         self.last_read = dict(rd)
         inferred = self.periods.inferred_quarter(t)
+        if inferred is None:
+            inferred = self.quarter
+        if inferred is None and self._opening_quarter(rd, c):
+            inferred = 1
         if inferred is None:
             return
         if self.quarter is not None and inferred < self.quarter:
@@ -157,6 +167,14 @@ class PauseCapableGate:
                 self.q_first_clock = c
             elif self.running_since is None and c < self.q_first_clock:
                 self.running_since = t
+
+    def _opening_quarter(self, rd: dict[str, Any], c) -> bool:
+        p = self.periods
+        if p.periods_completed or p.first_period_end_ms is not None or p.saw_low:
+            return False
+        if isinstance(c, bool) or not isinstance(c, int) or c <= 0:
+            return False
+        return rd.get("away") == 0 and rd.get("home") == 0
 
     # -- frames
     def on_frame(self, t_ms: int, play_call: bool, paused: bool = False) -> GateEvent | None:
@@ -192,6 +210,8 @@ class PauseCapableGate:
         if lr is None or isinstance(lr.get("quarter"), int):
             return None
         if not self.periods.clock_unreadable:
+            return None
+        if t_ms - int(lr.get("t_ms") or 0) > ELAPSED_READ_FRESH_MS:
             return None
         inferred = self.periods.inferred_quarter(t_ms)
         if inferred is None or inferred < 3:

@@ -95,9 +95,14 @@ def test_gate_second_half_needs_its_own_kickoff():
 def test_gate_unknown_quarter_uses_clock_reset_and_not_q1_for_the_end():
     """No quarter: a running clock after two period resets opens halftime. Q1 never opens the end."""
     g = PauseCapableGate(proxy_after_ms=1_000)
-    _read(g, 0, None, 900)
-    _read(g, 1_000, None, 880)
+    _read(g, 0, None, 900, 3, 0)              # score already on the board, no period seen: nothing
+    _read(g, 1_000, None, 880, 3, 0)
     assert [g.on_frame(t, False) for t in range(1_000, 20_000, 500)] == [None] * 38
+    g = PauseCapableGate(proxy_after_ms=1_000)
+    _read(g, 0, None, 900)                    # 0-0 with a running clock is the opening quarter: kickoff only
+    _read(g, 1_000, None, 880)
+    evs = [e for e in (g.on_frame(t, False) for t in range(1_000, 20_000, 500)) if e]
+    assert [(e.phase, e.quarter) for e in evs] == [("kickoff", 1)]
 
     g = PauseCapableGate(proxy_after_ms=1_000)
     _read(g, 0, 1, 1)                         # Q1 ran out
@@ -122,11 +127,111 @@ def test_gate_elapsed_fallback_when_the_clock_dies_at_the_quarter_break():
     g = PauseCapableGate()
     _read(g, 0, 1, 1)
     _read(g, 1_000, None, None)
+    _read(g, 1_000 + ELAPSED_PERIOD_MS - 5_000, None, None)              # the scorebug is still up, clock blank
     assert g.on_frame(1_000 + ELAPSED_PERIOD_MS, False) is None          # one period later is still Q2
+    _read(g, 1_000 + 2 * ELAPSED_PERIOD_MS - 5_000, None, None)
     half = g.on_frame(1_000 + 2 * ELAPSED_PERIOD_MS, False)
     assert half is not None and half.basis == "elapsed" and half.phase == "halftime"
+    _read(g, 1_000 + 3 * ELAPSED_PERIOD_MS - 5_000, None, None)
     end = g.on_frame(1_000 + 3 * ELAPSED_PERIOD_MS, False)
     assert end is not None and end.basis == "elapsed" and end.phase == "end" and end.quarter == 4
+
+
+def test_gate_elapsed_fallback_needs_the_scorebug_on_screen():
+    """match-20261018-002316 was quit at the half. 24 min after the Q1 rundown it was in the menus with no
+    scorebug for almost 6 min; v0.3.20 issued "halftime" there. A stale last read must not open a phase."""
+    from qorcap_playcall import ELAPSED_READ_FRESH_MS
+    from qorcap_reader import ELAPSED_PERIOD_MS
+
+    g = PauseCapableGate()
+    _read(g, 0, None, 1, 21, 31)
+    _read(g, 1_000, None, None, 21, 37)
+    t = 1_000 + 2 * ELAPSED_PERIOD_MS
+    assert g.on_frame(t, False) is None
+    _read(g, t + 1_000 - ELAPSED_READ_FRESH_MS + 2_000, None, None, 21, 37)  # scorebug back: the fallback may fire
+    assert g.on_frame(t + 1_000, False).phase == "halftime"
+
+
+def _six_minute_game(g, q_of=lambda q: None, step=1_000):
+    """A Thursday Night game with 6:00 quarters, as on match-20261017-232726: each quarter 6:00 -> 0:00."""
+    t = 0
+    for q in (1, 2, 3, 4):
+        for c in range(360, -1, -2):
+            _read(g, t, q_of(q), c, 7 * (q - 1), 3 * (q - 1) if q > 1 else 0)
+            g.on_frame(t, False)
+            t += step
+        t += 60_000                         # quarter break: no scorebug
+    return t
+
+
+def test_gate_short_quarters_open_every_phase_without_a_quarter_glyph():
+    """6:00 quarters never reached the 10:00 reset rule, so v0.3.20 never counted a period. Now every reset counts
+    after a real rundown: kickoff in Q1 (0-0), halftime in Q3, end in Q4, each once from the clock proxy."""
+    g = PauseCapableGate(proxy_after_ms=45_000)
+    _six_minute_game(g)
+    got = [(e.phase, e.quarter) for e in g.events]
+    assert ("kickoff", 1) in got and ("halftime", 3) in got and ("end", 4) in got
+    assert all(e.basis == "clock_proxy" for e in g.events)
+    assert g.periods.periods_completed == 3
+    # Phases arrive in order, each one at least 45 s into its own quarter (never at a reset or a rundown).
+    order = [e.phase for e in g.events]
+    assert order.index("kickoff") < order.index("halftime") < order.index("end")
+    for e in g.events:
+        assert e.clock_s is not None and 0 < e.clock_s < 360
+
+
+def test_gate_short_quarters_same_events_when_the_glyph_is_read():
+    a = PauseCapableGate(proxy_after_ms=45_000)
+    _six_minute_game(a, q_of=lambda q: q)
+    b = PauseCapableGate(proxy_after_ms=45_000)
+    _six_minute_game(b)
+    assert [(e.phase, e.quarter) for e in a.events if e.phase != "kickoff" or e.quarter == 1] == \
+           [(e.phase, e.quarter) for e in b.events if e.phase != "kickoff" or e.quarter == 1]
+
+
+def test_lone_low_clock_misread_mid_quarter_is_not_a_period():
+    """A single 0:03 between 3:00 reads is a misread, not a rundown: the next 5:50 must not count as a new quarter."""
+    from qorcap_reader import PeriodTrack
+
+    p = PeriodTrack()
+    for t, c in enumerate([360, 300, 240, 180, 3, 178, 350, 170]):
+        p.note(t * 1_000, c)
+    assert p.periods_completed == 0
+    for t, c in enumerate([60, 30, 2, 0, 360, 358], start=10):
+        p.note(t * 1_000, c)
+    assert p.periods_completed == 1
+
+
+def test_short_reset_needs_a_clock_near_the_quarter_length():
+    """After a real rundown, a 2:00 read is not a 6:00 reset. 15:00 quarters keep the 10:00 rule."""
+    from qorcap_reader import PeriodTrack
+
+    p = PeriodTrack()
+    for t, c in enumerate([360, 200, 60, 1, 120, 200, 320]):
+        p.note(t * 1_000, c)
+    assert p.periods_completed == 0          # 320 < 360 - 30
+    p.note(10_000, 340)
+    assert p.periods_completed == 1
+    q = PeriodTrack()
+    for t, c in enumerate([900, 300, 50, 0, 590]):
+        q.note(t * 1_000, c)
+    assert q.periods_completed == 0 and q.reset_clock_s() == 600
+    q.note(9_000, 900)
+    assert q.periods_completed == 1
+
+
+def test_opening_quarter_is_not_inferred_after_a_rundown_or_with_points():
+    g = PauseCapableGate(proxy_after_ms=1_000)
+    _read(g, 1_000, None, 2, 0, 0)            # recording opens on a rundown: whatever comes next is not "Q1"
+    _read(g, 2_000, None, None, 0, 0)
+    _read(g, 3_000, None, 2, 0, 0)
+    assert g.quarter is None
+    assert all(g.on_frame(t, False) is None for t in range(3_000, 10_000, 500))
+    g = PauseCapableGate(proxy_after_ms=1_000)
+    _read(g, 0, None, 300, 7, 0)              # points on the board: Q1 or Q2, unknown
+    _read(g, 1_000, None, 290, 7, 0)
+    assert g.quarter is None
+    assert all(g.on_frame(t, False) is None for t in range(1_000, 10_000, 500))
 
 
 def test_gate_clock_proxy_fallback_once_per_quarter():
