@@ -75,7 +75,7 @@ Files in the match folder: `video.mp4`, `clips/`, `manifest.jsonl`, `checkpoints
 referee countersignatures); after finalize also `timeline.offline.jsonl`, `score_checkpoints.jsonl`, `final.offline.json`; when the final was
 confirmed from the recording's last minutes at stop, `final.tail.json` and `clips/final-recorded.mp4`.
 
-QorTime code: the zip bundles a pinned copy (`qortime/`, commit `e9c5c95`, includes `qortime referee-ai`, `end_menu_read` and official-review (verified uploads) support). If it is missing, the launcher downloads that
+QorTime code: the zip bundles a pinned copy (`qortime/`, commit `11baa46`, includes `qortime referee-ai`, `end_menu_read`, official-review (verified uploads) and challenge rule v2 verification). If it is missing, the launcher downloads that
 pinned commit's zip once into `%LOCALAPPDATA%\QorCap`.
 
 ## Stack and why
@@ -355,7 +355,7 @@ written, `verify-bundle` OK, and a single flipped byte reported as FAIL.
 
 **Tested on Windows (v0.2.0–v0.2.1 era, MyTurn, USB3.0 Video):** `--input-format mjpeg` 1280x720@30 with `h264_mf` at 29.7 fps. v0.2.1 fixed audio / auto-format / OBS.
 
-**v0.3.20:** challenge rule v2. `bundle.json` now carries `challenge_rule: 2` for a new recording, and an older recording opts in when it is signed again. The official referee then times each challenge pause from the fragment PTS (presentation time) with a 2500 ms ceiling, and requires every successful latency to sit within ±300 ms of their median. A bundle without the field stays on rule v1 (segment_ranges clock, 0..600 ms), so older receipts keep their meaning. The recorder's own recheck results carry no rule field. Known gap: a constant relay delay under 2.5 s still passes rule v2. Score reading is unchanged from v0.3.19.
+**v0.3.20:** challenge rule v2. `bundle.json` now carries `challenge_rule: 2` for a new recording, and an older recording opts in when it is signed again. The official referee then times each challenge pause from the fragment PTS (presentation time) with a 2500 ms ceiling, and requires every successful latency to sit within ±300 ms of their median. A bundle without the field stays on rule v1 (segment_ranges clock, 0..600 ms), so older receipts keep their meaning. The recorder's own recheck results carry no rule field. Known gap: a constant relay delay under 2.5 s still passes rule v2. The bundled QorTime copy moves to `11baa46` (from `ad3d0da`), so the official receipt that Submit for Verification checks on this PC is read with rule v2; the older copy would have flagged a rule-2 pause above 600 ms as `challenge_latency_out_of_range`. Score reading is unchanged from v0.3.19.
 
 **v0.3.19:** Monday Night quarter words on match 20261017-162055 are thicker and blurrier than the templates cut from the earlier strip, so a correct 2nd or 3rd quarter led by a wide margin and still scored 0.65–0.75. The pack now includes real glyphs from that match (quarter, the thick clock digits, and the teal away 6). A frame is scored again with every template from its own video minute held out, and a 3rd quarter held out that way stays unknown instead of flipping to 1st. A blurry 1st quarter that still leads by a wide gap is accepted. The chevron beside the teal away score no longer blanks the digit. The 0.85 and 0.75 gates are unchanged. The receipt quarter for that match is 3. The offline labels used to cut the glyphs are not a live input.
 
