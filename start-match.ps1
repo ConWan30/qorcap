@@ -72,7 +72,7 @@ foreach ($x in $fwd) {
 }
 if (-not $hasChallengeFlag) { $fwd = @("--official-challenges") + $fwd }
 
-# Advisory Glimpse watcher (v0.3.22): ADVISORY_AI, shadow-only, never feeds a lock or the receipt. On when the user
+# Advisory Glimpse watcher (v0.3.23): ADVISORY_AI, shadow-only, never feeds a lock or the receipt. On when the user
 # variable QORCAP_GLIMPSE_FRAME is 1 (opt out for one match with --no-glimpse). Started detached, minimized, below
 # normal priority, before recording; it waits for QorCap's frame tap and stops when QorCap goes away. Any problem
 # here is reported in one line and the match runs normally. The API key is never printed.
