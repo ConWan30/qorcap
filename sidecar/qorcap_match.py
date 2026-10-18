@@ -42,7 +42,7 @@ import urllib.request
 import zipfile
 from pathlib import Path
 
-QORTIME_PIN = "11baa4643d93ba57dcf6e57765b462f0bc33f452"
+QORTIME_PIN = "0204e6d8082f8c40ea1fe5e09bf16402aaee3ff2"
 QORTIME_ZIP = f"https://github.com/ConWan30/qortime/archive/{QORTIME_PIN}.zip"
 VERIFY_URL = "https://conwan30.github.io/qortime/verify/"
 REFEREE_KIND = "local-self-attested"
@@ -669,6 +669,11 @@ def main(argv=None) -> int:
         sys.path.insert(0, str(HERE))
         from qorcap_highlights import main as highlights_main
         return highlights_main(argv)
+    if "psn-names" in argv:  # `qorcap_match.py psn-names [BUNDLE] [--samples 60]` (post-match only, on-screen evidence)
+        argv.remove("psn-names")
+        sys.path.insert(0, str(HERE))
+        from qorcap_psn import main as psn_main
+        return psn_main(argv)
     if "submit" in argv:  # `qorcap_match.py [--qorcap X ...] submit [BUNDLE] [--full]` -> QorTime official referee
         argv.remove("submit")
         from qorcap_submit import main as submit_main
@@ -1087,6 +1092,7 @@ def sign_and_report(bundle: Path, draft: dict, cps: list[dict], device, referee,
     """Shared by Start Match and finalize: build + sign receipt.json, run both verifiers, print the summary."""
     opt_in_challenge_rule(bundle)
     draft = fill_challenge_results(bundle, draft)
+    draft = with_observed_handles(bundle, draft)
     no_final = "final_basis" not in draft["result"] or draft["result"].get("final_basis") is None
     if no_final:
         draft = dict(draft, result={k: v for k, v in draft["result"].items() if k != "final_basis"})
@@ -1958,6 +1964,9 @@ def finalize_main(argv) -> int:
     ap.add_argument("--no-open", action="store_true")
     ap.add_argument("--recover", action="store_true",
                     help="rebuild receipt.draft.json and bundle.json from manifest, checkpoints, inputs, challenges and timeline")
+    ap.add_argument("--psn-names", action="store_true",
+                    help="opt-in: before signing, read the PSN names Madden showed (online games) into the receipt as "
+                         "match.observed_handles (on-screen evidence, not account proof)")
     ap.add_argument("--highlights", action="store_true",
                     help="opt-in: after signing, cut verified highlight clips around each locked score change (highlights/)")
     a = ap.parse_args(argv)
@@ -1976,12 +1985,45 @@ def finalize_main(argv) -> int:
         say(f"Missing Python packages: {' '.join(miss)}\n  Fix: py -m pip install {' '.join(miss)}")
         return 3
     ff = a.ffmpeg or next((str(c) for c in [HERE.parent / ("ffmpeg.exe" if WIN else "ffmpeg")] if c.exists()), None) or shutil.which("ffmpeg") or "ffmpeg"
+    if a.psn_names:
+        post_match_psn_names(bundle, ff)
     rc = finalize(bundle, qt=qt, qorcap=find_qorcap(a.qorcap), ffmpeg=ff,
                   key_dir=Path(a.key_dir) if a.key_dir else data_dir() / "keys", no_open=a.no_open, hz=a.hz,
                   recover=a.recover)
     if a.highlights:
         post_match_highlights(bundle, ff)
     return rc
+
+
+def post_match_psn_names(bundle: Path, ffmpeg: str) -> None:
+    """Opt-in post-match step (before signing). Never raises: a name problem must not change the finalize result; the
+    receipt then simply carries no observed_handles. Refuses while the recorder still writes the bundle."""
+    try:
+        sys.path.insert(0, str(HERE))
+        from qorcap_psn import Refuse, read_bundle, summary
+        say("\nReading the PSN names Madden showed on screen (on-screen evidence, not account proof) ...")
+        doc = read_bundle(bundle, ffmpeg=ffmpeg)
+        (bundle / "psn_names.json").write_text(json.dumps(doc, indent=2), encoding="utf-8")
+        for line in summary(doc):
+            say(line)
+    except Refuse as e:
+        say(f"  PSN names skipped: {e}")
+    except Exception as e:  # noqa: BLE001
+        say(f"  PSN names failed (the receipt is unaffected): {e}")
+
+
+def with_observed_handles(bundle: Path, draft: dict) -> dict:
+    """Copy psn_names.json into the receipt draft as match.observed_handles when it is bound to this bundle's video
+    chain (a stale or copied file is ignored). Signed with the rest of the receipt."""
+    try:
+        sys.path.insert(0, str(HERE))
+        from qorcap_psn import load_bound, observed_handles
+        doc = load_bound(bundle)
+    except Exception:  # noqa: BLE001
+        return draft
+    if not doc:
+        return draft
+    return dict(draft, match=dict(draft["match"], observed_handles=observed_handles(doc)))
 
 
 def post_match_highlights(bundle: Path, ffmpeg: str) -> None:
