@@ -40,7 +40,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-VERSION = "glimpse-watch/0.1.2"
+VERSION = "glimpse-watch/0.1.3"
 ROLE_VERSION = "glimpse-shadow/role-v1"
 TAG = "ADVISORY_AI"
 LABEL = "AI-assisted advisory (Glimpse shadow). Not a score lock; QorCap's local reader decides."
@@ -495,6 +495,53 @@ class FrameTap:
             return 0, None, {}
 
 
+class TdJumpTail:
+    """v0.1.3: touchdown fast-path candidates QorCap's reader is holding (``td_jumps.jsonl`` in the watcher's OWN
+    output folder, written by the sidecar; never in the match folder). Shadow only: the second opinion is logged and
+    never changes a lock or a receipt."""
+
+    def __init__(self, path):
+        self.path, self.pos, self.queue, self.done = Path(path), 0, [], set()
+
+    def poll(self):
+        try:
+            with open(self.path, "r", encoding="utf-8") as f:
+                f.seek(self.pos)
+                data = f.read()
+        except OSError:
+            return
+        cut = data.rfind("\n")
+        if cut < 0:
+            return
+        self.pos += len(data[:cut + 1].encode("utf-8"))
+        for line in data[:cut + 1].splitlines():
+            try:
+                ev = json.loads(line)
+            except ValueError:
+                continue
+            if ev.get("event") == "pending" and ev.get("id") not in self.done:
+                self.queue.append(ev)
+            elif ev.get("event") in ("posted", "cancelled", "superseded"):
+                for q in self.queue:
+                    if q.get("id") == ev.get("id"):
+                        q["outcome"] = ev.get("event") + (":" + ev["why"] if ev.get("why") else "")
+
+
+def td_verdict(obj, cand, old):
+    """Second opinion on a held touchdown jump: agree / disagree_old / disagree_other / no_read."""
+    if not obj or obj.get("region") != "SCOREBUG" or obj.get("away_score") is None or obj.get("home_score") is None:
+        return "no_read"
+    p = (obj["away_score"], obj["home_score"])
+    if p == tuple(cand):
+        return "agree"
+    if old is not None and p == tuple(old):
+        return "disagree_old"
+    return "disagree_other"
+
+
+TD_SECOND_OPINION_MAX_AGE_MS = 15_000
+
+
 class TimelineTail:
     """Reads only the bytes appended since the last poll; opens and closes the file each time (no held handle)."""
 
@@ -614,7 +661,8 @@ class Watcher:
         self.c = {k: 0 for k in ("frames_seen", "known_skipped", "score_unknown", "quarter_unknown", "sent", "rate_skipped",
                                  "dup_skipped", "hold_skipped", "refused", "errors", "rejected", "scorebug", "stats_overlay", "other",
                                  "plausible", "agrees_with_lock", "legal_change", "implausible", "tap_off", "tap_429",
-                                 "tap_503", "tap_down")}
+                                 "tap_503", "tap_down", "td_asked", "td_agree", "td_disagree", "td_no_read", "td_expired")}
+        self.td = None
         self.regions_seen: list = []
         self.week = None
         self.started = clock.time()
@@ -643,6 +691,7 @@ class Watcher:
         if self.a.save_crops:
             (self.out / "crops").mkdir(exist_ok=True)
         self.tail = TimelineTail(self.match_dir / "timeline.jsonl")
+        self.td = TdJumpTail(self.out / "td_jumps.jsonl")
         self.budget = Budget(out_root / "ledger.jsonl", self.match_id, per_game_cap=self.a.game_cap, weekly_limit=self.a.weekly_limit,
                              weekly_floor=self.a.weekly_floor, key_reader=self.key_reader)
         self.client = Client(self.budget, timeout_s=self.a.timeout, max_calls=self.a.max_calls, post=self.post, clock=self.clock)
@@ -714,6 +763,8 @@ class Watcher:
             self.stop_reason = f"QorCap moved on to another match ({Path(b).name})"  # one watcher per match
             return
         self.c["frames_seen"] += 1
+        if self.td is not None and self._td_second_opinion(jpeg, frame_ms, seq):
+            return
         self.clock.sleep(self.a.read_grace)  # let the reader's row for this frame land
         self.tail.poll()
         state, last, locks = self.tail.state_at(frame_ms)
@@ -792,6 +843,55 @@ class Watcher:
                  f"{('suggest ' + str(sug['away']) + '-' + str(sug['home'])) if sug else ','.join(res['flags'])[:60]:<40} "
                  f"Q{res['advisory_quarter'] if res['advisory_quarter'] else '?'}  game ${g:.4f}/{self.a.game_cap:.2f}")
         self.write_report()
+
+    def _td_second_opinion(self, jpeg, frame_ms, seq) -> bool:
+        """A held touchdown jump gets one Glimpse read of the next frame (shadow: logged, never fed back)."""
+        self.td.poll()
+        while self.td.queue and frame_ms - int(self.td.queue[0].get("t_ms") or 0) > TD_SECOND_OPINION_MAX_AGE_MS:
+            ev = self.td.queue.pop(0)
+            self.td.done.add(ev.get("id"))
+            self.c["td_expired"] += 1
+        if not self.td.queue:
+            return False
+        ev = self.td.queue[0]
+        if frame_ms < int(ev.get("t_ms") or 0) - 1000:
+            return False
+        self.td.queue.pop(0)
+        self.td.done.add(ev.get("id"))
+        crop, _thumb = crop_scorebug(jpeg)
+        if crop is None:
+            self.c["errors"] += 1
+            return True
+        task = self.task + self.ctx.format(layout=LAYOUTS.get(self.layout, self.layout), last_lock="not given for this crop")
+        r = self.client.ask(self.system, task, crop, self.schema, kind="td_second_opinion")
+        obj, rej = None, None
+        if r["text"] is not None:
+            try:
+                obj = parse_strict(r["text"], self.schema)
+            except Rejected as e:
+                rej = str(e)
+        v = "refused" if r["refused"] else td_verdict(obj, ev.get("cand"), ev.get("old"))
+        self.c["td_asked"] += 1
+        self.c[{"agree": "td_agree", "no_read": "td_no_read", "refused": "td_no_read"}.get(v, "td_disagree")] += 1
+        item = f"td_{ev.get('id')}_seq{seq}"
+        if self.a.save_crops and not r["refused"]:
+            (self.out / "crops" / f"{item}.jpg").write_bytes(crop)
+        rec = {"tag": TAG, "ai_assisted": True, "advisory_only": True, "feeds_lock": False, "label": LABEL,
+               "role_version": ROLE_VERSION, "tool_version": VERSION, "prompt_sha": self.prompt_sha, "model": MODEL,
+               "kind": "td_second_opinion", "item_id": item, "td_id": ev.get("id"), "cand": ev.get("cand"),
+               "old": ev.get("old"), "confusable": ev.get("confusable"), "frame_wall_ms": frame_ms, "frame_seq": seq,
+               "t_wall": time.time(), "match_id": self.match_id, "layout": self.layout, "verdict": v,
+               "valid": obj is not None, "reject_reason": rej, "model_reply": obj, "cost": r["cost"],
+               "game_spent": round(self.budget.game_spent(), 6), "latency_s": r["latency_s"], "gen_id": r["gen_id"],
+               "error": r["error"], "refused": r["refused"], "raw": (r["text"] or "")[:600]}
+        self._emit(rec)
+        try:  # read only by QorCap's ENFORCING mode (off by default, needs Con's OK); shadow mode never reads it
+            with open(self.out / "td_verdicts.jsonl", "a", encoding="utf-8") as f:
+                f.write(json.dumps({"id": ev.get("id"), "verdict": v, "frame_wall_ms": frame_ms}) + "\n")
+        except OSError:
+            pass
+        self.say(f"[glimpse] {_hhmmss(frame_ms)} touchdown jump {ev.get('old')} -> {ev.get('cand')}: second opinion {v}")
+        return True
 
     def write_report(self, final=False):
         if self.out is None:

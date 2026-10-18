@@ -135,6 +135,280 @@ class PeriodTrack:
         return False
 
 
+# v0.3.22: a touchdown that the bar shows only briefly. match-20261018-002316 ended on a TD at 2ND 0:07 (21-31 ->
+# 21-37): the bar showed 21-37 on 8 of 24 frames between a TOUCHDOWN banner and the menus, and only 2 consecutive
+# frames read the clock, so neither window locked and the offline receipt fell back to 21-31.
+TD_DELTAS = (6, 7, 8)
+TD_NEED = 4                 # reads of the new pair
+TD_MIN_SPAN_MS = 750
+TD_WINDOW_MS = 8_000        # first to last read of the new pair
+TD_MIN_INTERVAL_MS = 200
+# v0.3.23 safeguard (local only). match-20261017-021003: the standard bar showed QOR 13 - EVE 0 and v0.3.22 locked
+# 13-8: the "0" matched the "8" template on 4 frames in a row (score margin ~0.09, conf ~0.83; real reads of that
+# bar: margin ~0.21, conf ~0.90), and 13-0 came straight back 250 ms after the lock. So:
+# * every fast-path read that carries a template margin needs at least TD_MIN_MARGIN (Thursday Night 21-37 on
+#   002316: 0.26-0.41), and at least TD_MIN_MARGIN_READS of them must carry one; a weaker read cancels the pair;
+# * a jump that only swaps one glyph for a look-alike (0->6, 0->8, 0->9, 3->9: closed loops) needs a margin on
+#   every read of at least TD_CONFUSABLE_MARGIN and TD_CONFUSABLE_CONFIRM more reads of the new pair during the hold;
+# * after the reads agree, the lock is held for TD_HOLD_MS (TD_CONFUSABLE_HOLD_MS): one read of the old pair or of a
+#   third pair in that time cancels it. Frames with no bar (banner, replay, menus) neither confirm nor cancel.
+TD_MIN_MARGIN = 0.15
+TD_MIN_MARGIN_READS = 2
+TD_CONFUSABLE = frozenset({(0, 6), (0, 8), (0, 9), (3, 9)})
+TD_CONFUSABLE_MARGIN = 0.18
+TD_CONFUSABLE_CONFIRM = 2
+TD_HOLD_MS = 1_000
+TD_CONFUSABLE_HOLD_MS = 2_000
+TD_HOLD_MAX_MS = 6_000      # a confusable jump that never shows again is dropped (the normal windows still apply)
+# Glimpse second opinion, ENFORCING mode (off by default; needs Con's explicit OK; QORCAP_GLIMPSE_TD_VETO=1):
+# a held fast-path lock may wait up to this long for a verdict. Glimpse can only veto or delay, never create a lock.
+TD_VETO_WAIT_MS = 4_000
+
+
+def td_confusable(old: int, new: int) -> bool:
+    """True when ``new`` differs from ``old`` in exactly one digit and that digit pair is a look-alike."""
+    a, b = str(int(old)), str(int(new))
+    if len(a) != len(b):
+        return False
+    diff = [(int(x), int(y)) for x, y in zip(a, b) if x != y]
+    return len(diff) == 1 and diff[0] in TD_CONFUSABLE
+
+
+class TouchdownJump:
+    """Lock a +6/+7/+8 on one side, other side unchanged, from fewer agreeing reads, only when corroborated.
+
+    Every frame that shows the bar must agree: any read of the old pair or of a third pair after the new pair
+    appeared cancels it, as does a quarter that differs from the posted quarter or a clock above the last posted
+    clock (or rising between the new reads); a cancelled pair stays on the normal windows until the next normal
+    lock. Frames with no bar (banner, replay) neither count nor cancel. Needs
+    ``TD_NEED`` reads >= ``TD_MIN_INTERVAL_MS`` apart spanning ``TD_MIN_SPAN_MS`` within ``TD_WINDOW_MS``.
+    v0.3.23: template-margin gate, look-alike rule and a hold (see the constants). ``offer`` never posts; ``due``
+    returns the held read once the hold is over. Only consulted when the normal windows did not agree on the frame.
+    """
+
+    def __init__(self, listener=None, veto=None) -> None:
+        self.cand: tuple[int, int] | None = None
+        self.reads: list[tuple[int, Any]] = []
+        self.blocked: set[tuple[int, int]] = set()   # contradicted once: normal windows only until the next lock
+        self.pending: dict | None = None
+        self.listener = listener   # shadow log only (Glimpse second opinion); never changes a lock
+        self.veto = veto           # ENFORCING mode only; None = off (default)
+
+    def _emit(self, ev: dict) -> None:
+        if self.listener is None:
+            return
+        try:
+            self.listener(dict(ev, schema="qorcap-td-jump/v1"))
+        except Exception as e:  # never fatal, never silent
+            print(f"touchdown listener error: {type(e).__name__}: {e}", file=sys.stderr)
+
+    def reset(self) -> None:
+        """A normal lock happened: start over."""
+        if self.pending is not None:
+            self._emit({"event": "superseded", "cand": list(self.pending["cand"]), "old": list(self.pending["old"]),
+                        "id": self.pending["id"]})
+        self.cand, self.reads, self.blocked, self.pending = None, [], set(), None
+
+    def _cancel(self, why: str = "contradicted", t_ms: int | None = None) -> None:
+        if self.pending is not None:
+            self.blocked.add(self.pending["cand"])
+            self._emit({"event": "cancelled", "why": why, "t_ms": t_ms, "cand": list(self.pending["cand"]),
+                        "old": list(self.pending["old"]), "id": self.pending["id"]})
+            self.pending = None
+        if self.cand is not None:
+            self.blocked.add(self.cand)
+        self.cand, self.reads = None, []
+
+    @staticmethod
+    def _int(v):
+        return v if isinstance(v, int) and not isinstance(v, bool) else None
+
+    @staticmethod
+    def _margin(fr):
+        m = getattr(fr, "score_margin", None)
+        return float(m) if isinstance(m, (int, float)) and not isinstance(m, bool) else None
+
+    def _pending_offer(self, fr, t_ms: int, last: dict | None, posted_quarter: int | None) -> None:
+        pd = self.pending
+        a, h = int(fr.pair[0]), int(fr.pair[1])
+        if (a, h) != pd["cand"]:
+            self._cancel("old_pair" if (a, h) == pd["old"] else "third_pair", t_ms)
+            return
+        q = self._int(getattr(fr, "quarter", None))
+        if q is not None and posted_quarter is not None and q != posted_quarter:
+            self._cancel("quarter", t_ms)
+            return
+        c, lc = self._int(getattr(fr, "clock_seconds", None)), self._int((last or {}).get("clock_s"))
+        if c is not None and lc is not None and c > lc:
+            self._cancel("clock", t_ms)
+            return
+        m = self._margin(fr)
+        if m is not None and m < pd["min_margin"]:
+            self._cancel("weak_margin", t_ms)
+            return
+        if t_ms - pd["last_t"] >= TD_MIN_INTERVAL_MS:
+            pd["confirms"] += 1
+            pd["last_t"] = t_ms
+
+    def offer(self, fr, t_ms: int, last: dict | None, posted_quarter: int | None):
+        """Feed one frame's read. Returns None (v0.3.23: the lock comes from ``due``)."""
+        pair = getattr(fr, "pair", None)
+        if pair is None:
+            return None
+        if self.pending is not None:
+            self._pending_offer(fr, t_ms, last, posted_quarter)
+            return None
+        if last is None or self._int(last.get("away")) is None or self._int(last.get("home")) is None:
+            self._cancel()
+            return None
+        a, h = int(pair[0]), int(pair[1])
+        la, lh = int(last["away"]), int(last["home"])
+        da, dh = a - la, h - lh
+        if not ((da == 0 and dh in TD_DELTAS) or (dh == 0 and da in TD_DELTAS)):
+            self._cancel()                    # the old pair, or anything else: the bar disagrees
+            return None
+        if (a, h) in self.blocked:
+            return None
+        if self.cand is not None and self.cand != (a, h):
+            self._cancel()                    # a second candidate pair: neither is corroborated
+            self.blocked.add((a, h))
+            return None
+        q = self._int(getattr(fr, "quarter", None))
+        if q is not None and posted_quarter is not None and q != posted_quarter:
+            self.cand = (a, h)
+            self._cancel()
+            return None
+        c, lc = self._int(getattr(fr, "clock_seconds", None)), self._int(last.get("clock_s"))
+        if c is not None and lc is not None and c > lc:
+            self.cand = (a, h)
+            self._cancel()
+            return None
+        conf = td_confusable(la, a) if da else td_confusable(lh, h)
+        floor = TD_CONFUSABLE_MARGIN if conf else TD_MIN_MARGIN
+        m = self._margin(fr)
+        if (m is not None and m < floor) or (conf and m is None):
+            self.cand = (a, h)
+            self._cancel()                    # a weak (or, for a look-alike, unmeasured) glyph match: no fast path
+            return None
+        if self.reads and t_ms - self.reads[0][0] > TD_WINDOW_MS:
+            self._cancel()                    # too slow to be one brief showing: normal windows only
+            return None
+        if self.cand is None:
+            self.cand, self.reads = (a, h), []
+        if self.reads:
+            pc = next((self._int(r.clock_seconds) for _, r in reversed(self.reads)
+                       if self._int(getattr(r, "clock_seconds", None)) is not None), None)
+            if c is not None and pc is not None and c > pc:
+                self._cancel()
+                return None
+            if t_ms - self.reads[-1][0] < TD_MIN_INTERVAL_MS:
+                return None
+        self.reads.append((t_ms, fr))
+        if len(self.reads) >= TD_NEED and self.reads[-1][0] - self.reads[0][0] >= TD_MIN_SPAN_MS:
+            margins = [self._margin(r) for _, r in self.reads]
+            if sum(x is not None for x in margins) < TD_MIN_MARGIN_READS:
+                return None                   # keep collecting: not enough measured glyph matches yet
+            got = self.reads[-1][1]
+            hold = TD_CONFUSABLE_HOLD_MS if conf else TD_HOLD_MS
+            self.pending = {"cand": (a, h), "old": (la, lh), "read": got, "t0": t_ms, "due": t_ms + hold,
+                            "last_t": t_ms, "confirms": 0, "need": TD_CONFUSABLE_CONFIRM if conf else 0,
+                            "confusable": conf, "min_margin": floor, "id": f"td{t_ms}_{a}_{h}", "verdict": None}
+            self._emit({"event": "pending", "id": self.pending["id"], "t_ms": t_ms, "cand": [a, h], "old": [la, lh],
+                        "confusable": conf, "hold_ms": hold, "margins": margins,
+                        "quarter": self._int(getattr(got, "quarter", None))})
+            self.cand, self.reads = None, []
+        return None
+
+    def due(self, t_ms: int):
+        """The held read once its hold is over (and, for a look-alike, confirmed), else None."""
+        pd = self.pending
+        if pd is None or t_ms < pd["due"]:
+            return None
+        if pd["confirms"] < pd["need"]:
+            if t_ms - pd["t0"] > TD_HOLD_MAX_MS:
+                self._cancel("unconfirmed", t_ms)
+            return None
+        if self.veto is not None:             # ENFORCING mode (off by default): may veto or delay, never create
+            try:
+                v = self.veto(dict(pd))
+            except Exception as e:  # a broken veto never blocks a lock forever
+                print(f"touchdown veto error: {type(e).__name__}: {e}", file=sys.stderr)
+                v = None
+            if v == "disagree":
+                self._cancel("glimpse_veto", t_ms)
+                return None
+            if v != "agree" and t_ms - pd["due"] < TD_VETO_WAIT_MS:
+                return None
+        got = pd["read"]
+        self._emit({"event": "posted", "id": pd["id"], "t_ms": t_ms, "cand": list(pd["cand"]), "old": list(pd["old"]),
+                    "confirms": pd["confirms"]})
+        self.pending = None
+        self.blocked.discard(pd["cand"])
+        return got
+
+
+# Glimpse second opinion on held touchdown jumps. SHADOW mode (default): the sidecar only writes the held candidates to
+# the watcher's own folder (%LOCALAPPDATA%\QorCapGlimpse\<match>\td_jumps.jsonl, never the match folder); the
+# watcher logs Glimpse's read of the next frame. Nothing comes back into the lock or the receipt.
+# ENFORCING mode is OFF unless QORCAP_GLIMPSE_TD_VETO=1, and must not be turned on without Con's explicit OK: then a
+# held jump waits up to TD_VETO_WAIT_MS for the watcher's verdict; "disagree" cancels that fast-path lock (the normal
+# windows still apply), "agree" posts it, no verdict posts it after the wait. It can only veto or delay, never create.
+TD_VETO_ENV = "QORCAP_GLIMPSE_TD_VETO"
+
+
+def glimpse_match_dir(match_name: str) -> Path:
+    import os
+    base = os.environ.get("LOCALAPPDATA") or str(Path.home() / ".local" / "share")
+    return Path(base) / "QorCapGlimpse" / match_name
+
+
+def td_shadow_listener(match_name: str):
+    out = glimpse_match_dir(match_name)
+
+    def write(ev: dict) -> None:
+        out.mkdir(parents=True, exist_ok=True)
+        with open(out / "td_jumps.jsonl", "a", encoding="utf-8") as f:
+            f.write(json.dumps(dict(ev, t_wall_ms=int(time.time() * 1000)), default=str) + "\n")
+    return write
+
+
+def td_veto_enabled() -> bool:
+    import os
+    return os.environ.get(TD_VETO_ENV, "").strip() == "1"
+
+
+def td_glimpse_veto(match_name: str):
+    """ENFORCING mode reader of the watcher's verdicts. Only wired when ``td_veto_enabled()``."""
+    path = glimpse_match_dir(match_name) / "td_verdicts.jsonl"
+
+    def veto(pd: dict):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                for line in f:
+                    try:
+                        v = json.loads(line)
+                    except ValueError:
+                        continue
+                    if v.get("id") == pd.get("id"):
+                        verdict = v.get("verdict")
+                        return "agree" if verdict == "agree" else "disagree" if str(verdict).startswith("disagree") else None
+        except OSError:
+            return None
+        return None
+    return veto
+
+
+def wire_touchdown_glimpse(core, match_name: str | None) -> str:
+    """Live only. Returns the mode: "off" (no match), "shadow", or "enforcing"."""
+    if core.touchdown is None or not match_name:
+        return "off"
+    core.touchdown.listener = td_shadow_listener(match_name)
+    if td_veto_enabled():
+        core.touchdown.veto = td_glimpse_veto(match_name)
+        return "enforcing"
+    return "shadow"
+
+
 class ScoreClockLock:
     """Lock (left score, right score) when the quarter glyph failed.
 
@@ -268,6 +542,7 @@ class ReaderCore:
         self.end_menu: dict | None = None
         self.end_menu_rejected: dict | None = None
         self.score_lock = ScoreClockLock()
+        self.touchdown: TouchdownJump | None = TouchdownJump()
         self._max_quarter: int | None = None  # highest quarter actually posted; a later read may not go backwards
         self.periods = PeriodTrack()
         self._quarter_reject: str | None = None
@@ -280,6 +555,7 @@ class ReaderCore:
         """``full`` may be a full-resolution frame (v0.3.5): the scorebug reader gets it when it asks for it
         (``wants_full_res``, e.g. the Monday Night profile); everything else gets the 640x360 reader frame."""
         self.stats["frames"] += 1
+        self._flush_touchdown(t_ms)
         img = prep(full)
         rimg = full if getattr(self.reader, "wants_full_res", False) else img
         # The end-of-game menu is static, so the pause detector would swallow it; check it first.
@@ -332,8 +608,31 @@ class ReaderCore:
             self.stats["errors"] += 1
             print(f"score agreement error: {type(e).__name__}: {e}", file=sys.stderr)
             return
-        if not (res.agreed and res.read is not None):
+        if res.agreed and res.read is not None:
+            if self.touchdown is not None:
+                self.touchdown.reset()
+        elif self.touchdown is not None:
+            self.touchdown.offer(fr, t_ms, self.last_scorebug(), self._max_quarter)
             return
+        else:
+            return
+        self._post_agreed(t_ms, res.read, soft)
+
+    def _flush_touchdown(self, t_ms: int) -> None:
+        """Post a held touchdown jump whose hold is over (runs first on every frame, menus and pauses included)."""
+        if self.touchdown is None or self.touchdown.pending is None:
+            return
+        got = self.touchdown.due(t_ms)
+        if got is None:
+            return
+        self.stats["touchdown_jump"] = self.stats.get("touchdown_jump", 0) + 1
+        print(f"touchdown jump locked: away {got.left_score} - home {got.right_score}", file=sys.stderr)
+        self.score_lock.remember(got.pair, t_ms * 1_000_000)
+        self._post_agreed(t_ms, got, True)
+
+    def _post_agreed(self, t_ms: int, read, soft: bool) -> None:
+        from types import SimpleNamespace
+        res = SimpleNamespace(read=read)
         if soft and hasattr(self.agree, "last_agreed"):
             self.agree.last_agreed = res.read.pair
             self.agree.last_agreed_ns = t_ms * 1_000_000
