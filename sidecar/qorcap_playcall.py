@@ -121,11 +121,15 @@ class PauseCapableGate:
         self._proxy_done_q: set[int] = set()
         self._elapsed_done: set[int] = set()
         self.periods = PeriodTrack()
+        self.max_points: int | None = None   # highest away + home seen; a later lower total is a post-game screen
 
     # -- scorebug
     def on_read(self, rd: dict[str, Any]) -> None:
         q, c = rd.get("quarter"), rd.get("clock_s")
         t = int(rd.get("t_ms") or 0)
+        a, h = rd.get("away"), rd.get("home")
+        if isinstance(a, int) and isinstance(h, int) and not isinstance(a, bool) and not isinstance(h, bool):
+            self.max_points = a + h if self.max_points is None else max(self.max_points, a + h)
         self.periods.note(t, c if isinstance(c, int) and not isinstance(c, bool) else None)
         if isinstance(q, bool) or not isinstance(q, int):
             self._arm_unknown(rd, t, c)
@@ -212,6 +216,10 @@ class PauseCapableGate:
         if not self.periods.clock_unreadable:
             return None
         if t_ms - int(lr.get("t_ms") or 0) > ELAPSED_READ_FRESH_MS:
+            return None
+        # A 0-0 (or any lower total) after points is the next game's intro, not this game's second half (002316).
+        a, h = lr.get("away"), lr.get("home")
+        if not isinstance(a, int) or not isinstance(h, int) or (self.max_points is not None and a + h < self.max_points):
             return None
         inferred = self.periods.inferred_quarter(t_ms)
         if inferred is None or inferred < 3:

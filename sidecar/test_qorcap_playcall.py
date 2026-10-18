@@ -150,6 +150,11 @@ def test_gate_elapsed_fallback_needs_the_scorebug_on_screen():
     assert g.on_frame(t, False) is None
     _read(g, t + 1_000 - ELAPSED_READ_FRESH_MS + 2_000, None, None, 21, 37)  # scorebug back: the fallback may fire
     assert g.on_frame(t + 1_000, False).phase == "halftime"
+    g = PauseCapableGate()
+    _read(g, 0, None, 1, 21, 31)
+    _read(g, 1_000, None, None, 21, 37)
+    _read(g, t, None, None, 0, 0)                 # the next game's 0-0 intro after the menus: not a second half
+    assert g.on_frame(t + 1_000, False) is None
 
 
 def _six_minute_game(g, q_of=lambda q: None, step=1_000):
