@@ -731,6 +731,7 @@ mod tests {
         assert!(draft["result"].get("final_basis").is_none() || draft["result"]["final_basis"].is_null());
         let bundle: Value = serde_json::from_str(&std::fs::read_to_string(out.join("bundle.json")).unwrap()).unwrap();
         assert_eq!(bundle["final_confirmed"], false);
+        assert_eq!(bundle["challenge_rule"], 2);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1358,6 +1359,7 @@ impl Engine {
             "segments": st.seg.seq, "chain_head": st.seg.head, "checkpoints": st.checkpoints.len(),
             "checkpoint_head": st.cps.prev, "challenges": st.challenges.len(), "clips": st.clips, "final": st.final_,
             "final_confirmed": confirmed,
+            "challenge_rule": 2,
             "receipt_draft_sha256": ev::jcs_sha(&receipt),
             "claims": "Proves the integrity and timing of these video bytes (hash chain + checkpoints, referee co-signable). Does NOT prove who was playing.",
         });

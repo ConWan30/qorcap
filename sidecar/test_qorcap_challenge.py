@@ -1,8 +1,9 @@
 """Recorder challenge recheck for the USB capture card + Bluetooth pad (v0.3.15).
 
 Measured on match-20261017-110028: the Madden pause menu is stable about 1.75 s after OPTIONS.
-The official contract stays 0..600 ms. This bound is the recorder's recheck only. The video clock
-is the fragment PTS through the manifest frame fit, not the segment close stamp.
+Rule v1, the default verifier, stays 0..600 ms. Rule v2 (opt-in) uses this same clock with a
+2500 ms ceiling and a ±300 ms consistency window. This bound is the recorder's recheck only. The
+video clock is the fragment PTS through the manifest frame fit, not the segment close stamp.
 """
 import json
 import os
@@ -23,7 +24,7 @@ if QT:
 from qorcap_challenge import (  # noqa: E402
     CAPTURE_PAUSE_MAX_LATENCY_MS, capture_clock, capture_pause_detector, frame_mono_ms,
 )
-from qor_receipt.challenge import MAX_LATENCY_MS, verify_response  # noqa: E402
+from qor_receipt.challenge import MAX_LATENCY_MS, RULE2_CONSISTENCY_MS, RULE2_MAX_LATENCY_MS, verify_response  # noqa: E402
 
 FX = HERE / "fixtures"
 
@@ -35,7 +36,8 @@ def _twice(det, im):
 
 def test_capture_detector_sees_both_pause_menus_and_not_gameplay():
     assert CAPTURE_PAUSE_MAX_LATENCY_MS == 2500
-    assert MAX_LATENCY_MS == 600  # the referee's bound is unchanged
+    assert MAX_LATENCY_MS == 600  # rule v1, still the default verifier
+    assert RULE2_MAX_LATENCY_MS == 2500 and RULE2_CONSISTENCY_MS == 300
     kick = cv2.imread(str(FX / "m27_std_110028_pause_kick.jpg"))
     end = cv2.imread(str(FX / "m27_std_110028_pause_end.jpg"))
     pre = cv2.imread(str(FX / "m27_std_110028_pre_pause.jpg"))
@@ -56,9 +58,12 @@ def test_recorder_bound_accepts_1750_ms_and_rejects_a_relay():
     early = verify_response(["OPTIONS"], ev, issued_ms=0, deadline_ms=10_000,
                             pause_seen_ms=press - 100, max_latency_ms=CAPTURE_PAUSE_MAX_LATENCY_MS)
     assert not early.ok and early.reason == "video_before_input"
-    # The same 1.75 s onset still fails the official 600 ms contract.
+    # The same 1.75 s onset still fails rule v1. The rule v2 ceiling accepts it; consistency is separate.
     official = verify_response(["OPTIONS"], ev, issued_ms=0, deadline_ms=10_000, pause_seen_ms=press + 1750)
     assert not official.ok and official.reason == "video_latency_too_high"
+    v2 = verify_response(["OPTIONS"], ev, issued_ms=0, deadline_ms=10_000, pause_seen_ms=press + 1750,
+                         max_latency_ms=RULE2_MAX_LATENCY_MS)
+    assert v2.ok and v2.latency_ms == 1750
 
 
 def test_capture_clock_extrapolates_frame_zero_behind_the_first_close():
