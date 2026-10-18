@@ -26,6 +26,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from qorcap_reader import PeriodTrack
+
 PHASE_QUARTERS = (("kickoff", 1), ("halftime", 3), ("end", 4))
 
 
@@ -85,7 +87,7 @@ class PlayCallDetector:
 @dataclass
 class GateEvent:
     t_ms: int
-    basis: str                      # "play_call" | "clock_proxy"
+    basis: str                      # "play_call" | "clock_proxy" | "elapsed"
     quarter: int
     phase: str
     clock_s: int | None
@@ -113,21 +115,48 @@ class PauseCapableGate:
         self.calls_seen = 0
         self.events: list[GateEvent] = []
         self._proxy_done_q: set[int] = set()
+        self._elapsed_done: set[int] = set()
+        self.periods = PeriodTrack()
 
     # -- scorebug
     def on_read(self, rd: dict[str, Any]) -> None:
         q, c = rd.get("quarter"), rd.get("clock_s")
-        if not isinstance(q, int):
+        t = int(rd.get("t_ms") or 0)
+        self.periods.note(t, c if isinstance(c, int) and not isinstance(c, bool) else None)
+        if isinstance(q, bool) or not isinstance(q, int):
+            self._arm_unknown(rd, t, c)
             return
         if q != self.quarter:
-            self.quarter, self.q_first_clock, self.running_since = q, c, None
+            self.quarter, self.q_first_clock, self.running_since = q, c if isinstance(c, int) and not isinstance(c, bool) else None, None
             self.call_start = self.call_last = None
-        elif isinstance(c, int):
+        elif isinstance(c, int) and not isinstance(c, bool):
             if self.q_first_clock is None:
                 self.q_first_clock = c
             elif self.running_since is None and c < self.q_first_clock:
-                self.running_since = int(rd["t_ms"])
+                self.running_since = t
         self.last_read = dict(rd)
+
+    def _arm_unknown(self, rd: dict[str, Any], t: int, c) -> None:
+        """Quarter glyph missing: keep the score, and arm from a clock reset or from elapsed time.
+
+        A null quarter during the opening quarter does not open halftime or the end challenge.
+        """
+        self.last_read = dict(rd)
+        inferred = self.periods.inferred_quarter(t)
+        if inferred is None:
+            return
+        if self.quarter is not None and inferred < self.quarter:
+            inferred = self.quarter
+        if inferred != self.quarter:
+            self.quarter = inferred
+            self.q_first_clock = c if isinstance(c, int) and not isinstance(c, bool) else None
+            self.running_since = None
+            self.call_start = self.call_last = None
+        if isinstance(c, int) and not isinstance(c, bool):
+            if self.q_first_clock is None:
+                self.q_first_clock = c
+            elif self.running_since is None and c < self.q_first_clock:
+                self.running_since = t
 
     # -- frames
     def on_frame(self, t_ms: int, play_call: bool, paused: bool = False) -> GateEvent | None:
@@ -153,7 +182,28 @@ class PauseCapableGate:
                 and not any(e.quarter == self.quarter for e in self.events):
             self._proxy_done_q.add(self.quarter)
             ev = self._emit(t_ms, "clock_proxy", {"clock_running_ms": t_ms - self.running_since})
+        if ev is None:
+            ev = self._elapsed_fallback(t_ms)
         return ev
+
+    def _elapsed_fallback(self, t_ms: int) -> GateEvent | None:
+        """Halftime and end when the quarter is unknown and the clock never came back after a rundown."""
+        lr = self.last_read
+        if lr is None or isinstance(lr.get("quarter"), int):
+            return None
+        if not self.periods.clock_unreadable:
+            return None
+        inferred = self.periods.inferred_quarter(t_ms)
+        if inferred is None or inferred < 3:
+            return None
+        phase = phase_for_quarter(inferred)
+        if phase is None or any(e.phase == phase for e in self.events) or inferred in self._elapsed_done:
+            return None
+        self._elapsed_done.add(inferred)
+        self.quarter = inferred
+        if self.running_since is None:
+            self.running_since = t_ms
+        return self._emit(t_ms, "elapsed", {"elapsed_ms": t_ms - int(self.periods.first_period_end_ms or t_ms)})
 
     def _armed(self) -> bool:
         lr = self.last_read

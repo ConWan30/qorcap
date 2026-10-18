@@ -451,3 +451,177 @@ def test_pick_card_audio_and_hint():
     txt = "\n".join(Q.audio_silence_hint({"silent": True, "max_db": -91.0, "mean_db": -91.0}, when="now"))
     assert "pure digital silence" in txt and "Linear PCM" in txt and txt.index("Linear PCM") < txt.index("Chat Audio")
     assert "pure digital silence" not in "\n".join(Q.audio_silence_hint({"silent": True, "no_audio_stream": True}, when="now"))
+
+
+def test_recover_rebuilds_draft_from_disk_and_excludes_the_tail(tmp_path):
+    b = tmp_path / "match-20261017-151655"
+    b.mkdir()
+    body = b"hashed-bytes"
+    tail = b"TAILDATA"
+    (b / "video.mp4").write_bytes(body + tail)
+    seg = {"type": "segment", "seq": 0, "file": "video.mp4", "offset": 0, "bytes": len(body),
+           "sha256": "ab", "prev": "0" * 64, "chain_head": "cd", "wall_ms": 1000, "device": "USB3.0 Video"}
+    (b / "manifest.jsonl").write_text(json.dumps(seg) + "\n", encoding="utf-8")
+    cp = {"seq": 0, "t_ms": 1500, "hash": "ee", "qorcap": {
+        "trigger": "segment", "match_id": "m-151655", "role": "away",
+        "score": {"home": 16, "away": 10, "quarter": 4}}}
+    (b / "checkpoints.jsonl").write_text(json.dumps(cp) + "\n", encoding="utf-8")
+    (b / "timeline.jsonl").write_text(json.dumps({"t_ms": 1400, "home": 16, "away": 10, "quarter": 4}) + "\n", encoding="utf-8")
+    ch = {"id": "abcd1234", "role": "away", "phase": "kickoff", "nonce": "00112233445566778899aabbccddeeff",
+          "pattern": ["OPTIONS", "CROSS"], "issued_ms": 10, "deadline_ms": 20, "result": {"ok": True, "reason": "x"}}
+    (b / "challenges.jsonl").write_text(json.dumps(ch) + "\n", encoding="utf-8")
+    (b / "inputs.jsonl").write_text(json.dumps({"type": "chunk", "seq": 0, "head": "hh", "n": 1}) + "\n", encoding="utf-8")
+    (b / "qorcap.log").write_text(
+        "[ERROR] recorder pipe broken (The pipe is being closed. (os error 232)); stopping recording\n"
+        "recording finalised -> video.mp4\n", encoding="utf-8")
+    first = qm.recover_bundle(b)
+    second = qm.recover_bundle(b)
+    assert first == second
+    assert first["recovered"] is True and first["stop_reason"] == "pipe_broken"
+    assert first["signals"]["recovered"] is True and first["signals"]["stop_reason"] == "pipe_broken"
+    assert first["result"]["home_score"] == 16 and first["result"]["away_score"] == 10
+    assert first["result"]["quarter"] == 4
+    assert first["result"]["method"] == "last_scorebug_read_unconfirmed"
+    assert first["result"]["final_confirmed"] is False
+    assert "final_basis" not in first["result"]
+    assert first["challenges"][0]["result"] is None
+    assert first["players"][0]["player_id"] == "local:player"
+    assert any("player_id was not on disk" in n for n in first["result"]["notes"])
+    assert any("last timeline score is unconfirmed" in n for n in first["result"]["notes"])
+    meta = json.loads((b / "bundle.json").read_text(encoding="utf-8"))
+    assert meta["recovered"] is True and meta["stop_reason"] == "pipe_broken"
+    assert meta["match_id"] == "m-151655" and meta["role"] == "away" and meta["device"] == "USB3.0 Video"
+    assert meta["segments"] == 1 and meta["checkpoints"] == 1
+    assert meta["excluded_tails"][0]["covered_bytes"] == len(body)
+    assert meta["excluded_tails"][0]["tail_bytes"] == len(tail)
+    assert meta["excluded_tails"][0]["tail_sha256"]
+    assert meta["inputs_on_disk"]["chunks"] == 1
+    assert meta["final"] is None
+
+
+def test_recover_without_a_log_does_not_invent_a_cause_or_a_score(tmp_path):
+    b = tmp_path / "match-empty"
+    b.mkdir()
+    (b / "video.mp4").write_bytes(b"xyz")
+    seg = {"type": "segment", "seq": 0, "file": "video.mp4", "offset": 0, "bytes": 3, "chain_head": "aa", "wall_ms": 5}
+    (b / "manifest.jsonl").write_text(json.dumps(seg) + "\n", encoding="utf-8")
+    (b / "checkpoints.jsonl").write_text(
+        json.dumps({"seq": 0, "t_ms": 5, "hash": "h", "qorcap": {"match_id": "m", "role": "home"}}) + "\n",
+        encoding="utf-8")
+    draft = qm.recover_bundle(b)
+    assert draft["stop_reason"] == "not_recorded"
+    assert draft["result"]["home_score"] is None and draft["result"]["away_score"] is None
+    assert draft["result"]["winner"] == "unknown"
+    assert draft["challenges"] == []
+    meta = json.loads((b / "bundle.json").read_text(encoding="utf-8"))
+    assert "excluded_tails" not in meta
+    assert qm.recover_bundle(tmp_path / "does-not-exist") is None
+
+
+def test_finalize_recover_needs_evidence_and_plain_finalize_still_requires_a_draft(tmp_path, capsys):
+    b = tmp_path / "match-bare"
+    b.mkdir()
+    (b / "video.mp4").write_bytes(b"x")
+    assert qm.finalize(b, qt=tmp_path, qorcap="qorcap", ffmpeg="ffmpeg", key_dir=tmp_path, no_open=True) == 2
+    assert "receipt.draft.json" in capsys.readouterr().out
+    assert qm.finalize(b, qt=tmp_path, qorcap="qorcap", ffmpeg="ffmpeg", key_dir=tmp_path, no_open=True, recover=True) == 2
+    assert not (b / "receipt.draft.json").exists()
+
+
+def test_spawn_flags_detach_and_enter_still_posts_shutdown(monkeypatch):
+    monkeypatch.setattr(qm, "WIN", False)
+    assert qm.qorcap_spawn_flags() == 0
+    monkeypatch.setattr(qm, "WIN", True)
+    flags = qm.qorcap_spawn_flags()
+    assert flags & qm.DETACHED_PROCESS
+    assert flags & qm.CREATE_BREAKAWAY_FROM_JOB
+    assert flags & 0x200
+    calls = []
+
+    class Proc:
+        pid = 1
+
+    def popen(cmd, **kw):
+        calls.append(kw.get("creationflags"))
+        if kw.get("creationflags", 0) & qm.CREATE_BREAKAWAY_FROM_JOB:
+            raise OSError("job refused breakaway")
+        return Proc()
+
+    monkeypatch.setattr(qm.subprocess, "Popen", popen)
+    proc = qm.spawn_qorcap(["qorcap"], stdout=None)
+    assert proc.pid == 1
+    assert calls[0] & qm.CREATE_BREAKAWAY_FROM_JOB
+    assert calls[1] & qm.DETACHED_PROCESS
+    assert not (calls[1] & qm.CREATE_BREAKAWAY_FROM_JOB)
+    assert qm.shutdown_body("enter") == {"reason": "enter"}
+    assert qm.shutdown_body("ctrl_c") == {"reason": "ctrl_c"}
+    assert qm.shutdown_body("final") == {"reason": "final"}
+
+
+def test_stop_reason_from_log_is_the_earliest_recorded_cause():
+    text = "hello\n[ERROR] recorder pipe broken (os error 232)\nCtrl+C: stopping\n"
+    assert qm.stop_reason_from_log(text) == "pipe_broken"
+    assert qm.stop_reason_from_log("Ctrl+C: stopping\n") == "ctrl_c"
+    assert qm.stop_reason_from_log("") == "not_recorded"
+    assert qm.stop_reason_from_log(None) == "not_recorded"
+
+
+def test_recovery_notes_survive_the_score_read_and_a_normal_draft_does_not_gain_them():
+    recovered = {"recovered": True, "result": {"notes": ["recording stopped: pipe_broken", "recovered from on-disk evidence; unhashed video bytes are excluded"]}}
+    replaced = {"method": "last_scorebug_read_unconfirmed", "notes": ["end-of-game menu score not read: scorebug final only, NOT confirmed"]}
+    out = qm.keep_recovery_notes(replaced, recovered)
+    assert out["notes"][0].startswith("end-of-game menu")
+    assert any(n.startswith("recording stopped: pipe_broken") for n in out["notes"])
+    plain = {"result": {"notes": ["recording stopped: enter"]}}
+    assert qm.keep_recovery_notes(replaced, plain) is replaced
+
+
+def test_hashed_decode_limit_leaves_a_matching_file_whole(tmp_path):
+    p = tmp_path / "video.mp4"
+    p.write_bytes(b"abc")
+    assert qm.hashed_decode_limit(p, 3) is None
+    assert qm.hashed_decode_limit(p, 2) == 2
+    assert qm.hashed_decode_limit(p, None) is None
+
+
+def test_post_game_reset_after_the_scorebug_leaves_keeps_the_legal_score():
+    """match-20261017-162055: 6-21, scorebug gone 93s, then a fresh 0-0 Q1 4:00 became the receipt."""
+    events = [
+        {"type": "score", "t_ms": 1, "away": 0, "home": 0, "quarter": 1, "clock_s": 247},
+        {"type": "score", "t_ms": 2, "away": 0, "home": 14, "quarter": 1, "clock_s": 2},
+        {"type": "score", "t_ms": 3, "away": 6, "home": 14, "quarter": None, "clock_s": None},
+        {"type": "score", "t_ms": 4, "away": 6, "home": 21, "quarter": None, "clock_s": None},
+        {"type": "obs", "t_ms": 5_000, "until_ms": 98_000, "obs": "scorebug_absent", "n": 180},
+        {"type": "score", "t_ms": 99_000, "away": 0, "home": 0, "quarter": 1, "clock_s": 240},
+    ]
+    kept = qm.game_segment_score(events)
+    assert (kept["away"], kept["home"], kept["quarter"]) == (6, 21, 1)
+    assert "post-game score reset" in kept["notes"][0]
+    res = qm.apply_final({"home_score": 0, "away_score": 0, "quarter": 1, "winner": "tie"}, None, fallback=kept)
+    assert (res["away_score"], res["home_score"], res["winner"], res["final_confirmed"]) == (6, 21, "home", False)
+    assert any("post-game score reset" in n for n in res["notes"])
+    # A timeout, then a real touchdown, is still this game.
+    play = events[:5] + [{"type": "score", "t_ms": 99_000, "away": 6, "home": 28, "quarter": 2, "clock_s": 400}]
+    nxt = qm.game_segment_score(play)
+    assert (nxt["away"], nxt["home"], nxt["quarter"]) == (6, 28, 2)
+    assert "notes" not in nxt
+    # A short flicker is not a session break.
+    flicker = events[:4] + [
+        {"type": "obs", "t_ms": 10, "until_ms": 12_000, "obs": "scorebug_absent", "n": 4},
+        {"type": "score", "t_ms": 13_000, "away": 0, "home": 0, "quarter": 1, "clock_s": 240},
+    ]
+    assert qm.game_segment_score(flicker)["home"] == 0
+
+
+def test_post_game_reset_keeps_a_third_quarter_when_one_was_read():
+    """162055 never reaches the 4th quarter. A 3RD read before the reset is the receipt quarter."""
+    events = [
+        {"type": "score", "t_ms": 1, "away": 0, "home": 0, "quarter": 1, "clock_s": 247},
+        {"type": "score", "t_ms": 2, "away": 6, "home": 21, "quarter": 2, "clock_s": 20},
+        {"type": "score", "t_ms": 3, "away": 6, "home": 21, "quarter": 3, "clock_s": 237},
+        {"type": "obs", "t_ms": 5_000, "until_ms": 98_000, "obs": "scorebug_absent", "n": 180},
+        {"type": "score", "t_ms": 99_000, "away": 0, "home": 0, "quarter": 1, "clock_s": 240},
+    ]
+    kept = qm.game_segment_score(events)
+    assert (kept["away"], kept["home"], kept["quarter"]) == (6, 21, 3)
+    assert "post-game score reset" in kept["notes"][0]

@@ -2,6 +2,7 @@ use clap::Parser;
 use log::{error, info, LevelFilter};
 use qorcap::{api, cli::{Cli, Cmd}, engine::Engine, ffmpeg};
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 
 fn init_log(path: Option<&str>) -> String {
     let p = path.map(String::from).unwrap_or_else(|| "qorcap.log".into());
@@ -107,6 +108,126 @@ fn pid_alive(pid: u32) -> bool {
 #[cfg(not(any(unix, windows)))]
 fn pid_alive(_: u32) -> bool { true }
 
+/// Parent process of this recorder. Start Match's Python process is the parent; when that
+/// console is closed the recorder notices and writes the bundle instead of dying with the shell.
+#[cfg(unix)]
+fn parent_pid() -> Option<u32> {
+    let p = unsafe { libc::getppid() };
+    if p <= 0 { None } else { Some(p as u32) }
+}
+#[cfg(windows)]
+fn parent_pid() -> Option<u32> {
+    #[link(name = "ntdll")]
+    extern "system" {
+        fn NtQueryInformationProcess(process: *mut std::ffi::c_void, class: u32, info: *mut std::ffi::c_void, len: u32, ret_len: *mut u32) -> i32;
+    }
+    #[link(name = "kernel32")]
+    extern "system" { fn GetCurrentProcess() -> *mut std::ffi::c_void; }
+    #[repr(C)]
+    struct Pbi {
+        exit_status: i32,
+        peb: *mut std::ffi::c_void,
+        affinity: usize,
+        base_priority: i32,
+        pid: usize,
+        parent_pid: usize,
+    }
+    const _: () = assert!(std::mem::size_of::<Pbi>() == 48);
+    unsafe {
+        let mut info: Pbi = std::mem::zeroed();
+        let mut got = 0u32;
+        let st = NtQueryInformationProcess(GetCurrentProcess(), 0, &mut info as *mut Pbi as *mut _, std::mem::size_of::<Pbi>() as u32, &mut got);
+        if st < 0 { return None; }
+        let ppid = info.parent_pid as u32;
+        if ppid == 0 { None } else { Some(ppid) }
+    }
+}
+#[cfg(not(any(unix, windows)))]
+fn parent_pid() -> Option<u32> { None }
+
+/// True only when the OS reports that pid does not exist. Access denied is treated as still alive.
+#[cfg(unix)]
+fn parent_gone(pid: u32) -> bool {
+    let rc = unsafe { libc::kill(pid as i32, 0) };
+    rc != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+}
+#[cfg(windows)]
+fn parent_gone(pid: u32) -> bool {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn OpenProcess(access: u32, inherit: i32, pid: u32) -> *mut std::ffi::c_void;
+        fn CloseHandle(h: *mut std::ffi::c_void) -> i32;
+        fn GetLastError() -> u32;
+    }
+    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+    const ERROR_INVALID_PARAMETER: u32 = 87;
+    unsafe {
+        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if !h.is_null() { CloseHandle(h); return false; }
+        GetLastError() == ERROR_INVALID_PARAMETER
+    }
+}
+#[cfg(not(any(unix, windows)))]
+fn parent_gone(_: u32) -> bool { false }
+
+/// A closed terminal delivers SIGHUP. Ignoring it lets the parent watcher stop the recorder
+/// and write the bundle. Ctrl+C is still SIGINT.
+#[cfg(unix)]
+fn ignore_parent_hangup() { unsafe { libc::signal(libc::SIGHUP, libc::SIG_IGN); } }
+#[cfg(not(unix))]
+fn ignore_parent_hangup() {}
+
+fn watch_parent(e: Arc<Engine>) {
+    let Some(ppid) = parent_pid() else { return };
+    if ppid == 0 || ppid == std::process::id() { return; }
+    std::thread::spawn(move || {
+        while !e.shutdown.load(Ordering::SeqCst) {
+            std::thread::sleep(std::time::Duration::from_millis(400));
+            if e.shutdown.load(Ordering::SeqCst) { break; }
+            if parent_gone(ppid) {
+                info!("launcher process {ppid} is gone; stopping recording");
+                e.request_stop("launcher_gone");
+                break;
+            }
+        }
+    });
+}
+
+#[cfg(windows)]
+static CONSOLE_ENGINE: std::sync::Mutex<Option<Arc<Engine>>> = std::sync::Mutex::new(None);
+
+#[cfg(windows)]
+extern "system" fn console_ctrl(ctrl: u32) -> i32 {
+    let e = CONSOLE_ENGINE.lock().unwrap_or_else(|err| err.into_inner()).clone();
+    let Some(e) = e else { return 0 };
+    match ctrl {
+        0 | 1 => {
+            // CTRL_C / CTRL_BREAK: note it, then let the ctrlc handler finish the stop.
+            e.note_stop(if ctrl == 0 { "ctrl_c" } else { "ctrl_break" });
+            let _ = e.persist_stop_bundle();
+            0
+        }
+        2 | 5 | 6 => {
+            // Console close, logoff, shutdown. The process is about to be killed; write the bundle now.
+            e.request_stop("console_close");
+            1
+        }
+        _ => 0,
+    }
+}
+
+#[cfg(windows)]
+fn install_console_stop(e: Arc<Engine>) {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn SetConsoleCtrlHandler(handler: Option<extern "system" fn(u32) -> i32>, add: i32) -> i32;
+    }
+    *CONSOLE_ENGINE.lock().unwrap_or_else(|err| err.into_inner()) = Some(e);
+    unsafe { SetConsoleCtrlHandler(Some(console_ctrl), 1); }
+}
+#[cfg(not(windows))]
+fn install_console_stop(_: Arc<Engine>) {}
+
 /// `qorcap input-test`: live proof that the laptop is reading the DualSense over USB HID.
 fn input_test(secs: Option<u64>) -> i32 {
     use qorcap::inputs::{spawn_logger, InputLog};
@@ -187,6 +308,18 @@ fn input_test(secs: Option<u64>) -> i32 {
     0
 }
 
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn parent_watch_sees_a_live_parent_and_a_missing_pid() {
+        let parent = super::parent_pid().expect("parent pid");
+        assert!(parent > 0);
+        assert!(!super::parent_gone(parent));
+        assert!(!super::parent_gone(std::process::id()));
+        assert!(super::parent_gone(2_000_000_001));
+    }
+}
+
 fn main() {
     let cli = Cli::parse();
     let ff = ffmpeg::find_ffmpeg(cli.ffmpeg.as_deref());
@@ -214,7 +347,10 @@ fn main() {
             }
             Err(e) => { eprintln!("error: {e}"); 2 }
         },
-        Cmd::Finalize { bundle, python, rest } => finalize(bundle, python, rest, &ff),
+        Cmd::Finalize { bundle, python, recover, mut rest } => {
+            if recover { rest.insert(0, "--recover".into()); }
+            finalize(bundle, python, rest, &ff)
+        }
         Cmd::Submit { bundle, python, full, referee, yes } => {
             let mut rest = Vec::new();
             if full { rest.push("--full".to_string()); }
@@ -262,7 +398,10 @@ fn main() {
             let e = Engine::new(a.clone(), ff);
             if a.no_controller { info!("controller input logging disabled (--no-controller)"); } else { let _ = e.start_input_logger(); }
             let srv = match api::serve(e.clone(), cli.port) { Ok(h) => h, Err(m) => { error!("{m}"); std::process::exit(2); } };
-            { let e = e.clone(); let _ = ctrlc::set_handler(move || { info!("Ctrl+C: stopping"); e.shutdown.store(true, Ordering::SeqCst); }); }
+            { let e = e.clone(); let _ = ctrlc::set_handler(move || { info!("Ctrl+C: stopping"); e.request_stop("ctrl_c"); }); }
+            ignore_parent_hangup();
+            install_console_stop(e.clone());
+            watch_parent(e.clone());
             if let Some(out) = &a.out {
                 if let Err(m) = e.start_recording(out, a.duration) { error!("{m}"); std::process::exit(2); }
                 if a.replay.is_none() { e.exit_when_recording_ends.store(true, Ordering::SeqCst); }

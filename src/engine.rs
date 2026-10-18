@@ -69,6 +69,12 @@ pub struct Engine {
     pub sealed: AtomicBool,
     /// Highest checkpoint seq the local referee (Start Match) reports as countersigned; -1 = none attached.
     pub countersigned: std::sync::atomic::AtomicI64,
+    /// Why recording stopped. The first reason wins (a later Ctrl+C must not overwrite a broken pipe).
+    pub stop_reason: Mutex<Option<String>>,
+    /// Serializes receipt.draft.json / bundle.json writes.
+    bundle_write: Mutex<()>,
+    /// Set once the full stop write (including the input proof) has finished, so a late fast write cannot replace it.
+    bundle_finalized: AtomicBool,
 }
 
 /// QorTime evidence state for this run.
@@ -83,6 +89,10 @@ pub struct MatchState {
     pub last_seg_sha: Option<String>,
     pub last_score: Option<(i64, i64, Option<i64>)>,
     pub last_clock: Option<(bool, bool)>, // (at_zero, red)
+    /// A long scorebug-absent stretch, or an end screen, has closed since the last accepted score.
+    pub scorebug_break: bool,
+    /// Set when a later read was a new session and was kept out of the receipt score.
+    pub session_note: Option<String>,
     pub score: Value,
     pub final_: Option<Value>,
     pub device_id: Option<String>,
@@ -90,6 +100,19 @@ pub struct MatchState {
 }
 
 pub fn wall_ms() -> u64 { SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64 }
+
+/// How long the scorebug must stay gone before a backwards score is a new session.
+/// Match 20261017-162055 left it for 93s, then showed a fresh 0-0.
+const SESSION_BREAK_MS: u64 = 20_000;
+
+/// Same score, or one side up by a football increment. A drop or any other jump is not a step.
+fn football_step(prev_h: i64, prev_a: i64, h: i64, a: i64) -> bool {
+    let dh = h - prev_h;
+    let da = a - prev_a;
+    if dh == 0 && da == 0 { return true; }
+    if dh < 0 || da < 0 || (dh != 0 && da != 0) { return false; }
+    matches!(dh + da, 1 | 2 | 3 | 6 | 7 | 8)
+}
 
 fn append_jsonl(path: &Path, v: &Value) {
     use std::io::Write as _;
@@ -182,7 +205,8 @@ impl Engine {
             stamp_file: dir.join("stamp.txt"),
             snapshot: dir.join("snapshot.jpg"), exit_when_recording_ends: AtomicBool::new(false), started: Instant::now(), last_data_ms: AtomicU64::new(0), input,
             running: AtomicBool::new(false), api_closed: AtomicBool::new(false), sealed: AtomicBool::new(false),
-            countersigned: std::sync::atomic::AtomicI64::new(-1), args })
+            countersigned: std::sync::atomic::AtomicI64::new(-1),
+            stop_reason: Mutex::new(None), bundle_write: Mutex::new(()), bundle_finalized: AtomicBool::new(false), args })
     }
     fn ms(&self) -> u64 { self.started.elapsed().as_millis() as u64 }
     /// The monotonic clock behind every mono_ms (manifest, checkpoints) and inputs.jsonl t_us.
@@ -330,6 +354,7 @@ impl Engine {
         let (pat, pmt) = { let mut r = self.ring.lock().unwrap(); r.push(t, data); r.tables() };
         let mut g = self.rec.lock().unwrap();
         let mut done = false;
+        let mut stop_why: Option<&str> = None;
         if let Some(r) = g.as_mut() {
             let mut slice = data;
             if r.wait_key {
@@ -340,13 +365,31 @@ impl Engine {
                 }
             }
             if !slice.is_empty() {
-                if let Some(w) = r.stdin.as_mut() { if let Err(e) = w.write_all(slice) { error!("recorder pipe broken ({e}); stopping recording {}", r.path); done = true; } }
+                if let Some(w) = r.stdin.as_mut() {
+                    if let Err(e) = w.write_all(slice) {
+                        error!("recorder pipe broken ({e}); stopping recording {}", r.path);
+                        done = true;
+                        if stop_why.is_none() { stop_why = Some("pipe_broken"); }
+                    }
+                }
             }
-            if r.deadline.map(|d| Instant::now() >= d).unwrap_or(false) { info!("--duration reached"); done = true; }
+            if r.deadline.map(|d| Instant::now() >= d).unwrap_or(false) {
+                info!("--duration reached");
+                done = true;
+                if stop_why.is_none() { stop_why = Some("duration"); }
+            }
         }
         if done {
+            let why = stop_why.unwrap_or("shutdown");
             if let Some(r) = g.take() { finish(r); }
-            if self.exit_when_recording_ends.load(Ordering::Relaxed) { self.shutdown.store(true, Ordering::SeqCst); }
+            drop(g);
+            // Start Match always passes --replay, so the old path left the supervisor running with no
+            // recorder and never reached finish_stop. Any bundle recording ends here and writes the draft.
+            if self.args.bundle.is_some() || self.exit_when_recording_ends.load(Ordering::Relaxed) {
+                self.request_stop(why);
+            } else {
+                self.note_stop(why);
+            }
         }
     }
 
@@ -430,6 +473,11 @@ impl Engine {
                     self.set_state("disk_full", Some(msg.clone()));
                     self.status.lock().unwrap().warning = Some(msg);
                     if let Some(p) = self.stop_recording() { info!("finalised {p} due to low disk"); }
+                    if self.args.bundle.is_some() {
+                        self.request_stop("disk_full");
+                        break;
+                    }
+                    self.note_stop("disk_full");
                     self.sleep(5);
                     if self.shutdown.load(Ordering::SeqCst) { break; }
                     continue;
@@ -486,8 +534,12 @@ impl Engine {
     /// countersign everything, and only then run the slow input-proof / bundle work. Nothing after the
     /// seal adds checkpoints, so the referee stamps the tail within seconds of its t_ms.
     fn finish_stop(self: &Arc<Self>) {
+        if self.stop_reason.lock().unwrap().is_none() { self.note_stop("shutdown"); }
         if let Some(p) = self.stop_recording() { info!("finalised {p}"); }
         crate::inputproof::clear_recording_marker(self.bundle_dir().as_deref());
+        // Draft and bundle exist before the countersign wait and the slow input proof, so a kill
+        // during either still leaves receipt.draft.json for finalize.
+        if self.args.bundle.is_some() { let _ = self.persist_stop_bundle(); }
         self.seal_and_wait_countersign(Duration::from_secs(self.args.countersign_wait));
         if self.args.bundle.is_some() {
             self.set_state("finishing", Some("checking controller input against the video (1-2 minutes)".into()));
@@ -703,6 +755,102 @@ mod tests {
     }
 
     #[test]
+    fn null_quarter_score_change_does_not_freeze_the_score() {
+        // match-20261017-162055: after Q1 the live reads kept the digits and lost the quarter.
+        // The draft follows the digits. It does not stay on the last read that had a quarter.
+        use clap::Parser;
+        let dir = std::env::temp_dir().join(format!("qorcap-qscore-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let d = dir.to_string_lossy().into_owned();
+        let crate::cli::Cmd::Record(r) = crate::cli::Cli::try_parse_from(["q", "record", "--device", "testpattern", "--bundle", &d]).unwrap().cmd else { panic!() };
+        let e = Engine::new(r, "ffmpeg-x".into());
+        e.event(&serde_json::json!({"type":"score","home":0,"away":0,"quarter":1,"clock_s":0})).unwrap();
+        e.event(&serde_json::json!({"type":"score","home":14,"away":0,"quarter":Value::Null,"clock_s":Value::Null})).unwrap();
+        e.event(&serde_json::json!({"type":"score","home":21,"away":6,"quarter":Value::Null,"clock_s":Value::Null})).unwrap();
+        let out = e.write_bundle().unwrap();
+        let draft: Value = serde_json::from_str(&std::fs::read_to_string(out.join("receipt.draft.json")).unwrap()).unwrap();
+        assert_eq!(draft["result"]["home_score"], 21);
+        assert_eq!(draft["result"]["away_score"], 6);
+        assert_eq!(draft["result"]["quarter"], 1); // last reliable ordinal; the digits still moved
+        assert_ne!(draft["result"]["winner"], "tie");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn post_game_reset_after_the_scorebug_leaves_does_not_replace_the_score() {
+        // match-20261017-162055: 6-21, the scorebug gone for 93s, then a fresh 0-0 Q1 4:00.
+        use clap::Parser;
+        let dir = std::env::temp_dir().join(format!("qorcap-reset-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let d = dir.to_string_lossy().into_owned();
+        let crate::cli::Cmd::Record(r) = crate::cli::Cli::try_parse_from(["q", "record", "--device", "testpattern", "--bundle", &d]).unwrap().cmd else { panic!() };
+        let e = Engine::new(r, "ffmpeg-x".into());
+        e.event(&serde_json::json!({"type":"score","home":0,"away":0,"quarter":1,"clock_s":247})).unwrap();
+        e.event(&serde_json::json!({"type":"score","home":14,"away":0,"quarter":1,"clock_s":2})).unwrap();
+        e.event(&serde_json::json!({"type":"score","home":14,"away":6,"quarter":Value::Null,"clock_s":Value::Null})).unwrap();
+        e.event(&serde_json::json!({"type":"score","home":21,"away":6,"quarter":Value::Null,"clock_s":Value::Null})).unwrap();
+        e.event(&serde_json::json!({"type":"obs","obs":"scorebug_absent","t_ms":1000,"until_ms":94000,"n":180})).unwrap();
+        let ignored = e.event(&serde_json::json!({"type":"score","home":0,"away":0,"quarter":1,"clock_s":240})).unwrap();
+        assert_eq!(ignored["new_session"], true);
+        let out = e.write_bundle().unwrap();
+        let draft: Value = serde_json::from_str(&std::fs::read_to_string(out.join("receipt.draft.json")).unwrap()).unwrap();
+        assert_eq!(draft["result"]["home_score"], 21);
+        assert_eq!(draft["result"]["away_score"], 6);
+        assert_eq!(draft["result"]["final_confirmed"], false);
+        assert_ne!(draft["result"]["winner"], "tie");
+        let notes = draft["result"]["notes"].as_array().unwrap();
+        assert!(notes.iter().any(|n| n.as_str().unwrap_or("").contains("post-game score reset")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn third_quarter_read_survives_the_post_game_reset() {
+        // 162055's last on-screen quarter is the 3rd. A later 0-0 must not put the receipt back on Q1.
+        use clap::Parser;
+        let dir = std::env::temp_dir().join(format!("qorcap-q3-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let d = dir.to_string_lossy().into_owned();
+        let crate::cli::Cmd::Record(r) = crate::cli::Cli::try_parse_from(["q", "record", "--device", "testpattern", "--bundle", &d]).unwrap().cmd else { panic!() };
+        let e = Engine::new(r, "ffmpeg-x".into());
+        e.event(&serde_json::json!({"type":"score","home":0,"away":0,"quarter":1,"clock_s":247})).unwrap();
+        e.event(&serde_json::json!({"type":"score","home":21,"away":6,"quarter":2,"clock_s":20})).unwrap();
+        e.event(&serde_json::json!({"type":"score","home":21,"away":6,"quarter":3,"clock_s":237})).unwrap();
+        e.event(&serde_json::json!({"type":"obs","obs":"scorebug_absent","t_ms":1000,"until_ms":94000,"n":180})).unwrap();
+        let ignored = e.event(&serde_json::json!({"type":"score","home":0,"away":0,"quarter":1,"clock_s":240})).unwrap();
+        assert_eq!(ignored["new_session"], true);
+        let out = e.write_bundle().unwrap();
+        let draft: Value = serde_json::from_str(&std::fs::read_to_string(out.join("receipt.draft.json")).unwrap()).unwrap();
+        assert_eq!(draft["result"]["home_score"], 21);
+        assert_eq!(draft["result"]["away_score"], 6);
+        assert_eq!(draft["result"]["quarter"], 3);
+        assert_eq!(draft["result"]["final_confirmed"], false);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn legal_score_after_a_long_absence_still_counts() {
+        use clap::Parser;
+        let dir = std::env::temp_dir().join(format!("qorcap-abs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let d = dir.to_string_lossy().into_owned();
+        let crate::cli::Cmd::Record(r) = crate::cli::Cli::try_parse_from(["q", "record", "--device", "testpattern", "--bundle", &d]).unwrap().cmd else { panic!() };
+        let e = Engine::new(r, "ffmpeg-x".into());
+        e.event(&serde_json::json!({"type":"score","home":21,"away":6,"quarter":2,"clock_s":400})).unwrap();
+        e.event(&serde_json::json!({"type":"obs","obs":"scorebug_absent","t_ms":1000,"until_ms":94000,"n":180})).unwrap();
+        e.event(&serde_json::json!({"type":"score","home":28,"away":6,"quarter":2,"clock_s":350})).unwrap();
+        let out = e.write_bundle().unwrap();
+        let draft: Value = serde_json::from_str(&std::fs::read_to_string(out.join("receipt.draft.json")).unwrap()).unwrap();
+        assert_eq!(draft["result"]["home_score"], 28);
+        assert_eq!(draft["result"]["away_score"], 6);
+        assert!(draft["result"].get("notes").and_then(|n| n.as_array()).map(|a| a.iter().all(|x| !x.as_str().unwrap_or("").contains("post-game score reset"))).unwrap_or(true));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn null_quarter_keeps_last_reliable_and_does_not_go_backwards() {
         use clap::Parser;
         let dir = std::env::temp_dir().join(format!("qorcap-qkeep-{}", std::process::id()));
@@ -828,6 +976,50 @@ mod tests {
         assert!(err.contains("not enough free disk space"), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn stop_writes_draft_and_bundle_and_keeps_the_first_reason() {
+        use clap::Parser;
+        let dir = std::env::temp_dir().join(format!("qorcap-stop-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let d = dir.to_string_lossy().into_owned();
+        let video = dir.join("video.mp4");
+        let bytes = b"hashed-segment";
+        std::fs::write(&video, bytes).unwrap();
+        let crate::cli::Cmd::Record(r) = crate::cli::Cli::try_parse_from([
+            "q", "record", "--device", "testpattern", "--bundle", &d, "--no-controller", "--match-id", "m-stop",
+        ]).unwrap().cmd else { panic!() };
+        let e = Engine::new(r, "ffmpeg-x".into());
+        e.on_segment(video.to_str().unwrap(), 0, bytes);
+        let mut body = bytes.to_vec();
+        body.extend_from_slice(b"TAIL");
+        std::fs::write(&video, body).unwrap();
+        e.note_stop("pipe_broken");
+        e.note_stop("ctrl_c");
+        let out = e.persist_stop_bundle().unwrap();
+        let draft: Value = serde_json::from_str(&std::fs::read_to_string(out.join("receipt.draft.json")).unwrap()).unwrap();
+        let bundle: Value = serde_json::from_str(&std::fs::read_to_string(out.join("bundle.json")).unwrap()).unwrap();
+        assert_eq!(draft["stop_reason"], "pipe_broken");
+        assert_eq!(draft["signals"]["stop_reason"], "pipe_broken");
+        assert!(draft["result"]["notes"].as_array().unwrap().iter().any(|n| n == "recording stopped: pipe_broken"));
+        assert_eq!(bundle["stop_reason"], "pipe_broken");
+        assert_eq!(bundle["excluded_tails"][0]["file"], "video.mp4");
+        assert_eq!(bundle["excluded_tails"][0]["covered_bytes"], bytes.len() as u64);
+        assert_eq!(bundle["excluded_tails"][0]["tail_bytes"], 4);
+        let report = crate::bundle::verify(&dir).unwrap();
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        // A later fast write must not replace a finished bundle (the input-proof copy of the draft).
+        e.write_bundle_opts(true).unwrap();
+        let mut marked: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("receipt.draft.json")).unwrap()).unwrap();
+        marked["signals"]["input"] = json!({"status": "ok"});
+        std::fs::write(dir.join("receipt.draft.json"), serde_json::to_string_pretty(&marked).unwrap()).unwrap();
+        e.persist_stop_bundle().unwrap();
+        let kept: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("receipt.draft.json")).unwrap()).unwrap();
+        assert_eq!(kept["signals"]["input"]["status"], "ok");
+        assert_eq!(kept["stop_reason"], "pipe_broken");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 impl Engine {
@@ -931,7 +1123,22 @@ impl Engine {
                 let red = b["clock_red"].as_bool().unwrap_or(false);
                 let read = json!({"t_ms": t_ms, "home": h, "away": a, "quarter": raw_q, "clock_s": clock_s, "clock_red": red});
                 let mut st = self.ev.lock().unwrap();
+                // A fresh 0-0 (or any illegal drop) after the scorebug has been gone is the next
+                // session: a rematch, a demo, the menu. The receipt keeps the last legal score.
+                if let Some((ph, pa, _)) = st.last_score {
+                    if st.scorebug_break && !football_step(ph, pa, h, a) {
+                        st.session_note = Some(format!(
+                            "post-game score reset to away {a} - home {h} after the scorebug left; kept the last legal score away {pa} - home {ph}"));
+                        st.timeline.push(read.clone());
+                        drop(st);
+                        append_jsonl(&self.ev_path("timeline.jsonl"), &read);
+                        return Ok(json!({"ok": true, "new_session": true}));
+                    }
+                }
                 st.timeline.push(read.clone());
+                if st.last_score.map(|(ph, pa, _)| football_step(ph, pa, h, a)).unwrap_or(true) {
+                    st.scorebug_break = false;
+                }
                 // Receipt quarter follows the last reliable read: a null ordinal does not wipe OT, and a
                 // quarter never moves backwards (a 2ND glyph misread as Q1 must not replace Q3).
                 let prev_q = st.last_score.and_then(|p| p.2);
@@ -970,8 +1177,15 @@ impl Engine {
             "obs" => {
                 let o = b["obs"].as_str().ok_or("missing obs")?;
                 if o != "scorebug_absent" && o != "final_screen" { return Err("obs must be scorebug_absent|final_screen".into()); }
-                let v = json!({"t_ms": t_ms, "until_ms": b["until_ms"].as_u64().unwrap_or(t_ms), "obs": o, "n": b["n"].as_u64().unwrap_or(0)});
-                self.ev.lock().unwrap().timeline.push(v.clone());
+                let until = b["until_ms"].as_u64().unwrap_or(t_ms);
+                let v = json!({"t_ms": t_ms, "until_ms": until, "obs": o, "n": b["n"].as_u64().unwrap_or(0)});
+                {
+                    let mut st = self.ev.lock().unwrap();
+                    if o == "final_screen" || (o == "scorebug_absent" && until.saturating_sub(t_ms) >= SESSION_BREAK_MS) {
+                        st.scorebug_break = true;
+                    }
+                    st.timeline.push(v.clone());
+                }
                 append_jsonl(&self.ev_path("timeline.jsonl"), &v);
                 Ok(json!({"ok": true}))
             }
@@ -1033,11 +1247,39 @@ impl Engine {
         });
     }
 
+    /// Record why the match stopped. The first call wins.
+    pub fn note_stop(&self, reason: &str) {
+        let mut g = self.stop_reason.lock().unwrap_or_else(|e| e.into_inner());
+        if g.is_none() {
+            info!("stop reason: {reason}");
+            *g = Some(reason.to_string());
+        }
+    }
+
+    /// Note the reason, write the draft and bundle immediately (no input proof), and ask the supervisor to exit.
+    pub fn request_stop(&self, reason: &str) {
+        self.note_stop(reason);
+        let _ = self.persist_stop_bundle();
+        self.shutdown.store(true, Ordering::SeqCst);
+        if !self.running.load(Ordering::SeqCst) { self.api_closed.store(true, Ordering::SeqCst); }
+    }
+
+    /// Fast bundle write used on every stop path. A completed full write is left as it is.
+    pub fn persist_stop_bundle(&self) -> Option<PathBuf> {
+        if self.args.bundle.is_none() { return None; }
+        self.write_bundle_opts(false)
+    }
+
     /// Write bundle.json + receipt.draft.json (unsigned).
     /// If no `final` event, use the last timeline scorebug read (not 0–0) and label final unconfirmed.
     pub fn write_bundle(&self) -> Option<PathBuf> { self.write_bundle_opts(true) }
     pub fn write_bundle_opts(&self, input_proof: bool) -> Option<PathBuf> {
+        let _files = self.bundle_write.lock().unwrap_or_else(|e| e.into_inner());
+        if !input_proof && self.bundle_finalized.load(Ordering::SeqCst) {
+            return self.bundle_dir();
+        }
         let st = self.ev.lock().unwrap();
+        let session_note = st.session_note.clone();
         let unconfirmed = st.final_.is_none();
         let fin = st.final_.clone().unwrap_or_else(|| {
             if let Some((h, a, q)) = st.last_score {
@@ -1089,7 +1331,29 @@ impl Engine {
             }
             info!("draft receipt uses last scorebug read AWAY {} - HOME {} (final not confirmed)", fin["away"], fin["home"]);
         }
-        let bundle = json!({
+        if let Some(note) = session_note {
+            if let Some(r) = receipt["result"].as_object_mut() {
+                match r.get_mut("notes").and_then(|n| n.as_array_mut()) {
+                    Some(a) => a.push(json!(note)),
+                    None => { r.insert("notes".into(), json!([note])); }
+                }
+            }
+        }
+        let reason = self.stop_reason.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if let Some(reason) = reason.as_deref() {
+            receipt["stop_reason"] = json!(reason);
+            if let Some(sig) = receipt["signals"].as_object_mut() {
+                sig.insert("stop_reason".into(), json!(reason));
+            }
+            let note = format!("recording stopped: {reason}");
+            if let Some(r) = receipt["result"].as_object_mut() {
+                match r.get_mut("notes").and_then(|n| n.as_array_mut()) {
+                    Some(a) => a.push(json!(note)),
+                    None => { r.insert("notes".into(), json!([note])); }
+                }
+            }
+        }
+        let mut bundle = json!({
             "schema": "qorcap-bundle/v0", "qorcap_version": env!("CARGO_PKG_VERSION"),
             "match_id": self.args.match_id, "role": self.args.role, "device": self.args.device, "device_id": st.device_id,
             "segments": st.seg.seq, "chain_head": st.seg.head, "checkpoints": st.checkpoints.len(),
@@ -1099,9 +1363,24 @@ impl Engine {
             "receipt_draft_sha256": ev::jcs_sha(&receipt),
             "claims": "Proves the integrity and timing of these video bytes (hash chain + checkpoints, referee co-signable). Does NOT prove who was playing.",
         });
+        if let Some(reason) = reason.as_deref() { bundle["stop_reason"] = json!(reason); }
         drop(st);
         let dir = self.bundle_dir().unwrap_or_else(|| PathBuf::from("."));
         let _ = std::fs::create_dir_all(&dir);
+        let tails = crate::bundle::measure_excluded_tails(&dir);
+        if !tails.is_empty() {
+            bundle["excluded_tails"] = json!(tails);
+            if let Some(r) = receipt["result"].as_object_mut() {
+                let note = "unhashed video tail excluded: only hashed segments are part of the match";
+                match r.get_mut("notes").and_then(|n| n.as_array_mut()) {
+                    Some(a) => a.push(json!(note)),
+                    None => { r.insert("notes".into(), json!([note])); }
+                }
+            }
+            if let Some(obj) = bundle.as_object_mut() {
+                obj.insert("receipt_draft_sha256".into(), json!(ev::jcs_sha(&receipt)));
+            }
+        }
         let w = |n: &str, v: &Value| std::fs::write(dir.join(n), serde_json::to_string_pretty(v).unwrap()).map_err(|e| error!("write {n}: {e}"));
         let _ = w("receipt.draft.json", &receipt);
         let _ = w("bundle.json", &bundle);
@@ -1118,6 +1397,7 @@ impl Engine {
                 Err(e) => warn!("input proof not written: {e}"),
             }
         }
+        if input_proof { self.bundle_finalized.store(true, Ordering::SeqCst); }
         info!("match bundle written to {}", dir.display());
         Some(dir)
     }

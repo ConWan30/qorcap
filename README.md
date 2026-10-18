@@ -2,7 +2,7 @@
 
 # QorCap
 
-**Website:** https://conwan30.github.io/qorcap/ · **Download:** [v0.3.15](https://github.com/ConWan30/qorcap/releases/tag/v0.3.15) ([latest release](https://github.com/ConWan30/qorcap/releases/latest))
+**Website:** https://conwan30.github.io/qorcap/ · **Download:** [v0.3.19](https://github.com/ConWan30/qorcap/releases/tag/v0.3.19) ([latest release](https://github.com/ConWan30/qorcap/releases/latest))
 
 A small Windows recorder for a USB HDMI capture card (built for a generic **"USB3.0 Video"** card carrying a PS5),
 made for **[QorTime](https://github.com/ConWan30/qortime)** match receipts. It does two jobs:
@@ -26,7 +26,7 @@ with a local control surface). QorCap copies only that design idea, no code. No 
 
 ## Quickstart: double-click Start Match
 
-1. Download `qorcap-v0.3.15-windows-x64.zip` from the [latest release](https://github.com/ConWan30/qorcap/releases/latest)
+1. Download `qorcap-v0.3.19-windows-x64.zip` from the [latest release](https://github.com/ConWan30/qorcap/releases/latest)
    and unzip it, for example to `C:\QorCap` (right-click the zip, *Extract All*).
 2. Connect PS5 HDMI out to the **USB3.0 Video** card, and the card to a blue USB 3 port. Close OBS or the Camera app.
 3. Double-click **`Start Match`**. On the first run it downloads ffmpeg, installs Python 3.12 through winget if it
@@ -317,7 +317,7 @@ Global: `--port 8788`, `--ffmpeg PATH`, `--log FILE` (default `qorcap.log`, or `
 ## Run on Windows by hand (PowerShell, advanced)
 
 ```powershell
-# 1. unzip qorcap-v0.3.15-windows-x64.zip to C:\QorCap, then:
+# 1. unzip qorcap-v0.3.19-windows-x64.zip to C:\QorCap, then:
 cd C:\QorCap
 Unblock-File .\qorcap.exe, .\get-ffmpeg.ps1
 powershell -ExecutionPolicy Bypass -File .\get-ffmpeg.ps1     # puts ffmpeg.exe next to qorcap.exe
@@ -354,6 +354,14 @@ continues), replay save, challenge stamp visible in the video, score/final event
 written, `verify-bundle` OK, and a single flipped byte reported as FAIL.
 
 **Tested on Windows (v0.2.0–v0.2.1 era, MyTurn, USB3.0 Video):** `--input-format mjpeg` 1280x720@30 with `h264_mf` at 29.7 fps. v0.2.1 fixed audio / auto-format / OBS.
+
+**v0.3.19:** Monday Night quarter words on match 20261017-162055 are thicker and blurrier than the templates cut from the earlier strip, so a correct 2nd or 3rd quarter led by a wide margin and still scored 0.65–0.75. The pack now includes real glyphs from that match (quarter, the thick clock digits, and the teal away 6). A frame is scored again with every template from its own video minute held out, and a 3rd quarter held out that way stays unknown instead of flipping to 1st. A blurry 1st quarter that still leads by a wide gap is accepted. The chevron beside the teal away score no longer blanks the digit. The 0.85 and 0.75 gates are unchanged. The receipt quarter for that match is 3. The offline labels used to cut the glyphs are not a live input.
+
+**v0.3.18:** on Monday Night the 2nd, 3rd and 4th quarter words sit tight against the clock. The old crop clipped them, so after the 1st quarter every read was quarter null (the logged rejection was the real 1ST at 0:02, which still fails closed). The crop now stops at the bright clock, a 10:00–15:00 clock is four digits, and the clock still reads when the quarter word does not. A score that steps backwards after the scorebug has been gone — the end screen, or a rematch 0–0 — is a new session. The receipt keeps the last legal score. Match 20261017-162055 stays away 6, home 21, unconfirmed, with that reset noted.
+
+**v0.3.17:** on the standard bar, the quarter glyph going unknown at the end of the 1st quarter no longer blanks the rest of the match. A "1" read just after the clock runs out still fails closed, for a bounded window, and a clock reset to 15:00 or a real 2nd quarter releases it. Scores and the clock keep locking when the quarter word misses, including 10:00–15:00. Halftime and end challenges fall back to the running clock, or to elapsed time when the clock dies with the quarter. The end-of-game menu can still confirm. Match 20261017-162055 had read 6–21 with a null quarter and an empty clock from the Q1/Q2 whistle on, and the draft stayed 0–0.
+
+**v0.3.16:** closing the Start Match window no longer has to throw the match away. The recorder writes `receipt.draft.json` and `bundle.json` on a broken pipe, Ctrl+C, console close, launcher exit, a full disk, and a duration stop, and records why it stopped. `qorcap finalize --recover` rebuilds those two files from `manifest.jsonl`, checkpoints, `inputs.jsonl`, challenges and the timeline when a kill landed first. Video bytes after the last hashed segment are excluded; they are not added to the hash chain. Start Match detaches the recorder from the launcher console, and Enter still stops the match.
 
 **v0.3.15:** the challenge recheck times the pause menu from the video fragment's own presentation time. The manifest stamp is written when the fragment closes, about one fragment after the frames in it, which made match-20261017-110028 report the menu at 3593 / 3641 / 3522 ms instead of the ~1.75 s it is actually on screen. The 2.5 s bound is unchanged. Live challenge gating still uses the live frame clock.
 

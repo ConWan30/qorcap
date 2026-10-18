@@ -22,6 +22,79 @@ def img(name):
     return cv2.imread(str(FX / name))
 
 
+def _clock_band(reader, digits):
+    """Paint clock digits into the standard clock box. ``digits`` is four labels plus a colon kind."""
+    import numpy as np
+    p = reader.profile
+    top = reader._band_top()
+    band = np.zeros((p.ref_h - top, p.ref_w, 3), np.uint8)
+    x1, x2, y1, y2 = p.clock_text
+    patch = band[y1 - top:y2 - top, x1:x2]
+    canvas = np.zeros((y2 - y1, x2 - x1), np.uint8)
+
+    def paint(x, label):
+        t = reader.pack.groups["clock"][label][0].reshape(9, 6).astype(np.float32)
+        img = (t - t.min()) / (t.max() - t.min() + 1e-9)
+        canvas[0:9, x:x + 6] = (img * 255).astype(np.uint8)
+
+    paint(0, digits[0])
+    paint(7, digits[1])
+    if digits[2] == "dots":
+        canvas[1:3, 14:16] = 255
+        canvas[6:8, 14:16] = 255
+    else:
+        canvas[1:8, 14:16] = 255  # one bar: not a colon
+    paint(17, digits[3])
+    paint(24, digits[4])
+    patch[:] = canvas[:, :, None]
+    return band
+
+
+def test_standard_bar_reads_15_00_and_keeps_the_score_when_the_quarter_fails():
+    """Q2 opens at 15:00. The vendored segmenter calls that clock_layout and drops the pair with the quarter.
+
+    The rescue keeps away 6 / home 21 and reads 15:00. 16:00 and a bar-shaped colon stay unread.
+    """
+    from qor_receipt._vendor.qoresence.vision.local_scorebug.reader import FrameRead, ScorebugReader
+    from qorcap_standard import clock_seconds_mmss, rescue_standard_read
+
+    raw = ScorebugReader()
+    band = _clock_band(raw, ("1", "5", "dots", "0", "0"))
+    assert raw._read_clock(band, 0, 0)[0] is None  # two minute digits are not a learned M:SS
+    assert clock_seconds_mmss(raw, band, 0, 0) == (900, "15:00")
+    assert clock_seconds_mmss(raw, _clock_band(raw, ("1", "6", "dots", "0", "0")), 0, 0) is None
+    assert clock_seconds_mmss(raw, _clock_band(raw, ("1", "5", "bar", "0", "0")), 0, 0) is None
+
+    class Inner:
+        def __init__(self):
+            self.profile = raw.profile
+            self.pack = raw.pack
+
+        def read(self, _frame):
+            return FrameRead(ok=False, reason="quarter_unsure", profile_id="madden27_standard",
+                             offset=(0, 0), detail={"partial_pair": [6, 21]})
+
+        def reference_band(self, _frame):
+            return band, "ok"
+
+        def _read_clock(self, b, dx, dy):
+            return raw._read_clock(b, dx, dy)
+
+        def _crop(self, b, box):
+            return raw._crop(b, box)
+
+        def clock_is_red(self, patch):
+            return raw.clock_is_red(patch)
+
+        def clock_intensity(self, patch, red):
+            return raw.clock_intensity(patch, red)
+
+    import numpy as np
+    fr = rescue_standard_read(Inner(), np.zeros((360, 640, 3), np.uint8))
+    assert not fr.ok and fr.reason == "quarter_unsure" and fr.quarter is None
+    assert (fr.left_score, fr.right_score, fr.clock_seconds) == (6, 21, 900)
+
+
 def test_standard_bar_reads_23_and_30_and_refuses_the_downs_banner():
     raw, aug = ScorebugReader(), standard_reader()
     q3 = img("m27_std_110028_q3_23_0.jpg")
