@@ -5,6 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace as NS
 
 import cv2
+import numpy as np
 import pytest
 
 HERE = Path(__file__).parent
@@ -128,6 +129,113 @@ def test_end_menu_real_9_template_still_xchecked():
 def test_corroborate_online_end_menu(exp, ok):
     from qorcap_endmenu import EndMenuReader
     assert EndMenuReader().corroborate(img("m27_mnp_end_menu_online.jpg"), exp)["ok"] is ok
+
+
+def _shift_quarter_word(im, dx):
+    """Move only the grey quarter word right by ``dx``. The clock and the scores stay put."""
+    out = im.copy()
+    y0, y1 = M.BAR_Y
+    x0, x1 = M.QUARTER_X[0], 890
+    src = im[y0:y1, x0:x1]
+    hsv = cv2.cvtColor(src, cv2.COLOR_BGR2HSV)
+    ink = hsv[..., 2] > M.QUARTER_INK
+    if not ink.any():
+        return out
+    bg = np.median(src[~ink], axis=0).astype(np.uint8)
+    cleared = src.copy()
+    cleared[ink] = bg
+    out[y0:y1, x0:x1] = cleared
+    ys, xs = np.nonzero(ink)
+    for y, x in zip(ys, xs):
+        out[y0 + y, x0 + x + dx] = src[y, x]
+    return out
+
+
+def _old_box_label(mnp, im):
+    """The v0.3.17 crop: a fixed box ending at x=882, which clips a 2ND that has moved right."""
+    hsv = M.bar_hsv(im)
+    v = hsv[..., 2]
+    y0, y1 = M.QUARTER_Y[0] - M.BAR_Y[0], M.QUARTER_Y[1] - M.BAR_Y[0]
+    q = (v[y0:y1, M.QUARTER_X[0]:M.QUARTER_X[1]] > M.QUARTER_INK).astype(np.uint8)
+    ys, xs = np.nonzero(q)
+    if len(xs) < 20:
+        return None
+    lab, _, _ = mnp.classify("quarter", q[ys.min():ys.max() + 1, xs.min():xs.max() + 1], M.QUARTER_SIZE)
+    return lab
+
+
+@pytest.mark.parametrize("name,away,home,q,clock,red", [
+    ("m27_mnp_q2.jpg", 14, 13, 2, "2:27", False),
+    ("m27_mnp_q4_final.jpg", 34, 29, 4, "0:00", True),
+])
+def test_quarter_word_shifted_toward_the_clock_still_reads(mnp, name, away, home, q, clock, red):
+    """2ND/4TH are wider than 1ST. Eight pixels toward the clock clips the old box and used to go quarter-null."""
+    im = _shift_quarter_word(img(name), 8)
+    assert _old_box_label(mnp, im) is None
+    fr = mnp.read(im)
+    assert fr.ok, fr.reason
+    assert (fr.left_score, fr.right_score, fr.quarter, fr.clock_text, fr.clock_red) == (away, home, q, clock, red)
+
+
+def test_q1_word_still_reads_after_the_same_shift(mnp):
+    fr = mnp.read(_shift_quarter_word(img("m27_mnp_q1.jpg"), 8))
+    assert fr.ok and (fr.quarter, fr.clock_text, fr.left_score, fr.right_score) == (1, "4:07", 0, 0)
+
+
+def test_clock_keeps_reading_when_the_quarter_word_is_gone(mnp):
+    im = img("m27_mnp_q2.jpg").copy()
+    y0, y1 = M.BAR_Y
+    x0, x1 = M.QUARTER_X[0], 890
+    src = im[y0:y1, x0:x1]
+    hsv = cv2.cvtColor(src, cv2.COLOR_BGR2HSV)
+    ink = hsv[..., 2] > M.QUARTER_INK
+    bg = np.median(src[~ink], axis=0).astype(np.uint8)
+    src[ink] = bg
+    im[y0:y1, x0:x1] = src
+    fr = mnp.read(im)
+    assert fr.ok is False and fr.reason in ("quarter_missing", "quarter_unsure")
+    assert (fr.left_score, fr.right_score, fr.quarter, fr.clock_text) == (14, 13, None, "2:27")
+
+
+def test_clock_from_digits_accepts_ten_through_fifteen_only():
+    assert M.clock_from_digits("1500") == (900, "15:00")
+    assert M.clock_from_digits("1000") == (600, "10:00")
+    assert M.clock_from_digits("1559") == (959, "15:59")
+    assert M.clock_from_digits("427") == (267, "4:27")
+    assert M.clock_from_digits("1600") is None
+    assert M.clock_from_digits("0900") is None
+    assert M.clock_from_digits("460") is None
+
+
+def test_four_digit_clock_reads_fifteen_minutes(mnp):
+    """Paint 1 5 0 0 from the clock templates into the clock band of a real Monday Night frame."""
+    import numpy as np
+    im = img("m27_mnp_q2.jpg").copy()
+    hsv = cv2.cvtColor(im, cv2.COLOR_BGR2HSV)
+    v = hsv[..., 2]
+    # Clear the existing 3-digit clock so only the painted 15:00 remains.
+    v[M.QUARTER_Y[0]:M.QUARTER_Y[1], 880:940] = 20
+    labels, vecs = mnp.groups["clock"]
+    glyphs = {}
+    for lab, vec in zip(labels, vecs):
+        if lab in glyphs:
+            continue
+        imgv = vec.reshape(M.CLOCK_SIZE[1], M.CLOCK_SIZE[0])
+        glyphs[lab] = (imgv > 0.02).astype(np.uint8)
+    x = 880  # inside the one-digit box, four digits: the old reader required exactly three
+    for lab in "1500":
+        g = glyphs[lab]
+        h, w = g.shape
+        y = 692
+        patch = v[y:y + h, x:x + w]
+        patch[g.astype(bool)] = 255
+        v[y:y + h, x:x + w] = patch
+        x += w + 3
+    hsv[..., 2] = v
+    painted = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
+    fr = mnp.read(painted)
+    assert fr.clock_text == "15:00" and fr.clock_seconds == 900, (fr.reason, fr.clock_text, fr.quarter)
+    assert fr.quarter == 2 and (fr.left_score, fr.right_score) == (14, 13)
 
 
 def test_reader_core_confirms_covered_end_menu_only_with_q4_scorebug_final():
