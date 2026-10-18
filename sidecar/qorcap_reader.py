@@ -33,6 +33,14 @@ QUARTER_RESET_CLOCK_S = 10 * 60
 # quarter of 2 or higher ends it immediately. It must not stay shut for the rest of the match
 # (match-20261017-162055: from the Q1/Q2 boundary every read was quarter null).
 QUARTER_ONE_SUPPRESS_MS = 15_000
+# v0.3.21: short quarters. match-20261017-232726 and match-20261018-002316 were 6:00 quarters (Thursday Night), so a
+# reset never reached 10:00 and no period was ever counted. A reset also counts when the clock comes back to within
+# RESET_MARGIN_S of the highest clock seen so far (never below MIN_RESET_CLOCK_S, never above the 10:00 rule), but
+# only after a real rundown: the read before the first 0:0x was already inside the last RUNDOWN_PREV_MAX_S, or two
+# 0:0x reads in a row. A lone 0:0x misread in the middle of a quarter does not end it.
+RESET_MARGIN_S = 30
+MIN_RESET_CLOCK_S = 60
+RUNDOWN_PREV_MAX_S = 120
 # Wall-clock stand-in for one period when the game clock never comes back after a rundown.
 ELAPSED_PERIOD_MS = 12 * 60 * 1000
 # Q4 end menu: the scorebug's last red clock in the final 5 seconds (110028 locked 0:03, then the menu).
@@ -56,6 +64,15 @@ class PeriodTrack:
         self.periods_completed = 0
         self.clock_unreadable = False
         self.suppress_until_ms: int | None = None
+        self.max_clock_s: int | None = None
+        self.prev_clock_s: int | None = None
+        self.rundown_confirmed = False
+
+    def reset_clock_s(self) -> int:
+        """Clock that opens a new period after a confirmed rundown: 10:00, or near the longest clock seen if shorter."""
+        if self.max_clock_s is None:
+            return QUARTER_RESET_CLOCK_S
+        return max(MIN_RESET_CLOCK_S, min(QUARTER_RESET_CLOCK_S, self.max_clock_s - RESET_MARGIN_S))
 
     def note(self, t_ms: int, clock_s) -> None:
         if isinstance(clock_s, bool) or not isinstance(clock_s, int):
@@ -63,7 +80,10 @@ class PeriodTrack:
                 self.clock_unreadable = True
             return
         self.clock_unreadable = False
+        prev, self.prev_clock_s = self.prev_clock_s, int(clock_s)
         if clock_s <= PERIOD_END_CLOCK_S:
+            if self.saw_low or (prev is not None and prev <= RUNDOWN_PREV_MAX_S):
+                self.rundown_confirmed = True
             if not self.saw_low:
                 self.suppress_until_ms = int(t_ms) + QUARTER_ONE_SUPPRESS_MS
                 self.period_end_ms = int(t_ms)
@@ -72,11 +92,14 @@ class PeriodTrack:
             self.saw_low = True
             self.period_ended = True
             return
-        if clock_s >= QUARTER_RESET_CLOCK_S and self.saw_low:
+        if self.saw_low and (clock_s >= QUARTER_RESET_CLOCK_S
+                             or (self.rundown_confirmed and clock_s >= self.reset_clock_s())):
             self.periods_completed += 1
             self.saw_low = False
+            self.rundown_confirmed = False
             self.period_ended = False
             self.period_end_ms = int(t_ms)
+        self.max_clock_s = int(clock_s) if self.max_clock_s is None else max(self.max_clock_s, int(clock_s))
 
     def one_suppressed(self, t_ms: int) -> bool:
         """True while a glyph of "1" must stay unknown. The window is bounded."""

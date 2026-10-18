@@ -112,7 +112,9 @@ def test_pack_is_real_only(tnp):
     assert seen("quarter") == {"1", "2", "3", "4", "OT"}
     assert tnp.source["quarter:OT"].startswith("real:match-20261017-091651")
     assert "091651" in tnp.source["quarter:1"] and "091651" in tnp.source["quarter:4"]
-    assert tnp.source["quarter:2"] == "real:match-20261017-010703:63"
+    assert tnp.source["quarter:2"] == "real:match-20261017-010703:63+match-20261017-232726:40+match-20261018-002316:40"
+    for q in "1234":
+        assert "match-20261017-232726:40" in tnp.source[f"quarter:{q}"]
 
 
 def test_unseen_digit_fails_closed_not_wrong():
@@ -257,3 +259,37 @@ def test_quarter_does_not_go_backwards():
     last = [p for p in posts if p["type"] == "score"][-1]
     assert (last["away"], last["home"], last["quarter"]) == (6, 0, None)
     assert core._max_quarter == 3
+
+
+# v0.3.21: 6:00-quarter Thursday Night games (match-20261017-232726, match-20261018-002316). These frames are held
+# out of the 240 skeletons the pack gained from the same matches (tools/add_tnp_quarter_232726_002316.py).
+NEW_Q = [("m27_tnp_232726_q1_0_0.png", 0, 0, 1), ("m27_tnp_232726_q2_0_21.png", 0, 21, 2),
+         ("m27_tnp_232726_q3_7_21.png", 7, 21, 3), ("m27_tnp_232726_q4_7_30.png", 7, 30, 4),
+         ("m27_tnp_002316_q1_0_0.png", 0, 0, 1), ("m27_tnp_002316_q2_7_3.png", 7, 3, 2)]
+
+
+@pytest.mark.parametrize("name,away,home,q", NEW_Q)
+def test_232726_002316_quarters_read(tnp, name, away, home, q):
+    fr = tnp.read(img(name))
+    assert fr.quarter == q, fr.reason
+    assert (fr.left_score, fr.right_score) == (away, home)
+
+
+@pytest.mark.parametrize("name,away,home,q", NEW_Q)
+def test_232726_002316_quarters_without_the_new_templates_fail_closed(name, away, home, q):
+    """With only the 010703/091651 quarter templates these bars post no quarter (what v0.3.20 did), never a wrong one."""
+    r = T.ThursdayNightReader()
+    labels, vecs = r.groups["quarter"]
+    keep = [i for i in range(len(labels)) if i < 208]
+    r.groups["quarter"] = ([labels[i] for i in keep], vecs[keep])
+    fr = r.read(img(name))
+    assert fr.quarter in (None, q)
+    assert (fr.left_score, fr.right_score) == (away, home)
+
+
+def test_auto_reads_the_232726_quarter():
+    from qor_receipt._vendor.qoresence.vision.local_scorebug.reader import ScorebugReader
+    a = M.AutoProfileReader(ScorebugReader(), prep=prep)
+    fr = a.read(img("m27_tnp_232726_q3_7_21.png"))
+    assert fr.quarter == 3 and (fr.left_score, fr.right_score) == (7, 21)
+    assert a.active_profile == "madden27_thursday_night"
