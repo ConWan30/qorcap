@@ -309,6 +309,7 @@ Global: `--port 8788`, `--ffmpeg PATH`, `--log FILE` (default `qorcap.log`, or `
 | POST | `/record/start` `{out?, duration?}` · `/record/stop` | |
 | POST | `/replay/save` `{out?}` | returns `{file}` |
 | GET | `/snapshot.jpg` | latest frame (4 fps) |
+| GET | `/frame/scorebug` | opt-in (`QORCAP_GLIMPSE_FRAME=1` / `--glimpse-frame`), read-only, from memory: the reader's newest snapshot for the advisory Glimpse watcher; 1 per 2 s, refused when older than 3 s. See [docs/GLIMPSE_WATCH.md](docs/GLIMPSE_WATCH.md) |
 | POST | `/challenge` | referee nonce |
 | POST | `/events` | `{type:"score",home,away,quarter,clock_s,clock_red}` · `{type:"obs",obs,t_ms,until_ms,n}` · `{type:"final",basis,home,away,quarter}` |
 | GET | `/checkpoints?since=N` · `/checkpoints/stream` (SSE) · `/timeline` | |

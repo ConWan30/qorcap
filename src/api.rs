@@ -8,8 +8,8 @@ use std::io::{Read, Write};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
-pub struct Resp { pub code: u16, pub ctype: &'static str, pub body: Vec<u8> }
-fn j(code: u16, v: Value) -> Resp { Resp { code, ctype: "application/json", body: v.to_string().into_bytes() } }
+pub struct Resp { pub code: u16, pub ctype: &'static str, pub body: Vec<u8>, pub headers: Vec<(&'static str, String)> }
+fn j(code: u16, v: Value) -> Resp { Resp { code, ctype: "application/json", body: v.to_string().into_bytes(), headers: vec![] } }
 
 pub fn route(e: &Arc<Engine>, method: &str, url: &str, body: &str) -> Resp {
     let path = url.split('?').next().unwrap_or(url);
@@ -24,9 +24,14 @@ pub fn route(e: &Arc<Engine>, method: &str, url: &str, body: &str) -> Resp {
         ("POST", "/record/stop") => match e.stop_recording() { Some(p) => j(200, json!({"ok": true, "file": p})), None => j(409, json!({"ok": false, "error": "not recording"})) },
         ("POST", "/replay/save") => match e.save_replay(b["out"].as_str()) { Ok(p) => j(200, json!({"ok": true, "file": p})), Err(m) => j(409, json!({"ok": false, "error": m})) },
         ("GET", "/snapshot.jpg") => match std::fs::read(&e.snapshot) {
-            Ok(d) if d.len() > 2 && d[0] == 0xFF && d[1] == 0xD8 => Resp { code: 200, ctype: "image/jpeg", body: d },
+            Ok(d) if d.len() > 2 && d[0] == 0xFF && d[1] == 0xD8 => {
+                e.tap.offer(&d, crate::engine::wall_ms()); // no-op unless --glimpse-frame; never blocks
+                Resp { code: 200, ctype: "image/jpeg", body: d, headers: vec![] }
+            }
             _ => j(503, json!({"ok": false, "error": "no frame yet"})),
         },
+        // Advisory Glimpse watcher: the newest frame the reader already pulled (no file read here).
+        ("GET", "/frame/scorebug") => frame_scorebug(e),
         ("POST", "/challenge") => match e.challenge(&b) { Ok(v) => j(200, v), Err(m) => j(400, json!({"ok": false, "error": m})) },
         ("POST", "/events") => match e.event(&b) { Ok(v) => j(200, v), Err(m) => j(400, json!({"ok": false, "error": m})) },
         ("GET", "/checkpoints") => {
@@ -51,6 +56,26 @@ pub fn route(e: &Arc<Engine>, method: &str, url: &str, body: &str) -> Resp {
             _ => j(400, json!({"ok": false, "error": "seq must be a non-negative integer"})),
         },
         _ => j(404, json!({"ok": false, "error": format!("no route {method} {path}")})),
+    }
+}
+
+fn frame_scorebug(e: &Arc<Engine>) -> Resp {
+    use crate::glimpse::TapErr;
+    match e.tap.take(crate::engine::wall_ms()) {
+        Ok(f) => {
+            let mut h = vec![("X-Qorcap-Frame-Wall-Ms", f.wall_ms.to_string()), ("X-Qorcap-Frame-Seq", f.seq.to_string()),
+                             ("X-Qorcap-Advisory", "glimpse-shadow; read-only; never feeds locks".to_string()), ("Cache-Control", "no-store".to_string())];
+            if let Some(b) = e.args.bundle.as_deref().filter(|b| b.is_ascii() && !b.contains(['\r', '\n'])) { h.push(("X-Qorcap-Bundle", b.to_string())); }
+            Resp { code: 200, ctype: "image/jpeg", body: f.jpeg.as_ref().clone(), headers: h }
+        }
+        Err(TapErr::Off) => j(404, json!({"ok": false, "error": "glimpse frame tap is off (record --glimpse-frame or QORCAP_GLIMPSE_FRAME=1)"})),
+        Err(TapErr::Throttled { retry_ms }) => {
+            let mut r = j(429, json!({"ok": false, "error": "rate limited", "retry_ms": retry_ms}));
+            r.headers.push(("Retry-After", retry_ms.div_ceil(1000).max(1).to_string()));
+            r
+        }
+        Err(TapErr::NoFrame) => j(503, json!({"ok": false, "error": "no frame yet"})),
+        Err(TapErr::Stale { age_ms }) => j(503, json!({"ok": false, "error": "no fresh frame", "age_ms": age_ms})),
     }
 }
 
@@ -88,9 +113,13 @@ fn handle(e: Arc<Engine>, mut rq: tiny_http::Request) {
             let mut body = String::new();
             let _ = rq.as_reader().take(1 << 16).read_to_string(&mut body);
             let r = route(&e, rq.method().as_str(), rq.url(), &body);
-            if r.code >= 400 && rq.url() != "/snapshot.jpg" { warn!("API {} {} -> {} {}", rq.method(), rq.url(), r.code, String::from_utf8_lossy(&r.body)); }
+            if r.code >= 400 && rq.url() != "/snapshot.jpg" && !rq.url().starts_with("/frame/scorebug") { warn!("API {} {} -> {} {}", rq.method(), rq.url(), r.code, String::from_utf8_lossy(&r.body)); }
             let h = tiny_http::Header::from_bytes("Content-Type", r.ctype).unwrap();
-            let _ = rq.respond(tiny_http::Response::from_data(r.body).with_status_code(r.code).with_header(h));
+            let mut resp = tiny_http::Response::from_data(r.body).with_status_code(r.code).with_header(h);
+            for (k, v) in &r.headers {
+                if let Ok(x) = tiny_http::Header::from_bytes(k.as_bytes(), v.as_bytes()) { resp = resp.with_header(x); }
+            }
+            let _ = rq.respond(resp);
 }
 
 /// Minimal HTTP/1.0 client for the CLI subcommands.
@@ -182,6 +211,33 @@ mod tests {
         for c in all["checkpoints"].as_array().unwrap() { prev = crate::evidence::check_checkpoint(c, &prev).unwrap(); }
     }
     #[test]
+    fn glimpse_frame_tap_is_opt_in_memory_only_and_rate_limited() {
+        // Off by default: 404, and the reader's /snapshot.jpg path is unchanged.
+        let off = engine(&[]);
+        assert_eq!(route(&off, "GET", "/frame/scorebug", "").code, 404);
+        std::fs::write(&off.snapshot, [0xFF, 0xD8, 0xFF, 0xD9]).unwrap();
+        assert_eq!(route(&off, "GET", "/snapshot.jpg", "").code, 200);
+        assert_eq!(route(&off, "GET", "/frame/scorebug", "").code, 404);
+        // On: nothing until the reader has pulled a frame; the tap itself never opens the snapshot file.
+        let e = engine(&["--glimpse-frame"]);
+        std::fs::write(&e.snapshot, [0xFF, 0xD8, 7, 0xFF, 0xD9]).unwrap();
+        assert_eq!(route(&e, "GET", "/frame/scorebug", "").code, 503);
+        assert_eq!(route(&e, "GET", "/snapshot.jpg", "").code, 200); // the reader's own poll
+        std::fs::remove_file(&e.snapshot).unwrap(); // gone from disk: the tap serves memory only
+        let r = route(&e, "GET", "/frame/scorebug", "");
+        assert_eq!((r.code, r.ctype, r.body.as_slice()), (200, "image/jpeg", &[0xFF, 0xD8, 7, 0xFF, 0xD9][..]));
+        assert!(r.headers.iter().any(|(k, v)| *k == "X-Qorcap-Frame-Seq" && v == "1"));
+        assert!(r.headers.iter().any(|(k, _)| *k == "X-Qorcap-Bundle"));
+        assert!(!e.snapshot.exists(), "the tap must not write the snapshot file");
+        let again = route(&e, "GET", "/frame/scorebug", "");
+        assert_eq!(again.code, 429);
+        assert!(again.headers.iter().any(|(k, _)| *k == "Retry-After"));
+        // POST is not a route: nothing can be sent back through the tap.
+        assert_eq!(route(&e, "POST", "/frame/scorebug", "{}").code, 404);
+        // The engine's match state is untouched by the tap.
+        assert!(e.ev.lock().unwrap().timeline.is_empty());
+    }
+    #[test]
     fn snapshot_and_http_roundtrip() {
         let e = engine(&[]);
         std::fs::write(&e.snapshot, [0xFF, 0xD8, 0xFF, 0xD9]).unwrap();
@@ -190,6 +246,8 @@ mod tests {
         let h = serve(e.clone(), port).unwrap();
         let (c, b) = call(port, "GET", "/status", "").unwrap();
         assert_eq!(c, 200); assert!(b.contains("\"device\":\"testpattern\""));
+        // Off by default over HTTP too.
+        assert_eq!(call(port, "GET", "/frame/scorebug", "").unwrap().0, 404);
         // SSE stream receives a checkpoint
         let mut sse = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
         write!(sse, "GET /checkpoints/stream HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
