@@ -371,6 +371,15 @@ fn main() {
             if let Some(c) = check { rest.extend(["--check".to_string(), c]); }
             sidecar("highlights", bundle, python, rest, &ff)
         }
+        Cmd::PsnNames { bundle, python, samples } => {
+            if let Some(b) = bundle.as_deref() {
+                if qorcap::inputproof::recorder_running(std::path::Path::new(b)) {
+                    eprintln!("error: QorCap is still recording into {b}. PSN names are read only after the match stops.");
+                    std::process::exit(3);
+                }
+            }
+            sidecar("psn-names", bundle, python, vec!["--samples".to_string(), samples.to_string()], &ff)
+        }
         Cmd::InputTest { secs } => input_test(secs),
         Cmd::InputProof { dir, frames, no_video, force } => {
             let d = std::path::Path::new(&dir);

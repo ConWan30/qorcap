@@ -84,7 +84,7 @@ Files in the match folder: `video.mp4`, `clips/`, `manifest.jsonl`, `checkpoints
 referee countersignatures); after finalize also `timeline.offline.jsonl`, `score_checkpoints.jsonl`, `final.offline.json`; when the final was
 confirmed from the recording's last minutes at stop, `final.tail.json` and `clips/final-recorded.mp4`.
 
-QorTime code: the zip bundles a pinned copy (`qortime/`, commit `11baa46`, includes `qortime referee-ai`, `end_menu_read`, official-review (verified uploads) and challenge rule v2 verification). If it is missing, the launcher downloads that
+QorTime code: the zip bundles a pinned copy (`qortime/`, commit `0204e6d`, includes the PSN name check (`match.observed_handles`), `qortime referee-ai`, `end_menu_read`, official-review (verified uploads) and challenge rule v2 verification). If it is missing, the launcher downloads that
 pinned commit's zip once into `%LOCALAPPDATA%\QorCap`.
 
 ## Stack and why
@@ -289,6 +289,37 @@ public transparency log, and QorCap prints the entry number. See QorTime `docs/R
 v0.3.10 also includes the v0.3.9 crash fix: Start Match and Finalize no longer exit with code 6 on a SELF_ATTESTED
 verdict (#14).
 
+## PSN names from the screen (post-match, on-screen evidence)
+
+QorTime challenge links take both players' PSN IDs. Sony and EA have no public login or API (and QorCap uses no
+unofficial PSN API), so QorCap reads the names **Madden itself draws on screen** in online head-to-head games from the
+finished recording:
+
+| Where (1280x720) | When |
+|---|---|
+| top banners: PS logo at (215,8) left / (974,8) right, then headset icon, then the name | play call and pre-snap, also behind the pause menu |
+| pause-menu player cards (logo y≈587, x≈456 / 921) | every pause |
+| end-of-game menu cards (logo y≈607) | after the final whistle |
+
+Left is the away team, right is home (checked on match 021003). `sidecar/qorcap_psn.py` seeks about 60 single frames
+with ffmpeg (no full decode), finds the PS logo by template match (both banners required), crops the name band at a
+fixed offset, masks the white text and classifies each glyph against `sidecar/packs/madden27_psn_banner_v1.npz`
+(glyphs seen in real footage, plus a rendered Barlow Condensed fallback). Characters are voted across frames. Any
+character without a clear winner becomes `?`, and the handle is then `null`: it fails closed. Output is
+`psn_names.json` in the bundle, bound to the chain head and manifest hash, and, when run as part of finalize,
+`match.observed_handles` in the signed receipt (handle, pattern, confidence in permille, sightings, agreeing frames,
+screen side).
+
+```
+qorcap psn-names "C:\Users\you\Documents\QorCap Matches\match-...-021003"
+python sidecar\qorcap_match.py finalize DIR --psn-names ...     # read names, then sign them into the receipt
+```
+
+It refuses to run while QorCap is recording (exit 3). Exit 4 means no video. This is **on-screen evidence, not
+account proof**. Look-alike characters (0/O/Q, 1/l/I, g/y) can't be told apart, and a name made of characters the
+pack has never seen in real footage usually reads as unverified. Rebuild the pack with `tools/make_psn_pack.py` from
+labelled strips.
+
 ## Commands
 
 ```
@@ -305,6 +336,7 @@ qorcap verify-bundle DIR
 qorcap input-test [--secs N]
 qorcap input-proof DIR [--frames 15] [--no-video]
 qorcap submit DIR [--full] [--referee URL] [--yes]
+qorcap psn-names DIR [--samples 60]          read both on-screen PSN names after the match (not while recording)
 qorcap record ... [--no-controller]
 ```
 Global: `--port 8788`, `--ffmpeg PATH`, `--log FILE` (default `qorcap.log`, or `DIR\qorcap.log` with `--bundle`).

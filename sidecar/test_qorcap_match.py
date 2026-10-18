@@ -625,3 +625,33 @@ def test_post_game_reset_keeps_a_third_quarter_when_one_was_read():
     kept = qm.game_segment_score(events)
     assert (kept["away"], kept["home"], kept["quarter"]) == (6, 21, 3)
     assert "post-game score reset" in kept["notes"][0]
+
+
+def test_observed_handles_go_into_the_signed_receipt(tmp_path):
+    """psn_names.json bound to the bundle -> receipt.match.observed_handles, covered by both signatures."""
+    import qorcap_psn as P
+    from qor_receipt.receipt import verify_receipt
+    from qor_receipt.checkpoints import Chain
+    bundle = tmp_path / "b"
+    bundle.mkdir()
+    (bundle / "bundle.json").write_text(json.dumps({"chain_head": "cd" * 32}))
+    (bundle / "manifest.jsonl").write_text("{}\n")
+    side = {"handle": "Qortrola30", "pattern": "Qortrola30", "confidence_permille": 990, "sightings": 60, "agree": 60}
+    doc = {"schema": P.SCHEMA, "reader": P.READER, "pack": "t", "bound_to": P.binding(bundle),
+           "sides": {"left": dict(side, team="away"), "right": dict(side, handle=None, pattern="Every?hing_360", team="home")}}
+    (bundle / "psn_names.json").write_text(json.dumps(doc))
+    draft = qm.with_observed_handles(bundle, _draft())
+    oh = draft["match"]["observed_handles"]
+    assert oh["away"]["handle"] == "Qortrola30" and oh["home"]["handle"] is None and oh["source"] == "on_screen"
+    dev, ref = qm.load_keys(tmp_path / "keys")
+    cs = qm.Countersigner(ref, "local-1", "home", clock=lambda: 1050)
+    cp = Chain().next(1000, "a" * 64, "b" * 64)
+    assert cs.offer(cp)
+    rec = qm.build_receipt(draft, cs.signed, dev, ref, match_id="local-1", role="home", started_ms=900)
+    assert rec["match"]["observed_handles"] == oh
+    v = verify_receipt(rec, referee_pub=ref.pubkey_hex)
+    assert v["errors"] == [] and v["status"] == "SELF_ATTESTED"
+    rec["match"]["observed_handles"]["away"]["handle"] = "Someone_else"  # edited after signing -> signature fails
+    assert verify_receipt(rec, referee_pub=ref.pubkey_hex)["status"] == "FAIL"
+    (bundle / "manifest.jsonl").write_text('{"other": 1}\n')  # file from another recording: ignored
+    assert "observed_handles" not in qm.with_observed_handles(bundle, _draft())["match"]

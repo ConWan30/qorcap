@@ -95,6 +95,20 @@ pub enum Cmd {
         #[arg(long)]
         check: Option<String>,
     },
+    /// On-screen PSN names (post-match only): read the PSN names Madden shows in an ONLINE game (player banners at the top,
+    /// pause/end-of-game menu cards) from the recorded video and write psn_names.json. On-screen evidence, not account
+    /// proof; unreadable characters fail closed. 'finalize' then adds them to the receipt as match.observed_handles.
+    /// Refuses while the bundle is still being recorded. Runs sidecar/qorcap_psn.py (needs Python + ffmpeg).
+    PsnNames {
+        /// Match bundle folder. Default: the newest folder in Documents/QorCap Matches
+        bundle: Option<String>,
+        /// Python interpreter (default: QorCap's venv, then py/python3/python)
+        #[arg(long)]
+        python: Option<String>,
+        /// Frames to sample across the match
+        #[arg(long, default_value_t = 60)]
+        samples: u32,
+    },
     /// Live controller check: confirms the laptop is reading the DualSense over USB HID and shows presses
     InputTest {
         /// Stop after N seconds (default: until Ctrl+C)
@@ -258,6 +272,15 @@ mod tests {
             }
             _ => panic!(),
         }
+    }
+
+    #[test]
+    fn parses_psn_names() {
+        match Cli::try_parse_from(["qorcap", "psn-names", "D:/m", "--samples", "40"]).unwrap().cmd {
+            Cmd::PsnNames { bundle, samples, .. } => assert_eq!((bundle.as_deref(), samples), (Some("D:/m"), 40)),
+            _ => panic!(),
+        }
+        assert!(matches!(Cli::try_parse_from(["qorcap", "psn-names"]).unwrap().cmd, Cmd::PsnNames { bundle: None, samples: 60, .. }));
     }
 
     #[test]
