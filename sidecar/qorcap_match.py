@@ -664,6 +664,11 @@ def main(argv=None) -> int:
     if "finalize" in argv:  # `qorcap_match.py [--qorcap X ...] finalize [BUNDLE] [opts]` (launcher puts its opts first)
         argv.remove("finalize")
         return finalize_main(argv)
+    if "highlights" in argv:  # `qorcap_match.py highlights [BUNDLE] [--pre 8 --post 4]` (post-match only, opt-in)
+        argv.remove("highlights")
+        sys.path.insert(0, str(HERE))
+        from qorcap_highlights import main as highlights_main
+        return highlights_main(argv)
     if "submit" in argv:  # `qorcap_match.py [--qorcap X ...] submit [BUNDLE] [--full]` -> QorTime official referee
         argv.remove("submit")
         from qorcap_submit import main as submit_main
@@ -1908,6 +1913,8 @@ def finalize_main(argv) -> int:
     ap.add_argument("--no-open", action="store_true")
     ap.add_argument("--recover", action="store_true",
                     help="rebuild receipt.draft.json and bundle.json from manifest, checkpoints, inputs, challenges and timeline")
+    ap.add_argument("--highlights", action="store_true",
+                    help="opt-in: after signing, cut verified highlight clips around each locked score change (highlights/)")
     a = ap.parse_args(argv)
     say("=" * 64)
     say("  QorCap  -  Finalize Match (offline)")
@@ -1924,9 +1931,27 @@ def finalize_main(argv) -> int:
         say(f"Missing Python packages: {' '.join(miss)}\n  Fix: py -m pip install {' '.join(miss)}")
         return 3
     ff = a.ffmpeg or next((str(c) for c in [HERE.parent / ("ffmpeg.exe" if WIN else "ffmpeg")] if c.exists()), None) or shutil.which("ffmpeg") or "ffmpeg"
-    return finalize(bundle, qt=qt, qorcap=find_qorcap(a.qorcap), ffmpeg=ff,
-                    key_dir=Path(a.key_dir) if a.key_dir else data_dir() / "keys", no_open=a.no_open, hz=a.hz,
-                    recover=a.recover)
+    rc = finalize(bundle, qt=qt, qorcap=find_qorcap(a.qorcap), ffmpeg=ff,
+                  key_dir=Path(a.key_dir) if a.key_dir else data_dir() / "keys", no_open=a.no_open, hz=a.hz,
+                  recover=a.recover)
+    if a.highlights:
+        post_match_highlights(bundle, ff)
+    return rc
+
+
+def post_match_highlights(bundle: Path, ffmpeg: str) -> None:
+    """Opt-in post-match step. Never raises (a clip problem must not change the finalize result) and never runs while
+    the recorder is still writing the bundle (qorcap_highlights refuses on a fresh recording marker)."""
+    try:
+        sys.path.insert(0, str(HERE))
+        from qorcap_highlights import Refuse, make_highlights
+        say("\nCutting verified highlight clips ...")
+        man = make_highlights(bundle, ffmpeg=ffmpeg)
+        say(f"  {len(man['clips'])} clip(s) in {bundle / 'highlights'} (manifest.json links each to its lock and the receipt)")
+    except Refuse as e:
+        say(f"  highlights skipped: {e}")
+    except Exception as e:  # noqa: BLE001
+        say(f"  highlights failed (receipt is unaffected): {e}")
 
 
 def run_main(argv=None) -> int:

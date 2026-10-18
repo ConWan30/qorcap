@@ -72,6 +72,29 @@ pub enum Cmd {
         #[arg(long)]
         yes: bool,
     },
+    /// Verified highlight clips (off by default, post-match only): cut a short clip around each locked score change of a
+    /// FINISHED bundle, with a burned-in locked-score overlay + .vtt sidecar and highlights/manifest.json linking every clip
+    /// to its checkpoint lock and the receipt hash. Refuses while the bundle is still being recorded.
+    /// Runs sidecar/qorcap_highlights.py (needs Python + ffmpeg).
+    Highlights {
+        /// Match bundle folder (contains receipt.json). Default: the newest folder in Documents/QorCap Matches
+        bundle: Option<String>,
+        /// Python interpreter (default: QorCap's venv, then py/python3/python)
+        #[arg(long)]
+        python: Option<String>,
+        /// Seconds of video before each lock
+        #[arg(long, default_value_t = 8.0)]
+        pre: f64,
+        /// Seconds of video after each lock
+        #[arg(long, default_value_t = 4.0)]
+        post: f64,
+        /// Stream-copy clips; the overlay goes only into the .vtt sidecar
+        #[arg(long)]
+        no_burn: bool,
+        /// Check an existing highlights/manifest.json against the bundle instead of cutting clips
+        #[arg(long)]
+        check: Option<String>,
+    },
     /// Live controller check: confirms the laptop is reading the DualSense over USB HID and shows presses
     InputTest {
         /// Stop after N seconds (default: until Ctrl+C)
@@ -225,6 +248,18 @@ mod tests {
         assert!(matches!(Cli::try_parse_from(["qorcap", "input-proof", "b", "--frames", "10"]).unwrap().cmd, Cmd::InputProof { frames: 10, .. }));
         if let Cmd::Record(r) = Cli::try_parse_from(["qorcap", "record", "--no-controller"]).unwrap().cmd { assert!(r.no_controller); } else { panic!() }
     }
+    #[test]
+    fn parses_highlights() {
+        let c = Cli::try_parse_from(["qorcap", "highlights", "D:/m", "--pre", "6", "--no-burn"]).unwrap();
+        match c.cmd {
+            Cmd::Highlights { bundle, pre, post, no_burn, check, .. } => {
+                assert_eq!(bundle.as_deref(), Some("D:/m"));
+                assert_eq!((pre, post, no_burn, check), (6.0, 4.0, true, None));
+            }
+            _ => panic!(),
+        }
+    }
+
     #[test]
     fn rejects_bad_input() {
         assert!(Cli::try_parse_from(["qorcap", "record", "--res", "720p"]).is_err());
