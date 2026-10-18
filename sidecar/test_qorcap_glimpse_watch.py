@@ -262,3 +262,65 @@ def test_confirm_hold_skips_until_the_lock_changes(tmp_path):
     assert c["quarter_unknown"] == c["frames_seen"] and c["hold_skipped"] > 0
     # one confirmation per 20 s on 0-0, and the lock change to 0-6 at +30 s releases the hold at once
     assert len(post.calls) <= 5 and any("HOME 6" in b["messages"][1]["content"][0]["text"] for b in post.calls)
+
+
+class DownTap:
+    """QorCap absent: connection refused on every poll."""
+
+    def get(self):
+        return 0, None, {}
+
+
+class SimClock:
+    def __init__(self):
+        self.t = 1_800_000_000.0
+
+    def time(self):
+        return self.t
+
+    def sleep(self, s):
+        self.t += s
+
+
+def test_waits_for_qorcap_then_exits_cleanly_when_it_never_comes(tmp_path):
+    """Started by Start Match before recording: waits --wait-start-s for the tap, then stops, writing nothing anywhere."""
+    a = W.build_parser().parse_args(["--layout", "auto", "--out", str(tmp_path / "out"), "--wait-start-s", "900",
+                                     "--idle-exit-s", "60"])
+    clk = SimClock()
+    w = W.Watcher(a, tap=DownTap(), clock=clk, printer=lambda m: None)
+    t0 = clk.time()
+    c = w.run()
+    assert 900 <= clk.time() - t0 <= 905 and c["tap_down"] > 300 and c["sent"] == 0
+    assert w.match_dir is None and not (tmp_path / "out").exists()
+
+
+def test_layouts_include_thursday_night_and_auto():
+    for lay in ("thursday_night", "auto"):
+        assert W.build_parser().parse_args(["--layout", lay]).layout == lay
+
+
+def test_stops_when_qorcap_moves_to_another_match(tmp_path):
+    md = make_match(tmp_path, [])
+    other = tmp_path / "match-20261018-090000"
+    other.mkdir()
+    clk = SimClock()
+    tap = FakeTap(clk, [(int(clk.time() * 1000) + i * 2500, b"\xff\xd8x") for i in range(40)])
+    tap.bundle = str(md)
+    a = W.build_parser().parse_args(["--layout", "auto", "--out", str(tmp_path / "out"), "--max-minutes", "3"])
+    w = W.Watcher(a, tap=tap, clock=clk, printer=lambda m: None)
+    w._open_match(str(md))
+    tap.bundle = str(other)
+    w.run()
+    assert w.stop_reason and "another match" in w.stop_reason
+
+
+def test_start_match_launches_the_watcher_safely():
+    """Start Match starts the watcher detached, minimized, below normal, only when QORCAP_GLIMPSE_FRAME=1, inside a
+    try/catch so a Glimpse problem never stops the match, strips --no-glimpse, and never prints the API key."""
+    ps = (Path(__file__).resolve().parents[1] / "start-match.ps1").read_text(encoding="utf-8")
+    blk = ps[ps.index("# Advisory Glimpse watcher"):ps.index("& $vpy (Join-Path $here \"sidecar\\qorcap_match.py\")")]
+    for s in ('try {', '} catch {', '-WindowStyle Minimized', '"BelowNormal"', '$gFlag -eq "1"', '"--no-glimpse"',
+              '"--wait-start-s", "900"', '"--idle-exit-s", "60"', 'Start-Process', 'Remove-Item Env:OPENROUTER_API_KEY'):
+        assert s in blk, s
+    assert "Write-Host" in blk and not any("OPENROUTER_API_KEY" in ln for ln in blk.splitlines() if "Write-Host" in ln)
+    assert "Wait-Process" not in blk and "-Wait" not in blk

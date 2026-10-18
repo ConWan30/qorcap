@@ -14,6 +14,10 @@ from pathlib import Path
 import numpy as np
 
 PACK = Path(__file__).resolve().parent / "packs" / "madden27_standard_score_110028.npz"
+# QorCap 0.3.23: on match-20261018-084523 (CHI–ATL) the red home "14" scored 0.57-0.64 against the QorTime
+# "4" template, so every read from 0-14 on was score_unsure and the draft stopped at 0-13 Q2 (real final 6-14).
+# This pack holds the mean of 111 real "4" glyphs from that match (tools/add_standard_four_084523.py).
+PACK_FOUR = Path(__file__).resolve().parent / "packs" / "madden27_standard_score_084523.npz"
 
 
 QUARTER_FAIL = {"quarter_unsure", "quarter_missing", "quarter_unknown", "quarter_no_templates"}
@@ -155,7 +159,7 @@ class StandardBarReader:
 
 
 def standard_reader():
-    """QorTime's ScorebugReader plus the 110028 "2" and "3" variants."""
+    """QorTime's ScorebugReader plus the 110028 "2"/"3" and 084523 "4" variants."""
     from qor_receipt._vendor.qoresence.vision.local_scorebug.reader import ScorebugReader
 
     reader = ScorebugReader()
@@ -164,4 +168,8 @@ def standard_reader():
         score = reader.pack.groups["score"]
         score["2"] = np.vstack([score["2"], np.atleast_2d(z["two"].astype(np.float32))])
         score["3"] = np.vstack([score["3"], np.atleast_2d(z["three"].astype(np.float32))])
+    if PACK_FOUR.is_file():
+        z = np.load(PACK_FOUR)
+        score = reader.pack.groups["score"]
+        score["4"] = np.vstack([score["4"], np.atleast_2d(z["four"].astype(np.float32))])
     return StandardBarReader(reader)

@@ -303,3 +303,18 @@ def test_fill_challenge_results_on_real_fmp4(tmp_path, capsys):
     assert all(json.loads(x)["reason"] == "no_pause_press"
                for x in (tmp_path / "m" / "challenge_results.jsonl").read_text().splitlines())
     assert fx is not None
+
+
+def test_submit_prompt_times_out_to_no(tmp_path, capsys):
+    """v0.3.23: an unattended "Submit now?" prompt answers No after the timeout instead of waiting forever."""
+    import os
+    import qorcap_match as qm
+    r, w = os.pipe()
+    with os.fdopen(r) as fin, os.fdopen(w, "w") as fout:
+        assert qm.ask_with_timeout("Submit now? [y/N] ", 0.3, stdin=fin) == ""
+        fout.write("y\n")
+        fout.flush()
+        assert qm.ask_with_timeout("Submit now? [y/N] ", 2.0, stdin=fin) == "y"
+    assert "No answer" in capsys.readouterr().out
+    # the timeout answer is a plain No: nothing is submitted
+    assert qm.offer_submit(tmp_path, None, ask=lambda p: qm.ask_with_timeout(p, 0.1, stdin=open(os.devnull))) is None

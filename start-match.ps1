@@ -71,5 +71,28 @@ foreach ($x in $fwd) {
   if ($x -eq "--official-challenges" -or $x -eq "--no-official-challenges") { $hasChallengeFlag = $true }
 }
 if (-not $hasChallengeFlag) { $fwd = @("--official-challenges") + $fwd }
+
+# Advisory Glimpse watcher (v0.3.23): ADVISORY_AI, shadow-only, never feeds a lock or the receipt. On when the user
+# variable QORCAP_GLIMPSE_FRAME is 1 (opt out for one match with --no-glimpse). Started detached, minimized, below
+# normal priority, before recording; it waits for QorCap's frame tap and stops when QorCap goes away. Any problem
+# here is reported in one line and the match runs normally. The API key is never printed.
+$noGlimpse = $fwd -contains "--no-glimpse"
+$fwd = @($fwd | Where-Object { $_ -ne "--no-glimpse" })
+try {
+  $gFlag = $env:QORCAP_GLIMPSE_FRAME
+  if (-not $gFlag) { $gFlag = [Environment]::GetEnvironmentVariable("QORCAP_GLIMPSE_FRAME", "User") }
+  $gWatch = Join-Path $here "sidecar\qorcap_glimpse_watch.py"
+  if ($gFlag -eq "1" -and -not $noGlimpse -and (Test-Path $gWatch)) {
+    $env:QORCAP_GLIMPSE_FRAME = "1"            # QorCap (started by qorcap_match.py) inherits the opt-in frame tap
+    $hadKey = [bool]$env:OPENROUTER_API_KEY
+    if (-not $hadKey) { $env:OPENROUTER_API_KEY = [Environment]::GetEnvironmentVariable("OPENROUTER_API_KEY", "User") }
+    $gLayout = $env:QORCAP_GLIMPSE_LAYOUT; if (-not $gLayout) { $gLayout = "auto" }
+    $gp = Start-Process -FilePath $vpy -WindowStyle Minimized -PassThru -ArgumentList @(
+      "`"$gWatch`"", "--layout", $gLayout, "--wait-start-s", "900", "--idle-exit-s", "60")
+    if (-not $hadKey) { Remove-Item Env:OPENROUTER_API_KEY -ErrorAction SilentlyContinue }  # the recorder does not need it
+    try { $gp.PriorityClass = "BelowNormal" } catch {}
+    Write-Host "  Glimpse watch .. started (advisory only, minimized; report in $env:LOCALAPPDATA\QorCapGlimpse)"
+  }
+} catch { Write-Host "  Glimpse watch .. not started ($($_.Exception.Message)); the match is unaffected" }
 & $vpy (Join-Path $here "sidecar\qorcap_match.py") --qorcap (Join-Path $here "qorcap.exe") --ffmpeg (Join-Path $here "ffmpeg.exe") @qtArgs @fwd
 Done $LASTEXITCODE
