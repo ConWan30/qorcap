@@ -569,3 +569,32 @@ def test_hashed_decode_limit_leaves_a_matching_file_whole(tmp_path):
     assert qm.hashed_decode_limit(p, 3) is None
     assert qm.hashed_decode_limit(p, 2) == 2
     assert qm.hashed_decode_limit(p, None) is None
+
+
+def test_post_game_reset_after_the_scorebug_leaves_keeps_the_legal_score():
+    """match-20261017-162055: 6-21, scorebug gone 93s, then a fresh 0-0 Q1 4:00 became the receipt."""
+    events = [
+        {"type": "score", "t_ms": 1, "away": 0, "home": 0, "quarter": 1, "clock_s": 247},
+        {"type": "score", "t_ms": 2, "away": 0, "home": 14, "quarter": 1, "clock_s": 2},
+        {"type": "score", "t_ms": 3, "away": 6, "home": 14, "quarter": None, "clock_s": None},
+        {"type": "score", "t_ms": 4, "away": 6, "home": 21, "quarter": None, "clock_s": None},
+        {"type": "obs", "t_ms": 5_000, "until_ms": 98_000, "obs": "scorebug_absent", "n": 180},
+        {"type": "score", "t_ms": 99_000, "away": 0, "home": 0, "quarter": 1, "clock_s": 240},
+    ]
+    kept = qm.game_segment_score(events)
+    assert (kept["away"], kept["home"], kept["quarter"]) == (6, 21, 1)
+    assert "post-game score reset" in kept["notes"][0]
+    res = qm.apply_final({"home_score": 0, "away_score": 0, "quarter": 1, "winner": "tie"}, None, fallback=kept)
+    assert (res["away_score"], res["home_score"], res["winner"], res["final_confirmed"]) == (6, 21, "home", False)
+    assert any("post-game score reset" in n for n in res["notes"])
+    # A timeout, then a real touchdown, is still this game.
+    play = events[:5] + [{"type": "score", "t_ms": 99_000, "away": 6, "home": 28, "quarter": 2, "clock_s": 400}]
+    nxt = qm.game_segment_score(play)
+    assert (nxt["away"], nxt["home"], nxt["quarter"]) == (6, 28, 2)
+    assert "notes" not in nxt
+    # A short flicker is not a session break.
+    flicker = events[:4] + [
+        {"type": "obs", "t_ms": 10, "until_ms": 12_000, "obs": "scorebug_absent", "n": 4},
+        {"type": "score", "t_ms": 13_000, "away": 0, "home": 0, "quarter": 1, "clock_s": 240},
+    ]
+    assert qm.game_segment_score(flicker)["home"] == 0

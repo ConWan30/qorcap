@@ -38,6 +38,10 @@ SCORE_H, CLOCK_H = (15, 21), (11, 15)
 CLOCK_MAX_W = 13                    # a clock digit is <= 10 px wide; wider = two touching digits
 INK = 150                           # HSV value: white (and red final-minute) digits on the navy bar
 QUARTER_INK = 90                    # quarter word is grey
+# The quarter word peaks around 145. The game clock is white (~255) or red and still clears 160.
+# 2ND/3RD/4TH end within a few pixels of that clock; 1ST is narrower and still fitted the old box.
+CLOCK_BRIGHT = 160
+CLOCK_LEAD = 28                     # a 10:00–15:00 minute digit sits this far left of the one-digit box
 GATE = {"score": (0.80, 0.08), "clock": (0.75, 0.12), "quarter": (0.85, 0.08)}
 QUARTERS = {"1ST": 1, "2ND": 2, "3RD": 3, "4TH": 4, "OT": 5}
 NOT_VISIBLE = {"layout_unknown", "frame_invalid", "frame_too_small", "frame_aspect"}
@@ -81,6 +85,46 @@ def clock_thr(v) -> float:
     """The final-minute clock is red and dimmer (V ~210 vs ~250): scale the ink threshold to the clock's own peak."""
     pk = float(np.percentile(v[:, CLOCK_X[0]:CLOCK_X[1]], 99.5))
     return INK * min(1.0, max(pk, 1.0) / 250.0)
+
+
+def quarter_crop(v):
+    """Grey ordinal, cut off before the bright game clock.
+
+    The fixed box ended at x=882: six pixels past a 2ND that ends at 876, nine before the clock at 891.
+    1ST is narrower, so it still matched. A 2ND/3RD/4TH a few pixels to the right was clipped, the word
+    fell through the gate, and every later read was quarter null (match-20261017-162055). The crop now
+    runs up to the bright clock, so the suffix stays in the word and the clock's leading 1 stays out.
+    """
+    y0, y1 = QUARTER_Y[0] - BAR_Y[0], QUARTER_Y[1] - BAR_Y[0]
+    left = QUARTER_X[0]
+    band = v[y0:y1, 860:940]
+    hit = np.nonzero(band.max(axis=0) >= CLOCK_BRIGHT)[0] if band.size else []
+    clk = 860 + int(hit[0]) if len(hit) else None
+    right = (clk - 2) if clk else 890
+    if right <= left + 8:
+        return None
+    q = (v[y0:y1, left:right] > QUARTER_INK).astype(np.uint8)
+    ys, xs = np.nonzero(q)
+    if len(xs) < 20:
+        return None
+    return q[ys.min():ys.max() + 1, xs.min():xs.max() + 1]
+
+
+def clock_from_digits(digits: str | None):
+    """(seconds, text) for M:SS or for MM:SS when the minute is 10–15. Anything else is not a clock."""
+    if not digits or not digits.isdigit():
+        return None
+    if len(digits) == 3:
+        sec = int(digits[1:])
+        if sec > 59:
+            return None
+        return int(digits[0]) * 60 + sec, f"{digits[0]}:{digits[1:]}"
+    if len(digits) == 4:
+        mins, sec = int(digits[:2]), int(digits[2:])
+        if mins < 10 or mins > 15 or sec > 59:
+            return None
+        return mins * 60 + sec, f"{mins}:{digits[2:]}"
+    return None
 
 
 def split_pair(mask, max_w):
@@ -204,32 +248,66 @@ class MondayNightReader:
             if len(txt) == 2 and txt[0] == "0":
                 return _fr(ok=False, reason=f"score_{side}_leading_zero")
             scores[side] = int(txt)
-        # quarter word (grey)
-        q = (v[QUARTER_Y[0] - BAR_Y[0]:QUARTER_Y[1] - BAR_Y[0], QUARTER_X[0]:QUARTER_X[1]] > QUARTER_INK).astype(np.uint8)
-        ys, xs = np.nonzero(q)
-        if len(xs) < 20:
-            return _fr(ok=False, reason="quarter_missing", left_score=scores["away"], right_score=scores["home"])
-        qlab, _, _ = self.classify("quarter", q[ys.min():ys.max() + 1, xs.min():xs.max() + 1], QUARTER_SIZE)
+        # Quarter and clock are separate. A missed ordinal still returns the clock (a 15:00 reset has to
+        # reach the period track), and a read ordinal is not thrown away when the clock is the thing that failed.
+        crop = quarter_crop(v)
+        qlab = None
+        if crop is not None:
+            lab, _, _ = self.classify("quarter", crop, QUARTER_SIZE)
+            if lab in QUARTERS:
+                qlab = lab
+        clock = self._clock(v, hsv)
+        partial = {"left_score": scores["away"], "right_score": scores["home"],
+                   "score_conf": round(conf, 3), "score_margin": round(margin, 3)}
+        if clock is not None and clock[0] is not None:
+            sec, text, red = clock
+            partial.update(clock_seconds=sec, clock_text=text, clock_red=red)
         if qlab is None:
-            return _fr(ok=False, reason="quarter_unsure", left_score=scores["away"], right_score=scores["home"])
-        # clock m:ss (colon is below the glyph size filter)
-        cg = components(v, *CLOCK_X, CLOCK_H, thr=clock_thr(v), max_w=CLOCK_MAX_W)
-        if len(cg) != 3 or any(g is None for g in cg):
-            return _fr(ok=False, reason="clock_glyph_count", left_score=scores["away"], right_score=scores["home"])
-        cd = ""
-        for g in cg:
-            lab, b, m = self.classify("clock", g, CLOCK_SIZE)
+            return _fr(ok=False, reason="quarter_missing" if crop is None else "quarter_unsure", **partial)
+        if clock is None or clock[0] is None:
+            why = "clock_glyph_count" if clock is None else clock[1]
+            return _fr(ok=False, reason=why, quarter=QUARTERS[qlab], **partial)
+        return _fr(ok=True, reason="ok", quarter=QUARTERS[qlab], **partial)
+
+    def _digits(self, v, x0: int, x1: int, thr: float) -> str | None:
+        """Digit string, ``""`` when a glyph is present but does not classify, None when the count is wrong."""
+        gs = components(v, x0, x1, CLOCK_H, thr=thr, max_w=CLOCK_MAX_W)
+        if any(g is None for g in gs) or not 3 <= len(gs) <= 4:
+            return None
+        out = ""
+        for g in gs:
+            lab, _, _ = self.classify("clock", g, CLOCK_SIZE)
             if lab is None:
-                return _fr(ok=False, reason="clock_unsure", left_score=scores["away"], right_score=scores["home"])
-            cd += lab
-        if int(cd[1:]) > 59:
-            return _fr(ok=False, reason="clock_invalid")
-        cx = hsv[:, CLOCK_X[0]:CLOCK_X[1]]
-        ink = cx[..., 2] > INK
-        red = bool(ink.any() and (((cx[..., 0] < 10) | (cx[..., 0] > 165)) & (cx[..., 1] > 120))[ink].mean() > 0.5)
-        return _fr(ok=True, reason="ok", left_score=scores["away"], right_score=scores["home"], quarter=QUARTERS[qlab],
-                   clock_seconds=int(cd[0]) * 60 + int(cd[1:]), clock_text=f"{cd[0]}:{cd[1:]}", clock_red=red,
-                   score_conf=round(conf, 3), score_margin=round(margin, 3))
+                return ""
+            out += lab
+        return out
+
+    def _red_clock(self, hsv, x0: int, x1: int, thr: float) -> bool:
+        cx = hsv[:, x0:x1]
+        ink = cx[..., 2] > thr
+        return bool(ink.any() and (((cx[..., 0] < 10) | (cx[..., 0] > 165)) & (cx[..., 1] > 120))[ink].mean() > 0.5)
+
+    def _clock_from(self, digits: str | None, hsv, x0: int, x1: int, red_thr: float):
+        if digits == "":
+            return (None, "clock_unsure")
+        parsed = clock_from_digits(digits)
+        if parsed is None:
+            return None if digits is None else (None, "clock_invalid")
+        return (*parsed, self._red_clock(hsv, x0, x1, red_thr))
+
+    def _clock(self, v, hsv):
+        """(seconds, text, red) or (None, reason). 10:00–15:00 is four digits; the leading 1 is left of CLOCK_X.
+
+        None (not a pair) means the glyph count was wrong. A pair with seconds None carries the reason.
+        """
+        thr = clock_thr(v)
+        tight = self._clock_from(self._digits(v, CLOCK_X[0], CLOCK_X[1], thr), hsv, CLOCK_X[0], CLOCK_X[1], INK)
+        if tight is not None:
+            return tight
+        bright = max(thr, float(CLOCK_BRIGHT))
+        return self._clock_from(
+            self._digits(v, CLOCK_X[0] - CLOCK_LEAD, CLOCK_X[1], bright),
+            hsv, CLOCK_X[0] - CLOCK_LEAD, CLOCK_X[1], bright)
 
 
 def default_extra_readers() -> list:

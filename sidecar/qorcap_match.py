@@ -1266,6 +1266,85 @@ def last_reliable_read(reads: list[dict]) -> dict | None:
     return last
 
 
+# One side, by a football increment. A drop, both sides, or any other jump is not a step.
+_FOOTBALL_DELTAS = {1, 2, 3, 6, 7, 8}
+# Match 20261017-162055: the scorebug was gone for 93s (end screen, not recognized), then a fresh 0-0.
+SESSION_BREAK_MS = 20_000
+
+
+def _score_pair(e: dict) -> tuple[int, int] | None:
+    if "away" not in e or "home" not in e:
+        return None
+    try:
+        return int(e["away"]), int(e["home"])
+    except (TypeError, ValueError):
+        return None
+
+
+def _legal_step(prev: tuple[int, int], new: tuple[int, int]) -> bool:
+    da, dh = new[0] - prev[0], new[1] - prev[1]
+    if da == 0 and dh == 0:
+        return True
+    if da < 0 or dh < 0 or (da and dh):
+        return False
+    return (da or dh) in _FOOTBALL_DELTAS
+
+
+def _obs_kind(e: dict) -> str | None:
+    if e.get("type") == "obs" or ("obs" in e and "home" not in e):
+        kind = e.get("obs")
+        return kind if isinstance(kind, str) else None
+    return None
+
+
+def game_segment_score(events: list[dict]) -> dict | None:
+    """Last legal score of the game segment.
+
+    A backwards score, or any other illegal change, after a long scorebug-absent stretch or an
+    end-of-game screen is a new session (a rematch, a demo, a fresh 0-0). It is excluded. The
+    receipt keeps the last legal score from before that reset and says so. A legal scoring play
+    after the same stretch is still this game (a timeout, then a touchdown). With no end-menu
+    final the result stays unconfirmed.
+    """
+    kept: list[dict] = []
+    pending_break = False
+    note = None
+    for e in events:
+        kind = _obs_kind(e)
+        if kind is not None:
+            if kind == "final_screen":
+                pending_break = True
+            elif kind == "scorebug_absent":
+                dur = int(e.get("until_ms") or 0) - int(e.get("t_ms") or 0)
+                if dur >= SESSION_BREAK_MS:
+                    pending_break = True
+            continue
+        if e.get("type") not in (None, "score"):
+            continue
+        pair = _score_pair(e)
+        if pair is None:
+            continue
+        if not kept:
+            kept.append(e)
+            pending_break = False
+            continue
+        prev = _score_pair(kept[-1])
+        if prev is not None and _legal_step(prev, pair):
+            kept.append(e)
+            pending_break = False
+            continue
+        if pending_break and prev is not None:
+            note = (f"post-game score reset to away {pair[0]} - home {pair[1]} after the scorebug left; "
+                    f"kept the last legal score away {prev[0]} - home {prev[1]}")
+            break
+        kept.append(e)
+        pending_break = False
+    last = last_reliable_read(kept)
+    if last is not None and note:
+        last = dict(last, notes=[note])
+    return last
+
+
 def keep_recovery_notes(res: dict, draft: dict) -> dict:
     """Keep the recover notes after the score read replaces ``result``. A normal draft is unchanged."""
     if not draft.get("recovered"):
@@ -1313,6 +1392,8 @@ def apply_final(res: dict, fin: dict | None, *, fallback: dict | None = None) ->
         res["notes"] = ["end-of-game menu score not read: scorebug final only, NOT confirmed"]
     else:
         res.update(method="last_scorebug_read_unconfirmed", final_confirmed=False)
+        if src and src.get("notes"):
+            res["notes"] = [n for n in src["notes"] if isinstance(n, str)]
     return res
 
 
@@ -1752,7 +1833,7 @@ def finalize(bundle: Path, *, qt: Path, qorcap: str, ffmpeg: str, key_dir: Path,
          "method": "offline: QorTime ScorebugReader + AgreementWindow + detect_final over recorded video",
          "finalized_ms": int(time.time() * 1000)}, indent=2), encoding="utf-8")
 
-    res = apply_final(draft["result"], fin, fallback=last_reliable_read(reads))
+    res = apply_final(draft["result"], fin, fallback=game_segment_score(events))
     res = keep_recovery_notes(res, draft)
     draft = dict(draft, result=res)
     rdr = getattr(shared["core"], "reader", None)

@@ -89,6 +89,10 @@ pub struct MatchState {
     pub last_seg_sha: Option<String>,
     pub last_score: Option<(i64, i64, Option<i64>)>,
     pub last_clock: Option<(bool, bool)>, // (at_zero, red)
+    /// A long scorebug-absent stretch, or an end screen, has closed since the last accepted score.
+    pub scorebug_break: bool,
+    /// Set when a later read was a new session and was kept out of the receipt score.
+    pub session_note: Option<String>,
     pub score: Value,
     pub final_: Option<Value>,
     pub device_id: Option<String>,
@@ -96,6 +100,19 @@ pub struct MatchState {
 }
 
 pub fn wall_ms() -> u64 { SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64 }
+
+/// How long the scorebug must stay gone before a backwards score is a new session.
+/// Match 20261017-162055 left it for 93s, then showed a fresh 0-0.
+const SESSION_BREAK_MS: u64 = 20_000;
+
+/// Same score, or one side up by a football increment. A drop or any other jump is not a step.
+fn football_step(prev_h: i64, prev_a: i64, h: i64, a: i64) -> bool {
+    let dh = h - prev_h;
+    let da = a - prev_a;
+    if dh == 0 && da == 0 { return true; }
+    if dh < 0 || da < 0 || (dh != 0 && da != 0) { return false; }
+    matches!(dh + da, 1 | 2 | 3 | 6 | 7 | 8)
+}
 
 fn append_jsonl(path: &Path, v: &Value) {
     use std::io::Write as _;
@@ -760,6 +777,54 @@ mod tests {
     }
 
     #[test]
+    fn post_game_reset_after_the_scorebug_leaves_does_not_replace_the_score() {
+        // match-20261017-162055: 6-21, the scorebug gone for 93s, then a fresh 0-0 Q1 4:00.
+        use clap::Parser;
+        let dir = std::env::temp_dir().join(format!("qorcap-reset-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let d = dir.to_string_lossy().into_owned();
+        let crate::cli::Cmd::Record(r) = crate::cli::Cli::try_parse_from(["q", "record", "--device", "testpattern", "--bundle", &d]).unwrap().cmd else { panic!() };
+        let e = Engine::new(r, "ffmpeg-x".into());
+        e.event(&serde_json::json!({"type":"score","home":0,"away":0,"quarter":1,"clock_s":247})).unwrap();
+        e.event(&serde_json::json!({"type":"score","home":14,"away":0,"quarter":1,"clock_s":2})).unwrap();
+        e.event(&serde_json::json!({"type":"score","home":14,"away":6,"quarter":Value::Null,"clock_s":Value::Null})).unwrap();
+        e.event(&serde_json::json!({"type":"score","home":21,"away":6,"quarter":Value::Null,"clock_s":Value::Null})).unwrap();
+        e.event(&serde_json::json!({"type":"obs","obs":"scorebug_absent","t_ms":1000,"until_ms":94000,"n":180})).unwrap();
+        let ignored = e.event(&serde_json::json!({"type":"score","home":0,"away":0,"quarter":1,"clock_s":240})).unwrap();
+        assert_eq!(ignored["new_session"], true);
+        let out = e.write_bundle().unwrap();
+        let draft: Value = serde_json::from_str(&std::fs::read_to_string(out.join("receipt.draft.json")).unwrap()).unwrap();
+        assert_eq!(draft["result"]["home_score"], 21);
+        assert_eq!(draft["result"]["away_score"], 6);
+        assert_eq!(draft["result"]["final_confirmed"], false);
+        assert_ne!(draft["result"]["winner"], "tie");
+        let notes = draft["result"]["notes"].as_array().unwrap();
+        assert!(notes.iter().any(|n| n.as_str().unwrap_or("").contains("post-game score reset")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn legal_score_after_a_long_absence_still_counts() {
+        use clap::Parser;
+        let dir = std::env::temp_dir().join(format!("qorcap-abs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let d = dir.to_string_lossy().into_owned();
+        let crate::cli::Cmd::Record(r) = crate::cli::Cli::try_parse_from(["q", "record", "--device", "testpattern", "--bundle", &d]).unwrap().cmd else { panic!() };
+        let e = Engine::new(r, "ffmpeg-x".into());
+        e.event(&serde_json::json!({"type":"score","home":21,"away":6,"quarter":2,"clock_s":400})).unwrap();
+        e.event(&serde_json::json!({"type":"obs","obs":"scorebug_absent","t_ms":1000,"until_ms":94000,"n":180})).unwrap();
+        e.event(&serde_json::json!({"type":"score","home":28,"away":6,"quarter":2,"clock_s":350})).unwrap();
+        let out = e.write_bundle().unwrap();
+        let draft: Value = serde_json::from_str(&std::fs::read_to_string(out.join("receipt.draft.json")).unwrap()).unwrap();
+        assert_eq!(draft["result"]["home_score"], 28);
+        assert_eq!(draft["result"]["away_score"], 6);
+        assert!(draft["result"].get("notes").and_then(|n| n.as_array()).map(|a| a.iter().all(|x| !x.as_str().unwrap_or("").contains("post-game score reset"))).unwrap_or(true));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn null_quarter_keeps_last_reliable_and_does_not_go_backwards() {
         use clap::Parser;
         let dir = std::env::temp_dir().join(format!("qorcap-qkeep-{}", std::process::id()));
@@ -1032,7 +1097,22 @@ impl Engine {
                 let red = b["clock_red"].as_bool().unwrap_or(false);
                 let read = json!({"t_ms": t_ms, "home": h, "away": a, "quarter": raw_q, "clock_s": clock_s, "clock_red": red});
                 let mut st = self.ev.lock().unwrap();
+                // A fresh 0-0 (or any illegal drop) after the scorebug has been gone is the next
+                // session: a rematch, a demo, the menu. The receipt keeps the last legal score.
+                if let Some((ph, pa, _)) = st.last_score {
+                    if st.scorebug_break && !football_step(ph, pa, h, a) {
+                        st.session_note = Some(format!(
+                            "post-game score reset to away {a} - home {h} after the scorebug left; kept the last legal score away {pa} - home {ph}"));
+                        st.timeline.push(read.clone());
+                        drop(st);
+                        append_jsonl(&self.ev_path("timeline.jsonl"), &read);
+                        return Ok(json!({"ok": true, "new_session": true}));
+                    }
+                }
                 st.timeline.push(read.clone());
+                if st.last_score.map(|(ph, pa, _)| football_step(ph, pa, h, a)).unwrap_or(true) {
+                    st.scorebug_break = false;
+                }
                 // Receipt quarter follows the last reliable read: a null ordinal does not wipe OT, and a
                 // quarter never moves backwards (a 2ND glyph misread as Q1 must not replace Q3).
                 let prev_q = st.last_score.and_then(|p| p.2);
@@ -1071,8 +1151,15 @@ impl Engine {
             "obs" => {
                 let o = b["obs"].as_str().ok_or("missing obs")?;
                 if o != "scorebug_absent" && o != "final_screen" { return Err("obs must be scorebug_absent|final_screen".into()); }
-                let v = json!({"t_ms": t_ms, "until_ms": b["until_ms"].as_u64().unwrap_or(t_ms), "obs": o, "n": b["n"].as_u64().unwrap_or(0)});
-                self.ev.lock().unwrap().timeline.push(v.clone());
+                let until = b["until_ms"].as_u64().unwrap_or(t_ms);
+                let v = json!({"t_ms": t_ms, "until_ms": until, "obs": o, "n": b["n"].as_u64().unwrap_or(0)});
+                {
+                    let mut st = self.ev.lock().unwrap();
+                    if o == "final_screen" || (o == "scorebug_absent" && until.saturating_sub(t_ms) >= SESSION_BREAK_MS) {
+                        st.scorebug_break = true;
+                    }
+                    st.timeline.push(v.clone());
+                }
                 append_jsonl(&self.ev_path("timeline.jsonl"), &v);
                 Ok(json!({"ok": true}))
             }
@@ -1166,6 +1253,7 @@ impl Engine {
             return self.bundle_dir();
         }
         let st = self.ev.lock().unwrap();
+        let session_note = st.session_note.clone();
         let unconfirmed = st.final_.is_none();
         let fin = st.final_.clone().unwrap_or_else(|| {
             if let Some((h, a, q)) = st.last_score {
@@ -1216,6 +1304,14 @@ impl Engine {
                 r.insert("method".into(), json!("last_scorebug_read_unconfirmed"));
             }
             info!("draft receipt uses last scorebug read AWAY {} - HOME {} (final not confirmed)", fin["away"], fin["home"]);
+        }
+        if let Some(note) = session_note {
+            if let Some(r) = receipt["result"].as_object_mut() {
+                match r.get_mut("notes").and_then(|n| n.as_array_mut()) {
+                    Some(a) => a.push(json!(note)),
+                    None => { r.insert("notes".into(), json!([note])); }
+                }
+            }
         }
         let reason = self.stop_reason.lock().unwrap_or_else(|e| e.into_inner()).clone();
         if let Some(reason) = reason.as_deref() {
