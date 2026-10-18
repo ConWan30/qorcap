@@ -358,6 +358,19 @@ fn main() {
             if let Some(r) = referee { rest.extend(["--referee".to_string(), r]); }
             sidecar("submit", bundle, python, rest, &ff)
         }
+        Cmd::Highlights { bundle, python, pre, post, no_burn, check } => {
+            // never while recording: the sidecar also refuses on a fresh recording marker, this is the cheap early exit
+            if let Some(b) = bundle.as_deref() {
+                if qorcap::inputproof::recorder_running(std::path::Path::new(b)) {
+                    eprintln!("error: QorCap is still recording into {b}. Highlights only run after the match stops.");
+                    std::process::exit(3);
+                }
+            }
+            let mut rest = vec!["--pre".to_string(), pre.to_string(), "--post".to_string(), post.to_string()];
+            if no_burn { rest.push("--no-burn".into()); }
+            if let Some(c) = check { rest.extend(["--check".to_string(), c]); }
+            sidecar("highlights", bundle, python, rest, &ff)
+        }
         Cmd::InputTest { secs } => input_test(secs),
         Cmd::InputProof { dir, frames, no_video, force } => {
             let d = std::path::Path::new(&dir);
