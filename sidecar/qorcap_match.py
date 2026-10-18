@@ -2005,7 +2005,9 @@ def finalize(bundle: Path, *, qt: Path, qorcap: str, ffmpeg: str, key_dir: Path,
         for c in qcps:
             cs.offer(c)
         cps, kind = cs.signed, REFEREE_KIND_OFFLINE
-        note = ("no live countersignatures; the local referee signed QorCap's checkpoints after the fact, "
+        note = (f"the live countersignatures are bound to the recorded side {rec_role}; " if role != rec_role and live
+                else "no live countersignatures; ") + (
+                "the local referee signed QorCap's checkpoints after the fact, "
                 "stamped with QorCap's recording times (referee key_kind local-self-attested-offline).")
     report_recording_audio(bundle, ffmpeg)
     say("\nSigning the receipt ...")
