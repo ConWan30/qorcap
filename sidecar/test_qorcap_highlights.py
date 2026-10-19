@@ -85,6 +85,22 @@ def test_needs_receipt(tmp_path):
     assert e.value.code == 4
 
 
+def test_burn_label_matches_the_evidence(tmp_path):
+    """The burned-in title is the QorTime viewer's unverified wording. A referee verdict is not known here."""
+    assert hl.BURN_LABEL == "SCOREBUG LOCK"
+    vf = hl.overlay_filter("AWAY 0 - HOME 6   Q1 1:40", "lock #2 ab  receipt cd", tmp_path, "hl00", None, 720)
+    assert "text='SCOREBUG LOCK'" in vf
+    assert "LOCKED SCORE" not in vf and "VERIFIED" not in vf
+    # 720p panel geometry (k = height/360) stays the one the Windows build already draws
+    assert "drawbox=x=20:y=20:w=660:h=116:color=0x081122@0.80:t=fill" in vf
+    assert "fontcolor=0xf0c95c" in vf
+    cap = hl.clip_caption("AWAY 0 - HOME 6   Q1 1:40", "lock #2 ab  receipt cd", 12.0, 8.0)
+    assert cap.startswith("WEBVTT\n")
+    assert "SCOREBUG LOCK AWAY 0 - HOME 6   Q1 1:40" in cap
+    assert "scorebug read here" in cap
+    assert "LOCKED SCORE" not in cap and "LOCKED " not in cap and "VERIFIED" not in cap
+
+
 def test_video_clock_maps_wall_to_seconds(tmp_path):
     b = _bundle(tmp_path, [(500, 0, 0)])
     vc = hl.VideoClock(hl.read_jsonl(b / "manifest.jsonl"))
@@ -102,7 +118,10 @@ def test_cuts_clips_and_manifest_checks(tmp_path, burn):
     assert [c["lock"]["score_after"]["home"] for c in man["clips"]] == [6, 7]
     c = man["clips"][0]
     assert c["source"]["start_s"] == 12.0 and 11.5 < c["duration_s"] < 12.5
-    assert (b / "highlights" / c["vtt"]).read_text().startswith("WEBVTT")
+    vtt = (b / "highlights" / c["vtt"]).read_text()
+    assert vtt.startswith("WEBVTT")
+    assert "SCOREBUG LOCK AWAY" in vtt and "scorebug read here" in vtt
+    assert "LOCKED SCORE" not in vtt and "LOCKED " not in vtt and "VERIFIED" not in vtt
     assert man["receipt"]["sha256"] == hl.sha256_file(b / "receipt.json")
     assert hl.check_manifest(b / "highlights" / "manifest.json") == []
     with open(b / "highlights" / c["file"], "ab") as f:

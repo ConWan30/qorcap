@@ -57,14 +57,17 @@ countersigned live (`countersigned.jsonl`), those signatures are reused. Otherwi
 checkpoints at finalize time, stamping each with QorCap's recording time, and `referee.key_kind` is
 `local-self-attested-offline` so a reader can tell.
 
-**Verified highlight clips (opt-in, after the match).** Double-click **`Make Highlights`** (or run `qorcap highlights <bundle folder>`,
+**Highlight clips (opt-in, after the match).** Double-click **`Make Highlights`** (or run `qorcap highlights <bundle folder>`,
 or add `--highlights` to `qorcap finalize`). For every **locked** score change (a `score_change` checkpoint in the signed hash chain whose
-evidence hash matches, normally inside `receipt.json`) it cuts about 8 s before to 4 s after (`--pre`/`--post`), burns in a small panel with
-the locked score in gold plus the lock and receipt hashes (`--no-burn` stream-copies and keeps the overlay only in the `.vtt` sidecar), and
-writes `highlights/manifest.json` (`qorcap-highlights/v0`) linking each clip to its lock, the receipt SHA-256 and the hash-chained source
+evidence hash matches, normally inside `receipt.json`) it cuts about 8 s before to 4 s after (`--pre`/`--post`) and burns in a small panel
+titled **SCOREBUG LOCK** (the QorTime viewer's wording for a scorebug read), with the score in gold plus the lock and receipt hashes.
+**LOCKED SCORE** and **VERIFIED** are reserved for a referee-verified receipt. The sidecar does not know that verdict when it cuts the clip,
+so the panel and the `.vtt` stay on **SCOREBUG LOCK** (`--no-burn` stream-copies and keeps those words only in the `.vtt`). It writes
+`highlights/manifest.json` (`qorcap-highlights/v0`) linking each clip to its lock, the receipt SHA-256 and the hash-chained source
 segments. `qorcap highlights --check highlights/manifest.json` re-checks all of it. It never runs during recording: a fresh
 `.qorcap-run/recording.lock` makes it refuse (exit 3), and it needs the signed `receipt.json` (exit 4 without it). Scorebug misreads that a
-later lock contradicts are skipped and listed. Clips show what was on screen, not who held the controller. Match 125430 (18.9 min): 6 clips in about 3 s.
+later lock contradicts are skipped and listed. Clips show what was on screen, not who held the controller. Match 125430 (18.9 min) is a
+QorTime **FAIL** because the capture key is local self-attested: 6 clips in about 3 s, each panel titled SCOREBUG LOCK.
 
 No card? Double-click **`Test Without Card`**. It plays a test-pattern video and a scripted 20-second game through the same
 record, sign and verify path (`python sidecar/qorcap_match.py --test-pattern`).

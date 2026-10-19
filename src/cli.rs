@@ -72,8 +72,9 @@ pub enum Cmd {
         #[arg(long)]
         yes: bool,
     },
-    /// Verified highlight clips (off by default, post-match only): cut a short clip around each locked score change of a
-    /// FINISHED bundle, with a burned-in locked-score overlay + .vtt sidecar and highlights/manifest.json linking every clip
+    /// Highlight clips (off by default, post-match only): cut a short clip around each locked score change of a
+    /// FINISHED bundle. The burned-in panel says SCOREBUG LOCK (a scorebug read; a referee VERIFIED seal is not
+    /// known when the clip is cut) plus a .vtt sidecar and highlights/manifest.json linking every clip
     /// to its checkpoint lock and the receipt hash. Refuses while the bundle is still being recorded.
     /// Runs sidecar/qorcap_highlights.py (needs Python + ffmpeg).
     Highlights {

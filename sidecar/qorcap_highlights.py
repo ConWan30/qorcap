@@ -1,4 +1,4 @@
-"""Verified highlight clips: cut a short clip around each locked score change of a FINISHED match bundle.
+"""Highlight clips: cut a short clip around each locked score change of a FINISHED match bundle.
 
     qorcap highlights [BUNDLE] [--pre 8] [--post 4] [--out DIR] [--no-burn] [--max N]
     qorcap highlights --check BUNDLE/highlights/manifest.json [--bundle BUNDLE]
@@ -14,11 +14,13 @@ checkpoint hash is inside the signed ``receipt.json`` are marked ``in_receipt``.
 ``score_checkpoints.jsonl`` written by ``qorcap finalize`` is used (hash-chained and bound to the video chain head, but
 not inside the receipt signature). A lock that a later lock contradicts (a side goes down) is skipped as a misread.
 
-Each clip is re-encoded with a small burned-in overlay (locked score in gold, lock hash, receipt hash) and gets a
-WebVTT sidecar with the same text. ``manifest.json`` (schema ``qorcap-highlights/v0``) links every clip to its lock, the
-receipt's SHA-256 and the hash-chained source segments that cover the window, so anyone can check it. A re-encoded clip
-cannot be byte-matched to the source; what is checkable is the lock, the receipt and the source segment hashes. It shows
-what was on screen, not who held the controller.
+Each clip is re-encoded with a small burned-in overlay. The panel title is ``SCOREBUG LOCK`` (the QorTime viewer's
+wording for a scorebug read): the score in gold, then the lock hash and the receipt hash. A ``.vtt`` sidecar carries
+the same words. ``LOCKED SCORE`` and ``VERIFIED`` stay off the picture. Those belong to a referee-verified receipt, and
+this tool does not know that verdict when it cuts the clip (a local capture key is self-attested). ``manifest.json``
+(schema ``qorcap-highlights/v0``) links every clip to its lock, the receipt's SHA-256 and the hash-chained source
+segments that cover the window, so anyone can check it. A re-encoded clip cannot be byte-matched to the source; what is
+checkable is the lock, the receipt and the source segment hashes. It shows what was on screen, not who held the controller.
 """
 from __future__ import annotations
 
@@ -40,6 +42,10 @@ PRE_S, POST_S = 8.0, 4.0
 MARKER = Path(".qorcap-run") / "recording.lock"
 MARKER_FRESH_S = 30  # = src/inputproof.rs MARKER_FRESH_SECS
 FOOTBALL_DELTAS = {1, 2, 3, 6, 7, 8}
+# Panel title burned into the clip and written on the .vtt cue. The QorTime viewer uses this for a scorebug
+# read, and reserves "LOCKED SCORE" for a receipt whose status is VERIFIED. That verdict is computed later by
+# the verifier, so a clip cut here always uses the weaker title.
+BURN_LABEL = "SCOREBUG LOCK"
 CLAIMS = ("Each clip shows hash-chained recording bytes around a score change that QorCap committed into its checkpoint "
           "chain. Clips are re-encoded, so check the lock, the receipt hash and the source segment hashes, not the clip "
           "bytes against the video. Integrity and timing only: this does not show who was playing.")
@@ -244,7 +250,11 @@ def probe_height(ffmpeg: str, src: Path) -> int:
 
 
 def overlay_filter(score_txt: str, meta_txt: str, workdir: Path, stem: str, font: str | None, height: int = 720) -> str:
-    """Small navy glass panel at the TOP-left (the game's own scorebug at the bottom stays visible), locked score in gold."""
+    """Small navy glass panel at the TOP-left (the game's own scorebug at the bottom stays visible), score in gold.
+
+    The aqua title is ``BURN_LABEL`` (``SCOREBUG LOCK``). It is a scorebug read committed into the checkpoint
+    chain, not a referee-verified result.
+    """
     (workdir / f"{stem}.score.txt").write_text(score_txt, encoding="utf-8")
     (workdir / f"{stem}.meta.txt").write_text(meta_txt, encoding="utf-8")
     ff = f":fontfile='{_esc(font)}'" if font else ""
@@ -252,7 +262,7 @@ def overlay_filter(score_txt: str, meta_txt: str, workdir: Path, stem: str, font
     x, y, w, h = int(10 * k), int(10 * k), int(330 * k), int(58 * k)
     return (f"drawbox=x={x}:y={y}:w={w}:h={h}:color=0x081122@0.80:t=fill,"
             f"drawbox=x={x}:y={y}:w={max(2, int(2 * k))}:h={h}:color=0x3fe0d0@0.95:t=fill,"
-            f"drawtext=text='LOCKED SCORE'{ff}:fontsize={int(9 * k)}:fontcolor=0x3fe0d0:x={x + int(9 * k)}:y={y + int(6 * k)},"
+            f"drawtext=text='{BURN_LABEL}'{ff}:fontsize={int(9 * k)}:fontcolor=0x3fe0d0:x={x + int(9 * k)}:y={y + int(6 * k)},"
             f"drawtext=textfile='{_esc(str(workdir / (stem + '.score.txt')))}'{ff}:fontsize={int(18 * k)}:fontcolor=0xf0c95c"
             f":x={x + int(9 * k)}:y={y + int(18 * k)},"
             f"drawtext=textfile='{_esc(str(workdir / (stem + '.meta.txt')))}'{ff}:fontsize={int(8 * k)}:fontcolor=0xb8c7da"
@@ -277,6 +287,12 @@ def fmt_clock(s) -> str:
 
 def vtt_time(s: float) -> str:
     return f"{int(s // 3600):02d}:{int(s % 3600 // 60):02d}:{s % 60:06.3f}"
+
+
+def clip_caption(score_txt: str, meta_txt: str, dur: float, lock_at: float) -> str:
+    """WebVTT sidecar. Same title as the burn: a scorebug read, not a referee verdict."""
+    return ("WEBVTT\n\n" f"1\n{vtt_time(0)} --> {vtt_time(dur)}\n{BURN_LABEL} {score_txt}\n{meta_txt}\n\n"
+            f"2\n{vtt_time(lock_at)} --> {vtt_time(min(dur, lock_at + 2))}\nscorebug read here\n")
 
 
 # ------------------------------------------------------------------ main work
@@ -332,9 +348,7 @@ def make_highlights(bundle: Path, out: Path | None = None, pre: float = PRE_S, p
                             "reason": f"ffmpeg failed: {err.strip()[:200]}"})
             continue
         lock_at = round(at - a, 3)
-        (out / f"{stem}.vtt").write_text(
-            "WEBVTT\n\n" f"1\n{vtt_time(0)} --> {vtt_time(dur)}\nLOCKED {score_txt}\n{meta_txt}\n\n"
-            f"2\n{vtt_time(lock_at)} --> {vtt_time(min(dur, lock_at + 2))}\nscore locked here\n", encoding="utf-8")
+        (out / f"{stem}.vtt").write_text(clip_caption(score_txt, meta_txt, dur, lock_at), encoding="utf-8")
         wall_a, wall_b = int(lk["t_ms"] - pre * 1000), int(lk["t_ms"] + post * 1000)
         clips.append({
             "id": stem, "file": f.name, "sha256": sha256_file(f), "bytes": f.stat().st_size, "vtt": f"{stem}.vtt",
@@ -417,7 +431,8 @@ def newest_bundle() -> Path | None:
 
 
 def main(argv=None) -> int:
-    ap = argparse.ArgumentParser(prog="qorcap highlights", description="Verified highlight clips around locked score changes")
+    ap = argparse.ArgumentParser(prog="qorcap highlights",
+                                 description="Highlight clips around score-change locks. The burned-in title is SCOREBUG LOCK.")
     ap.add_argument("bundle", nargs="?", help="finished match bundle (default: newest in Documents/QorCap Matches)")
     ap.add_argument("--pre", type=float, default=PRE_S, help="seconds before the lock (default 8)")
     ap.add_argument("--post", type=float, default=POST_S, help="seconds after the lock (default 4)")
