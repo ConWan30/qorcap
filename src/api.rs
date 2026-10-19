@@ -36,18 +36,18 @@ pub fn route(e: &Arc<Engine>, method: &str, url: &str, body: &str) -> Resp {
         ("POST", "/events") => match e.event(&b) { Ok(v) => j(200, v), Err(m) => j(400, json!({"ok": false, "error": m})) },
         ("GET", "/checkpoints") => {
             let since: u64 = url.split_once("since=").and_then(|x| x.1.split('&').next()?.parse().ok()).unwrap_or(0);
-            let st = e.ev.lock().unwrap();
+            let st = e.ev.lock().unwrap_or_else(|e| e.into_inner());
             let cps: Vec<&Value> = st.checkpoints.iter().filter(|c| c["seq"].as_u64().unwrap_or(0) >= since).collect();
             j(200, json!({"chain_head": st.seg.head, "segments": st.seg.seq, "checkpoint_head": st.cps.prev, "checkpoints": cps}))
         }
-        ("GET", "/timeline") => { let st = e.ev.lock().unwrap(); j(200, json!({"timeline": st.timeline, "score": st.score, "challenges": st.challenges, "clips": st.clips, "final": st.final_})) }
+        ("GET", "/timeline") => { let st = e.ev.lock().unwrap_or_else(|e| e.into_inner()); j(200, json!({"timeline": st.timeline, "score": st.score, "challenges": st.challenges, "clips": st.clips, "final": st.final_})) }
         ("POST", "/bundle/write") => match e.write_bundle() { Some(d) => j(200, json!({"ok": true, "dir": d})), None => j(500, json!({"ok": false})) },
         ("POST", "/shutdown") => {
             let reason = b["reason"].as_str().map(str::trim).filter(|s| {
                 !s.is_empty() && s.len() <= 64 && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
             }).unwrap_or("shutdown");
             e.request_stop(reason);
-            j(200, json!({"ok": true, "reason": e.stop_reason.lock().unwrap().clone()}))
+            j(200, json!({"ok": true, "reason": e.stop_reason.lock().unwrap_or_else(|e| e.into_inner()).clone()}))
         }
         // Local referee progress: "I have countersigned every checkpoint through seq". Lets the stop path
         // hold the slow bundle work until the final checkpoints carry fresh referee stamps.
@@ -94,7 +94,7 @@ pub fn serve(e: Arc<Engine>, port: u16) -> Result<std::thread::JoinHandle<()>, S
 fn handle(e: Arc<Engine>, mut rq: tiny_http::Request) {
             if rq.url().starts_with("/checkpoints/stream") {
                 let (tx, rx) = std::sync::mpsc::channel();
-                e.subs.lock().unwrap().push(tx);
+                e.subs.lock().unwrap_or_else(|e| e.into_inner()).push(tx);
                 // Take the raw socket so every event is flushed immediately (no chunk buffering).
                 let resp = tiny_http::Response::empty(200)
                     .with_header(tiny_http::Header::from_bytes("Content-Type", "text/event-stream").unwrap())
@@ -158,11 +158,11 @@ mod tests {
         assert_eq!(route(&e, "GET", "/snapshot.jpg", "").code, 503);
         let shut = route(&e, "POST", "/shutdown", r#"{"reason":"enter"}"#);
         assert_eq!(shut.code, 200);
-        assert_eq!(e.stop_reason.lock().unwrap().as_deref(), Some("enter"));
+        assert_eq!(e.stop_reason.lock().unwrap_or_else(|e| e.into_inner()).as_deref(), Some("enter"));
         assert!(e.bundle_dir().unwrap().join("receipt.draft.json").is_file());
         assert!(e.bundle_dir().unwrap().join("bundle.json").is_file());
         route(&e, "POST", "/shutdown", r#"{"reason":"ctrl_c"}"#);
-        assert_eq!(e.stop_reason.lock().unwrap().as_deref(), Some("enter"));
+        assert_eq!(e.stop_reason.lock().unwrap_or_else(|e| e.into_inner()).as_deref(), Some("enter"));
     }
     #[test]
     fn replay_rules_and_ts_written() {
@@ -235,7 +235,7 @@ mod tests {
         // POST is not a route: nothing can be sent back through the tap.
         assert_eq!(route(&e, "POST", "/frame/scorebug", "{}").code, 404);
         // The engine's match state is untouched by the tap.
-        assert!(e.ev.lock().unwrap().timeline.is_empty());
+        assert!(e.ev.lock().unwrap_or_else(|e| e.into_inner()).timeline.is_empty());
     }
     #[test]
     fn snapshot_and_http_roundtrip() {

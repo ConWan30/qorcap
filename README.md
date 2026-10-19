@@ -2,7 +2,7 @@
 
 # QorCap
 
-**Website:** https://conwan30.github.io/qorcap/ · **Download:** [v0.3.24](https://github.com/ConWan30/qorcap/releases/tag/v0.3.24) ([latest release](https://github.com/ConWan30/qorcap/releases/latest))
+**Website:** https://conwan30.github.io/qorcap/ · **Download:** [v0.3.25](https://github.com/ConWan30/qorcap/releases/tag/v0.3.25) ([latest release](https://github.com/ConWan30/qorcap/releases/latest))
 
 A small Windows recorder for a USB HDMI capture card (built for a generic **"USB3.0 Video"** card carrying a PS5),
 made for **[QorTime](https://github.com/ConWan30/qortime)** match receipts. It does two jobs:
@@ -26,7 +26,7 @@ with a local control surface). QorCap copies only that design idea, no code. No 
 
 ## Quickstart: double-click Start Match
 
-1. Download `qorcap-v0.3.24-windows-x64.zip` from the [latest release](https://github.com/ConWan30/qorcap/releases/latest)
+1. Download `qorcap-v0.3.25-windows-x64.zip` from the [latest release](https://github.com/ConWan30/qorcap/releases/latest)
    and unzip it, for example to `C:\QorCap` (right-click the zip, *Extract All*).
 2. Connect PS5 HDMI out to the **USB3.0 Video** card, and the card to a blue USB 3 port. Close OBS or the Camera app.
 3. Double-click **`Start Match`**. On the first run it downloads ffmpeg, installs Python 3.12 through winget if it
@@ -366,7 +366,7 @@ Global: `--port 8788`, `--ffmpeg PATH`, `--log FILE` (default `qorcap.log`, or `
 ## Run on Windows by hand (PowerShell, advanced)
 
 ```powershell
-# 1. unzip qorcap-v0.3.24-windows-x64.zip to C:\QorCap, then:
+# 1. unzip qorcap-v0.3.25-windows-x64.zip to C:\QorCap, then:
 cd C:\QorCap
 Unblock-File .\qorcap.exe, .\get-ffmpeg.ps1
 powershell -ExecutionPolicy Bypass -File .\get-ffmpeg.ps1     # puts ffmpeg.exe next to qorcap.exe
@@ -403,6 +403,8 @@ continues), replay save, challenge stamp visible in the video, score/final event
 written, `verify-bundle` OK, and a single flipped byte reported as FAIL.
 
 **Tested on Windows (v0.2.0–v0.2.1 era, MyTurn, USB3.0 Video):** `--input-format mjpeg` 1280x720@30 with `h264_mf` at 29.7 fps. v0.2.1 fixed audio / auto-format / OBS.
+
+**v0.3.25:** a float in an event can no longer stop a recording. In match-20261018-193534 the end-of-game-menu final carried `end_menu.conf` and `end_menu.margin` as floats (`round(x, 3)`, there since v0.3.4). qorcap.exe's JCS hash (QorTime profile: no floats) panicked while the match state was locked, every later request panicked on the poisoned lock, and the recording stopped (`stop reason: pipe_broken`) one second after the final screen. Now: the hash returns an error instead of panicking; a final that is not JCS-safe is refused (HTTP 400) before any state changes; a checkpoint with bad evidence is refused and the chain is left as it was; lock poisoning is recovered instead of cascading. The sidecar posts every event through `jcs_safe`, which turns floats into integer `<key>_permille` fields (`end_menu.conf_permille`, `end_menu.margin_permille`); its own state keeps the floats. Known, not changed: ffmpeg can warn `real-time buffer [audio input] too full ... frame dropped` on the separate dshow audio input (default 3 MB buffer); that means about 10 s of audio was waiting unread, so a bigger buffer would only hide the lag and could shift audio against video.
 
 **v0.3.24:** the touchdown fast path, guarded. v0.3.22 (never released) locked match-20261017-021003 at 13-8 while the bar showed 13-0: the standard "0" matched the "8" template on four frames (score margin ~0.09 against ~0.21 for real reads) and 13-0 came back 250 ms later. Now every fast-path read that has a template margin needs at least 0.15; a jump that only swaps one digit for a look-alike (0->6/8/9, 3->9) needs 0.18 on every read and two more reads during a 2 s hold; every fast-path lock is held 1 s and one read of the old or a third pair cancels it. The normal windows are unchanged. Glimpse second opinion, shadow only: while a jump is held, the sidecar writes it to the watcher's own folder (`%LOCALAPPDATA%\QorCapGlimpse\<match>\td_jumps.jsonl`) and watcher 0.1.3 asks Glimpse to read the next frame without any score hint, logging agree/disagree (`td_second_opinion`, `feeds_lock: false`). It never changes a lock or a receipt. An enforcing mode (Glimpse may only cancel or delay a fast-path lock, never create one) exists behind `QORCAP_GLIMPSE_TD_VETO=1`; it is off by default and must not be turned on without the owner's explicit OK. Offline finalize never uses Glimpse. Replay gate (15 recorded matches, same decoded frames, against v0.3.21): 0 new wrong locks, 0 lost locks; the only new locks are 002316 21-37 Q2 (the true score the old 9-read rule missed) and the 084523 red-4 reads from v0.3.23. Glimpse second opinion offline on the same candidates: 2/2 bad jumps flagged, 0/18 good ones disputed.
 

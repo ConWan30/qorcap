@@ -517,6 +517,32 @@ def madden_final_screen(img) -> bool:
     return bool(text > 0.05 and below < 0.004)
 
 
+
+def jcs_safe(v):
+    """Copy of an event with every float replaced by an integer ``<key>_permille`` (round(x * 1000)).
+
+    QorCap commits events into its checkpoint chain and receipt with RFC 8785 JCS under the QorTime profile, which
+    refuses floats. v0.3.4 to v0.3.24 posted the end-of-game-menu final with ``end_menu.conf``/``margin`` as floats
+    (``round(x, 3)``); qorcap.exe panicked hashing it and the recording stopped (match-20261018-193534).
+    The reader keeps its float state internally (the referee's end-menu fallback reads ``conf``); only what is
+    posted is converted. A float list element (no key to rename) becomes its permille integer."""
+    if isinstance(v, bool) or v is None:
+        return v
+    if isinstance(v, float):
+        return round(v * 1000)
+    if isinstance(v, dict):
+        out = {}
+        for k, x in v.items():
+            if isinstance(x, float) and not isinstance(x, bool):
+                out[f"{k}_permille"] = round(x * 1000)
+            else:
+                out[k] = jcs_safe(x)
+        return out
+    if isinstance(v, (list, tuple)):
+        return [jcs_safe(x) for x in v]
+    return v
+
+
 class ReaderCore:
     """Frame -> agreed reads / obs spans -> events. Pure logic; I/O injected (unit-testable)."""
 
@@ -648,7 +674,7 @@ class ReaderCore:
             self.gate.on_read(rd)
         if prev is None or key(prev) != key(rd) or rd["t_ms"] - prev["t_ms"] >= 1_000:
             self.timeline.append(rd)
-            self.post({"type": "score", **rd})
+            self.post(jcs_safe({"type": "score", **rd}))
             q = rd.get("quarter")
             if isinstance(q, int) and not isinstance(q, bool) and q >= 1:
                 self._max_quarter = q if self._max_quarter is None else max(self._max_quarter, q)
@@ -662,7 +688,7 @@ class ReaderCore:
         def span(cur, name, on):
             if not on:
                 if cur is not None:
-                    self.post({"type": "obs", **cur})
+                    self.post(jcs_safe({"type": "obs", **cur}))
                 return None
             if cur is None:
                 cur = {"t_ms": t_ms, "until_ms": t_ms, "obs": name, "n": 0}
@@ -679,7 +705,7 @@ class ReaderCore:
     def _close_spans(self) -> None:
         for s in (self._absent, self._screen):
             if s is not None:
-                self.post({"type": "obs", **s})
+                self.post(jcs_safe({"type": "obs", **s}))
         self._absent = self._screen = None
 
     def last_scorebug(self) -> dict | None:
@@ -857,7 +883,7 @@ class ReaderCore:
         tag = "CONFIRMED" if confirmed else "UNCONFIRMED"
         print(f"FINAL (end-of-game menu, {st['frames']} frames, {tag}): away {st['away']} - home {st['home']}"
               + (f"  [{notes[0]}]" if notes else ""), file=sys.stderr)
-        self.post(self.final)
+        self.post(jcs_safe(self.final))
 
     def _corroborate(self, img, rd):
         """v0.3.6: a covered end-menu panel can only CONFIRM the scorebug's Q4 final (never read a new score)."""
@@ -891,7 +917,7 @@ class ReaderCore:
                           "quarter": fin.quarter, "t_ms": fin.t_ms}
             print(f"FINAL ({fin.basis}): away {fin.away} - home {fin.home}"
                   + ("  (scorebug; waiting for the end-of-game menu to confirm)" if self.end_menu_reader else ""), file=sys.stderr)
-            self.post(self.final)
+            self.post(jcs_safe(self.final))
 
 
 LEGAL_STEPS = {1, 2, 3, 6, 7, 8}  # same as qortime referee_ai.integrity.LEGAL_STEPS

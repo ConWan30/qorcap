@@ -221,11 +221,11 @@ impl Engine {
     }
 
     pub fn status(&self) -> Status {
-        let mut s = self.status.lock().unwrap().clone();
-        { let r = self.ring.lock().unwrap(); s.replay_bytes = r.len_bytes(); s.replay_secs_buffered = r.span_ms() as f64 / 1000.0; }
+        let mut s = self.status.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        { let r = self.ring.lock().unwrap_or_else(|e| e.into_inner()); s.replay_bytes = r.len_bytes(); s.replay_secs_buffered = r.span_ms() as f64 / 1000.0; }
         if self.args.replay.is_none() { s.replay_bytes = 0; s.replay_secs_buffered = 0.0; }
-        if !self.args.no_controller { s.input = Some(self.input.lock().unwrap().live.clone()); }
-        if let Some(r) = self.rec.lock().unwrap().as_ref() { s.recording = Some(r.path.clone()); s.recording_secs = r.started.elapsed().as_secs_f64(); }
+        if !self.args.no_controller { s.input = Some(self.input.lock().unwrap_or_else(|e| e.into_inner()).live.clone()); }
+        if let Some(r) = self.rec.lock().unwrap_or_else(|e| e.into_inner()).as_ref() { s.recording = Some(r.path.clone()); s.recording_secs = r.started.elapsed().as_secs_f64(); }
         s.uptime_secs = self.started.elapsed().as_secs_f64();
         let probe = self.args.out.as_deref().or(self.args.bundle.as_deref()).unwrap_or(".");
         if let Some(free) = crate::disk::free_bytes(Path::new(probe)) { s.disk_free_mb = Some(free / (1024 * 1024)); }
@@ -233,7 +233,7 @@ impl Engine {
     }
 
     pub fn start_recording(self: &Arc<Self>, path: &str, duration: Option<u64>) -> Result<String, String> {
-        let mut g = self.rec.lock().unwrap();
+        let mut g = self.rec.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(r) = g.as_ref() { return Err(format!("already recording to {}", r.path)); }
         if let Some(min) = self.args.min_free_bytes() {
             crate::disk::check_start(Path::new(path), min)?;
@@ -257,7 +257,7 @@ impl Engine {
             let t0 = Instant::now();
             while t0.elapsed() < Duration::from_secs(120) {
                 std::thread::sleep(Duration::from_millis(4000));
-                if me.shutdown.load(Ordering::SeqCst) || me.ev.lock().unwrap().seg.seq > 0 || me.rec.lock().unwrap().is_none() { break; }
+                if me.shutdown.load(Ordering::SeqCst) || me.ev.lock().unwrap_or_else(|e| e.into_inner()).seg.seq > 0 || me.rec.lock().unwrap_or_else(|e| e.into_inner()).is_none() { break; }
                 me.checkpoint("startup", json!({}));
             }
         }); }
@@ -302,12 +302,12 @@ impl Engine {
         Ok(Recorder { reader: Some(reader), child, stdin, path, started: Instant::now(), deadline, wait_key: true, base: base.to_string(), part })
     }
     pub fn stop_recording(&self) -> Option<String> {
-        let r = self.rec.lock().unwrap().take()?;
+        let r = self.rec.lock().unwrap_or_else(|e| e.into_inner()).take()?;
         Some(finish(r))
     }
     /// After a device reopen, timestamps restart: close the current part, open the next unused part name.
     fn rotate_recording(self: &Arc<Self>) {
-        let mut g = self.rec.lock().unwrap();
+        let mut g = self.rec.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(r) = g.take() {
             let (base, part, deadline) = (r.base.clone(), r.part + 1, r.deadline);
             let old = finish(r);
@@ -330,7 +330,7 @@ impl Engine {
     pub fn save_replay(&self, out: Option<&str>) -> Result<String, String> { self.save_replay_secs(out, None) }
     pub fn save_replay_secs(&self, out: Option<&str>, secs: Option<u64>) -> Result<String, String> {
         if self.args.replay.is_none() { return Err("replay buffer disabled (start with --replay SECS)".into()); }
-        let data = self.ring.lock().unwrap().snapshot_last(secs.map(|s| s * 1000)).ok_or("replay buffer is empty (no keyframe yet)")?;
+        let data = self.ring.lock().unwrap_or_else(|e| e.into_inner()).snapshot_last(secs.map(|s| s * 1000)).ok_or("replay buffer is empty (no keyframe yet)")?;
         let out = out.map(|s| s.to_string()).unwrap_or_else(|| Path::new(&self.args.replay_dir).join(format!("replay-{}.mp4", now_stamp())).to_string_lossy().into_owned());
         if let Some(d) = Path::new(&out).parent() { if !d.as_os_str().is_empty() { std::fs::create_dir_all(d).map_err(|e| format!("mkdir {}: {e}", d.display()))?; } }
         let ts = format!("{out}.ts");
@@ -344,7 +344,7 @@ impl Engine {
     }
 
     fn set_state(&self, s: &str, err: Option<String>) {
-        let mut st = self.status.lock().unwrap();
+        let mut st = self.status.lock().unwrap_or_else(|e| e.into_inner());
         st.state = s.into();
         if err.is_some() { st.last_error = err; }
     }
@@ -353,8 +353,8 @@ impl Engine {
     pub fn ingest(self: &Arc<Self>, data: &[u8]) {
         let t = self.ms();
         self.last_data_ms.store(t, Ordering::Relaxed);
-        let (pat, pmt) = { let mut r = self.ring.lock().unwrap(); r.push(t, data); r.tables() };
-        let mut g = self.rec.lock().unwrap();
+        let (pat, pmt) = { let mut r = self.ring.lock().unwrap_or_else(|e| e.into_inner()); r.push(t, data); r.tables() };
+        let mut g = self.rec.lock().unwrap_or_else(|e| e.into_inner());
         let mut done = false;
         let mut stop_why: Option<&str> = None;
         if let Some(r) = g.as_mut() {
@@ -422,7 +422,7 @@ impl Engine {
                         if !devs.iter().any(|d| d.kind == "video" && d.name == self.args.device) {
                             let msg = format!("video device \"{}\" not present (have: {})", self.args.device,
                                 devs.iter().filter(|d| d.kind == "video").map(|d| d.name.as_str()).collect::<Vec<_>>().join(", "));
-                            if self.status.lock().unwrap().state != "waiting_for_device" { warn!("{msg}; waiting for it to appear"); }
+                            if self.status.lock().unwrap_or_else(|e| e.into_inner()).state != "waiting_for_device" { warn!("{msg}; waiting for it to appear"); }
                             self.set_state("waiting_for_device", Some(msg));
                             fmt = None;
                             self.sleep(1);
@@ -444,7 +444,7 @@ impl Engine {
                         if self.args.audio != "none" && self.args.audio != "off" && audio.is_none() && !audio_off {
                             warn!("no audio device for \"{}\" found; recording video-only", self.args.device);
                             audio_off = true;
-                            self.status.lock().unwrap().warning = Some("AUDIO UNAVAILABLE — recording video-only (no game sound).".into());
+                            self.status.lock().unwrap_or_else(|e| e.into_inner()).warning = Some("AUDIO UNAVAILABLE — recording video-only (no game sound).".into());
                         }
                         if fmt.is_none() {
                             let f = if self.args.input_format == "auto" {
@@ -457,15 +457,15 @@ impl Engine {
                             } else { self.args.input_format.clone() };
                             fmt = Some(f);
                         }
-                        self.ev.lock().unwrap().device_id = devs.iter().find(|d| d.kind == "video" && d.name == self.args.device).and_then(|d| d.alt.clone());
+                        self.ev.lock().unwrap_or_else(|e| e.into_inner()).device_id = devs.iter().find(|d| d.kind == "video" && d.name == self.args.device).and_then(|d| d.alt.clone());
                     }
                 }
             }
-            self.status.lock().unwrap().audio = audio.as_ref().map(|a| a.name.clone());
+            self.status.lock().unwrap_or_else(|e| e.into_inner()).audio = audio.as_ref().map(|a| a.name.clone());
             // Disk guard: stop cleanly when critically low — never keep writing into ENOSPC.
             let probe = self.args.out.as_deref().or(self.args.bundle.as_deref()).unwrap_or(".");
             if let Some((crit, free)) = crate::disk::is_critical(Path::new(probe)) {
-                self.status.lock().unwrap().disk_free_mb = Some(free / (1024 * 1024));
+                self.status.lock().unwrap_or_else(|e| e.into_inner()).disk_free_mb = Some(free / (1024 * 1024));
                 if crit {
                     let msg = format!(
                         "disk space critically low ({} free on {}); stopping recording cleanly to avoid ENOSPC corruption",
@@ -473,7 +473,7 @@ impl Engine {
                     );
                     error!("{msg}");
                     self.set_state("disk_full", Some(msg.clone()));
-                    self.status.lock().unwrap().warning = Some(msg);
+                    self.status.lock().unwrap_or_else(|e| e.into_inner()).warning = Some(msg);
                     if let Some(p) = self.stop_recording() { info!("finalised {p} due to low disk"); }
                     if self.args.bundle.is_some() {
                         self.request_stop("disk_full");
@@ -487,12 +487,12 @@ impl Engine {
             }
             let t0 = Instant::now();
             let (ok, why) = self.run_capture_once(fmt.as_deref().unwrap_or("auto"), audio.as_ref());
-            if self.shutdown.load(Ordering::SeqCst) { self.ring.lock().unwrap().clear(); break; }
+            if self.shutdown.load(Ordering::SeqCst) { self.ring.lock().unwrap_or_else(|e| e.into_inner()).clear(); break; }
             if why == ffmpeg::Failure::Snapshot && ok {
                 // Snapshot mux path failed but video kept flowing — recreate dir, do not burn reopen budget.
                 warn!("snapshot output failed; recreating run dir and continuing without counting as reopen");
                 if let Some(d) = self.snapshot.parent() { let _ = std::fs::create_dir_all(d); }
-                self.ring.lock().unwrap().clear();
+                self.ring.lock().unwrap_or_else(|e| e.into_inner()).clear();
                 continue;
             }
             if !ok && audio.is_some() {
@@ -500,7 +500,7 @@ impl Engine {
                     let cur = audio.as_ref().map(|a| a.strategy);
                     audio_try += 1;
                     warn!("audio device {:?} failed to open with {:?}; retrying with another DirectShow open strategy", audio.as_ref().map(|a| &a.name), cur);
-                    self.ring.lock().unwrap().clear();
+                    self.ring.lock().unwrap_or_else(|e| e.into_inner()).clear();
                     self.set_state("reopening", Some("audio open failed; trying another audio open method".into()));
                     continue; // immediate retry, no backoff / no reopen_count
                 }
@@ -510,18 +510,18 @@ impl Engine {
                         if why == ffmpeg::Failure::AudioOpen { "" } else { " (two failed opens with audio)" });
                     audio_off = true;
                     {
-                        let mut st = self.status.lock().unwrap();
+                        let mut st = self.status.lock().unwrap_or_else(|e| e.into_inner());
                         st.warning = Some("AUDIO FAILED — recording video-only (no game sound). Capture continues.".into());
                         st.last_error = Some("audio could not be opened; recording video-only".into());
                     }
-                    self.ring.lock().unwrap().clear();
+                    self.ring.lock().unwrap_or_else(|e| e.into_inner()).clear();
                     self.set_state("reopening", Some("audio could not be opened; retrying video-only".into()));
                     continue; // immediate retry, no backoff / no reopen_count
                 }
             } else if ok { audio_fails = 0; }
-            self.ring.lock().unwrap().clear();
+            self.ring.lock().unwrap_or_else(|e| e.into_inner()).clear();
             if self.shutdown.load(Ordering::SeqCst) { break; }
-            self.status.lock().unwrap().reopen_count += 1;
+            self.status.lock().unwrap_or_else(|e| e.into_inner()).reopen_count += 1;
             self.set_state("reopening", None);
             self.note_reopen();
             self.rotate_recording();
@@ -536,7 +536,7 @@ impl Engine {
     /// countersign everything, and only then run the slow input-proof / bundle work. Nothing after the
     /// seal adds checkpoints, so the referee stamps the tail within seconds of its t_ms.
     fn finish_stop(self: &Arc<Self>) {
-        if self.stop_reason.lock().unwrap().is_none() { self.note_stop("shutdown"); }
+        if self.stop_reason.lock().unwrap_or_else(|e| e.into_inner()).is_none() { self.note_stop("shutdown"); }
         if let Some(p) = self.stop_recording() { info!("finalised {p}"); }
         crate::inputproof::clear_recording_marker(self.bundle_dir().as_deref());
         // Draft and bundle exist before the countersign wait and the slow input proof, so a kill
@@ -558,7 +558,7 @@ impl Engine {
         let cp = self.checkpoint("stop", json!({}));
         self.sealed.store(true, Ordering::SeqCst);
         let last = cp["seq"].as_u64()?;
-        self.status.lock().unwrap().final_checkpoint_seq = Some(last);
+        self.status.lock().unwrap_or_else(|e| e.into_inner()).final_checkpoint_seq = Some(last);
         info!("stop checkpoint {last} written; checkpoint chain sealed");
         if self.countersigned.load(Ordering::SeqCst) < 0 { return Some(last); }
         self.set_state("countersigning", Some("waiting for the referee to countersign the final checkpoints".into()));
@@ -598,7 +598,7 @@ impl Engine {
                 let l = line.trim();
                 if let Some((k, v)) = l.split_once('=') {
                     if !k.contains(' ') {
-                        let mut s = me.status.lock().unwrap();
+                        let mut s = me.status.lock().unwrap_or_else(|e| e.into_inner());
                         match k { "frame" => s.frames = v.parse().unwrap_or(s.frames), "fps" => s.fps_actual = v.parse().unwrap_or(0.0),
                             "dup_frames" => s.dup_frames = v.parse().unwrap_or(0), "drop_frames" => s.drop_frames = v.parse().unwrap_or(0), _ => {} }
                         continue;
@@ -606,7 +606,7 @@ impl Engine {
                 }
                 if l.is_empty() { continue; }
                 warn!("ffmpeg: {l}");
-                let mut e = last_err.lock().unwrap(); e.push(l.to_string()); if e.len() > 5 { e.remove(0); }
+                let mut e = last_err.lock().unwrap_or_else(|e| e.into_inner()); e.push(l.to_string()); if e.len() > 5 { e.remove(0); }
             }
         }); }
         // watchdog: kill if no data for N seconds (frozen driver / shared device / unplug)
@@ -619,7 +619,7 @@ impl Engine {
                 let grace = if last == start { 15_000 } else { wd };
                 if me.shutdown.load(Ordering::SeqCst) || now - last > grace {
                     if !me.shutdown.load(Ordering::SeqCst) { let m = format!("no data from device for {}s: treating as frozen/unplugged, restarting", grace / 1000); error!("{m}"); me.set_state("reopening", Some(m)); }
-                    let _ = child.lock().unwrap().kill();
+                    let _ = child.lock().unwrap_or_else(|e| e.into_inner()).kill();
                     break;
                 }
             }
@@ -646,11 +646,11 @@ impl Engine {
             }
         }
         alive.store(false, Ordering::SeqCst);
-        let st = { let mut c = child.lock().unwrap(); let _ = c.kill(); c.wait() };
+        let st = { let mut c = child.lock().unwrap_or_else(|e| e.into_inner()); let _ = c.kill(); c.wait() };
         let mut why = ffmpeg::Failure::Other;
         if !self.shutdown.load(Ordering::SeqCst) {
             std::thread::sleep(Duration::from_millis(200));
-            let tail = last_err.lock().unwrap().join(" | ");
+            let tail = last_err.lock().unwrap_or_else(|e| e.into_inner()).join(" | ");
             why = ffmpeg::classify_failure(&tail);
             // Snapshot-only errors must not look like a fatal capture failure when video flowed.
             if why == ffmpeg::Failure::Snapshot && got {
@@ -873,6 +873,42 @@ mod tests {
     }
 
     #[test]
+    fn float_in_final_is_refused_without_poisoning_state() {
+        // match-20261018-193534 (v0.3.24): the sidecar's end-menu final carried end_menu.conf/margin as floats;
+        // jcs_sha panicked inside checkpoint() with the match state locked, every later lock() panicked on the
+        // poisoned mutex and the recording stopped (pipe_broken). Now: 400-style Err, state untouched, recording goes on.
+        use clap::Parser;
+        let dir = std::env::temp_dir().join(format!("qorcap-floatfinal-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let d = dir.to_string_lossy().into_owned();
+        let crate::cli::Cmd::Record(r) = crate::cli::Cli::try_parse_from(["q", "record", "--device", "testpattern", "--bundle", &d]).unwrap().cmd else { panic!() };
+        let e = Engine::new(r, "ffmpeg-x".into());
+        let ev = |s: &str| e.event(&serde_json::from_str::<Value>(s).unwrap());
+        ev(r#"{"type":"score","home":3,"away":7,"quarter":4,"clock_s":0}"#).unwrap();
+        let n0 = e.ev.lock().unwrap().checkpoints.len();
+        let bad = ev(r#"{"type":"final","basis":"end_menu","method":"end_menu_read","home":3,"away":7,"quarter":4,"t_ms":2000,
+                        "end_menu":{"away":7,"home":3,"frames":3,"conf":0.953,"margin":0.215},
+                        "final_confirmed":true,"delta_corroboration":{"kind":"exact_match"}}"#);
+        assert!(bad.unwrap_err().contains("not JCS-safe"));
+        assert!(!e.ev.is_poisoned(), "a bad event must never poison the match state");
+        assert!(e.ev.lock().unwrap().final_.is_none(), "refused final leaves no trace");
+        assert_eq!(e.ev.lock().unwrap().checkpoints.len(), n0);
+        // recording state still works: a checkpoint with float evidence is refused, a normal one is appended
+        assert!(e.checkpoint("x", json!({"f": 1.5})).is_null());
+        assert!(!e.ev.is_poisoned());
+        assert!(e.checkpoint("x", json!({})).is_object());
+        let ok = ev(r#"{"type":"final","basis":"end_menu","method":"end_menu_read","home":3,"away":7,"quarter":4,"t_ms":2000,
+                       "end_menu":{"away":7,"home":3,"frames":3,"conf_permille":953,"margin_permille":215},
+                       "final_confirmed":true,"delta_corroboration":{"kind":"exact_match"}}"#).unwrap();
+        assert_eq!(ok["final"]["end_menu"]["conf_permille"], 953);
+        let out = e.write_bundle().unwrap();
+        let b: Value = serde_json::from_str(&std::fs::read_to_string(out.join("bundle.json")).unwrap()).unwrap();
+        assert!(b["receipt_draft_sha256"].is_string());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn end_menu_final_amends_scorebug_final_and_confirms() {
         use clap::Parser;
         let dir = std::env::temp_dir().join(format!("qorcap-endmenu-{}", std::process::id()));
@@ -1034,10 +1070,10 @@ impl Engine {
     }
     fn broadcast(&self, kind: &str, v: &Value) {
         let msg = format!("event: {kind}\ndata: {v}\n\n");
-        self.subs.lock().unwrap().retain(|s| s.send(msg.clone()).is_ok());
+        self.subs.lock().unwrap_or_else(|e| e.into_inner()).retain(|s| s.send(msg.clone()).is_ok());
     }
     fn note_reopen(&self) {
-        let st = self.ev.lock().unwrap();
+        let st = self.ev.lock().unwrap_or_else(|e| e.into_inner());
         let v = json!({"type": "reopen", "mono_ms": self.ms(), "wall_ms": wall_ms(), "chain_head": st.seg.head, "segment_seq": st.seg.seq});
         drop(st);
         append_jsonl(&self.ev_path("manifest.jsonl"), &v);
@@ -1045,8 +1081,8 @@ impl Engine {
 
     /// Called for every completed fMP4 segment (exact bytes on disk).
     pub fn on_segment(&self, file: &str, offset: u64, bytes: &[u8]) {
-        let frames = self.status.lock().unwrap().frames;
-        let mut st = self.ev.lock().unwrap();
+        let frames = self.status.lock().unwrap_or_else(|e| e.into_inner()).frames;
+        let mut st = self.ev.lock().unwrap_or_else(|e| e.into_inner());
         let (seq, sha, prev, head) = st.seg.push(bytes);
         st.last_seg_sha = Some(sha.clone());
         let kind = if bytes.len() >= 8 && &bytes[4..8] == b"moof" { "media" } else { "init" };
@@ -1059,7 +1095,7 @@ impl Engine {
         crate::inputproof::touch_recording_marker(self.bundle_dir().as_deref());
         self.broadcast("segment", &m);
         // Seal controller inputs received up to now into this segment's chunk (same clock, same checkpoint).
-        let (ih, ihead, n) = self.input.lock().unwrap().seal(seq, self.started.elapsed().as_micros() as u64);
+        let (ih, ihead, n) = self.input.lock().unwrap_or_else(|e| e.into_inner()).seal(seq, self.started.elapsed().as_micros() as u64);
         if self.args.no_controller { self.checkpoint("segment", json!({})); }
         else { self.checkpoint_with("segment", json!({"input_seg": seq, "input_n": n, "input_head": ihead}), Some(ih)); }
     }
@@ -1071,11 +1107,19 @@ impl Engine {
             warn!("checkpoint '{trigger}' after the stop checkpoint refused (chain is sealed)");
             return Value::Null;
         }
-        let mut st = self.ev.lock().unwrap();
+        let mut st = self.ev.lock().unwrap_or_else(|e| e.into_inner());
         let mut ext = json!({"trigger": trigger, "segment_seq": st.seg.seq, "segment_hash": st.last_seg_sha, "chain_head": st.seg.head,
             "score": st.score, "mono_ms": self.ms(), "match_id": self.args.match_id, "role": self.args.role});
         if let (Value::Object(e), Value::Object(x)) = (&mut ext, extra) { e.extend(x); }
-        let cp = st.cps.next_with_input(wall_ms(), ext, input_hash);
+        let cp = match st.cps.next_with_input(wall_ms(), ext, input_hash) {
+            Ok(cp) => cp,
+            Err(e) => {
+                // v0.3.25: never panic with the match state locked (that poisoned it and stopped the recording).
+                drop(st);
+                error!("checkpoint '{trigger}' refused: {e}");
+                return Value::Null;
+            }
+        };
         st.checkpoints.push(cp.clone());
         drop(st);
         append_jsonl(&self.ev_path("checkpoints.jsonl"), &cp);
@@ -1089,7 +1133,7 @@ impl Engine {
         let pattern = ev::pattern_for(nonce)?;
         let now = wall_ms();
         let issued = b["issued_ms"].as_u64().unwrap_or(now);
-        let (seq, head) = { let st = self.ev.lock().unwrap(); (st.seg.seq, st.seg.head.clone()) };
+        let (seq, head) = { let st = self.ev.lock().unwrap_or_else(|e| e.into_inner()); (st.seg.seq, st.seg.head.clone()) };
         let c = json!({"id": b["id"].as_str().map(String::from).unwrap_or_else(|| nonce[..8].to_string()),
             "role": b["role"].as_str().unwrap_or(&self.args.role), "phase": b["phase"].as_str().unwrap_or("kickoff"),
             "nonce": nonce, "pattern": pattern, "issued_ms": issued, "deadline_ms": b["deadline_ms"].as_u64().unwrap_or(issued + 90_000),
@@ -1099,7 +1143,7 @@ impl Engine {
             let tmp = self.stamp_file.with_extension("tmp");
             if std::fs::write(&tmp, text).is_ok() { let _ = std::fs::rename(&tmp, &self.stamp_file); }
         }
-        self.ev.lock().unwrap().challenges.push(c.clone());
+        self.ev.lock().unwrap_or_else(|e| e.into_inner()).challenges.push(c.clone());
         append_jsonl(&self.ev_path("challenges.jsonl"), &c);
         let cp = self.checkpoint("challenge", json!({"nonce": nonce}));
         info!("referee challenge {nonce} received; pattern {pattern:?}; bound at checkpoint {}", cp["seq"]);
@@ -1124,7 +1168,7 @@ impl Engine {
                 let clock_s = b["clock_s"].as_i64();
                 let red = b["clock_red"].as_bool().unwrap_or(false);
                 let read = json!({"t_ms": t_ms, "home": h, "away": a, "quarter": raw_q, "clock_s": clock_s, "clock_red": red});
-                let mut st = self.ev.lock().unwrap();
+                let mut st = self.ev.lock().unwrap_or_else(|e| e.into_inner());
                 // A fresh 0-0 (or any illegal drop) after the scorebug has been gone is the next
                 // session: a rematch, a demo, the menu. The receipt keeps the last legal score.
                 if let Some((ph, pa, _)) = st.last_score {
@@ -1182,7 +1226,7 @@ impl Engine {
                 let until = b["until_ms"].as_u64().unwrap_or(t_ms);
                 let v = json!({"t_ms": t_ms, "until_ms": until, "obs": o, "n": b["n"].as_u64().unwrap_or(0)});
                 {
-                    let mut st = self.ev.lock().unwrap();
+                    let mut st = self.ev.lock().unwrap_or_else(|e| e.into_inner());
                     if o == "final_screen" || (o == "scorebug_absent" && until.saturating_sub(t_ms) >= SESSION_BREAK_MS) {
                         st.scorebug_break = true;
                     }
@@ -1208,8 +1252,11 @@ impl Engine {
                         if !b[k].is_null() { fin[k] = b[k].clone(); }
                     }
                 }
+                // v0.3.25: the final is committed into the checkpoint chain and the receipt draft, both JCS
+                // (no floats). Refuse a non-JCS final up front, before any state changes.
+                ev::jcs(&fin).map_err(|e| format!("final event is not JCS-safe ({e}): send integers (e.g. *_permille) or strings, not floats"))?;
                 let amended = {
-                    let mut st = self.ev.lock().unwrap();
+                    let mut st = self.ev.lock().unwrap_or_else(|e| e.into_inner());
                     let prev = st.final_.clone();
                     match &prev {
                         Some(p) if p["basis"] == "end_menu" || !end_menu => return Ok(json!({"ok": true, "duplicate": true})),
@@ -1241,7 +1288,7 @@ impl Engine {
             Ok(p) => {
                 let sha = std::fs::read(&p).map(|d| ev::sha256_hex(&d)).unwrap_or_default();
                 let c = json!({"type": "clip", "name": name, "file": p, "sha256": sha, "secs": secs, "wall_ms": wall_ms()});
-                me.ev.lock().unwrap().clips.push(c.clone());
+                me.ev.lock().unwrap_or_else(|e| e.into_inner()).clips.push(c.clone());
                 append_jsonl(&me.ev_path("manifest.jsonl"), &c);
                 me.broadcast("clip", &c);
             }
@@ -1280,7 +1327,7 @@ impl Engine {
         if !input_proof && self.bundle_finalized.load(Ordering::SeqCst) {
             return self.bundle_dir();
         }
-        let st = self.ev.lock().unwrap();
+        let st = self.ev.lock().unwrap_or_else(|e| e.into_inner());
         let session_note = st.session_note.clone();
         let unconfirmed = st.final_.is_none();
         let fin = st.final_.clone().unwrap_or_else(|| {
@@ -1362,7 +1409,7 @@ impl Engine {
             "checkpoint_head": st.cps.prev, "challenges": st.challenges.len(), "clips": st.clips, "final": st.final_,
             "final_confirmed": confirmed,
             "challenge_rule": 2,
-            "receipt_draft_sha256": ev::jcs_sha(&receipt),
+            "receipt_draft_sha256": ev::try_jcs_sha(&receipt).map(Value::from).unwrap_or_else(|e| { error!("receipt draft not JCS-safe: {e}"); Value::Null }),
             "claims": "Proves the integrity and timing of these video bytes (hash chain + checkpoints, referee co-signable). Does NOT prove who was playing.",
         });
         if let Some(reason) = reason.as_deref() { bundle["stop_reason"] = json!(reason); }
@@ -1380,7 +1427,7 @@ impl Engine {
                 }
             }
             if let Some(obj) = bundle.as_object_mut() {
-                obj.insert("receipt_draft_sha256".into(), json!(ev::jcs_sha(&receipt)));
+                obj.insert("receipt_draft_sha256".into(), ev::try_jcs_sha(&receipt).map(Value::from).unwrap_or_else(|e| { error!("receipt draft not JCS-safe: {e}"); Value::Null }));
             }
         }
         let w = |n: &str, v: &Value| std::fs::write(dir.join(n), serde_json::to_string_pretty(v).unwrap()).map_err(|e| error!("write {n}: {e}"));
