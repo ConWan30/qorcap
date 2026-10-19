@@ -1,0 +1,90 @@
+name: Release
+on:
+  push:
+    tags:
+      - "v*"
+permissions:
+  contents: write
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build qorcap.exe
+        run: cargo build --release --locked
+      - name: Package the Windows zip and publish the release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          # A missing release is expected the first time; don't treat that native exit as fatal.
+          $PSNativeCommandUseErrorActionPreference = $false
+          $tag = "${{ github.ref_name }}"
+          if ($tag -notmatch '^v\d+\.\d+\.\d+$') { throw "tag $tag is not vX.Y.Z" }
+          $ver = (Select-String -Path Cargo.toml -Pattern '^version = "([^"]+)"').Matches[0].Groups[1].Value
+          if ($tag -ne "v$ver") { throw "tag $tag does not match Cargo.toml $ver" }
+          $name = "qorcap-$tag-windows-x64"
+          $stage = Join-Path $env:RUNNER_TEMP "qorcap-stage"
+          $root = Join-Path $stage $name
+          New-Item -ItemType Directory -Force -Path $root | Out-Null
+
+          Copy-Item target\release\qorcap.exe $root
+          $exeHash = (Get-FileHash (Join-Path $root "qorcap.exe") -Algorithm SHA256).Hash.ToLower()
+          [System.IO.File]::WriteAllText((Join-Path $root "qorcap.exe.sha256"), "$exeHash  qorcap.exe`n")
+
+          foreach ($f in @(
+            "Start Match.cmd", "Finalize Last Match.cmd", "Make Highlights.cmd",
+            "Input Test.cmd", "Submit for Verification.cmd", "Test Without Card.cmd",
+            "Glimpse Watch.cmd", "LICENSE", "README.md", "get-ffmpeg.ps1", "start-match.ps1"
+          )) { Copy-Item $f $root }
+          New-Item -ItemType Directory -Force -Path (Join-Path $root "docs") | Out-Null
+          Copy-Item docs\GLIMPSE_WATCH.md (Join-Path $root "docs")
+          Copy-Item sidecar (Join-Path $root "sidecar") -Recurse
+          Get-ChildItem (Join-Path $root "sidecar") -Recurse -Directory -Filter __pycache__ | Remove-Item -Recurse -Force
+
+          Push-Location $root
+          try { & .\get-ffmpeg.ps1 } finally { Pop-Location }
+          if (-not (Test-Path (Join-Path $root "ffmpeg.exe"))) { throw "ffmpeg.exe was not installed" }
+
+          $pin = (Select-String -Path sidecar\qorcap_match.py -Pattern 'QORTIME_PIN = "([0-9a-f]+)"').Matches[0].Groups[1].Value
+          $qt = Join-Path $env:RUNNER_TEMP "qortime-src"
+          git init $qt
+          git -C $qt remote add origin https://github.com/ConWan30/qortime.git
+          git -C $qt fetch --depth 1 origin $pin
+          if ($LASTEXITCODE -ne 0) { throw "could not fetch QorTime $pin" }
+          git -C $qt checkout --detach FETCH_HEAD
+          if (Test-Path (Join-Path $qt ".git")) { Remove-Item (Join-Path $qt ".git") -Recurse -Force }
+          Move-Item $qt (Join-Path $root "qortime")
+
+          $zip = Join-Path $env:RUNNER_TEMP "$name.zip"
+          if (Test-Path $zip) { Remove-Item $zip }
+          tar.exe -a -c -f $zip -C $stage $name
+          if (-not (Test-Path $zip)) { throw "zip was not created" }
+          $zipHash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+          $sum = Join-Path $env:RUNNER_TEMP "$name.zip.sha256"
+          [System.IO.File]::WriteAllText($sum, "$zipHash  $name.zip`n")
+
+          $notesPath = ".github/release-notes/$tag.md"
+          if (Test-Path $notesPath) {
+            $lines = Get-Content $notesPath
+            $title = $lines[0]
+            $body = (($lines | Select-Object -Skip 1) -join "`n").Trim()
+          } else {
+            $title = "QorCap $tag"
+            $body = "QorCap $tag"
+          }
+          $body = $body.TrimEnd() + "`n`nqorcap.exe sha256 ``$exeHash```n"
+          $have = $false
+          gh release view $tag | Out-Null
+          if ($LASTEXITCODE -eq 0) { $have = $true }
+          if ($have) {
+            gh release upload $tag $zip $sum --clobber
+            gh release edit $tag --title $title --notes $body
+          } else {
+            gh release create $tag $zip $sum --target "${{ github.sha }}" --title $title --notes $body
+          }
+          gh release edit $tag --draft=false --latest
+          Write-Host "published $tag exe $exeHash zip $zipHash"

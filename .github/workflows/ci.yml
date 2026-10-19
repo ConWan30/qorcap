@@ -1,0 +1,33 @@
+name: CI
+on:
+  pull_request:
+  push:
+    branches: [main]
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --locked
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: sudo apt-get update && sudo apt-get install -y ffmpeg
+      - run: pip install pytest
+      - run: python -m pytest -q sidecar/test_qorcap_highlights.py
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --locked
+      - run: cargo build --release --locked
+      # No controller is the expected result: input-test returns 1.
+      # pwsh forwards that native code as the step result unless the script exits 0 itself.
+      - shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          .\target\release\qorcap.exe input-test --secs 2
+          if ($LASTEXITCODE -ne 1) { throw "expected exit 1 with no controller" }
+          exit 0

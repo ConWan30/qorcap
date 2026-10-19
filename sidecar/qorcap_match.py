@@ -2202,7 +2202,7 @@ def finalize_main(argv) -> int:
                     help="opt-in: before signing, read the PSN names Madden showed (online games) into the receipt as "
                          "match.observed_handles (on-screen evidence, not account proof)")
     ap.add_argument("--highlights", action="store_true",
-                    help="opt-in: after signing, cut verified highlight clips around each locked score change (highlights/)")
+                    help="opt-in: after signing, cut highlight clips around each locked score change (highlights/). The panel title is SCOREBUG LOCK.")
     a = ap.parse_args(argv)
     say("=" * 64)
     say("  QorCap  -  Finalize Match (offline)")
@@ -2266,7 +2266,7 @@ def post_match_highlights(bundle: Path, ffmpeg: str) -> None:
     try:
         sys.path.insert(0, str(HERE))
         from qorcap_highlights import Refuse, make_highlights
-        say("\nCutting verified highlight clips ...")
+        say("\nCutting highlight clips ...")
         man = make_highlights(bundle, ffmpeg=ffmpeg)
         say(f"  {len(man['clips'])} clip(s) in {bundle / 'highlights'} (manifest.json links each to its lock and the receipt)")
     except Refuse as e:

@@ -2,7 +2,7 @@
 
 # QorCap
 
-**Website:** https://conwan30.github.io/qorcap/ · **Download:** [v0.3.26](https://github.com/ConWan30/qorcap/releases/tag/v0.3.26) ([latest release](https://github.com/ConWan30/qorcap/releases/latest))
+**Website:** https://conwan30.github.io/qorcap/ · **Download:** [v0.3.27](https://github.com/ConWan30/qorcap/releases/tag/v0.3.27) ([latest release](https://github.com/ConWan30/qorcap/releases/latest))
 
 A small Windows recorder for a USB HDMI capture card (built for a generic **"USB3.0 Video"** card carrying a PS5),
 made for **[QorTime](https://github.com/ConWan30/qortime)** match receipts. It does two jobs:
@@ -26,7 +26,7 @@ with a local control surface). QorCap copies only that design idea, no code. No 
 
 ## Quickstart: double-click Start Match
 
-1. Download `qorcap-v0.3.26-windows-x64.zip` from the [latest release](https://github.com/ConWan30/qorcap/releases/latest)
+1. Download `qorcap-v0.3.27-windows-x64.zip` from the [latest release](https://github.com/ConWan30/qorcap/releases/latest)
    and unzip it, for example to `C:\QorCap` (right-click the zip, *Extract All*).
 2. Connect PS5 HDMI out to the **USB3.0 Video** card, and the card to a blue USB 3 port. Close OBS or the Camera app.
 3. Double-click **`Start Match`**. On the first run it downloads ffmpeg, installs Python 3.12 through winget if it
@@ -57,14 +57,17 @@ countersigned live (`countersigned.jsonl`), those signatures are reused. Otherwi
 checkpoints at finalize time, stamping each with QorCap's recording time, and `referee.key_kind` is
 `local-self-attested-offline` so a reader can tell.
 
-**Verified highlight clips (opt-in, after the match).** Double-click **`Make Highlights`** (or run `qorcap highlights <bundle folder>`,
+**Highlight clips (opt-in, after the match).** Double-click **`Make Highlights`** (or run `qorcap highlights <bundle folder>`,
 or add `--highlights` to `qorcap finalize`). For every **locked** score change (a `score_change` checkpoint in the signed hash chain whose
-evidence hash matches, normally inside `receipt.json`) it cuts about 8 s before to 4 s after (`--pre`/`--post`), burns in a small panel with
-the locked score in gold plus the lock and receipt hashes (`--no-burn` stream-copies and keeps the overlay only in the `.vtt` sidecar), and
-writes `highlights/manifest.json` (`qorcap-highlights/v0`) linking each clip to its lock, the receipt SHA-256 and the hash-chained source
+evidence hash matches, normally inside `receipt.json`) it cuts about 8 s before to 4 s after (`--pre`/`--post`) and burns in a small panel
+titled **SCOREBUG LOCK** (the QorTime viewer's wording for a scorebug read), with the score in gold plus the lock and receipt hashes.
+**LOCKED SCORE** and **VERIFIED** are reserved for a referee-verified receipt. The sidecar does not know that verdict when it cuts the clip,
+so the panel and the `.vtt` stay on **SCOREBUG LOCK** (`--no-burn` stream-copies and keeps those words only in the `.vtt`). It writes
+`highlights/manifest.json` (`qorcap-highlights/v0`) linking each clip to its lock, the receipt SHA-256 and the hash-chained source
 segments. `qorcap highlights --check highlights/manifest.json` re-checks all of it. It never runs during recording: a fresh
 `.qorcap-run/recording.lock` makes it refuse (exit 3), and it needs the signed `receipt.json` (exit 4 without it). Scorebug misreads that a
-later lock contradicts are skipped and listed. Clips show what was on screen, not who held the controller. Match 125430 (18.9 min): 6 clips in about 3 s.
+later lock contradicts are skipped and listed. Clips show what was on screen, not who held the controller. Match 125430 (18.9 min) is a
+QorTime **FAIL** because the capture key is local self-attested: 6 clips in about 3 s, each panel titled SCOREBUG LOCK.
 
 No card? Double-click **`Test Without Card`**. It plays a test-pattern video and a scripted 20-second game through the same
 record, sign and verify path (`python sidecar/qorcap_match.py --test-pattern`).
@@ -366,7 +369,7 @@ Global: `--port 8788`, `--ffmpeg PATH`, `--log FILE` (default `qorcap.log`, or `
 ## Run on Windows by hand (PowerShell, advanced)
 
 ```powershell
-# 1. unzip qorcap-v0.3.26-windows-x64.zip to C:\QorCap, then:
+# 1. unzip qorcap-v0.3.27-windows-x64.zip to C:\QorCap, then:
 cd C:\QorCap
 Unblock-File .\qorcap.exe, .\get-ffmpeg.ps1
 powershell -ExecutionPolicy Bypass -File .\get-ffmpeg.ps1     # puts ffmpeg.exe next to qorcap.exe
@@ -403,6 +406,8 @@ continues), replay save, challenge stamp visible in the video, score/final event
 written, `verify-bundle` OK, and a single flipped byte reported as FAIL.
 
 **Tested on Windows (v0.2.0–v0.2.1 era, MyTurn, USB3.0 Video):** `--input-format mjpeg` 1280x720@30 with `h264_mf` at 29.7 fps. v0.2.1 fixed audio / auto-format / OBS.
+
+**v0.3.27:** highlight clips burn **SCOREBUG LOCK** instead of **LOCKED SCORE**. The panel is a scorebug read committed into the checkpoint chain. **LOCKED SCORE** and **VERIFIED** stay off the picture, because a referee verdict is not known when the clip is cut (QorTime match 125430 is FAIL: the capture key is local self-attested). The `.vtt` uses the same title. Panel layout, cut windows, and the recorder are unchanged.
 
 **v0.3.26:** pick your side at Start Match. Your side (home or away) is signed into every checkpoint from the very first one the official referee countersigns, so it has to be right before recording starts; fixing it afterwards re-signs the checkpoints and the referee then refuses the receipt. Start Match now shows a big prompt: press **H** for HOME or **A** for AWAY, then Enter. AWAY is the LEFT team, listed first on the Madden scorebug (scorebug `CHI 7  ATL 3`: CHI is away, ATL is home). Nothing is recorded until you choose; there is no timeout and no silent default (the prompt is shown again with a beep every 60 s). To skip the prompt: `Start Match.cmd --side away` (or `home`), or put `home` or `away` in `%LOCALAPPDATA%\QorCap\next-side.txt` before starting; that file is used once and then renamed `next-side.used-<time>.txt` (a file older than 4 hours, or one that does not say home/away, is renamed `next-side.ignored-<time>.txt` and the prompt is shown). The side and how it was chosen (`prompt`, `flag` or `file`) show in `http://127.0.0.1:8788/status` (`role`, `side_source`), in the start checkpoint, in `bundle.json` and in `side_choice.json`. The Glimpse watcher now waits up to 30 minutes for recording to start.
 
