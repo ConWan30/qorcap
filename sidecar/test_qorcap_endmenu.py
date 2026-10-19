@@ -431,3 +431,42 @@ def test_end_menu_rejection_is_logged(capsys):
     err = capsys.readouterr().err
     assert "END MENU rejected:" in err and "clock not 0:00" in err
     assert not any(p.get("basis") == "end_menu" for p in posts)
+
+
+def _floats(v, path=""):
+    if isinstance(v, float):
+        return [path]
+    if isinstance(v, dict):
+        return [p for k, x in v.items() for p in _floats(x, f"{path}.{k}")]
+    if isinstance(v, (list, tuple)):
+        return [p for i, x in enumerate(v) for p in _floats(x, f"{path}[{i}]")]
+    return []
+
+
+def test_posted_end_menu_final_is_jcs_safe_match_193534():
+    """v0.3.25 regression (match-20261018-193534): the live end-menu final carried end_menu.conf and
+    end_menu.margin as floats; qorcap.exe's JCS hash panicked with the match state locked and the recording
+    stopped. Every posted event must canonicalize under the QorTime JCS profile (no floats)."""
+    from qor_receipt.jcs import canonicalize
+    core, posts = _core({"t_ms": 0, "home": 14, "away": 7, "quarter": 4, "clock_s": 0, "clock_red": True})
+    for k in range(6):
+        core.on_frame(10_000 + k * 500, FIN)
+    f = next(p for p in posts if p["type"] == "final" and p["basis"] == "end_menu")
+    # the reader's own state still holds the floats (the referee's end-menu fallback reads `conf`) ...
+    assert isinstance(core.final["end_menu"]["conf"], float) and isinstance(core.final["end_menu"]["margin"], float)
+    # ... but what is posted to qorcap.exe has none
+    assert _floats(f) == [], _floats(f)
+    em = f["end_menu"]
+    assert "conf" not in em and "margin" not in em
+    assert em["conf_permille"] == round(core.final["end_menu"]["conf"] * 1000)
+    assert em["margin_permille"] == round(core.final["end_menu"]["margin"] * 1000)
+    for p in posts:
+        canonicalize(p)  # raises on floats
+
+
+def test_jcs_safe_helper():
+    from qorcap_reader import jcs_safe
+    src = {"a": 1, "b": 0.9534, "c": {"d": [0.5, 2, None, True]}, "e": "x", "f": False}
+    out = jcs_safe(src)
+    assert out == {"a": 1, "b_permille": 953, "c": {"d": [500, 2, None, True]}, "e": "x", "f": False}
+    assert src["b"] == 0.9534  # input untouched

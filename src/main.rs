@@ -247,7 +247,7 @@ fn input_test(secs: Option<u64>) -> i32 {
     let mut rate = 0u64; let mut ever_ok = false; let mut seen_haptic = 0u64; let mut calib_said = false;
     while !stop.load(Ordering::SeqCst) && secs.map(|s| clock.elapsed() < Duration::from_secs(s)).unwrap_or(true) {
         std::thread::sleep(Duration::from_millis(50));
-        let lv = log.lock().unwrap().live.clone();
+        let lv = log.lock().unwrap_or_else(|e| e.into_inner()).live.clone();
         if lv.state != last_state {
             match lv.state.as_str() {
                 "connected" => { ever_ok = true; println!("\r\n[ OK ] HID is being read: {}", lv.device.clone().unwrap_or_default()); }
@@ -267,7 +267,7 @@ fn input_test(secs: Option<u64>) -> i32 {
             println!("\r{:>8.2}s  IMU baseline calibrated; haptic detection is live{}", clock.elapsed().as_secs_f64(), " ".repeat(40));
         }
         if lv.haptic.events > seen_haptic {
-            let pend = log.lock().unwrap().pending().iter().rev().find(|r| r["type"] == "haptic").cloned();
+            let pend = log.lock().unwrap_or_else(|e| e.into_inner()).pending().iter().rev().find(|r| r["type"] == "haptic").cloned();
             if let Some(e) = pend {
                 println!("\r{:>8.2}s  HAPTIC  peak={}x dur={}ms energy={} confidence={} ({}){}{}", e["t_us"].as_u64().unwrap_or(0) as f64 / 1e6,
                     e["peak"], e["duration_ms"], e["energy"], e["confidence"], e["confidence_label"].as_str().unwrap_or(""),
@@ -283,7 +283,7 @@ fn input_test(secs: Option<u64>) -> i32 {
     }
     stop.store(true, Ordering::SeqCst);
     let _ = h.join();
-    let l = log.lock().unwrap();
+    let l = log.lock().unwrap_or_else(|e| e.into_inner());
     println!("\n\nSummary: {} HID reports read, {} logged, {} button presses.", l.live.reports, l.live.logged, l.live.presses);
     if l.live.reports == 0 {
         println!("RESULT: FAIL. No HID reports were read. {}", if ever_ok { "The controller was found but sent nothing." } else { "The DualSense was not visible over USB on this laptop. Check the USB cable into the laptop; the PS5 Bluetooth link stays as is." });

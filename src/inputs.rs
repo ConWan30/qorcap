@@ -278,8 +278,8 @@ where F: Fn() -> Result<Box<dyn ReportSource>, String> + Send + 'static {
         while !stop.load(Ordering::SeqCst) {
             match open() {
                 Err(e) => {
-                    let first = log.lock().unwrap().live.state != "missing";
-                    log.lock().unwrap().on_status(us(), "missing", &e);
+                    let first = log.lock().unwrap_or_else(|e| e.into_inner()).live.state != "missing";
+                    log.lock().unwrap_or_else(|e| e.into_inner()).on_status(us(), "missing", &e);
                     if first || last_warn.map(|t| t.elapsed() > Duration::from_secs(60)).unwrap_or(true) {
                         warn!("CONTROLLER: {e}. Input proof is OFF until the DualSense is visible over USB (recording continues).");
                         last_warn = Some(Instant::now());
@@ -289,14 +289,14 @@ where F: Fn() -> Result<Box<dyn ReportSource>, String> + Send + 'static {
                 Ok(mut dev) => {
                     let name = dev.name();
                     info!("CONTROLLER: reading {name} HID reports on the QorCap clock");
-                    log.lock().unwrap().on_status(us(), "connected", &name);
+                    log.lock().unwrap_or_else(|e| e.into_inner()).on_status(us(), "connected", &name);
                     let mut last_rx = Instant::now();
                     while !stop.load(Ordering::SeqCst) {
                         match dev.read(&mut buf, 100) {
                             Ok(Some(n)) => {
                                 let t = us();
                                 if let Some(p) = hid::parse(&buf[..n]) {
-                                    let mut l = log.lock().unwrap();
+                                    let mut l = log.lock().unwrap_or_else(|e| e.into_inner());
                                     if l.live.state != "connected" { l.on_status(t, "connected", &name); }
                                     l.on_report(t, &p);
                                     last_rx = Instant::now();
@@ -304,13 +304,13 @@ where F: Fn() -> Result<Box<dyn ReportSource>, String> + Send + 'static {
                             }
                             Ok(None) => {
                                 if last_rx.elapsed() > Duration::from_secs(2) {
-                                    let mut l = log.lock().unwrap();
+                                    let mut l = log.lock().unwrap_or_else(|e| e.into_inner());
                                     if l.live.state == "connected" { warn!("CONTROLLER: no HID reports for 2 s"); l.on_status(us(), "stalled", "no reports for 2 s"); }
                                 }
                             }
                             Err(e) => {
                                 warn!("CONTROLLER: USB HID read failed ({e}); retrying");
-                                log.lock().unwrap().on_status(us(), "unplugged", &e);
+                                log.lock().unwrap_or_else(|e| e.into_inner()).on_status(us(), "unplugged", &e);
                                 break;
                             }
                         }
@@ -435,7 +435,7 @@ mod tests {
         let h = spawn_logger_with(log.clone(), Instant::now(), stop.clone(), || Err("no DualSense found on USB".into()));
         std::thread::sleep(Duration::from_millis(150));
         stop.store(true, Ordering::SeqCst); h.join().unwrap();
-        let mut l = log.lock().unwrap();
+        let mut l = log.lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!(l.live.state, "missing");
         assert!(l.live.warning.as_deref().unwrap().contains("not detected"));
         let (_, _, n) = l.seal(0, 1);
@@ -462,7 +462,7 @@ mod tests {
         });
         std::thread::sleep(Duration::from_millis(800));
         stop.store(true, Ordering::SeqCst); h.join().unwrap();
-        let l = log.lock().unwrap();
+        let l = log.lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!((l.live.reports, l.live.presses), (3, 1));
         assert!(l.live.state == "missing" || l.live.state == "unplugged");
         let states: Vec<&str> = l.pending.iter().filter_map(|r| r["state"].as_str()).collect();

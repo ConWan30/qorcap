@@ -79,7 +79,7 @@ mod tests {
         let t = FrameTap::new(false);
         t.offer(&J, 1_000);
         assert_eq!(t.take(1_000).unwrap_err(), TapErr::Off);
-        assert!(t.cur.lock().unwrap().is_none());
+        assert!(t.cur.lock().unwrap_or_else(|e| e.into_inner()).is_none());
     }
     #[test]
     fn serves_latest_rate_limited_and_refuses_stale() {
@@ -100,7 +100,7 @@ mod tests {
     fn a_held_tap_never_blocks_the_reader() {
         let t = FrameTap::new(true);
         t.offer(&J, 5_000);
-        let g = t.cur.lock().unwrap(); // watcher side mid-clone
+        let g = t.cur.lock().unwrap_or_else(|e| e.into_inner()); // watcher side mid-clone
         t.offer(&[0xFF, 0xD8, 9, 0xFF, 0xD9], 5_250); // returns immediately, skips this copy
         drop(g);
         assert_eq!(t.take(5_300).unwrap().seq, 1);

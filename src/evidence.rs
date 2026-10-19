@@ -51,7 +51,15 @@ fn write_jcs(v: &Value, s: &mut String) -> Result<(), String> {
     }
     Ok(())
 }
-pub fn jcs_sha(v: &Value) -> String { sha256_hex(jcs(v).expect("jcs").as_bytes()) }
+/// SHA-256 of JCS(v). Returns an error (never panics) when `v` is not JCS-safe under the QorTime profile
+/// (floats, integers above 2^53-1). v0.3.25: a panic here while the match-state mutex was held poisoned it and
+/// stopped the recording (match-20261018-193534: end-menu final carried `conf`/`margin` floats).
+pub fn try_jcs_sha(v: &Value) -> Result<String, String> { Ok(sha256_hex(jcs(v)?.as_bytes())) }
+/// For values QorCap builds itself from strings, bools and small integers only (chain links, empty arrays,
+/// checkpoint bodies). Anything that carries caller-supplied JSON must use `try_jcs_sha`.
+pub fn jcs_sha(v: &Value) -> String {
+    try_jcs_sha(v).unwrap_or_else(|e| panic!("internal JCS value not JCS-safe ({e}); use try_jcs_sha for caller data"))
+}
 
 /// Port of qor_receipt.challenge.pattern_for.
 pub fn pattern_for(nonce_hex: &str) -> Result<Vec<&'static str>, String> {
@@ -94,21 +102,23 @@ pub struct CheckpointChain { pub seq: u64, pub prev: String }
 impl Default for CheckpointChain { fn default() -> Self { Self { seq: 0, prev: GENESIS.into() } } }
 impl CheckpointChain {
     /// `ext` = QorCap evidence object; committed via frames_hash = SHA-256(JCS(ext)).
-    pub fn next(&mut self, t_ms: u64, ext: Value) -> Value { self.next_with_input(t_ms, ext, None) }
+    pub fn next(&mut self, t_ms: u64, ext: Value) -> Result<Value, String> { self.next_with_input(t_ms, ext, None) }
     /// `input_hash` = SHA-256(JCS([input records])) of the controller chunk sealed with this checkpoint
     /// (None = SHA-256(JCS([])), the pre-0.3.0 value).
-    pub fn next_with_input(&mut self, t_ms: u64, ext: Value, input_hash: Option<String>) -> Value {
+    /// Errors (and leaves the chain unchanged) when `ext` is not JCS-safe; never panics.
+    pub fn next_with_input(&mut self, t_ms: u64, ext: Value, input_hash: Option<String>) -> Result<Value, String> {
+        let frames_hash = try_jcs_sha(&ext).map_err(|e| format!("checkpoint evidence not JCS-safe: {e}"))?;
         let mut body = Map::new();
         body.insert("seq".into(), json!(self.seq));
         body.insert("t_ms".into(), json!(t_ms));
-        body.insert("frames_hash".into(), json!(jcs_sha(&ext)));
+        body.insert("frames_hash".into(), json!(frames_hash));
         body.insert("input_hash".into(), json!(input_hash.unwrap_or_else(|| jcs_sha(&json!([])))));
         body.insert("prev".into(), json!(self.prev));
-        let h = jcs_sha(&Value::Object(body.clone()));
+        let h = try_jcs_sha(&Value::Object(body.clone()))?;
         body.insert("hash".into(), json!(h));
         body.insert("qorcap".into(), ext);
         self.seq += 1; self.prev = h;
-        Value::Object(body)
+        Ok(Value::Object(body))
     }
 }
 
@@ -116,9 +126,9 @@ impl CheckpointChain {
 pub fn check_checkpoint(cp: &Value, prev: &str) -> Result<String, String> {
     let body = json!({"seq": cp["seq"], "t_ms": cp["t_ms"], "frames_hash": cp["frames_hash"], "input_hash": cp["input_hash"], "prev": cp["prev"]});
     if cp["prev"] != prev { return Err("prev link broken".into()); }
-    let h = jcs_sha(&body);
+    let h = try_jcs_sha(&body)?;
     if cp["hash"] != h.as_str() { return Err("hash mismatch".into()); }
-    if cp["frames_hash"] != jcs_sha(&cp["qorcap"]).as_str() { return Err("qorcap evidence does not match frames_hash".into()); }
+    if cp["frames_hash"] != try_jcs_sha(&cp["qorcap"])?.as_str() { return Err("qorcap evidence does not match frames_hash".into()); }
     Ok(h)
 }
 
@@ -245,8 +255,8 @@ mod tests {
         assert_eq!(jcs_sha(&body), "03245993acbd244a96e72e8bcabcb484e4f1bfd19a74ca9ee60502276b22c016");
         assert_eq!(jcs_sha(&json!([])), "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945");
         let mut c = CheckpointChain::default();
-        let a = c.next(5, json!({"trigger": "segment"}));
-        let b = c.next(6, json!({"trigger": "score_change", "score": {"home": 7, "away": 0}}));
+        let a = c.next(5, json!({"trigger": "segment"})).unwrap();
+        let b = c.next(6, json!({"trigger": "score_change", "score": {"home": 7, "away": 0}})).unwrap();
         let ha = check_checkpoint(&a, GENESIS).unwrap();
         check_checkpoint(&b, &ha).unwrap();
         let mut t = b.clone(); t["qorcap"]["score"]["home"] = json!(14);

@@ -120,7 +120,7 @@ pub fn apply(dir: &Path, ffmpeg: Option<&str>, n_frames: usize) -> Result<Value,
             if !r["signals"].is_object() { r["signals"] = json!({}); }
             r["signals"]["input"] = fields.clone();
             ev::jcs(&r).map_err(|e| format!("receipt draft would not be JCS-safe: {e}"))?;
-            draft_sha = Some(ev::jcs_sha(&r));
+            draft_sha = Some(ev::try_jcs_sha(&r)?);
             w("receipt.draft.json", &r)?;
         }
     }
