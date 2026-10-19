@@ -23,5 +23,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo test --locked
       - run: cargo build --release --locked
-      - run: .\target\release\qorcap.exe input-test --secs 2; if ($LASTEXITCODE -ne 1) { throw "expected exit 1 with no controller" }
-        shell: pwsh
+      # windows-latest pwsh stops on a native exit 1 before $LASTEXITCODE can be checked.
+      # No controller is the expected result: input-test returns 1.
+      - shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          .\target\release\qorcap.exe input-test --secs 2
+          if ($LASTEXITCODE -ne 1) { throw "expected exit 1 with no controller" }
