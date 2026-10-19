@@ -666,6 +666,159 @@ def overall(qt_status: str, bundle_ok: bool) -> str:
 
 
 # ------------------------------------------------------------------ main
+
+# ---- v0.3.26 side pick ---------------------------------------------------------------------------------------------
+# The side (home | away) is committed in every checkpoint (ext.role) from the first one the referee countersigns, so it
+# must be right before qorcap.exe starts: a later correction re-signs the checkpoints and the referee then refuses the
+# receipt (match-20261017-021003). Order: --side/--role flag > one-shot side file > the prompt. Never a silent default.
+SIDE_FILE_NAME = "next-side.txt"
+SIDE_FILE_MAX_AGE_S = 4 * 3600
+SIDE_REMIND_S = 60
+
+_BIG = {  # 5-row block letters for the prompt banner
+    "H": ["#   #", "#   #", "#####", "#   #", "#   #"], "O": [" ### ", "#   #", "#   #", "#   #", " ### "],
+    "M": ["#   #", "## ##", "# # #", "#   #", "#   #"], "E": ["#####", "#    ", "#### ", "#    ", "#####"],
+    "A": [" ### ", "#   #", "#####", "#   #", "#   #"], "W": ["#   #", "#   #", "# # #", "## ##", "#   #"],
+    "Y": ["#   #", " # # ", "  #  ", "  #  ", "  #  "], "=": ["     ", "#####", "     ", "#####", "     "],
+    " ": ["   ", "   ", "   ", "   ", "   "],
+}
+
+
+def big_text(text: str) -> list[str]:
+    return ["  ".join(_BIG[c][r] for c in text.upper()).rstrip() for r in range(5)]
+
+
+def side_prompt_lines() -> list[str]:
+    return ["", "=" * 64, "  WHICH SIDE ARE YOU?      press  H  or  A", "=" * 64, "",
+            *("  " + l for l in big_text("H = HOME")), "",
+            *("  " + l for l in big_text("A = AWAY")), "",
+            "  AWAY = the LEFT team, listed FIRST on the Madden scorebug.",
+            "  HOME = the RIGHT team, listed second.",
+            "  Example: scorebug 'CHI 7  ATL 3'  ->  CHI is AWAY, ATL is HOME.",
+            "",
+            "  Nothing is recorded until you choose. Then press Enter to start.", "=" * 64]
+
+
+def take_side_file(path: Path, *, now: float | None = None) -> tuple[str | None, str]:
+    """Read and consume a one-shot side file (``home`` or ``away``). The file is renamed, never deleted, so a stale
+    file cannot pick the side of a later match. Returns (side or None, note)."""
+    if not path.exists():
+        return None, ""
+    now = time.time() if now is None else now
+    try:
+        raw = path.read_text(encoding="utf-8-sig").strip().lower()
+        age = now - path.stat().st_mtime
+    except OSError as e:
+        return None, f"side file {path} unreadable ({e}); asking instead"
+    side = raw.split()[0] if raw else ""
+    ok = side in ("home", "away") and age <= SIDE_FILE_MAX_AGE_S
+    tag = "used" if ok else "ignored"
+    stamp, n = time.strftime('%Y%m%d-%H%M%S'), 0
+    dest = path.with_name(f"next-side.{tag}-{stamp}.txt")
+    while dest.exists():  # never overwrite an earlier renamed file
+        n += 1
+        dest = path.with_name(f"next-side.{tag}-{stamp}-{n}.txt")
+    try:
+        path.replace(dest)
+    except OSError:
+        pass
+    if not ok:
+        why = f"'{raw[:20]}' is not home/away" if side not in ("home", "away") else f"it is {int(age // 60)} min old"
+        return None, f"side file ignored ({why}); asking instead"
+    return side, f"side from {path.name}: {side.upper()}"
+
+
+def prompt_side(read_key, out=None, *, clock=time.monotonic, remind_s: float = SIDE_REMIND_S) -> str | None:
+    """Show the side prompt and wait (no timeout) for H or A, then Enter. Re-shows the prompt with a beep every
+    ``remind_s`` seconds. ``read_key(timeout)`` returns one character, "\n" for Enter, "" on timeout, None on EOF.
+    Returns "home" | "away", or None when input is closed (no console)."""
+    out = out or sys.stdout
+    def show():
+        out.write("\a" + "\n".join(side_prompt_lines()) + "\n")
+        out.flush()
+    show()
+    choice, next_remind = None, clock() + remind_s
+    while True:
+        k = read_key(min(1.0, max(0.05, next_remind - clock())))
+        if k is None:
+            return None
+        if k == "":
+            if clock() >= next_remind:
+                show()
+                if choice:
+                    out.write(f"  Picked {choice.upper()}. Press Enter to start recording (or the other letter to switch).\n")
+                next_remind = clock() + remind_s
+            continue
+        c = k.lower()
+        if c in ("h", "a"):
+            choice = "home" if c == "h" else "away"
+            label = "HOME (right team)" if choice == "home" else "AWAY (left / first-listed team)"
+            out.write(f"\n  You picked {label}.\n  Press Enter to start recording, or press {'A' if c == 'h' else 'H'} to switch.\n")
+            out.flush()
+        elif c in ("\r", "\n") and choice:
+            out.write("\n" + "\n".join("  " + l for l in big_text(choice)) + "\n\n")
+            out.flush()
+            return choice
+
+
+def console_key_reader():
+    """read_key for prompt_side: single keys on a Windows console, lines elsewhere (first char; empty = Enter)."""
+    if WIN and sys.stdin and sys.stdin.isatty():
+        import msvcrt
+        def rk(timeout):
+            end = time.monotonic() + timeout
+            while time.monotonic() < end:
+                if msvcrt.kbhit():
+                    ch = msvcrt.getwch()
+                    if ch in ("\x00", "\xe0"):  # arrow/function key prefix
+                        msvcrt.getwch()
+                        continue
+                    return "\n" if ch in ("\r", "\n") else ch
+                time.sleep(0.03)
+            return ""
+        return rk
+    import select
+    def rk(timeout):
+        try:
+            r, _, _ = select.select([sys.stdin], [], [], timeout)
+        except (OSError, ValueError):
+            r = [sys.stdin]
+        if not r:
+            return ""
+        line = sys.stdin.readline()
+        if line == "":
+            return None
+        line = line.strip()
+        return line[0] if line else "\n"
+    return rk
+
+
+def drain_console_keys() -> None:
+    if WIN and sys.stdin and sys.stdin.isatty():
+        import msvcrt
+        while msvcrt.kbhit():
+            msvcrt.getwch()
+
+
+def resolve_side(a, *, side_file: Path, read_key=None, out=None) -> tuple[str | None, str | None]:
+    """(side, source). source: flag | file | prompt; (home, None) is the legacy default for direct CLI runs without
+    --side (tests); (None, None) = no answer possible (no console)."""
+    if a.side in ("home", "away"):
+        return a.side, "flag"
+    if a.role in ("home", "away"):
+        return a.role, "flag"
+    if a.side == "ask":
+        side, note = take_side_file(side_file)
+        if note:
+            say(note)
+        if side:
+            return side, "file"
+        side = prompt_side(read_key or console_key_reader(), out)
+        drain_console_keys()
+        return (side, "prompt") if side else (None, None)
+    return "home", None
+
+
 def main(argv=None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     if "finalize" in argv:  # `qorcap_match.py [--qorcap X ...] finalize [BUNDLE] [opts]` (launcher puts its opts first)
@@ -695,7 +848,9 @@ def main(argv=None) -> int:
     ap.add_argument("--out", help="folder for match bundles (default: Documents/QorCap Matches)")
     ap.add_argument("--key-dir", help="where the device/referee keys live (default: user QorCap data folder)")
     ap.add_argument("--port", type=int, default=8788)
-    ap.add_argument("--role", choices=["home", "away"], default="home")
+    ap.add_argument("--side", choices=["home", "away", "ask"], default=None,
+                    help="your side: home or away (AWAY = left / first-listed team on the Madden scorebug); 'ask' shows the H/A prompt unless a fresh one-shot next-side.txt is in the QorCap data folder. Start Match.cmd passes 'ask' unless --side is given.")
+    ap.add_argument("--role", choices=["home", "away"], default=None, help="same as --side home|away (older name)")
     ap.add_argument("--player-id", default="local:player")
     ap.add_argument("--encoder")
     ap.add_argument("--res", default="1280x720")
@@ -731,6 +886,14 @@ def main(argv=None) -> int:
     if not a.test_pattern and a.audio != "none":
         for line in mic_hint(mic_privacy_blocked()):
             say(line)
+
+    side, side_source = resolve_side(a, side_file=data_dir() / SIDE_FILE_NAME)
+    if side is None:
+        say("No side chosen and no keyboard to ask on. Start again with --side home or --side away"
+            f" (or put home/away in {data_dir() / SIDE_FILE_NAME}).")
+        return 6
+    a.role = side
+    say(f"Side: {side.upper()}" + (f"  (from {side_source})" if side_source else "  (default; pass --side home|away)"))
 
     root = Path(a.out) if a.out else Path.home() / "Documents" / "QorCap Matches"
     stamp = time.strftime("%Y%m%d-%H%M%S")
@@ -772,6 +935,10 @@ def main(argv=None) -> int:
     cmd = [qorcap, "--port", str(a.port)] + (["--ffmpeg", a.ffmpeg] if a.ffmpeg else []) + [
         "record", "--device", "testpattern" if a.test_pattern else a.device, "--res", a.res, "--fps", a.fps,
         "--bundle", str(bundle), "--replay", "90", "--match-id", match_id, "--role", a.role, "--player-id", a.player_id]
+    if side_source:
+        cmd += ["--side-source", side_source]
+        (bundle / "side_choice.json").write_text(json.dumps({"role": side, "source": side_source,
+                                                             "chosen_at": time.strftime("%Y-%m-%dT%H:%M:%S%z")}, indent=2), encoding="utf-8")
     if a.encoder or a.test_pattern:
         cmd += ["--encoder", a.encoder or "libx264"]
     if a.test_pattern:

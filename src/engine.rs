@@ -42,6 +42,9 @@ pub struct Status {
     pub disk_free_mb: Option<u64>,
     /// Controller (USB HID) input logger state; None when --no-controller.
     pub input: Option<crate::inputs::Live>,
+    /// v0.3.26: this console's QorTime side (home | away), fixed before the first checkpoint, and how it was chosen.
+    pub role: String,
+    pub side_source: Option<String>,
 }
 
 pub struct Recorder { reader: Option<std::thread::JoinHandle<()>>, child: Child, stdin: Option<ChildStdin>, pub path: String, started: Instant, deadline: Option<Instant>, wait_key: bool, base: String, part: u32 }
@@ -201,7 +204,7 @@ impl Engine {
         let input_path = args.bundle.as_ref().map(|b| PathBuf::from(b).join("inputs.jsonl"))
             .or_else(|| args.out.as_ref().map(|o| PathBuf::from(format!("{o}.inputs.jsonl"))));
         let input = Arc::new(Mutex::new(crate::inputs::InputLog::new(input_path, !args.no_controller, wall_ms())));
-        let st = Status { state: "starting".into(), device: args.device.clone(), res: format!("{}x{}", args.res.0, args.res.1), fps_target: args.fps, replay_window: args.replay.unwrap_or(0), ..Default::default() };
+        let st = Status { state: "starting".into(), device: args.device.clone(), res: format!("{}x{}", args.res.0, args.res.1), fps_target: args.fps, replay_window: args.replay.unwrap_or(0), role: args.role.clone(), side_source: args.side_source.clone(), ..Default::default() };
         Arc::new(Self { ffmpeg, ring: Mutex::new(ReplayRing::new(window, cap)), rec: Mutex::new(None), status: Mutex::new(st), shutdown: AtomicBool::new(false),
             ev: Mutex::new(MatchState { started_wall_ms: wall_ms(), score: Value::Null, ..Default::default() }), subs: Mutex::new(vec![]),
             stamp_file: dir.join("stamp.txt"),
@@ -250,7 +253,7 @@ impl Engine {
         drop(g);
         // Genesis checkpoint right away: the first segment checkpoint can be 5-10 s away (device open,
         // audio fallback retry, encoder warm-up) and the referee must see the chain start promptly.
-        self.checkpoint("start", json!({}));
+        self.checkpoint("start", match &self.args.side_source { Some(src) => json!({"side_source": src}), None => json!({}) });
         // Until the first video segment exists (device open, audio fallbacks, encoder warm-up), keep the
         // referee fed every 4 s. Stops for good at the first segment, so mid-match gaps are still gaps.
         { let me = self.clone(); std::thread::spawn(move || {
@@ -873,6 +876,32 @@ mod tests {
     }
 
     #[test]
+    fn side_pick_is_in_status_checkpoints_and_bundle() {
+        // v0.3.26: the side chosen at Start Match is fixed before the first checkpoint, shown in /status, carried by
+        // every checkpoint (ext.role) and recorded with its source in bundle.json.
+        use clap::Parser;
+        let dir = std::env::temp_dir().join(format!("qorcap-side-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let d = dir.to_string_lossy().into_owned();
+        let crate::cli::Cmd::Record(r) = crate::cli::Cli::try_parse_from(["q", "record", "--device", "testpattern", "--bundle", &d,
+            "--role", "away", "--side-source", "prompt"]).unwrap().cmd else { panic!() };
+        let e = Engine::new(r, "ffmpeg-x".into());
+        let st = serde_json::to_value(e.status()).unwrap();
+        assert_eq!(st["role"], "away");
+        assert_eq!(st["side_source"], "prompt");
+        let cp = e.checkpoint("start", json!({"side_source": "prompt"}));
+        assert_eq!(cp["qorcap"]["role"], "away");
+        assert_eq!(cp["qorcap"]["side_source"], "prompt");
+        let out = e.write_bundle().unwrap();
+        let b: Value = serde_json::from_str(&std::fs::read_to_string(out.join("bundle.json")).unwrap()).unwrap();
+        assert_eq!((b["role"].as_str(), b["side_source"].as_str()), (Some("away"), Some("prompt")));
+        assert!(crate::cli::Cli::try_parse_from(["q", "record", "--role", "unset"]).is_err(), "only home|away");
+        assert!(crate::cli::Cli::try_parse_from(["q", "record", "--side-source", "guess"]).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn float_in_final_is_refused_without_poisoning_state() {
         // match-20261018-193534 (v0.3.24): the sidecar's end-menu final carried end_menu.conf/margin as floats;
         // jcs_sha panicked inside checkpoint() with the match state locked, every later lock() panicked on the
@@ -1413,6 +1442,7 @@ impl Engine {
             "claims": "Proves the integrity and timing of these video bytes (hash chain + checkpoints, referee co-signable). Does NOT prove who was playing.",
         });
         if let Some(reason) = reason.as_deref() { bundle["stop_reason"] = json!(reason); }
+        if let Some(src) = self.args.side_source.as_deref() { bundle["side_source"] = json!(src); }
         drop(st);
         let dir = self.bundle_dir().unwrap_or_else(|| PathBuf::from("."));
         let _ = std::fs::create_dir_all(&dir);

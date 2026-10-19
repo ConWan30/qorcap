@@ -180,6 +180,10 @@ pub struct RecordArgs {
     /// This console's QorTime role
     #[arg(long, default_value = "home", value_parser = ["home", "away"])]
     pub role: String,
+    /// How the side was chosen (v0.3.26 side pick): prompt | flag | file. Shown in /status and committed in the
+    /// start checkpoint and bundle.json. Omitted = not recorded (older launchers, tests).
+    #[arg(long, value_parser = ["prompt", "flag", "file"])]
+    pub side_source: Option<String>,
     #[arg(long, default_value = "local:player")]
     pub player_id: String,
     /// Seconds saved for each automatic score-change clip
