@@ -2,7 +2,7 @@
 
 # QorCap
 
-**Website:** https://conwan30.github.io/qorcap/ · **Download:** [v0.3.26](https://github.com/ConWan30/qorcap/releases/tag/v0.3.26) ([latest release](https://github.com/ConWan30/qorcap/releases/latest))
+**Website:** https://conwan30.github.io/qorcap/ · **Download:** [v0.3.27](https://github.com/ConWan30/qorcap/releases/tag/v0.3.27) ([latest release](https://github.com/ConWan30/qorcap/releases/latest))
 
 A small Windows recorder for a USB HDMI capture card (built for a generic **"USB3.0 Video"** card carrying a PS5),
 made for **[QorTime](https://github.com/ConWan30/qortime)** match receipts. It does two jobs:
@@ -26,7 +26,7 @@ with a local control surface). QorCap copies only that design idea, no code. No 
 
 ## Quickstart: double-click Start Match
 
-1. Download `qorcap-v0.3.26-windows-x64.zip` from the [latest release](https://github.com/ConWan30/qorcap/releases/latest)
+1. Download `qorcap-v0.3.27-windows-x64.zip` from the [latest release](https://github.com/ConWan30/qorcap/releases/latest)
    and unzip it, for example to `C:\QorCap` (right-click the zip, *Extract All*).
 2. Connect PS5 HDMI out to the **USB3.0 Video** card, and the card to a blue USB 3 port. Close OBS or the Camera app.
 3. Double-click **`Start Match`**. On the first run it downloads ffmpeg, installs Python 3.12 through winget if it
@@ -369,7 +369,7 @@ Global: `--port 8788`, `--ffmpeg PATH`, `--log FILE` (default `qorcap.log`, or `
 ## Run on Windows by hand (PowerShell, advanced)
 
 ```powershell
-# 1. unzip qorcap-v0.3.26-windows-x64.zip to C:\QorCap, then:
+# 1. unzip qorcap-v0.3.27-windows-x64.zip to C:\QorCap, then:
 cd C:\QorCap
 Unblock-File .\qorcap.exe, .\get-ffmpeg.ps1
 powershell -ExecutionPolicy Bypass -File .\get-ffmpeg.ps1     # puts ffmpeg.exe next to qorcap.exe
@@ -406,6 +406,8 @@ continues), replay save, challenge stamp visible in the video, score/final event
 written, `verify-bundle` OK, and a single flipped byte reported as FAIL.
 
 **Tested on Windows (v0.2.0–v0.2.1 era, MyTurn, USB3.0 Video):** `--input-format mjpeg` 1280x720@30 with `h264_mf` at 29.7 fps. v0.2.1 fixed audio / auto-format / OBS.
+
+**v0.3.27:** highlight clips burn **SCOREBUG LOCK** instead of **LOCKED SCORE**. The panel is a scorebug read committed into the checkpoint chain. **LOCKED SCORE** and **VERIFIED** stay off the picture, because a referee verdict is not known when the clip is cut (QorTime match 125430 is FAIL: the capture key is local self-attested). The `.vtt` uses the same title. Panel layout, cut windows, and the recorder are unchanged.
 
 **v0.3.26:** pick your side at Start Match. Your side (home or away) is signed into every checkpoint from the very first one the official referee countersigns, so it has to be right before recording starts; fixing it afterwards re-signs the checkpoints and the referee then refuses the receipt. Start Match now shows a big prompt: press **H** for HOME or **A** for AWAY, then Enter. AWAY is the LEFT team, listed first on the Madden scorebug (scorebug `CHI 7  ATL 3`: CHI is away, ATL is home). Nothing is recorded until you choose; there is no timeout and no silent default (the prompt is shown again with a beep every 60 s). To skip the prompt: `Start Match.cmd --side away` (or `home`), or put `home` or `away` in `%LOCALAPPDATA%\QorCap\next-side.txt` before starting; that file is used once and then renamed `next-side.used-<time>.txt` (a file older than 4 hours, or one that does not say home/away, is renamed `next-side.ignored-<time>.txt` and the prompt is shown). The side and how it was chosen (`prompt`, `flag` or `file`) show in `http://127.0.0.1:8788/status` (`role`, `side_source`), in the start checkpoint, in `bundle.json` and in `side_choice.json`. The Glimpse watcher now waits up to 30 minutes for recording to start.
 
