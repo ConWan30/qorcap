@@ -72,9 +72,16 @@ foreach ($x in $fwd) {
 }
 if (-not $hasChallengeFlag) { $fwd = @("--official-challenges") + $fwd }
 
+# Side pick (v0.3.26): your side is signed into the first checkpoint, so it is chosen before recording starts.
+# "Start Match.cmd --side away" (or home) skips the prompt; so does a one-shot next-side.txt in %LOCALAPPDATA%\QorCap
+# (renamed after use; ignored if older than 4 h). Otherwise qorcap_match.py shows the big H / A prompt and waits.
+$hasSide = $false
+foreach ($x in $fwd) { if ($x -eq "--side" -or $x -eq "--role" -or $x -like "--side=*" -or $x -like "--role=*") { $hasSide = $true } }
+if (-not $hasSide) { $fwd = @("--side", "ask") + $fwd }
+
 # Advisory Glimpse watcher (v0.3.23): ADVISORY_AI, shadow-only, never feeds a lock or the receipt. On when the user
 # variable QORCAP_GLIMPSE_FRAME is 1 (opt out for one match with --no-glimpse). Started detached, minimized, below
-# normal priority, before recording; it waits for QorCap's frame tap and stops when QorCap goes away. Any problem
+# normal priority, before recording; it waits (up to 30 min, covering the side prompt) for QorCap's frame tap and stops when QorCap goes away. Any problem
 # here is reported in one line and the match runs normally. The API key is never printed.
 $noGlimpse = $fwd -contains "--no-glimpse"
 $fwd = @($fwd | Where-Object { $_ -ne "--no-glimpse" })
@@ -88,7 +95,7 @@ try {
     if (-not $hadKey) { $env:OPENROUTER_API_KEY = [Environment]::GetEnvironmentVariable("OPENROUTER_API_KEY", "User") }
     $gLayout = $env:QORCAP_GLIMPSE_LAYOUT; if (-not $gLayout) { $gLayout = "auto" }
     $gp = Start-Process -FilePath $vpy -WindowStyle Minimized -PassThru -ArgumentList @(
-      "`"$gWatch`"", "--layout", $gLayout, "--wait-start-s", "900", "--idle-exit-s", "60")
+      "`"$gWatch`"", "--layout", $gLayout, "--wait-start-s", "1800", "--idle-exit-s", "60")
     if (-not $hadKey) { Remove-Item Env:OPENROUTER_API_KEY -ErrorAction SilentlyContinue }  # the recorder does not need it
     try { $gp.PriorityClass = "BelowNormal" } catch {}
     Write-Host "  Glimpse watch .. started (advisory only, minimized; report in $env:LOCALAPPDATA\QorCapGlimpse)"

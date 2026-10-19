@@ -320,7 +320,7 @@ def test_start_match_launches_the_watcher_safely():
     ps = (Path(__file__).resolve().parents[1] / "start-match.ps1").read_text(encoding="utf-8")
     blk = ps[ps.index("# Advisory Glimpse watcher"):ps.index("& $vpy (Join-Path $here \"sidecar\\qorcap_match.py\")")]
     for s in ('try {', '} catch {', '-WindowStyle Minimized', '"BelowNormal"', '$gFlag -eq "1"', '"--no-glimpse"',
-              '"--wait-start-s", "900"', '"--idle-exit-s", "60"', 'Start-Process', 'Remove-Item Env:OPENROUTER_API_KEY'):
+              '"--wait-start-s", "1800"', '"--idle-exit-s", "60"', 'Start-Process', 'Remove-Item Env:OPENROUTER_API_KEY'):
         assert s in blk, s
     assert "Write-Host" in blk and not any("OPENROUTER_API_KEY" in ln for ln in blk.splitlines() if "Write-Host" in ln)
     assert "Wait-Process" not in blk and "-Wait" not in blk
