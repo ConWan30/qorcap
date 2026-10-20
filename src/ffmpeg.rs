@@ -302,12 +302,16 @@ pub fn capture_args_with(a: &RecordArgs, input_format: &str, audio: Option<&Audi
     push(&mut v, &["-b:v", &a.bitrate, "-maxrate", &a.bitrate, "-bufsize", &a.bitrate, "-g", &fps, "-bf", "0"]);
     if has_audio { push(&mut v, &["-c:a", "aac", "-b:a", "160k", "-ar", "48000", "-af", "aresample=async=1000:first_pts=0"]); }
     push(&mut v, &["-f", "mpegts", "-mpegts_flags", "+resend_headers", "-pat_period", "0.2", "-muxdelay", "0", "pipe:1"]);
-    // Snapshot output (4 fps, atomic rewrite so readers never see a partial file).
-    // `q3` is the historical JPEG. hq/png change only this second output, not the MPEG-TS recording.
+    // Snapshot output (4 fps). `q3` is the historical JPEG and keeps `-atomic_writing 1`
+    // so the default command stays byte-for-byte. hq is the same pattern at q:v 2.
+    // PNG does not use atomic rename: on Windows, MoveFileEx cannot replace snapshot.png
+    // while GET /snapshot.jpg has it open, and the 2026-10-20 reader_png take logged
+    // "failed to rename ...snapshot.png.tmp to ...snapshot.png: Operation not permitted".
+    // The PNG is written in place; the API only serves a buffer that ends with IEND.
     push(&mut v, &["-map", "0:v", "-vf", "fps=4"]);
     match a.reader_snapshot.as_str() {
         "hq" => push(&mut v, &["-q:v", "2", "-f", "image2", "-update", "1", "-atomic_writing", "1", "-y", snapshot]),
-        "png" => push(&mut v, &["-c:v", "png", "-compression_level", "1", "-f", "image2", "-update", "1", "-atomic_writing", "1", "-y", snapshot]),
+        "png" => push(&mut v, &["-c:v", "png", "-compression_level", "1", "-f", "image2", "-update", "1", "-y", snapshot]),
         _ => push(&mut v, &["-q:v", "3", "-f", "image2", "-update", "1", "-atomic_writing", "1", "-y", snapshot]),
     }
     v
@@ -480,6 +484,7 @@ video=USB3.0 Video: Immediate exit requested"#;
         let png = joined(&record(&["--reader-snapshot", "png"]), "mjpeg", "snap.png");
         assert_eq!(until_pipe(&png), until_pipe(&base));
         assert!(png.contains("-c:v png -compression_level 1") && png.ends_with("-y snap.png"), "{png}");
+        assert!(!png.contains("atomic_writing"), "{png}");
         assert_eq!(from_encoder(&hq), enc);
         assert_eq!(from_encoder(&png), enc);
         let small = joined(&record(&["--rtbufsize", "128M"]), "mjpeg", "snap.jpg");

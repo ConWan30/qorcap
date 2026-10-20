@@ -51,16 +51,19 @@ def test_audio_line_from_the_match_log_is_about_ten_seconds():
     assert abs(summary["audio_lag_s"] - 9.82) < 0.02
 
 
-def test_equal_variant_may_be_promoted():
+def test_equal_variant_is_a_tie_and_is_not_promoted():
     d = ab.promotion_decision(_row(), _row())
-    assert d["promote"] is True
-    assert d["reasons"] == []
+    assert d["promote"] is False
+    assert d["tie"] is True
+    assert d["benefits"] == []
+    assert any("tie" in r for r in d["reasons"])
     assert d["disk_raised"] is False
+    assert ab.promotion_label(d) == "tie"
 
 
 def test_each_gate_blocks_on_its_own():
     assert any("wrong" in r for r in ab.promotion_decision(_row(), _row(wrong_reads=1, wrong_pairs=[[7, 0]]))["reasons"])
-    assert any("fewer successful" in r for r in ab.promotion_decision(_row(), _row(reads_succeeded=29))["reasons"])
+    assert any("success rate" in r for r in ab.promotion_decision(_row(), _row(reads_succeeded=10))["reasons"])
     assert any("missed" in r for r in ab.promotion_decision(_row(), _row(missed_scores=1, missed_pairs=[[0, 7]]))["reasons"])
     assert any("dropped" in r for r in ab.promotion_decision(_row(), _row(drop_frames=1))["reasons"])
     assert any("duplicate" in r for r in ab.promotion_decision(_row(), _row(dup_frames=2))["reasons"])
@@ -78,9 +81,12 @@ def test_each_gate_blocks_on_its_own():
 
 def test_small_cpu_and_disk_noise_does_not_block():
     # +3 points is under the 8 point gate. +3 MB/min is inside max(4, 10% of 60).
+    # That is a tie, not a promotion: nothing is measurably better either.
     d = ab.promotion_decision(_row(), _row(cpu_pct=23.0, disk_mb_per_min=63.0, audio_lag_s=10.2))
-    assert d["promote"] is True, d["reasons"]
+    assert d["promote"] is False, d["reasons"]
+    assert d["tie"] is True
     assert d["disk_raised"] is False
+    assert not any("CPU" in r or "disk" in r for r in d["reasons"])
 
 
 def test_score_delta_against_baseline_locks():
@@ -140,10 +146,45 @@ def test_tiny_read_counts_are_undecided():
     assert any("too few score reads" in r for r in d["reasons"])
     assert not any("fewer successful" in r for r in d["reasons"])
     assert ab.promotion_label(d) == "undecided"
-    # Enough samples still fail a real drop in agreed frames.
+    # Enough samples still fail a real drop in the success rate.
     fewer = ab.promotion_decision(_row(reads_succeeded=20), _row(reads_succeeded=8))
-    assert any("fewer successful" in r for r in fewer["reasons"])
+    assert any("success rate" in r for r in fewer["reasons"])
     assert ab.promotion_label(fewer) == "no"
+
+
+def test_read_rate_ignores_snapshot_count_noise_and_a_tie_does_not_promote():
+    # 2026-10-20: every take agreed exactly 2 fewer frames than it saved.
+    # 49/51 vs 46/48 is the same rate. 54/54 vs 54/54 is a tie, not a promotion.
+    noise = ab.promotion_decision(
+        _row(reads_succeeded=49, reads_attempted=51),
+        _row(reads_succeeded=46, reads_attempted=48),
+    )
+    assert noise["promote"] is False
+    assert noise["tie"] is True
+    assert not any("success rate" in r for r in noise["reasons"])
+    tied = ab.promotion_decision(
+        _row(reads_succeeded=54, reads_attempted=54),
+        _row(reads_succeeded=54, reads_attempted=54),
+    )
+    assert tied["tie"] is True and tied["promote"] is False
+    better = ab.promotion_decision(
+        _row(reads_succeeded=30, reads_attempted=40),
+        _row(reads_succeeded=40, reads_attempted=40),
+    )
+    assert better["promote"] is True, better["reasons"]
+    assert any("success rate" in b for b in better["benefits"])
+
+
+def test_a_real_improvement_promotes_and_a_short_file_does_not():
+    better = ab.promotion_decision(_row(drop_frames=4), _row(drop_frames=0))
+    assert better["promote"] is True, better["reasons"]
+    assert any("dropped" in b for b in better["benefits"])
+    short = ab.promotion_decision(_row(media_duration_s=15.0), _row(media_duration_s=5.9, drop_frames=39))
+    assert short["promote"] is False
+    assert any("media duration" in r for r in short["reasons"])
+    assert ab.anchored_snapshot_count(0.02, 15.0) == 60
+    assert ab.anchored_snapshot_count(0.05, 15.0) == 60
+    assert ab.anchored_snapshot_count(0.60, 15.0) < 60
 
 
 def test_scorebug_region_flags_a_change_and_ignores_a_still_bar():
@@ -173,6 +214,7 @@ def test_baseline_is_a_reference_not_a_promotion():
     assert ab.promotion_label({"promote": False, "role": "reference", "reasons": []}) == "ref"
     assert ab.promotion_label({"promote": True, "reasons": []}) == "YES"
     assert ab.promotion_label({"promote": False, "reasons": ["more dropped frames (1 > 0)"]}) == "no"
+    assert ab.promotion_label({"promote": False, "tie": True, "reasons": ["tie: no metric is measurably better than the baseline"]}) == "tie"
     assert ab.VARIANTS[0] == ("baseline", [])
     assert "11.6" in ab.YUY2_NOT_RECOMMENDED
     assert "not recommended" in ab.YUY2_NOT_RECOMMENDED.lower()

@@ -33,8 +33,11 @@ A flag may become the default only when, against this baseline:
 
 * zero new wrong score reads (no locked home/away pair the baseline did not lock)
 * no missed locked scores (every baseline home/away pair was locked again)
-* successful reads (agreed frames) are not fewer
-* both sides have at least 8 successful reads (fewer than that is undecided, not a fail)
+* read success rate (agreed frames / frames the reader attempted) is not worse than the
+  sampling noise of that rate. A 1–3 read gap on ~50 snapshots is noise: every take on
+  2026-10-20 agreed exactly two fewer frames than it saved. Both sides still need at
+  least 8 successful reads, or the reads gate is undecided.
+* at least one metric is measurably better (a tie is not a promotion)
 * the baseline actually locked at least one score (otherwise score quality is not proven)
 * the comparison is on the same footage (same-footage re-encode, or live takes whose
   scorebug region stayed stable under --stable-picture)
@@ -50,12 +53,31 @@ A flag may become the default only when, against this baseline:
   for had about 6.4 GB free.
 
 If a number was not measured, the flag is not promoted.
+
+The capture window is `secs` of snapshots after the first frame. qorcap's `--duration`
+starts when the process starts, before the card opens, so a 15s budget used to end
+with only ~46–51 of the 60 frames ffmpeg writes at 4/s.
+
+Measured on the MS2131 (paused Madden, score held at 3-0)
+---------------------------------------------------------
+fc061e0, first harness: CPU was 0.0% on 9 of 11 takes, 2–7 snapshots per 15s, disk
+43–62 MB/min, and `--stable-picture` did not look at pixels. Not used for promotion.
+
+637145d, MyTurn, 5:22 AM CT, 4m03s: CPU measured on all 11 takes (30–32 samples,
+Toolhelp32, baseline 3.5%, every take <= 5.4%). ffprobe disk 59.6–61.3 MB/min.
+Scorebug bar stayed stable, no retries. USB link `superspeed` (1082 bytes of PnP
+text, 30 modes). Every read was 3-0, nothing wrong or missed. Baseline 49/51 reads
+from 51/60 snapshots. reader_hq and reader_png tied the same-footage re-encode
+(54 vs 54). Eight other flags were 46–48 reads against 49 only because
+reads == snapshots saved − 2 and the saves were 46–51 of 60. No flag promoted.
+Capture CPU on this card is about 3–5%.
 """
 from __future__ import annotations
 
 import argparse
 import hashlib
 import json
+import math
 import os
 import shutil
 import subprocess
@@ -76,11 +98,22 @@ LAG_NOISE_S = 0.5
 VIDEO_QUEUE_NOISE_MB = 1.0
 AUDIO_BYTES_PER_SEC = 48_000 * 2 * 2  # 16-bit stereo 48 kHz, the card's native format
 MIN_SUCCESSFUL_READS = 8
+# Two-proportion noise on the read rate. 49/51 vs 46/48 is inside this; 30/40 vs 10/40 is not.
+READ_RATE_ABS = 0.03
+READ_RATE_Z = 1.96
+FPS_ABS = 1.0
+FPS_REL = 0.05
+MEDIA_ABS_S = 1.0
+MEDIA_REL = 0.10
 SNAP_HZ = 4.0
 SNAP_INTERVAL_S = 1.0 / SNAP_HZ
 CPU_INTERVAL_S = 0.5
 CPU_MIN_SPAN_S = 0.5
-POLL_S = 0.05
+# qorcap --duration starts at process start, before the device opens. This backstop
+# keeps the process alive; the harness itself stops `secs` after the first snapshot.
+STARTUP_BACKSTOP_S = 45
+SNAP_POLL_S = 0.02
+STATUS_INTERVAL_S = 0.5
 # Same bar Glimpse crops: y0, y1, x0, x1 on a 1280x720 frame (standard / SNP / TNP / MNP).
 SCOREBUG_BOX = (640, 720, 300, 980)
 MEAN_LIMIT = 8.0
@@ -92,10 +125,11 @@ CHANGED_FRACTION = 0.15
 
 # Measured on the MS2131 with live Madden held at 3-0 (2026-10-20, 15s). Not a default.
 YUY2_NOT_RECOMMENDED = (
-    "Not recommended for the MS2131. A 2026-10-20 live Madden take at 3-0 delivered "
-    "11.6 fps, 27 real-time buffer drops, a 400 MB video queue, and missed the 3-0. "
-    "USB link check returned unknown (0 bytes of PnP text, 30 modes) because the PnP "
-    "probe produced no text; the 30 modes came from ffmpeg -list_options. Leave --yuy2-720p60 off."
+    "Not recommended for the MS2131. Two paused-at-3-0 takes on 2026-10-20 both failed. "
+    "fc061e0: 11.6 fps, 27 real-time buffer drops, a 400 MB queue, missed the 3-0, USB link "
+    "unknown (0 bytes of PnP text, 30 modes). 637145d on confirmed SuperSpeed (1082 bytes of "
+    "PnP text, 30 modes): 21 fps reported but only 5.9 s of media in a 16.6 s take, 39 buffer "
+    "drops, a 366 MB queue. Leave --yuy2-720p60 off. No flag was promoted. Capture CPU was about 3-5%."
 )
 
 # Baseline is today's Start Match capture: explicit mjpeg 720p30, no tune flags.
@@ -307,8 +341,65 @@ def score_delta(baseline_rows: list[dict], variant_rows: list[dict]) -> dict:
     }
 
 
+def read_counts(row: dict) -> tuple[int, int] | None:
+    """(agreed, attempted). Attempted is the frames the reader saw, else snapshots saved."""
+    ok = row.get("reads_succeeded")
+    if ok is None:
+        return None
+    attempted = row.get("reads_attempted")
+    if attempted is None:
+        attempted = row.get("snapshots_attempted")
+    if attempted is None:
+        attempted = row.get("snapshots_saved")
+    if attempted is None:
+        return None
+    return int(ok), int(attempted)
+
+
+def read_rate_margin(b_ok: int, b_n: int, v_n: int) -> float:
+    """How far a variant rate may sit below the baseline and still be the same rate.
+
+    Uses the two-proportion standard error at the baseline rate, and at least
+    READ_RATE_ABS so a perfect 1.0 (zero standard error) still has a small floor.
+    """
+    if b_n <= 0 or v_n <= 0:
+        return 1.0
+    p = min(1.0, max(0.0, b_ok / b_n))
+    se = 0.0
+    if 0.0 < p < 1.0:
+        se = math.sqrt(p * (1.0 - p) * (1.0 / b_n + 1.0 / v_n))
+    return max(READ_RATE_ABS, READ_RATE_Z * se)
+
+
+def snapshot_slot(elapsed: float, interval: float = SNAP_INTERVAL_S) -> int:
+    """Index of the 4 Hz slot that `elapsed` seconds after the first frame falls in."""
+    if elapsed < 0 or interval <= 0:
+        return -1
+    return int(elapsed / interval + 1e-9)
+
+
+def anchored_snapshot_count(poll_s: float, window_s: float, interval: float = SNAP_INTERVAL_S) -> int:
+    """Distinct slots a fixed poll hits in [0, window). The slot clock does not drift."""
+    if poll_s <= 0 or window_s <= 0 or interval <= 0:
+        return 0
+    saved: set[int] = set()
+    t = 0.0
+    steps = 0
+    while t < window_s and steps < 1_000_000:
+        slot = snapshot_slot(t, interval)
+        if slot >= 0 and slot * interval < window_s:
+            saved.add(slot)
+        t += poll_s
+        steps += 1
+    return len(saved)
+
+
 def promotion_decision(baseline: dict, variant: dict) -> dict:
-    """Return {promote, reasons, disk_raised}. promote is true only when every gate passes."""
+    """Return {promote, reasons, disk_raised, tie, benefits}.
+
+    promote is true only when nothing is worse and at least one metric is
+    measurably better. A tie stays off.
+    """
     reasons: list[str] = []
 
     def both(key: str):
@@ -365,21 +456,42 @@ def promotion_decision(baseline: dict, variant: dict) -> dict:
 
     if not variant.get("same_footage"):
         reasons.append(variant.get("picture_reason") or "scorebug comparison is not on the same footage")
-    if baseline.get("reads_succeeded") is None or variant.get("reads_succeeded") is None:
+    b_fps, v_fps = baseline.get("delivered_fps"), variant.get("delivered_fps")
+    if b_fps is not None and v_fps is not None and b_fps > 0:
+        fps_slack = max(FPS_ABS, FPS_REL * b_fps)
+        if v_fps + 1e-9 < b_fps - fps_slack:
+            reasons.append(f"delivered fps {v_fps:.1f} is below baseline {b_fps:.1f} (tolerance {fps_slack:.1f})")
+    b_media, v_media = baseline.get("media_duration_s"), variant.get("media_duration_s")
+    if b_media is not None and v_media is not None and b_media > 0:
+        media_slack = max(MEDIA_ABS_S, MEDIA_REL * b_media)
+        if v_media + 1e-9 < b_media - media_slack:
+            reasons.append(
+                f"media duration {v_media:.1f}s is shorter than baseline {b_media:.1f}s (tolerance {media_slack:.1f}s)"
+            )
+
+    counts_b = read_counts(baseline)
+    counts_v = read_counts(variant)
+    if baseline.get("reads_succeeded") is None or variant.get("reads_succeeded") is None or counts_b is None or counts_v is None:
         reasons.append("scorebug reader did not run")
     else:
-        b_ok = int(baseline.get("reads_succeeded") or 0)
-        v_ok = int(variant.get("reads_succeeded") or 0)
-        if b_ok < MIN_SUCCESSFUL_READS or v_ok < MIN_SUCCESSFUL_READS:
+        b_ok, b_n = counts_b
+        v_ok, v_n = counts_v
+        if b_ok < MIN_SUCCESSFUL_READS or v_ok < MIN_SUCCESSFUL_READS or b_n < MIN_SUCCESSFUL_READS or v_n < MIN_SUCCESSFUL_READS:
             reasons.append(
-                f"too few score reads to decide (baseline {b_ok}, variant {v_ok}; "
+                f"too few score reads to decide (baseline {b_ok}/{b_n}, variant {v_ok}/{v_n}; "
                 f"need at least {MIN_SUCCESSFUL_READS} successful reads each)"
             )
         else:
             if int(baseline.get("baseline_locks") or 0) <= 0:
                 reasons.append("baseline locked no scores; score quality is not proven")
-            if v_ok < b_ok:
-                reasons.append(f"fewer successful reads ({v_ok} < {b_ok})")
+            margin = read_rate_margin(b_ok, b_n, v_n)
+            b_rate = b_ok / b_n
+            v_rate = v_ok / v_n if v_n else 0.0
+            if v_rate + 1e-12 < b_rate - margin:
+                reasons.append(
+                    f"read success rate {v_rate:.1%} ({v_ok}/{v_n}) is below baseline "
+                    f"{b_rate:.1%} ({b_ok}/{b_n}); margin {margin:.1%}"
+                )
             if int(variant.get("wrong_reads") or 0) > 0:
                 reasons.append(f"new wrong score reads: {variant.get('wrong_pairs')}")
             if int(variant.get("missed_scores") or 0) > 0:
@@ -390,13 +502,67 @@ def promotion_decision(baseline: dict, variant: dict) -> dict:
         if r not in seen:
             seen.add(r)
             uniq.append(r)
-    return {"promote": not uniq, "reasons": uniq, "disk_raised": disk_raised}
+    benefits = measurable_benefits(baseline, variant) if not uniq else []
+    tie = False
+    if not uniq and not benefits:
+        tie = True
+        uniq.append("tie: no metric is measurably better than the baseline")
+    return {"promote": not uniq, "reasons": uniq, "disk_raised": disk_raised, "tie": tie, "benefits": benefits}
+
+
+def measurable_benefits(baseline: dict, variant: dict) -> list[str]:
+    """Improvements larger than the same noise floors the regression gates use."""
+    benefits: list[str] = []
+    b_drop, v_drop = baseline.get("drop_frames"), variant.get("drop_frames")
+    if b_drop is not None and v_drop is not None and v_drop < b_drop:
+        benefits.append(f"fewer dropped frames ({v_drop} < {b_drop})")
+    b_dup, v_dup = baseline.get("dup_frames"), variant.get("dup_frames")
+    if b_dup is not None and v_dup is not None and v_dup < b_dup:
+        benefits.append(f"fewer duplicate frames ({v_dup} < {b_dup})")
+    b_lag, v_lag = baseline.get("audio_lag_s"), variant.get("audio_lag_s")
+    if b_lag is not None and v_lag is not None and b_lag - v_lag > LAG_NOISE_S:
+        benefits.append(f"audio lag {v_lag:.2f}s is better than baseline {b_lag:.2f}s")
+    b_q, v_q = baseline.get("video_queued_mb"), variant.get("video_queued_mb")
+    if b_q is not None and v_q is not None and b_q - v_q > VIDEO_QUEUE_NOISE_MB:
+        benefits.append(f"video queue {v_q:.1f} MB is below baseline {b_q:.1f} MB")
+    b_cpu, v_cpu = baseline.get("cpu_pct"), variant.get("cpu_pct")
+    if b_cpu is not None and v_cpu is not None and b_cpu > 0 and v_cpu > 0:
+        slack = max(CPU_ABS_POINTS, CPU_REL * b_cpu)
+        if b_cpu - v_cpu > slack:
+            benefits.append(f"CPU {v_cpu:.1f}% is below baseline {b_cpu:.1f}%")
+    b_disk, v_disk = baseline.get("disk_mb_per_min"), variant.get("disk_mb_per_min")
+    if b_disk is not None and v_disk is not None and b_disk > 0 and v_disk > 0:
+        slack = disk_limit(b_disk) - b_disk
+        if b_disk - v_disk > slack:
+            benefits.append(f"disk {v_disk:.2f} MB/min is below baseline {b_disk:.2f} MB/min")
+    b_fps, v_fps = baseline.get("delivered_fps"), variant.get("delivered_fps")
+    if b_fps is not None and v_fps is not None and b_fps > 0:
+        slack = max(FPS_ABS, FPS_REL * b_fps)
+        if v_fps > b_fps + slack:
+            benefits.append(f"delivered fps {v_fps:.1f} is above baseline {b_fps:.1f}")
+    b_media, v_media = baseline.get("media_duration_s"), variant.get("media_duration_s")
+    if b_media is not None and v_media is not None and b_media > 0:
+        slack = max(MEDIA_ABS_S, MEDIA_REL * b_media)
+        if v_media > b_media + slack:
+            benefits.append(f"media duration {v_media:.1f}s is longer than baseline {b_media:.1f}s")
+    counts_b, counts_v = read_counts(baseline), read_counts(variant)
+    if counts_b and counts_v:
+        b_ok, b_n = counts_b
+        v_ok, v_n = counts_v
+        if b_ok >= MIN_SUCCESSFUL_READS and v_ok >= MIN_SUCCESSFUL_READS and b_n >= MIN_SUCCESSFUL_READS and v_n >= MIN_SUCCESSFUL_READS and b_n and v_n:
+            margin = read_rate_margin(b_ok, b_n, v_n)
+            b_rate, v_rate = b_ok / b_n, v_ok / v_n
+            if v_rate > b_rate + margin:
+                benefits.append(f"read success rate {v_rate:.1%} is above baseline {b_rate:.1%}")
+    return benefits
 
 
 def promotion_label(row: dict) -> str:
     """Baseline is 'ref'. A pass is 'YES'. Measurement gaps are 'undecided', not a promotion."""
     if row.get("role") == "reference":
         return "ref"
+    if row.get("tie"):
+        return "tie"
     if row.get("promote"):
         return "YES"
     reasons = row.get("reasons") or []
@@ -601,7 +767,14 @@ def _get_bytes(url: str, timeout: float = 1.0) -> bytes | None:
 
 
 def _looks_like_image(blob: bytes) -> bool:
-    return blob.startswith(b"\xff\xd8") or blob.startswith(b"\x89PNG\r\n\x1a\n")
+    """Complete JPEG (EOI) or complete PNG (IEND). A torn in-place write is not a frame."""
+    if len(blob) >= 4 and blob[0] == 0xFF and blob[1] == 0xD8 and blob.endswith(b"\xff\xd9"):
+        return True
+    return (
+        len(blob) >= 24
+        and blob.startswith(b"\x89PNG\r\n\x1a\n")
+        and blob.endswith(b"\x00\x00\x00\x00IEND\xaeB`\x82")
+    )
 
 
 def _tree_cpu_psutil(psutil, pid: int) -> float | None:
@@ -816,36 +989,59 @@ def run_variant(name: str, extra: list[str], *, qorcap: str, ffmpeg: str | None,
     snaps.mkdir(exist_ok=True)
     out = d / "video.mp4"
     log = d / "qorcap.log"
-    cmd = record_command(qorcap, ffmpeg, port, str(log), str(out), secs, extra, device)
+    # --duration inside qorcap starts at process start, before the card opens. A 15s
+    # budget on 2026-10-20 left only 46-51 of 60 snapshot slots. The backstop keeps
+    # the process up; this loop stops `secs` after the first complete snapshot and
+    # saves on a fixed 4 Hz grid so poll latency does not stretch the interval.
+    backstop = secs + STARTUP_BACKSTOP_S
+    cmd = record_command(qorcap, ffmpeg, port, str(log), str(out), backstop, extra, device)
     (d / "command.txt").write_text(" ".join(cmd), encoding="utf-8")
     proc = subprocess.Popen(cmd)
     t0 = time.monotonic()
     sampler = TreeCpu(proc.pid)
     sampler.sample()
     next_cpu = t0 + CPU_INTERVAL_S
-    next_snap = t0
+    next_status = t0
+    origin = None
+    last_slot = -1
     last: dict = {}
     seen: set[bytes] = set()
     saved = 0
-    deadline = t0 + secs + 40
+    deadline = t0 + backstop + 15
     while proc.poll() is None and time.monotonic() < deadline:
         now = time.monotonic()
-        st = _get_json(f"http://127.0.0.1:{port}/status")
-        if st:
-            last = st
-        if now >= next_snap:
-            blob = _get_bytes(f"http://127.0.0.1:{port}/snapshot.jpg")
+        if origin is not None and now >= origin + secs:
+            break
+        due = origin is None or snapshot_slot(now - origin) > last_slot
+        if due:
+            blob = _get_bytes(f"http://127.0.0.1:{port}/snapshot.jpg", timeout=0.2)
             if blob and _looks_like_image(blob):
                 digest = hashlib.sha256(blob).digest()
                 if digest not in seen:
                     seen.add(digest)
                 saved += 1
                 _save_snap(blob, snaps, saved)
-                next_snap = now + SNAP_INTERVAL_S
+                if origin is None:
+                    origin = time.monotonic()
+                    last_slot = 0
+                else:
+                    last_slot = snapshot_slot(time.monotonic() - origin)
+        now = time.monotonic()
+        if now >= next_status:
+            st = _get_json(f"http://127.0.0.1:{port}/status", timeout=0.25)
+            if st:
+                last = st
+            next_status = now + STATUS_INTERVAL_S
         if now >= next_cpu:
             sampler.sample()
             next_cpu = now + CPU_INTERVAL_S
-        time.sleep(POLL_S)
+        if origin is None:
+            time.sleep(SNAP_POLL_S)
+        else:
+            nxt = origin + (last_slot + 1) * SNAP_INTERVAL_S
+            delay = min(SNAP_POLL_S, max(0.0, nxt - time.monotonic()))
+            if delay:
+                time.sleep(delay)
     if proc.poll() is None:
         proc.terminate()
         try:
@@ -1031,6 +1227,9 @@ def _metric_row(live: dict, scores: dict, same: bool, delta: dict | None, pictur
         "picture_reason": picture_reason,
         "reads_attempted": scores.get("reads_attempted"),
         "reads_succeeded": scores.get("reads_succeeded"),
+        "snapshots_attempted": scores.get("reads_attempted") if scores.get("reads_attempted") is not None else live.get("snapshots_saved"),
+        "delivered_fps": live.get("delivered_fps"),
+        "media_duration_s": live.get("media_duration_s"),
         "wrong_reads": None if delta is None else delta["wrong_reads"],
         "wrong_pairs": None if delta is None else delta["wrong_pairs"],
         "missed_scores": None if delta is None else delta["missed_scores"],
@@ -1051,11 +1250,10 @@ def _fmt(v, spec=""):
 def _print_report(report: dict) -> None:
     print()
     print("QorCap capture A/B")
-    print("promotion: zero new wrong scores, no missed scores, no fewer successful reads")
-    print(f"(at least {MIN_SUCCESSFUL_READS} each, otherwise undecided), no more drops or duplicates,")
-    print("lag no worse, CPU not meaningfully higher (a zero or missing sample does not pass),")
-    print(f"disk not above max(+{DISK_ABS_MB_PER_MIN} MB/min, +{DISK_REL:.0%} of baseline) from ffprobe duration.")
-    print("The baseline row is the reference. Flags stay off until a variant prints YES.")
+    print("promotion: zero new wrong scores, no missed scores, read rate not worse than sampling noise")
+    print(f"(at least {MIN_SUCCESSFUL_READS} agreed frames each, otherwise undecided), no more drops,")
+    print("duplicates, lag, queue, or CPU, disk within tolerance, and strictly better on at least one metric.")
+    print("A tie is not a promotion. The baseline row is the reference. Flags stay off until a variant prints YES.")
     print(YUY2_NOT_RECOMMENDED)
     print()
     hdr = f"{'variant':<20} {'fps':>6} {'drop':>5} {'dup':>5} {'lag_s':>6} {'cpu%':>7} {'MB/min':>8} {'snaps':>5} {'reads':>7} {'wrong':>5} {'promote':>9}"
@@ -1070,7 +1268,10 @@ def _print_report(report: dict) -> None:
               f"{_fmt(live.get('snapshots_saved')):>5} "
               f"{_fmt(row.get('reads_succeeded')):>7} {_fmt(row.get('wrong_reads')):>5} "
               f"{label:>9}")
-        if label not in ("YES", "ref"):
+        if label == "YES":
+            for benefit in row.get("benefits") or []:
+                print(f"    + {benefit}")
+        elif label not in ("ref",):
             for reason in row["reasons"]:
                 print(f"    - {reason}")
     if report.get("scorebug_error"):
@@ -1228,6 +1429,7 @@ def main(argv: list[str] | None = None) -> int:
             metric_base["same_footage"] = True
             metric_base["reads_succeeded"] = base_scores.get("reads_succeeded")
             metric_base["reads_attempted"] = base_scores.get("reads_attempted")
+            metric_base["snapshots_attempted"] = base_scores.get("reads_attempted")
             metric_base["baseline_locks"] = delta["baseline_locks"]
             metric_base["wrong_reads"] = 0
             metric_base["missed_scores"] = 0
@@ -1238,6 +1440,7 @@ def main(argv: list[str] | None = None) -> int:
                 "picture_reason": None,
                 "reads_attempted": scores.get("reads_attempted"),
                 "reads_succeeded": scores.get("reads_succeeded"),
+                "snapshots_attempted": scores.get("reads_attempted"),
                 **{k: delta[k] for k in ("wrong_reads", "wrong_pairs", "missed_scores", "missed_pairs")},
                 "baseline_locks": delta["baseline_locks"],
             })
@@ -1258,13 +1461,16 @@ def main(argv: list[str] | None = None) -> int:
     report = {
         "promotion_rule": (
             "A flag may become the default only with zero new wrong score reads, no missed baseline "
-            "scores, no fewer successful reads, at least 8 successful reads on each side (otherwise "
-            "the reads gate is undecided), a baseline that locked at least one score, the same footage "
-            "(--stable-picture must show a stable scorebug bar), no more drops or duplicate frames, "
-            "audio lag no worse than +0.5s, video queue no worse than +1 MB, CPU not above baseline by "
-            "more than max(8 points, 25% relative) with a missing or zero CPU sample counting as not "
-            "measured, and disk MB/min (ffprobe media duration) not above baseline by more than "
-            "max(4 MB/min, 10% of baseline). The baseline is a reference, not a promotion. Otherwise the flag stays off."
+            "scores, a read success rate inside the sampling margin of the baseline (at least 8 "
+            "successful reads on each side, otherwise undecided), a baseline that locked at least one "
+            "score, the same footage (--stable-picture must show a stable scorebug bar), no more drops "
+            "or duplicate frames, audio lag no worse than +0.5s, video queue no worse than +1 MB, "
+            "delivered fps and media duration not meaningfully shorter, CPU not above baseline by more "
+            "than max(8 points, 25% relative) with a missing or zero CPU sample counting as not measured, "
+            "and disk MB/min (ffprobe media duration) not above baseline by more than max(4 MB/min, 10% "
+            "of baseline). A tie is not a promotion: some metric must be measurably better and none worse. "
+            "The baseline is a reference. Otherwise the flag stays off. No flag was promoted on the "
+            "2026-10-20 MS2131 runs. --yuy2-720p60 is not recommended on that card. Capture CPU was about 3-5%."
         ),
         "yuy2_720p60_note": YUY2_NOT_RECOMMENDED,
         "variants": lives,

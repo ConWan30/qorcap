@@ -10,12 +10,33 @@ use std::sync::Arc;
 
 pub struct Resp { pub code: u16, pub ctype: &'static str, pub body: Vec<u8>, pub headers: Vec<(&'static str, String)> }
 
-/// JPEG always. PNG only when the opt-in lossless snapshot is on. Anything else is "no frame yet",
-/// which is what a partial atomic rewrite looks like.
+const PNG_SIG: &[u8] = b"\x89PNG\r\n\x1a\n";
+/// Length 0 + "IEND" + CRC. A torn in-place PNG write does not end with this.
+const PNG_IEND: &[u8] = b"\x00\x00\x00\x00IEND\xaeB`\x82";
+
+/// JPEG always, and only with an EOI so a torn file is "no frame yet".
+/// PNG only when the opt-in lossless snapshot is on, and only with an IEND trailer.
 fn snapshot_kind(d: &[u8], png_ok: bool) -> Option<&'static str> {
-    if d.len() > 2 && d[0] == 0xFF && d[1] == 0xD8 { return Some("image/jpeg"); }
-    if png_ok && d.starts_with(b"\x89PNG\r\n\x1a\n") { return Some("image/png"); }
+    if d.len() > 3 && d[0] == 0xFF && d[1] == 0xD8 && d.ends_with(&[0xFF, 0xD9]) { return Some("image/jpeg"); }
+    if png_ok && d.starts_with(PNG_SIG) && d.ends_with(PNG_IEND) { return Some("image/png"); }
     None
+}
+
+/// Read the live snapshot and close it before the HTTP response is written.
+/// Share read, write, and delete so ffmpeg can replace or rewrite the file on Windows.
+fn read_snapshot(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        opts.share_mode(0x1 | 0x2 | 0x4);
+    }
+    let mut f = opts.open(path)?;
+    let mut buf = Vec::new();
+    f.read_to_end(&mut buf)?;
+    drop(f);
+    Ok(buf)
 }
 fn j(code: u16, v: Value) -> Resp { Resp { code, ctype: "application/json", body: v.to_string().into_bytes(), headers: vec![] } }
 
@@ -31,7 +52,7 @@ pub fn route(e: &Arc<Engine>, method: &str, url: &str, body: &str) -> Resp {
         }
         ("POST", "/record/stop") => match e.stop_recording() { Some(p) => j(200, json!({"ok": true, "file": p})), None => j(409, json!({"ok": false, "error": "not recording"})) },
         ("POST", "/replay/save") => match e.save_replay(b["out"].as_str()) { Ok(p) => j(200, json!({"ok": true, "file": p})), Err(m) => j(409, json!({"ok": false, "error": m})) },
-        ("GET", "/snapshot.jpg") => match std::fs::read(&e.snapshot) {
+        ("GET", "/snapshot.jpg") => match read_snapshot(&e.snapshot) {
             Ok(d) => match snapshot_kind(&d, e.args.reader_snapshot == "png") {
                 Some(ctype) => {
                     // Glimpse stays on the JPEG the reader already pulled. A PNG snapshot is not offered.
@@ -263,6 +284,8 @@ mod tests {
         assert!(on.snapshot.ends_with("snapshot.png"));
         assert_eq!(on.args.fps, 30);
         std::fs::write(&on.snapshot, b"\x89PNG\r\n\x1a\nrest").unwrap();
+        assert_eq!(route(&on, "GET", "/snapshot.jpg", "").code, 503); // no IEND yet: torn write
+        std::fs::write(&on.snapshot, b"\x89PNG\r\n\x1a\nrest\x00\x00\x00\x00IEND\xaeB`\x82").unwrap();
         let r = route(&on, "GET", "/snapshot.jpg", "");
         assert_eq!((r.code, r.ctype), (200, "image/png"));
         // Glimpse is not handed a PNG: the tap stays empty.
