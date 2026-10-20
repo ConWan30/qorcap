@@ -15,7 +15,7 @@ jobs:
           python-version: "3.12"
       - run: sudo apt-get update && sudo apt-get install -y ffmpeg
       - run: pip install pytest
-      - run: python -m pytest -q sidecar/test_qorcap_highlights.py
+      - run: python -m pytest -q sidecar/test_qorcap_highlights.py tools/test_capture_ab.py
   windows:
     runs-on: windows-latest
     steps:

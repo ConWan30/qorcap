@@ -9,6 +9,14 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 pub struct Resp { pub code: u16, pub ctype: &'static str, pub body: Vec<u8>, pub headers: Vec<(&'static str, String)> }
+
+/// JPEG always. PNG only when the opt-in lossless snapshot is on. Anything else is "no frame yet",
+/// which is what a partial atomic rewrite looks like.
+fn snapshot_kind(d: &[u8], png_ok: bool) -> Option<&'static str> {
+    if d.len() > 2 && d[0] == 0xFF && d[1] == 0xD8 { return Some("image/jpeg"); }
+    if png_ok && d.starts_with(b"\x89PNG\r\n\x1a\n") { return Some("image/png"); }
+    None
+}
 fn j(code: u16, v: Value) -> Resp { Resp { code, ctype: "application/json", body: v.to_string().into_bytes(), headers: vec![] } }
 
 pub fn route(e: &Arc<Engine>, method: &str, url: &str, body: &str) -> Resp {
@@ -24,10 +32,14 @@ pub fn route(e: &Arc<Engine>, method: &str, url: &str, body: &str) -> Resp {
         ("POST", "/record/stop") => match e.stop_recording() { Some(p) => j(200, json!({"ok": true, "file": p})), None => j(409, json!({"ok": false, "error": "not recording"})) },
         ("POST", "/replay/save") => match e.save_replay(b["out"].as_str()) { Ok(p) => j(200, json!({"ok": true, "file": p})), Err(m) => j(409, json!({"ok": false, "error": m})) },
         ("GET", "/snapshot.jpg") => match std::fs::read(&e.snapshot) {
-            Ok(d) if d.len() > 2 && d[0] == 0xFF && d[1] == 0xD8 => {
-                e.tap.offer(&d, crate::engine::wall_ms()); // no-op unless --glimpse-frame; never blocks
-                Resp { code: 200, ctype: "image/jpeg", body: d, headers: vec![] }
-            }
+            Ok(d) => match snapshot_kind(&d, e.args.reader_snapshot == "png") {
+                Some(ctype) => {
+                    // Glimpse stays on the JPEG the reader already pulled. A PNG snapshot is not offered.
+                    if ctype == "image/jpeg" { e.tap.offer(&d, crate::engine::wall_ms()); }
+                    Resp { code: 200, ctype, body: d, headers: vec![] }
+                }
+                None => j(503, json!({"ok": false, "error": "no frame yet"})),
+            },
             _ => j(503, json!({"ok": false, "error": "no frame yet"})),
         },
         // Advisory Glimpse watcher: the newest frame the reader already pulled (no file read here).
@@ -156,6 +168,8 @@ mod tests {
         assert_eq!(route(&e, "GET", "/nope", "").code, 404);
         assert_eq!(route(&e, "POST", "/record/stop", "").code, 409);
         assert_eq!(route(&e, "GET", "/snapshot.jpg", "").code, 503);
+        let body = String::from_utf8(r.body.clone()).unwrap();
+        assert!(!body.contains("buffer_full_warnings") && !body.contains("no_signal") && !body.contains("usb_link"), "{body}");
         let shut = route(&e, "POST", "/shutdown", r#"{"reason":"enter"}"#);
         assert_eq!(shut.code, 200);
         assert_eq!(e.stop_reason.lock().unwrap_or_else(|e| e.into_inner()).as_deref(), Some("enter"));
@@ -236,6 +250,25 @@ mod tests {
         assert_eq!(route(&e, "POST", "/frame/scorebug", "{}").code, 404);
         // The engine's match state is untouched by the tap.
         assert!(e.ev.lock().unwrap_or_else(|e| e.into_inner()).timeline.is_empty());
+    }
+    #[test]
+    fn png_snapshot_is_opt_in_and_jpeg_stays_the_default() {
+        let off = engine(&[]);
+        assert!(off.snapshot.ends_with("snapshot.jpg"));
+        std::fs::write(&off.snapshot, b"\x89PNG\r\n\x1a\nrest").unwrap();
+        assert_eq!(route(&off, "GET", "/snapshot.jpg", "").code, 503);
+        std::fs::write(&off.snapshot, [0xFF, 0xD8, 0xFF, 0xD9]).unwrap();
+        assert_eq!(route(&off, "GET", "/snapshot.jpg", "").ctype, "image/jpeg");
+        let on = engine(&["--reader-snapshot", "png", "--glimpse-frame"]);
+        assert!(on.snapshot.ends_with("snapshot.png"));
+        assert_eq!(on.args.fps, 30);
+        std::fs::write(&on.snapshot, b"\x89PNG\r\n\x1a\nrest").unwrap();
+        let r = route(&on, "GET", "/snapshot.jpg", "");
+        assert_eq!((r.code, r.ctype), (200, "image/png"));
+        // Glimpse is not handed a PNG: the tap stays empty.
+        assert_eq!(route(&on, "GET", "/frame/scorebug", "").code, 503);
+        let yuy = engine(&["--yuy2-720p60"]);
+        assert_eq!((yuy.args.res, yuy.args.fps, yuy.args.input_format.as_str()), ((1280, 720), 60, "yuyv422"));
     }
     #[test]
     fn snapshot_and_http_roundtrip() {
