@@ -45,6 +45,20 @@ RUNDOWN_PREV_MAX_S = 120
 ELAPSED_PERIOD_MS = 12 * 60 * 1000
 # Q4 end menu: the scorebug's last red clock in the final 5 seconds (110028 locked 0:03, then the menu).
 END_MENU_RED_CLOCK_S = 5
+# A final_screen observation is posted only once it has lasted as long as QorTime's detect_final
+# already requires (3 frames and 3 seconds). A shorter flash is dropped and is not posted, so it
+# cannot mark the session closed. A real end menu stays up for minutes and still commits.
+FINAL_SCREEN_MIN_FRAMES = 3
+FINAL_SCREEN_MIN_SPAN_MS = 3000
+# DualSense OPTIONS is button bit 9 (src/hid.rs). Records live in inputs.jsonl field "b".
+OPTIONS_BIT = 1 << 9
+# The dark picture must start within this long after OPTIONS, and the last scorebug read must
+# still have been on screen at the press (the scorebug leaves about 0.8 s after OPTIONS).
+OPTIONS_MENU_LEAD_MS = 4000
+SCOREBUG_VISIBLE_MS = 3000
+# A real ending that happened to coincide with OPTIONS is still accepted once that same picture
+# has stayed up this long and the end-of-game clock gates hold. A scripted pause is a few seconds.
+OPTIONS_COINCIDENT_HOLD_MS = 12000
 
 
 class PeriodTrack:
@@ -472,10 +486,67 @@ READER_SIZE = (640, 360)  # QorTime's reader/profile is calibrated on 640x360 fr
 
 def prep(img):
     """Downscale the card frame (e.g. 1280x720) to the reader's 640x360."""
-    import cv2
     if img is None or (img.shape[1], img.shape[0]) == READER_SIZE:
         return img
+    import cv2
     return cv2.resize(img, READER_SIZE, interpolation=cv2.INTER_AREA)
+
+
+def options_presses_ms(records, wall_anchor_ms=None) -> list[int]:
+    """Rising edges of OPTIONS (button bit 9) as wall-clock milliseconds.
+
+    ``records`` are ``inputs.jsonl`` objects. Wall time is ``wall_anchor_ms + t_us/1000`` from the
+    header. A record that already carries ``t_ms`` uses that.
+    """
+    presses: list[int] = []
+    prev = False
+    anchor = wall_anchor_ms
+    for r in records:
+        if not isinstance(r, dict):
+            continue
+        if r.get("type") == "header":
+            w = r.get("wall_anchor_ms")
+            if anchor is None and isinstance(w, int) and not isinstance(w, bool):
+                anchor = w
+            continue
+        if r.get("type") != "in":
+            continue
+        b = r.get("b")
+        if isinstance(b, bool) or not isinstance(b, int):
+            prev = False
+            continue
+        down = bool(b & OPTIONS_BIT)
+        if down and not prev:
+            t_ms = r.get("t_ms")
+            t_us = r.get("t_us")
+            if isinstance(t_ms, int) and not isinstance(t_ms, bool):
+                presses.append(t_ms)
+            elif anchor is not None and isinstance(t_us, int) and not isinstance(t_us, bool):
+                presses.append(int(anchor + t_us // 1000))
+        prev = down
+    return presses
+
+
+def note_options_from_inputs(core, path) -> None:
+    """Read OPTIONS rising edges from an inputs.jsonl. Missing file is a no-op. Duplicates are ignored."""
+    p = Path(path)
+    if not p.is_file():
+        return
+    try:
+        with open_shared_text(p) as fh:
+            text = fh.read()
+    except Exception:
+        return
+    recs = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            recs.append(json.loads(line))
+        except Exception:
+            continue
+    core.note_options(options_presses_ms(recs))
 
 
 def madden_final_screen(img) -> bool:
@@ -576,6 +647,57 @@ class ReaderCore:
         # each entry: {"kind": "scorebug_final_play"|"score_change_clip"|"input_activity"|"haptic",
         #              "t_ms": int, ...optional "home","away","sha256"}
         self.delta_corroboration: list[dict] = []
+        # Pause menu vs end screen. ``_pixel_match_since`` is the first frame of the current dark picture.
+        self._pixel_match_since: int | None = None
+        self._options_presses_ms: list[int] = []
+
+    def note_options(self, presses_ms) -> None:
+        """Remember OPTIONS press times (wall ms). Repeating a time is a no-op."""
+        seen = set(self._options_presses_ms)
+        for t in presses_ms or []:
+            if isinstance(t, bool) or not isinstance(t, int):
+                continue
+            if t not in seen:
+                self._options_presses_ms.append(t)
+                seen.add(t)
+        self._options_presses_ms.sort()
+
+    def _end_context(self, t_ms: int) -> bool:
+        """Same gates as the end-of-game menu: Q4/OT (or elapsed periods) and a finished clock."""
+        last = self._scorebug_for_final()
+        if last is None:
+            return False
+        return self._quarter_ready_for_end_menu(last, t_ms) and self._clock_ready_for_end_menu(last, t_ms)
+
+    def _opened_by_options(self, t_ms: int) -> bool:
+        """This dark picture started just after OPTIONS while the scorebug was still up, and no scorebug read has returned."""
+        if self._pixel_match_since is None or not self._options_presses_ms:
+            return False
+        start = self._pixel_match_since
+        last = self.last_scorebug()
+        if last is None:
+            return False
+        lt = last.get("t_ms")
+        if isinstance(lt, bool) or not isinstance(lt, int):
+            return False
+        for press in self._options_presses_ms:
+            if press > t_ms:
+                break
+            if not (-500 <= start - press <= OPTIONS_MENU_LEAD_MS):
+                continue
+            if lt > press or press - lt > SCOREBUG_VISIBLE_MS:
+                continue
+            return True
+        return False
+
+    def _accept_final_screen(self, t_ms: int) -> bool:
+        """Label ``final_screen`` only in end-of-game context, and not on an OPTIONS pause unless it stays up."""
+        if not self._end_context(t_ms):
+            return False
+        held = 0 if self._pixel_match_since is None else max(0, t_ms - self._pixel_match_since)
+        if self._opened_by_options(t_ms) and held < OPTIONS_COINCIDENT_HOLD_MS:
+            return False
+        return True
 
     def on_frame(self, t_ms: int, full) -> None:
         """``full`` may be a full-resolution frame (v0.3.5): the scorebug reader gets it when it asks for it
@@ -585,11 +707,26 @@ class ReaderCore:
         img = prep(full)
         rimg = full if getattr(self.reader, "wants_full_res", False) else img
         # The end-of-game menu is static, so the pause detector would swallow it; check it first.
+        # A pixel match is not by itself a final: Practice/Play Now pause (match-20261020-171032)
+        # can look like the end menu for a moment after OPTIONS. Label final_screen only in
+        # end-of-game context, and treat an OPTIONS press that hid the scorebug as a pause until
+        # the picture has stayed up long enough that it cannot be the scripted pause menu.
         if self.final_screen_detector is not None and self.final_screen_detector(img):
-            self.stats["final_screen"] = self.stats.get("final_screen", 0) + 1
-            self._observe(t_ms, img, True, screen=True)
+            if self._pixel_match_since is None:
+                self._pixel_match_since = t_ms
+            accept = self._accept_final_screen(t_ms)
+            if self._opened_by_options(t_ms) and not accept:
+                self.stats["final_screen_rejected"] = self.stats.get("final_screen_rejected", 0) + 1
+                self._observe(t_ms, img, True, screen=False)
+                if self.gate is not None:
+                    self.gate.on_frame(t_ms, False, paused=True)
+                return
+            if accept:
+                self.stats["final_screen"] = self.stats.get("final_screen", 0) + 1
+            self._observe(t_ms, img, True, screen=accept)
             self._end_menu(t_ms, img)
             return
+        self._pixel_match_since = None
         if self.pause is not None:
             self.pause.update(t_ms, img)
             if self.pause.paused:
@@ -687,25 +824,43 @@ class ReaderCore:
     def _observe(self, t_ms: int, img, absent: bool, screen: bool | None = None) -> None:
         def span(cur, name, on):
             if not on:
-                if cur is not None:
-                    self.post(jcs_safe({"type": "obs", **cur}))
+                self._commit_span(cur)
                 return None
             if cur is None:
-                cur = {"t_ms": t_ms, "until_ms": t_ms, "obs": name, "n": 0}
+                # A picture that was held through the OPTIONS pause still started when the pixels matched.
+                start = t_ms
+                if name == "final_screen" and self._pixel_match_since is not None:
+                    start = self._pixel_match_since
+                cur = {"t_ms": start, "until_ms": t_ms, "obs": name, "n": 0}
                 self.timeline.append(cur)
             cur["until_ms"], cur["n"] = t_ms, cur["n"] + 1
             return cur
         self._absent = span(self._absent, "scorebug_absent", absent)
         if screen is None:
-            screen = bool(absent and self.final_screen_detector and self.final_screen_detector(img))
+            # Same gate as the early path. A raw pixel match is not a final_screen by itself.
+            raw = bool(absent and self.final_screen_detector and self.final_screen_detector(img))
+            if raw and self._pixel_match_since is None:
+                self._pixel_match_since = t_ms
+            screen = bool(raw and self._accept_final_screen(t_ms))
         self._screen = span(self._screen, "final_screen", screen)
         if absent:
             self._check_final(t_ms)
 
+    def _commit_span(self, s: dict | None) -> None:
+        """Post a closed observation. A final_screen shorter than detect_final's bar is dropped, not posted."""
+        if s is None:
+            return
+        if s.get("obs") == "final_screen":
+            n = s.get("n") or 0
+            dur = int(s.get("until_ms") or 0) - int(s.get("t_ms") or 0)
+            if n < FINAL_SCREEN_MIN_FRAMES or dur < FINAL_SCREEN_MIN_SPAN_MS:
+                self.timeline = [x for x in self.timeline if x is not s]
+                return
+        self.post(jcs_safe({"type": "obs", **s}))
+
     def _close_spans(self) -> None:
-        for s in (self._absent, self._screen):
-            if s is not None:
-                self.post(jcs_safe({"type": "obs", **s}))
+        self._commit_span(self._absent)
+        self._commit_span(self._screen)
         self._absent = self._screen = None
 
     def last_scorebug(self) -> dict | None:

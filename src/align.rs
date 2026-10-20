@@ -23,6 +23,7 @@
 //! Score events from the scorebug reader (timeline.jsonl) are checked for controller activity in the 30 s
 //! before each scoring change. Limits: this shows the inputs and the picture move together; it is a
 //! statistical signal over many presses, not proof for any single press, and says nothing about who played.
+use crate::frameclock::{self, FrameStamp};
 use crate::hid;
 use serde_json::{json, Value};
 use std::io::Read;
@@ -167,11 +168,31 @@ fn locate(clocks: &[FileClock], t_us: u64) -> Option<(usize, i64)> {
     Some((i, ((t - clocks[i].start_ms) / clocks[i].ms_per_frame).round() as i64))
 }
 
+/// Nearest captured frame on the measured clock, if a stamp for one of `clocks` is within
+/// [`frameclock::MEASURED_MAX_GAP_US`]. `None` means "use the manifest fit".
+pub fn measured_locate(clocks: &[FileClock], stamps: &[FrameStamp], t_us: u64) -> Option<(usize, i64)> {
+    if stamps.is_empty() { return None; }
+    let i = stamps.partition_point(|s| s.t_mono_us < t_us);
+    let mut best: Option<(u64, usize, i64)> = None;
+    for j in [i.wrapping_sub(1), i] {
+        let Some(s) = stamps.get(j) else { continue };
+        let d = s.t_mono_us.abs_diff(t_us);
+        if d > frameclock::MEASURED_MAX_GAP_US { continue; }
+        let Some(ci) = clocks.iter().position(|c| c.file == s.file) else { continue; };
+        if best.as_ref().map(|(bd, _, _)| d < *bd).unwrap_or(true) { best = Some((d, ci, s.frame)); }
+    }
+    best.map(|(_, ci, fr)| (ci, fr))
+}
+
+fn locate_frame(clocks: &[FileClock], stamps: &[FrameStamp], t_us: u64) -> Option<(usize, i64)> {
+    measured_locate(clocks, stamps, t_us).or_else(|| locate(clocks, t_us))
+}
+
 /// Score a set of event times at offset `off` frames: (tested, matched, lags of matches).
-fn score(tracks: &[Energy], clocks: &[FileClock], ts: &[u64], off: i64, n: usize) -> (usize, usize, Vec<usize>) {
+fn score(tracks: &[Energy], clocks: &[FileClock], stamps: &[FrameStamp], ts: &[u64], off: i64, n: usize) -> (usize, usize, Vec<usize>) {
     let (mut t, mut m, mut lags) = (0, 0, vec![]);
     for &x in ts {
-        let Some((i, k)) = locate(clocks, x) else { continue };
+        let Some((i, k)) = locate_frame(clocks, stamps, x) else { continue };
         let Some(tr) = tracks.get(i) else { continue };
         if tr.e.is_empty() { continue; }
         if let Some(r) = press_response(&tr.e, k + off, n) { t += 1; if let Some(l) = r { m += 1; lags.push(l); } }
@@ -180,11 +201,11 @@ fn score(tracks: &[Energy], clocks: &[FileClock], ts: &[u64], off: i64, n: usize
 }
 
 /// Offset (frames) maximising the match rate of `ts`; ties -> smallest |offset|.
-fn calibrate(tracks: &[Energy], clocks: &[FileClock], ts: &[u64], n: usize) -> i64 {
+fn calibrate(tracks: &[Energy], clocks: &[FileClock], stamps: &[FrameStamp], ts: &[u64], n: usize) -> i64 {
     let mut best = (f64::MIN, 0i64);
     let mut o = -SEARCH;
     while o <= SEARCH {
-        let (t, m, _) = score(tracks, clocks, ts, o, n);
+        let (t, m, _) = score(tracks, clocks, stamps, ts, o, n);
         let r = if t >= 3 { m as f64 / t as f64 } else { -1.0 };
         if r > best.0 + 1e-9 || ((r - best.0).abs() <= 1e-9 && o.abs() < best.1.abs()) { best = (r, o); }
         o += STEP;
@@ -194,16 +215,23 @@ fn calibrate(tracks: &[Energy], clocks: &[FileClock], ts: &[u64], n: usize) -> i
 
 /// Core of v2 on precomputed energy tracks (unit-testable without ffmpeg).
 pub fn align_tracks(tracks: &[Energy], clocks: &[FileClock], presses: &[u64], n: usize) -> Value {
+    align_tracks_with(tracks, clocks, presses, n, &[])
+}
+
+/// Like [`align_tracks`]. Non-empty `stamps` locate a press on the measured frame clock when a stamp
+/// is within 500 ms; every other press uses the manifest fit. An empty stamp list is the fit alone,
+/// and the JSON is the same object [`align_tracks`] has always returned.
+pub fn align_tracks_with(tracks: &[Energy], clocks: &[FileClock], presses: &[u64], n: usize, stamps: &[FrameStamp]) -> Value {
     let pts = sample(presses, MAX_EVENTS);
     let ch = chance_times(&pts, presses);
     let (a, b): (Vec<u64>, Vec<u64>) = (pts.iter().step_by(2).copied().collect(), pts.iter().skip(1).step_by(2).copied().collect());
     let (ca, cb): (Vec<u64>, Vec<u64>) = (ch.iter().step_by(2).copied().collect(), ch.iter().skip(1).step_by(2).copied().collect());
-    let (oa, ob) = (calibrate(tracks, clocks, &a, n), calibrate(tracks, clocks, &b, n));
+    let (oa, ob) = (calibrate(tracks, clocks, stamps, &a, n), calibrate(tracks, clocks, stamps, &b, n));
     // held out: B scored at A's offset, A at B's offset; same for chance
-    let (t1, m1, l1) = score(tracks, clocks, &b, oa, n);
-    let (t2, m2, l2) = score(tracks, clocks, &a, ob, n);
-    let (ct1, cm1, _) = score(tracks, clocks, &cb, oa, n);
-    let (ct2, cm2, _) = score(tracks, clocks, &ca, ob, n);
+    let (t1, m1, l1) = score(tracks, clocks, stamps, &b, oa, n);
+    let (t2, m2, l2) = score(tracks, clocks, stamps, &a, ob, n);
+    let (ct1, cm1, _) = score(tracks, clocks, stamps, &cb, oa, n);
+    let (ct2, cm2, _) = score(tracks, clocks, stamps, &ca, ob, n);
     let (pt, pm_, ct, cm) = (t1 + t2, m1 + m2, ct1 + ct2, cm1 + cm2);
     let pm = |a: usize, b: usize| if b == 0 { Value::Null } else { json!((a as f64 * 1000.0 / b as f64).round() as i64) };
     let fms = |f: f64| (f * 1000.0 / FPS).round() as i64;
@@ -218,14 +246,18 @@ pub fn align_tracks(tracks: &[Energy], clocks: &[FileClock], presses: &[u64], n:
         let se = (p * (1.0 - p) * (1.0 / pt as f64 + 1.0 / ct as f64)).sqrt();
         if se > 0.0 { json!(((p1 - p2) / se * 100.0).round() as i64) } else { Value::Null }
     } else { Value::Null };
-    let (all_t, _, _) = score(tracks, clocks, &pts, 0, n);
+    let (all_t, _, _) = score(tracks, clocks, stamps, &pts, 0, n);
     let _ = all_t;
-    json!({"presses_tested": pt, "presses_matched": pm_, "match_permille": pm(pm_, pt),
+    let mut out = json!({"presses_tested": pt, "presses_matched": pm_, "match_permille": pm(pm_, pt),
            "chance_tested": ct, "chance_matched": cm, "chance_permille": pm(cm, ct),
            "z_x100": z, "offset_ms": offset, "offset_iqr_ms": spread,
            "calibration_offsets_ms": [fms(oa as f64), fms(ob as f64)],
            "presses_spaced": pts.len(), "window_frames": n, "fps": FPS as i64,
-           "clock_fitted": clocks.iter().all(|c| c.fitted)})
+           "clock_fitted": clocks.iter().all(|c| c.fitted)});
+    // Absent unless a measured clock was supplied. Adding the key on the fit path would change
+    // input_proof.json for every bundle recorded with the flag off.
+    if !stamps.is_empty() { out["clock_source"] = json!("frame_clock"); out["frame_clock_frames"] = json!(stamps.len()); }
+    out
 }
 
 /// Full alignment over a bundle directory. `ffmpeg = None` skips the video pass (reports why).
@@ -233,6 +265,7 @@ pub fn align_bundle(dir: &std::path::Path, recs: &[Value], manifest: &[Value], t
     let presses = key_presses(recs);
     let all: Vec<u64> = recs.iter().filter(|r| r["type"] == "in").filter_map(|r| r["t_us"].as_u64()).collect();
     let clocks = file_clocks(manifest);
+    let stamps = frameclock::load(&dir.join(frameclock::FILE_NAME));
     let mut notes: Vec<String> = vec![];
     let mut out = if let (Some(ff), false) = (ffmpeg, clocks.is_empty()) {
         let mut tracks = vec![];
@@ -243,7 +276,8 @@ pub fn align_bundle(dir: &std::path::Path, recs: &[Value], manifest: &[Value], t
             }
         }
         if clocks.iter().any(|c| !c.fitted) { notes.push("video clock from init segment (too few segments to fit frames vs time)".into()); }
-        align_tracks(&tracks, &clocks, &presses, n)
+        if !stamps.is_empty() { notes.push("frame times from frame_clock.jsonl where a stamp is within 500 ms of the press; manifest fit otherwise".into()); }
+        align_tracks_with(&tracks, &clocks, &presses, n, &stamps)
     } else {
         notes.push(if clocks.is_empty() { "no video segments in manifest".into() } else { "ffmpeg not available: video pass skipped".into() });
         align_tracks(&[], &[], &[], n)
@@ -271,6 +305,98 @@ pub fn align_bundle(dir: &std::path::Path, recs: &[Value], manifest: &[Value], t
     out["notes"] = json!(notes);
     out["method"] = json!("v2: one-pass 96x54 motion energy; presses on a still screen (20-frame baseline) match when energy jumps >=5x within 100-667 ms; offset calibrated on half the presses, scored on the other half (2-fold); chance = presses shifted 3-8 s through the same filter");
     out
+}
+
+fn pct(xs: &mut [i64], p: usize) -> i64 {
+    if xs.is_empty() { return 0; }
+    xs.sort();
+    xs[(xs.len() - 1) * p / 100]
+}
+
+/// Clock A/B. `fit` is the manifest straight line (fragment close vs frame count): typical / p95 / worst
+/// absolute residual, in ms. `measured` is present only when `stamps` is non-empty: those same percentiles
+/// for |stamp time − fitted time of that frame|, plus how far consecutive stamp gaps sit from one nominal frame.
+/// This does not write a receipt.
+pub fn clock_ab(manifest: &[Value], stamps: &[FrameStamp]) -> Value {
+    let clocks = file_clocks(manifest);
+    let Some(c) = clocks.iter().find(|c| c.fitted).or_else(|| clocks.first()) else {
+        return json!({"fit": Value::Null, "measured": Value::Null});
+    };
+    let segs: Vec<&Value> = manifest.iter().filter(|m| m["type"] == "segment" && m["kind"] == "media" && m["file"] == c.file).collect();
+    let mut resid: Vec<i64> = segs.iter().filter_map(|s| {
+        let fr = s["frames"].as_f64()?;
+        let mono = s["mono_ms"].as_f64()?;
+        if fr <= 0.0 { return None; }
+        Some((mono - (c.start_ms + c.ms_per_frame * fr)).round() as i64)
+    }).map(|r| r.abs()).collect();
+    let fit = json!({
+        "file": c.file, "fitted": c.fitted,
+        "ms_per_frame_milli": (c.ms_per_frame * 1000.0).round() as i64,
+        "n": resid.len(),
+        "resid_abs_p50_ms": pct(&mut resid, 50),
+        "resid_abs_p95_ms": pct(&mut resid, 95),
+        "resid_abs_max_ms": resid.iter().copied().max().unwrap_or(0),
+    });
+    let mine: Vec<&FrameStamp> = stamps.iter().filter(|s| s.file == c.file).collect();
+    if mine.is_empty() { return json!({"fit": fit, "measured": Value::Null}); }
+    let mut vs: Vec<i64> = mine.iter().map(|s| {
+        let fitted = c.start_ms + c.ms_per_frame * s.frame as f64;
+        (s.t_mono_us as f64 / 1000.0 - fitted).round().abs() as i64
+    }).collect();
+    let nominal_us = (1_000_000.0 / FPS).round() as i64;
+    let mut gaps: Vec<i64> = mine.windows(2).map(|w| {
+        ((w[1].t_mono_us as i64 - w[0].t_mono_us as i64) - nominal_us).abs() / 1000
+    }).collect();
+    json!({
+        "fit": fit,
+        "measured": {
+            "n": mine.len(),
+            "vs_fit_abs_p50_ms": pct(&mut vs, 50),
+            "vs_fit_abs_p95_ms": pct(&mut vs, 95),
+            "vs_fit_abs_max_ms": vs.iter().copied().max().unwrap_or(0),
+            "interval_abs_dev_p50_ms": pct(&mut gaps, 50),
+            "interval_abs_dev_p95_ms": pct(&mut gaps, 95),
+            "interval_abs_dev_max_ms": gaps.iter().copied().max().unwrap_or(0),
+        }
+    })
+}
+
+/// Offline A/B for one bundle. With a video and ffmpeg, scores the input proof's alignment twice
+/// (manifest fit, then measured stamps) on one decode. Never writes the receipt or the proof.
+pub fn ab_report(dir: &std::path::Path, ffmpeg: Option<&str>, n: usize) -> Value {
+    let read = |name: &str| frameclock_read(dir, name);
+    let manifest = read("manifest.jsonl");
+    let inputs = read("inputs.jsonl");
+    let stamps = frameclock::load(&dir.join(frameclock::FILE_NAME));
+    let mut out = clock_ab(&manifest, &stamps);
+    out["frame_clock_file"] = json!(dir.join(frameclock::FILE_NAME).exists());
+    out["frame_clock_frames"] = json!(stamps.len());
+    let presses = key_presses(&inputs);
+    let clocks = file_clocks(&manifest);
+    if let Some(ff) = ffmpeg {
+        if clocks.is_empty() {
+            out["video"] = json!("no segments");
+        } else {
+            let mut tracks = vec![];
+            for c in &clocks {
+                match decode_energy(ff, &dir.join(&c.file).to_string_lossy()) {
+                    Ok(e) => tracks.push(e),
+                    Err(e) => { out["video_error"] = json!(e); tracks.push(Energy::default()); }
+                }
+            }
+            out["fit_alignment"] = align_tracks_with(&tracks, &clocks, &presses, n, &[]);
+            out["measured_alignment"] = if stamps.is_empty() { Value::Null } else { align_tracks_with(&tracks, &clocks, &presses, n, &stamps) };
+            out["video"] = json!("decoded");
+        }
+    } else {
+        out["video"] = json!("skipped");
+    }
+    out["how_to_read"] = json!("fit.resid_* is the fragment-close straight line (flag off). measured.vs_fit_* is how far real frame arrivals sit from that line. measured.interval_* is frame-to-frame jitter of the arrivals (one frame is 33 ms). fit_alignment / measured_alignment are the input-proof scores. This command does not write a receipt.");
+    out
+}
+
+fn frameclock_read(dir: &std::path::Path, name: &str) -> Vec<Value> {
+    std::fs::read_to_string(dir.join(name)).map(|s| s.lines().filter_map(|l| serde_json::from_str(l).ok()).collect()).unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -342,5 +468,89 @@ mod tests {
         let a = vec![0u8; 16]; let b = vec![100u8; 16];
         let e = energy_from_frames(&[&a, &a, &b, &b]);
         assert_eq!(e, vec![0.0, 0.0, 100.0, 100.0]);
+    }
+
+    /// Flag off: no stamps. The alignment object is the one `align_tracks` has always returned.
+    #[test]
+    fn flag_off_alignment_json_matches_the_fit_byte_for_byte() {
+        let frames: Vec<usize> = (0..40).map(|i| 200 + i * 41).collect();
+        let tr = track(3000, &frames, 6);
+        let presses: Vec<u64> = frames.iter().map(|&f| (f as f64 * 1000.0 / FPS * 1000.0) as u64).collect();
+        let clocks = clock(0.0);
+        let fit = align_tracks(&[tr.clone()], &clocks, &presses, 15);
+        let with_empty = align_tracks_with(&[tr], &clocks, &presses, 15, &[]);
+        assert_eq!(serde_json::to_string(&fit).unwrap(), serde_json::to_string(&with_empty).unwrap());
+        assert!(fit.get("clock_source").is_none());
+        assert!(fit.get("frame_clock_frames").is_none());
+    }
+
+    #[test]
+    fn measured_stamp_overrides_an_800ms_fit_and_falls_back_past_500ms() {
+        let clocks = clock(0.0);
+        let t = 800_000u64;
+        assert_eq!(locate(&clocks, t).unwrap().1, 24); // 800 ms / (1000/30) = frame 24
+        let near = FrameStamp { file: "video.mp4".into(), frame: 0, t_mono_us: t, pts_90k: 0 };
+        assert_eq!(measured_locate(&clocks, &[near.clone()], t).unwrap().1, 0);
+        assert_eq!(locate_frame(&clocks, &[near], t).unwrap().1, 0);
+        let far = FrameStamp { file: "video.mp4".into(), frame: 0, t_mono_us: t + 600_000, pts_90k: 0 };
+        assert!(measured_locate(&clocks, &[far.clone()], t).is_none());
+        assert_eq!(locate_frame(&clocks, &[far], t).unwrap().1, 24);
+    }
+
+    /// One offset cannot absorb a clock that is early in one stretch and late in the next.
+    /// Stamps on the same Instant as the presses recover the picture.
+    #[test]
+    fn wandering_fit_misses_and_measured_stamps_recover() {
+        let n = 40i64;
+        let mut presses = Vec::new();
+        let mut spikes = Vec::new();
+        let mut stamps = Vec::new();
+        for i in 0..n {
+            // Farther apart than the +/-3 s offset search, so a press cannot match its neighbour.
+            // The two halves sit 40 frames on opposite sides of the fit, outside one response window.
+            let fit_frame = 400 + i * 120;
+            let t_us = (fit_frame as f64 * 1_000_000.0 / FPS) as u64;
+            let bias: i64 = if i < n / 2 { 40 } else { -40 };
+            let true_frame = fit_frame + bias;
+            presses.push(t_us);
+            spikes.push((true_frame + 6) as usize);
+            stamps.push(FrameStamp { file: "video.mp4".into(), frame: true_frame, t_mono_us: t_us, pts_90k: true_frame as u64 * 3000 });
+        }
+        let len = spikes.iter().copied().max().unwrap() + 40;
+        let tr = track(len, &spikes, 0);
+        let clocks = clock(0.0);
+        let fit = align_tracks(&[tr.clone()], &clocks, &presses, 15);
+        let measured = align_tracks_with(&[tr], &clocks, &presses, 15, &stamps);
+        let (fm, mm) = (fit["match_permille"].as_i64().unwrap(), measured["match_permille"].as_i64().unwrap());
+        assert!(mm >= 800, "measured {measured:#}");
+        assert!(mm - fm >= 300, "fit {fm} measured {mm}\n{fit:#}");
+        assert_eq!(measured["clock_source"], "frame_clock");
+        assert!(fit.get("clock_source").is_none());
+    }
+
+    #[test]
+    fn clock_ab_reports_fit_residuals_and_leaves_measured_null_without_stamps() {
+        let mut m = vec![json!({"type":"segment","kind":"init","file":"video.mp4","mono_ms":0,"frames":0})];
+        for i in 1..20 {
+            let fr = i * 60;
+            m.push(json!({"type":"segment","kind":"media","file":"video.mp4","mono_ms": fr * 1000 / 30, "frames": fr}));
+        }
+        let z = clock_ab(&m, &[]);
+        assert!(z["measured"].is_null());
+        assert!(z["fit"]["resid_abs_max_ms"].as_i64().unwrap() <= 1, "{z:#}");
+        let mut late = m.clone();
+        let n = late.len() - 1;
+        late[n]["mono_ms"] = json!(late[n]["mono_ms"].as_i64().unwrap() + 800);
+        let bad = clock_ab(&late, &[]);
+        assert!(bad["fit"]["resid_abs_max_ms"].as_i64().unwrap() >= 400, "{bad:#}");
+        let stamps: Vec<FrameStamp> = (0..10).map(|f| FrameStamp {
+            file: "video.mp4".into(),
+            frame: f,
+            t_mono_us: (f as f64 * 1_000_000.0 / FPS).round() as u64,
+            pts_90k: f as u64 * 3000,
+        }).collect();
+        let ok = clock_ab(&m, &stamps);
+        assert!(ok["measured"]["vs_fit_abs_max_ms"].as_i64().unwrap() <= 2, "{ok:#}");
+        assert_eq!(ok["measured"]["interval_abs_dev_max_ms"], 0);
     }
 }

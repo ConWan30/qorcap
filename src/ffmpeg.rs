@@ -347,6 +347,19 @@ dummy: Immediate exit requested"#;
         assert_eq!(audio_strategies(&dev), vec![AudioStrategy::Separate, AudioStrategy::Combined, AudioStrategy::SeparateAlt]);
     }
     #[test]
+    fn frame_clock_flag_does_not_change_the_capture_command() {
+        use clap::Parser;
+        let crate::cli::Cmd::Record(off) = crate::cli::Cli::try_parse_from(["q", "record", "--device", "USB3.0 Video"]).unwrap().cmd else { panic!() };
+        let crate::cli::Cmd::Record(on) = crate::cli::Cli::try_parse_from(["q", "record", "--device", "USB3.0 Video", "--frame-clock"]).unwrap().cmd else { panic!() };
+        assert!(!off.frame_clock && on.frame_clock);
+        let a = capture_args(&off, "auto", Some("USB3.0 Audio"), "s.jpg", None);
+        let b = capture_args(&on, "auto", Some("USB3.0 Audio"), "s.jpg", None);
+        assert_eq!(a, b, "flag on must not change ffmpeg arguments");
+        let joined = a.join(" ");
+        assert!(joined.contains("-use_wallclock_as_timestamps 1"));
+        assert!(!joined.contains("showinfo") && !joined.contains("-copyts"));
+    }
+    #[test]
     fn audio_strategy_args() {
         use clap::Parser;
         let c = crate::cli::Cli::try_parse_from(["q", "record"]).unwrap();

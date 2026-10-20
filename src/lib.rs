@@ -11,6 +11,7 @@ pub mod hid;
 pub mod inputs;
 pub mod humanlike;
 pub mod align;
+pub mod frameclock;
 pub mod inputproof;
 pub mod haptics;
 pub mod glimpse;
