@@ -1,0 +1,176 @@
+{
+ "match": "match-20261017-010703",
+ "layout": "thursday_night",
+ "chain": {
+  "verified": false,
+  "head": null,
+  "n": 15
+ },
+ "champion": "full_v0",
+ "frames_cached": 55,
+ "labelled": 21,
+ "grades": {
+  "B": 21
+ },
+ "bank_added": 9,
+ "tune": 12,
+ "bank_stats": {
+  "primetime:active": 1,
+  "thursday_night:active": 9
+ },
+ "candidates": [
+  {
+   "kind": "INV",
+   "harness": "full_v0+lockguard",
+   "verdict": "TUNE_PASS",
+   "d_right": 0,
+   "d_wrong": -4,
+   "new_wrong": 0,
+   "cost_delta": 0.0,
+   "score": 20
+  },
+  {
+   "kind": "INV",
+   "harness": "full_v0+stats_never_score",
+   "verdict": "TUNE_FAIL",
+   "d_right": 0,
+   "d_wrong": 0,
+   "new_wrong": 0,
+   "cost_delta": 0.0,
+   "score": 0
+  },
+  {
+   "kind": "DOM",
+   "harness": "full_v0+thursday_night->crop_v0",
+   "verdict": "TUNE_PASS",
+   "d_right": 4,
+   "d_wrong": 0,
+   "new_wrong": 0,
+   "cost_delta": -0.001038,
+   "score": 4
+  },
+  {
+   "kind": "DOM",
+   "harness": "full_v0+thursday_night->crop_v1",
+   "verdict": "TUNE_PASS",
+   "d_right": 4,
+   "d_wrong": -4,
+   "new_wrong": 0,
+   "cost_delta": 0.004182,
+   "score": 24
+  },
+  {
+   "kind": "DOM",
+   "harness": "full_v0+thursday_night->watch_012",
+   "verdict": "TUNE_PASS",
+   "d_right": 4,
+   "d_wrong": -4,
+   "new_wrong": 0,
+   "cost_delta": 0.005766,
+   "score": 24
+  }
+ ],
+ "lesson": {
+  "key": {
+   "game": "madden27",
+   "layout": "thursday_night"
+  },
+  "cue": "thursday_night: champion wrong on 4 tune frame(s)",
+  "action": {
+   "routes": {
+    "thursday_night": "crop_v1"
+   },
+   "checks": []
+  },
+  "evidence": {
+   "tune": {
+    "verdict": "TUNE_PASS",
+    "d_right": 4,
+    "d_wrong": -4,
+    "new_wrong": 0,
+    "cost_delta": 0.004182,
+    "score": 24
+   },
+   "bank": "FAIL_NOT_SIGNIFICANT",
+   "match": "match-20261017-010703"
+  },
+  "receipt_refs": {
+   "chain_head": null,
+   "label_basis": [
+    "reader-lock:match-20261017-010703:1792217435",
+    "reader-lock:match-20261017-010703:1792217981",
+    "reader-lock:match-20261017-010703:1792218614",
+    "reader-lock:match-20261017-010703:1792218815",
+    "reader-lock:match-20261017-010703:1792219448"
+   ],
+   "receipt_sha256": null
+  },
+  "replay_digest": "c124851b396419cb713e18bca495fb8954e515e31ea294ea0e3469a1bd25ab88",
+  "harness_sha256": "0bfcd9022888b18fc5cd2d2b5b0840337714f5c9c04824b126502489c555979e",
+  "status": "candidate",
+  "confidence": "medium",
+  "tag": "ADVISORY_AI"
+ },
+ "pending": null,
+ "decision": null,
+ "champion_on_game": {
+  "right": 7,
+  "wrong": 4,
+  "abstain": 8,
+  "other": 0,
+  "missing": 5
+ },
+ "hard": {
+  "wrong": [
+   "tnp-089",
+   "tnp-153",
+   "tnp-193",
+   "tnp-263"
+  ],
+  "unsure": [
+   "tnp-018",
+   "tnp-113",
+   "tnp-167",
+   "tnp-278"
+  ],
+  "disagree_reader": [
+   "tnp-089",
+   "tnp-153",
+   "tnp-193",
+   "tnp-263"
+  ]
+ },
+ "review_queue": [
+  "tnp-016",
+  "tnp-082",
+  "tnp-084",
+  "tnp-120",
+  "tnp-139",
+  "tnp-140",
+  "tnp-162",
+  "tnp-212",
+  "tnp-244",
+  "tnp-283",
+  "tnp-296",
+  "tnp-301",
+  "tnp-315"
+ ],
+ "bank_gate": {
+  "harness": "full_v0+thursday_night->crop_v1",
+  "n": 8,
+  "champ_right": 4,
+  "cand_right": 5,
+  "champ_wrong": 0,
+  "cand_wrong": 0,
+  "new_wrong": [],
+  "b_only_cand": 1,
+  "c_only_champ": 0,
+  "p_mcnemar": 0.5,
+  "champ_cost": 0.00408,
+  "cand_cost": 0.00653,
+  "verdict": "FAIL_NOT_SIGNIFICANT"
+ },
+ "spend_usd": 0.0,
+ "would_cost_live_usd": 0.038,
+ "lab_version": "glimpse-lab/0.1.0-proposal"
+}
