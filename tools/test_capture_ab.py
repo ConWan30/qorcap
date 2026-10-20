@@ -66,17 +66,19 @@ def test_each_gate_blocks_on_its_own():
     assert any("duplicate" in r for r in ab.promotion_decision(_row(), _row(dup_frames=2))["reasons"])
     assert any("audio lag" in r for r in ab.promotion_decision(_row(), _row(audio_lag_s=11.0))["reasons"])
     assert any("CPU" in r for r in ab.promotion_decision(_row(), _row(cpu_pct=40.0))["reasons"])
-    disk = ab.promotion_decision(_row(), _row(disk_mb_per_min=61.0))
+    # Baseline 60 MB/min tolerates max(4, 10%) = 6, so 70 is over and 63 is not.
+    disk = ab.promotion_decision(_row(), _row(disk_mb_per_min=70.0))
     assert disk["disk_raised"] is True
     assert any("disk" in r for r in disk["reasons"])
     assert any("same footage" in r for r in ab.promotion_decision(_row(), _row(same_footage=False))["reasons"])
-    assert any("not proven" in r for r in ab.promotion_decision(_row(baseline_locks=0, reads_succeeded=0), _row(reads_succeeded=0))["reasons"])
+    assert any("not proven" in r for r in ab.promotion_decision(_row(baseline_locks=0, reads_succeeded=8), _row(reads_succeeded=8))["reasons"])
     assert any("not measured" in r for r in ab.promotion_decision(_row(), _row(cpu_pct=None))["reasons"])
+    assert any("not measured" in r for r in ab.promotion_decision(_row(), _row(disk_mb_per_min=None))["reasons"])
 
 
 def test_small_cpu_and_disk_noise_does_not_block():
-    # +3 points is under the 8 point gate. +0.04 MB/min is under the 0.05 floor.
-    d = ab.promotion_decision(_row(), _row(cpu_pct=23.0, disk_mb_per_min=60.04, audio_lag_s=10.2))
+    # +3 points is under the 8 point gate. +3 MB/min is inside max(4, 10% of 60).
+    d = ab.promotion_decision(_row(), _row(cpu_pct=23.0, disk_mb_per_min=63.0, audio_lag_s=10.2))
     assert d["promote"] is True, d["reasons"]
     assert d["disk_raised"] is False
 
@@ -107,5 +109,98 @@ def test_baseline_command_is_todays_match_capture():
 def test_cpu_and_disk_math():
     assert abs(ab.cpu_percent(1.5, 10) - 15.0) < 1e-9
     assert ab.cpu_percent(None, 10) is None
+    assert ab.cpu_percent(0.0, 10) is None
+    assert ab.cpu_percent(1.5, 0) is None
     # 60 MB over 60s is 60 MB/min. 8 Mbit/s is about that.
     assert abs(ab.disk_mb_per_min(60 * 1024 * 1024, 60) - 60.0) < 1e-6
+    assert ab.parse_duration("15.5\n") == 15.5
+    assert ab.parse_duration("N/A") is None
+    assert ab.parse_duration("0") is None
+    assert ab.parse_duration("") is None
+
+
+def test_zero_cpu_samples_do_not_pass():
+    assert ab.cpu_percent_from_samples([]) is None
+    assert ab.cpu_percent_from_samples([(0.0, 0.0)]) is None
+    assert ab.cpu_percent_from_samples([(0.0, 0.0), (2.0, 0.0)]) is None
+    assert ab.cpu_percent_from_samples([(0.0, 1.0), (2.0, 1.0)]) is None
+    assert ab.cpu_percent_from_samples([(0.0, 0.0), (0.2, 0.5)]) is None
+    assert abs(ab.cpu_percent_from_samples([(0.0, 0.0), (1.0, 0.5)]) - 50.0) < 1e-9
+    flat = ab.promotion_decision(_row(), _row(cpu_pct=0.0))
+    assert flat["promote"] is False
+    assert any("not measured" in r for r in flat["reasons"])
+    assert ab.promotion_label(flat) == "undecided"
+    both_zero = ab.promotion_decision(_row(cpu_pct=0.0), _row(cpu_pct=0.0))
+    assert both_zero["promote"] is False
+
+
+def test_tiny_read_counts_are_undecided():
+    d = ab.promotion_decision(_row(reads_succeeded=2), _row(reads_succeeded=1))
+    assert d["promote"] is False
+    assert any("too few score reads" in r for r in d["reasons"])
+    assert not any("fewer successful" in r for r in d["reasons"])
+    assert ab.promotion_label(d) == "undecided"
+    # Enough samples still fail a real drop in agreed frames.
+    fewer = ab.promotion_decision(_row(reads_succeeded=20), _row(reads_succeeded=8))
+    assert any("fewer successful" in r for r in fewer["reasons"])
+    assert ab.promotion_label(fewer) == "no"
+
+
+def test_scorebug_region_flags_a_change_and_ignores_a_still_bar():
+    width, height = 32, 8
+    still = bytes([20] * (width * height))
+    same = ab.take_picture_stable([(width, still), (width, still), (width, bytes(still))])
+    assert same["stable"] is True
+    moved = bytearray(still)
+    for i in range(16):
+        moved[i] = 220
+    changed = ab.take_picture_stable([(width, still), (width, bytes(moved))])
+    assert changed["stable"] is False
+    assert "changed" in changed["reason"]
+    few = ab.take_picture_stable([(width, still)])
+    assert few["stable"] is None
+    # One stray frame in a paused take is not a score change.
+    stray = [(width, still)] * 12 + [(width, bytes(moved))]
+    assert ab.take_picture_stable(stray)["stable"] is True
+    mean, tile = ab.region_distance(still, bytes(moved), width)
+    assert tile > ab.TILE_LIMIT
+    assert mean > 0
+    assert ab.regions_match((width, still), (width, still))["stable"] is True
+    assert ab.regions_match((width, still), (width, bytes(moved)))["stable"] is False
+
+
+def test_baseline_is_a_reference_not_a_promotion():
+    assert ab.promotion_label({"promote": False, "role": "reference", "reasons": []}) == "ref"
+    assert ab.promotion_label({"promote": True, "reasons": []}) == "YES"
+    assert ab.promotion_label({"promote": False, "reasons": ["more dropped frames (1 > 0)"]}) == "no"
+    assert ab.VARIANTS[0] == ("baseline", [])
+    assert "11.6" in ab.YUY2_NOT_RECOMMENDED
+    assert "not recommended" in ab.YUY2_NOT_RECOMMENDED.lower()
+
+
+def test_ffmpeg_resolver_uses_the_bundle_and_rejects_a_missing_path(tmp_path):
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    (bundle / "qorcap.exe").write_bytes(b"")
+    (bundle / "ffmpeg.exe").write_bytes(b"")
+    assert ab.resolve_ffmpeg(None, str(bundle / "qorcap.exe"), use_path=False) == str(bundle / "ffmpeg.exe")
+    missing = tmp_path / "missing" / "ffmpeg.exe"
+    try:
+        ab.resolve_ffmpeg(str(missing), str(bundle / "qorcap.exe"), use_path=False)
+        raise AssertionError("missing --ffmpeg should stop")
+    except SystemExit as e:
+        assert "--ffmpeg" in str(e)
+        assert str(missing) in str(e)
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    (empty / "qorcap.exe").write_bytes(b"")
+    try:
+        ab.resolve_ffmpeg(None, str(empty / "qorcap.exe"), use_path=False)
+        raise AssertionError("bundle without ffmpeg should stop")
+    except SystemExit as e:
+        text = str(e)
+        assert "--ffmpeg" in text
+        assert "release bundle" in text
+    hint = ab.venv_python_hint()
+    assert hint.endswith("python.exe")
+    assert "QorCap" in hint and "venv" in hint

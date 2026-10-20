@@ -4,14 +4,28 @@
 Today's capture (MJPEG 1280x720@30, 512M video rtbuf, JPEG q:v 3 snapshot) is the
 baseline. Each other variant turns on one opt-in flag. Nothing here changes
 scoring, receipts, or signing. A flag stays off unless this report says it may
-be promoted.
+be promoted. The baseline row is the reference, not a candidate.
 
-    py -3 tools\\capture_ab.py --secs 15 --stable-picture --qortime C:\\path\\to\\qortime
+Plain ``py -3`` on the laptop does not have cv2, so score reads will not run.
+Use the QorCap venv:
 
-Pause Madden on a readable scorebug for the whole run and pass --stable-picture
-so live takes can be compared. Without that, only the same-footage snapshot
-re-encode (q3 vs hq vs png of the baseline recording) is allowed to speak about
-score reads. YUY2 vs MJPEG is a different photon stream unless the picture is held.
+    %LOCALAPPDATA%\\QorCap\\venv\\Scripts\\python.exe tools\\capture_ab.py --secs 15 --stable-picture
+
+ffmpeg is taken from --ffmpeg, from ffmpeg.exe beside qorcap.exe (the release
+bundle), or from %LOCALAPPDATA%\\QorCap\\ffmpeg.exe. If none of those exist the
+harness stops and asks for --ffmpeg. qortime is not downloaded; pass --qortime
+or put the bundle's qortime folder next to qorcap.exe.
+
+Pause Madden on a readable scorebug for the whole run and pass --stable-picture.
+That flag compares the scorebug bar (the same 1280x720 crop Glimpse uses) across
+the take and against the baseline take. A take whose bar changes is retried once
+and then flagged, so live play cannot silently pass as the same footage.
+
+--yuy2-720p60 is not recommended for the MS2131. A live 15s Madden take on
+2026-10-20 (score held at 3-0) delivered 11.6 fps, 27 "real-time buffer too full"
+drops, a 400 MB video queue, and missed the 3-0. The USB link check on that run
+returned unknown (0 bytes of PnP text, 30 modes) because the PnP probe produced
+nothing; the mode list is a separate ffmpeg query. Leave the flag off.
 
 Promotion rule
 --------------
@@ -20,16 +34,19 @@ A flag may become the default only when, against this baseline:
 * zero new wrong score reads (no locked home/away pair the baseline did not lock)
 * no missed locked scores (every baseline home/away pair was locked again)
 * successful reads (agreed frames) are not fewer
+* both sides have at least 8 successful reads (fewer than that is undecided, not a fail)
 * the baseline actually locked at least one score (otherwise score quality is not proven)
-* the comparison is on the same footage (same-footage re-encode, or live takes with --stable-picture)
+* the comparison is on the same footage (same-footage re-encode, or live takes whose
+  scorebug region stayed stable under --stable-picture)
 * dropped frames are not higher, and duplicate frames are not higher
 * audio lag is not worse (variant <= baseline + 0.5s; a new lag above 0.5s fails)
 * video real-time queue is not higher by more than 1 MB
-* CPU of qorcap+ffmpeg is not meaningfully higher: not above baseline by more than
-  max(8 percentage points, 25% of the baseline CPU). CPU is the sum of one-core
-  percents, so two busy cores read as 200%.
-* disk MB/min of the recording is not higher by more than 0.05 MB/min
-  (the noise floor). Anything above that is flagged. The laptop this was sized
+* CPU of the qorcap process tree (qorcap + ffmpeg) is not meaningfully higher: not
+  above baseline by more than max(8 percentage points, 25% of the baseline CPU).
+  CPU is the sum of one-core percents, so two busy cores read as 200%.
+  A missing sample or a zero delta is not measured and does not pass.
+* disk MB/min, from the recording's ffprobe duration (not wall-clock), is not higher
+  by more than max(4 MB/min, 10% of the baseline rate). The laptop this was sized
   for had about 6.4 GB free.
 
 If a number was not measured, the flag is not promoted.
@@ -50,10 +67,36 @@ from pathlib import Path
 # Noise floors and the CPU gate. These are the promotion rule, not suggestions.
 CPU_ABS_POINTS = 8.0
 CPU_REL = 0.25
-DISK_NOISE_MB_PER_MIN = 0.05
+# 8 Mbit/s CBR plus 160 kbit/s audio is about 58 MiB/min. A 15s ffprobe duration
+# that is off by a few tenths of a second, plus container padding, moves the rate
+# by a few MB/min. The old 0.05 MB/min floor flagged that noise.
+DISK_ABS_MB_PER_MIN = 4.0
+DISK_REL = 0.10
 LAG_NOISE_S = 0.5
 VIDEO_QUEUE_NOISE_MB = 1.0
 AUDIO_BYTES_PER_SEC = 48_000 * 2 * 2  # 16-bit stereo 48 kHz, the card's native format
+MIN_SUCCESSFUL_READS = 8
+SNAP_HZ = 4.0
+SNAP_INTERVAL_S = 1.0 / SNAP_HZ
+CPU_INTERVAL_S = 0.5
+CPU_MIN_SPAN_S = 0.5
+POLL_S = 0.05
+# Same bar Glimpse crops: y0, y1, x0, x1 on a 1280x720 frame (standard / SNP / TNP / MNP).
+SCOREBUG_BOX = (640, 720, 300, 980)
+MEAN_LIMIT = 8.0
+TILE_LIMIT = 24.0
+TILE_PX = 16
+# A couple of startup or glitch frames must not fail a paused take. A score change
+# that covers more than this fraction of the saved strips is a different picture.
+CHANGED_FRACTION = 0.15
+
+# Measured on the MS2131 with live Madden held at 3-0 (2026-10-20, 15s). Not a default.
+YUY2_NOT_RECOMMENDED = (
+    "Not recommended for the MS2131. A 2026-10-20 live Madden take at 3-0 delivered "
+    "11.6 fps, 27 real-time buffer drops, a 400 MB video queue, and missed the 3-0. "
+    "USB link check returned unknown (0 bytes of PnP text, 30 modes) because the PnP "
+    "probe produced no text; the 30 modes came from ffmpeg -list_options. Leave --yuy2-720p60 off."
+)
 
 # Baseline is today's Start Match capture: explicit mjpeg 720p30, no tune flags.
 # (The qorcap CLI default for --input-format is `auto`. Start Match passes mjpeg.)
@@ -77,6 +120,19 @@ SAME_FOOTAGE = {
     "hq": ["-q:v", "2"],
     "png": ["-c:v", "png", "-compression_level", "1"],
 }
+
+_UNDECIDED_MARKERS = (
+    "was not measured",
+    "too few score reads",
+    "could not be verified",
+    "did not run",
+    "not proven",
+)
+
+
+def venv_python_hint() -> str:
+    local = os.environ.get("LOCALAPPDATA") or "%LOCALAPPDATA%"
+    return str(Path(local) / "QorCap" / "venv" / "Scripts" / "python.exe")
 
 
 def record_command(qorcap: str, ffmpeg: str | None, port: int, log: str, out: str, secs: int,
@@ -185,15 +241,50 @@ def summarize_buffer(text: str) -> dict:
 
 
 def cpu_percent(cpu_seconds: float | None, wall_seconds: float | None) -> float | None:
-    if cpu_seconds is None or wall_seconds is None or wall_seconds <= 0:
+    """Percent of one core. A missing or non-positive CPU delta is not a measurement."""
+    if cpu_seconds is None or wall_seconds is None or wall_seconds <= 0 or cpu_seconds <= 0:
         return None
     return 100.0 * cpu_seconds / wall_seconds
+
+
+def cpu_percent_from_samples(samples: list[tuple[float, float]]) -> float | None:
+    """CPU% from (monotonic_time, process-tree cpu seconds) samples.
+
+    Needs two samples at least CPU_MIN_SPAN_S apart whose CPU-seconds increased.
+    A flat or all-zero series is not measured (the old harness reported that as 0.0%
+    and the gate treated 0.0 as a pass).
+    """
+    if len(samples) < 2:
+        return None
+    t0, s0 = samples[0]
+    t1, s1 = samples[-1]
+    wall = t1 - t0
+    if wall < CPU_MIN_SPAN_S or s1 <= 0:
+        return None
+    delta = s1 - s0
+    if delta <= 0:
+        return None
+    return cpu_percent(delta, wall)
+
+
+def disk_limit(baseline_rate: float) -> float:
+    return baseline_rate + max(DISK_ABS_MB_PER_MIN, DISK_REL * baseline_rate)
 
 
 def disk_mb_per_min(nbytes: int | None, seconds: float | None) -> float | None:
     if nbytes is None or seconds is None or seconds <= 0:
         return None
     return (nbytes / (1024 * 1024)) / (seconds / 60.0)
+
+
+def parse_duration(text: str) -> float | None:
+    try:
+        dur = float((text or "").strip())
+    except ValueError:
+        return None
+    if dur <= 0:
+        return None
+    return dur
 
 
 def score_delta(baseline_rows: list[dict], variant_rows: list[dict]) -> dict:
@@ -251,34 +342,48 @@ def promotion_decision(baseline: dict, variant: dict) -> dict:
     if v_q is not None and v_q > (b_q or 0.0) + VIDEO_QUEUE_NOISE_MB:
         reasons.append(f"video queue {v_q:.1f} MB is above baseline {(b_q or 0):.1f} MB")
 
-    cpu = both("cpu_pct")
-    if cpu:
-        limit = cpu[0] + max(CPU_ABS_POINTS, CPU_REL * cpu[0])
-        if cpu[1] > limit:
-            reasons.append(f"CPU {cpu[1]:.1f}% is meaningfully above baseline {cpu[0]:.1f}% (limit {limit:.1f}%)")
-    disk = both("disk_mb_per_min")
+    b_cpu, v_cpu = baseline.get("cpu_pct"), variant.get("cpu_pct")
+    if b_cpu is None or v_cpu is None or b_cpu <= 0 or v_cpu <= 0:
+        reasons.append("cpu_pct was not measured")
+    else:
+        limit = b_cpu + max(CPU_ABS_POINTS, CPU_REL * b_cpu)
+        if v_cpu > limit:
+            reasons.append(f"CPU {v_cpu:.1f}% is meaningfully above baseline {b_cpu:.1f}% (limit {limit:.1f}%)")
+    b_disk, v_disk = baseline.get("disk_mb_per_min"), variant.get("disk_mb_per_min")
     disk_raised = False
-    if disk and disk[1] > disk[0] + DISK_NOISE_MB_PER_MIN:
-        disk_raised = True
-        reasons.append(
-            f"disk {disk[1]:.2f} MB/min is above baseline {disk[0]:.2f} MB/min "
-            f"(laptop free space is tight; anything over +{DISK_NOISE_MB_PER_MIN} MB/min is flagged)"
-        )
+    if b_disk is None or v_disk is None or b_disk <= 0 or v_disk <= 0:
+        reasons.append("disk_mb_per_min was not measured")
+    else:
+        limit = disk_limit(b_disk)
+        if v_disk > limit:
+            disk_raised = True
+            slack = limit - b_disk
+            reasons.append(
+                f"disk {v_disk:.2f} MB/min is above baseline {b_disk:.2f} MB/min "
+                f"(tolerance +{slack:.2f} MB/min from ffprobe duration)"
+            )
 
     if not variant.get("same_footage"):
-        reasons.append("scorebug comparison is not on the same footage")
+        reasons.append(variant.get("picture_reason") or "scorebug comparison is not on the same footage")
     if baseline.get("reads_succeeded") is None or variant.get("reads_succeeded") is None:
         reasons.append("scorebug reader did not run")
     else:
-        if int(baseline.get("baseline_locks") or 0) <= 0 or int(baseline.get("reads_succeeded") or 0) <= 0:
-            reasons.append("baseline locked no scores; score quality is not proven")
-        if variant["reads_succeeded"] < baseline["reads_succeeded"]:
-            reasons.append(f"fewer successful reads ({variant['reads_succeeded']} < {baseline['reads_succeeded']})")
-        if int(variant.get("wrong_reads") or 0) > 0:
-            reasons.append(f"new wrong score reads: {variant.get('wrong_pairs')}")
-        if int(variant.get("missed_scores") or 0) > 0:
-            reasons.append(f"missed scores the baseline locked: {variant.get('missed_pairs')}")
-    # de-duplicate while keeping order
+        b_ok = int(baseline.get("reads_succeeded") or 0)
+        v_ok = int(variant.get("reads_succeeded") or 0)
+        if b_ok < MIN_SUCCESSFUL_READS or v_ok < MIN_SUCCESSFUL_READS:
+            reasons.append(
+                f"too few score reads to decide (baseline {b_ok}, variant {v_ok}; "
+                f"need at least {MIN_SUCCESSFUL_READS} successful reads each)"
+            )
+        else:
+            if int(baseline.get("baseline_locks") or 0) <= 0:
+                reasons.append("baseline locked no scores; score quality is not proven")
+            if v_ok < b_ok:
+                reasons.append(f"fewer successful reads ({v_ok} < {b_ok})")
+            if int(variant.get("wrong_reads") or 0) > 0:
+                reasons.append(f"new wrong score reads: {variant.get('wrong_pairs')}")
+            if int(variant.get("missed_scores") or 0) > 0:
+                reasons.append(f"missed scores the baseline locked: {variant.get('missed_pairs')}")
     seen = set()
     uniq = []
     for r in reasons:
@@ -286,6 +391,132 @@ def promotion_decision(baseline: dict, variant: dict) -> dict:
             seen.add(r)
             uniq.append(r)
     return {"promote": not uniq, "reasons": uniq, "disk_raised": disk_raised}
+
+
+def promotion_label(row: dict) -> str:
+    """Baseline is 'ref'. A pass is 'YES'. Measurement gaps are 'undecided', not a promotion."""
+    if row.get("role") == "reference":
+        return "ref"
+    if row.get("promote"):
+        return "YES"
+    reasons = row.get("reasons") or []
+    if reasons and all(any(m in r for m in _UNDECIDED_MARKERS) for r in reasons):
+        return "undecided"
+    return "no"
+
+
+def region_distance(a: bytes, b: bytes, width: int, tile: int = TILE_PX) -> tuple[float, float]:
+    """Return (mean abs diff, max per-tile mean abs diff) for two equal gray strips."""
+    if not a or len(a) != len(b) or width <= 0 or len(a) % width != 0:
+        return (255.0, 255.0)
+    height = len(a) // width
+    total = 0
+    max_tile = 0.0
+    x = 0
+    while x < width:
+        x1 = min(width, x + tile)
+        acc = 0
+        n = 0
+        for y in range(height):
+            row = y * width
+            for i in range(x, x1):
+                acc += abs(a[row + i] - b[row + i])
+                n += 1
+        if n:
+            max_tile = max(max_tile, acc / n)
+        total += acc
+        x = x1
+    return (total / len(a), max_tile)
+
+
+def median_strip(samples: list[tuple[int, bytes]]) -> tuple[int, bytes] | None:
+    """Per-pixel median of equal-sized strips. This is the still picture, not frame 0."""
+    if not samples:
+        return None
+    width, first = samples[0]
+    strips = [s for w, s in samples if w == width and len(s) == len(first)]
+    if not strips:
+        return None
+    if len(strips) == 1:
+        return width, strips[0]
+    length = len(strips[0])
+    mid = len(strips) // 2
+    out = bytearray(length)
+    for i in range(length):
+        vals = sorted(s[i] for s in strips)
+        out[i] = vals[mid]
+    return width, bytes(out)
+
+
+def take_picture_stable(samples: list[tuple[int, bytes]]) -> dict:
+    """True when the scorebug strip stays near its median for this take.
+
+    Frame 0 is often still black or the previous scene. Those few frames do not
+    fail the take. A change that shows up in more than CHANGED_FRACTION of the
+    strips (a score that moves and stays moved) does.
+    """
+    empty = {
+        "stable": None,
+        "reason": "too few snapshots to check the scorebug region",
+        "compared": len(samples),
+        "worst_mean": None,
+        "worst_tile": None,
+        "changed_frames": 0,
+    }
+    if len(samples) < 2:
+        return empty
+    width, first = samples[0]
+    usable = [(w, s) for w, s in samples if w == width and len(s) == len(first)]
+    if len(usable) < 2:
+        return {
+            "stable": False,
+            "reason": "scorebug region size changed during the take",
+            "compared": len(samples),
+            "worst_mean": None,
+            "worst_tile": None,
+            "changed_frames": len(samples),
+        }
+    ref = median_strip(usable)
+    if ref is None:
+        return empty
+    worst_mean = 0.0
+    worst_tile = 0.0
+    changed = 0
+    for _w, s in usable:
+        mean, tile_m = region_distance(ref[1], s, width)
+        worst_mean = max(worst_mean, mean)
+        worst_tile = max(worst_tile, tile_m)
+        if mean > MEAN_LIMIT or tile_m > TILE_LIMIT:
+            changed += 1
+    fraction = changed / len(usable)
+    stable = fraction <= CHANGED_FRACTION
+    reason = None if stable else (
+        f"scorebug region changed during the take ({changed} of {len(usable)} frames)"
+    )
+    return {
+        "stable": stable,
+        "reason": reason,
+        "compared": len(usable),
+        "worst_mean": worst_mean,
+        "worst_tile": worst_tile,
+        "changed_frames": changed,
+    }
+
+
+def regions_match(a: tuple[int, bytes], b: tuple[int, bytes]) -> dict:
+    w1, s1 = a
+    w2, s2 = b
+    if w1 != w2 or len(s1) != len(s2):
+        return {"stable": False, "reason": "scorebug region size differs from the baseline take", "worst_mean": None, "worst_tile": None}
+    mean, tile_m = region_distance(s1, s2, w1)
+    if mean > MEAN_LIMIT or tile_m > TILE_LIMIT:
+        return {
+            "stable": False,
+            "reason": f"scorebug region differs from the baseline take (mean {mean:.1f}, tile {tile_m:.1f})",
+            "worst_mean": mean,
+            "worst_tile": tile_m,
+        }
+    return {"stable": True, "reason": None, "worst_mean": mean, "worst_tile": tile_m}
 
 
 def _find_qorcap(arg: str | None) -> str:
@@ -298,17 +529,55 @@ def _find_qorcap(arg: str | None) -> str:
     raise SystemExit("qorcap not found. Pass --qorcap path\\to\\qorcap.exe (build it with cargo build --release).")
 
 
-def _find_ffmpeg(arg: str | None, qorcap: str) -> str | None:
-    if arg and Path(arg).exists():
-        return arg
-    beside = Path(qorcap).resolve().parent / ("ffmpeg.exe" if os.name == "nt" else "ffmpeg")
-    if beside.exists():
-        return str(beside)
-    return shutil.which("ffmpeg")
+def resolve_ffmpeg(arg: str | None, qorcap: str, *, use_path: bool = True) -> str:
+    """ffmpeg.exe beside qorcap (the release bundle), then LOCALAPPDATA\\QorCap, then PATH.
+
+    A --ffmpeg path that does not exist is an error. It is not replaced with another binary.
+    """
+    if arg:
+        if Path(arg).exists():
+            return arg
+        raise SystemExit(
+            f"--ffmpeg was set to {arg} but that file does not exist. "
+            "Pass ffmpeg.exe from the QorCap release bundle (the folder that contains qorcap.exe)."
+        )
+    names = ("ffmpeg.exe", "ffmpeg")
+    looked: list[str] = []
+    roots = [Path(qorcap).resolve().parent]
+    local = os.environ.get("LOCALAPPDATA")
+    if local:
+        roots.append(Path(local) / "QorCap")
+    for root in roots:
+        for name in names:
+            cand = root / name
+            looked.append(str(cand))
+            if cand.exists():
+                return str(cand)
+    if use_path:
+        found = shutil.which("ffmpeg")
+        if found:
+            return found
+        looked.append("PATH")
+    raise SystemExit(
+        "ffmpeg was not found next to qorcap.exe (the release bundle) or in %LOCALAPPDATA%\\QorCap. "
+        "Re-run with --ffmpeg path\\to\\ffmpeg.exe from that bundle. Looked at: " + "; ".join(looked)
+    )
 
 
-def _find_qortime(arg: str | None) -> Path | None:
-    cands = [arg, os.getenv("QORTIME"), Path(__file__).resolve().parent.parent / "qortime"]
+def resolve_ffprobe(ffmpeg: str) -> str | None:
+    parent = Path(ffmpeg).resolve().parent
+    for name in ("ffprobe.exe", "ffprobe"):
+        cand = parent / name
+        if cand.exists():
+            return str(cand)
+    return shutil.which("ffprobe")
+
+
+def _find_qortime(arg: str | None, qorcap: str | None = None) -> Path | None:
+    cands = [arg, os.getenv("QORTIME")]
+    if qorcap:
+        cands.append(str(Path(qorcap).resolve().parent / "qortime"))
+    cands.append(str(Path(__file__).resolve().parent.parent / "qortime"))
     for c in cands:
         if c and (Path(c) / "qor_receipt" / "receipt.py").exists():
             return Path(c).resolve()
@@ -331,24 +600,130 @@ def _get_bytes(url: str, timeout: float = 1.0) -> bytes | None:
         return None
 
 
-def _cpu_seconds(pid: int) -> float | None:
+def _looks_like_image(blob: bytes) -> bool:
+    return blob.startswith(b"\xff\xd8") or blob.startswith(b"\x89PNG\r\n\x1a\n")
+
+
+def _tree_cpu_psutil(psutil, pid: int) -> float | None:
+    try:
+        root = psutil.Process(pid)
+    except Exception:
+        return None
+    procs = [root]
+    try:
+        procs.extend(root.children(recursive=True))
+    except Exception:
+        pass
+    total = 0.0
+    seen = 0
+    for proc in procs:
+        try:
+            times = proc.cpu_times()
+            total += float(times.user) + float(times.system)
+            seen += 1
+        except Exception:
+            continue
+    if seen == 0:
+        return None
+    return total
+
+
+def _tree_cpu_windows(root_pid: int) -> float | None:
+    """Sum user+kernel seconds of root_pid and every descendant. Toolhelp + GetProcessTimes.
+
+    psutil is used when it imports. This is the fallback so the QorCap venv does not
+    need another package. It does not spawn PowerShell (that enumeration made the
+    snapshot poll run a handful of times per take and report 0.0% CPU).
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    TH32CS_SNAPPROCESS = 0x00000002
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+
+    class PROCESSENTRY32W(ctypes.Structure):
+        _fields_ = [
+            ("dwSize", wintypes.DWORD),
+            ("cntUsage", wintypes.DWORD),
+            ("th32ProcessID", wintypes.DWORD),
+            ("th32DefaultHeapID", ctypes.c_size_t),
+            ("th32ModuleID", wintypes.DWORD),
+            ("cntThreads", wintypes.DWORD),
+            ("th32ParentProcessID", wintypes.DWORD),
+            ("pcPriClassBase", ctypes.c_long),
+            ("dwFlags", wintypes.DWORD),
+            ("szExeFile", ctypes.c_wchar * 260),
+        ]
+
+    class FILETIME(ctypes.Structure):
+        _fields_ = [("dwLowDateTime", wintypes.DWORD), ("dwHighDateTime", wintypes.DWORD)]
+
+    kernel32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+    kernel32.CreateToolhelp32Snapshot.restype = ctypes.c_void_p
+    kernel32.Process32FirstW.argtypes = [ctypes.c_void_p, ctypes.POINTER(PROCESSENTRY32W)]
+    kernel32.Process32FirstW.restype = wintypes.BOOL
+    kernel32.Process32NextW.argtypes = [ctypes.c_void_p, ctypes.POINTER(PROCESSENTRY32W)]
+    kernel32.Process32NextW.restype = wintypes.BOOL
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.OpenProcess.restype = ctypes.c_void_p
+    kernel32.GetProcessTimes.argtypes = [
+        ctypes.c_void_p, ctypes.POINTER(FILETIME), ctypes.POINTER(FILETIME),
+        ctypes.POINTER(FILETIME), ctypes.POINTER(FILETIME),
+    ]
+    kernel32.GetProcessTimes.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+
+    snap = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+    invalid = ctypes.c_void_p(-1).value
+    if not snap or snap == invalid:
+        return None
+    parents: dict[int, int] = {}
+    try:
+        entry = PROCESSENTRY32W()
+        entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)
+        ok = kernel32.Process32FirstW(snap, ctypes.byref(entry))
+        while ok:
+            parents[int(entry.th32ProcessID)] = int(entry.th32ParentProcessID)
+            ok = kernel32.Process32NextW(snap, ctypes.byref(entry))
+    finally:
+        kernel32.CloseHandle(snap)
+    want = {int(root_pid)}
+    changed = True
+    while changed:
+        changed = False
+        for pid, ppid in parents.items():
+            if ppid in want and pid not in want:
+                want.add(pid)
+                changed = True
+
+    def ft(value: FILETIME) -> int:
+        return (int(value.dwHighDateTime) << 32) | int(value.dwLowDateTime)
+
+    total = 0
+    seen = 0
+    for pid in want:
+        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not handle:
+            continue
+        try:
+            created, exited, kernel, user = FILETIME(), FILETIME(), FILETIME(), FILETIME()
+            if kernel32.GetProcessTimes(
+                handle, ctypes.byref(created), ctypes.byref(exited), ctypes.byref(kernel), ctypes.byref(user)
+            ):
+                total += ft(kernel) + ft(user)
+                seen += 1
+        finally:
+            kernel32.CloseHandle(handle)
+    if seen == 0:
+        return None
+    return total / 10_000_000.0
+
+
+def _tree_cpu_proc(pid: int) -> float | None:
     if pid <= 0:
         return None
-    if os.name == "nt":
-        script = (
-            f"$ids = @({pid}); "
-            f"Get-CimInstance Win32_Process | Where-Object {{ $_.ParentProcessId -eq {pid} }} | "
-            "ForEach-Object { $ids += $_.ProcessId }; "
-            "$sum = 0.0; foreach ($id in $ids) { "
-            "$p = Get-Process -Id $id -ErrorAction SilentlyContinue; "
-            "if ($p -and $null -ne $p.CPU) { $sum += [double]$p.CPU } }; Write-Output $sum"
-        )
-        try:
-            out = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
-                                 capture_output=True, text=True, timeout=8)
-            return float((out.stdout or "").strip().splitlines()[-1])
-        except Exception:
-            return None
     ticks = os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else 100
     total = 0.0
     seen = False
@@ -369,13 +744,44 @@ def _cpu_seconds(pid: int) -> float | None:
         try:
             stat = Path(f"/proc/{p}/stat").read_text()
             rest = stat.rsplit(")", 1)[-1].split()
-            total += int(rest[11]) + int(rest[12])  # utime, stime after comm
+            total += int(rest[11]) + int(rest[12])
             seen = True
         except Exception:
             continue
     if not seen:
         return None
     return total / float(ticks)
+
+
+class TreeCpu:
+    """CPU seconds of one process and its descendants, sampled on the caller's interval."""
+
+    def __init__(self, pid: int):
+        self.pid = pid
+        self.samples: list[tuple[float, float]] = []
+        self.failures = 0
+        try:
+            import psutil
+            self._psutil = psutil
+        except Exception:
+            self._psutil = None
+
+    def sample(self) -> None:
+        secs = self._seconds()
+        if secs is None:
+            self.failures += 1
+            return
+        self.samples.append((time.monotonic(), float(secs)))
+
+    def percent(self) -> float | None:
+        return cpu_percent_from_samples(self.samples)
+
+    def _seconds(self) -> float | None:
+        if self._psutil is not None:
+            return _tree_cpu_psutil(self._psutil, self.pid)
+        if os.name == "nt":
+            return _tree_cpu_windows(self.pid)
+        return _tree_cpu_proc(self.pid)
 
 
 def _save_snap(blob: bytes, dest: Path, n: int) -> Path:
@@ -385,10 +791,27 @@ def _save_snap(blob: bytes, dest: Path, n: int) -> Path:
     return path
 
 
-def run_variant(name: str, extra: list[str], *, qorcap: str, ffmpeg: str | None, secs: int,
-                device: str, root: Path, port: int) -> dict:
+def media_duration_s(ffprobe: str | None, path: Path) -> float | None:
+    """Container duration. Wall-clock and /status recording_secs are not the media rate."""
+    if not ffprobe or not path.exists() or path.stat().st_size <= 0:
+        return None
+    try:
+        out = subprocess.run(
+            [ffprobe, "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", str(path)],
+            capture_output=True, text=True, timeout=20,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return parse_duration(out.stdout or "")
+
+
+def run_variant(name: str, extra: list[str], *, qorcap: str, ffmpeg: str | None, ffprobe: str | None,
+                secs: int, device: str, root: Path, port: int) -> dict:
     d = root / name
-    d.mkdir(parents=True, exist_ok=True)
+    if d.exists():
+        shutil.rmtree(d)
+    d.mkdir(parents=True)
     snaps = d / "snaps"
     snaps.mkdir(exist_ok=True)
     out = d / "video.mp4"
@@ -397,38 +820,42 @@ def run_variant(name: str, extra: list[str], *, qorcap: str, ffmpeg: str | None,
     (d / "command.txt").write_text(" ".join(cmd), encoding="utf-8")
     proc = subprocess.Popen(cmd)
     t0 = time.monotonic()
-    cpu0 = _cpu_seconds(proc.pid)
-    last_cpu = cpu0
+    sampler = TreeCpu(proc.pid)
+    sampler.sample()
+    next_cpu = t0 + CPU_INTERVAL_S
+    next_snap = t0
     last: dict = {}
     seen: set[bytes] = set()
     saved = 0
     deadline = t0 + secs + 40
     while proc.poll() is None and time.monotonic() < deadline:
+        now = time.monotonic()
         st = _get_json(f"http://127.0.0.1:{port}/status")
         if st:
             last = st
-        blob = _get_bytes(f"http://127.0.0.1:{port}/snapshot.jpg")
-        if blob and len(blob) > 8:
-            h = hashlib.sha256(blob).digest()
-            if h not in seen:
-                seen.add(h)
+        if now >= next_snap:
+            blob = _get_bytes(f"http://127.0.0.1:{port}/snapshot.jpg")
+            if blob and _looks_like_image(blob):
+                digest = hashlib.sha256(blob).digest()
+                if digest not in seen:
+                    seen.add(digest)
                 saved += 1
                 _save_snap(blob, snaps, saved)
-        sample = _cpu_seconds(proc.pid)
-        if sample is not None:
-            last_cpu = sample
-        time.sleep(0.25)
+                next_snap = now + SNAP_INTERVAL_S
+        if now >= next_cpu:
+            sampler.sample()
+            next_cpu = now + CPU_INTERVAL_S
+        time.sleep(POLL_S)
     if proc.poll() is None:
         proc.terminate()
         try:
             proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
             proc.kill()
+    sampler.sample()
     wall = max(0.001, time.monotonic() - t0)
-    cpu = None
-    if cpu0 is not None and last_cpu is not None:
-        cpu = cpu_percent(max(0.0, last_cpu - cpu0), wall)
     nbytes = out.stat().st_size if out.exists() else 0
+    duration = media_duration_s(ffprobe, out)
     log_text = log.read_text(encoding="utf-8", errors="replace") if log.exists() else ""
     buf = summarize_buffer(log_text)
     # /status counts only exist when --buffer-watch is on. The log count is the fair comparison.
@@ -438,6 +865,7 @@ def run_variant(name: str, extra: list[str], *, qorcap: str, ffmpeg: str | None,
         buf["video_queued_mb"] = max(buf["video_queued_mb"] or 0.0, float(last["buffer_video_queued_mb"]))
     frames = int(last.get("frames") or 0)
     rec_secs = float(last.get("recording_secs") or 0.0) or wall
+    expected = int(secs * SNAP_HZ)
     return {
         "name": name,
         "extra": extra,
@@ -447,12 +875,17 @@ def run_variant(name: str, extra: list[str], *, qorcap: str, ffmpeg: str | None,
         "delivered_fps": (frames / rec_secs) if rec_secs else None,
         "drop_frames": int(last.get("drop_frames") or 0) if last else None,
         "dup_frames": int(last.get("dup_frames") or 0) if last else None,
-        "cpu_pct": cpu,
-        "disk_mb_per_min": disk_mb_per_min(nbytes, rec_secs) if nbytes else None,
+        "cpu_pct": sampler.percent(),
+        "cpu_samples": len(sampler.samples),
+        "cpu_sample_failures": sampler.failures,
+        "disk_mb_per_min": disk_mb_per_min(nbytes, duration) if nbytes else None,
+        "media_duration_s": duration,
         "recording_bytes": nbytes,
         "recording_secs": rec_secs,
         "wall_secs": wall,
         "snapshots_saved": saved,
+        "snapshots_unique": len(seen),
+        "snapshots_expected": expected,
         "snap_dir": str(snaps),
         "warning": last.get("warning"),
         "no_signal": bool(last.get("no_signal")),
@@ -518,7 +951,73 @@ def extract_mode(ffmpeg: str, video: Path, dest: Path, mode: str) -> list[Path]:
     return sorted(dest.glob(f"f*.{ext}"))
 
 
-def _metric_row(live: dict, scores: dict, same: bool, delta: dict | None) -> dict:
+def extract_scorebug_gray(path: Path, ffmpeg: str | None) -> tuple[int, bytes] | None:
+    """Gray scorebug strip. cv2 when the venv has it, otherwise one ffmpeg rawvideo crop."""
+    y0, y1, x0, x1 = SCOREBUG_BOX
+    width, height = x1 - x0, y1 - y0
+    try:
+        import cv2
+        img = cv2.imread(str(path), cv2.IMREAD_COLOR)
+        if img is not None:
+            if img.shape[1] != 1280 or img.shape[0] != 720:
+                img = cv2.resize(img, (1280, 720))
+            crop = img[y0:y1, x0:x1]
+            gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+            return int(gray.shape[1]), gray.tobytes()
+    except Exception:
+        pass
+    if not ffmpeg:
+        return None
+    vf = f"scale=1280:720,crop={width}:{height}:{x0}:{y0}"
+    try:
+        out = subprocess.run(
+            [ffmpeg, "-hide_banner", "-loglevel", "error", "-i", str(path), "-frames:v", "1",
+             "-vf", vf, "-f", "rawvideo", "-pix_fmt", "gray", "pipe:1"],
+            capture_output=True, timeout=15,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    raw = out.stdout or b""
+    if len(raw) != width * height:
+        return None
+    return width, raw
+
+
+def assess_snapshots(paths: list[Path], ffmpeg: str | None) -> tuple[dict, tuple[int, bytes] | None]:
+    samples: list[tuple[int, bytes]] = []
+    for path in paths:
+        gray = extract_scorebug_gray(path, ffmpeg)
+        if gray is not None:
+            samples.append(gray)
+    verdict = take_picture_stable(samples)
+    ref = median_strip(samples)
+    return verdict, ref
+
+
+def _apply_picture(live: dict, verdict: dict, *, retried: bool) -> None:
+    live["picture_stable"] = verdict["stable"]
+    live["picture_reason"] = verdict["reason"]
+    live["picture_compared"] = verdict["compared"]
+    live["picture_worst_mean"] = verdict["worst_mean"]
+    live["picture_worst_tile"] = verdict["worst_tile"]
+    live["picture_retried"] = retried
+
+
+def _live_same(name: str, live: dict, stable_flag: bool) -> tuple[bool, str | None]:
+    if name in ("reader_hq", "reader_png"):
+        return True, None
+    if not stable_flag:
+        return False, None
+    if live.get("picture_stable") is not True:
+        if live.get("picture_stable") is False:
+            return False, live.get("picture_reason") or "scorebug region changed during the take"
+        return False, "stable-picture could not be verified (scorebug region was not decoded)"
+    if live.get("picture_matches_baseline") is not True:
+        return False, live.get("picture_cross_reason") or "stable-picture could not be verified against the baseline take"
+    return True, None
+
+
+def _metric_row(live: dict, scores: dict, same: bool, delta: dict | None, picture_reason: str | None = None) -> dict:
     row = {
         "capture_ok": live.get("capture_ok"),
         "drop_frames": live.get("drop_frames"),
@@ -529,6 +1028,7 @@ def _metric_row(live: dict, scores: dict, same: bool, delta: dict | None) -> dic
         "cpu_pct": live.get("cpu_pct"),
         "disk_mb_per_min": live.get("disk_mb_per_min"),
         "same_footage": same,
+        "picture_reason": picture_reason,
         "reads_attempted": scores.get("reads_attempted"),
         "reads_succeeded": scores.get("reads_succeeded"),
         "wrong_reads": None if delta is None else delta["wrong_reads"],
@@ -551,21 +1051,26 @@ def _fmt(v, spec=""):
 def _print_report(report: dict) -> None:
     print()
     print("QorCap capture A/B")
-    print("promotion: zero new wrong scores, no missed scores, no fewer successful reads,")
-    print("no more drops or duplicates, lag no worse, CPU not meaningfully higher,")
-    print(f"disk not above +{DISK_NOISE_MB_PER_MIN} MB/min. Flags stay off until that passes.")
+    print("promotion: zero new wrong scores, no missed scores, no fewer successful reads")
+    print(f"(at least {MIN_SUCCESSFUL_READS} each, otherwise undecided), no more drops or duplicates,")
+    print("lag no worse, CPU not meaningfully higher (a zero or missing sample does not pass),")
+    print(f"disk not above max(+{DISK_ABS_MB_PER_MIN} MB/min, +{DISK_REL:.0%} of baseline) from ffprobe duration.")
+    print("The baseline row is the reference. Flags stay off until a variant prints YES.")
+    print(YUY2_NOT_RECOMMENDED)
     print()
-    hdr = f"{'variant':<20} {'fps':>6} {'drop':>5} {'dup':>5} {'lag_s':>6} {'cpu%':>7} {'MB/min':>8} {'reads':>7} {'wrong':>5} {'promote':>8}"
+    hdr = f"{'variant':<20} {'fps':>6} {'drop':>5} {'dup':>5} {'lag_s':>6} {'cpu%':>7} {'MB/min':>8} {'snaps':>5} {'reads':>7} {'wrong':>5} {'promote':>9}"
     print(hdr)
     print("-" * len(hdr))
     for name, row in report["promotion"].items():
         live = report["variants"].get(name, {})
+        label = promotion_label(row)
         print(f"{name:<20} {_fmt(live.get('delivered_fps'), '.1f'):>6} {_fmt(live.get('drop_frames')):>5} "
               f"{_fmt(live.get('dup_frames')):>5} {_fmt(live.get('audio_lag_s'), '.1f'):>6} "
               f"{_fmt(live.get('cpu_pct'), '.1f'):>7} {_fmt(live.get('disk_mb_per_min'), '.2f'):>8} "
+              f"{_fmt(live.get('snapshots_saved')):>5} "
               f"{_fmt(row.get('reads_succeeded')):>7} {_fmt(row.get('wrong_reads')):>5} "
-              f"{'YES' if row['promote'] else 'no':>8}")
-        if not row["promote"]:
+              f"{label:>9}")
+        if label not in ("YES", "ref"):
             for reason in row["reasons"]:
                 print(f"    - {reason}")
     if report.get("scorebug_error"):
@@ -575,29 +1080,49 @@ def _print_report(report: dict) -> None:
     print("full report:", report["report_path"])
 
 
+def _cv2_hint() -> str | None:
+    try:
+        import cv2  # noqa: F401
+    except Exception as e:
+        return (
+            f"cv2 is not importable ({type(e).__name__}: {e}). "
+            f"Plain py -3 does not have it. Re-run with {venv_python_hint()} "
+            "or score reads stay unmeasured and nothing can be promoted on score quality."
+        )
+    return None
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="Record a short capture A/B and apply the promotion rule.")
     ap.add_argument("--qorcap")
-    ap.add_argument("--ffmpeg")
+    ap.add_argument("--ffmpeg", help="ffmpeg.exe. Default: the copy beside qorcap.exe in the release bundle")
     ap.add_argument("--qortime", help="qortime checkout (the scorebug reader). Not downloaded.")
     ap.add_argument("--device", default="USB3.0 Video")
     ap.add_argument("--secs", type=int, default=15)
     ap.add_argument("--out", help="directory for the takes (default: a temp folder)")
     ap.add_argument("--stable-picture", action="store_true",
-                    help="the scorebug was paused/static, so live takes are the same footage")
+                    help="verify the scorebug bar stays stable during each take and matches the baseline take")
     ap.add_argument("--variants", help="comma list; baseline is always included. Default: all")
     ap.add_argument("--port", type=int, default=8791)
     args = ap.parse_args(argv)
     if os.name != "nt":
         print("This harness records from a DirectShow capture card. Run it on the Windows laptop.", file=sys.stderr)
+        print(f"Use {venv_python_hint()} (plain py -3 has no cv2).", file=sys.stderr)
         print("The promotion rule is covered by: python -m pytest -q tools/test_capture_ab.py", file=sys.stderr)
         return 2
+    hint = _cv2_hint()
+    if hint:
+        print(hint, file=sys.stderr)
     qorcap = _find_qorcap(args.qorcap)
-    ffmpeg = _find_ffmpeg(args.ffmpeg, qorcap)
-    if not ffmpeg:
-        print("ffmpeg not found. Pass --ffmpeg path\\to\\ffmpeg.exe", file=sys.stderr)
+    try:
+        ffmpeg = resolve_ffmpeg(args.ffmpeg, qorcap)
+    except SystemExit as e:
+        print(str(e), file=sys.stderr)
         return 2
-    qortime = _find_qortime(args.qortime)
+    ffprobe = resolve_ffprobe(ffmpeg)
+    if ffprobe is None:
+        print("ffprobe was not found beside ffmpeg. Disk MB/min will be unmeasured and cannot pass.", file=sys.stderr)
+    qortime = _find_qortime(args.qortime, qorcap)
     root = Path(args.out) if args.out else Path(os.environ.get("TEMP", ".")) / "qorcap-capture-ab"
     root.mkdir(parents=True, exist_ok=True)
     free_gb = shutil.disk_usage(root).free / (1024 ** 3)
@@ -607,19 +1132,62 @@ def main(argv: list[str] | None = None) -> int:
     wanted = {v.strip() for v in args.variants.split(",")} if args.variants else None
     plan = [("baseline", [])] + [v for v in VARIANTS if v[0] != "baseline" and (wanted is None or v[0] in wanted)]
     print(f"recording {len(plan)} variants, {args.secs}s each, into {root}")
-    print(f"free {free_gb:.2f} GB. Pause on a readable scorebug and pass --stable-picture for live score comparison.")
+    print(f"free {free_gb:.2f} GB. ffmpeg: {ffmpeg}")
+    print("Pause on a readable scorebug. --stable-picture checks that the scorebug bar does not change.")
     lives = {}
+    refs: dict[str, tuple[int, bytes] | None] = {}
     for i, (name, extra) in enumerate(plan):
         print(f"  [{i + 1}/{len(plan)}] {name} {' '.join(extra)}".rstrip())
-        lives[name] = run_variant(name, extra, qorcap=qorcap, ffmpeg=ffmpeg, secs=args.secs,
-                                  device=args.device, root=root, port=args.port + i)
-        print(f"     frames={lives[name]['frames']} fps={lives[name]['delivered_fps']} "
-              f"drops={lives[name]['drop_frames']} disk={lives[name]['disk_mb_per_min']}")
-    score_err = None
+        live = run_variant(name, extra, qorcap=qorcap, ffmpeg=ffmpeg, ffprobe=ffprobe, secs=args.secs,
+                           device=args.device, root=root, port=args.port + i)
+        paths = sorted((root / name / "snaps").glob("snap*"))
+        verdict, ref = assess_snapshots(paths, ffmpeg)
+        retried = False
+        if args.stable_picture and verdict["stable"] is False:
+            print(f"     {verdict['reason']}; retrying this take once")
+            live = run_variant(name, extra, qorcap=qorcap, ffmpeg=ffmpeg, ffprobe=ffprobe, secs=args.secs,
+                               device=args.device, root=root, port=args.port + i)
+            paths = sorted((root / name / "snaps").glob("snap*"))
+            verdict, ref = assess_snapshots(paths, ffmpeg)
+            retried = True
+        _apply_picture(live, verdict, retried=retried)
+        refs[name] = ref
+        lives[name] = live
+        print(f"     frames={live['frames']} fps={live['delivered_fps']} drops={live['drop_frames']} "
+              f"snaps={live['snapshots_saved']}/{live['snapshots_expected']} unique={live['snapshots_unique']} "
+              f"cpu={live['cpu_pct']} samples={live['cpu_samples']} disk={live['disk_mb_per_min']} "
+              f"media_s={live['media_duration_s']}")
+    base_ref = refs.get("baseline")
+    base_stable = (lives.get("baseline") or {}).get("picture_stable")
+    for name, live in lives.items():
+        if name == "baseline":
+            live["picture_matches_baseline"] = True
+            live["picture_cross_reason"] = None
+            continue
+        if name in ("reader_hq", "reader_png"):
+            live["picture_matches_baseline"] = None
+            live["picture_cross_reason"] = None
+            continue
+        ref = refs.get(name)
+        if base_stable is False:
+            live["picture_matches_baseline"] = False
+            live["picture_cross_reason"] = "baseline scorebug region changed during the reference take"
+        elif base_ref is None or ref is None:
+            live["picture_matches_baseline"] = None
+            live["picture_cross_reason"] = "stable-picture could not be verified against the baseline take"
+        else:
+            match = regions_match(base_ref, ref)
+            live["picture_matches_baseline"] = match["stable"]
+            live["picture_cross_reason"] = match["reason"]
+            live["picture_cross_mean"] = match.get("worst_mean")
+            live["picture_cross_tile"] = match.get("worst_tile")
+    score_err = hint
     same_scores = {}
     base_video = root / "baseline" / "video.mp4"
     if qortime is None:
-        score_err = "qortime not found; pass --qortime. Score reads were not run, so nothing can be promoted."
+        score_err = "qortime not found; pass --qortime or use the bundle folder that contains qortime\\. Score reads were not run, so nothing can be promoted."
+    elif hint:
+        score_err = hint
     elif ffmpeg and base_video.exists() and base_video.stat().st_size > 0:
         for mode in ("q3", "hq", "png"):
             frames = extract_mode(ffmpeg, base_video, root / "same-footage" / mode, mode)
@@ -629,7 +1197,7 @@ def main(argv: list[str] | None = None) -> int:
     else:
         score_err = "baseline recording missing; same-footage score reads were not run"
     live_scores = {}
-    if qortime is not None:
+    if qortime is not None and hint is None:
         for name, live in lives.items():
             paths = sorted(Path(live["snap_dir"]).glob("snap*"))
             live_scores[name] = score_paths(paths, qortime)
@@ -640,55 +1208,65 @@ def main(argv: list[str] | None = None) -> int:
     promotion = {}
     for name, _extra in plan:
         live = lives[name]
+        if name == "baseline":
+            scores = live_scores.get(name) or {"reads_attempted": None, "reads_succeeded": None, "locks": []}
+            promotion[name] = {
+                "promote": False,
+                "role": "reference",
+                "reasons": [],
+                "disk_raised": False,
+                "reads_succeeded": scores.get("reads_succeeded"),
+                "wrong_reads": 0,
+            }
+            continue
         if name in ("reader_hq", "reader_png"):
             mode = "hq" if name == "reader_hq" else "png"
             scores = same_scores.get(mode) or {"reads_attempted": None, "reads_succeeded": None, "locks": []}
             base_scores = base_same
-            same = True
-            # Live capture metrics still come from the flagged recording. Scores come from one file.
+            delta = score_delta(base_scores.get("locks") or [], scores.get("locks") or [])
             metric_base = dict(base_live)
+            metric_base["same_footage"] = True
             metric_base["reads_succeeded"] = base_scores.get("reads_succeeded")
             metric_base["reads_attempted"] = base_scores.get("reads_attempted")
-            metric_base["baseline_locks"] = score_delta(base_scores.get("locks") or [], []).get("baseline_locks")
-            # score_delta(base, []) puts baseline pairs in missed and baseline_locks = len(base).
-            # Recompute properly:
-            delta = score_delta(base_scores.get("locks") or [], scores.get("locks") or [])
             metric_base["baseline_locks"] = delta["baseline_locks"]
+            metric_base["wrong_reads"] = 0
+            metric_base["missed_scores"] = 0
             metric_base["capture_ok"] = base_live.get("capture_ok")
             metric_var = dict(live)
             metric_var.update({
                 "same_footage": True,
+                "picture_reason": None,
                 "reads_attempted": scores.get("reads_attempted"),
                 "reads_succeeded": scores.get("reads_succeeded"),
                 **{k: delta[k] for k in ("wrong_reads", "wrong_pairs", "missed_scores", "missed_pairs")},
                 "baseline_locks": delta["baseline_locks"],
             })
-            metric_base["same_footage"] = True
-            metric_base["reads_succeeded"] = base_scores.get("reads_succeeded")
-            metric_base["wrong_reads"] = 0
-            metric_base["missed_scores"] = 0
             promotion[name] = promotion_decision(metric_base, metric_var)
             promotion[name]["reads_succeeded"] = scores.get("reads_succeeded")
             promotion[name]["wrong_reads"] = delta["wrong_reads"]
         else:
             scores = live_scores.get(name) or {"reads_attempted": None, "reads_succeeded": None, "locks": []}
             base_scores = live_scores.get("baseline") or {"locks": [], "reads_attempted": None, "reads_succeeded": None}
-            same = bool(args.stable_picture) or name == "baseline"
+            same, picture_reason = _live_same(name, live, bool(args.stable_picture))
             delta = score_delta(base_scores.get("locks") or [], scores.get("locks") or [])
-            base_row = _metric_row(base_live, base_scores, True, score_delta(base_scores.get("locks") or [], base_scores.get("locks") or []))
-            var_row = _metric_row(live, scores, same, delta)
-            # baseline compared to itself has zero wrong/missed and same lock count
+            base_delta = score_delta(base_scores.get("locks") or [], base_scores.get("locks") or [])
+            base_row = _metric_row(base_live, base_scores, True, base_delta)
+            var_row = _metric_row(live, scores, same, delta, picture_reason)
             promotion[name] = promotion_decision(base_row, var_row)
             promotion[name]["reads_succeeded"] = scores.get("reads_succeeded")
             promotion[name]["wrong_reads"] = delta["wrong_reads"]
     report = {
         "promotion_rule": (
             "A flag may become the default only with zero new wrong score reads, no missed baseline "
-            "scores, no fewer successful reads, a baseline that locked at least one score, the same "
-            "footage, no more drops or duplicate frames, audio lag no worse than +0.5s, video queue "
-            "no worse than +1 MB, CPU not above baseline by more than max(8 points, 25% relative), "
-            "and disk MB/min not above baseline by more than 0.05. Otherwise it stays off."
+            "scores, no fewer successful reads, at least 8 successful reads on each side (otherwise "
+            "the reads gate is undecided), a baseline that locked at least one score, the same footage "
+            "(--stable-picture must show a stable scorebug bar), no more drops or duplicate frames, "
+            "audio lag no worse than +0.5s, video queue no worse than +1 MB, CPU not above baseline by "
+            "more than max(8 points, 25% relative) with a missing or zero CPU sample counting as not "
+            "measured, and disk MB/min (ffprobe media duration) not above baseline by more than "
+            "max(4 MB/min, 10% of baseline). The baseline is a reference, not a promotion. Otherwise the flag stays off."
         ),
+        "yuy2_720p60_note": YUY2_NOT_RECOMMENDED,
         "variants": lives,
         "same_footage": same_scores,
         "live_scores": {k: {kk: vv for kk, vv in v.items() if kk != "locks"} | {"locks": v.get("locks")} for k, v in live_scores.items()},
@@ -696,6 +1274,8 @@ def main(argv: list[str] | None = None) -> int:
         "scorebug_error": score_err,
         "stable_picture": bool(args.stable_picture),
         "free_gb": free_gb,
+        "ffmpeg": ffmpeg,
+        "ffprobe": ffprobe,
     }
     path = root / "capture-ab-report.json"
     path.write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")

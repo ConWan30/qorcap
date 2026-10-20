@@ -7,7 +7,7 @@
 
 use crate::cli::RecordArgs;
 use std::collections::VecDeque;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
 #[cfg(any(windows, test))]
 use std::process::Command;
@@ -104,15 +104,25 @@ impl UsbLink {
 
 /// Classify a PnP / location dump. The product string "USB3.0 Video" is not a link speed.
 /// A legacy hub IOCTL reports HighSpeed for SuperSpeed devices, so any SuperSpeed token wins.
+/// `ROOT_HUB30` / `ROOT_HUB20` are the Windows parent hubs (USB 3 vs the USB 2 companion).
 pub fn classify_usb_link(text: &str) -> UsbLink {
     if text.trim().is_empty() {
         return UsbLink::Unknown;
     }
     let lower = text.to_ascii_lowercase();
-    if has_port_token(text, "SS") || lower.contains("superspeed") || lower.contains("usb300") {
+    if has_port_token(text, "SS")
+        || lower.contains("superspeed")
+        || lower.contains("usb300")
+        || lower.contains("root_hub30")
+    {
         return UsbLink::SuperSpeed;
     }
-    if has_port_token(text, "HS") || lower.contains("highspeed") || lower.contains("high-speed") || lower.contains("rev_2100") {
+    if has_port_token(text, "HS")
+        || lower.contains("highspeed")
+        || lower.contains("high-speed")
+        || lower.contains("rev_2100")
+        || lower.contains("root_hub20")
+    {
         return UsbLink::HighSpeed;
     }
     UsbLink::Unknown
@@ -127,50 +137,151 @@ fn has_port_token(text: &str, prefix: &str) -> bool {
     })
 }
 
-/// Read-only PnP dump for VID 345F PID 2131. Empty when this is not Windows or the query fails.
-pub fn probe_usb_link() -> String {
+/// What `probe_usb_link` managed to read. Empty `text` is not a measured "unknown" link:
+/// `error` says why the probe produced nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UsbProbe {
+    pub text: String,
+    pub error: String,
+}
+
+/// Warning to show for a USB link check. An empty dump is a failed probe, not a classified link.
+pub fn usb_link_warning(text: &str, error: &str, link: UsbLink, modes: &[crate::ffmpeg::Mode], requesting_raw60: bool) -> Option<String> {
+    if text.trim().is_empty() {
+        let why = if error.is_empty() { "probe returned no PnP text" } else { error };
+        return Some(format!("{TAG_USB} USB link probe failed ({why}); link speed was not read"));
+    }
+    raw60_warning(link, modes, requesting_raw60)
+}
+
+/// PowerShell 5.1 script. Registry first (fast, no module), then location/parent for that one instance.
+/// The old probe enumerated every present device with `Get-PnpDevice -PresentOnly` and hid errors.
+/// That walk often outlived the 8s kill, PowerShell block-buffers stdout when it is not a console,
+/// and stderr was discarded, so the log showed "0 bytes of pnp text" next to a successful mode list.
+pub const USB_PROBE_SCRIPT: &str = r#"
+$ProgressPreference='SilentlyContinue'
+$ErrorActionPreference='Continue'
+try { [Console]::Out.AutoFlush = $true } catch {}
+function Emit([string]$s) { [Console]::Out.WriteLine($s); try { [Console]::Out.Flush() } catch {} }
+Emit 'PROBE=start'
+$base = 'HKLM:\SYSTEM\CurrentControlSet\Enum\USB\VID_345F&PID_2131'
+if (-not (Test-Path -LiteralPath $base)) {
+  Emit 'REGISTRY=missing'
+} else {
+  Get-ChildItem -LiteralPath $base -ErrorAction Continue | ForEach-Object {
+    $id = 'USB\VID_345F&PID_2131\' + $_.PSChildName
+    Emit ('INSTANCE=' + $id)
+    try {
+      $p = Get-ItemProperty -LiteralPath $_.PSPath -ErrorAction Stop
+      foreach ($h in @($p.HardwareID)) { if ($h) { Emit ('HW=' + $h) } }
+      if ($p.LocationInformation) { Emit ('LOCINFO=' + $p.LocationInformation) }
+      if ($p.FriendlyName) { Emit ('NAME=' + $p.FriendlyName) }
+    } catch {
+      Emit ('REGERR=' + $_.Exception.Message)
+    }
+    try {
+      Import-Module PnpDevice -ErrorAction Stop
+      foreach ($k in @('DEVPKEY_Device_LocationPaths','DEVPKEY_Device_LocationInfo','DEVPKEY_Device_Parent','DEVPKEY_Device_HardwareIds')) {
+        $d = (Get-PnpDeviceProperty -InstanceId $id -KeyName $k -ErrorAction Stop).Data
+        if ($null -ne $d) { @($d) | ForEach-Object { if ($_) { Emit ('PROP=' + $k + '=' + $_) } } }
+      }
+    } catch {
+      Emit ('PNPERR=' + $_.Exception.Message)
+    }
+  }
+}
+Emit 'PROBE=done'
+"#;
+
+/// Read-only PnP dump for VID 345F PID 2131. On non-Windows, `error` explains that the probe did not run.
+pub fn probe_usb_link() -> UsbProbe {
     #[cfg(windows)]
     {
-        let script = r#"
-$ErrorActionPreference='SilentlyContinue'
-Get-PnpDevice -PresentOnly | Where-Object { $_.InstanceId -match 'VID_345F&PID_2131' } | ForEach-Object {
-  Write-Output ('INSTANCE=' + $_.InstanceId)
-  $hw = (Get-PnpDeviceProperty -InstanceId $_.InstanceId -KeyName 'DEVPKEY_Device_HardwareIds').Data
-  if ($hw) { $hw | ForEach-Object { Write-Output ('HW=' + $_) } }
-  $loc = (Get-PnpDeviceProperty -InstanceId $_.InstanceId -KeyName 'DEVPKEY_Device_LocationPaths').Data
-  if ($loc) { $loc | ForEach-Object { Write-Output ('LOC=' + $_) } }
-}
-"#;
-        return run_capture("powershell", &["-NoProfile", "-NonInteractive", "-Command", script], Duration::from_secs(8)).unwrap_or_default();
+        let (stdout, stderr, timed_out) = run_capture(
+            "powershell",
+            &["-NoProfile", "-NonInteractive", "-Command", USB_PROBE_SCRIPT],
+            Duration::from_secs(12),
+        );
+        let error = if timed_out {
+            format!("timed out after 12s; stderr: {}", clip(&stderr))
+        } else if stdout.trim().is_empty() {
+            if stderr.trim().is_empty() {
+                "returned no PnP text and no stderr".into()
+            } else {
+                format!("returned no PnP text; stderr: {}", clip(&stderr))
+            }
+        } else {
+            String::new()
+        };
+        return UsbProbe { text: stdout, error };
     }
     #[cfg(not(windows))]
     {
-        String::new()
+        UsbProbe { text: String::new(), error: "usb link probe only runs on Windows".into() }
+    }
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+fn clip(s: &str) -> String {
+    let t = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    let n = t.chars().count();
+    if n <= 240 {
+        t
+    } else {
+        format!("{}...", t.chars().take(240).collect::<String>())
     }
 }
 
 #[cfg(windows)]
-fn run_capture(program: &str, args: &[&str], bound: Duration) -> Option<String> {
+fn run_capture(program: &str, args: &[&str], bound: Duration) -> (String, String, bool) {
     let mut cmd = hidden(program);
-    cmd.args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null());
-    let mut child = cmd.spawn().ok()?;
-    let mut out = child.stdout.take()?;
-    let (tx, rx) = std::sync::mpsc::channel();
+    cmd.args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => return (String::new(), format!("failed to start {program}: {e}"), false),
+    };
+    let mut stdout = match child.stdout.take() {
+        Some(p) => p,
+        None => return (String::new(), "probe stdout was not piped".into(), false),
+    };
+    let mut stderr = match child.stderr.take() {
+        Some(p) => p,
+        None => return (String::new(), "probe stderr was not piped".into(), false),
+    };
+    let (tx_out, rx_out) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let mut buf = Vec::new();
-        let _ = std::io::Read::read_to_end(&mut out, &mut buf);
-        let _ = tx.send(buf);
+        let _ = std::io::Read::read_to_end(&mut stdout, &mut buf);
+        let _ = tx_out.send(buf);
     });
-    let bytes = match rx.recv_timeout(bound) {
-        Ok(b) => b,
-        Err(_) => {
-            let _ = child.kill();
-            let _ = wait_until(&mut child, Duration::from_secs(1));
-            return None;
+    let (tx_err, rx_err) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = std::io::Read::read_to_end(&mut stderr, &mut buf);
+        let _ = tx_err.send(buf);
+    });
+    let start = Instant::now();
+    let mut timed_out = false;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if start.elapsed() > bound => {
+                let _ = child.kill();
+                let _ = wait_until(&mut child, Duration::from_secs(2));
+                timed_out = true;
+                break;
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(30)),
+            Err(_) => break,
         }
-    };
-    let _ = wait_until(&mut child, Duration::from_secs(1));
-    Some(String::from_utf8_lossy(&bytes).into_owned())
+    }
+    let out_bytes = rx_out.recv_timeout(Duration::from_secs(2)).unwrap_or_default();
+    let err_bytes = rx_err.recv_timeout(Duration::from_secs(2)).unwrap_or_default();
+    (
+        String::from_utf8_lossy(&out_bytes).into_owned(),
+        String::from_utf8_lossy(&err_bytes).into_owned(),
+        timed_out,
+    )
 }
 
 #[cfg(windows)]
@@ -451,8 +562,32 @@ impl BlackStreak {
     }
 }
 
+/// Copy `path` to a temp file. The no-signal watcher must not open the live snapshot:
+/// ffmpeg image2 `-atomic_writing` renames `snapshot.jpg.tmp` onto `snapshot.jpg`, and Windows
+/// returns "Operation not permitted" while another ffmpeg holds the destination open.
+fn copy_aside(path: &Path) -> Option<PathBuf> {
+    let bytes = std::fs::read(path).ok()?;
+    if bytes.len() < 8 {
+        return None;
+    }
+    let mut tmp = std::env::temp_dir();
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+    let leaf = path.file_name().and_then(|s| s.to_str()).unwrap_or("snap");
+    tmp.push(format!("qorcap-luma-{}-{}-{}", std::process::id(), nanos, leaf));
+    std::fs::write(&tmp, &bytes).ok()?;
+    Some(tmp)
+}
+
 /// Decode one snapshot to 160x90 gray. Only used by the opt-in no-signal watcher.
+/// Decodes a private copy so the live `snapshot.jpg` can still be renamed.
 pub fn decode_luma_file(ffmpeg: &str, path: &Path) -> Option<Vec<u8>> {
+    let tmp = copy_aside(path)?;
+    let out = decode_luma_path(ffmpeg, &tmp);
+    let _ = std::fs::remove_file(&tmp);
+    out
+}
+
+fn decode_luma_path(ffmpeg: &str, path: &Path) -> Option<Vec<u8>> {
     const N: usize = 160 * 90;
     let mut cmd = crate::ffmpeg::command(ffmpeg);
     cmd.args([
@@ -580,6 +715,12 @@ mod tests {
         // The product string is not a link speed.
         assert_eq!(classify_usb_link("FriendlyName=USB3.0 Video\n"), UsbLink::Unknown);
         assert_eq!(classify_usb_link(""), UsbLink::Unknown);
+        assert_eq!(classify_usb_link("PROP=DEVPKEY_Device_Parent=USB\\ROOT_HUB30\\4&x\n"), UsbLink::SuperSpeed);
+        assert_eq!(classify_usb_link("PROP=DEVPKEY_Device_Parent=USB\\ROOT_HUB20\\4&x\n"), UsbLink::HighSpeed);
+        let empty = usb_link_warning("", "returned no PnP text; stderr: timed out", UsbLink::Unknown, &[], true).unwrap();
+        assert!(empty.contains("probe failed"));
+        assert!(empty.contains("timed out"));
+        assert!(usb_link_warning(ss, "", UsbLink::SuperSpeed, &[], false).is_none());
         assert!((YUY2_720P60_MBIT - 884.736).abs() < 0.01);
     }
 
@@ -601,6 +742,48 @@ mod tests {
         let missing = raw60_warning(UsbLink::SuperSpeed, &mjpeg_only, false).unwrap();
         assert!(missing.contains("no YUY2 1280x720@60"));
         assert!(raw60_warning(UsbLink::SuperSpeed, &[], true).is_none());
+    }
+
+    #[test]
+    fn usb_probe_script_reads_one_instance_and_keeps_errors() {
+        let s = USB_PROBE_SCRIPT;
+        assert!(s.contains(r"VID_345F&PID_2131"));
+        assert!(s.contains("AutoFlush"));
+        assert!(s.contains("DEVPKEY_Device_LocationPaths"));
+        assert!(s.contains("DEVPKEY_Device_Parent"));
+        assert!(s.contains("$ProgressPreference='SilentlyContinue'"));
+        assert!(!s.contains("$ErrorActionPreference='SilentlyContinue'"));
+        assert!(!s.contains("-PresentOnly"));
+        let non_win = if cfg!(windows) { None } else { Some(probe_usb_link()) };
+        if let Some(p) = non_win {
+            assert!(p.text.is_empty());
+            assert!(p.error.contains("Windows"));
+        }
+    }
+
+    #[test]
+    fn luma_decode_copies_aside_and_does_not_keep_the_live_snapshot_open() {
+        let dir = std::env::temp_dir().join(format!("qorcap-luma-dir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let live = dir.join("snapshot.jpg");
+        std::fs::write(&live, b"0123456789abcdef").unwrap();
+        let copied = copy_aside(&live).unwrap();
+        assert_ne!(copied, live);
+        assert_eq!(std::fs::read(&copied).unwrap(), b"0123456789abcdef");
+        let _ = std::fs::remove_file(&copied);
+        assert!(decode_luma_file("qorcap-no-such-ffmpeg", &live).is_none());
+        std::fs::write(&live, b"replaced-bytes!!").unwrap();
+        assert_eq!(std::fs::read(&live).unwrap(), b"replaced-bytes!!");
+        let prefix = format!("qorcap-luma-{}", std::process::id());
+        let left: Vec<_> = std::fs::read_dir(std::env::temp_dir())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with(&prefix) && e.path() != dir)
+            .map(|e| e.path())
+            .collect();
+        assert!(left.is_empty(), "decoder left snapshot copies behind: {left:?}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

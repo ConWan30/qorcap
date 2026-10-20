@@ -615,8 +615,8 @@ impl Engine {
     }
 
     fn note_usb_link(&self, already: Option<&[ffmpeg::Mode]>) {
-        let text = capture_tune::probe_usb_link();
-        let link = capture_tune::classify_usb_link(&text);
+        let probe = capture_tune::probe_usb_link();
+        let link = capture_tune::classify_usb_link(&probe.text);
         let owned = if already.is_none() {
             ffmpeg::list_options(&self.ffmpeg, &self.args.device).unwrap_or_default()
         } else {
@@ -624,9 +624,17 @@ impl Engine {
         };
         let modes: &[ffmpeg::Mode] = already.unwrap_or(&owned);
         let req = self.args.yuy2_720p60 || (self.args.input_format == "yuyv422" && self.args.fps >= 60);
-        info!("usb link check: {} ({} bytes of pnp text, {} modes)", link.as_str(), text.len(), modes.len());
+        if probe.error.is_empty() {
+            info!("usb link check: {} ({} bytes of pnp text, {} modes)", link.as_str(), probe.text.len(), modes.len());
+        } else {
+            info!("usb link check: {} ({} bytes of pnp text, {} modes); probe: {}", link.as_str(), probe.text.len(), modes.len(), probe.error);
+        }
+        if link == capture_tune::UsbLink::Unknown && !probe.text.trim().is_empty() {
+            let snippet: String = probe.text.chars().take(400).collect();
+            info!("usb link probe text: {snippet}");
+        }
         self.status.lock().unwrap_or_else(|e| e.into_inner()).usb_link = Some(link.as_str().into());
-        let warning = capture_tune::raw60_warning(link, modes, req);
+        let warning = capture_tune::usb_link_warning(&probe.text, &probe.error, link, modes, req);
         if let Some(w) = &warning { warn!("{w}"); }
         self.set_tagged(capture_tune::TAG_USB, warning.as_deref());
     }

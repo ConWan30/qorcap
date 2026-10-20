@@ -166,6 +166,8 @@ pub struct RecordArgs {
     #[arg(long, default_value = "auto")]
     pub input_format: String,
     /// Opt-in: capture YUY2 1280x720 at 60 fps (forces res, fps, and input format). Off keeps today's settings.
+    /// Not recommended for the MS2131: a live 15s take on 2026-10-20 ran at 11.6 fps with 27 real-time
+    /// buffer drops, a ~400 MB queue, and a missed score. Leave this off unless a later A/B passes.
     #[arg(long, default_value_t = false)]
     pub yuy2_720p60: bool,
     /// Opt-in: at startup, read the USB link and the card's mode list and warn if raw 720p60 cannot fit
