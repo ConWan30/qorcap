@@ -258,7 +258,7 @@ def start_reader(api: Api, stop: threading.Event, state: dict, bundle: Path | No
 
     sys.path.insert(0, str(HERE))
     from qorcap_endmenu import EndMenuReader
-    from qorcap_reader import ReaderCore, madden_final_screen, prep
+    from qorcap_reader import ReaderCore, madden_final_screen, note_options_from_inputs, prep
     from qorcap_standard import standard_reader
 
     def post(b):
@@ -326,6 +326,11 @@ def start_reader(api: Api, stop: threading.Event, state: dict, bundle: Path | No
                     _refresh_corr()
                 except Exception as e:
                     state["corr_error"] = f"{type(e).__name__}: {e}"
+                if bundle is not None:
+                    try:
+                        note_options_from_inputs(core, bundle / "inputs.jsonl")
+                    except Exception as e:
+                        state["options_error"] = f"{type(e).__name__}: {e}"
             try:
                 with urllib.request.urlopen(api.base + "/snapshot.jpg", timeout=3) as r:
                     data = r.read()
@@ -1677,6 +1682,11 @@ def tail_final_check(bundle: Path, draft: dict, *, ffmpeg: str, secs: int = TAIL
     core = (core_factory or default_core_factory)(lambda b: events.append(b) or {})
     core.timeline = [dict(r) for r in live]
     try:
+        from qorcap_reader import note_options_from_inputs
+        note_options_from_inputs(core, bundle / "inputs.jsonl")
+    except Exception:
+        pass
+    try:
         from qorcap_reader import load_delta_corroboration_from_bundle
         # Preserve any corroboration the test/core_factory already set; else load from bundle.
         if not getattr(core, "delta_corroboration", None):
@@ -2088,6 +2098,11 @@ def finalize(bundle: Path, *, qt: Path, qorcap: str, ffmpeg: str, key_dir: Path,
     def fac(post):  # one reader across parts so agreement/final state carries over
         if shared["core"] is None:
             shared["core"] = factory(post)
+            try:
+                from qorcap_reader import note_options_from_inputs
+                note_options_from_inputs(shared["core"], bundle / "inputs.jsonl")
+            except Exception:
+                pass
         else:
             shared["core"].post = post
         return shared["core"]
