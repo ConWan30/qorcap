@@ -66,6 +66,8 @@ pub struct Engine {
     pub subs: Mutex<Vec<Sender<String>>>,
     pub stamp_file: PathBuf,
     pub input: Arc<Mutex<crate::inputs::InputLog>>,
+    /// Opt-in per-frame capture clock. Off unless `--frame-clock` or `QORCAP_FRAME_CLOCK`. No file when off.
+    pub frame_clock: Arc<crate::frameclock::FrameClock>,
     /// The supervisor loop (`run`) is active; the API keeps serving until it has finished the bundle.
     pub running: AtomicBool,
     /// Set when `run` has returned (or /shutdown arrives while not running): the API thread exits.
@@ -204,11 +206,14 @@ impl Engine {
         let input_path = args.bundle.as_ref().map(|b| PathBuf::from(b).join("inputs.jsonl"))
             .or_else(|| args.out.as_ref().map(|o| PathBuf::from(format!("{o}.inputs.jsonl"))));
         let input = Arc::new(Mutex::new(crate::inputs::InputLog::new(input_path, !args.no_controller, wall_ms())));
+        // After the input logger's wall anchor, before `started`. Opening the file does not read the clock.
+        let frame_on = crate::frameclock::flag_enabled(args.frame_clock, std::env::var(crate::frameclock::ENV).ok().as_deref());
+        let frame_clock = Arc::new(crate::frameclock::FrameClock::open(frame_on, args.bundle.as_deref().map(Path::new)));
         let st = Status { state: "starting".into(), device: args.device.clone(), res: format!("{}x{}", args.res.0, args.res.1), fps_target: args.fps, replay_window: args.replay.unwrap_or(0), role: args.role.clone(), side_source: args.side_source.clone(), ..Default::default() };
         Arc::new(Self { ffmpeg, ring: Mutex::new(ReplayRing::new(window, cap)), rec: Mutex::new(None), status: Mutex::new(st), shutdown: AtomicBool::new(false),
             ev: Mutex::new(MatchState { started_wall_ms: wall_ms(), score: Value::Null, ..Default::default() }), subs: Mutex::new(vec![]),
             stamp_file: dir.join("stamp.txt"),
-            snapshot: dir.join("snapshot.jpg"), tap: crate::glimpse::FrameTap::new(args.glimpse_frame || crate::glimpse::env_enabled()), exit_when_recording_ends: AtomicBool::new(false), started: Instant::now(), last_data_ms: AtomicU64::new(0), input,
+            snapshot: dir.join("snapshot.jpg"), tap: crate::glimpse::FrameTap::new(args.glimpse_frame || crate::glimpse::env_enabled()), exit_when_recording_ends: AtomicBool::new(false), started: Instant::now(), last_data_ms: AtomicU64::new(0), input, frame_clock,
             running: AtomicBool::new(false), api_closed: AtomicBool::new(false), sealed: AtomicBool::new(false),
             countersigned: std::sync::atomic::AtomicI64::new(-1),
             stop_reason: Mutex::new(None), bundle_write: Mutex::new(()), bundle_finalized: AtomicBool::new(false), args })
@@ -355,6 +360,9 @@ impl Engine {
     /// Fan a block of TS packets out to ring + recorder.
     pub fn ingest(self: &Arc<Self>, data: &[u8]) {
         let t = self.ms();
+        // Same Instant as inputs.jsonl `t_us`. Taken at the read, before the recorder write.
+        let t_us = self.started.elapsed().as_micros() as u64;
+        let frame_clock = Arc::clone(&self.frame_clock);
         self.last_data_ms.store(t, Ordering::Relaxed);
         let (pat, pmt) = { let mut r = self.ring.lock().unwrap_or_else(|e| e.into_inner()); r.push(t, data); r.tables() };
         let mut g = self.rec.lock().unwrap_or_else(|e| e.into_inner());
@@ -370,12 +378,18 @@ impl Engine {
                 }
             }
             if !slice.is_empty() {
-                if let Some(w) = r.stdin.as_mut() {
+                let written = if let Some(w) = r.stdin.as_mut() {
                     if let Err(e) = w.write_all(slice) {
                         error!("recorder pipe broken ({e}); stopping recording {}", r.path);
                         done = true;
                         if stop_why.is_none() { stop_why = Some("pipe_broken"); }
-                    }
+                        false
+                    } else { true }
+                } else { false };
+                // Only bytes that reached the recording. The capture command itself is unchanged.
+                if written && frame_clock.enabled() {
+                    let file = Path::new(&r.path).file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+                    frame_clock.observe(slice, t_us, &file);
                 }
             }
             if r.deadline.map(|d| Instant::now() >= d).unwrap_or(false) {
@@ -1086,6 +1100,49 @@ mod tests {
         assert_eq!(kept["signals"]["input"]["status"], "ok");
         assert_eq!(kept["stop_reason"], "pipe_broken");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn frame_clock_off_leaves_the_bundle_unchanged_and_on_records_only_when_asked() {
+        use clap::Parser;
+        let pkt = crate::frameclock::video_ts_packet(0x100, 3_000);
+        let dir = std::env::temp_dir().join(format!("qorcap-fc-eng-off-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let d = dir.to_string_lossy().into_owned();
+        let crate::cli::Cmd::Record(r) = crate::cli::Cli::try_parse_from(["q", "record", "--device", "testpattern", "--bundle", &d, "--no-controller"]).unwrap().cmd else { panic!() };
+        let e = Engine::new(r, "ffmpeg-x".into());
+        assert!(!e.frame_clock.enabled());
+        e.ingest(&pkt);
+        let video = dir.join("video.mp4");
+        std::fs::write(&video, b"hashed-segment").unwrap();
+        e.on_segment(video.to_str().unwrap(), 0, b"hashed-segment");
+        assert!(!dir.join("frame_clock.jsonl").exists());
+        let line = std::fs::read_to_string(dir.join("manifest.jsonl")).unwrap().lines().next().unwrap().to_string();
+        let v: Value = serde_json::from_str(&line).unwrap();
+        let keys: std::collections::BTreeSet<&str> = v.as_object().unwrap().keys().map(|s| s.as_str()).collect();
+        let expect: std::collections::BTreeSet<&str> = ["type", "seq", "kind", "file", "offset", "bytes", "sha256", "prev", "chain_head", "mono_ms", "wall_ms", "frames", "device", "device_id"].into();
+        assert_eq!(keys, expect);
+        assert!(!line.contains("frame_clock") && !line.contains("clock_source"));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let dir2 = std::env::temp_dir().join(format!("qorcap-fc-eng-on-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir2);
+        std::fs::create_dir_all(&dir2).unwrap();
+        let d2 = dir2.to_string_lossy().into_owned();
+        let crate::cli::Cmd::Record(r2) = crate::cli::Cli::try_parse_from(["q", "record", "--device", "testpattern", "--bundle", &d2, "--no-controller", "--frame-clock"]).unwrap().cmd else { panic!() };
+        let e2 = Engine::new(r2, "ffmpeg-x".into());
+        assert!(e2.frame_clock.enabled());
+        e2.ingest(&pkt); // no recorder open: nothing to stamp
+        let text = std::fs::read_to_string(dir2.join("frame_clock.jsonl")).unwrap();
+        assert!(text.contains("qorcap-frame-clock/v0"));
+        assert!(!text.contains("\"type\":\"frame\""));
+        e2.frame_clock.observe(&pkt, 1_000_000, "video.mp4");
+        let stamps = crate::frameclock::load(&dir2.join("frame_clock.jsonl"));
+        assert_eq!(stamps.len(), 1);
+        assert_eq!(stamps[0].t_mono_us, 1_000_000);
+        assert_eq!(stamps[0].file, "video.mp4");
+        let _ = std::fs::remove_dir_all(&dir2);
     }
 }
 

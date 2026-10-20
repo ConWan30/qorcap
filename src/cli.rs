@@ -116,6 +116,17 @@ pub enum Cmd {
         #[arg(long)]
         secs: Option<u64>,
     },
+    /// Re-score a bundle's input-to-frame clock with frame_clock.jsonl and without it.
+    /// Prints both. Does not write the receipt, the proof, or the hash chain.
+    AlignAb {
+        dir: String,
+        /// A screen change must follow a key press within this many frames (30 fps)
+        #[arg(long, default_value_t = 15)]
+        frames: usize,
+        /// Clock residuals only (no video decode)
+        #[arg(long)]
+        no_video: bool,
+    },
     /// (Re)compute a bundle's controller-input proof: human-likeness, input-video match rate and offset;
     /// writes input_proof.json and adds signals.input to receipt.draft.json
     InputProof {
@@ -204,6 +215,14 @@ pub struct RecordArgs {
     /// shadow watcher (read-only, rate-limited, never touches capture). Also on with QORCAP_GLIMPSE_FRAME=1.
     #[arg(long)]
     pub glimpse_frame: bool,
+    /// Opt-in per-frame capture clock (default off). Also on with QORCAP_FRAME_CLOCK=1.
+    /// Writes frame_clock.jsonl beside the bundle: the QorCap monotonic time when each video frame's
+    /// MPEG-TS packet was read. Not in the hash chain or the receipt. Input-to-frame alignment uses
+    /// it only when the file is present; with the flag off the capture command and the proof are unchanged.
+    /// Does not change scoring, signing, or verification. Promote only after a real-game A/B
+    /// (`qorcap align-ab`, docs/FRAME_CLOCK_AB.md).
+    #[arg(long)]
+    pub frame_clock: bool,
 }
 
 impl RecordArgs {
@@ -265,7 +284,9 @@ mod tests {
         assert!(matches!(Cli::try_parse_from(["qorcap", "submit", "b", "--full"]).unwrap().cmd, Cmd::Submit { full: true, .. }));
         assert!(matches!(Cli::try_parse_from(["qorcap", "submit"]).unwrap().cmd, Cmd::Submit { bundle: None, full: false, yes: false, .. }));
         assert!(matches!(Cli::try_parse_from(["qorcap", "input-proof", "b", "--frames", "10"]).unwrap().cmd, Cmd::InputProof { frames: 10, .. }));
-        if let Cmd::Record(r) = Cli::try_parse_from(["qorcap", "record", "--no-controller"]).unwrap().cmd { assert!(r.no_controller); } else { panic!() }
+        if let Cmd::Record(r) = Cli::try_parse_from(["qorcap", "record", "--no-controller"]).unwrap().cmd { assert!(r.no_controller); assert!(!r.frame_clock); } else { panic!() }
+        if let Cmd::Record(r) = Cli::try_parse_from(["qorcap", "record", "--frame-clock"]).unwrap().cmd { assert!(r.frame_clock); } else { panic!() }
+        assert!(matches!(Cli::try_parse_from(["qorcap", "align-ab", "b", "--no-video"]).unwrap().cmd, Cmd::AlignAb { no_video: true, frames: 15, .. }));
     }
     #[test]
     fn parses_highlights() {

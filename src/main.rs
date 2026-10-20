@@ -381,6 +381,12 @@ fn main() {
             sidecar("psn-names", bundle, python, vec!["--samples".to_string(), samples.to_string()], &ff)
         }
         Cmd::InputTest { secs } => input_test(secs),
+        Cmd::AlignAb { dir, frames, no_video } => {
+            // Prints both clocks. Does not write the receipt, the proof, or the hash chain.
+            let report = qorcap::align::ab_report(std::path::Path::new(&dir), if no_video { None } else { Some(ff.as_str()) }, frames);
+            println!("{}", serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".into()));
+            0
+        }
         Cmd::InputProof { dir, frames, no_video, force } => {
             let d = std::path::Path::new(&dir);
             if qorcap::inputproof::recorder_running(d) && !force {

@@ -199,6 +199,11 @@ Setup this is built for: the DualSense / DualSense Edge plays the PS5 over **Blu
     offsets. Also `z_x100` (two-proportion z x100), `offset_ms`/`offset_iqr_ms` (press -> onset, includes
     capture + game latency), `calibration_offsets_ms`, `presses_spaced`/`presses_tested`, and scorebug score
     events with controller activity in the 30 s before. Mid-play presses (camera already moving) are not scored.
+    That clock is the fragment-close fit, not a measured frame time. `--frame-clock` (default off; also
+    `QORCAP_FRAME_CLOCK=1`) writes `frame_clock.jsonl` on the same monotonic clock as the HID log and uses it
+    for alignment only when a stamp is present. The capture command, the receipt, and the flag-off proof
+    stay as they are. Compare with `qorcap align-ab DIR` or `python tools/frame_clock_ab.py DIR`. Do not
+    turn the flag on for scored matches until the real-game A/B in `docs/FRAME_CLOCK_AB.md`.
   * `inputs_sha256`, `inputs_chain_head`, warnings, and the limit.
 * **Receipt (backward-compatible):** `receipt.draft.json` gains `signals.input` = `{status, device,
   human_permille, human_label, match_permille, chance_permille, offset_ms, inputs_sha256, inputs_chain_head,
