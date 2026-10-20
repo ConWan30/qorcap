@@ -1,6 +1,7 @@
 //! Capture supervisor: runs the ffmpeg capture process, fans its MPEG-TS out
 //! to the replay ring and the recorder, and reopens the device on exit,
 //! error, unplug or freeze (watchdog).
+use crate::capture_tune::{self, BufferKind};
 use crate::cli::RecordArgs;
 use crate::ffmpeg;
 use crate::ring::{self, ReplayRing, TS};
@@ -45,7 +46,21 @@ pub struct Status {
     /// v0.3.26: this console's QorTime side (home | away), fixed before the first checkpoint, and how it was chosen.
     pub role: String,
     pub side_source: Option<String>,
+    /// Opt-in `--buffer-watch` counter. Omitted from /status when zero so the default JSON stays the same.
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    pub buffer_full_warnings: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub buffer_lag_s: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub buffer_video_queued_mb: Option<f64>,
+    #[serde(skip_serializing_if = "is_false")]
+    pub no_signal: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usb_link: Option<String>,
 }
+
+fn is_zero_u64(v: &u64) -> bool { *v == 0 }
+fn is_false(v: &bool) -> bool { !*v }
 
 pub struct Recorder { reader: Option<std::thread::JoinHandle<()>>, child: Child, stdin: Option<ChildStdin>, pub path: String, started: Instant, deadline: Option<Instant>, wait_key: bool, base: String, part: u32 }
 
@@ -80,6 +95,8 @@ pub struct Engine {
     bundle_write: Mutex<()>,
     /// Set once the full stop write (including the input proof) has finished, so a late fast write cannot replace it.
     bundle_finalized: AtomicBool,
+    buf_persist: Mutex<capture_tune::BufferPersist>,
+    last_buf_restart_ms: AtomicU64,
 }
 
 /// QorTime evidence state for this run.
@@ -195,7 +212,8 @@ fn run_dir(args: &RecordArgs) -> PathBuf {
 }
 
 impl Engine {
-    pub fn new(args: RecordArgs, ffmpeg: String) -> Arc<Self> {
+    pub fn new(mut args: RecordArgs, ffmpeg: String) -> Arc<Self> {
+        capture_tune::apply_capture_profile(&mut args);
         let window = args.replay.unwrap_or(3).max(3);
         // Cap memory: bitrate estimate * window * 1.5 (+ audio), at least 64 MiB.
         let bps = parse_bitrate(&args.bitrate).unwrap_or(8_000_000) + 200_000;
@@ -208,10 +226,11 @@ impl Engine {
         Arc::new(Self { ffmpeg, ring: Mutex::new(ReplayRing::new(window, cap)), rec: Mutex::new(None), status: Mutex::new(st), shutdown: AtomicBool::new(false),
             ev: Mutex::new(MatchState { started_wall_ms: wall_ms(), score: Value::Null, ..Default::default() }), subs: Mutex::new(vec![]),
             stamp_file: dir.join("stamp.txt"),
-            snapshot: dir.join("snapshot.jpg"), tap: crate::glimpse::FrameTap::new(args.glimpse_frame || crate::glimpse::env_enabled()), exit_when_recording_ends: AtomicBool::new(false), started: Instant::now(), last_data_ms: AtomicU64::new(0), input,
+            snapshot: dir.join(if args.reader_snapshot == "png" { "snapshot.png" } else { "snapshot.jpg" }), tap: crate::glimpse::FrameTap::new(args.glimpse_frame || crate::glimpse::env_enabled()), exit_when_recording_ends: AtomicBool::new(false), started: Instant::now(), last_data_ms: AtomicU64::new(0), input,
             running: AtomicBool::new(false), api_closed: AtomicBool::new(false), sealed: AtomicBool::new(false),
             countersigned: std::sync::atomic::AtomicI64::new(-1),
-            stop_reason: Mutex::new(None), bundle_write: Mutex::new(()), bundle_finalized: AtomicBool::new(false), args })
+            stop_reason: Mutex::new(None), bundle_write: Mutex::new(()), bundle_finalized: AtomicBool::new(false),
+            buf_persist: Mutex::new(capture_tune::BufferPersist::new()), last_buf_restart_ms: AtomicU64::new(0), args })
     }
     fn ms(&self) -> u64 { self.started.elapsed().as_millis() as u64 }
     /// The monotonic clock behind every mono_ms (manifest, checkpoints) and inputs.jsonl t_us.
@@ -412,6 +431,8 @@ impl Engine {
         let mut audio_off = false;          // audio failed to open: continue video-only
         let mut audio_fails = 0u32;
         let mut audio_try = 0usize;         // index into the audio open strategies for this device
+        let mut was_absent = false;
+        let mut link_checked = false;
         while !self.shutdown.load(Ordering::SeqCst) {
             let mut audio: Option<ffmpeg::AudioSpec> = None;
             if self.args.device == "testpattern" && self.args.audio != "none" && self.args.audio != "off" && !audio_off {
@@ -428,9 +449,19 @@ impl Engine {
                             if self.status.lock().unwrap_or_else(|e| e.into_inner()).state != "waiting_for_device" { warn!("{msg}; waiting for it to appear"); }
                             self.set_state("waiting_for_device", Some(msg));
                             fmt = None;
+                            was_absent = true;
+                            link_checked = false;
                             self.sleep(1);
                             continue;
                         }
+                        if let Some(wait) = capture_tune::arrival_settle(was_absent, self.args.replug_resilient) {
+                            was_absent = false;
+                            info!("capture card \"{}\" arrived; waiting {}ms before reopen", self.args.device, wait.as_millis());
+                            self.set_state("waiting_for_device", Some(format!("card arrived; waiting {}ms for the device to settle", wait.as_millis())));
+                            self.sleep_ms(wait.as_millis() as u64);
+                            continue;
+                        }
+                        was_absent = false;
                         audio = if audio_off { None } else {
                             ffmpeg::pick_audio_device(&self.args.device, &self.args.audio, &devs).and_then(|d| {
                                 let strats = ffmpeg::audio_strategies(&d);
@@ -447,18 +478,24 @@ impl Engine {
                         if self.args.audio != "none" && self.args.audio != "off" && audio.is_none() && !audio_off {
                             warn!("no audio device for \"{}\" found; recording video-only", self.args.device);
                             audio_off = true;
-                            self.status.lock().unwrap_or_else(|e| e.into_inner()).warning = Some("AUDIO UNAVAILABLE — recording video-only (no game sound).".into());
+                            self.assign_warning("AUDIO UNAVAILABLE — recording video-only (no game sound).".into());
                         }
+                        let mut probed: Option<Vec<ffmpeg::Mode>> = None;
                         if fmt.is_none() {
                             let f = if self.args.input_format == "auto" {
                                 match ffmpeg::list_options(&self.ffmpeg, &self.args.device) {
                                     Ok(m) => { let f = ffmpeg::choose_input_format(&m, self.args.res.0, self.args.res.1, self.args.fps);
                                         info!("card modes: {}; input format auto -> {f}", m.iter().map(|x| format!("{}:{}x{}@{}", x.format, x.w, x.h, x.max_fps.round())).collect::<Vec<_>>().join(" "));
+                                        probed = Some(m);
                                         f }
                                     Err(e) => { warn!("could not list card modes ({e}); input format auto"); "auto".into() }
                                 }
                             } else { self.args.input_format.clone() };
                             fmt = Some(f);
+                        }
+                        if !link_checked && (self.args.check_usb_link || self.args.yuy2_720p60) {
+                            link_checked = true;
+                            self.note_usb_link(probed.as_deref());
                         }
                         self.ev.lock().unwrap_or_else(|e| e.into_inner()).device_id = devs.iter().find(|d| d.kind == "video" && d.name == self.args.device).and_then(|d| d.alt.clone());
                     }
@@ -476,7 +513,7 @@ impl Engine {
                     );
                     error!("{msg}");
                     self.set_state("disk_full", Some(msg.clone()));
-                    self.status.lock().unwrap_or_else(|e| e.into_inner()).warning = Some(msg);
+                    self.assign_warning(msg);
                     if let Some(p) = self.stop_recording() { info!("finalised {p} due to low disk"); }
                     if self.args.bundle.is_some() {
                         self.request_stop("disk_full");
@@ -512,11 +549,8 @@ impl Engine {
                     warn!("audio device {:?} could not be opened{}; falling back to VIDEO-ONLY recording", audio.as_ref().map(|a| &a.name),
                         if why == ffmpeg::Failure::AudioOpen { "" } else { " (two failed opens with audio)" });
                     audio_off = true;
-                    {
-                        let mut st = self.status.lock().unwrap_or_else(|e| e.into_inner());
-                        st.warning = Some("AUDIO FAILED — recording video-only (no game sound). Capture continues.".into());
-                        st.last_error = Some("audio could not be opened; recording video-only".into());
-                    }
+                    self.status.lock().unwrap_or_else(|e| e.into_inner()).last_error = Some("audio could not be opened; recording video-only".into());
+                    self.assign_warning("AUDIO FAILED — recording video-only (no game sound). Capture continues.".into());
                     self.ring.lock().unwrap_or_else(|e| e.into_inner()).clear();
                     self.set_state("reopening", Some("audio could not be opened; retrying video-only".into()));
                     continue; // immediate retry, no backoff / no reopen_count
@@ -574,9 +608,108 @@ impl Engine {
         Some(last)
     }
 
-    fn sleep(&self, secs: u64) {
-        let end = Instant::now() + Duration::from_secs(secs);
-        while Instant::now() < end && !self.shutdown.load(Ordering::SeqCst) { std::thread::sleep(Duration::from_millis(100)); }
+    fn sleep(&self, secs: u64) { self.sleep_ms(secs.saturating_mul(1000)); }
+    fn sleep_ms(&self, ms: u64) {
+        let end = Instant::now() + Duration::from_millis(ms);
+        while Instant::now() < end && !self.shutdown.load(Ordering::SeqCst) { std::thread::sleep(Duration::from_millis(50).min(end.saturating_duration_since(Instant::now()))); }
+    }
+
+    fn note_usb_link(&self, already: Option<&[ffmpeg::Mode]>) {
+        let probe = capture_tune::probe_usb_link();
+        let link = capture_tune::classify_usb_link(&probe.text);
+        let owned = if already.is_none() {
+            ffmpeg::list_options(&self.ffmpeg, &self.args.device).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let modes: &[ffmpeg::Mode] = already.unwrap_or(&owned);
+        let req = self.args.yuy2_720p60 || (self.args.input_format == "yuyv422" && self.args.fps >= 60);
+        if probe.error.is_empty() {
+            info!("usb link check: {} ({} bytes of pnp text, {} modes)", link.as_str(), probe.text.len(), modes.len());
+        } else {
+            info!("usb link check: {} ({} bytes of pnp text, {} modes); probe: {}", link.as_str(), probe.text.len(), modes.len(), probe.error);
+        }
+        if link == capture_tune::UsbLink::Unknown && !probe.text.trim().is_empty() {
+            let snippet: String = probe.text.chars().take(400).collect();
+            info!("usb link probe text: {snippet}");
+        }
+        self.status.lock().unwrap_or_else(|e| e.into_inner()).usb_link = Some(link.as_str().into());
+        let warning = capture_tune::usb_link_warning(&probe.text, &probe.error, link, modes, req);
+        if let Some(w) = &warning { warn!("{w}"); }
+        self.set_tagged(capture_tune::TAG_USB, warning.as_deref());
+    }
+
+    fn set_tagged(&self, tag: &str, text: Option<&str>) {
+        let mut st = self.status.lock().unwrap_or_else(|e| e.into_inner());
+        capture_tune::upsert_tagged(&mut st.warning, tag, text);
+    }
+
+    /// Replace the plain warning. With every tune flag off this is `warning = Some(text)`.
+    /// Tagged capture warnings (USB / buffer / no-signal) are kept when those flags are on.
+    fn assign_warning(&self, text: String) {
+        let mut st = self.status.lock().unwrap_or_else(|e| e.into_inner());
+        let keep: Vec<String> = st.warning.as_deref().unwrap_or("").split(" | ")
+            .filter(|p| p.starts_with(capture_tune::TAG_BUFFER) || p.starts_with(capture_tune::TAG_NOSIGNAL) || p.starts_with(capture_tune::TAG_USB))
+            .map(|s| s.to_string()).collect();
+        st.warning = if keep.is_empty() { Some(text) } else { Some(format!("{text} | {}", keep.join(" | "))) };
+    }
+
+    /// Returns true when the capture child should be restarted.
+    fn note_buffer_line(&self, line: &str) -> bool {
+        let Some(w) = capture_tune::parse_buffer_warning(line) else { return false };
+        let now = self.ms();
+        let persistent = self.buf_persist.lock().unwrap_or_else(|e| e.into_inner()).observe(now);
+        {
+            let mut st = self.status.lock().unwrap_or_else(|e| e.into_inner());
+            st.buffer_full_warnings = st.buffer_full_warnings.saturating_add(1);
+            if let Some(lag) = w.lag_s {
+                st.buffer_lag_s = Some(st.buffer_lag_s.map(|p| p.max(lag)).unwrap_or(lag));
+            }
+            if w.kind == BufferKind::Video && w.queued_bytes > 0 {
+                let mb = w.queued_bytes as f64 / (1024.0 * 1024.0);
+                st.buffer_video_queued_mb = Some(st.buffer_video_queued_mb.map(|p| p.max(mb)).unwrap_or(mb));
+            }
+            if persistent {
+                capture_tune::upsert_tagged(&mut st.warning, capture_tune::TAG_BUFFER, Some(&w.text));
+            }
+        }
+        let last = self.last_buf_restart_ms.load(Ordering::Relaxed);
+        if capture_tune::restart_due(persistent, self.args.buffer_restart, now, last) {
+            self.last_buf_restart_ms.store(now, Ordering::Relaxed);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn set_no_signal(&self, on: bool) {
+        let mut st = self.status.lock().unwrap_or_else(|e| e.into_inner());
+        if st.no_signal == on && (!on || st.warning.as_deref().unwrap_or("").contains(capture_tune::TAG_NOSIGNAL)) {
+            return;
+        }
+        st.no_signal = on;
+        let text = if on { Some(capture_tune::no_signal_warning()) } else { None };
+        capture_tune::upsert_tagged(&mut st.warning, capture_tune::TAG_NOSIGNAL, text.as_deref());
+    }
+
+    /// One read's worth of stdout. Same resync rules as the historical inline loop.
+    fn accept_stdout(self: &Arc<Self>, buf: &mut Vec<u8>, fill: &mut usize, n: usize, got: &mut bool) {
+        *fill += n;
+        let whole = *fill / TS * TS;
+        if whole == 0 { return; }
+        if buf[0] != 0x47 {
+            if let Some(p) = buf[..*fill].iter().position(|&b| b == 0x47) {
+                buf.copy_within(p..*fill, 0);
+                *fill -= p;
+            } else {
+                *fill = 0;
+            }
+            return;
+        }
+        if !*got { *got = true; info!("capturing"); self.set_state("capturing", None); }
+        self.ingest(&buf[..whole]);
+        buf.copy_within(whole..*fill, 0);
+        *fill -= whole;
     }
 
     /// One capture session. Returns true if it produced data.
@@ -586,6 +719,7 @@ impl Engine {
         if self.args.stamp && !self.stamp_file.exists() { let _ = std::fs::write(&self.stamp_file, "QorCap  no referee nonce yet"); }
         let stamp = if self.args.stamp { Some(self.stamp_file.to_string_lossy().into_owned()) } else { None };
         let args = ffmpeg::capture_args_with(&self.args, input_format, audio, &self.snapshot.to_string_lossy(), stamp.as_deref());
+        if capture_tune::any_tune(&self.args) { info!("capture tune active; ffmpeg args: {}", args.join(" ")); }
         info!("opening \"{}\" format={input_format} audio={:?} ({:?}) {}x{}@{} enc={}", self.args.device, audio.map(|a| &a.name), audio.map(|a| a.strategy), self.args.res.0, self.args.res.1, self.args.fps, self.args.encoder);
         let child = ffmpeg::command(&self.ffmpeg).args(&args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn();
         let mut child = match child { Ok(c) => c, Err(e) => { let m = format!("cannot start ffmpeg `{}`: {e}", self.ffmpeg); error!("{m}"); self.set_state("reopening", Some(m)); return (false, ffmpeg::Failure::Other); } };
@@ -595,7 +729,7 @@ impl Engine {
         let alive = Arc::new(AtomicBool::new(true));
         let last_err = Arc::new(Mutex::new(Vec::<String>::new()));
         // stderr: progress key=value -> status; everything else -> log
-        { let me = self.clone(); let last_err = last_err.clone(); std::thread::spawn(move || {
+        { let me = self.clone(); let last_err = last_err.clone(); let child = child.clone(); std::thread::spawn(move || {
             use std::io::BufRead;
             for line in std::io::BufReader::new(stderr).lines().map_while(Result::ok) {
                 let l = line.trim();
@@ -609,9 +743,37 @@ impl Engine {
                 }
                 if l.is_empty() { continue; }
                 warn!("ffmpeg: {l}");
+                if me.args.buffer_watch && me.note_buffer_line(l) {
+                    warn!("real-time buffer stayed full; restarting the capture child");
+                    me.set_state("reopening", Some("real-time buffer stayed full; restarting capture".into()));
+                    let _ = child.lock().unwrap_or_else(|e| e.into_inner()).kill();
+                }
                 let mut e = last_err.lock().unwrap_or_else(|e| e.into_inner()); e.push(l.to_string()); if e.len() > 5 { e.remove(0); }
             }
         }); }
+        if self.args.no_signal {
+            let me = self.clone();
+            let alive = alive.clone();
+            std::thread::spawn(move || {
+                let need = (me.args.no_signal_secs.max(1).saturating_mul(2)) as u32;
+                let mut streak = capture_tune::BlackStreak::new(need);
+                let mut seen: Option<std::time::SystemTime> = None;
+                while alive.load(Ordering::SeqCst) && !me.shutdown.load(Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(500));
+                    if !alive.load(Ordering::SeqCst) { break; }
+                    let modified = std::fs::metadata(&me.snapshot).and_then(|m| m.modified()).ok();
+                    if modified.is_none() || modified == seen { continue; }
+                    seen = modified;
+                    match capture_tune::decode_luma_file(&me.ffmpeg, &me.snapshot) {
+                        Some(gray) => {
+                            let black = capture_tune::luma_is_black(&gray, &capture_tune::BlackDetect::default());
+                            me.set_no_signal(streak.push(black));
+                        }
+                        None => {}
+                    }
+                }
+            });
+        }
         // watchdog: kill if no data for N seconds (frozen driver / shared device / unplug)
         { let me = self.clone(); let child = child.clone(); let alive = alive.clone(); let start = self.ms(); std::thread::spawn(move || {
             let wd = me.args.watchdog.max(1) * 1000;
@@ -630,26 +792,66 @@ impl Engine {
         let mut buf = vec![0u8; TS * 512];
         let mut fill = 0usize;
         let mut got = false;
-        loop {
-            match stdout.read(&mut buf[fill..]) {
-                Ok(0) => break,
-                Ok(n) => {
-                    fill += n;
-                    let whole = fill / TS * TS;
-                    if whole > 0 {
-                        // resync if needed
-                        if buf[0] != 0x47 { if let Some(p) = buf[..fill].iter().position(|&b| b == 0x47) { buf.copy_within(p..fill, 0); fill -= p; continue; } else { fill = 0; continue; } }
-                        if !got { got = true; info!("capturing"); self.set_state("capturing", None); }
-                        self.ingest(&buf[..whole]);
-                        buf.copy_within(whole..fill, 0);
-                        fill -= whole;
+        if self.args.replug_resilient {
+            // Read on a side thread so a stuck ReadFile cannot pin the supervisor after kill.
+            let (tx, rx) = std::sync::mpsc::channel::<std::io::Result<Vec<u8>>>();
+            std::thread::spawn(move || {
+                let mut tmp = vec![0u8; 32 * 1024];
+                loop {
+                    match stdout.read(&mut tmp) {
+                        Ok(0) => { let _ = tx.send(Ok(Vec::new())); break; }
+                        Ok(n) => { if tx.send(Ok(tmp[..n].to_vec())).is_err() { break; } }
+                        Err(e) => { let _ = tx.send(Err(e)); break; }
                     }
                 }
-                Err(e) => { error!("capture read error: {e}"); break; }
+            });
+            let mut idle_after_dead = 0u32;
+            loop {
+                match rx.recv_timeout(Duration::from_millis(500)) {
+                    Ok(Ok(chunk)) if chunk.is_empty() => break,
+                    Ok(Ok(chunk)) => {
+                        idle_after_dead = 0;
+                        let mut off = 0usize;
+                        while off < chunk.len() {
+                            let room = buf.len().saturating_sub(fill);
+                            if room == 0 { break; }
+                            let n = (chunk.len() - off).min(room);
+                            buf[fill..fill + n].copy_from_slice(&chunk[off..off + n]);
+                            self.accept_stdout(&mut buf, &mut fill, n, &mut got);
+                            off += n;
+                        }
+                    }
+                    Ok(Err(e)) => { error!("capture read error: {e}"); break; }
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        if !alive.load(Ordering::SeqCst) || self.shutdown.load(Ordering::SeqCst) {
+                            idle_after_dead += 1;
+                            if idle_after_dead >= 6 {
+                                warn!("capture read did not return within 3s after the capture child was killed; abandoning the read");
+                                break;
+                            }
+                        }
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                }
+            }
+        } else {
+            loop {
+                match stdout.read(&mut buf[fill..]) {
+                    Ok(0) => break,
+                    Ok(n) => self.accept_stdout(&mut buf, &mut fill, n, &mut got),
+                    Err(e) => { error!("capture read error: {e}"); break; }
+                }
             }
         }
         alive.store(false, Ordering::SeqCst);
-        let st = { let mut c = child.lock().unwrap_or_else(|e| e.into_inner()); let _ = c.kill(); c.wait() };
+        let st = {
+            let mut c = child.lock().unwrap_or_else(|e| e.into_inner());
+            let status = capture_tune::stop_child(&mut c, self.args.replug_resilient);
+            if status.is_none() && self.args.replug_resilient {
+                warn!("ffmpeg did not exit within 3s after kill; leaving it and continuing");
+            }
+            status
+        };
         let mut why = ffmpeg::Failure::Other;
         if !self.shutdown.load(Ordering::SeqCst) {
             std::thread::sleep(Duration::from_millis(200));
@@ -660,7 +862,7 @@ impl Engine {
                 warn!("ffmpeg snapshot path issue (video capture was ok): {tail}");
                 return (got, why);
             }
-            let m = format!("ffmpeg capture exited ({:?}){}", st.ok(), if tail.is_empty() { String::new() } else { format!(": {tail}") });
+            let m = format!("ffmpeg capture exited ({st:?}){}", if tail.is_empty() { String::new() } else { format!(": {tail}") });
             let apps = if got { Vec::new() } else { ffmpeg::capture_apps_running() };
             let hint = ffmpeg::failure_hint(why, !apps.is_empty());
             error!("{m}{hint}");

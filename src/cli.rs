@@ -165,6 +165,43 @@ pub struct RecordArgs {
     /// Input pixel format / codec from the card: auto, mjpeg, yuyv422, nv12
     #[arg(long, default_value = "auto")]
     pub input_format: String,
+    /// Opt-in: capture YUY2 1280x720 at 60 fps (forces res, fps, and input format). Off keeps today's settings.
+    /// Not recommended for the MS2131: a live 15s take on 2026-10-20 ran at 11.6 fps with 27 real-time
+    /// buffer drops, a ~400 MB queue, and a missed score. Leave this off unless a later A/B passes.
+    #[arg(long, default_value_t = false)]
+    pub yuy2_720p60: bool,
+    /// Opt-in: at startup, read the USB link and the card's mode list and warn if raw 720p60 cannot fit
+    /// (USB 2, or the mode is not listed). Does not change the capture command.
+    #[arg(long, default_value_t = false)]
+    pub check_usb_link: bool,
+    /// Live scorebug snapshot only. The recording and the receipt are unchanged.
+    /// `q3` is today's JPEG. `hq` is JPEG q:v 2. `png` is a lossless PNG served at the same /snapshot.jpg URL.
+    #[arg(long, default_value = "q3", value_parser = ["q3", "hq", "png"])]
+    pub reader_snapshot: String,
+    /// dshow real-time buffer for the video input. 512M is today's value.
+    #[arg(long, default_value = "512M")]
+    pub rtbufsize: String,
+    /// Opt-in: set -rtbufsize on the separate audio input. Unset keeps ffmpeg's default (~3 MB).
+    #[arg(long)]
+    pub audio_rtbufsize: Option<String>,
+    /// Opt-in: -probesize 32 -analyzeduration 0 on each dshow input.
+    #[arg(long, default_value_t = false)]
+    pub short_probe: bool,
+    /// Opt-in: count persistent "real-time buffer too full" lines and put the lag on /status.
+    #[arg(long, default_value_t = false)]
+    pub buffer_watch: bool,
+    /// Opt-in: restart the capture child when buffer-full warnings stay persistent. Implies --buffer-watch.
+    #[arg(long, default_value_t = false)]
+    pub buffer_restart: bool,
+    /// Opt-in: warn when snapshots stay black (the card streams black with no HDMI picture).
+    #[arg(long, default_value_t = false)]
+    pub no_signal: bool,
+    /// Black samples required before --no-signal warns. The watcher samples about twice a second.
+    #[arg(long, default_value_t = 2)]
+    pub no_signal_secs: u64,
+    /// Opt-in: bound the wait after killing ffmpeg, and wait 1.5s after the card reappears before reopening.
+    #[arg(long, default_value_t = false)]
+    pub replug_resilient: bool,
     /// Seconds without data before the device is considered frozen and reopened
     #[arg(long, default_value_t = 4)]
     pub watchdog: u64,
@@ -257,7 +294,16 @@ mod tests {
     fn defaults_and_subcommands() {
         let c = Cli::try_parse_from(["qorcap", "--port", "9000", "record"]).unwrap();
         assert_eq!(c.port, 9000);
-        if let Cmd::Record(r) = c.cmd { assert_eq!(r.res, (1280, 720)); assert_eq!(r.fps, 30); assert!(r.out.is_none()); } else { panic!() }
+        if let Cmd::Record(r) = c.cmd {
+            assert_eq!(r.res, (1280, 720));
+            assert_eq!(r.fps, 30);
+            assert!(r.out.is_none());
+            assert!(!r.yuy2_720p60 && !r.check_usb_link && !r.short_probe && !r.buffer_watch && !r.buffer_restart && !r.no_signal && !r.replug_resilient);
+            assert_eq!(r.reader_snapshot, "q3");
+            assert_eq!(r.rtbufsize, "512M");
+            assert!(r.audio_rtbufsize.is_none());
+            assert_eq!(r.no_signal_secs, 2);
+        } else { panic!() }
         assert!(matches!(Cli::try_parse_from(["qorcap", "devices"]).unwrap().cmd, Cmd::Devices));
         assert!(matches!(Cli::try_parse_from(["qorcap", "stop"]).unwrap().cmd, Cmd::Stop));
         assert!(matches!(Cli::try_parse_from(["qorcap", "save-replay"]).unwrap().cmd, Cmd::SaveReplay { out: None }));

@@ -152,8 +152,12 @@ pub fn list_options(ffmpeg: &str, device: &str) -> std::io::Result<Vec<Mode>> {
 }
 
 /// Resolve `--input-format auto` from the card's mode list. Prefers a raw format that offers the
-/// exact size at the requested fps (nv12, then yuyv422, then any), otherwise mjpeg (many USB cards
-/// only expose raw modes at 1080p and up). Returns "auto" (let DirectShow pick) if nothing matches.
+/// exact size at the requested fps (nv12, then yuyv422, then any), otherwise mjpeg. Returns "auto"
+/// (let DirectShow pick) if nothing matches.
+///
+/// A 2026-10-19 teardown of the MS2131 lists YUY2 at 1280x720@60, so `auto` would pick `yuyv422`
+/// for that listing. Start Match still passes `--input-format mjpeg`, and this preference order
+/// is unchanged. The opt-in `--yuy2-720p60` flag is the measured path.
 pub fn choose_input_format(modes: &[Mode], w: u32, h: u32, fps: u32) -> String {
     let fits = |m: &&Mode| m.w == w && m.h == h && m.max_fps + 0.5 >= fps as f64;
     let raw: Vec<&Mode> = modes.iter().filter(|m| m.raw).filter(fits).collect();
@@ -173,7 +177,7 @@ pub enum Failure { AudioOpen, VideoNotFound, FormatUnsupported, Busy, Snapshot, 
 pub fn classify_failure(tail: &str) -> Failure {
     let t = tail.to_lowercase();
     // Snapshot/image2 path gone (TEMP cleared) — must not burn reopen budget when video is fine.
-    if (t.contains("snapshot") || t.contains("image2") || t.contains(".jpg"))
+    if (t.contains("snapshot") || t.contains("image2") || t.contains(".jpg") || t.contains(".png"))
         && (t.contains("no such file") || t.contains("error opening output") || t.contains("permission denied") || t.contains("failed to open"))
     {
         return Failure::Snapshot;
@@ -243,8 +247,15 @@ pub fn capture_args_with(a: &RecordArgs, input_format: &str, audio: Option<&Audi
         if audio.is_some() { push(&mut v, &["-re", "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000"]); }
         has_audio = audio.is_some();
     } else {
-        push(&mut v, &["-f", "dshow", "-rtbufsize", "512M", "-thread_queue_size", "1024", "-use_wallclock_as_timestamps", "1",
-            "-video_size", &format!("{w}x{h}"), "-framerate", &fps]);
+        let mut vin: Vec<&str> = vec!["-f", "dshow", "-rtbufsize"];
+        let rtbuf = a.rtbufsize.as_str();
+        vin.push(rtbuf);
+        if a.short_probe { vin.extend(["-probesize", "32", "-analyzeduration", "0"]); }
+        vin.extend(["-thread_queue_size", "1024", "-use_wallclock_as_timestamps", "1", "-video_size"]);
+        let size = format!("{w}x{h}");
+        vin.push(&size);
+        vin.extend(["-framerate", &fps]);
+        push(&mut v, &vin);
         match input_format {
             "auto" | "" => {}
             "mjpeg" => push(&mut v, &["-vcodec", "mjpeg"]),
@@ -257,7 +268,12 @@ pub fn capture_args_with(a: &RecordArgs, input_format: &str, audio: Option<&Audi
             }
             Some(au) => {
                 push(&mut v, &["-i", &format!("video={}", a.device)]);
-                push(&mut v, &["-f", "dshow", "-thread_queue_size", "1024", "-use_wallclock_as_timestamps", "1"]);
+                let mut ain: Vec<&str> = vec!["-f", "dshow"];
+                let audio_rt = a.audio_rtbufsize.clone().unwrap_or_default();
+                if a.audio_rtbufsize.is_some() { ain.extend(["-rtbufsize", audio_rt.as_str()]); }
+                if a.short_probe { ain.extend(["-probesize", "32", "-analyzeduration", "0"]); }
+                ain.extend(["-thread_queue_size", "1024", "-use_wallclock_as_timestamps", "1"]);
+                push(&mut v, &ain);
                 let name = match (au.strategy, &au.alt) {
                     (AudioStrategy::SeparateAlt, Some(alt)) => alt.clone(),
                     _ => { push(&mut v, &["-audio_buffer_size", "50"]); au.name.clone() }
@@ -286,8 +302,18 @@ pub fn capture_args_with(a: &RecordArgs, input_format: &str, audio: Option<&Audi
     push(&mut v, &["-b:v", &a.bitrate, "-maxrate", &a.bitrate, "-bufsize", &a.bitrate, "-g", &fps, "-bf", "0"]);
     if has_audio { push(&mut v, &["-c:a", "aac", "-b:a", "160k", "-ar", "48000", "-af", "aresample=async=1000:first_pts=0"]); }
     push(&mut v, &["-f", "mpegts", "-mpegts_flags", "+resend_headers", "-pat_period", "0.2", "-muxdelay", "0", "pipe:1"]);
-    // Snapshot output (4 fps, atomic rewrite so readers never see a partial JPEG)
-    push(&mut v, &["-map", "0:v", "-vf", "fps=4", "-q:v", "3", "-f", "image2", "-update", "1", "-atomic_writing", "1", "-y", snapshot]);
+    // Snapshot output (4 fps). `q3` is the historical JPEG and keeps `-atomic_writing 1`
+    // so the default command stays byte-for-byte. hq is the same pattern at q:v 2.
+    // PNG does not use atomic rename: on Windows, MoveFileEx cannot replace snapshot.png
+    // while GET /snapshot.jpg has it open, and the 2026-10-20 reader_png take logged
+    // "failed to rename ...snapshot.png.tmp to ...snapshot.png: Operation not permitted".
+    // The PNG is written in place; the API only serves a buffer that ends with IEND.
+    push(&mut v, &["-map", "0:v", "-vf", "fps=4"]);
+    match a.reader_snapshot.as_str() {
+        "hq" => push(&mut v, &["-q:v", "2", "-f", "image2", "-update", "1", "-atomic_writing", "1", "-y", snapshot]),
+        "png" => push(&mut v, &["-c:v", "png", "-compression_level", "1", "-f", "image2", "-update", "1", "-y", snapshot]),
+        _ => push(&mut v, &["-q:v", "3", "-f", "image2", "-update", "1", "-atomic_writing", "1", "-y", snapshot]),
+    }
     v
 }
 
@@ -414,7 +440,78 @@ video=USB3.0 Video: Immediate exit requested"#;
         assert_eq!(classify_failure("Could not find video device with name [X] among source devices of type video."), Failure::VideoNotFound);
         assert_eq!(classify_failure("Could not open file : C:\\Users\\x\\AppData\\Local\\Temp\\qorcap-1\\snapshot.jpg: No such file or directory"), Failure::Snapshot);
         assert_eq!(classify_failure("Error opening output file snapshot.jpg."), Failure::Snapshot);
+        assert_eq!(classify_failure("Could not open file : C:\\t\\snapshot.png: No such file or directory"), Failure::Snapshot);
         assert!(failure_hint(Failure::Busy, true).contains("Close OBS. It's using the capture card"));
         assert!(!failure_hint(Failure::Other, false).contains("busy"));
+    }
+
+    /// Today's capture command, flags off, input mjpeg (what Start Match passes). Byte-for-byte.
+    const GOLDEN_MJPEG_720P30: &str = "-hide_banner -nostdin -loglevel warning -stats_period 1 -progress pipe:2 -f dshow -rtbufsize 512M -thread_queue_size 1024 -use_wallclock_as_timestamps 1 -video_size 1280x720 -framerate 30 -vcodec mjpeg -i video=USB3.0 Video -f dshow -thread_queue_size 1024 -use_wallclock_as_timestamps 1 -audio_buffer_size 50 -i audio=Digital Audio Interface (USB3.0 Audio) -map 0:v -map 1:a -vf fps=30,format=nv12 -fps_mode cfr -r 30 -c:v h264_mf -hw_encoding 1 -rate_control cbr -scenario live_streaming -b:v 8M -maxrate 8M -bufsize 8M -g 30 -bf 0 -c:a aac -b:a 160k -ar 48000 -af aresample=async=1000:first_pts=0 -f mpegts -mpegts_flags +resend_headers -pat_period 0.2 -muxdelay 0 pipe:1 -map 0:v -vf fps=4 -q:v 3 -f image2 -update 1 -atomic_writing 1 -y snap.jpg";
+
+    fn record(extra: &[&str]) -> crate::cli::RecordArgs {
+        use clap::Parser;
+        let mut a = vec!["q", "record"];
+        a.extend_from_slice(extra);
+        let crate::cli::Cmd::Record(r) = crate::cli::Cli::try_parse_from(a).unwrap().cmd else { panic!() };
+        r
+    }
+    fn joined(r: &crate::cli::RecordArgs, fmt: &str, snap: &str) -> String {
+        capture_args(r, fmt, Some("Digital Audio Interface (USB3.0 Audio)"), snap, None).join(" ")
+    }
+    fn until_pipe(s: &str) -> &str { s.split(" pipe:1 ").next().unwrap_or(s) }
+    fn from_encoder(s: &str) -> &str {
+        let i = s.find("-c:v ").unwrap();
+        let j = s.find(" pipe:1 ").unwrap();
+        &s[i..j + " pipe:1".len()]
+    }
+
+    #[test]
+    fn default_capture_command_is_byte_for_byte_todays() {
+        let r = record(&[]);
+        assert_eq!(joined(&r, "mjpeg", "snap.jpg"), GOLDEN_MJPEG_720P30);
+        let mut tuned = r.clone();
+        crate::capture_tune::apply_capture_profile(&mut tuned);
+        assert_eq!(joined(&tuned, "mjpeg", "snap.jpg"), GOLDEN_MJPEG_720P30);
+    }
+
+    #[test]
+    fn opt_in_flags_only_change_their_own_args() {
+        let base = joined(&record(&[]), "mjpeg", "snap.jpg");
+        let enc = from_encoder(&base);
+        let hq = joined(&record(&["--reader-snapshot", "hq"]), "mjpeg", "snap.jpg");
+        assert_eq!(until_pipe(&hq), until_pipe(&base));
+        assert!(hq.contains("-q:v 2") && !hq.contains("-q:v 3"), "{hq}");
+        let png = joined(&record(&["--reader-snapshot", "png"]), "mjpeg", "snap.png");
+        assert_eq!(until_pipe(&png), until_pipe(&base));
+        assert!(png.contains("-c:v png -compression_level 1") && png.ends_with("-y snap.png"), "{png}");
+        assert!(!png.contains("atomic_writing"), "{png}");
+        assert_eq!(from_encoder(&hq), enc);
+        assert_eq!(from_encoder(&png), enc);
+        let small = joined(&record(&["--rtbufsize", "128M"]), "mjpeg", "snap.jpg");
+        assert!(small.contains("-rtbufsize 128M") && !small.contains("-rtbufsize 512M"), "{small}");
+        assert_eq!(from_encoder(&small), enc);
+        let probe = joined(&record(&["--short-probe"]), "mjpeg", "snap.jpg");
+        assert_eq!(probe.matches("-probesize 32 -analyzeduration 0").count(), 2, "{probe}");
+        assert_eq!(from_encoder(&probe), enc);
+        let art = joined(&record(&["--audio-rtbufsize", "512K"]), "mjpeg", "snap.jpg");
+        assert!(art.contains("-f dshow -rtbufsize 512K -thread_queue_size 1024"), "{art}");
+        assert!(art.contains("-rtbufsize 512M"), "{art}");
+        assert_eq!(from_encoder(&art), enc);
+        let mut yuy = record(&["--yuy2-720p60"]);
+        crate::capture_tune::apply_capture_profile(&mut yuy);
+        let y = capture_args(&yuy, &yuy.input_format, Some("Digital Audio Interface (USB3.0 Audio)"), "snap.jpg", None).join(" ");
+        assert!(y.contains("-pixel_format yuyv422") && y.contains("-video_size 1280x720 -framerate 60") && y.contains("-r 60") && y.contains("-g 60"), "{y}");
+        assert!(y.contains("-c:v h264_mf -hw_encoding 1 -rate_control cbr"), "{y}");
+    }
+
+    #[test]
+    fn auto_picks_yuy2_at_720p_when_the_card_lists_it() {
+        // The unit fixture above still models the older "raw only at 1080p" listing.
+        // The 2026-10-19 teardown lists YUY2 at 720p60. `auto` already prefers that raw mode.
+        // Start Match does not use auto; it passes mjpeg. This test locks the existing preference.
+        let listed = "  vcodec=mjpeg  min s=1280x720 fps=10 max s=1280x720 fps=60\n  pixel_format=yuyv422  min s=1280x720 fps=10 max s=1280x720 fps=60.0002\n  pixel_format=yuyv422  min s=1920x1080 fps=10 max s=1920x1080 fps=60\n";
+        let m = parse_dshow_options(listed);
+        assert_eq!(choose_input_format(&m, 1280, 720, 60), "yuyv422");
+        assert_eq!(choose_input_format(&m, 1280, 720, 30), "yuyv422");
     }
 }
