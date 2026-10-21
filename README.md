@@ -2,7 +2,7 @@
 
 # QorCap
 
-**Website:** https://conwan30.github.io/qorcap/ · **Download:** [v0.3.27](https://github.com/ConWan30/qorcap/releases/tag/v0.3.27) ([latest release](https://github.com/ConWan30/qorcap/releases/latest))
+**Website:** https://conwan30.github.io/qorcap/ · **Download:** [v0.3.28](https://github.com/ConWan30/qorcap/releases/tag/v0.3.28) ([latest release](https://github.com/ConWan30/qorcap/releases/latest))
 
 A small Windows recorder for a USB HDMI capture card (built for a generic **"USB3.0 Video"** card carrying a PS5),
 made for **[QorTime](https://github.com/ConWan30/qortime)** match receipts. It does two jobs:
@@ -26,7 +26,7 @@ with a local control surface). QorCap copies only that design idea, no code. No 
 
 ## Quickstart: double-click Start Match
 
-1. Download `qorcap-v0.3.27-windows-x64.zip` from the [latest release](https://github.com/ConWan30/qorcap/releases/latest)
+1. Download `qorcap-v0.3.28-windows-x64.zip` from the [latest release](https://github.com/ConWan30/qorcap/releases/latest)
    and unzip it, for example to `C:\QorCap` (right-click the zip, *Extract All*).
 2. Connect PS5 HDMI out to the **USB3.0 Video** card, and the card to a blue USB 3 port. Close OBS or the Camera app.
 3. Double-click **`Start Match`**. On the first run it downloads ffmpeg, installs Python 3.12 through winget if it
@@ -57,7 +57,7 @@ countersigned live (`countersigned.jsonl`), those signatures are reused. Otherwi
 checkpoints at finalize time, stamping each with QorCap's recording time, and `referee.key_kind` is
 `local-self-attested-offline` so a reader can tell.
 
-**Glimpse witness (opt-in, default off).** Three observer-only switches sit beside the shadow watcher and do not feed a lock or a receipt: `QORCAP_GLIMPSE_WITNESS` (unhinted read of locked frames, about $0.08/match), `QORCAP_GLIMPSE_BURST` (one extra crop on a disagreement, about $0.006/match), and `QORCAP_GLIMPSE_ATTEST` (signed sidecar after the match, $0, its own key). Together about $2/week at 25 matches if the quotas fill, under the default $10 week cap. See [docs/GLIMPSE_WITNESS.md](docs/GLIMPSE_WITNESS.md).
+**Glimpse witness (on in Start Match).** Start Match sets `QORCAP_GLIMPSE_FRAME=1` (so `GET /frame/scorebug` is served), starts the advisory watcher, and turns on `QORCAP_GLIMPSE_WITNESS` (unhinted read of locked frames, about $0.08/match), `QORCAP_GLIMPSE_BURST` (one extra crop on a disagreement, about $0.006/match), and `QORCAP_GLIMPSE_ATTEST` (signed sidecar after the match, $0, its own key). Together about $2/week at 25 matches if the quotas fill, under the default $10/week and $0.50/game caps. Nothing here feeds a lock or a receipt. `--no-glimpse` turns all of it off. `--no-glimpse-witness`, `--no-glimpse-burst`, and `--no-glimpse-attest` each turn one switch off. `QORCAP_GLIMPSE_BURST_RING`, `QORCAP_GLIMPSE_CLIP_AUDIT`, and the touchdown veto `QORCAP_GLIMPSE_TD_VETO` stay off. `qorcap record` itself stays default-off. See [docs/GLIMPSE_WITNESS.md](docs/GLIMPSE_WITNESS.md).
 
 **Highlight clips (automatic after the match).** Start Match and Finalize Last Match cut them once the receipt is signed.
 Opt out with `--no-auto-highlights`. You can still double-click **`Make Highlights`** (or run `qorcap highlights <bundle folder>`).
@@ -374,7 +374,7 @@ Global: `--port 8788`, `--ffmpeg PATH`, `--log FILE` (default `qorcap.log`, or `
 | POST | `/record/start` `{out?, duration?}` · `/record/stop` | |
 | POST | `/replay/save` `{out?}` | returns `{file}` |
 | GET | `/snapshot.jpg` | latest frame (4 fps) |
-| GET | `/frame/scorebug` | opt-in (`QORCAP_GLIMPSE_FRAME=1` / `--glimpse-frame`), read-only, from memory: the reader's newest snapshot for the advisory Glimpse watcher; 1 per 2 s, refused when older than 3 s. See [docs/GLIMPSE_WATCH.md](docs/GLIMPSE_WATCH.md) |
+| GET | `/frame/scorebug` | on when `QORCAP_GLIMPSE_FRAME=1` or `--glimpse-frame` (Start Match sets the env for a live match; `qorcap record` alone stays off), read-only, from memory: the reader's newest snapshot for the advisory Glimpse watcher; 1 per 2 s, refused when older than 3 s. See [docs/GLIMPSE_WATCH.md](docs/GLIMPSE_WATCH.md) |
 | GET | `/frame/burst-ring` | opt-in and off unless `QORCAP_GLIMPSE_BURST_RING=1` as well (404 otherwise). Newest 8 frames / 16 s the reader already pulled, hex-encoded, no rate-limit shared with `/frame/scorebug`. A busy ring drops the sample. Advisory only. See [docs/GLIMPSE_WITNESS.md](docs/GLIMPSE_WITNESS.md) |
 | POST | `/challenge` | referee nonce |
 | POST | `/events` | `{type:"score",home,away,quarter,clock_s,clock_red}` · `{type:"obs",obs,t_ms,until_ms,n}` · `{type:"final",basis,home,away,quarter}` |
@@ -384,7 +384,7 @@ Global: `--port 8788`, `--ffmpeg PATH`, `--log FILE` (default `qorcap.log`, or `
 ## Run on Windows by hand (PowerShell, advanced)
 
 ```powershell
-# 1. unzip qorcap-v0.3.27-windows-x64.zip to C:\QorCap, then:
+# 1. unzip qorcap-v0.3.28-windows-x64.zip to C:\QorCap, then:
 cd C:\QorCap
 Unblock-File .\qorcap.exe, .\get-ffmpeg.ps1
 powershell -ExecutionPolicy Bypass -File .\get-ffmpeg.ps1     # puts ffmpeg.exe next to qorcap.exe
@@ -421,6 +421,8 @@ continues), replay save, challenge stamp visible in the video, score/final event
 written, `verify-bundle` OK, and a single flipped byte reported as FAIL.
 
 **Tested on Windows (v0.2.0–v0.2.1 era, MyTurn, USB3.0 Video):** `--input-format mjpeg` 1280x720@30 with `h264_mf` at 29.7 fps. v0.2.1 fixed audio / auto-format / OBS.
+
+**v0.3.28:** Start Match turns the cheap-tier Glimpse witness on. For a live match, `start-match.ps1` sets `QORCAP_GLIMPSE_FRAME=1` so `GET /frame/scorebug` is served, starts the advisory watcher (detached, minimized, below normal), and sets `QORCAP_GLIMPSE_WITNESS=1`, `QORCAP_GLIMPSE_BURST=1`, and `QORCAP_GLIMPSE_ATTEST=1`. Caps stay at the watcher defaults, $0.50 per game and $10 per week. `--no-glimpse` turns all of it off, including a frame tap that a saved user variable would have left on. `--no-glimpse-witness`, `--no-glimpse-burst`, and `--no-glimpse-attest` each turn one switch off. `QORCAP_GLIMPSE_BURST_RING`, `QORCAP_GLIMPSE_CLIP_AUDIT`, and `QORCAP_GLIMPSE_TD_VETO` are set to `0`; Start Match never turns the touchdown veto on. `qorcap.exe` is unchanged: the record command stays default-off, and a flag-off watcher still writes the same advisory bytes. If `%LOCALAPPDATA%\QorCap\keys\glimpse-observer.key` is missing, Start Match creates it once with `qorcap_glimpse_attest.py --init-key` and keeps recording if that fails. If the OpenRouter key is missing, witness and burst calls are skipped and that line is written to the Start Match window and to `%LOCALAPPDATA%\QorCapGlimpse\start-match.log`; recording is not blocked or slowed. After the receipt is signed, Start Match (and Finalize Last Match) runs the attestation sidecar. The match folder gains no file unless `QORCAP_GLIMPSE_ATTEST_COPY=1`. This release also includes the changes that landed after v0.3.27. PR #48: `--frame-clock` / `QORCAP_FRAME_CLOCK=1` writes `frame_clock.jsonl` on the same monotonic clock as the controller log and uses a stamp for input alignment only when one is present. The flag stays default off. The ffmpeg command, the receipt, and flag-off alignment are unchanged. A pause menu is no longer the final screen: that label needs end-of-game context, and an OPTIONS press that hid the scorebug is held back unless that picture stays up. A real end screen still commits. PR #49: Start Match and Finalize Last Match cut highlight clips after the receipt is signed and attach Content Credentials when the receipt verifies (`--no-auto-highlights` opts out). `verified: true` is written only when QorTime's verifier returns VERIFIED and `qorcap verify-bundle` is clean. A local receipt stays self-attested. `qorcap clip export` stays default-off. A highlights failure does not change the receipt or the submission. PR #51: the cheap-tier witness (unhinted read of frames the reader already locked, own 45 s clock, about $0.08/match), burst (one extra unhinted crop on a disagreement, 8 events, about $0.006/match), and a signed observer attestation ($0, its own key, not a receipt). About $2/week at 25 matches if the quotas fill, under the $10 week cap. See [docs/GLIMPSE_WITNESS.md](docs/GLIMPSE_WITNESS.md).
 
 **v0.3.27:** highlight clips burn **SCOREBUG LOCK** instead of **LOCKED SCORE**. The panel is a scorebug read committed into the checkpoint chain. **LOCKED SCORE** and **VERIFIED** stay off the picture, because a referee verdict is not known when the clip is cut (QorTime match 125430 is FAIL: the capture key is local self-attested). The `.vtt` uses the same title. Panel layout, cut windows, and the recorder are unchanged.
 

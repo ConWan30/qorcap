@@ -48,20 +48,25 @@ Start Match.cmd                        (as usual)
 It stops by itself when QorCap has been unreachable for 5 minutes, after 180 minutes, or when the game cap is
 reached. Closing its window stops it at any time; recording is unaffected either way.
 
-## Automatic start with Start Match (v0.3.22)
+## Automatic start with Start Match (v0.3.28)
 
-When the user environment variable `QORCAP_GLIMPSE_FRAME` is `1`, `start-match.ps1` starts the
-watcher by itself just before recording begins:
+A live Start Match turns the frame tap on and starts the watcher. `start-match.ps1` sets
+`QORCAP_GLIMPSE_FRAME=1` for that process (so `GET /frame/scorebug` answers) and launches
+`qorcap_glimpse_watch.py` just before recording:
 
 - detached (`Start-Process`), minimized window, `BelowNormal` priority — it never blocks or slows capture;
 - `--layout auto` (override with user env `QORCAP_GLIMPSE_LAYOUT`, e.g. `thursday_night`);
-- `--wait-start-s 900`: it waits up to 15 min for the first scorebug frame, then exits;
+- `--wait-start-s 1800`: it waits up to 30 min for the first scorebug frame, then exits;
   `--idle-exit-s 60`: it exits a minute after frames stop; it also stops if a different match starts;
-- `OPENROUTER_API_KEY` is read from the user environment only for the watcher's launch and is never printed;
+- `OPENROUTER_API_KEY` is read from the process, then the user, then the machine environment, only for the
+  watcher's launch, and is never printed. The recorder process does not keep it;
 - any failure prints one line ("not started …; the match is unaffected") and the match continues.
 
-Set `QORCAP_GLIMPSE_FRAME=0` (or remove it) to turn both the frame tap and the watcher off.
-Caps stay in force: $0.50 per game, $10 per week (`budget.py`). Glimpse remains ADVISORY_AI only.
+`Start Match.cmd --no-glimpse` sets `QORCAP_GLIMPSE_FRAME=0` and does not start the watcher.
+Caps stay in force: $0.50 per game, $10 per week. Glimpse remains ADVISORY_AI only.
+
+v0.3.22 started the watcher only when the user variable `QORCAP_GLIMPSE_FRAME` was already `1`.
+The launcher is now the default.
 
 ## Second opinion on touchdown jumps (v0.3.23, watcher 0.1.3) — shadow only
 
@@ -77,9 +82,11 @@ turned on. When on, a held fast-path lock waits up to 4 s for the verdict: `disa
 (the normal 3/9-read windows still apply), `agree` posts it, no verdict posts it after the wait. Glimpse can only
 veto or delay a fast-path lock; it can never create a lock, and offline finalize never uses it.
 
-## Witness, burst, attestation (cheap tier, all default off)
+## Witness, burst, attestation (cheap tier)
 
-Separate flags, off unless set to `1`: `QORCAP_GLIMPSE_WITNESS`, `QORCAP_GLIMPSE_BURST`,
-`QORCAP_GLIMPSE_BURST_RING`, `QORCAP_GLIMPSE_ATTEST`, `QORCAP_GLIMPSE_CLIP_AUDIT`. Start Match does not enable
-them. Flag-off output matches today's watcher. See [GLIMPSE_WITNESS.md](GLIMPSE_WITNESS.md). The loop specs are
-in [PR #50](https://github.com/ConWan30/qorcap/pull/50).
+`QORCAP_GLIMPSE_WITNESS`, `QORCAP_GLIMPSE_BURST`, and `QORCAP_GLIMPSE_ATTEST` are on for a live Start Match.
+`QORCAP_GLIMPSE_BURST_RING`, `QORCAP_GLIMPSE_CLIP_AUDIT`, and `QORCAP_GLIMPSE_TD_VETO` stay off. Start Match
+sets those three to `0` and never turns the touchdown veto on. The watcher and `qorcap.exe` still default
+off when the environment is unset, so a flag-off run matches today's advisory bytes. See
+[GLIMPSE_WITNESS.md](GLIMPSE_WITNESS.md). The loop specs are in
+[PR #50](https://github.com/ConWan30/qorcap/pull/50).

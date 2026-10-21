@@ -315,15 +315,18 @@ def test_stops_when_qorcap_moves_to_another_match(tmp_path):
 
 
 def test_start_match_launches_the_watcher_safely():
-    """Start Match starts the watcher detached, minimized, below normal, only when QORCAP_GLIMPSE_FRAME=1, inside a
-    try/catch so a Glimpse problem never stops the match, strips --no-glimpse, and never prints the API key."""
+    """Start Match starts the watcher detached, minimized, below normal, inside a try/catch so a Glimpse problem
+    never stops the match, strips --no-glimpse, and never prints the API key. The launcher sets
+    QORCAP_GLIMPSE_FRAME=1 for a live match; qorcap.exe is not passed --glimpse-frame."""
     ps = (Path(__file__).resolve().parents[1] / "start-match.ps1").read_text(encoding="utf-8")
-    blk = ps[ps.index("# Advisory Glimpse watcher"):ps.index("& $vpy (Join-Path $here \"sidecar\\qorcap_match.py\")")]
-    for s in ('try {', '} catch {', '-WindowStyle Minimized', '"BelowNormal"', '$gFlag -eq "1"', '"--no-glimpse"',
-              '"--wait-start-s", "1800"', '"--idle-exit-s", "60"', 'Start-Process', 'Remove-Item Env:OPENROUTER_API_KEY'):
+    blk = ps[ps.index("# Glimpse defaults"):ps.index("& $vpy (Join-Path $here \"sidecar\\qorcap_match.py\")")]
+    for s in ('try {', '} catch {', '-WindowStyle Minimized', '"BelowNormal"', '$env:QORCAP_GLIMPSE_FRAME = "1"',
+              '$glimpseLive', '"--no-glimpse"', '"--wait-start-s", "1800"', '"--idle-exit-s", "60"',
+              'Start-Process', 'Remove-Item Env:OPENROUTER_API_KEY'):
         assert s in blk, s
     assert "Write-Host" in blk and not any("OPENROUTER_API_KEY" in ln for ln in blk.splitlines() if "Write-Host" in ln)
     assert "Wait-Process" not in blk and "-Wait" not in blk
+    assert "--glimpse-frame" not in ps
 
 
 # ---- v0.1.3: second opinion on held touchdown jumps (shadow) --------------------------------------------------------
