@@ -42,9 +42,31 @@ jobs:
           )) { Copy-Item $f $root }
           New-Item -ItemType Directory -Force -Path (Join-Path $root "docs") | Out-Null
           Copy-Item docs\GLIMPSE_WATCH.md (Join-Path $root "docs")
+          Copy-Item docs\GLIMPSE_WITNESS.md (Join-Path $root "docs")
           Copy-Item docs\CONTENT_CREDENTIALS.md (Join-Path $root "docs")
+          Copy-Item docs\FRAME_CLOCK_AB.md (Join-Path $root "docs")
           Copy-Item sidecar (Join-Path $root "sidecar") -Recurse
           Get-ChildItem (Join-Path $root "sidecar") -Recurse -Directory -Filter __pycache__ | Remove-Item -Recurse -Force
+          # Witness, burst, and attest ship as sidecar\qorcap_glimpse_watch.py, qorcap_glimpse_side.py,
+          # qorcap_glimpse_attest.py, and sidecar\glimpse\ prompts. Python deps are not vendored:
+          # start-match.ps1 installs numpy, opencv-python-headless, and cryptography (Ed25519 attest).
+          foreach ($need in @(
+            "docs\GLIMPSE_WITNESS.md",
+            "docs\GLIMPSE_WATCH.md",
+            "docs\CONTENT_CREDENTIALS.md",
+            "docs\FRAME_CLOCK_AB.md",
+            "sidecar\qorcap_glimpse_watch.py",
+            "sidecar\qorcap_glimpse_side.py",
+            "sidecar\qorcap_glimpse_attest.py",
+            "sidecar\glimpse\ROLE_v1.md",
+            "start-match.ps1"
+          )) {
+            if (-not (Test-Path (Join-Path $root $need))) { throw "package missing $need" }
+          }
+          $launcher = Get-Content (Join-Path $root "start-match.ps1") -Raw
+          if ($launcher -notmatch "numpy opencv-python-headless cryptography") {
+            throw "start-match.ps1 does not install the Glimpse Python packages"
+          }
 
           Push-Location $root
           try { & .\get-ffmpeg.ps1 } finally { Pop-Location }
