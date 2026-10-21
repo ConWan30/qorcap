@@ -69,6 +69,11 @@ segments. `qorcap highlights --check highlights/manifest.json` re-checks all of 
 later lock contradicts are skipped and listed. Clips show what was on screen, not who held the controller. Match 125430 (18.9 min) is a
 QorTime **FAIL** because the capture key is local self-attested: 6 clips in about 3 s, each panel titled SCOREBUG LOCK.
 
+**Content Credentials on one shared clip (opt-in, default off).** `qorcap clip export` cuts a match-clock range from a bundle.
+With `--content-credentials` or `QORCAP_CONTENT_CREDENTIALS=1` it embeds a C2PA manifest that binds that file to `receipt.json` by hash.
+The receipt file is unchanged. `qorcap clip-verify` checks the signature and, given the bundle, recomputes the hashes.
+See [docs/CONTENT_CREDENTIALS.md](docs/CONTENT_CREDENTIALS.md). Highlight clips above are a separate path and are not credentialed.
+
 No card? Double-click **`Test Without Card`**. It plays a test-pattern video and a scripted 20-second game through the same
 record, sign and verify path (`python sidecar/qorcap_match.py --test-pattern`).
 

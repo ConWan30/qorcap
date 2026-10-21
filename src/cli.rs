@@ -127,6 +127,28 @@ pub enum Cmd {
         #[arg(long)]
         no_video: bool,
     },
+    /// Cut one range of a match bundle on the match clock (`qorcap clip export`).
+    /// Content Credentials are off unless `--content-credentials` or `QORCAP_CONTENT_CREDENTIALS` is set.
+    Clip {
+        #[command(subcommand)]
+        clip: ClipCmd,
+    },
+    /// Read a clip's Content Credentials, check the C2PA signature, and (with `--bundle`) recompute
+    /// the receipt and segment hashes. Exit 0 pass, 1 fail, 2 the clip could not be opened.
+    #[command(name = "clip-verify")]
+    ClipVerify {
+        /// Credentialed or plain clip (MP4)
+        clip: String,
+        /// Match bundle the clip claims to come from. Without it, hash checks fail closed.
+        #[arg(long)]
+        bundle: Option<String>,
+        /// QorTime checkout (directory that contains qor_receipt/). Also $QORTIME.
+        #[arg(long)]
+        qortime: Option<String>,
+        /// Python interpreter used to run `python -m qor_receipt.cli verify`
+        #[arg(long)]
+        python: Option<String>,
+    },
     /// (Re)compute a bundle's controller-input proof: human-likeness, input-video match rate and offset;
     /// writes input_proof.json and adds signals.input to receipt.draft.json
     InputProof {
@@ -140,6 +162,37 @@ pub enum Cmd {
         /// Run even though a recorder still seems to be writing this bundle (result gets a warning)
         #[arg(long)]
         force: bool,
+    },
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum ClipCmd {
+    /// Cut `[start, end)` on the match clock out of the bundle's video.
+    /// With credentials off, the file is the ffmpeg cut and nothing else.
+    Export {
+        /// Match bundle folder (video.mp4, manifest.jsonl, and receipt.json when signing)
+        #[arg(long)]
+        bundle: String,
+        /// First millisecond of the clip on the match's monotonic clock (inclusive)
+        #[arg(long)]
+        start_mono_ms: u64,
+        /// End millisecond on that clock (exclusive)
+        #[arg(long)]
+        end_mono_ms: u64,
+        /// Output MP4
+        #[arg(long)]
+        out: String,
+        /// Embed a C2PA manifest bound to the signed receipt. Default off.
+        /// Also on when QORCAP_CONTENT_CREDENTIALS is 1, true, yes, or on.
+        /// Off: the output is the ffmpeg cut, byte for byte.
+        #[arg(long)]
+        content_credentials: bool,
+        /// QorTime checkout (directory that contains qor_receipt/). Also $QORTIME.
+        #[arg(long)]
+        qortime: Option<String>,
+        /// Python interpreter used to run `python -m qor_receipt.cli verify`
+        #[arg(long)]
+        python: Option<String>,
     },
 }
 
@@ -295,6 +348,29 @@ mod tests {
             Cmd::Highlights { bundle, pre, post, no_burn, check, .. } => {
                 assert_eq!(bundle.as_deref(), Some("D:/m"));
                 assert_eq!((pre, post, no_burn, check), (6.0, 4.0, true, None));
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn parses_clip_export_with_credentials_off() {
+        match Cli::try_parse_from([
+            "qorcap", "clip", "export", "--bundle", "D:/m", "--start-mono-ms", "0",
+            "--end-mono-ms", "1000", "--out", "c.mp4",
+        ]).unwrap().cmd {
+            Cmd::Clip { clip: ClipCmd::Export { bundle, start_mono_ms, end_mono_ms, out, content_credentials, qortime, .. } } => {
+                assert_eq!(bundle, "D:/m");
+                assert_eq!((start_mono_ms, end_mono_ms, out.as_str(), content_credentials), (0, 1000, "c.mp4", false));
+                assert!(qortime.is_none());
+            }
+            _ => panic!(),
+        }
+        match Cli::try_parse_from(["qorcap", "clip-verify", "c.mp4", "--bundle", "D:/m"]).unwrap().cmd {
+            Cmd::ClipVerify { clip, bundle, qortime, .. } => {
+                assert_eq!(clip, "c.mp4");
+                assert_eq!(bundle.as_deref(), Some("D:/m"));
+                assert!(qortime.is_none());
             }
             _ => panic!(),
         }

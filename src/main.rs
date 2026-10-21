@@ -387,6 +387,53 @@ fn main() {
             println!("{}", serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".into()));
             0
         }
+        Cmd::Clip { clip } => match clip {
+            qorcap::cli::ClipCmd::Export { bundle, start_mono_ms, end_mono_ms, out, content_credentials, qortime, python } => {
+                let on = qorcap::credentials::flag_enabled(
+                    content_credentials,
+                    std::env::var(qorcap::credentials::ENV).ok().as_deref(),
+                );
+                let req = qorcap::clip::ExportRequest {
+                    bundle: std::path::PathBuf::from(bundle),
+                    start_mono_ms,
+                    end_mono_ms,
+                    out: std::path::PathBuf::from(out),
+                    ffmpeg: ff,
+                    credentials: on,
+                    qortime: qortime.map(std::path::PathBuf::from),
+                    python,
+                    key_dir: None,
+                };
+                match qorcap::clip::export(&req) {
+                    Ok(done) => {
+                        println!("wrote {}", done.out.display());
+                        if let Some(a) = &done.assertion {
+                            println!("content_credentials: on");
+                            println!("verification_status: {}", a.verification_status);
+                            println!("verified: {}", a.verified);
+                            println!("match_id: {}", a.match_id);
+                            println!("receipt_sha256: {}", a.receipt_sha256);
+                            println!("signer: self-signed local key (standard C2PA validators show this signer as untrusted)");
+                        } else {
+                            println!("content_credentials: off");
+                        }
+                        0
+                    }
+                    Err(e) => { eprintln!("error: {e}"); e.code() }
+                }
+            }
+        },
+        Cmd::ClipVerify { clip, bundle, qortime, python } => {
+            match qorcap::clip::verify_clip(
+                std::path::Path::new(&clip),
+                bundle.as_deref().map(std::path::Path::new),
+                qortime.as_deref().map(std::path::Path::new),
+                python.as_deref(),
+            ) {
+                Ok(r) => { print!("{}", r.text); if r.pass { 0 } else { 1 } }
+                Err(e) => { eprintln!("error: {e}"); 2 }
+            }
+        }
         Cmd::InputProof { dir, frames, no_video, force } => {
             let d = std::path::Path::new(&dir);
             if qorcap::inputproof::recorder_running(d) && !force {

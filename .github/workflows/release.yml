@@ -42,6 +42,7 @@ jobs:
           )) { Copy-Item $f $root }
           New-Item -ItemType Directory -Force -Path (Join-Path $root "docs") | Out-Null
           Copy-Item docs\GLIMPSE_WATCH.md (Join-Path $root "docs")
+          Copy-Item docs\CONTENT_CREDENTIALS.md (Join-Path $root "docs")
           Copy-Item sidecar (Join-Path $root "sidecar") -Recurse
           Get-ChildItem (Join-Path $root "sidecar") -Recurse -Directory -Filter __pycache__ | Remove-Item -Recurse -Force
 
