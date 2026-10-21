@@ -57,17 +57,24 @@ countersigned live (`countersigned.jsonl`), those signatures are reused. Otherwi
 checkpoints at finalize time, stamping each with QorCap's recording time, and `referee.key_kind` is
 `local-self-attested-offline` so a reader can tell.
 
-**Highlight clips (opt-in, after the match).** Double-click **`Make Highlights`** (or run `qorcap highlights <bundle folder>`,
-or add `--highlights` to `qorcap finalize`). For every **locked** score change (a `score_change` checkpoint in the signed hash chain whose
+**Highlight clips (automatic after the match).** Start Match and Finalize Last Match cut them once the receipt is signed.
+Opt out with `--no-auto-highlights`. You can still double-click **`Make Highlights`** (or run `qorcap highlights <bundle folder>`).
+For every **locked** score change (a `score_change` checkpoint in the signed hash chain whose
 evidence hash matches, normally inside `receipt.json`) it cuts about 8 s before to 4 s after (`--pre`/`--post`) and burns in a small panel
 titled **SCOREBUG LOCK** (the QorTime viewer's wording for a scorebug read), with the score in gold plus the lock and receipt hashes.
-**LOCKED SCORE** and **VERIFIED** are reserved for a referee-verified receipt. The sidecar does not know that verdict when it cuts the clip,
-so the panel and the `.vtt` stay on **SCOREBUG LOCK** (`--no-burn` stream-copies and keeps those words only in the `.vtt`). It writes
-`highlights/manifest.json` (`qorcap-highlights/v0`) linking each clip to its lock, the receipt SHA-256 and the hash-chained source
-segments. `qorcap highlights --check highlights/manifest.json` re-checks all of it. It never runs during recording: a fresh
-`.qorcap-run/recording.lock` makes it refuse (exit 3), and it needs the signed `receipt.json` (exit 4 without it). Scorebug misreads that a
-later lock contradicts are skipped and listed. Clips show what was on screen, not who held the controller. Match 125430 (18.9 min) is a
-QorTime **FAIL** because the capture key is local self-attested: 6 clips in about 3 s, each panel titled SCOREBUG LOCK.
+The panel and the `.vtt` stay on **SCOREBUG LOCK** (`--no-burn` stream-copies and keeps those words only in the `.vtt`). They do not say
+**VERIFIED**. It writes `highlights/manifest.json` (`qorcap-highlights/v0`) linking each clip to its lock, the receipt SHA-256 and the
+hash-chained source segments. `qorcap highlights --check highlights/manifest.json` re-checks all of it. It never runs during recording: a fresh
+`.qorcap-run/recording.lock` makes it refuse (exit 3), and it needs the signed `receipt.json` (exit 4 without it). A highlights failure does
+not change the receipt, the finalize result, or submission. Scorebug misreads that a later lock contradicts are skipped and listed. Clips show
+what was on screen, not who held the controller.
+
+**Content Credentials.** After those clips are cut, Start Match signs each one with `qorcap clip sign` when the receipt verifies.
+`verified: true` is written only when QorTime's verifier returns `VERIFIED` and `qorcap verify-bundle` is clean. A local receipt stays
+`self_attested` with `verified: false`. If the receipt does not verify, the clips are still exported, without credentials, and the manifest
+records `verified: false` and `receipt did not verify`. `qorcap clip export` is a separate one-range cut and stays default-off
+(`--content-credentials` or `QORCAP_CONTENT_CREDENTIALS`). With that flag off, its output is the ffmpeg cut and nothing else.
+See [docs/CONTENT_CREDENTIALS.md](docs/CONTENT_CREDENTIALS.md).
 
 No card? Double-click **`Test Without Card`**. It plays a test-pattern video and a scripted 20-second game through the same
 record, sign and verify path (`python sidecar/qorcap_match.py --test-pattern`).

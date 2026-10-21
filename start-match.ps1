@@ -65,19 +65,25 @@ Write-Host ""
 
 # Official challenges are on for a double-clicked match. Pass --no-official-challenges to opt out.
 # Tests call qorcap_match.py directly and do not get this flag.
+# Highlight clips plus content credentials run after the receipt is signed (Start Match and Finalize Last Match).
+# Pass --no-auto-highlights to opt out. This script does not set QORCAP_CONTENT_CREDENTIALS, so qorcap.exe
+# record and clip export stay default-off and a recording is unchanged. A highlights failure cannot stop finalize or submit.
 $fwd = @($args)
+# finalize is an offline sign of a finished bundle. Live-only flags (side prompt, official challenges)
+# must not be forwarded or argparse rejects the whole finalize before any clip is cut.
+$isFinalize = $fwd -contains "finalize"
 $hasChallengeFlag = $false
 foreach ($x in $fwd) {
   if ($x -eq "--official-challenges" -or $x -eq "--no-official-challenges") { $hasChallengeFlag = $true }
 }
-if (-not $hasChallengeFlag) { $fwd = @("--official-challenges") + $fwd }
+if (-not $hasChallengeFlag -and -not $isFinalize) { $fwd = @("--official-challenges") + $fwd }
 
 # Side pick (v0.3.26): your side is signed into the first checkpoint, so it is chosen before recording starts.
 # "Start Match.cmd --side away" (or home) skips the prompt; so does a one-shot next-side.txt in %LOCALAPPDATA%\QorCap
 # (renamed after use; ignored if older than 4 h). Otherwise qorcap_match.py shows the big H / A prompt and waits.
 $hasSide = $false
 foreach ($x in $fwd) { if ($x -eq "--side" -or $x -eq "--role" -or $x -like "--side=*" -or $x -like "--role=*") { $hasSide = $true } }
-if (-not $hasSide) { $fwd = @("--side", "ask") + $fwd }
+if (-not $hasSide -and -not $isFinalize) { $fwd = @("--side", "ask") + $fwd }
 
 # Advisory Glimpse watcher (v0.3.23): ADVISORY_AI, shadow-only, never feeds a lock or the receipt. On when the user
 # variable QORCAP_GLIMPSE_FRAME is 1 (opt out for one match with --no-glimpse). Started detached, minimized, below
@@ -101,5 +107,8 @@ try {
     Write-Host "  Glimpse watch .. started (advisory only, minimized; report in $env:LOCALAPPDATA\QorCapGlimpse)"
   }
 } catch { Write-Host "  Glimpse watch .. not started ($($_.Exception.Message)); the match is unaffected" }
+$noAutoHighlights = $fwd -contains "--no-auto-highlights"
+$fwd = @($fwd | Where-Object { $_ -ne "--no-auto-highlights" })
+if (-not $noAutoHighlights -and -not ($fwd -contains "--auto-highlights")) { $fwd = @("--auto-highlights") + $fwd }
 & $vpy (Join-Path $here "sidecar\qorcap_match.py") --qorcap (Join-Path $here "qorcap.exe") --ffmpeg (Join-Path $here "ffmpeg.exe") @qtArgs @fwd
 Done $LASTEXITCODE

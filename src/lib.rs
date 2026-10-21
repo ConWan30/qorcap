@@ -15,3 +15,5 @@ pub mod frameclock;
 pub mod inputproof;
 pub mod haptics;
 pub mod glimpse;
+pub mod credentials;
+pub mod clip;
