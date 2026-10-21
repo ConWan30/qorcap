@@ -29,8 +29,9 @@ FRAMES_PER_CLIP = 1
 
 
 def default_key_dir() -> Path:
-    base = os.environ.get("LOCALAPPDATA") or str(Path.home() / ".local" / "share")
-    return Path(base) / "QorCap" / "keys"
+    """Same directory as the device and referee keys, so a copied seed is refused."""
+    from qorcap_paths import key_dir
+    return key_dir()
 
 
 def observer_key_path(key_dir=None) -> Path:
@@ -100,15 +101,14 @@ def _verify(pub: bytes, payload: bytes, sig: bytes) -> bool:
 def init_key(path: Path) -> int:
     """Create the observer seed. Does not sign anything and does not overwrite an existing key."""
     path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
+    from qorcap_paths import private_dir
+    private_dir(path.parent)
     if path.exists():
         print(f"[glimpse-attest] observer key already exists at {path}")
         return 0
     path.write_text(os.urandom(32).hex() + "\n", encoding="utf-8")
-    try:
-        os.chmod(path, 0o600)
-    except OSError:
-        pass
+    from qorcap_paths import restrict_private
+    restrict_private(path)
     print(f"[glimpse-attest] wrote observer key {path} (key_kind {KEY_KIND})")
     return 0
 
@@ -368,7 +368,9 @@ def _run_clips(match, out, audit_path, *, post, extract_frame, key_reader, deadl
                 continue
             frame = None
             try:
-                frame = extract(match / "highlights" / (clip["file"] or ""))
+                from qorcap_paths import bundle_child
+                clip_path = bundle_child(match / "highlights", clip.get("file"))
+                frame = extract(clip_path) if clip_path is not None else None
             except Exception:
                 frame = None
             if not frame:

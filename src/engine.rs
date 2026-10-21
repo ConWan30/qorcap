@@ -1034,9 +1034,10 @@ mod tests {
         let out = e.write_bundle().unwrap();
         let draft: Value = serde_json::from_str(&std::fs::read_to_string(out.join("receipt.draft.json")).unwrap()).unwrap();
         assert_eq!(draft["result"]["final_confirmed"], true);
-        assert_eq!(draft["result"]["delta_corroboration"]["kind"], "haptic");
+        assert!(draft["result"].get("delta_corroboration").is_none(), "corroboration is not a receipt field");
         let bundle: Value = serde_json::from_str(&std::fs::read_to_string(out.join("bundle.json")).unwrap()).unwrap();
         assert_eq!(bundle["final_confirmed"], true);
+        assert_eq!(bundle["delta_corroboration"]["kind"], "haptic");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1433,6 +1434,9 @@ impl Engine {
         let mut receipt = ev::draft_receipt(&self.args.match_id, &self.args.role, &self.args.player_id, st.started_wall_ms, wall_ms(), &fin, &st.challenges);
         // End-of-game-menu read is required to confirm (v0.3.4). From v0.3.8 the sidecar may set
         // final_confirmed=false when a one-legal-step delta lacks corroboration; honor that field.
+        // Corroboration is evidence for the menu read. receipt.v0.json closes `result`, so it
+        // stays on bundle.json and is not signed into the receipt.
+        let corroboration = fin.get("delta_corroboration").filter(|v| !v.is_null()).cloned();
         let is_end_menu = !unconfirmed && fin["basis"] == "end_menu";
         let confirmed = if is_end_menu {
             match fin.get("final_confirmed") {
@@ -1451,9 +1455,6 @@ impl Engine {
                     r.insert("scorebug_last".into(), json!({"home_score": sb["home"], "away_score": sb["away"], "quarter": sb["quarter"], "t_ms": sb["t_ms"]}));
                 }
                 if let Some(n) = fin.get("notes").filter(|v| v.as_array().map(|a| !a.is_empty()).unwrap_or(false)) { r.insert("notes".into(), n.clone()); }
-                if let Some(d) = fin.get("delta_corroboration").filter(|v| !v.is_null()) {
-                    r.insert("delta_corroboration".into(), d.clone());
-                }
             } else {
                 r.insert("notes".into(), json!(["end-of-game menu score not read: scorebug final only, NOT confirmed"]));
             }
@@ -1499,6 +1500,7 @@ impl Engine {
             "claims": "Proves the integrity and timing of these video bytes (hash chain + checkpoints, referee co-signable). Does NOT prove who was playing.",
         });
         if let Some(reason) = reason.as_deref() { bundle["stop_reason"] = json!(reason); }
+        if let Some(d) = corroboration { bundle["delta_corroboration"] = d; }
         if let Some(src) = self.args.side_source.as_deref() { bundle["side_source"] = json!(src); }
         drop(st);
         let dir = self.bundle_dir().unwrap_or_else(|| PathBuf::from("."));

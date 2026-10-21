@@ -30,7 +30,6 @@ Trust: both keys live on this PC, so the result is SELF-ATTESTED. The receipt's 
 from __future__ import annotations
 
 import argparse
-import io
 import json
 import os
 import shutil
@@ -39,7 +38,6 @@ import sys
 import threading
 import time
 import urllib.request
-import zipfile
 from pathlib import Path
 
 QORTIME_PIN = "0204e6d8082f8c40ea1fe5e09bf16402aaee3ff2"
@@ -57,12 +55,8 @@ def say(msg: str = "") -> None:
 
 
 def data_dir() -> Path:
-    base = os.getenv("QORCAP_HOME")
-    if base:
-        return Path(base)
-    if WIN:
-        return Path(os.getenv("LOCALAPPDATA") or Path.home()) / "QorCap"
-    return Path.home() / ".qorcap"
+    from qorcap_paths import data_dir as _data_dir
+    return _data_dir()
 
 
 # ------------------------------------------------------------------ prerequisites
@@ -78,7 +72,8 @@ def find_qortime(arg: str | None, download: bool = True) -> Path:
     say(f"Downloading QorTime (pinned {QORTIME_PIN[:7]}) ...")
     try:
         with urllib.request.urlopen(QORTIME_ZIP, timeout=60) as r:
-            zipfile.ZipFile(io.BytesIO(r.read())).extractall(dst)
+            from qorcap_paths import safe_extract_zip
+            safe_extract_zip(r.read(), dst)
     except Exception as e:
         raise SystemExit(f"Could not download QorTime ({e}). Check the internet connection and try again.")
     out = dst / f"qortime-{QORTIME_PIN}"
@@ -108,20 +103,15 @@ def check_python_deps(need_vision: bool) -> list[str]:
 
 def restrict_acl(p: Path) -> None:
     """Key files: owner-only. POSIX: QorTime's FileKey already writes 0600. Windows: icacls."""
-    if WIN:
-        user = os.getenv("USERNAME", "")
-        subprocess.run(["icacls", str(p), "/inheritance:r", "/grant:r", f"{user}:F"], stdout=subprocess.DEVNULL,
-                       stderr=subprocess.DEVNULL, check=False)
-    else:
-        os.chmod(p, 0o600)
+    from qorcap_paths import restrict_private
+    restrict_private(p)
 
 
 def load_keys(key_dir: Path):
     from qor_receipt.keys import FileKey  # QorTime's own persistent Ed25519 key (vendored Qoresence signing)
 
-    key_dir.mkdir(parents=True, exist_ok=True)
-    if not WIN:
-        os.chmod(key_dir, 0o700)
+    from qorcap_paths import private_dir
+    private_dir(key_dir)
     keys = {}
     for name in ("device", "referee"):
         p = key_dir / f"{name}.key"
@@ -229,15 +219,39 @@ def wait_and_countersign(proc, path: Path, cs: "Countersigner", timeout: float =
     return proc.returncode == 0
 
 
+def _closed_props(section: str) -> frozenset:
+    """Property names receipt.v0.json allows. The object sets additionalProperties to false."""
+    schema = json.loads((HERE.parent / "contracts" / "receipt.v0.json").read_text(encoding="utf-8"))
+    node = schema["properties"][section]
+    if node.get("additionalProperties") is not False:
+        raise RuntimeError(f"receipt.v0.json {section} is not closed")
+    return frozenset(node["properties"])
+
+
+def closed_result(result: dict) -> dict:
+    """Drop fields receipt.v0.json rejects. Corroboration and Glimpse stay off the receipt."""
+    if not isinstance(result, dict):
+        return {}
+    allowed = _closed_props("result")
+    return {k: result[k] for k in result if k in allowed}
+
+
+def closed_match(match: dict) -> dict:
+    if not isinstance(match, dict):
+        return {}
+    allowed = _closed_props("match")
+    return {k: match[k] for k in match if k in allowed}
+
+
 def build_receipt(draft: dict, cps: list[dict], device, referee, *, match_id: str, role: str, started_ms: int,
                   referee_kind: str = REFEREE_KIND) -> dict:
     """QorTime's receipt.build + sign_referee + sign_player on what QorCap observed."""
     from qor_receipt import receipt as R
 
-    m = dict(draft["match"], match_id=match_id, started_ms=started_ms,
+    m = dict(closed_match(draft["match"]), match_id=match_id, started_ms=started_ms,
              ended_ms=max(cps[-1]["referee_ts_ms"] if cps else started_ms, started_ms))
     player = dict(draft["players"][0], role=role, pubkey=device.pubkey_hex, key_kind=device.kind)
-    rec = R.build(match=m, result=draft["result"], players=[player],
+    rec = R.build(match=m, result=closed_result(draft["result"]), players=[player],
                   referee={"pubkey": referee.pubkey_hex, "key_id": referee.key_id, "key_kind": referee_kind},
                   challenges=draft.get("challenges", []), checkpoints={role: cps},
                   agreement=draft.get("agreement") or {"timelines_agree": None, "mismatches": []},
@@ -1384,14 +1398,26 @@ def latest_bundle(root: Path) -> Path | None:
 
 
 def video_files(bundle: Path) -> list[Path]:
-    """video.mp4 then any reopen parts (video.part2.mp4 ...), in manifest order."""
+    """video.mp4 then any reopen parts (video.part2.mp4 ...), in manifest order.
+
+    A segment ``file`` that leaves the bundle is ignored. The score is read from the
+    video in the bundle, not from a path the manifest points at outside it.
+    """
+    from qorcap_paths import bundle_child
     seen: list[str] = []
+    files: list[Path] = []
     for m in read_jsonl(bundle / "manifest.jsonl"):
         f = m.get("file")
-        if m.get("type") == "segment" and f and f not in seen:
-            seen.append(f)
-    files = [bundle / f for f in seen if (bundle / f).exists()]
-    return files or ([bundle / "video.mp4"] if (bundle / "video.mp4").exists() else [])
+        if m.get("type") != "segment" or not f or f in seen:
+            continue
+        seen.append(f)
+        child = bundle_child(bundle, f)
+        if child is not None and child.is_file():
+            files.append(child)
+    if files:
+        return files
+    fallback = bundle_child(bundle, "video.mp4")
+    return [fallback] if fallback is not None and fallback.is_file() else []
 
 
 def hashed_decode_limit(video: Path, max_bytes: int | None) -> int | None:
@@ -1987,9 +2013,10 @@ def recover_bundle(bundle: Path) -> dict | None:
         n = m.get("bytes") if isinstance(m.get("bytes"), int) and not isinstance(m.get("bytes"), bool) else 0
         covered[f] = max(covered.get(f, 0), off + n)
     tails = []
+    from qorcap_paths import bundle_child
     for f, end in covered.items():
-        p = bundle / f
-        if not p.is_file():
+        p = bundle_child(bundle, f)
+        if p is None or not p.is_file():
             continue
         real = p.stat().st_size
         if real > end:

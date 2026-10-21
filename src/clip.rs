@@ -590,7 +590,8 @@ fn load_span(dir: &Path, start: u64, end: u64) -> Result<Span, String> {
 }
 
 fn plain_file_name(file: &str) -> Result<(), String> {
-    if file.is_empty() || file.contains('/') || file.contains('\\') || file.contains("..") {
+    // `:` is a drive prefix on Windows (`C:video.mp4` replaces the bundle directory on join).
+    if file.is_empty() || file.contains(['/', '\\', ':', '\0']) || file.contains("..") {
         return Err("manifest segment file name is not a single file in the bundle".into());
     }
     Ok(())
@@ -1045,6 +1046,8 @@ mod tests {
         assert!(plain_file_name("../video.mp4").is_err());
         assert!(plain_file_name("a/b.mp4").is_err());
         assert!(plain_file_name(r"a\b.mp4").is_err());
+        assert!(plain_file_name("C:video.mp4").is_err());
+        assert!(plain_file_name("/etc/passwd").is_err());
     }
 
     fn seg(seq: u64, kind: &str, file: &str, mono: u64, frames: i64) -> Seg {

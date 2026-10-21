@@ -31,6 +31,7 @@ import base64
 import datetime as _dt
 import hashlib
 import json
+import math
 import os
 import re
 import sys
@@ -337,6 +338,19 @@ def worst_case(prompt_tokens_est=CROP_PROMPT_TOKENS, max_tokens=CROP_MAX_TOKENS)
     return prompt_tokens_est * PRICE_PROMPT * 1.25 + max_tokens * PRICE_COMPLETION
 
 
+def booked_cost(value):
+    """A ledger or provider cost that may be added to a cap. Negative and non-finite values are not a credit."""
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        return None
+    try:
+        n = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(n) or n < 0:
+        return None
+    return n
+
+
 class Budget:
     def __init__(self, ledger_path, match_id, per_game_cap=0.50, weekly_limit=10.0, weekly_floor=0.0,
                  unknown_usage_margin=0.50, key_check_every_s=120, key_reader=None):
@@ -361,7 +375,14 @@ class Budget:
         return rows
 
     def game_spent(self):
-        return sum(r.get("cost", 0) or 0 for r in self._ledger() if r.get("match_id") == self.match_id)
+        total = 0.0
+        for r in self._ledger():
+            if r.get("match_id") != self.match_id:
+                continue
+            n = booked_cost(r.get("cost", 0))
+            if n:
+                total += n
+        return total
 
     def kind_spent(self, kind):
         """Spend booked under ``kind`` or ``kind:...`` (failed calls use ``kind:failed_worst_case``)."""
@@ -372,12 +393,21 @@ class Budget:
                 continue
             k = r.get("kind") or ""
             if k == kind or (isinstance(k, str) and k.startswith(prefix)):
-                total += r.get("cost", 0) or 0
+                n = booked_cost(r.get("cost", 0))
+                if n:
+                    total += n
         return total
 
     def week_spent_local(self):
         cut = time.time() - 7 * 86400
-        return sum(r.get("cost", 0) or 0 for r in self._ledger() if r.get("t", 0) >= cut)
+        total = 0.0
+        for r in self._ledger():
+            if r.get("t", 0) < cut:
+                continue
+            n = booked_cost(r.get("cost", 0))
+            if n:
+                total += n
+        return total
 
     @staticmethod
     def _read_key_usage():
@@ -431,8 +461,11 @@ class Budget:
             return {"game_spent": g, "week_spent": week, "remote_weekly": remote}
 
     def record(self, cost, gen_id, kind):
+        booked = booked_cost(cost)
+        if booked is None:
+            booked = worst_case()
         with self._lock, open(self.path, "a", encoding="utf-8") as f:
-            f.write(json.dumps({"t": time.time(), "match_id": self.match_id, "cost": cost, "gen_id": gen_id, "kind": kind}) + "\n")
+            f.write(json.dumps({"t": time.time(), "match_id": self.match_id, "cost": booked, "gen_id": gen_id, "kind": kind}) + "\n")
 
 
 def openrouter_post(body: dict, timeout: float) -> dict:
@@ -490,7 +523,8 @@ class Client:
             d = self.post(body, self.timeout)
             out["latency_s"] = round(self._perf() - t, 3)
             u = d.get("usage") or {}
-            out["cost"] = float(u.get("cost") or 0.0)
+            parsed = booked_cost(u.get("cost") if u.get("cost") is not None else 0.0)
+            out["cost"] = worst_case() if parsed is None else parsed
             out["gen_id"] = d.get("id")
             ch = d.get("choices") or []
             out["text"] = ch[0]["message"].get("content") if ch else None

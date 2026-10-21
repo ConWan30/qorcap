@@ -58,6 +58,41 @@ def _signed(tmp_path, n=5):
     return rec, ref
 
 
+def test_signed_receipt_drops_fields_the_schema_rejects(tmp_path):
+    """receipt.v0.json closes result and match. New data stays off the signed receipt."""
+    schema = json.loads((HERE.parent / "contracts" / "receipt.v0.json").read_text())
+    assert schema["additionalProperties"] is False
+    assert schema["properties"]["result"]["additionalProperties"] is False
+    assert schema["properties"]["match"]["additionalProperties"] is False
+    draft = _draft()
+    draft["result"]["delta_corroboration"] = {"kind": "haptic", "t_ms": 2}
+    draft["result"]["glimpse"] = {"verdict": "agree"}
+    draft["match"]["glimpse_note"] = "advisory"
+    draft["stop_reason"] = "enter"
+    rec, ref = _signed_from(tmp_path, draft)
+    assert "delta_corroboration" not in rec["result"] and "glimpse" not in rec["result"]
+    assert "glimpse_note" not in rec["match"] and "stop_reason" not in rec
+    assert set(rec["result"]) <= set(schema["properties"]["result"]["properties"])
+    assert set(rec["match"]) <= set(schema["properties"]["match"]["properties"])
+    from qor_receipt.receipt import verify_receipt
+    assert verify_receipt(rec, referee_pub=ref.pubkey_hex)["status"] == "SELF_ATTESTED"
+
+
+def _signed_from(tmp_path, draft, n=2):
+    from qor_receipt.checkpoints import Chain
+    dev, ref = qm.load_keys(tmp_path / "keys")
+    t = [1000]
+    cs = qm.Countersigner(ref, "local-1", "home", clock=lambda: t[0] + 50)
+    ch = Chain()
+    for _ in range(n):
+        cp = ch.next(t[0], "a" * 64, "b" * 64)
+        cp["qorcap"] = {"trigger": "segment"}
+        assert cs.offer(cp)
+        t[0] += 2000
+    rec = qm.build_receipt(draft, cs.signed, dev, ref, match_id="local-1", role="home", started_ms=900)
+    return rec, ref
+
+
 def test_signed_receipt_verifies_and_is_honest(tmp_path):
     from qor_receipt.receipt import verify_receipt
     rec, ref = _signed(tmp_path)

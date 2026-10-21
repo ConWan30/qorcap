@@ -48,6 +48,28 @@ fn recorded_tails(dir: &Path) -> Vec<ExcludedTail> {
     }).collect()
 }
 
+/// A manifest or bundle name that is one file directly inside `dir`.
+///
+/// Rejects `..`, separators, and a Windows drive prefix (`C:name`). `Path::join` replaces
+/// the directory when the name is absolute or has a prefix, which would let `verify-bundle`
+/// hash a file outside the bundle and report the tampered video as intact.
+pub fn contained_file(dir: &Path, name: &str) -> Result<std::path::PathBuf, String> {
+    let one = std::path::Path::new(name).components().count() == 1
+        && matches!(std::path::Path::new(name).components().next(), Some(std::path::Component::Normal(_)));
+    if name.is_empty() || !one || name.contains(['/', '\\', ':', '\0']) || name == "." || name == ".." {
+        return Err(format!("refusing a path that is not a single file in the bundle ({name})"));
+    }
+    let path = dir.join(name);
+    if path.parent() != Some(dir) {
+        return Err(format!("refusing a path that is not a single file in the bundle ({name})"));
+    }
+    // `File::open` follows a symlink. A link named `video.mp4` can point at a key outside the bundle.
+    if std::fs::symlink_metadata(&path).map(|m| m.file_type().is_symlink()).unwrap_or(false) {
+        return Err(format!("refusing a path that is not a single file in the bundle ({name})"));
+    }
+    Ok(path)
+}
+
 /// Bytes past the last hashed segment of each video file. The tail is named and hashed so
 /// `verify` can accept exactly those bytes and reject anything else. Nothing is added to the chain.
 pub fn measure_excluded_tails(dir: &Path) -> Vec<Value> {
@@ -55,12 +77,13 @@ pub fn measure_excluded_tails(dir: &Path) -> Vec<Value> {
     let mut end: std::collections::BTreeMap<String, u64> = Default::default();
     for m in man.iter().filter(|m| m["type"] == "segment") {
         let file = match m["file"].as_str() { Some(f) if !f.is_empty() => f, _ => continue };
+        if contained_file(dir, file).is_err() { continue; }
         let e = m["offset"].as_u64().unwrap_or(0).saturating_add(m["bytes"].as_u64().unwrap_or(0));
         end.entry(file.to_string()).and_modify(|x| *x = (*x).max(e)).or_insert(e);
     }
     let mut out = Vec::new();
     for (file, covered) in end {
-        let path = dir.join(&file);
+        let Ok(path) = contained_file(dir, &file) else { continue };
         let real = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
         if real <= covered { continue; }
         let extra = real - covered;
@@ -108,11 +131,15 @@ pub fn verify(dir: &Path) -> Result<Report, String> {
         let eo = expect_off.entry(file.to_string()).or_insert(0);
         if off != *eo { r.errors.push(format!("{tag}: offset gap (expected {eo})")); }
         *eo = off + len;
-        let mut buf = vec![0u8; len as usize];
-        let rd = std::fs::File::open(dir.join(file)).and_then(|mut f| { f.seek(SeekFrom::Start(off))?; f.read_exact(&mut buf) });
-        match rd {
-            Err(e) => r.errors.push(format!("{tag}: cannot read video bytes: {e}")),
-            Ok(()) => { if ev::sha256_hex(&buf) != m["sha256"].as_str().unwrap_or("") { r.errors.push(format!("{tag}: SHA-256 mismatch (video bytes altered)")); } }
+        match contained_file(dir, file) {
+            Ok(p) => {
+                let mut buf = vec![0u8; len as usize];
+                match std::fs::File::open(p).and_then(|mut f| { f.seek(SeekFrom::Start(off))?; f.read_exact(&mut buf) }) {
+                    Err(e) => r.errors.push(format!("{tag}: cannot read video bytes: {e}")),
+                    Ok(()) => { if ev::sha256_hex(&buf) != m["sha256"].as_str().unwrap_or("") { r.errors.push(format!("{tag}: SHA-256 mismatch (video bytes altered)")); } }
+                }
+            }
+            Err(msg) => r.errors.push(format!("{tag}: {msg}")),
         }
         if m["prev"].as_str() != Some(r.chain_head.as_str()) { r.errors.push(format!("{tag}: prev link broken")); }
         let head = ev::link(&r.chain_head, seq, m["sha256"].as_str().unwrap_or(""));
@@ -123,13 +150,17 @@ pub fn verify(dir: &Path) -> Result<Report, String> {
     }
     let tails = recorded_tails(dir);
     for (f, end) in &expect_off {
-        let real = std::fs::metadata(dir.join(f)).map(|m| m.len()).unwrap_or(0);
+        let path = match contained_file(dir, f) {
+            Ok(p) => p,
+            Err(msg) => { r.errors.push(format!("{f}: {msg}")); continue; }
+        };
+        let real = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
         if real == *end { continue; }
         if real > *end {
             let extra = real - *end;
             if let Some(t) = tails.iter().find(|t| t.file == *f) {
                 if t.covered == *end && t.tail_bytes == extra {
-                    match sha256_range(&dir.join(f), *end, extra) {
+                    match sha256_range(&path, *end, extra) {
                         Ok(h) if h == t.sha => continue,
                         Ok(_) => r.errors.push(format!("{f}: excluded tail SHA-256 does not match bundle.json")),
                         Err(e) => r.errors.push(format!("{f}: cannot read excluded tail: {e}")),
@@ -227,5 +258,46 @@ mod tests {
         let short = verify(&dir).unwrap();
         assert!(short.errors.iter().any(|e| e.contains("truncated") || e.contains("cannot read")), "{:?}", short.errors);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn seg_line(file: &str, body: &[u8]) -> String {
+        let sha = ev::sha256_hex(body);
+        let head = ev::link(GENESIS, 0, &sha);
+        format!("{}\n", serde_json::json!({"type":"segment","seq":0,"file":file,"offset":0,"bytes": body.len(),
+            "sha256": sha, "prev": GENESIS, "chain_head": head}))
+    }
+
+    #[test]
+    fn verify_does_not_follow_a_segment_path_outside_the_bundle() {
+        let dir = std::env::temp_dir().join(format!("qorcap-escape-{}", std::process::id()));
+        let outside = std::env::temp_dir().join(format!("qorcap-outside-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&outside);
+        std::fs::create_dir_all(&dir).unwrap();
+        let secret = b"SECRET-KEY-MATERIAL";
+        std::fs::write(&outside, secret).unwrap();
+        std::fs::write(dir.join("video.mp4"), b"tampered-video").unwrap();
+        let escaped = format!("../{}", outside.file_name().unwrap().to_string_lossy());
+        std::fs::write(dir.join("manifest.jsonl"), seg_line(&escaped, secret)).unwrap();
+        let report = verify(&dir).unwrap();
+        assert!(report.errors.iter().any(|e| e.contains("not a single file")), "{:?}", report.errors);
+        assert!(report.errors.iter().all(|e| !e.contains("SHA-256 mismatch")), "outside bytes must not be hashed: {:?}", report.errors);
+        for name in ["../video.mp4", "/etc/passwd", r"..\keys\device.key", "C:video.mp4", "a/b.mp4", ""] {
+            assert!(contained_file(&dir, name).is_err(), "{name}");
+        }
+        assert!(contained_file(&dir, "video.mp4").is_ok());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            std::fs::remove_file(dir.join("video.mp4")).unwrap();
+            symlink(&outside, dir.join("video.mp4")).unwrap();
+            std::fs::write(dir.join("manifest.jsonl"), seg_line("video.mp4", secret)).unwrap();
+            let linked = verify(&dir).unwrap();
+            assert!(linked.errors.iter().any(|e| e.contains("not a single file")), "{:?}", linked.errors);
+            assert!(linked.errors.iter().all(|e| !e.contains("SHA-256 mismatch")), "symlink target must not be hashed: {:?}", linked.errors);
+            assert!(std::fs::read(&outside).unwrap() == secret);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&outside);
     }
 }

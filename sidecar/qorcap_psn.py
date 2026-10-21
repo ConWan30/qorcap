@@ -364,6 +364,9 @@ def _videos(bundle: Path) -> list[tuple[str, float]]:
                 continue
             if m.get("type") == "segment" and isinstance(m.get("frames"), (int, float)):
                 f = m.get("file") or "video.mp4"
+                from qorcap_paths import bundle_child
+                if bundle_child(bundle, f) is None:
+                    continue
                 files[f] = max(files.get(f, 0.0), m["frames"] / 30.0)
     if not files and (bundle / "video.mp4").exists():
         files["video.mp4"] = 0.0
@@ -451,9 +454,11 @@ def read_bundle(bundle: Path, *, ffmpeg: str = "ffmpeg", samples: int = 60, vide
 
 def _sample(bundle: Path, vids, ffmpeg: str, samples: int):
     total = []
+    from qorcap_paths import bundle_child
     for f, secs in vids:
-        p = Path(f) if Path(f).is_absolute() else bundle / f
-        if not p.exists():
+        # An explicit absolute path is the caller's video. A manifest name must stay in the bundle.
+        p = Path(f) if Path(f).is_absolute() else bundle_child(bundle, f)
+        if p is None or not p.exists():
             continue
         secs = secs or _probe(ffmpeg, p)
         if secs > 5:
