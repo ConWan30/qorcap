@@ -178,6 +178,24 @@ fn write_private(path: &Path, bytes: &[u8]) -> Result<(), String> {
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
     }
+    #[cfg(windows)]
+    {
+        // chmod does not set an NTFS ACL. Match the device and referee keys: owner only.
+        if let Ok(user) = std::env::var("USERNAME") {
+            let user = user.trim();
+            if !user.is_empty() && !user.contains(['"', '\r', '\n']) {
+                let grant = format!("{user}:F");
+                let _ = std::process::Command::new("icacls")
+                    .arg(path)
+                    .arg("/inheritance:r")
+                    .arg("/grant:r")
+                    .arg(&grant)
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status();
+            }
+        }
+    }
     Ok(())
 }
 

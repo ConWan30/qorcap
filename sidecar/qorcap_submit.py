@@ -167,7 +167,12 @@ def read_manifest(bundle: Path) -> list[dict]:
 
 
 def segment_bytes(bundle: Path, m: dict) -> bytes:
-    with open(bundle / m["file"], "rb") as f:
+    """Read one manifest segment. The file name must be a single file inside the bundle."""
+    from qorcap_paths import bundle_child
+    path = bundle_child(bundle, m.get("file"))
+    if path is None:
+        raise ValueError(f"segment file is not inside the bundle: {m.get('file')!r}")
+    with open(path, "rb") as f:
         f.seek(int(m["offset"]))
         return f.read(int(m["bytes"]))
 
@@ -178,12 +183,8 @@ def latest_bundle(root: Path) -> Path | None:
 
 
 def data_dir() -> Path:
-    base = os.getenv("QORCAP_HOME")
-    if base:
-        return Path(base)
-    if sys.platform == "win32":
-        return Path(os.getenv("LOCALAPPDATA") or Path.home()) / "QorCap"
-    return Path.home() / ".qorcap"
+    from qorcap_paths import data_dir as _data_dir
+    return _data_dir()
 
 
 def fmt_mb(n: int) -> str:
@@ -261,14 +262,27 @@ def submit(bundle: Path, *, base: str, full: bool = False, key_path: Path | None
     c.token = sub["upload_token"]
     save({"submission": sub["id"], "state": sub["state"], "commit": sub.get("commit"), "required": len(sub["required"])})
     man = read_manifest(bundle)
-    need = sub["required"]
+    need = sub.get("required")
+    if not isinstance(need, list) or any(isinstance(s, bool) or not isinstance(s, int) or s < 0 or s >= len(man) for s in need):
+        say("\n  PROBLEM: the referee asked for a segment that is not in this manifest. Nothing else was uploaded.")
+        save({"state": "upload_failed", "error": "segment index outside the manifest"})
+        return 2
     total = sum(int(man[s]["bytes"]) for s in need)
     say(f"  accepted (commit {str(sub.get('commit'))[:12]}). The referee asked for {len(need)} of {len(man)} video "
         f"segments ({fmt_mb(total)}).")
     say(f"2/4  Uploading those segments; each is hashed against the manifest ...")
     sent, t0 = 0, time.monotonic()
     for i, s in enumerate(need):
-        data = segment_bytes(bundle, man[s])
+        if isinstance(s, bool) or not isinstance(s, int) or s < 0 or s >= len(man):
+            say(f"\n  PROBLEM: the referee asked for segment {s!r}, which is not in this manifest. Nothing else was uploaded.")
+            save({"state": "upload_failed", "error": "segment index outside the manifest"})
+            return 2
+        try:
+            data = segment_bytes(bundle, man[s])
+        except (ValueError, OSError) as e:
+            say(f"\n  PROBLEM: {e}. Refusing to read a file outside the bundle.")
+            save({"state": "upload_failed", "error": str(e)})
+            return 2
         for attempt in range(4):
             try:
                 r = c.call("PUT", f"/v1/submissions/{sub['id']}/segments/{s}", data, "application/octet-stream",

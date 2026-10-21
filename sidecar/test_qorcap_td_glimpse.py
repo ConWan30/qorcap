@@ -44,6 +44,12 @@ def test_enforcing_needs_the_env_flag_and_reads_verdicts(tmp_path, monkeypatch):
                                          json.dumps({"id": "y", "verdict": "agree"}) + "\n" +
                                          json.dumps({"id": "z", "verdict": "no_read"}) + "\n")
     assert veto({"id": "x"}) == "disagree" and veto({"id": "y"}) == "agree" and veto({"id": "z"}) is None
+    # An earlier no_read or agree must not hide a later disagree. Agree never creates a lock.
+    (d / "td_verdicts.jsonl").write_text(
+        json.dumps({"id": "h", "verdict": "agree"}) + "\n"
+        + json.dumps({"id": "h", "verdict": "no_read"}) + "\n"
+        + json.dumps({"id": "h", "verdict": "disagree_old"}) + "\n")
+    assert veto({"id": "h"}) == "disagree"
 
 
 def test_no_match_no_wiring():

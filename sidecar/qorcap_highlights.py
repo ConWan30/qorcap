@@ -330,8 +330,9 @@ def make_highlights(bundle: Path, out: Path | None = None, pre: float = PRE_S, p
                             "reason": "lock time is outside the recorded video (no manifest frame clock)"})
             continue
         vfile, at = loc
-        src = bundle / vfile
-        if not src.exists():
+        from qorcap_paths import bundle_child
+        src = bundle_child(bundle, vfile)
+        if src is None or not src.exists():
             skipped.append({"seq": lk["seq"], "t_ms": lk["t_ms"], "hash": lk["hash"], "score_after": sa,
                             "reason": f"{vfile} is not in the bundle folder"})
             continue
@@ -408,9 +409,12 @@ def check_manifest(manifest_path: Path, bundle: Path | None = None) -> list[str]
         errs.append("receipt.json not found next to the bundle / manifest")
     hashes = {c.get("hash") for cps in ((receipt or {}).get("checkpoints") or {}).values() for c in (cps or [])}
     mf = {m.get("seq"): m.get("sha256") for m in read_jsonl(bundle / "manifest.jsonl") if m.get("type") == "segment"}
+    from qorcap_paths import bundle_child
     for c in man.get("clips") or []:
-        f = mp.parent / c["file"]
-        if not f.exists():
+        f = bundle_child(mp.parent, c.get("file") if isinstance(c, dict) else None)
+        if f is None:
+            errs.append(f"{c.get('id') if isinstance(c, dict) else '?'}: clip file is not inside the highlights folder")
+        elif not f.exists():
             errs.append(f"{c['id']}: clip file missing")
         elif sha256_file(f) != c.get("sha256"):
             errs.append(f"{c['id']}: clip sha256 mismatch")
@@ -543,8 +547,9 @@ def attach_credentials(bundle: Path, manifest_path: Path, *, qorcap: str | None 
         bounds = None
         if isinstance(src.get("start_s"), (int, float)) and isinstance(src.get("end_s"), (int, float)):
             bounds = mono_bounds(rows, src.get("file") or "video.mp4", float(src["start_s"]), float(src["end_s"]))
-        f = mp.parent / c["file"]
-        if bounds is None or not f.exists() or not exe:
+        from qorcap_paths import bundle_child
+        f = bundle_child(mp.parent, c.get("file"))
+        if bounds is None or f is None or not f.exists() or not exe:
             c["content_credentials"] = {"attached": False, "verified": False, "reason": "credentials were not attached"}
             continue
         original = f.read_bytes()

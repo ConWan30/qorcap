@@ -270,7 +270,7 @@ pub fn align_bundle(dir: &std::path::Path, recs: &[Value], manifest: &[Value], t
     let mut out = if let (Some(ff), false) = (ffmpeg, clocks.is_empty()) {
         let mut tracks = vec![];
         for c in &clocks {
-            match decode_energy(ff, &dir.join(&c.file).to_string_lossy()) {
+            match crate::bundle::contained_file(dir, &c.file).and_then(|p| decode_energy(ff, &p.to_string_lossy()).map_err(|e| e)) {
                 Ok(e) => tracks.push(e),
                 Err(e) => { notes.push(format!("{}: {e}", c.file)); tracks.push(Energy::default()); }
             }

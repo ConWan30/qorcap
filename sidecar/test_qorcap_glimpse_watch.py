@@ -203,6 +203,24 @@ def test_live_loop_sends_only_unknown_frames_and_never_writes_the_match(tmp_path
     assert tree_hash(md) == before
 
 
+def test_negative_cost_cannot_buy_more_calls(tmp_path):
+    """A provider cost below zero is not a credit against the $0.50 / $10 caps."""
+    b = W.Budget(tmp_path / "ledger.jsonl", "m1", per_game_cap=0.50, weekly_limit=10.0, key_reader=lambda: 0.0)
+    b.record(-5, "gen", "crop_live")
+    assert b.game_spent() >= W.worst_case() - 1e-12
+    row = json.loads((tmp_path / "ledger.jsonl").read_text().splitlines()[-1])
+    assert row["cost"] >= W.worst_case() - 1e-12
+    b.record(0.49, "gen2", "crop_live")
+    with open(tmp_path / "ledger.jsonl", "a", encoding="utf-8") as f:
+        f.write(json.dumps({"t": 2_000_000_000, "match_id": "m1", "cost": -100, "kind": "crop_live"}) + "\n")
+    assert b.game_spent() >= 0.49
+    try:
+        b.authorise(0.02)
+        raise AssertionError("a negative ledger line opened the per-game cap")
+    except W.BudgetRefused as e:
+        assert "per-game cap" in str(e)
+
+
 def test_game_cap_and_no_key(tmp_path, monkeypatch):
     clock = SimClock()
     t0 = int(clock.time() * 1000)

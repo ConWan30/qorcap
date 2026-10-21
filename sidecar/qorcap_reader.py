@@ -396,6 +396,7 @@ def td_glimpse_veto(match_name: str):
     path = glimpse_match_dir(match_name) / "td_verdicts.jsonl"
 
     def veto(pd: dict):
+        found = None
         try:
             with open(path, "r", encoding="utf-8") as f:
                 for line in f:
@@ -403,12 +404,18 @@ def td_glimpse_veto(match_name: str):
                         v = json.loads(line)
                     except ValueError:
                         continue
-                    if v.get("id") == pd.get("id"):
-                        verdict = v.get("verdict")
-                        return "agree" if verdict == "agree" else "disagree" if str(verdict).startswith("disagree") else None
+                    if v.get("id") != pd.get("id"):
+                        continue
+                    verdict = v.get("verdict")
+                    # A later disagree must not be hidden by an earlier no_read or agree.
+                    # Disagree only cancels a lock the reader already held. It cannot create one.
+                    if isinstance(verdict, str) and verdict.startswith("disagree"):
+                        return "disagree"
+                    if verdict == "agree":
+                        found = "agree"
         except OSError:
             return None
-        return None
+        return found
     return veto
 
 
