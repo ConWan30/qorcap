@@ -4,6 +4,7 @@ import json
 import sys
 import zipfile
 from pathlib import Path
+from types import SimpleNamespace
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
@@ -137,14 +138,15 @@ def test_submit_refuses_a_segment_index_or_name_outside_the_bundle(tmp_path):
                 return {}
             raise AssertionError(method + " " + path)
 
+    device = SimpleNamespace(pubkey_hex="ab" * 32)
     bad = Fake([99])
-    code = qs.submit(bundle, base="http://referee.test", client=bad, device=object())
+    code = qs.submit(bundle, base="http://referee.test", client=bad, device=device)
     assert code == 2 and bad.puts == []
     saved = json.loads((bundle / "submission.json").read_text())
     assert saved["error"] == "segment index outside the manifest"
 
     escape = Fake([1])
-    code = qs.submit(bundle, base="http://referee.test", client=escape, device=object())
+    code = qs.submit(bundle, base="http://referee.test", client=escape, device=device)
     assert code == 2 and escape.puts == []
     assert secret.read_bytes() == b"SECRET-KEY-MATERIAL"
 
