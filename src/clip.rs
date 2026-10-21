@@ -458,24 +458,47 @@ fn run_verifier(qortime: &Path, receipt: &Path, referee_pub: &str, python: Optio
         cmd.arg(receipt);
         cmd.arg("--referee-pub").arg(referee_pub);
         cmd.env("PYTHONPATH", pythonpath(qortime));
+        // Windows consoles default to a legacy code page. The verifier prints JSON.
+        cmd.env("PYTHONUTF8", "1");
         cmd.stdin(Stdio::null());
         match cmd.output() {
-            Err(e) => last = e.to_string(),
+            Err(e) => last = format!("{}: {e}", c[0]),
             Ok(o) => {
                 let stdout = String::from_utf8_lossy(&o.stdout);
                 if let Some(v) = parse_json_object(&stdout) {
                     return Ok(v);
                 }
+                // A launcher that starts and then crashes (no JSON) is not a verdict.
+                // Try the next interpreter. `py -3` on a Windows CI image is often a
+                // different install from the `python` that `pip install` targeted.
                 let err = String::from_utf8_lossy(&o.stderr);
-                let tail: String = err.chars().filter(|c| *c != '\n').take(180).collect();
-                if !tail.is_empty() {
-                    eprintln!("qor_receipt verify: {tail}");
-                }
-                return Err(format!("QorTime verifier could not be run (exit {})", o.status.code().unwrap_or(-1)));
+                let tail = stderr_tail(&err);
+                last = format!(
+                    "{} exit {}: {tail}",
+                    c.join(" "),
+                    o.status.code().unwrap_or(-1)
+                );
             }
         }
     }
-    Err(format!("QorTime verifier could not be run ({last})"))
+    eprintln!("qor_receipt verify: {last}");
+    Err("QorTime verifier could not be run".into())
+}
+
+/// The exception is the last traceback line. Keep it short and drop file paths.
+fn stderr_tail(err: &str) -> String {
+    let mut last = String::new();
+    for line in err.lines() {
+        let t = line.trim();
+        if t.is_empty() || t.starts_with("File ") || t.starts_with("Traceback") {
+            continue;
+        }
+        last = t.to_string();
+    }
+    if last.len() > 160 {
+        last.truncate(160);
+    }
+    last
 }
 
 fn pythonpath(qortime: &Path) -> String {
@@ -498,14 +521,19 @@ fn python_candidates(explicit: Option<&str>) -> Vec<Vec<String>> {
     if v.exists() {
         cands.push(vec![v.to_string_lossy().into_owned()]);
     }
-    if cfg!(windows) {
-        cands.push(vec!["py".into(), "-3".into()]);
-        cands.push(vec!["python".into()]);
-    } else {
-        cands.push(vec!["python3".into()]);
-        cands.push(vec!["python".into()]);
-    }
+    // `python` / `python3` are the interpreters on PATH, which is where `pip install`
+    // puts cryptography. On Windows the `py -3` launcher can point at a different
+    // install that does not have that package, so it is only a last try.
+    cands.extend(interpreter_candidates(cfg!(windows)));
     cands
+}
+
+fn interpreter_candidates(windows: bool) -> Vec<Vec<String>> {
+    if windows {
+        vec![vec!["python".into()], vec!["python3".into()], vec!["py".into(), "-3".into()]]
+    } else {
+        vec![vec!["python3".into()], vec!["python".into()]]
+    }
 }
 
 fn hide_window(cmd: &mut Command) {
@@ -960,6 +988,26 @@ fn fail_text(reason: &str) -> String {
 mod tests {
     use super::*;
     use crate::evidence::{CheckpointChain, SegmentChain};
+
+    #[test]
+    fn windows_verifier_tries_path_python_before_the_py_launcher() {
+        let w = interpreter_candidates(true);
+        assert_eq!(w[0], vec!["python".to_string()]);
+        assert_eq!(w[1], vec!["python3".to_string()]);
+        assert_eq!(w.last().unwrap(), &vec!["py".to_string(), "-3".to_string()]);
+        let u = interpreter_candidates(false);
+        assert_eq!(u[0], vec!["python3".to_string()]);
+        assert!(u.iter().all(|c| c[0] != "py"));
+    }
+
+    #[test]
+    fn a_crash_without_json_is_not_a_verdict() {
+        let boom = "Traceback (most recent call last):\n  File \"D:\\\\a\\\\qorcap\\\\qortime\\\\qor_receipt\\\\cli.py\", line 11, in <module>\nModuleNotFoundError: No module named 'cryptography'\n";
+        assert!(parse_json_object(boom).is_none());
+        assert_eq!(stderr_tail(boom), "ModuleNotFoundError: No module named 'cryptography'");
+        let verdict = "{\"status\":\"SELF_ATTESTED\",\"errors\":[],\"partial\":[]}";
+        assert_eq!(parse_json_object(verdict).unwrap()["status"], "SELF_ATTESTED");
+    }
 
     #[test]
     fn verdict_is_verified_only_when_both_checks_say_so() {
