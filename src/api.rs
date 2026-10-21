@@ -32,6 +32,8 @@ pub fn route(e: &Arc<Engine>, method: &str, url: &str, body: &str) -> Resp {
         },
         // Advisory Glimpse watcher: the newest frame the reader already pulled (no file read here).
         ("GET", "/frame/scorebug") => frame_scorebug(e),
+        // Opt-in burst ring. Off (the default): 404, and /frame/scorebug is unchanged.
+        ("GET", "/frame/burst-ring") => frame_burst_ring(e),
         ("POST", "/challenge") => match e.challenge(&b) { Ok(v) => j(200, v), Err(m) => j(400, json!({"ok": false, "error": m})) },
         ("POST", "/events") => match e.event(&b) { Ok(v) => j(200, v), Err(m) => j(400, json!({"ok": false, "error": m})) },
         ("GET", "/checkpoints") => {
@@ -76,6 +78,30 @@ fn frame_scorebug(e: &Arc<Engine>) -> Resp {
         }
         Err(TapErr::NoFrame) => j(503, json!({"ok": false, "error": "no frame yet"})),
         Err(TapErr::Stale { age_ms }) => j(503, json!({"ok": false, "error": "no fresh frame", "age_ms": age_ms})),
+        Err(TapErr::Busy) => j(503, json!({"ok": false, "error": "dropped under load"})),
+    }
+}
+
+/// Opt-in ring for the disagreement burst. Does not touch the scorebug rate limiter.
+/// Off (frame tap off, or `QORCAP_GLIMPSE_BURST_RING` unset): 404. A busy ring mutex is a drop.
+fn frame_burst_ring(e: &Arc<Engine>) -> Resp {
+    use crate::glimpse::TapErr;
+    match e.tap.copy_ring() {
+        Ok(frames) => {
+            let rows: Vec<_> = frames.iter().map(|f| json!({
+                "seq": f.seq,
+                "wall_ms": f.wall_ms,
+                "jpeg_hex": crate::evidence::hex(f.jpeg.as_ref()),
+            })).collect();
+            j(200, json!({
+                "ok": true,
+                "advisory": "glimpse-shadow; read-only; never feeds locks",
+                "frames": rows,
+            }))
+        }
+        Err(TapErr::Off) => j(404, json!({"ok": false, "error": "glimpse burst ring is off (QORCAP_GLIMPSE_BURST_RING=1 and the frame tap)"})),
+        Err(TapErr::Busy) => j(503, json!({"ok": false, "error": "dropped under load"})),
+        Err(_) => j(503, json!({"ok": false, "error": "dropped under load"})),
     }
 }
 
@@ -113,7 +139,7 @@ fn handle(e: Arc<Engine>, mut rq: tiny_http::Request) {
             let mut body = String::new();
             let _ = rq.as_reader().take(1 << 16).read_to_string(&mut body);
             let r = route(&e, rq.method().as_str(), rq.url(), &body);
-            if r.code >= 400 && rq.url() != "/snapshot.jpg" && !rq.url().starts_with("/frame/scorebug") { warn!("API {} {} -> {} {}", rq.method(), rq.url(), r.code, String::from_utf8_lossy(&r.body)); }
+            if r.code >= 400 && rq.url() != "/snapshot.jpg" && !rq.url().starts_with("/frame/scorebug") && !rq.url().starts_with("/frame/burst-ring") { warn!("API {} {} -> {} {}", rq.method(), rq.url(), r.code, String::from_utf8_lossy(&r.body)); }
             let h = tiny_http::Header::from_bytes("Content-Type", r.ctype).unwrap();
             let mut resp = tiny_http::Response::from_data(r.body).with_status_code(r.code).with_header(h);
             for (k, v) in &r.headers {
@@ -229,6 +255,11 @@ mod tests {
         assert!(r.headers.iter().any(|(k, v)| *k == "X-Qorcap-Frame-Seq" && v == "1"));
         assert!(r.headers.iter().any(|(k, _)| *k == "X-Qorcap-Bundle"));
         assert!(!e.snapshot.exists(), "the tap must not write the snapshot file");
+        // Ring flag off: 404, and the scorebug limiter is untouched (still 429, same JPEG already served).
+        let ring = route(&e, "GET", "/frame/burst-ring", "");
+        assert_eq!(ring.code, 404);
+        assert_eq!(route(&off, "GET", "/frame/burst-ring", "").code, 404);
+        assert_eq!(route(&e, "POST", "/frame/burst-ring", "{}").code, 404);
         let again = route(&e, "GET", "/frame/scorebug", "");
         assert_eq!(again.code, 429);
         assert!(again.headers.iter().any(|(k, _)| *k == "Retry-After"));

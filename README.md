@@ -57,6 +57,8 @@ countersigned live (`countersigned.jsonl`), those signatures are reused. Otherwi
 checkpoints at finalize time, stamping each with QorCap's recording time, and `referee.key_kind` is
 `local-self-attested-offline` so a reader can tell.
 
+**Glimpse witness (opt-in, default off).** Three observer-only switches sit beside the shadow watcher and do not feed a lock or a receipt: `QORCAP_GLIMPSE_WITNESS` (unhinted read of locked frames, about $0.08/match), `QORCAP_GLIMPSE_BURST` (one extra crop on a disagreement, about $0.006/match), and `QORCAP_GLIMPSE_ATTEST` (signed sidecar after the match, $0, its own key). Together about $2/week at 25 matches if the quotas fill, under the default $10 week cap. See [docs/GLIMPSE_WITNESS.md](docs/GLIMPSE_WITNESS.md).
+
 **Highlight clips (opt-in, after the match).** Double-click **`Make Highlights`** (or run `qorcap highlights <bundle folder>`,
 or add `--highlights` to `qorcap finalize`). For every **locked** score change (a `score_change` checkpoint in the signed hash chain whose
 evidence hash matches, normally inside `receipt.json`) it cuts about 8 s before to 4 s after (`--pre`/`--post`) and burns in a small panel
@@ -366,6 +368,7 @@ Global: `--port 8788`, `--ffmpeg PATH`, `--log FILE` (default `qorcap.log`, or `
 | POST | `/replay/save` `{out?}` | returns `{file}` |
 | GET | `/snapshot.jpg` | latest frame (4 fps) |
 | GET | `/frame/scorebug` | opt-in (`QORCAP_GLIMPSE_FRAME=1` / `--glimpse-frame`), read-only, from memory: the reader's newest snapshot for the advisory Glimpse watcher; 1 per 2 s, refused when older than 3 s. See [docs/GLIMPSE_WATCH.md](docs/GLIMPSE_WATCH.md) |
+| GET | `/frame/burst-ring` | opt-in and off unless `QORCAP_GLIMPSE_BURST_RING=1` as well (404 otherwise). Newest 8 frames / 16 s the reader already pulled, hex-encoded, no rate-limit shared with `/frame/scorebug`. A busy ring drops the sample. Advisory only. See [docs/GLIMPSE_WITNESS.md](docs/GLIMPSE_WITNESS.md) |
 | POST | `/challenge` | referee nonce |
 | POST | `/events` | `{type:"score",home,away,quarter,clock_s,clock_red}` · `{type:"obs",obs,t_ms,until_ms,n}` · `{type:"final",basis,home,away,quarter}` |
 | GET | `/checkpoints?since=N` · `/checkpoints/stream` (SSE) · `/timeline` | |

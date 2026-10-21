@@ -213,7 +213,7 @@ impl Engine {
         Arc::new(Self { ffmpeg, ring: Mutex::new(ReplayRing::new(window, cap)), rec: Mutex::new(None), status: Mutex::new(st), shutdown: AtomicBool::new(false),
             ev: Mutex::new(MatchState { started_wall_ms: wall_ms(), score: Value::Null, ..Default::default() }), subs: Mutex::new(vec![]),
             stamp_file: dir.join("stamp.txt"),
-            snapshot: dir.join("snapshot.jpg"), tap: crate::glimpse::FrameTap::new(args.glimpse_frame || crate::glimpse::env_enabled()), exit_when_recording_ends: AtomicBool::new(false), started: Instant::now(), last_data_ms: AtomicU64::new(0), input, frame_clock,
+            snapshot: dir.join("snapshot.jpg"), tap: crate::glimpse::FrameTap::with_ring(args.glimpse_frame || crate::glimpse::env_enabled(), crate::glimpse::ring_enabled()), exit_when_recording_ends: AtomicBool::new(false), started: Instant::now(), last_data_ms: AtomicU64::new(0), input, frame_clock,
             running: AtomicBool::new(false), api_closed: AtomicBool::new(false), sealed: AtomicBool::new(false),
             countersigned: std::sync::atomic::AtomicI64::new(-1),
             stop_reason: Mutex::new(None), bundle_write: Mutex::new(()), bundle_finalized: AtomicBool::new(false), args })
