@@ -76,3 +76,10 @@ QorCap never reads the verdicts.
 turned on. When on, a held fast-path lock waits up to 4 s for the verdict: `disagree` cancels that fast-path lock
 (the normal 3/9-read windows still apply), `agree` posts it, no verdict posts it after the wait. Glimpse can only
 veto or delay a fast-path lock; it can never create a lock, and offline finalize never uses it.
+
+## Witness, burst, attestation (cheap tier, all default off)
+
+Separate flags, off unless set to `1`: `QORCAP_GLIMPSE_WITNESS`, `QORCAP_GLIMPSE_BURST`,
+`QORCAP_GLIMPSE_BURST_RING`, `QORCAP_GLIMPSE_ATTEST`, `QORCAP_GLIMPSE_CLIP_AUDIT`. Start Match does not enable
+them. Flag-off output matches today's watcher. See [GLIMPSE_WITNESS.md](GLIMPSE_WITNESS.md). The loop specs are
+in [PR #50](https://github.com/ConWan30/qorcap/pull/50).

@@ -40,6 +40,8 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+import qorcap_glimpse_side as side
+
 VERSION = "glimpse-watch/0.1.3"
 ROLE_VERSION = "glimpse-shadow/role-v1"
 TAG = "ADVISORY_AI"
@@ -361,6 +363,18 @@ class Budget:
     def game_spent(self):
         return sum(r.get("cost", 0) or 0 for r in self._ledger() if r.get("match_id") == self.match_id)
 
+    def kind_spent(self, kind):
+        """Spend booked under ``kind`` or ``kind:...`` (failed calls use ``kind:failed_worst_case``)."""
+        prefix = kind + ":"
+        total = 0.0
+        for r in self._ledger():
+            if r.get("match_id") != self.match_id:
+                continue
+            k = r.get("kind") or ""
+            if k == kind or (isinstance(k, str) and k.startswith(prefix)):
+                total += r.get("cost", 0) or 0
+        return total
+
     def week_spent_local(self):
         cut = time.time() - 7 * 86400
         return sum(r.get("cost", 0) or 0 for r in self._ledger() if r.get("t", 0) >= cut)
@@ -390,8 +404,24 @@ class Budget:
         week = max(self.weekly_floor, self.week_spent_local(), remote if remote is not None else 0.0)
         return week + (self.margin if remote is None else 0.0), remote
 
-    def authorise(self, worst):
+    def authorise(self, worst, stratum=None, stratum_cap=None):
+        """Reserve ``worst`` (R) against G, W, and an optional stratum inside G. Fail closed.
+
+        A missing, non-finite, or non-positive G or W raises ``BudgetRefused('cap_unconfigured')``
+        before any socket. The same message is used when a stratum is requested without a positive
+        cap, or when that cap is larger than G. Exceeding a configured cap raises a ``budget:``
+        message the client keeps distinct from ``cap_unconfigured``.
+        """
         with self._lock:
+            if side.finite_positive(self.per_game_cap) is None or side.finite_positive(self.weekly_limit) is None:
+                raise BudgetRefused("cap_unconfigured")
+            if stratum is not None:
+                cap = side.finite_positive(stratum_cap)
+                if cap is None or cap > self.per_game_cap:
+                    raise BudgetRefused("cap_unconfigured")
+                spent = self.kind_spent(stratum)
+                if spent + worst > cap:
+                    raise BudgetRefused(f"stratum {stratum}: spent ${spent:.4f} + worst ${worst:.4f} > ${cap:.4f}")
             g = self.game_spent()
             if g + worst > self.per_game_cap:
                 raise BudgetRefused(f"per-game cap: spent ${g:.4f} + worst ${worst:.4f} > ${self.per_game_cap:.2f}")
@@ -420,8 +450,17 @@ class Client:
         self.breaker_failures, self.cooldown = breaker_failures, breaker_cooldown_s
         self.post, self.clock = post or openrouter_post, clock
         self._fails, self._open_until, self.calls = 0, 0.0, 0
+        self._call_lock = threading.Lock()
 
-    def ask(self, system, task, image_jpeg: bytes, schema, kind="crop_live"):
+    def ask(self, system, task, image_jpeg: bytes, schema, kind="crop_live", stratum=None, stratum_cap=None):
+        with self._call_lock:
+            return self._ask_locked(system, task, image_jpeg, schema, kind, stratum, stratum_cap)
+
+    def _perf(self):
+        pc = getattr(self.clock, "perf_counter", None)
+        return pc() if callable(pc) else time.perf_counter()
+
+    def _ask_locked(self, system, task, image_jpeg: bytes, schema, kind="crop_live", stratum=None, stratum_cap=None):
         """dict(text, cost, latency_s, gen_id, error, refused). Never raises; a failure is 'unknown'."""
         out = {"text": None, "cost": 0.0, "latency_s": None, "gen_id": None, "error": None, "refused": None}
         if self.clock.time() < self._open_until:
@@ -434,9 +473,9 @@ class Client:
             out["refused"] = "no_key"
             return out
         try:
-            self.b.authorise(worst_case())
+            self.b.authorise(worst_case(), stratum=stratum, stratum_cap=stratum_cap)
         except BudgetRefused as e:
-            out["refused"] = f"budget: {e}"
+            out["refused"] = "cap_unconfigured" if str(e) == "cap_unconfigured" else f"budget: {e}"
             return out
         sch = {k: v for k, v in schema.items() if k != "$id"}
         body = {"model": MODEL, "temperature": 0, "max_tokens": CROP_MAX_TOKENS, "reasoning": {"enabled": False},
@@ -446,10 +485,10 @@ class Client:
                              {"role": "user", "content": [{"type": "text", "text": task},
                                                           {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + base64.b64encode(image_jpeg).decode()}}]}]}
         self.calls += 1
-        t = time.perf_counter()
+        t = self._perf()
         try:
             d = self.post(body, self.timeout)
-            out["latency_s"] = round(time.perf_counter() - t, 3)
+            out["latency_s"] = round(self._perf() - t, 3)
             u = d.get("usage") or {}
             out["cost"] = float(u.get("cost") or 0.0)
             out["gen_id"] = d.get("id")
@@ -462,7 +501,7 @@ class Client:
             out["error"] = f"HTTP {e.code}"  # body intentionally not stored
         except Exception as e:  # timeout, DNS, reset
             out["error"] = type(e).__name__
-        out["latency_s"] = round(time.perf_counter() - t, 3)
+        out["latency_s"] = round(self._perf() - t, 3)
         self._fails += 1
         if self._fails >= self.breaker_failures:
             self._open_until = self.clock.time() + self.cooldown
@@ -493,6 +532,16 @@ class FrameTap:
             return e.code, None, {k.lower(): v for k, v in (e.headers or {}).items()}
         except Exception:
             return 0, None, {}
+
+    def get_ring(self, timeout=0.4):
+        """Newest ring frames, only when the ring flag is on. Failure is a drop, never a wait on the recorder."""
+        if not side.env_on(side.RING_ENV):
+            return None
+        try:
+            with urllib.request.urlopen(self.base + "/frame/burst-ring", timeout=timeout) as r:
+                return json.loads(r.read().decode("utf-8"))
+        except Exception:
+            return None
 
 
 class TdJumpTail:
@@ -661,12 +710,29 @@ class Watcher:
         self.c = {k: 0 for k in ("frames_seen", "known_skipped", "score_unknown", "quarter_unknown", "sent", "rate_skipped",
                                  "dup_skipped", "hold_skipped", "refused", "errors", "rejected", "scorebug", "stats_overlay", "other",
                                  "plausible", "agrees_with_lock", "legal_change", "implausible", "tap_off", "tap_429",
-                                 "tap_503", "tap_down", "td_asked", "td_agree", "td_disagree", "td_no_read", "td_expired")}
+                                 "tap_503", "tap_down", "td_asked", "td_agree", "td_disagree", "td_no_read", "td_expired",
+                                 "witness_sent", "witness_hold", "burst_events", "burst_expired", "burst_dropped", "ring_dropped",
+                                 "lane_dropped")}
         self.td = None
         self.regions_seen: list = []
         self.week = None
         self.started = clock.time()
         self.stop_reason = None
+        # Cheap-tier observer strata. Read once at construction so a flag left at 0 stays off for the process.
+        self.lane = side.CallLane()
+        self._io = threading.Lock()
+        self.witness_on = side.env_on(side.WITNESS_ENV)
+        self.burst_on = side.env_on(side.BURST_ENV)
+        self.ring_on = side.env_on(side.RING_ENV)
+        self.witness_interval = side.witness_interval()
+        self.s_witness = side.resolve_money(side.WITNESS_CAP_ENV, side.S_WITNESS_DEFAULT)
+        self.s_burst = side.resolve_money(side.BURST_CAP_ENV, side.S_BURST_DEFAULT)
+        self.last_witness_t = -1e18
+        self.witness_seqs: set = set()
+        self.burst_seen_seq: set = set()
+        self.burst_seen_td: set = set()
+        self.burst_events = 0
+        self.burst_stop = False
 
     def say(self, msg):
         self._print(msg)
@@ -692,7 +758,9 @@ class Watcher:
             (self.out / "crops").mkdir(exist_ok=True)
         self.tail = TimelineTail(self.match_dir / "timeline.jsonl")
         self.td = TdJumpTail(self.out / "td_jumps.jsonl")
-        self.budget = Budget(out_root / "ledger.jsonl", self.match_id, per_game_cap=self.a.game_cap, weekly_limit=self.a.weekly_limit,
+        game_cap = side.resolve_money(side.GAME_ENV, self.a.game_cap)
+        weekly = side.resolve_money(side.WEEK_ENV, self.a.weekly_limit)
+        self.budget = Budget(out_root / "ledger.jsonl", self.match_id, per_game_cap=game_cap, weekly_limit=weekly,
                              weekly_floor=self.a.weekly_floor, key_reader=self.key_reader)
         self.client = Client(self.budget, timeout_s=self.a.timeout, max_calls=self.a.max_calls, post=self.post, clock=self.clock)
         self.say(f"[glimpse] {LABEL}")
@@ -701,8 +769,11 @@ class Watcher:
         return True
 
     def _emit(self, rec):
-        with open(self.out / "advisory.jsonl", "a", encoding="utf-8") as f:
+        with self._io, open(self.out / "advisory.jsonl", "a", encoding="utf-8") as f:
             f.write(json.dumps(rec) + "\n")
+
+    def _unhinted_task(self):
+        return self.task + self.ctx.format(layout=LAYOUTS.get(self.layout, self.layout), last_lock=side.LOCK_WITHHELD)
 
     def run(self):
         end = self.clock.time() + self.a.max_minutes * 60
@@ -741,11 +812,15 @@ class Watcher:
                 self.say("[glimpse] budget reached; stopping (recording is unaffected).")
                 break
             self.clock.sleep(self.a.poll)
+        self.lane.drain()
         self.write_report(final=True)
         return self.c
 
     def _budget_exhausted(self):
-        return self.budget.game_spent() + worst_case() > self.a.game_cap
+        cap = self.budget.per_game_cap
+        if side.finite_positive(cap) is None:
+            return True
+        return self.budget.game_spent() + worst_case() > cap
 
     def on_frame(self, jpeg, hdr):
         seq = hdr.get("x-qorcap-frame-seq")
@@ -770,6 +845,8 @@ class Watcher:
         state, last, locks = self.tail.state_at(frame_ms)
         if state == "known":
             self.c["known_skipped"] += 1
+            if self.witness_on:
+                self._arm_witness(jpeg, frame_ms, seq, locks, last, state)
             return
         self.c[state] += 1
         now = self.clock.time()
@@ -830,7 +907,7 @@ class Watcher:
         g = self.budget.game_spent()
         rec = {"tag": TAG, "ai_assisted": True, "advisory_only": True, "feeds_lock": False, "label": LABEL,
                "role_version": ROLE_VERSION, "tool_version": VERSION, "prompt_sha": self.prompt_sha, "model": MODEL,
-               "kind": "crop_live", "item_id": item, "frame_wall_ms": frame_ms, "frame_seq": seq, "t_wall": time.time(),
+               "kind": "crop_live", "item_id": item, "frame_wall_ms": frame_ms, "frame_seq": seq, "t_wall": self.clock.time(),
                "match_id": self.match_id, "layout": self.layout, "local_state": state,
                "local_last_row": last, "reference_lock": lock,
                "valid": obj is not None, "reject_reason": rej, "model_reply": obj, **res,
@@ -838,6 +915,8 @@ class Watcher:
                "error": r["error"], "refused": r["refused"], "raw": (r["text"] or "")[:600]}
         self._emit(rec)
         self.regions_seen.append(rec)
+        if self.burst_on and not r["refused"] and side.is_burst_trigger(res, obj, lock):
+            self._arm_burst(jpeg, frame_ms, seq, lock, reused=None, obj=obj, reply=r, task_was_unhinted=False)
         sug = res["advisory_score"]
         self.say(f"[glimpse] {_hhmmss(frame_ms)} {state:<15} -> {res['region']:<13} "
                  f"{('suggest ' + str(sug['away']) + '-' + str(sug['home'])) if sug else ','.join(res['flags'])[:60]:<40} "
@@ -851,6 +930,8 @@ class Watcher:
             ev = self.td.queue.pop(0)
             self.td.done.add(ev.get("id"))
             self.c["td_expired"] += 1
+            if self.burst_on:
+                self.c["burst_expired"] += 1
         if not self.td.queue:
             return False
         ev = self.td.queue[0]
@@ -880,7 +961,7 @@ class Watcher:
                "role_version": ROLE_VERSION, "tool_version": VERSION, "prompt_sha": self.prompt_sha, "model": MODEL,
                "kind": "td_second_opinion", "item_id": item, "td_id": ev.get("id"), "cand": ev.get("cand"),
                "old": ev.get("old"), "confusable": ev.get("confusable"), "frame_wall_ms": frame_ms, "frame_seq": seq,
-               "t_wall": time.time(), "match_id": self.match_id, "layout": self.layout, "verdict": v,
+               "t_wall": self.clock.time(), "match_id": self.match_id, "layout": self.layout, "verdict": v,
                "valid": obj is not None, "reject_reason": rej, "model_reply": obj, "cost": r["cost"],
                "game_spent": round(self.budget.game_spent(), 6), "latency_s": r["latency_s"], "gen_id": r["gen_id"],
                "error": r["error"], "refused": r["refused"], "raw": (r["text"] or "")[:600]}
@@ -891,7 +972,205 @@ class Watcher:
         except OSError:
             pass
         self.say(f"[glimpse] {_hhmmss(frame_ms)} touchdown jump {ev.get('old')} -> {ev.get('cand')}: second opinion {v}")
+        if self.burst_on:
+            old = ev.get("old")
+            lock = {"away": old[0], "home": old[1]} if isinstance(old, (list, tuple)) and len(old) == 2 else None
+            self._arm_burst(jpeg, frame_ms, seq, lock, reused=(r, obj), obj=obj, reply=r, task_was_unhinted=True,
+                            td_id=ev.get("id"), pending_td=True)
         return True
+
+    def _arm_witness(self, jpeg, frame_ms, seq, locks, last, state):
+        """Known frame, witness flag on. Own interval. Does not touch the ordinary 6 s clock or confirm-hold."""
+        if seq is not None and seq in self.witness_seqs:
+            return
+        if self.clock.time() * 1000 - int(frame_ms) > 3000:
+            return
+        if self.clock.time() - self.last_witness_t < self.witness_interval:
+            self.c["witness_hold"] += 1
+            return
+        lock = locks[-1] if locks else None
+        task = self._unhinted_task()
+        if not side.task_withholds_lock(task, lock):
+            return
+        blob = bytes(jpeg)
+
+        def job():
+            self._witness_call(blob, frame_ms, seq, lock, locks, last, state, task)
+
+        if self.lane.submit(job):
+            self.last_witness_t = self.clock.time()
+            if seq is not None:
+                self.witness_seqs.add(str(seq))
+        else:
+            self.c["lane_dropped"] += 1
+
+    def _witness_call(self, jpeg, frame_ms, seq, lock, locks, last, state, task):
+        crop, _thumb = crop_scorebug(jpeg)
+        if crop is None:
+            self.c["errors"] += 1
+            return
+        r = self.client.ask(self.system, task, crop, self.schema, kind="witness",
+                            stratum="witness", stratum_cap=self.s_witness)
+        obj, rej = None, None
+        if r["text"] is not None:
+            try:
+                obj = parse_strict(r["text"], self.schema)
+            except Rejected as e:
+                rej = str(e)
+                self.c["rejected"] += 1
+        if r["refused"]:
+            self.c["refused"] += 1
+        elif r["error"]:
+            self.c["errors"] += 1
+        else:
+            self.c["witness_sent"] += 1
+        qage = None if self.tail is None or self.tail.max_quarter_t_ms is None else frame_ms - self.tail.max_quarter_t_ms
+        res = assess(obj, lock, locks or [], None if self.tail is None else self.tail.max_quarter, qage)
+        item = f"witness_seq{seq}_{frame_ms}"
+        if self.a.save_crops and not r["refused"] and crop is not None:
+            try:
+                (self.out / "crops" / f"{item}.jpg").write_bytes(crop)
+            except OSError:
+                pass
+        rec = {"tag": TAG, "ai_assisted": True, "advisory_only": True, "feeds_lock": False, "label": LABEL,
+               "role_version": ROLE_VERSION, "tool_version": VERSION, "prompt_sha": self.prompt_sha, "model": MODEL,
+               "kind": "witness", "item_id": item, "frame_wall_ms": frame_ms, "frame_seq": seq, "t_wall": self.clock.time(),
+               "match_id": self.match_id, "layout": self.layout, "local_state": state, "local_last_row": last,
+               "reference_lock": lock, "valid": obj is not None, "reject_reason": rej, "model_reply": obj, **res,
+               "cost": r["cost"], "game_spent": round(self.budget.game_spent(), 6), "latency_s": r["latency_s"],
+               "gen_id": r["gen_id"], "error": r["error"], "refused": r["refused"], "raw": (r["text"] or "")[:600]}
+        self._emit(rec)
+        if not r["refused"] and side.is_burst_trigger(res, obj, lock):
+            self._arm_burst(jpeg, frame_ms, seq, lock, reused=(r, obj), task_was_unhinted=True)
+
+    def _arm_burst(self, jpeg, frame_ms, seq, lock, reused=None, obj=None, reply=None, task_was_unhinted=False,
+                   td_id=None, pending_td=False):
+        """Disagreement burst. Flag off: the caller does not enter. Output is burst.jsonl under the Glimpse folder."""
+        if not self.burst_on:
+            return
+        seq_key = None if seq is None else str(seq)
+        with self._io:
+            if self.burst_stop:
+                self.c["burst_dropped"] += 1
+                return
+            if seq_key is not None and seq_key in self.burst_seen_seq:
+                return
+            if td_id is not None and td_id in self.burst_seen_td:
+                return
+            if self.clock.time() - (int(frame_ms) / 1000.0) > side.BURST_MAX_AGE_S:
+                self.c["burst_expired"] += 1
+                return
+            if self.burst_events >= side.BURST_MAX_EVENTS:
+                self.c["burst_dropped"] += 1
+                self.burst_stop = True
+                return
+            self.burst_events += 1
+            self.c["burst_events"] += 1
+            if seq_key is not None:
+                self.burst_seen_seq.add(seq_key)
+            if td_id is not None:
+                self.burst_seen_td.add(td_id)
+        blob = bytes(jpeg)
+        args = (blob, frame_ms, seq, lock, reused, task_was_unhinted, pending_td)
+
+        def job():
+            self._burst_run(*args)
+
+        on_lane = self.lane._thread is not None and threading.current_thread() is self.lane._thread
+        if self.lane.sync or on_lane:
+            job()
+            return
+        if not self.lane.submit(job):
+            with self._io:
+                self.burst_events -= 1
+                self.c["burst_events"] -= 1
+                if seq_key is not None:
+                    self.burst_seen_seq.discard(seq_key)
+                if td_id is not None:
+                    self.burst_seen_td.discard(td_id)
+                self.c["burst_dropped"] += 1
+                self.c["lane_dropped"] += 1
+
+    def _burst_crops(self, jpeg, frame_ms):
+        """Cheap tier (ring flag off): the JPEG this watcher already pulled. Ring on: one nearest frame, else drop."""
+        if not self.ring_on:
+            return [bytes(jpeg)]
+        payload = None
+        getter = getattr(self.tap, "get_ring", None)
+        if callable(getter):
+            try:
+                payload = getter(0.4)
+            except Exception:
+                payload = None
+        frames = payload.get("frames") if isinstance(payload, dict) else None
+        best, best_d = None, None
+        for fr in frames or []:
+            try:
+                wall = int(fr.get("wall_ms"))
+                raw = bytes.fromhex(fr.get("jpeg_hex") or "")
+            except (TypeError, ValueError):
+                continue
+            dist = abs(wall - int(frame_ms))
+            if best_d is None or dist < best_d:
+                best, best_d = raw, dist
+        if not best:
+            self.c["ring_dropped"] += 1
+            return [bytes(jpeg)]
+        return [best]
+
+    def _burst_run(self, jpeg, frame_ms, seq, lock, reused, task_was_unhinted, pending_td):
+        jpegs = []
+        chosen = []
+        if side.disk_free_ok(self.out):
+            folder = self.out / "burst"
+            folder.mkdir(exist_ok=True)
+            chosen = self._burst_crops(jpeg, frame_ms)[:side.BURST_CROPS_PER_EVENT]
+            for i, blob in enumerate(chosen):
+                name = f"seq{seq}_{frame_ms}_{i}.jpg"
+                (folder / name).write_bytes(blob)
+                jpegs.append(name)
+        else:
+            self._seal_burst(frame_ms, seq, lock, "no_read", "disk", None, None, 0.0, None, None, None, [], False, None)
+            return
+        if task_was_unhinted and reused is not None:
+            r, obj = reused
+            verdict = "no_read" if r.get("refused") or r.get("error") else side.burst_verdict(obj, lock)
+            self._seal_burst(frame_ms, seq, lock, verdict, r.get("refused"), obj, None, 0.0, r.get("error"),
+                             r.get("gen_id"), r.get("latency_s"), jpegs, True, r.get("text"))
+            return
+        task = self._unhinted_task()
+        if not side.task_withholds_lock(task, lock):
+            self._seal_burst(frame_ms, seq, lock, "no_read", "prompt_guard", None, None, 0.0, None, None, None, jpegs, False, None)
+            return
+        crop, _thumb = crop_scorebug(chosen[0] if chosen else jpeg)
+        if crop is None:
+            self._seal_burst(frame_ms, seq, lock, "no_read", None, None, "crop_failed", 0.0, "crop_failed", None, None, jpegs, False, None)
+            return
+        r = self.client.ask(self.system, task, crop, self.schema, kind="burst", stratum="burst", stratum_cap=self.s_burst)
+        obj, rej = None, None
+        if r["text"] is not None:
+            try:
+                obj = parse_strict(r["text"], self.schema)
+            except Rejected as e:
+                rej = str(e)
+        refused = r.get("refused")
+        if isinstance(refused, str) and refused.startswith("budget"):
+            refused = "budget"
+            self.burst_stop = True
+        verdict = "no_read" if refused or r.get("error") or obj is None else side.burst_verdict(obj, lock)
+        self._seal_burst(frame_ms, seq, lock, verdict, refused, obj, rej, r.get("cost") or 0.0, r.get("error"),
+                         r.get("gen_id"), r.get("latency_s"), jpegs, False, r.get("text"))
+
+    def _seal_burst(self, frame_ms, seq, lock, verdict, refused, obj, rej, cost, error, gen_id, latency, jpegs, reused, raw):
+        rec = {"tag": TAG, "ai_assisted": True, "advisory_only": True, "feeds_lock": False, "label": LABEL,
+               "role_version": ROLE_VERSION, "tool_version": VERSION, "prompt_sha": self.prompt_sha, "model": MODEL,
+               "kind": "burst", "frame_wall_ms": frame_ms, "frame_seq": seq, "t_wall": self.clock.time(),
+               "match_id": self.match_id, "layout": self.layout, "reference_lock": lock, "verdict": verdict,
+               "valid": obj is not None, "reject_reason": rej, "model_reply": obj, "cost": cost,
+               "latency_s": latency, "gen_id": gen_id, "error": error, "refused": refused,
+               "reused_unhinted": bool(reused), "jpegs": jpegs, "raw": (raw or "")[:600]}
+        with self._io, open(self.out / "burst.jsonl", "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec) + "\n")
 
     def write_report(self, final=False):
         if self.out is None:
@@ -975,6 +1254,8 @@ def build_parser():
     ap.add_argument("--idle-exit-s", type=float, default=300, help="stop when QorCap has been unreachable this long")
     ap.add_argument("--wait-start-s", type=float, default=None, help="before the first frame, wait this long for QorCap (default: --idle-exit-s)")
     ap.add_argument("--no-save-crops", dest="save_crops", action="store_false")
+    ap.add_argument("--sync-calls", action="store_true",
+                    help="run witness and burst calls on the poll thread (tests). Production leaves this off when those flags are on.")
     return ap
 
 
@@ -983,7 +1264,12 @@ def main(argv=None):
     lower_priority()
     if not os.environ.get(KEY_ENV):
         print(f"[glimpse] {KEY_ENV} is not set; nothing will be sent (frames are still counted).")
-    Watcher(a).run()
+    w = Watcher(a)
+    # Witness and burst model work leaves the poll thread only when those flags are on.
+    # Flag-off stays synchronous, which is the path the byte-for-byte tests pin.
+    if (w.witness_on or w.burst_on) and not a.sync_calls:
+        w.lane.sync = False
+    w.run()
     return 0
 
 

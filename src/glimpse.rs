@@ -9,21 +9,35 @@
 //! Off unless `record --glimpse-frame` or `QORCAP_GLIMPSE_FRAME=1`. Rate-limited (one frame per
 //! `MIN_INTERVAL_MS` across all callers) and stale frames are refused, so an old frame is never presented
 //! as live. Nothing the watcher sends back can reach QorCap: the endpoint is GET-only and has no body.
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 pub const ENV: &str = "QORCAP_GLIMPSE_FRAME";
+/// Opt-in memory ring for the disagreement burst. Off unless this is `1`.
+/// The ring is a clone of frames the reader already pulled. It never blocks `offer`.
+pub const RING_ENV: &str = "QORCAP_GLIMPSE_BURST_RING";
 /// At most one frame per this many ms, across all callers.
 pub const MIN_INTERVAL_MS: u64 = 2_000;
 /// A frame older than this is refused (the reader stopped pulling: menu pause, stop, no signal).
 pub const MAX_AGE_MS: u64 = 3_000;
+/// Burst ring: newest frames only, and nothing older than this.
+pub const RING_DEPTH: usize = 8;
+pub const RING_WINDOW_MS: u64 = 16_000;
+
+pub fn ring_enabled() -> bool {
+    std::env::var(RING_ENV).map(|v| matches!(v.trim(), "1" | "true" | "yes" | "on")).unwrap_or(false)
+}
 
 #[derive(Clone, Debug)]
 pub struct Frame { pub jpeg: Arc<Vec<u8>>, pub wall_ms: u64, pub seq: u64 }
 
 pub struct FrameTap {
     pub enabled: bool,
+    /// Separate from `enabled`. Off: `offer` does not touch the ring and `copy_ring` is `Off`.
+    pub ring_enabled: bool,
     cur: Mutex<Option<Frame>>,
+    ring: Mutex<VecDeque<Frame>>,
     seq: AtomicU64,
     last_served_ms: AtomicU64,
     pub served: AtomicU64,
@@ -31,15 +45,17 @@ pub struct FrameTap {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-pub enum TapErr { Off, Throttled { retry_ms: u64 }, NoFrame, Stale { age_ms: u64 } }
+pub enum TapErr { Off, Throttled { retry_ms: u64 }, NoFrame, Stale { age_ms: u64 }, Busy }
 
 pub fn env_enabled() -> bool {
     std::env::var(ENV).map(|v| matches!(v.trim(), "1" | "true" | "yes" | "on")).unwrap_or(false)
 }
 
 impl FrameTap {
-    pub fn new(enabled: bool) -> Self {
-        Self { enabled, cur: Mutex::new(None), seq: AtomicU64::new(0), last_served_ms: AtomicU64::new(0),
+    pub fn new(enabled: bool) -> Self { Self::with_ring(enabled, false) }
+    pub fn with_ring(enabled: bool, ring_enabled: bool) -> Self {
+        Self { enabled, ring_enabled, cur: Mutex::new(None), ring: Mutex::new(VecDeque::new()),
+               seq: AtomicU64::new(0), last_served_ms: AtomicU64::new(0),
                served: AtomicU64::new(0), throttled: AtomicU64::new(0) }
     }
     /// Called by the `/snapshot.jpg` handler after it has already read a valid JPEG. Never blocks.
@@ -47,7 +63,28 @@ impl FrameTap {
         if !self.enabled { return; }
         if let Ok(mut g) = self.cur.try_lock() {
             let seq = self.seq.fetch_add(1, Ordering::Relaxed) + 1;
-            *g = Some(Frame { jpeg: Arc::new(jpeg.to_vec()), wall_ms: now_ms, seq });
+            let frame = Frame { jpeg: Arc::new(jpeg.to_vec()), wall_ms: now_ms, seq };
+            // Ring flag off: this branch is skipped, so the stored frame matches `FrameTap::new`.
+            if self.ring_enabled { self.push_ring(frame.clone()); }
+            *g = Some(frame);
+        }
+    }
+    /// Drop the sample if the ring mutex is busy. Never waits.
+    fn push_ring(&self, frame: Frame) {
+        let Ok(mut q) = self.ring.try_lock() else { return; };
+        let now = frame.wall_ms;
+        q.push_back(frame);
+        while q.len() > RING_DEPTH { q.pop_front(); }
+        while q.len() > 1 && q.front().is_some_and(|f| now.saturating_sub(f.wall_ms) > RING_WINDOW_MS) {
+            q.pop_front();
+        }
+    }
+    /// Clone of the ring for GET /frame/burst-ring. Busy means the caller should drop the poll.
+    pub fn copy_ring(&self) -> Result<Vec<Frame>, TapErr> {
+        if !self.enabled || !self.ring_enabled { return Err(TapErr::Off); }
+        match self.ring.try_lock() {
+            Ok(q) => Ok(q.iter().cloned().collect()),
+            Err(_) => Err(TapErr::Busy),
         }
     }
     /// The newest frame for the watcher, or why not.
@@ -104,5 +141,42 @@ mod tests {
         t.offer(&[0xFF, 0xD8, 9, 0xFF, 0xD9], 5_250); // returns immediately, skips this copy
         drop(g);
         assert_eq!(t.take(5_300).unwrap().seq, 1);
+    }
+    #[test]
+    fn flag_off_ring_matches_take_bytes() {
+        let jpeg = [0xFF, 0xD8, 1, 2, 0xFF, 0xD9];
+        let plain = FrameTap::new(true);
+        let off = FrameTap::with_ring(true, false);
+        plain.offer(&jpeg, 10_000);
+        off.offer(&jpeg, 10_000);
+        let a = plain.take(10_100).unwrap();
+        let b = off.take(10_100).unwrap();
+        assert_eq!((a.seq, a.wall_ms, a.jpeg.as_slice()), (b.seq, b.wall_ms, b.jpeg.as_slice()));
+        assert_eq!(off.copy_ring().unwrap_err(), TapErr::Off);
+        assert!(off.ring.lock().unwrap_or_else(|e| e.into_inner()).is_empty());
+    }
+    #[test]
+    fn a_held_ring_drops_the_sample_and_still_updates_the_frame() {
+        let t = FrameTap::with_ring(true, true);
+        t.offer(&J, 5_000);
+        let g = t.ring.lock().unwrap_or_else(|e| e.into_inner());
+        let next = [0xFF, 0xD8, 9, 0xFF, 0xD9];
+        t.offer(&next, 5_250);
+        assert_eq!(t.copy_ring().unwrap_err(), TapErr::Busy);
+        drop(g);
+        let f = t.take(5_300).unwrap();
+        assert_eq!(f.jpeg.as_slice(), &next);
+        assert_eq!(t.copy_ring().unwrap().len(), 1);
+    }
+    #[test]
+    fn test_burst_ring_try_lock_does_not_block_reader() {
+        let t = FrameTap::with_ring(true, true);
+        t.offer(&J, 5_000);
+        let g = t.ring.lock().unwrap_or_else(|e| e.into_inner());
+        let start = std::time::Instant::now();
+        t.offer(&[0xFF, 0xD8, 9, 0xFF, 0xD9], 5_250);
+        assert!(start.elapsed().as_millis() < 200, "offer waited on the ring mutex");
+        drop(g);
+        assert_eq!(t.take(5_300).unwrap().jpeg.as_slice(), &[0xFF, 0xD8, 9, 0xFF, 0xD9]);
     }
 }
