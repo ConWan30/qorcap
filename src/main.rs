@@ -422,6 +422,31 @@ fn main() {
                     Err(e) => { eprintln!("error: {e}"); e.code() }
                 }
             }
+            qorcap::cli::ClipCmd::Sign { bundle, clip, start_mono_ms, end_mono_ms, repackaged, qortime, python } => {
+                let req = qorcap::clip::SignExistingRequest {
+                    bundle: std::path::PathBuf::from(bundle),
+                    clip: std::path::PathBuf::from(&clip),
+                    start_mono_ms,
+                    end_mono_ms,
+                    transcoded: !repackaged,
+                    qortime: qortime.map(std::path::PathBuf::from),
+                    python,
+                    key_dir: None,
+                };
+                match qorcap::clip::sign_existing(&req) {
+                    Ok(a) => {
+                        println!("content_credentials: on");
+                        println!("verification_status: {}", a.verification_status);
+                        println!("verified: {}", a.verified);
+                        println!("match_id: {}", a.match_id);
+                        println!("receipt_sha256: {}", a.receipt_sha256);
+                        println!("clip: {clip}");
+                        println!("signer: self-signed local key (standard C2PA validators show this signer as untrusted)");
+                        0
+                    }
+                    Err(e) => { eprintln!("error: {e}"); e.code() }
+                }
+            }
         },
         Cmd::ClipVerify { clip, bundle, qortime, python } => {
             match qorcap::clip::verify_clip(

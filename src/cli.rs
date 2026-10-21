@@ -194,6 +194,34 @@ pub enum ClipCmd {
         #[arg(long)]
         python: Option<String>,
     },
+    /// Sign an existing MP4 (a highlight clip) in place. Does not re-cut it.
+    /// Refuses, and leaves the file unchanged, when the receipt does not verify
+    /// or while the bundle is still being recorded.
+    /// This command does not follow `QORCAP_CONTENT_CREDENTIALS`. `qorcap record`
+    /// and `clip export` stay default-off.
+    Sign {
+        /// Match bundle folder (receipt.json, manifest.jsonl, video)
+        #[arg(long)]
+        bundle: String,
+        /// MP4 to sign in place
+        #[arg(long)]
+        clip: String,
+        /// First millisecond of the source span on the match clock (inclusive)
+        #[arg(long)]
+        start_mono_ms: u64,
+        /// End millisecond on that clock (exclusive)
+        #[arg(long)]
+        end_mono_ms: u64,
+        /// The clip was stream-copied. The default is a re-encode (a burned-in highlight).
+        #[arg(long)]
+        repackaged: bool,
+        /// QorTime checkout (directory that contains qor_receipt/). Also $QORTIME.
+        #[arg(long)]
+        qortime: Option<String>,
+        /// Python interpreter used to run `python -m qor_receipt.cli verify`
+        #[arg(long)]
+        python: Option<String>,
+    },
 }
 
 #[derive(clap::Args, Debug, Clone, PartialEq)]
@@ -371,6 +399,15 @@ mod tests {
                 assert_eq!(clip, "c.mp4");
                 assert_eq!(bundle.as_deref(), Some("D:/m"));
                 assert!(qortime.is_none());
+            }
+            _ => panic!(),
+        }
+        match Cli::try_parse_from([
+            "qorcap", "clip", "sign", "--bundle", "D:/m", "--clip", "h.mp4",
+            "--start-mono-ms", "0", "--end-mono-ms", "1000",
+        ]).unwrap().cmd {
+            Cmd::Clip { clip: ClipCmd::Sign { bundle, clip, start_mono_ms, end_mono_ms, repackaged, .. } } => {
+                assert_eq!((bundle.as_str(), clip.as_str(), start_mono_ms, end_mono_ms, repackaged), ("D:/m", "h.mp4", 0, 1000, false));
             }
             _ => panic!(),
         }

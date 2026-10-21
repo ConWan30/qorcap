@@ -4,7 +4,9 @@
     qorcap highlights --check BUNDLE/highlights/manifest.json [--bundle BUNDLE]
     python sidecar/qorcap_highlights.py ...
 
-Off by default. It never runs while QorCap is recording: a fresh ``.qorcap-run/recording.lock`` (touched on every
+Start Match and Finalize Last Match run this cutter after the receipt is signed, then attach content credentials.
+``--no-auto-highlights`` opts out. ``qorcap highlights`` on its own still only cuts clips.
+It never runs while QorCap is recording: a fresh ``.qorcap-run/recording.lock`` (touched on every
 ~2 s video segment) makes it refuse (exit 3), and it needs the signed ``receipt.json`` that Start Match / Finalize only
 write after the stop (exit 4 without it).
 
@@ -412,6 +414,8 @@ def check_manifest(manifest_path: Path, bundle: Path | None = None) -> list[str]
             errs.append(f"{c['id']}: clip file missing")
         elif sha256_file(f) != c.get("sha256"):
             errs.append(f"{c['id']}: clip sha256 mismatch")
+        else:
+            errs.extend(credential_problems(c["id"], c.get("content_credentials"), f.read_bytes()))
         lk = c.get("lock") or {}
         if lk.get("frames_hash") != jcs_sha(lk.get("evidence")):
             errs.append(f"{c['id']}: lock frames_hash does not match its evidence")
@@ -422,6 +426,179 @@ def check_manifest(manifest_path: Path, bundle: Path | None = None) -> list[str]
                 if mf.get(s.get("seq")) != s.get("sha256"):
                     errs.append(f"{c['id']}: source segment {s.get('seq')} does not match manifest.jsonl")
     return errs
+
+
+def credential_problems(clip_id: str, cred, file_bytes: bytes) -> list[str]:
+    """A clip may omit credentials. It may not claim ``verified`` unless the assertion does too."""
+    if not isinstance(cred, dict):
+        return []
+    errs = []
+    verified = cred.get("verified") is True
+    attached = cred.get("attached") is True
+    status = cred.get("verification_status")
+    if verified and not (attached and status == "verified"):
+        errs.append(f"{clip_id}: content credentials claim verified without a verified receipt")
+    claims_verified = b'"verified":true' in file_bytes or b'"verified": true' in file_bytes
+    has_label = b"org.qorcap.match-receipt-v0" in file_bytes
+    if verified and not claims_verified:
+        errs.append(f"{clip_id}: manifest says verified but the clip does not")
+    if not verified and claims_verified:
+        errs.append(f"{clip_id}: clip says verified but the receipt is not verified")
+    if attached and not has_label:
+        errs.append(f"{clip_id}: content credentials are missing from the clip")
+    if not attached and has_label:
+        errs.append(f"{clip_id}: credentials were not supposed to be attached")
+    return errs
+
+
+def mono_bounds(manifest_rows: list[dict], source_file: str, start_s: float, end_s: float) -> tuple[int, int] | None:
+    """Map seconds-into-file onto the match mono clock. None when that clock is not in the manifest."""
+    pts = []
+    for m in manifest_rows:
+        if m.get("type") != "segment":
+            continue
+        if (m.get("file") or "video.mp4") != source_file:
+            continue
+        mono, frames = m.get("mono_ms"), m.get("frames")
+        if isinstance(mono, bool) or isinstance(frames, bool):
+            continue
+        if not isinstance(mono, (int, float)) or not isinstance(frames, (int, float)):
+            continue
+        pts.append((float(frames) / FPS, int(mono)))
+    pts.sort()
+    if len(pts) < 1 or end_s <= start_s:
+        return None
+    # One segment still has a clock: the previous point is the start of the file.
+    if len(pts) == 1 or pts[0][0] > 0:
+        pts.insert(0, (0.0, 0))
+
+    def at(sec: float) -> int:
+        if sec <= pts[0][0]:
+            return pts[0][1]
+        for (s0, m0), (s1, m1) in zip(pts, pts[1:]):
+            if sec <= s1:
+                if s1 == s0:
+                    return m1
+                return int(round(m0 + (sec - s0) * (m1 - m0) / (s1 - s0)))
+        return pts[-1][1]
+
+    a, b = at(start_s), at(end_s)
+    if b <= a:
+        return None
+    return a, b
+
+
+def honest_credential_record(status: str | None, verified_flag: bool) -> dict:
+    """What the highlights manifest is allowed to say. ``verified`` stays false unless both words agree."""
+    if status == "verified" and verified_flag:
+        return {"attached": True, "verified": True, "verification_status": "verified"}
+    if status in ("self_attested", "partial") and not verified_flag:
+        return {"attached": True, "verified": False, "verification_status": status}
+    return {"attached": False, "verified": False, "reason": "receipt did not verify"}
+
+
+def default_qorcap() -> str | None:
+    exe = "qorcap.exe" if os.name == "nt" else "qorcap"
+    here = Path(__file__).resolve().parent.parent
+    for c in (here / exe, here / "target" / "release" / exe, here / "target" / "debug" / exe):
+        if c.exists():
+            return str(c)
+    return shutil.which("qorcap") or shutil.which(exe)
+
+
+def _run_cmd(cmd: list[str]) -> tuple[int, str, str]:
+    p = subprocess.run(cmd, check=False, capture_output=True, text=True)
+    return p.returncode, p.stdout or "", p.stderr or ""
+
+
+def _stdout_field(text: str, key: str) -> str | None:
+    prefix = key + ":"
+    for line in text.splitlines():
+        if line.startswith(prefix):
+            return line.split(":", 1)[1].strip()
+    return None
+
+
+def attach_credentials(bundle: Path, manifest_path: Path, *, qorcap: str | None = None, qortime: Path | None = None,
+                       python: str | None = None, run=None) -> dict:
+    """Sign each highlight clip in place. A bad receipt leaves the clip bytes alone and records verified false.
+
+    Never raises for a per-clip failure. Does not write ``receipt.json``.
+    """
+    bundle = Path(bundle)
+    mp = Path(manifest_path)
+    man = json.loads(mp.read_text(encoding="utf-8"))
+    if recorder_running(bundle):
+        say("  content credentials skipped: QorCap is still recording")
+        return man
+    rows = read_jsonl(bundle / "manifest.jsonl")
+    exe = qorcap or default_qorcap()
+    run = run or _run_cmd
+    stop = False
+    for c in man.get("clips") or []:
+        if stop:
+            c["content_credentials"] = {"attached": False, "verified": False, "reason": "QorCap is still recording"}
+            continue
+        src = c.get("source") or {}
+        bounds = None
+        if isinstance(src.get("start_s"), (int, float)) and isinstance(src.get("end_s"), (int, float)):
+            bounds = mono_bounds(rows, src.get("file") or "video.mp4", float(src["start_s"]), float(src["end_s"]))
+        f = mp.parent / c["file"]
+        if bounds is None or not f.exists() or not exe:
+            c["content_credentials"] = {"attached": False, "verified": False, "reason": "credentials were not attached"}
+            continue
+        original = f.read_bytes()
+        transcoded = c.get("overlay") == "burned+sidecar"
+        cmd = [exe, "clip", "sign", "--bundle", str(bundle), "--clip", str(f),
+               "--start-mono-ms", str(bounds[0]), "--end-mono-ms", str(bounds[1])]
+        if not transcoded:
+            cmd.append("--repackaged")
+        if qortime:
+            cmd += ["--qortime", str(qortime)]
+        if python:
+            cmd += ["--python", python]
+        try:
+            code, out, _err = run(cmd)
+        except Exception:
+            if f.exists():
+                f.write_bytes(original)
+            c["content_credentials"] = {"attached": False, "verified": False, "reason": "credentials were not attached"}
+            continue
+        if code == 3:
+            if f.exists() and f.read_bytes() != original:
+                f.write_bytes(original)
+            c["content_credentials"] = {"attached": False, "verified": False, "reason": "QorCap is still recording"}
+            stop = True
+            continue
+        if code != 0:
+            if f.exists() and f.read_bytes() != original:
+                f.write_bytes(original)
+            reason = "receipt did not verify" if code == 4 else "credentials were not attached"
+            c["content_credentials"] = {"attached": False, "verified": False, "reason": reason}
+            continue
+        status = _stdout_field(out, "verification_status")
+        verified_flag = _stdout_field(out, "verified") == "true"
+        record = honest_credential_record(status, verified_flag)
+        signed = f.read_bytes() if f.exists() else b""
+        claims_verified = b'"verified":true' in signed or b'"verified": true' in signed
+        if not record.get("attached") or (claims_verified and not record.get("verified")) or (
+                record.get("verified") and not claims_verified):
+            f.write_bytes(original)
+            c["content_credentials"] = {"attached": False, "verified": False, "reason": "receipt did not verify"}
+            continue
+        c["sha256"] = sha256_file(f)
+        c["bytes"] = f.stat().st_size
+        c["content_credentials"] = record
+        say(f"  credentials {c['id']}: {record.get('verification_status')} (verified: {str(record['verified']).lower()})")
+    attached = sum(1 for c in man.get("clips") or [] if (c.get("content_credentials") or {}).get("attached"))
+    verified_n = sum(1 for c in man.get("clips") or [] if (c.get("content_credentials") or {}).get("verified") is True)
+    man["content_credentials"] = {
+        "attached_clips": attached,
+        "verified_clips": verified_n,
+        "note": "verified is true only when the receipt verifier returned VERIFIED. A local receipt stays self_attested.",
+    }
+    mp.write_text(json.dumps(man, indent=2), encoding="utf-8")
+    return man
 
 
 def newest_bundle() -> Path | None:

@@ -2,7 +2,7 @@
 
 QorCap's signed match receipt (`receipt.json`, schema `qor-receipt/v0`) is the source of truth for a result. A shared clip can carry a [C2PA](https://c2pa.org/) manifest that binds that file to the receipt by hash. Anyone can read the manifest with standard Content Credentials tools and, with the match bundle, check that the clip really came from that receipt and that segment.
 
-This is off unless you ask for it. `receipt.json` is not modified. Highlight clips from `qorcap highlights` are a separate path and are not credentialed.
+`qorcap clip export` is off unless you ask for it. `receipt.json` is not modified. Start Match and Finalize Last Match are different: after the receipt is signed they cut highlight clips and then attach credentials. `--no-auto-highlights` opts out. That step does not set `QORCAP_CONTENT_CREDENTIALS`, so `qorcap record` and `clip export` stay default-off.
 
 ## Turn it on
 
@@ -58,6 +58,20 @@ No raw input log, no usernames, no file paths, no device names, no device serial
 
 Nothing is added to `receipt.json`. That file rejects extra fields (`additionalProperties: false`). New data lives in the clip manifest.
 
+## After each match
+
+Start Match (`start-match.ps1`) and Finalize Last Match pass `--auto-highlights`. The order is fixed:
+
+1. Recording stops. A fresh `.qorcap-run/recording.lock` means highlights do not run.
+2. The receipt is signed and verified. That result is what gets submitted.
+3. `qorcap highlights` cuts `highlights/`. The burned-in title stays **SCOREBUG LOCK**.
+4. `qorcap clip sign` signs each clip in place when the receipt verifies (`VERIFIED`, `SELF_ATTESTED`, or `PARTIAL`, and `verify-bundle` is clean).
+5. The submit prompt runs. A highlights or credentials failure does not change its exit, the receipt bytes, or whether it is offered.
+
+`verified: true` on a clip still requires the verifier's own word `VERIFIED`. A local Start Match receipt is `SELF_ATTESTED`, so the clip is signed with `verified: false`. If the receipt does not verify, step 4 leaves the clip bytes alone. `highlights/manifest.json` then says `attached: false`, `verified: false`, and `reason: receipt did not verify`. The picture never says VERIFIED.
+
+`qorcap clip sign` does not read `QORCAP_CONTENT_CREDENTIALS`. The flag that keeps `clip export` byte-identical stays off for the recorder.
+
 ## Honesty rule
 
 `verified: true` is written only when both of these are true:
@@ -72,7 +86,7 @@ Anything else is not upgraded:
 | `VERIFIED` | clean | `verified: true`, status `verified` |
 | `SELF_ATTESTED` | clean | `verified: false`, status `self_attested`. A local QorCap referee is this case. |
 | `PARTIAL` | clean | `verified: false`, status `partial` |
-| `FAIL`, unknown, or bundle errors | | Refused. No credentialed file is written. |
+| `FAIL`, unknown, or bundle errors | | Refused. No credentialed file is written. Highlight clips are still exported, unsigned, with `verified: false`. |
 
 A missing QorTime checkout is also a refusal. Clip export does not download QorTime and does not invent a status. Pass `--qortime DIR` or set `QORTIME` to a checkout that contains `qor_receipt/`. The pin QorCap already uses is `0204e6d8082f8c40ea1fe5e09bf16402aaee3ff2`.
 
@@ -100,7 +114,7 @@ The crate is `c2pa` 0.91.4 with default features off and `rust_native_crypto` on
 - The parent ingredient names the span and its hash. It does not embed the span, and it is not a full C2PA data-hash of those bytes. c2patool reports `ingredient.unknownProvenance` for that ingredient, which is expected: the span was not itself a credentialed asset.
 - The C2PA BMFF hash excludes `ftyp`, `free`, `skip`, `mfra`, and the `uuid` box that holds the manifest. Changing the picture (`mdat` / `moov`) fails the signature. Changing only `ftyp` does not. `clip-verify` does not re-hash the clip's picture against the span, because the cut is a remux or a re-encode. It re-hashes the bundle segments the manifest names.
 - Standard validators do not know what `org.qorcap.match-receipt-v0` means. They can show it. `clip-verify` is what checks it against a bundle.
-- `qorcap highlights` is unchanged and does not get this manifest.
+- Highlight clips keep the SCOREBUG LOCK title. Credentials, when attached, are the C2PA manifest on those files. `qorcap highlights` run by hand does not sign them; Start Match does, after the receipt exists.
 - There is no live signing of the capture as it is recorded. Credentials are attached to a clip cut after the match.
 
 ProofMode (Guardian Project) signs media with C2PA and OpenTimestamps. Truepic, Streamplace, and several cameras sign video or stills the same family of way. What this adds is a game-result receipt: the clip points at one signed match, one clock range, and the hash of the segment it was cut from.

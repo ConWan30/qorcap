@@ -873,6 +873,11 @@ def main(argv=None) -> int:
                     help="do not fetch official challenge nonces (overrides --official-challenges)")
     ap.add_argument("--submit", action="store_true", help="submit for verification at the end without asking")
     ap.add_argument("--no-submit-prompt", action="store_true", help="do not offer 'Submit for Verification' at the end")
+    ap.add_argument("--auto-highlights", action="store_true",
+                    help="after the receipt is signed, cut highlight clips and attach content credentials. "
+                         "Start Match passes this. A failure does not change the receipt or the submission.")
+    ap.add_argument("--no-auto-highlights", action="store_true",
+                    help="do not cut highlight clips after the match (overrides --auto-highlights)")
     a = ap.parse_args(argv)
     if a.no_official_challenges:
         a.official_challenges = False
@@ -1128,12 +1133,37 @@ def main(argv=None) -> int:
                            started_ms=started_ms, qt=qt, qorcap=qorcap, no_open=a.no_open)
     if live is not None:
         say(f"  Official anchors: {live.anchors} (link failures: {live.failures})")
-    if code != 2 and (a.submit or not a.no_submit_prompt) and not a.test_pattern:
-        offer_submit(bundle, a.referee_url, auto=a.submit, ask=ask_with_timeout)
-    return code
+    ff = a.ffmpeg or next((str(c) for c in [HERE.parent / ("ffmpeg.exe" if WIN else "ffmpeg")] if c.exists()), None) or shutil.which("ffmpeg") or "ffmpeg"
+
+    def _highlights():
+        # After sign_and_report only. The recorder has stopped; a fresh marker still skips this.
+        post_match_highlights(bundle, ff, qorcap=qorcap, qortime=qt)
+
+    def _submit():
+        if code != 2 and (a.submit or not a.no_submit_prompt) and not a.test_pattern:
+            offer_submit(bundle, a.referee_url, auto=a.submit, ask=ask_with_timeout)
+
+    return after_receipt(code, auto_highlights=a.auto_highlights and not a.no_auto_highlights,
+                         highlights=_highlights, submit=_submit)
 
 
 SUBMIT_PROMPT_TIMEOUT_S = 600
+
+
+def after_receipt(code: int, *, auto_highlights: bool, highlights, submit) -> int:
+    """Highlights run after the receipt exists. They cannot change ``code`` or skip submission.
+
+    ``highlights`` and ``submit`` are callables. ``submit`` may be a no-op when this match is not offered
+    for upload. A highlights failure is printed and swallowed.
+    """
+    if auto_highlights and highlights is not None:
+        try:
+            highlights()
+        except Exception as e:  # noqa: BLE001
+            say(f"  highlights failed (receipt and submission are unaffected): {e}")
+    if submit is not None:
+        submit()
+    return code
 
 
 def ask_with_timeout(prompt: str, timeout_s: float = SUBMIT_PROMPT_TIMEOUT_S, *, stdin=None, clock=time.monotonic) -> str:
@@ -2217,7 +2247,12 @@ def finalize_main(argv) -> int:
                     help="opt-in: before signing, read the PSN names Madden showed (online games) into the receipt as "
                          "match.observed_handles (on-screen evidence, not account proof)")
     ap.add_argument("--highlights", action="store_true",
-                    help="opt-in: after signing, cut highlight clips around each locked score change (highlights/). The panel title is SCOREBUG LOCK.")
+                    help="after signing, cut highlight clips around each locked score change (highlights/). The panel title is SCOREBUG LOCK.")
+    ap.add_argument("--auto-highlights", action="store_true",
+                    help="same clip step as --highlights, then attach content credentials when the receipt verifies. "
+                         "Start Match and Finalize Last Match pass this.")
+    ap.add_argument("--no-auto-highlights", action="store_true",
+                    help="do not cut highlight clips after signing")
     a = ap.parse_args(argv)
     say("=" * 64)
     say("  QorCap  -  Finalize Match (offline)")
@@ -2236,11 +2271,16 @@ def finalize_main(argv) -> int:
     ff = a.ffmpeg or next((str(c) for c in [HERE.parent / ("ffmpeg.exe" if WIN else "ffmpeg")] if c.exists()), None) or shutil.which("ffmpeg") or "ffmpeg"
     if a.psn_names:
         post_match_psn_names(bundle, ff)
-    rc = finalize(bundle, qt=qt, qorcap=find_qorcap(a.qorcap), ffmpeg=ff,
+    qorcap = find_qorcap(a.qorcap)
+    rc = finalize(bundle, qt=qt, qorcap=qorcap, ffmpeg=ff,
                   key_dir=Path(a.key_dir) if a.key_dir else data_dir() / "keys", no_open=a.no_open, hz=a.hz,
                   recover=a.recover, role=a.role, role_reason=a.role_reason)
-    if a.highlights:
-        post_match_highlights(bundle, ff)
+    if (a.auto_highlights or a.highlights) and not a.no_auto_highlights:
+        # Receipt and rc are already settled. Highlights cannot change either.
+        try:
+            post_match_highlights(bundle, ff, qorcap=qorcap, qortime=qt)
+        except Exception as e:  # noqa: BLE001
+            say(f"  highlights failed (receipt is unaffected): {e}")
     return rc
 
 
@@ -2275,19 +2315,46 @@ def with_observed_handles(bundle: Path, draft: dict) -> dict:
     return dict(draft, match=dict(draft["match"], observed_handles=observed_handles(doc)))
 
 
-def post_match_highlights(bundle: Path, ffmpeg: str) -> None:
-    """Opt-in post-match step. Never raises (a clip problem must not change the finalize result) and never runs while
-    the recorder is still writing the bundle (qorcap_highlights refuses on a fresh recording marker)."""
+def post_match_highlights(bundle: Path, ffmpeg: str, *, qorcap: str | None = None, qortime: Path | None = None) -> None:
+    """After the receipt is signed. Never raises, never runs while a recorder is writing, never rewrites receipt.json.
+
+    Highlight clips are cut either way. Content credentials are attached only when the receipt verifies.
+    A receipt that does not verify leaves the clips unsigned (verified stays false). The panel title stays
+    SCOREBUG LOCK. Submission and the finalize exit code are not this function's to change.
+    """
+    receipt_p = bundle / "receipt.json"
+    before = receipt_p.read_bytes() if receipt_p.exists() else None
     try:
         sys.path.insert(0, str(HERE))
-        from qorcap_highlights import Refuse, make_highlights
+        from qorcap_highlights import Refuse, attach_credentials, make_highlights, recorder_running
+        if recorder_running(bundle):
+            say("  highlights skipped: QorCap is still recording")
+            return
         say("\nCutting highlight clips ...")
         man = make_highlights(bundle, ffmpeg=ffmpeg)
         say(f"  {len(man['clips'])} clip(s) in {bundle / 'highlights'} (manifest.json links each to its lock and the receipt)")
+        if recorder_running(bundle):
+            say("  content credentials skipped: QorCap is still recording")
+            return
+        try:
+            cred = attach_credentials(bundle, bundle / "highlights" / "manifest.json", qorcap=qorcap, qortime=qortime)
+            n = (cred.get("content_credentials") or {}).get("attached_clips", 0)
+            say(f"  content credentials on {n} clip(s). A local receipt is self-attested, not verified.")
+        except Exception as e:  # noqa: BLE001
+            say(f"  content credentials skipped (clips and receipt are unaffected): {e}")
     except Refuse as e:
         say(f"  highlights skipped: {e}")
     except Exception as e:  # noqa: BLE001
         say(f"  highlights failed (receipt is unaffected): {e}")
+    finally:
+        if before is not None:
+            try:
+                now = receipt_p.read_bytes() if receipt_p.exists() else b""
+            except OSError:
+                now = b""
+            if now != before:
+                receipt_p.write_bytes(before)
+                say("  highlights restored receipt.json")
 
 
 def run_main(argv=None) -> int:

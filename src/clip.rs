@@ -189,6 +189,68 @@ pub fn export(req: &ExportRequest) -> Result<ExportDone, ExportError> {
     Ok(ExportDone { out: req.out.clone(), credentials: req.credentials, transcoded, assertion })
 }
 
+/// Sign an existing MP4 in place. Used for a highlight clip that is already cut.
+/// A recorder that is still writing, or a receipt that does not verify, leaves the file untouched.
+pub struct SignExistingRequest {
+    pub bundle: PathBuf,
+    pub clip: PathBuf,
+    pub start_mono_ms: u64,
+    pub end_mono_ms: u64,
+    pub transcoded: bool,
+    pub qortime: Option<PathBuf>,
+    pub python: Option<String>,
+    pub key_dir: Option<PathBuf>,
+}
+
+pub fn sign_existing(req: &SignExistingRequest) -> Result<MatchReceipt, ExportError> {
+    if inputproof::recorder_running(&req.bundle) {
+        return Err(ExportError::Recording(format!(
+            "QorCap is still recording into {}. Content credentials are attached only after the match stops.",
+            req.bundle.display()
+        )));
+    }
+    let plain = std::fs::read(&req.clip).map_err(|e| ExportError::Other(format!("read clip: {e}")))?;
+    let span = load_span(&req.bundle, req.start_mono_ms, req.end_mono_ms).map_err(ExportError::Other)?;
+    let judge = judge_bundle(&req.bundle, req.qortime.as_deref(), req.python.as_deref()).map_err(|e| {
+        if e.starts_with("refusing") {
+            ExportError::Refuse(e)
+        } else {
+            ExportError::Refuse(format!("refusing to attach content credentials: {e}"))
+        }
+    })?;
+    if !span.bundle_ok || judge.chain_head != span.video_chain_head {
+        return Err(ExportError::Refuse("refusing to attach content credentials: the match bundle did not verify".into()));
+    }
+    if !judge.sign || (judge.verified && judge.verification_status != "verified") {
+        return Err(ExportError::Refuse("refusing to attach content credentials: receipt did not verify".into()));
+    }
+    let assertion = receipt_assertion(&span, &judge, req.transcoded).map_err(|e| {
+        if e.starts_with("refusing") { ExportError::Refuse(e) } else { ExportError::Other(e) }
+    })?;
+    if assertion.verified != (assertion.verification_status == "verified") {
+        return Err(ExportError::Refuse("refusing to attach content credentials: verified does not match the receipt".into()));
+    }
+    let dir = req.key_dir.clone().unwrap_or_else(credentials::default_key_dir);
+    let signed = credentials::apply_credentials(&plain, Some(SignRequest {
+        assertion: &assertion,
+        key_dir: &dir,
+        transcoded: req.transcoded,
+    })).map_err(|e| {
+        if e.starts_with("refusing") { ExportError::Refuse(e) } else { ExportError::Other(e) }
+    })?;
+    // Keep the original until the replacement is durable. A failed replace restores it.
+    let backup = req.clip.with_extension("qorcap-bak");
+    std::fs::copy(&req.clip, &backup).map_err(|e| ExportError::Other(format!("backup clip: {e}")))?;
+    let wrote = write_atomic(&req.clip, &signed);
+    if let Err(e) = wrote {
+        let _ = std::fs::copy(&backup, &req.clip);
+        let _ = std::fs::remove_file(&backup);
+        return Err(ExportError::Other(e));
+    }
+    let _ = std::fs::remove_file(&backup);
+    Ok(assertion)
+}
+
 /// Sign `plain` against a bundle, or return it unchanged when `credentials` is false.
 /// Tests use this so a byte-identity check does not depend on two ffmpeg runs.
 pub fn seal_plain(
@@ -1059,6 +1121,89 @@ mod tests {
         assert!(!bytes.windows(credentials::LABEL.len()).any(|w| w == credentials::LABEL.as_bytes()));
         assert!(!bytes.windows(4).any(|w| w == b"c2pa"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sign_existing_refuses_while_recording_and_leaves_the_file() {
+        let dir = temp("sign-rec");
+        let clip = dir.join("clip.mp4");
+        let bytes = include_bytes!("../tests/fixtures/tiny_clip.mp4");
+        std::fs::write(&clip, bytes).unwrap();
+        let marker = dir.join(".qorcap-run");
+        std::fs::create_dir_all(&marker).unwrap();
+        std::fs::write(marker.join("recording.lock"), "1\n").unwrap();
+        let err = sign_existing(&SignExistingRequest {
+            bundle: dir.clone(),
+            clip: clip.clone(),
+            start_mono_ms: 0,
+            end_mono_ms: 1000,
+            transcoded: true,
+            qortime: None,
+            python: None,
+            key_dir: None,
+        }).unwrap_err();
+        assert!(matches!(err, ExportError::Recording(_)), "{err}");
+        assert_eq!(std::fs::read(&clip).unwrap(), bytes);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sign_existing_round_trips_and_a_failed_receipt_stays_unsigned() {
+        let Some(qt) = qortime_dir() else { return };
+        let video = include_bytes!("../tests/fixtures/tiny_clip.mp4");
+        let dir = temp("sign-ok");
+        write_video_bundle(&dir, video, "DEVICE-SENTINEL-9f3a", "GAMERTAG-SENTINEL-9f3a");
+        let minted = mint(&qt, "m-qorcap-clip-1", &dir.join("receipt.json"), false);
+        assert_eq!(minted["status"], "SELF_ATTESTED", "{minted}");
+        std::fs::write(dir.join("referee.pub"), format!("{}\n", minted["pubkey"].as_str().unwrap())).unwrap();
+        let clip = dir.join("highlight.mp4");
+        std::fs::write(&clip, video).unwrap();
+        let key = temp("sign-keys");
+        let assertion = sign_existing(&SignExistingRequest {
+            bundle: dir.clone(),
+            clip: clip.clone(),
+            start_mono_ms: 0,
+            end_mono_ms: 1000,
+            transcoded: true,
+            qortime: Some(qt.clone()),
+            python: None,
+            key_dir: Some(key.clone()),
+        }).unwrap();
+        assert_eq!(assertion.verification_status, "self_attested");
+        assert!(!assertion.verified);
+        let signed = std::fs::read(&clip).unwrap();
+        assert!(signed.windows(credentials::LABEL.len()).any(|w| w == credentials::LABEL.as_bytes()));
+        assert!(!signed.windows(b"\"verified\":true".len()).any(|w| w == b"\"verified\":true"));
+        assert!(!signed.windows(b"\"verified\": true".len()).any(|w| w == b"\"verified\": true"));
+        let report = verify_clip(&clip, Some(&dir), Some(&qt), None).unwrap();
+        assert!(report.pass, "{}", report.text);
+        assert!(report.text.contains("verified: false"), "{}", report.text);
+        assert!(report.text.contains("self_attested"), "{}", report.text);
+
+        let broken = temp("sign-bad");
+        write_video_bundle(&broken, video, "DEVICE-SENTINEL-9f3a", "GAMERTAG-SENTINEL-9f3a");
+        let bad = mint(&qt, "m-qorcap-clip-1", &broken.join("receipt.json"), true);
+        assert_eq!(bad["status"], "FAIL", "{bad}");
+        std::fs::write(broken.join("referee.pub"), format!("{}\n", bad["pubkey"].as_str().unwrap())).unwrap();
+        let plain = broken.join("highlight.mp4");
+        std::fs::write(&plain, video).unwrap();
+        let err = sign_existing(&SignExistingRequest {
+            bundle: broken.clone(),
+            clip: plain.clone(),
+            start_mono_ms: 0,
+            end_mono_ms: 1000,
+            transcoded: true,
+            qortime: Some(qt),
+            python: None,
+            key_dir: Some(key.clone()),
+        }).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("receipt did not verify"), "{msg}");
+        assert_eq!(std::fs::read(&plain).unwrap(), video);
+        assert!(!std::fs::read(&plain).unwrap().windows(credentials::LABEL.len()).any(|w| w == credentials::LABEL.as_bytes()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&broken);
+        let _ = std::fs::remove_dir_all(&key);
     }
 
     fn lying_clip(dir: &Path, key: &Path, video: &[u8]) -> Vec<u8> {
