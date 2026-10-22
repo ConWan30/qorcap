@@ -41,7 +41,13 @@ OFFICIAL_PUB = "a5aa0c9121db2c517284bf1c49eeec199829ca832a2b665f26e872e01192feea
 META_FILES = ("bundle.json", "manifest.jsonl", "checkpoints.jsonl", "countersigned.jsonl", "inputs.jsonl",
               "haptics.jsonl", "input_proof.json", "receipt.json", "receipt.draft.json", "timeline.jsonl",
               "challenges.jsonl", "official_challenges.jsonl", "anchors.jsonl", "referee.pub",
-              "challenge_gates.jsonl", "challenge_results.jsonl", "pairing.json", "device_attest.v0.json")
+              "challenge_gates.jsonl", "challenge_results.jsonl", "pairing.json", "device_attest.v0.json",
+              "score_timeline.json")
+
+
+def upload_names() -> tuple[str, ...]:
+    """Files meta_zip sends when they exist. Same order as contracts/compat.json bundle_files.meta."""
+    return META_FILES
 HERE = Path(__file__).resolve().parent
 CLIENT_VERSION = "0.3.30"
 SUBMIT_TYPE = "qortime-submit/v1"   # = QorTime contracts compat.json submit_auth.request_type
@@ -150,7 +156,7 @@ def load_device(key_path: Path | None):
 def meta_zip(bundle: Path) -> bytes:
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
-        for n in META_FILES:
+        for n in upload_names():
             p = bundle / n
             if p.exists():
                 z.write(p, n)

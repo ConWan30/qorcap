@@ -1,1 +1,1 @@
-ef9d24a0b57e8cf57199c4ccb4d96130a874ca31  (ConWan30/qortime main schema/contracts + schema/receipt.v0.json; re-vendor with: cp ../qortime/schema/contracts/*.json ../qortime/schema/receipt.v0.json contracts/ && (cd contracts && sha256sum *.json > SHA256SUMS))
+f5ad659299f572d15726572cf83880edfc1ad7da  (ConWan30/qortime main after #54 a81f03e and #55 f5ad659. compat.json matches a81f03e: score_timeline.json in the meta list, plus the pairing and score_timeline objects. Runtime verifier pin stays 0204e6d.)

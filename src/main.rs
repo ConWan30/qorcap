@@ -1,6 +1,6 @@
 use clap::Parser;
 use log::{error, info, LevelFilter};
-use qorcap::{api, cli::{Cli, Cmd, DeviceKeyCmd}, engine::Engine, ffmpeg};
+use qorcap::{api, cli::{Cli, Cmd, DeviceKeyCmd, PairCmd}, engine::Engine, ffmpeg};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
@@ -360,6 +360,16 @@ fn main() {
             if yes { rest.push("--yes".to_string()); }
             if let Some(r) = referee { rest.extend(["--referee".to_string(), r]); }
             sidecar("submit", bundle, python, rest, &ff)
+        }
+        Cmd::Pair { bundle, python, referee, action } => {
+            let mut rest = Vec::new();
+            if let Some(b) = bundle { rest.extend(["--bundle".into(), b]); }
+            if let Some(r) = referee { rest.extend(["--referee".into(), r]); }
+            match action {
+                PairCmd::Create => rest.push("create".into()),
+                PairCmd::Join { code } => { rest.push("join".into()); rest.push(code); }
+            }
+            sidecar("pair", None, python, rest, &ff)
         }
         Cmd::Highlights { bundle, python, pre, post, no_burn, check } => {
             // never while recording: the sidecar also refuses on a fresh recording marker, this is the cheap early exit
