@@ -18,6 +18,8 @@ On Windows, `init` opens CNG provider `Microsoft Platform Crypto Provider` with 
 - ECDSA P-256 when `NCryptIsAlgSupported` accepts `ECDSA_P256`.
 - Otherwise RSA-2048 (`Length` set to 2048 before finalize).
 
+`NCryptIsAlgSupported` and `NCryptDeleteKey` are called with flags 0. This provider returns `NTE_BAD_FLAGS` (`0x80090009`) when those two calls are passed `NCRYPT_SILENT_FLAG` (`0x40`), so a silent algorithm check never reaches key creation and a silent delete leaves the key behind. `NCryptOpenStorageProvider`, `NCryptOpenKey`, and `NCryptFinalizeKey` still use the silent flag. If neither algorithm is created, the software-key fallback records each call's HRESULT (`ECDSA_P256: NCryptIsAlgSupported returned 0x80090009; RSA: ...`).
+
 Before finalize, `Export Policy` is set to 0 (no export, plaintext-export, or archiving bits). The private key is not written to a file. A later `init` opens that same key. It does not overwrite it.
 
 If the provider does not open, or key creation fails, `init` falls back to a software key and records the reason in the local key file `device-attest-v0.key.json`. The sidecar's `key_provider` is then `software`. `--software` skips the TPM even when the provider opens. An existing TPM key is left in place.

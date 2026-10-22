@@ -25,6 +25,13 @@ pub const ALG_P256: &str = "ECDSA_P256";
 pub const ALG_RSA: &str = "RSA_2048";
 pub const TPM_KEY_NAME: &str = "QorCap-Device-Attest-v0";
 pub const SIDECAR_NAME: &str = "device_attest.v0.json";
+/// `NCRYPT_SILENT_FLAG`. The Platform Crypto Provider returns `NTE_BAD_FLAGS`
+/// (`0x80090009`) when this is passed to `NCryptIsAlgSupported` or `NCryptDeleteKey`.
+#[cfg_attr(not(windows), allow(dead_code))]
+const NCRYPT_SILENT_FLAG: u32 = 0x40;
+/// Flags for `NCryptIsAlgSupported` and `NCryptDeleteKey`. Not [`NCRYPT_SILENT_FLAG`].
+#[cfg_attr(not(windows), allow(dead_code))]
+const NCRYPT_ALG_AND_DELETE_FLAGS: u32 = 0;
 const SOFTWARE_FILE: &str = "device-attest-v0.p256.pkcs8";
 const KEY_RECORD: &str = "device-attest-v0.key.json";
 
@@ -439,6 +446,18 @@ fn hex64(s: &str) -> Result<(), String> {
     else { Err(format!("chain head is not 64 lowercase hex characters")) }
 }
 
+/// CNG status codes are unsigned. Formatting the `i32` with `{:x}` prints a minus sign.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn hresult(st: i32) -> String { format!("{:#010x}", st as u32) }
+
+/// Fallback text when neither ECDSA P-256 nor RSA-2048 is created. Each attempt keeps the
+/// NCrypt call and its HRESULT (`ECDSA_P256: NCryptIsAlgSupported returned 0x80090009; RSA: ...`).
+#[cfg_attr(not(windows), allow(dead_code))]
+fn tpm_create_failure(attempts: &[(&str, &str)]) -> String {
+    let detail = attempts.iter().map(|(alg, err)| format!("{alg}: {err}")).collect::<Vec<_>>().join("; ");
+    format!("Platform Crypto Provider did not create an ECDSA P-256 or RSA-2048 key. {detail}")
+}
+
 fn is_tpm_provider(name: &str) -> bool {
     name == "platform-crypto" || name == PROVIDER_TPM
 }
@@ -692,7 +711,8 @@ mod tpm_backend {
     use super::*;
     use std::ffi::c_void;
 
-    const SILENT: u32 = 0x40;
+    // Open, finalize, and property reads keep NCRYPT_SILENT_FLAG. Algorithm
+    // checks and key deletion do not: this provider rejects that flag there.
     const NTE_BAD_KEYSET: i32 = 0x8009_0016_u32 as i32;
     const CLAIM_SUBJECT_ONLY: u32 = 0x2;
     const CLAIM_PLATFORM: u32 = 0x0001_0000;
@@ -783,7 +803,7 @@ mod tpm_backend {
     fn open_provider() -> Result<Handle, String> {
         let mut h = 0usize;
         let name = wide(PROVIDER_TPM);
-        let st = unsafe { NCryptOpenStorageProvider(&mut h, name.as_ptr(), SILENT) };
+        let st = unsafe { NCryptOpenStorageProvider(&mut h, name.as_ptr(), NCRYPT_SILENT_FLAG) };
         if st != 0 || h == 0 { return Err(format!("NCryptOpenStorageProvider({PROVIDER_TPM}) returned {st:#010x}")); }
         Ok(Handle(h))
     }
@@ -820,25 +840,36 @@ mod tpm_backend {
     fn open_named(prov: usize) -> Result<Handle, OpenErr> {
         let mut h = 0usize;
         let name = wide(TPM_KEY_NAME);
-        let st = unsafe { NCryptOpenKey(prov, &mut h, name.as_ptr(), 0, SILENT) };
+        let st = unsafe { NCryptOpenKey(prov, &mut h, name.as_ptr(), 0, NCRYPT_SILENT_FLAG) };
         if st == 0 && h != 0 { Ok(Handle(h)) }
         else if st == NTE_BAD_KEYSET { Err(OpenErr::Missing) }
         else { Err(OpenErr::Other(format!("NCryptOpenKey({TPM_KEY_NAME}) returned {st:#010x}"))) }
     }
 
     fn create_new(prov: usize) -> Result<(Handle, String), String> {
-        if alg_ok(prov, "ECDSA_P256") {
-            if let Ok(h) = create_one(prov, "ECDSA_P256", None) { return Ok((h, ALG_P256.into())); }
+        let mut attempts: Vec<(&str, String)> = Vec::new();
+        match create_alg(prov, "ECDSA_P256", None) {
+            Ok(h) => return Ok((h, ALG_P256.into())),
+            Err(e) => attempts.push(("ECDSA_P256", e)),
         }
-        if alg_ok(prov, "RSA") {
-            if let Ok(h) = create_one(prov, "RSA", Some(2048)) { return Ok((h, ALG_RSA.into())); }
+        match create_alg(prov, "RSA", Some(2048)) {
+            Ok(h) => return Ok((h, ALG_RSA.into())),
+            Err(e) => attempts.push(("RSA", e)),
         }
-        Err("Platform Crypto Provider did not create an ECDSA P-256 or RSA-2048 key".into())
+        let refs: Vec<(&str, &str)> = attempts.iter().map(|(alg, err)| (*alg, err.as_str())).collect();
+        Err(tpm_create_failure(&refs))
     }
 
-    fn alg_ok(prov: usize, alg: &str) -> bool {
+    /// `NCryptIsAlgSupported` with flags 0. `NCRYPT_SILENT_FLAG` is `NTE_BAD_FLAGS` on this provider.
+    fn alg_status(prov: usize, alg: &str) -> i32 {
         let w = wide(alg);
-        unsafe { NCryptIsAlgSupported(prov, w.as_ptr(), SILENT) == 0 }
+        unsafe { NCryptIsAlgSupported(prov, w.as_ptr(), NCRYPT_ALG_AND_DELETE_FLAGS) }
+    }
+
+    fn create_alg(prov: usize, alg: &str, bits: Option<u32>) -> Result<Handle, String> {
+        let st = alg_status(prov, alg);
+        if st != 0 { return Err(format!("NCryptIsAlgSupported returned {}", hresult(st))); }
+        create_one(prov, alg, bits)
     }
 
     fn create_one(prov: usize, alg: &str, bits: Option<u32>) -> Result<Handle, String> {
@@ -846,23 +877,31 @@ mod tpm_backend {
         let alg_w = wide(alg);
         let name = wide(TPM_KEY_NAME);
         let st = unsafe { NCryptCreatePersistedKey(prov, &mut raw, alg_w.as_ptr(), name.as_ptr(), 0, 0) };
-        if st != 0 || raw == 0 { return Err(format!("NCryptCreatePersistedKey({alg}) returned {st:#010x}")); }
+        if st != 0 || raw == 0 { return Err(format!("NCryptCreatePersistedKey({alg}) returned {}", hresult(st))); }
         let mut h = Handle(raw);
         if let Some(bits) = bits {
             let st = unsafe { NCryptSetProperty(h.0, wide("Length").as_ptr(), &bits as *const u32 as *const u8, 4, 0) };
-            if st != 0 { delete_key(&mut h); return Err(format!("set Length {bits} returned {st:#010x}")); }
+            if st != 0 { return Err(after_delete(&mut h, format!("set Length {bits} returned {}", hresult(st)))); }
         }
         let policy: u32 = 0;
         let _ = unsafe { NCryptSetProperty(h.0, wide("Export Policy").as_ptr(), &policy as *const u32 as *const u8, 4, 0) };
-        let st = unsafe { NCryptFinalizeKey(h.0, SILENT) };
-        if st != 0 { delete_key(&mut h); return Err(format!("NCryptFinalizeKey returned {st:#010x}")); }
+        let st = unsafe { NCryptFinalizeKey(h.0, NCRYPT_SILENT_FLAG) };
+        if st != 0 { return Err(after_delete(&mut h, format!("NCryptFinalizeKey returned {}", hresult(st)))); }
         Ok(h)
     }
 
-    fn delete_key(h: &mut Handle) {
-        if h.0 == 0 { return; }
-        let st = unsafe { NCryptDeleteKey(h.0, SILENT) };
-        if st == 0 { h.0 = 0; }
+    fn after_delete(h: &mut Handle, err: String) -> String {
+        match delete_key(h) {
+            Some(d) => format!("{err}; {d}"),
+            None => err,
+        }
+    }
+
+    /// `NCryptDeleteKey` with flags 0. Silent delete returns `NTE_BAD_FLAGS` and leaves the key.
+    fn delete_key(h: &mut Handle) -> Option<String> {
+        if h.0 == 0 { return None; }
+        let st = unsafe { NCryptDeleteKey(h.0, NCRYPT_ALG_AND_DELETE_FLAGS) };
+        if st == 0 { h.0 = 0; None } else { Some(format!("NCryptDeleteKey returned {}", hresult(st))) }
     }
 
     fn algorithm_of(key: usize) -> Result<String, String> {
@@ -970,13 +1009,13 @@ mod tpm_backend {
     fn get_bytes(obj: usize, prop: &str) -> Result<Vec<u8>, String> {
         let w = wide(prop);
         let mut needed = 0u32;
-        let st = unsafe { NCryptGetProperty(obj, w.as_ptr(), std::ptr::null_mut(), 0, &mut needed, SILENT) };
+        let st = unsafe { NCryptGetProperty(obj, w.as_ptr(), std::ptr::null_mut(), 0, &mut needed, NCRYPT_SILENT_FLAG) };
         if st != 0 { return Err(format!("NCryptGetProperty({prop}) size returned {st:#010x}")); }
         if needed == 0 { return Ok(vec![]); }
         if needed > 1_000_000 { return Err(format!("{prop} is {needed} bytes")); }
         let mut buf = vec![0u8; needed as usize];
         let mut wrote = 0u32;
-        let st = unsafe { NCryptGetProperty(obj, w.as_ptr(), buf.as_mut_ptr(), needed, &mut wrote, SILENT) };
+        let st = unsafe { NCryptGetProperty(obj, w.as_ptr(), buf.as_mut_ptr(), needed, &mut wrote, NCRYPT_SILENT_FLAG) };
         if st != 0 { return Err(format!("NCryptGetProperty({prop}) returned {st:#010x}")); }
         buf.truncate(wrote as usize);
         Ok(buf)
@@ -1126,6 +1165,42 @@ mod tests {
     }
 
     #[test]
+    fn alg_query_and_key_delete_do_not_pass_the_silent_flag() {
+        assert_eq!(NCRYPT_SILENT_FLAG, 0x40);
+        assert_eq!(NCRYPT_ALG_AND_DELETE_FLAGS, 0);
+        assert_ne!(NCRYPT_ALG_AND_DELETE_FLAGS, NCRYPT_SILENT_FLAG);
+        let src = include_str!("device_attest.rs");
+        let alg = fn_body(src, "fn alg_status");
+        assert!(alg.contains("NCryptIsAlgSupported(prov, w.as_ptr(), NCRYPT_ALG_AND_DELETE_FLAGS)"));
+        assert!(!alg.contains("NCRYPT_SILENT_FLAG"));
+        let del = fn_body(src, "fn delete_key");
+        assert!(del.contains("NCryptDeleteKey(h.0, NCRYPT_ALG_AND_DELETE_FLAGS)"));
+        assert!(!del.contains("NCRYPT_SILENT_FLAG"));
+    }
+
+    fn fn_body<'a>(src: &'a str, name: &str) -> &'a str {
+        let start = src.find(name).unwrap_or_else(|| panic!("missing {name}"));
+        let rest = &src[start + name.len()..];
+        let end = rest.find("\n    fn ").unwrap_or_else(|| panic!("{name} has no following fn"));
+        &rest[..end]
+    }
+
+    #[test]
+    fn tpm_create_failure_keeps_each_algorithm_hresult() {
+        assert_eq!(hresult(0x8009_0009_u32 as i32), "0x80090009");
+        assert_eq!(hresult(0), "0x00000000");
+        let msg = tpm_create_failure(&[
+            ("ECDSA_P256", "NCryptIsAlgSupported returned 0x80090009"),
+            ("RSA", "NCryptCreatePersistedKey(RSA) returned 0x80090020"),
+        ]);
+        assert_eq!(
+            msg,
+            "Platform Crypto Provider did not create an ECDSA P-256 or RSA-2048 key. ECDSA_P256: NCryptIsAlgSupported returned 0x80090009; RSA: NCryptCreatePersistedKey(RSA) returned 0x80090020"
+        );
+        assert!(msg.contains("0x80090009") && msg.contains("ECDSA_P256:") && msg.contains("RSA:"));
+    }
+
+    #[test]
     fn rsa_public_blob_round_trips_through_spki() {
         let mut blob = vec![0u8; 24 + 3 + 256];
         blob[0..4].copy_from_slice(&0x3141_5352u32.to_le_bytes());
@@ -1156,8 +1231,8 @@ mod tests {
             Err(e) => { eprintln!("skip: TPM init failed: {e}"); return; }
         };
         if out.key.key_provider == PROVIDER_SOFTWARE {
-            eprintln!("skip: provider opened but key creation fell back: {}", out.key.fallback.unwrap_or_default());
-            return;
+            let why = out.key.fallback.unwrap_or_else(|| "(no NCrypt status recorded)".into());
+            panic!("provider opened but key creation fell back: {why}");
         }
         assert_eq!(out.key.key_provider, PROVIDER_TPM);
         assert!(out.key.algorithm == ALG_P256 || out.key.algorithm == ALG_RSA);
