@@ -1363,6 +1363,11 @@ def sign_and_report(bundle: Path, draft: dict, cps: list[dict], device, referee,
                         referee_kind=referee_kind)
     (bundle / "receipt.json").write_text(json.dumps(rec, indent=2), encoding="utf-8")
     (bundle / "referee.pub").write_text(referee.pubkey_hex + "\n", encoding="ascii")
+    try:
+        from qorcap_score_timeline import write_score_timeline
+        write_score_timeline(bundle, device, rec)
+    except Exception as e:  # noqa: BLE001
+        say(f"  score timeline sidecar failed (receipt is unaffected): {e}")
 
     env = dict(os.environ, PYTHONPATH=str(qt) + os.pathsep + os.getenv("PYTHONPATH", ""))
     code, out = run_cmd([sys.executable, "-m", "qor_receipt.cli", "verify", str(bundle / "receipt.json"),
