@@ -17,3 +17,4 @@ pub mod haptics;
 pub mod glimpse;
 pub mod credentials;
 pub mod clip;
+pub mod redteam;

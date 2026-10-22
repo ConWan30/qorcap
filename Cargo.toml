@@ -16,6 +16,9 @@ simplelog = "0.12"
 ctrlc = "3"
 sha2 = "0.10"
 libc = "0.2"
+# Red-team receipts are signed the same way QorTime signs: Ed25519 over JCS with the
+# signatures object removed. default-features off so key generation stays on a fixed seed.
+ed25519-dalek = { version = "2.2.0", default-features = false, features = ["alloc", "std", "zeroize", "fast"] }
 # Content Credentials. default-features is off so the vendored OpenSSL backend
 # and the HTTP client (remote manifests, TSA, OCSP) are not compiled.
 # `rust_native_crypto` is pure Rust (p256 / ed25519-dalek) and is what keeps

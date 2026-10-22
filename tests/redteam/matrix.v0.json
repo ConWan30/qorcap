@@ -1,0 +1,792 @@
+{
+  "schema": "qorcap-redteam-matrix/v0",
+  "rules_changed": false,
+  "rule_v2": {
+    "max_latency_ms": 2500,
+    "consistency_ms": 300,
+    "max_window_ms": 120000,
+    "source": "qor_receipt.challenge RULE2_MAX_LATENCY_MS and RULE2_CONSISTENCY_MS; a gap of exactly 300 ms passes"
+  },
+  "layers": [
+    "hash chain",
+    "signature",
+    "challenge rule v2",
+    "humanlike check",
+    "input-video alignment",
+    "schema",
+    "referee-only"
+  ],
+  "rows": [
+    {
+      "id": "honest_control",
+      "attack": "control",
+      "variant": "human inputs, live nonce answers at 1750 ms, USB3.0 Video",
+      "verdict": "pass",
+      "caught_by": [],
+      "weak_layers": [],
+      "blocks_verify_bundle": false,
+      "fail_closed": false,
+      "layers": [
+        {
+          "name": "hash chain",
+          "result": "pass",
+          "detail": "verify-bundle: video bytes, checkpoint links, and input chunks agree"
+        },
+        {
+          "name": "signature",
+          "result": "pass",
+          "detail": "Ed25519 over JCS(receipt without signatures) matches the player and referee keys in the receipt"
+        },
+        {
+          "name": "challenge rule v2",
+          "result": "pass",
+          "detail": "latencies [1750, 1750, 1750] ms inside 0..=2500 and within ±300 of the median"
+        },
+        {
+          "name": "humanlike check",
+          "result": "pass",
+          "detail": "label consistent with human play, score_permille 950"
+        },
+        {
+          "name": "input-video alignment",
+          "result": "pass",
+          "detail": "match_permille 1000 chance_permille 0 offset_ms 200 presses_tested 100"
+        },
+        {
+          "name": "schema",
+          "result": "pass",
+          "detail": "receipt.v0.json accepts this object"
+        },
+        {
+          "name": "referee-only",
+          "result": "pass",
+          "detail": "no referee-only check rejects this row beyond the layers above"
+        }
+      ]
+    },
+    {
+      "id": "replay_stale_no_fresh_nonce",
+      "attack": "pre-recorded video replayed as if live",
+      "variant": "stale frames, no fresh nonce response",
+      "verdict": "caught",
+      "caught_by": [
+        "challenge rule v2"
+      ],
+      "weak_layers": [],
+      "blocks_verify_bundle": false,
+      "fail_closed": true,
+      "layers": [
+        {
+          "name": "hash chain",
+          "result": "pass",
+          "detail": "verify-bundle: video bytes, checkpoint links, and input chunks agree"
+        },
+        {
+          "name": "signature",
+          "result": "pass",
+          "detail": "Ed25519 over JCS(receipt without signatures) matches the player and referee keys in the receipt"
+        },
+        {
+          "name": "challenge rule v2",
+          "result": "fail",
+          "detail": "kickoff: no_pause_press; halftime: no_pause_press; end: no_pause_press"
+        },
+        {
+          "name": "humanlike check",
+          "result": "pass",
+          "detail": "label consistent with human play, score_permille 950"
+        },
+        {
+          "name": "input-video alignment",
+          "result": "pass",
+          "detail": "the replayed pad log still lines up with the replayed picture; the fresh nonce is the check that sees staleness"
+        },
+        {
+          "name": "schema",
+          "result": "pass",
+          "detail": "receipt.v0.json accepts this object"
+        },
+        {
+          "name": "referee-only",
+          "result": "pass",
+          "detail": "the official referee runs this same rule v2; the catch is recorded on the challenge layer"
+        }
+      ]
+    },
+    {
+      "id": "relay_0_5s",
+      "attack": "constant relay delay, video versus pad log",
+      "variant": "0.5 s",
+      "verdict": "weak",
+      "caught_by": [],
+      "weak_layers": [
+        "input-video alignment"
+      ],
+      "blocks_verify_bundle": false,
+      "fail_closed": false,
+      "layers": [
+        {
+          "name": "hash chain",
+          "result": "pass",
+          "detail": "verify-bundle: video bytes, checkpoint links, and input chunks agree"
+        },
+        {
+          "name": "signature",
+          "result": "pass",
+          "detail": "Ed25519 over JCS(receipt without signatures) matches the player and referee keys in the receipt"
+        },
+        {
+          "name": "challenge rule v2",
+          "result": "pass",
+          "detail": "latencies [500, 500, 500] ms inside 0..=2500 and within ±300 of the median"
+        },
+        {
+          "name": "humanlike check",
+          "result": "pass",
+          "detail": "label consistent with human play, score_permille 950"
+        },
+        {
+          "name": "input-video alignment",
+          "result": "weak",
+          "detail": "injected delay 500 ms; match_permille 1000 chance_permille 0 offset_ms 700 presses_tested 100. The ±3 s search keeps the match and records the delay as the offset; nothing rejects the bundle"
+        },
+        {
+          "name": "schema",
+          "result": "pass",
+          "detail": "receipt.v0.json accepts this object"
+        },
+        {
+          "name": "referee-only",
+          "result": "pass",
+          "detail": "no referee-only check rejects this row beyond the layers above"
+        }
+      ],
+      "closure": {
+        "software_can_close": true,
+        "hardware_required": false,
+        "note": "Rule v2 accepts a constant latency of 500 ms (ceiling 2500 ms, and every success within ±300 ms of the median). The aligner reports the same delay as offset_ms and still scores a match; its search is ±3 s so a fixed pipeline delay is calibration, not a failure. Software can close a delay of this size by bounding accepted latency to the band measured on a live capture (recorded pause onsets sit near 1750 ms, spread under 100 ms). This suite does not add that bound. A relay smaller than that honest spread would remain inside the band."
+      }
+    },
+    {
+      "id": "relay_1_0s",
+      "attack": "constant relay delay, video versus pad log",
+      "variant": "1.0 s",
+      "verdict": "weak",
+      "caught_by": [],
+      "weak_layers": [
+        "input-video alignment"
+      ],
+      "blocks_verify_bundle": false,
+      "fail_closed": false,
+      "layers": [
+        {
+          "name": "hash chain",
+          "result": "pass",
+          "detail": "verify-bundle: video bytes, checkpoint links, and input chunks agree"
+        },
+        {
+          "name": "signature",
+          "result": "pass",
+          "detail": "Ed25519 over JCS(receipt without signatures) matches the player and referee keys in the receipt"
+        },
+        {
+          "name": "challenge rule v2",
+          "result": "pass",
+          "detail": "latencies [1000, 1000, 1000] ms inside 0..=2500 and within ±300 of the median"
+        },
+        {
+          "name": "humanlike check",
+          "result": "pass",
+          "detail": "label consistent with human play, score_permille 950"
+        },
+        {
+          "name": "input-video alignment",
+          "result": "weak",
+          "detail": "injected delay 1000 ms; match_permille 990 chance_permille 0 offset_ms 1200 presses_tested 100. The ±3 s search keeps the match and records the delay as the offset; nothing rejects the bundle"
+        },
+        {
+          "name": "schema",
+          "result": "pass",
+          "detail": "receipt.v0.json accepts this object"
+        },
+        {
+          "name": "referee-only",
+          "result": "pass",
+          "detail": "no referee-only check rejects this row beyond the layers above"
+        }
+      ],
+      "closure": {
+        "software_can_close": true,
+        "hardware_required": false,
+        "note": "Rule v2 accepts a constant latency of 1000 ms (ceiling 2500 ms, and every success within ±300 ms of the median). The aligner reports the same delay as offset_ms and still scores a match; its search is ±3 s so a fixed pipeline delay is calibration, not a failure. Software can close a delay of this size by bounding accepted latency to the band measured on a live capture (recorded pause onsets sit near 1750 ms, spread under 100 ms). This suite does not add that bound. A relay smaller than that honest spread would remain inside the band."
+      }
+    },
+    {
+      "id": "relay_1_5s",
+      "attack": "constant relay delay, video versus pad log",
+      "variant": "1.5 s",
+      "verdict": "weak",
+      "caught_by": [],
+      "weak_layers": [
+        "input-video alignment"
+      ],
+      "blocks_verify_bundle": false,
+      "fail_closed": false,
+      "layers": [
+        {
+          "name": "hash chain",
+          "result": "pass",
+          "detail": "verify-bundle: video bytes, checkpoint links, and input chunks agree"
+        },
+        {
+          "name": "signature",
+          "result": "pass",
+          "detail": "Ed25519 over JCS(receipt without signatures) matches the player and referee keys in the receipt"
+        },
+        {
+          "name": "challenge rule v2",
+          "result": "pass",
+          "detail": "latencies [1500, 1500, 1500] ms inside 0..=2500 and within ±300 of the median"
+        },
+        {
+          "name": "humanlike check",
+          "result": "pass",
+          "detail": "label consistent with human play, score_permille 950"
+        },
+        {
+          "name": "input-video alignment",
+          "result": "weak",
+          "detail": "injected delay 1500 ms; match_permille 990 chance_permille 0 offset_ms 1700 presses_tested 100. The ±3 s search keeps the match and records the delay as the offset; nothing rejects the bundle"
+        },
+        {
+          "name": "schema",
+          "result": "pass",
+          "detail": "receipt.v0.json accepts this object"
+        },
+        {
+          "name": "referee-only",
+          "result": "pass",
+          "detail": "no referee-only check rejects this row beyond the layers above"
+        }
+      ],
+      "closure": {
+        "software_can_close": true,
+        "hardware_required": false,
+        "note": "Rule v2 accepts a constant latency of 1500 ms (ceiling 2500 ms, and every success within ±300 ms of the median). The aligner reports the same delay as offset_ms and still scores a match; its search is ±3 s so a fixed pipeline delay is calibration, not a failure. Software can close a delay of this size by bounding accepted latency to the band measured on a live capture (recorded pause onsets sit near 1750 ms, spread under 100 ms). This suite does not add that bound. A relay smaller than that honest spread would remain inside the band."
+      }
+    },
+    {
+      "id": "relay_2_0s",
+      "attack": "constant relay delay, video versus pad log",
+      "variant": "2.0 s",
+      "verdict": "weak",
+      "caught_by": [],
+      "weak_layers": [
+        "input-video alignment"
+      ],
+      "blocks_verify_bundle": false,
+      "fail_closed": false,
+      "layers": [
+        {
+          "name": "hash chain",
+          "result": "pass",
+          "detail": "verify-bundle: video bytes, checkpoint links, and input chunks agree"
+        },
+        {
+          "name": "signature",
+          "result": "pass",
+          "detail": "Ed25519 over JCS(receipt without signatures) matches the player and referee keys in the receipt"
+        },
+        {
+          "name": "challenge rule v2",
+          "result": "pass",
+          "detail": "latencies [2000, 2000, 2000] ms inside 0..=2500 and within ±300 of the median"
+        },
+        {
+          "name": "humanlike check",
+          "result": "pass",
+          "detail": "label consistent with human play, score_permille 950"
+        },
+        {
+          "name": "input-video alignment",
+          "result": "weak",
+          "detail": "injected delay 2000 ms; match_permille 990 chance_permille 167 offset_ms 2200 presses_tested 100. The ±3 s search keeps the match and records the delay as the offset; nothing rejects the bundle"
+        },
+        {
+          "name": "schema",
+          "result": "pass",
+          "detail": "receipt.v0.json accepts this object"
+        },
+        {
+          "name": "referee-only",
+          "result": "pass",
+          "detail": "no referee-only check rejects this row beyond the layers above"
+        }
+      ],
+      "closure": {
+        "software_can_close": true,
+        "hardware_required": false,
+        "note": "Rule v2 accepts a constant latency of 2000 ms (ceiling 2500 ms, and every success within ±300 ms of the median). The aligner reports the same delay as offset_ms and still scores a match; its search is ±3 s so a fixed pipeline delay is calibration, not a failure. Software can close a delay of this size by bounding accepted latency to the band measured on a live capture (recorded pause onsets sit near 1750 ms, spread under 100 ms). This suite does not add that bound. A relay smaller than that honest spread would remain inside the band."
+      }
+    },
+    {
+      "id": "relay_2_4s",
+      "attack": "constant relay delay, video versus pad log",
+      "variant": "2.4 s",
+      "verdict": "weak",
+      "caught_by": [],
+      "weak_layers": [
+        "input-video alignment"
+      ],
+      "blocks_verify_bundle": false,
+      "fail_closed": false,
+      "layers": [
+        {
+          "name": "hash chain",
+          "result": "pass",
+          "detail": "verify-bundle: video bytes, checkpoint links, and input chunks agree"
+        },
+        {
+          "name": "signature",
+          "result": "pass",
+          "detail": "Ed25519 over JCS(receipt without signatures) matches the player and referee keys in the receipt"
+        },
+        {
+          "name": "challenge rule v2",
+          "result": "pass",
+          "detail": "latencies [2400, 2400, 2400] ms inside 0..=2500 and within ±300 of the median"
+        },
+        {
+          "name": "humanlike check",
+          "result": "pass",
+          "detail": "label consistent with human play, score_permille 950"
+        },
+        {
+          "name": "input-video alignment",
+          "result": "weak",
+          "detail": "injected delay 2400 ms; match_permille 990 chance_permille 167 offset_ms 2600 presses_tested 100. The ±3 s search keeps the match and records the delay as the offset; nothing rejects the bundle"
+        },
+        {
+          "name": "schema",
+          "result": "pass",
+          "detail": "receipt.v0.json accepts this object"
+        },
+        {
+          "name": "referee-only",
+          "result": "pass",
+          "detail": "no referee-only check rejects this row beyond the layers above"
+        }
+      ],
+      "closure": {
+        "software_can_close": true,
+        "hardware_required": false,
+        "note": "Rule v2 accepts a constant latency of 2400 ms (ceiling 2500 ms, and every success within ±300 ms of the median). The aligner reports the same delay as offset_ms and still scores a match; its search is ±3 s so a fixed pipeline delay is calibration, not a failure. Software can close a delay of this size by bounding accepted latency to the band measured on a live capture (recorded pause onsets sit near 1750 ms, spread under 100 ms). This suite does not add that bound. A relay smaller than that honest spread would remain inside the band."
+      }
+    },
+    {
+      "id": "relay_3_0s",
+      "attack": "constant relay delay, video versus pad log",
+      "variant": "3.0 s",
+      "verdict": "caught",
+      "caught_by": [
+        "challenge rule v2"
+      ],
+      "weak_layers": [
+        "input-video alignment"
+      ],
+      "blocks_verify_bundle": false,
+      "fail_closed": true,
+      "layers": [
+        {
+          "name": "hash chain",
+          "result": "pass",
+          "detail": "verify-bundle: video bytes, checkpoint links, and input chunks agree"
+        },
+        {
+          "name": "signature",
+          "result": "pass",
+          "detail": "Ed25519 over JCS(receipt without signatures) matches the player and referee keys in the receipt"
+        },
+        {
+          "name": "challenge rule v2",
+          "result": "fail",
+          "detail": "kickoff: video_latency_too_high; halftime: video_latency_too_high; end: video_latency_too_high"
+        },
+        {
+          "name": "humanlike check",
+          "result": "pass",
+          "detail": "label consistent with human play, score_permille 950"
+        },
+        {
+          "name": "input-video alignment",
+          "result": "weak",
+          "detail": "injected delay 3000 ms; match_permille 990 chance_permille 167 offset_ms 3200 presses_tested 100. The ±3 s search keeps the match and records the delay as the offset; nothing rejects the bundle"
+        },
+        {
+          "name": "schema",
+          "result": "pass",
+          "detail": "receipt.v0.json accepts this object"
+        },
+        {
+          "name": "referee-only",
+          "result": "pass",
+          "detail": "no referee-only check rejects this row beyond the layers above"
+        }
+      ]
+    },
+    {
+      "id": "virtual_capture_device",
+      "attack": "fake or virtual capture device identity",
+      "variant": "OBS Virtual Camera written at seal time",
+      "verdict": "missed",
+      "caught_by": [],
+      "weak_layers": [],
+      "blocks_verify_bundle": false,
+      "fail_closed": false,
+      "layers": [
+        {
+          "name": "hash chain",
+          "result": "pass",
+          "detail": "verify-bundle: video bytes, checkpoint links, and input chunks agree"
+        },
+        {
+          "name": "signature",
+          "result": "pass",
+          "detail": "Ed25519 over JCS(receipt without signatures) matches the player and referee keys in the receipt"
+        },
+        {
+          "name": "challenge rule v2",
+          "result": "pass",
+          "detail": "latencies [1750, 1750, 1750] ms inside 0..=2500 and within ±300 of the median"
+        },
+        {
+          "name": "humanlike check",
+          "result": "pass",
+          "detail": "label consistent with human play, score_permille 950"
+        },
+        {
+          "name": "input-video alignment",
+          "result": "pass",
+          "detail": "device identity is a manifest string; press timing is unchanged"
+        },
+        {
+          "name": "schema",
+          "result": "pass",
+          "detail": "receipt.v0.json accepts this object"
+        },
+        {
+          "name": "referee-only",
+          "result": "pass",
+          "detail": "no referee-only check rejects this row beyond the layers above"
+        }
+      ],
+      "closure": {
+        "software_can_close": false,
+        "hardware_required": true,
+        "note": "device and device_id are labels on the manifest line. The hash link is prev, seq, and the segment sha256, and verify-bundle does not read the device fields. An unmodified recorder can refuse a known virtual-camera name when it opens the device. A recorder willing to lie writes any name, and the bundle still verifies. Proving the frames entered through a physical HDMI capture device takes attestation of that device, or a hash of the HDMI stream taken before a PC can substitute a virtual camera."
+      }
+    },
+    {
+      "id": "splice_sealed_segment",
+      "attack": "edited or spliced video segment",
+      "variant": "one segment's bytes flipped after the manifest was sealed",
+      "verdict": "caught",
+      "caught_by": [
+        "hash chain"
+      ],
+      "weak_layers": [],
+      "blocks_verify_bundle": true,
+      "fail_closed": true,
+      "layers": [
+        {
+          "name": "hash chain",
+          "result": "fail",
+          "detail": "segment 3 (video.mp4@288): SHA-256 mismatch (video bytes altered)"
+        },
+        {
+          "name": "signature",
+          "result": "pass",
+          "detail": "Ed25519 over JCS(receipt without signatures) matches the player and referee keys in the receipt"
+        },
+        {
+          "name": "challenge rule v2",
+          "result": "pass",
+          "detail": "latencies [1750, 1750, 1750] ms inside 0..=2500 and within ±300 of the median"
+        },
+        {
+          "name": "humanlike check",
+          "result": "pass",
+          "detail": "label consistent with human play, score_permille 950"
+        },
+        {
+          "name": "input-video alignment",
+          "result": "pass",
+          "detail": "press times are unchanged; the edited bytes are not a decoded picture"
+        },
+        {
+          "name": "schema",
+          "result": "pass",
+          "detail": "receipt.v0.json accepts this object"
+        },
+        {
+          "name": "referee-only",
+          "result": "pass",
+          "detail": "the hash chain already rejects the bytes; the referee re-hashes the same way"
+        }
+      ]
+    },
+    {
+      "id": "splice_rehashed_resigned",
+      "attack": "edited or spliced video segment",
+      "variant": "segment replaced, chain and receipt re-signed with the software key",
+      "verdict": "weak",
+      "caught_by": [],
+      "weak_layers": [
+        "referee-only"
+      ],
+      "blocks_verify_bundle": false,
+      "fail_closed": false,
+      "layers": [
+        {
+          "name": "hash chain",
+          "result": "pass",
+          "detail": "verify-bundle: video bytes, checkpoint links, and input chunks agree"
+        },
+        {
+          "name": "signature",
+          "result": "pass",
+          "detail": "Ed25519 over JCS(receipt without signatures) matches the player and referee keys in the receipt"
+        },
+        {
+          "name": "challenge rule v2",
+          "result": "pass",
+          "detail": "latencies [1750, 1750, 1750] ms inside 0..=2500 and within ±300 of the median"
+        },
+        {
+          "name": "humanlike check",
+          "result": "pass",
+          "detail": "label consistent with human play, score_permille 950"
+        },
+        {
+          "name": "input-video alignment",
+          "result": "pass",
+          "detail": "press times are unchanged; the edited bytes are not a decoded picture"
+        },
+        {
+          "name": "schema",
+          "result": "pass",
+          "detail": "receipt.v0.json accepts this object"
+        },
+        {
+          "name": "referee-only",
+          "result": "weak",
+          "detail": "A fresh submit is hashed against the manifest the submitter just built. The sampled scorebug re-read can miss a splice outside that sample. Weak, and it does not close the row."
+        }
+      ],
+      "closure": {
+        "software_can_close": false,
+        "hardware_required": true,
+        "note": "The sealed-segment row fails the hash chain. This row rebuilds the manifest, the checkpoint chain, and both receipt signatures over the edited bytes, so those checks agree with the new file. The official referee re-hashes the segments it samples and re-reads the scorebug on that sample; a splice outside the sample stays consistent with the new chain (spot-check miss probability is about (1-f)^16 plus the forced tail and challenge segments). A head fixed before the file can be edited is capture-before-PC. A co-signer who already holds the pre-edit head would reject the new signature; a first submit of the rebuilt bundle has no earlier head on record."
+      }
+    },
+    {
+      "id": "turbo_macro",
+      "attack": "turbo or macro input",
+      "variant": "perfectly periodic presses (100 ms CROSS, fixed holds)",
+      "verdict": "caught",
+      "caught_by": [
+        "humanlike check"
+      ],
+      "weak_layers": [],
+      "blocks_verify_bundle": false,
+      "fail_closed": false,
+      "layers": [
+        {
+          "name": "hash chain",
+          "result": "pass",
+          "detail": "verify-bundle: video bytes, checkpoint links, and input chunks agree"
+        },
+        {
+          "name": "signature",
+          "result": "pass",
+          "detail": "Ed25519 over JCS(receipt without signatures) matches the player and referee keys in the receipt"
+        },
+        {
+          "name": "challenge rule v2",
+          "result": "pass",
+          "detail": "latencies [1750, 1750, 1750] ms inside 0..=2500 and within ±300 of the median"
+        },
+        {
+          "name": "humanlike check",
+          "result": "fail",
+          "detail": "label bot-like patterns (macro/turbo/injection suspected), score_permille 50. Advisory: verify-bundle stays OK and input_proof status stays ok"
+        },
+        {
+          "name": "input-video alignment",
+          "result": "pass",
+          "detail": "match_permille 1000 chance_permille 0 offset_ms 200 presses_tested 8"
+        },
+        {
+          "name": "schema",
+          "result": "pass",
+          "detail": "receipt.v0.json accepts this object"
+        },
+        {
+          "name": "referee-only",
+          "result": "pass",
+          "detail": "no referee-only check rejects this row beyond the layers above"
+        }
+      ]
+    },
+    {
+      "id": "second_pad",
+      "attack": "second pad mid-match",
+      "variant": "different serial and descriptor after an unplug",
+      "verdict": "missed",
+      "caught_by": [],
+      "weak_layers": [],
+      "blocks_verify_bundle": false,
+      "fail_closed": false,
+      "layers": [
+        {
+          "name": "hash chain",
+          "result": "pass",
+          "detail": "verify-bundle: video bytes, checkpoint links, and input chunks agree"
+        },
+        {
+          "name": "signature",
+          "result": "pass",
+          "detail": "Ed25519 over JCS(receipt without signatures) matches the player and referee keys in the receipt"
+        },
+        {
+          "name": "challenge rule v2",
+          "result": "pass",
+          "detail": "latencies [1750, 1750, 1750] ms inside 0..=2500 and within ±300 of the median"
+        },
+        {
+          "name": "humanlike check",
+          "result": "pass",
+          "detail": "label consistent with human play, score_permille 950"
+        },
+        {
+          "name": "input-video alignment",
+          "result": "pass",
+          "detail": "status lines in the sealed log: connected DualSense Edge (USB) serial=AAAA1111 path=hid#vid_054c&pid_0df2#1 | unplugged usb disconnect | connected DualSense Edge (USB) serial=BBBB2222 path=hid#vid_054c&pid_0df2#2 descriptor=054c:0df2. Alignment does not read the serial"
+        },
+        {
+          "name": "schema",
+          "result": "pass",
+          "detail": "receipt.v0.json accepts this object"
+        },
+        {
+          "name": "referee-only",
+          "result": "pass",
+          "detail": "no referee-only check rejects this row beyond the layers above"
+        }
+      ],
+      "closure": {
+        "software_can_close": true,
+        "hardware_required": false,
+        "note": "The log holds two connected status lines, serial=AAAA1111 then serial=BBBB2222. verify-bundle re-hashes the chunk and does not compare serials. The Windows reader stores \"DualSense Edge (USB)\" and does not store a serial, so two Edge pads of the same model can look identical. Software can close this by recording the USB serial (or the hidraw id) on each connect and failing the input proof when it changes. That check does not need a new capture device. It is not added here."
+      }
+    },
+    {
+      "id": "receipt_tamper_score",
+      "attack": "receipt field tampering",
+      "variant": "result.home_score changed after signing",
+      "verdict": "caught",
+      "caught_by": [
+        "signature"
+      ],
+      "weak_layers": [],
+      "blocks_verify_bundle": false,
+      "fail_closed": true,
+      "layers": [
+        {
+          "name": "hash chain",
+          "result": "pass",
+          "detail": "verify-bundle: video bytes, checkpoint links, and input chunks agree"
+        },
+        {
+          "name": "signature",
+          "result": "fail",
+          "detail": "player signature: signature error: Verification equation was not satisfied"
+        },
+        {
+          "name": "challenge rule v2",
+          "result": "pass",
+          "detail": "latencies [1750, 1750, 1750] ms inside 0..=2500 and within ±300 of the median"
+        },
+        {
+          "name": "humanlike check",
+          "result": "pass",
+          "detail": "label consistent with human play, score_permille 950"
+        },
+        {
+          "name": "input-video alignment",
+          "result": "pass",
+          "detail": "the video and the pad log are untouched"
+        },
+        {
+          "name": "schema",
+          "result": "pass",
+          "detail": "receipt.v0.json accepts this object"
+        },
+        {
+          "name": "referee-only",
+          "result": "pass",
+          "detail": "no referee-only check rejects this row beyond the layers above"
+        }
+      ]
+    },
+    {
+      "id": "receipt_extra_field",
+      "attack": "receipt extra field",
+      "variant": "top-level device_attest added, then re-signed",
+      "verdict": "caught",
+      "caught_by": [
+        "schema"
+      ],
+      "weak_layers": [],
+      "blocks_verify_bundle": false,
+      "fail_closed": true,
+      "layers": [
+        {
+          "name": "hash chain",
+          "result": "pass",
+          "detail": "verify-bundle: video bytes, checkpoint links, and input chunks agree"
+        },
+        {
+          "name": "signature",
+          "result": "pass",
+          "detail": "Ed25519 over JCS(receipt without signatures) matches the player and referee keys in the receipt"
+        },
+        {
+          "name": "challenge rule v2",
+          "result": "pass",
+          "detail": "latencies [1750, 1750, 1750] ms inside 0..=2500 and within ±300 of the median"
+        },
+        {
+          "name": "humanlike check",
+          "result": "pass",
+          "detail": "label consistent with human play, score_permille 950"
+        },
+        {
+          "name": "input-video alignment",
+          "result": "pass",
+          "detail": "the video and the pad log are untouched"
+        },
+        {
+          "name": "schema",
+          "result": "fail",
+          "detail": "/device_attest: additional property"
+        },
+        {
+          "name": "referee-only",
+          "result": "pass",
+          "detail": "no referee-only check rejects this row beyond the layers above"
+        }
+      ]
+    }
+  ]
+}

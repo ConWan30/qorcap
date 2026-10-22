@@ -462,6 +462,27 @@ fn main() {
                 Err(e) => { eprintln!("error: {e}"); 2 }
             }
         }
+        Cmd::Redteam { out, markdown } => {
+            let json = qorcap::redteam::matrix_pretty();
+            let md = qorcap::redteam::markdown();
+            let mut code = 0;
+            if let Some(p) = &out {
+                match std::fs::write(p, &json) {
+                    Ok(()) => println!("wrote {p}"),
+                    Err(e) => { eprintln!("error: write {p}: {e}"); code = 2; }
+                }
+            }
+            if code == 0 {
+                if let Some(p) = &markdown {
+                    match std::fs::write(p, &md) {
+                        Ok(()) => println!("wrote {p}"),
+                        Err(e) => { eprintln!("error: write {p}: {e}"); code = 2; }
+                    }
+                }
+            }
+            if code == 0 && out.is_none() && markdown.is_none() { println!("{json}"); }
+            code
+        }
         Cmd::InputProof { dir, frames, no_video, force } => {
             let d = std::path::Path::new(&dir);
             if qorcap::inputproof::recorder_running(d) && !force {
