@@ -235,10 +235,10 @@ else (function L(now){if(seen(wcv)&&!document.hidden)wdDraw(now);else lastT=0;re
 $('#copy').addEventListener('click',async e=>{const t=$('#ps').innerText;try{await navigator.clipboard.writeText(t);e.target.textContent='Copied ✓'}catch(_){e.target.textContent='Select & copy'}setTimeout(()=>e.target.textContent='Copy',1600)});
 })();
 /* ---------- version: one source (meta), refreshed from GitHub's latest release ---------- */
-(()=>{const REPO='https://github.com/ConWan30/qorcap';const m=document.querySelector('meta[name="qorcap-version"]');
+(()=>{const REPO='https://github.com/ConWan30/qorcap';const LATEST=REPO+'/releases/latest';const m=document.querySelector('meta[name="qorcap-version"]');
  function apply(v,zip){if(!v)return;document.querySelectorAll('[data-ver]').forEach(e=>e.textContent=v);
   document.querySelectorAll('[data-zipname]').forEach(e=>e.textContent=`qorcap-${v}-windows-x64.zip`);
-  document.querySelectorAll('a[data-zip]').forEach(a=>a.href=zip||`${REPO}/releases/download/${v}/qorcap-${v}-windows-x64.zip`)}
+  document.querySelectorAll('a[data-zip]').forEach(a=>a.href=zip||LATEST)}
  apply(m&&m.content);
  if(window.fetch)fetch('https://api.github.com/repos/ConWan30/qorcap/releases/latest',{headers:{Accept:'application/vnd.github+json'}}).then(r=>r.ok?r.json():null).then(j=>{
   if(!j||!/^v\d+(\.\d+)*$/.test(j.tag_name||''))return;const a=(j.assets||[]).find(x=>/windows-x64\.zip$/.test(x.name));apply(j.tag_name,a&&a.browser_download_url)}).catch(()=>{})})();
