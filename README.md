@@ -81,11 +81,13 @@ See [docs/CONTENT_CREDENTIALS.md](docs/CONTENT_CREDENTIALS.md).
 No card? Double-click **`Test Without Card`**. It plays a test-pattern video and a scripted 20-second game through the same
 record, sign and verify path (`python sidecar/qorcap_match.py --test-pattern`).
 
-**Trust level: self-attested.** No public QorTime referee server exists yet. So the launcher signs as the player with a
+**Trust level: self-attested until submit.** The launcher signs as the player with a
 device key (QorTime `FileKey`, `%LOCALAPPDATA%\QorCap\keys\device.key`, ACL limited to your Windows user, never printed)
 and countersigns every checkpoint live with a **local** referee key (`referee.key`, same protections). It uses QorTime's
 own `checkpoints.countersign`, `receipt.build`, `sign_referee` and `sign_player`. The receipt's computed QorTime tier is
 `single-attested` and `referee.key_kind` is `local-self-attested`, so anyone checking it can see the "referee" is the same PC.
+The public QorTime referee is live at `https://qortime-referee-production.up.railway.app`. `qorcap submit` asks that
+referee to replace the local signature. Until a submission is accepted, the receipt on disk stays `local-self-attested`.
 With no referee challenges or HID motion, `qortime verify` gives **PARTIAL**: signatures, the checkpoint chain and the
 video hashes are all checked, and challenges and motion are listed under "not checked". **FAIL** means something was altered or broken.
 This proves the footage was not edited after it was recorded. It does not prove who was playing, and the PC's owner could
@@ -162,7 +164,7 @@ flowchart LR
 | Segment hash | `sha256` of the exact bytes on disk for segment *n* (seg 0 = `ftyp+moov`, then each `moof+mdat`, ~2 s) |
 | Chain | `head_n = SHA-256(JCS({"prev": head_{n-1}, "seq": n, "sha256": seg_n}))`, `head_-1 = 64×"0"` |
 | `manifest.jsonl` | `{type:"segment", seq, kind, file, offset, bytes, sha256, prev, chain_head, mono_ms, wall_ms, frames, device, device_id}`, plus `reopen` and `clip` rows |
-| Checkpoint | QorTime body `{seq, t_ms, frames_hash, input_hash, prev, hash}` with `hash = SHA-256(JCS(body))`, the same rule as `qor_receipt/checkpoints.py`, chained from 64×"0". `frames_hash = SHA-256(JCS(qorcap))` commits to the attached `qorcap` evidence object: `{trigger, segment_seq, segment_hash, chain_head, score, mono_ms, match_id, role, [nonce], [final]}`. `input_hash = SHA-256(JCS([]))` because QorCap has no HID log. |
+| Checkpoint | QorTime body `{seq, t_ms, frames_hash, input_hash, prev, hash}` with `hash = SHA-256(JCS(body))`, the same rule as `qor_receipt/checkpoints.py`, chained from 64×"0". `frames_hash = SHA-256(JCS(qorcap))` commits to the attached `qorcap` evidence object: `{trigger, segment_seq, segment_hash, chain_head, score, mono_ms, match_id, role, [nonce], [final]}`. `input_hash` is SHA-256(JCS(records)) for a segment that logged a controller, and SHA-256(JCS([])) when that segment has no records (a recording with no pad stays on the empty hash). v0.3.2 read a DualSense Edge over USB. |
 | Triggers | every segment, `score_change`, `clock_state` (clock hits 0:00 / red clock toggles), `challenge`, `final` |
 | Challenge | `POST /challenge {nonce, phase, role, issued_ms, deadline_ms}` stores `pattern_for(nonce)` (a port of QorTime's, tested against Python output), `received_wall_ms`, `received_mono_ms`, `segment_seq_at_receipt`, `chain_head_at_receipt`, and a checkpoint that contains the nonce. With `--stamp`, the nonce and button pattern are **burned into the recorded video**, so footage after that point could not have been recorded before the nonce existed. |
 | Scorebug | `sidecar/qorcap_reader.py` downscales to 640×360 and runs QorTime's **unchanged** `ScorebugReader`, `AgreementWindow` (≥3 agreeing frames over ≥400 ms), `PauseDetector` and `detect_final` (clock 0:00 Q4 with ≥3 reads / ≥5 for the red clock, `scorebug_gone`, `final_screen`). Left score = **away**, right = **home**. |
@@ -536,13 +538,14 @@ device's alternative name, then video-only.
 **Not tested in v0.2.2 on Windows yet:** the full Start Match path on MyTurn after this fix, real ENOSPC recovery, card audio video-only fallback in the wild, OBS close offer, Finalize Last Match on a real long match, DirectShow/`h264_mf` on this build, and the sidecar on live PS5 frames. The `.exe` was cross-compiled on Linux.
 
 ## Stubbed / not done
-- `receipt.draft.json` stays unsigned (see above). `Start Match` writes the signed, self-attested `receipt.json`. Signing by an independent referee needs a QorTime referee server, which does not exist yet.
+- `receipt.draft.json` stays unsigned (see above). `Start Match` writes the signed, self-attested `receipt.json`. The QorTime referee is live at `https://qortime-referee-production.up.railway.app`. `qorcap submit` asks it to replace the local referee signature. An unsubmitted receipt stays `local-self-attested`.
 - A device outage longer than 10 s leaves a checkpoint gap, and `qortime verify` then reports `gap_too_long` (FAIL). This is the intended behaviour: the gap is real.
 - `final_screen`: QorCap ships a Madden 27 end-of-game menu detector (`madden_final_screen`, 0.3.2), calibrated on
   one real match at 360p/720p. It only counts behind QorTime's Q4-low-clock gate. Other games: none.
-- Controller input proof (v0.3.0) is tested with synthetic HID reports and a synthetic video only. It has not
-  yet read a real DualSense on MyTurn (run Input Test.cmd first). The last <2 s of inputs after the final
-  segment are not sealed. The human-likeness weights are hand-set, not trained on real Madden sessions.
+- Controller input proof (v0.3.0) was first tested with synthetic HID reports and a synthetic video. v0.3.2
+  (2026-10-16, Madden 27 14-7) read a real DualSense Edge over USB: alignment 737 vs chance 434 permille on 76
+  still-screen presses. The last <2 s of inputs after the final segment are not sealed. The human-likeness
+  weights are hand-set, not trained on real Madden sessions.
 - Haptic detection (v0.3.1) is tested with synthetic IMU streams only; IMU offsets come from Linux
   `hid-playstation.c` and are not yet checked on a real DualSense / Edge, and thresholds are hand-set.
 - No PR to qortime yet for ingesting bundles.
