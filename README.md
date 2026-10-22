@@ -2,7 +2,7 @@
 
 # QorCap
 
-**Website:** https://conwan30.github.io/qorcap/ · **Download:** [v0.3.28](https://github.com/ConWan30/qorcap/releases/tag/v0.3.28) ([latest release](https://github.com/ConWan30/qorcap/releases/latest))
+**Website:** https://conwan30.github.io/qorcap/ · **Download:** [v0.3.29](https://github.com/ConWan30/qorcap/releases/tag/v0.3.29) ([latest release](https://github.com/ConWan30/qorcap/releases/latest))
 
 A small Windows recorder for a USB HDMI capture card (built for a generic **"USB3.0 Video"** card carrying a PS5),
 made for **[QorTime](https://github.com/ConWan30/qortime)** match receipts. It does two jobs:
@@ -26,7 +26,7 @@ with a local control surface). QorCap copies only that design idea, no code. No 
 
 ## Quickstart: double-click Start Match
 
-1. Download `qorcap-v0.3.28-windows-x64.zip` from the [latest release](https://github.com/ConWan30/qorcap/releases/latest)
+1. Download `qorcap-v0.3.29-windows-x64.zip` from the [latest release](https://github.com/ConWan30/qorcap/releases/latest)
    and unzip it, for example to `C:\QorCap` (right-click the zip, *Extract All*).
 2. Connect PS5 HDMI out to the **USB3.0 Video** card, and the card to a blue USB 3 port. Close OBS or the Camera app.
 3. Double-click **`Start Match`**. On the first run it downloads ffmpeg, installs Python 3.12 through winget if it
@@ -386,7 +386,7 @@ Global: `--port 8788`, `--ffmpeg PATH`, `--log FILE` (default `qorcap.log`, or `
 ## Run on Windows by hand (PowerShell, advanced)
 
 ```powershell
-# 1. unzip qorcap-v0.3.28-windows-x64.zip to C:\QorCap, then:
+# 1. unzip qorcap-v0.3.29-windows-x64.zip to C:\QorCap, then:
 cd C:\QorCap
 Unblock-File .\qorcap.exe, .\get-ffmpeg.ps1
 powershell -ExecutionPolicy Bypass -File .\get-ffmpeg.ps1     # puts ffmpeg.exe next to qorcap.exe
@@ -423,6 +423,8 @@ continues), replay save, challenge stamp visible in the video, score/final event
 written, `verify-bundle` OK, and a single flipped byte reported as FAIL.
 
 **Tested on Windows (v0.2.0–v0.2.1 era, MyTurn, USB3.0 Video):** `--input-format mjpeg` 1280x720@30 with `h264_mf` at 29.7 fps. v0.2.1 fixed audio / auto-format / OBS.
+
+**v0.3.29:** device key, red team, and pad identity. This release collects the changes that landed after v0.3.28. PR #53: manifest and clip paths outside the bundle are refused, the signer keeps only the properties `receipt.v0.json` allows, the Glimpse observer key moves to `QORCAP_HOME/keys` with owner-only creation, the pinned QorTime download refuses zip-slip members, and an unusable OpenRouter cost is booked at the worst-case estimate. PR #54: haptic bursts that look like a grip jolt or hand motion are low-confidence instead of high-confidence; they are not dropped. PR #55: `qorcap redteam` scores synthetic replay, relay, splice, and receipt attacks with the checks that already ship (see [docs/REDTEAM.md](docs/REDTEAM.md)). PR #56: README corrections (a DualSense was read; the QorTime referee is live). PR #57: `qorcap device-key init|status` creates an opt-in TPM-backed (or software fallback) device key and writes the `device_attest.v0.json` sidecar; `receipt.json` gains no fields. PR #58: `qorcap submit` refuses a side-corrected or offline-re-signed receipt before any network call (exit 4, `state: not_submitted`). PR #59: a signed `score_timeline.json` sidecar for two-sided corroboration. PR #60: the controller identity is sealed into `inputs.jsonl` and `input-proof` fails corroboration when the pad changes mid-match. `receipt.v0.json` is unchanged, Glimpse stays observer-only, `QORCAP_GLIMPSE_TD_VETO` stays off, and nothing is written to the controller.
 
 **v0.3.28:** Start Match turns the cheap-tier Glimpse witness on. For a live match, `start-match.ps1` sets `QORCAP_GLIMPSE_FRAME=1` so `GET /frame/scorebug` is served, starts the advisory watcher (detached, minimized, below normal), and sets `QORCAP_GLIMPSE_WITNESS=1`, `QORCAP_GLIMPSE_BURST=1`, and `QORCAP_GLIMPSE_ATTEST=1`. Caps stay at the watcher defaults, $0.50 per game and $10 per week. `--no-glimpse` turns all of it off, including a frame tap that a saved user variable would have left on. `--no-glimpse-witness`, `--no-glimpse-burst`, and `--no-glimpse-attest` each turn one switch off. `QORCAP_GLIMPSE_BURST_RING`, `QORCAP_GLIMPSE_CLIP_AUDIT`, and `QORCAP_GLIMPSE_TD_VETO` are set to `0`; Start Match never turns the touchdown veto on. `qorcap.exe` is unchanged: the record command stays default-off, and a flag-off watcher still writes the same advisory bytes. If `%LOCALAPPDATA%\QorCap\keys\glimpse-observer.key` is missing, Start Match creates it once with `qorcap_glimpse_attest.py --init-key` and keeps recording if that fails. If the OpenRouter key is missing, witness and burst calls are skipped and that line is written to the Start Match window and to `%LOCALAPPDATA%\QorCapGlimpse\start-match.log`; recording is not blocked or slowed. After the receipt is signed, Start Match (and Finalize Last Match) runs the attestation sidecar. The match folder gains no file unless `QORCAP_GLIMPSE_ATTEST_COPY=1`. This release also includes the changes that landed after v0.3.27. PR #48: `--frame-clock` / `QORCAP_FRAME_CLOCK=1` writes `frame_clock.jsonl` on the same monotonic clock as the controller log and uses a stamp for input alignment only when one is present. The flag stays default off. The ffmpeg command, the receipt, and flag-off alignment are unchanged. A pause menu is no longer the final screen: that label needs end-of-game context, and an OPTIONS press that hid the scorebug is held back unless that picture stays up. A real end screen still commits. PR #49: Start Match and Finalize Last Match cut highlight clips after the receipt is signed and attach Content Credentials when the receipt verifies (`--no-auto-highlights` opts out). `verified: true` is written only when QorTime's verifier returns VERIFIED and `qorcap verify-bundle` is clean. A local receipt stays self-attested. `qorcap clip export` stays default-off. A highlights failure does not change the receipt or the submission. PR #51: the cheap-tier witness (unhinted read of frames the reader already locked, own 45 s clock, about $0.08/match), burst (one extra unhinted crop on a disagreement, 8 events, about $0.006/match), and a signed observer attestation ($0, its own key, not a receipt). About $2/week at 25 matches if the quotas fill, under the $10 week cap. See [docs/GLIMPSE_WITNESS.md](docs/GLIMPSE_WITNESS.md).
 
