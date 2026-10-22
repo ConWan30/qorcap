@@ -11,8 +11,12 @@
 //! 3. Each is divided by its rolling baseline (EMA, ~3 s, frozen during events; seeded by a 3 s "hold still"
 //!    calibration). score = max(accel ratio, gyro ratio). An event starts when score >= 8 and ends when it stays
 //!    below 3 for 24 ms. Events shorter than 20 ms are dropped.
-//! 4. A button/trigger change within 30 ms of an event (before, during or after) marks it low-confidence:
-//!    pressing a button jolts the pad too.
+//! 4. Two kinds of non-rumble jolt are marked low-confidence (confidence <= 250), not dropped:
+//!    a button/trigger change within 30 ms (pressing a button jolts the pad), and hand activity that
+//!    does not look like an actuator. Grip shifts show up on the accelerometer while the gyro stays
+//!    near its still-hand floor; swipes and flicks swing the whole pad and the accel RMS jumps past
+//!    fire-haptic levels. Touch-contact bits are not part of this check: the DualSense Edge sessions
+//!    this was tuned on keep `touch_active` false the entire time, including a touchpad-swipe recording.
 //!
 //! This is advisory corroborating evidence, never proof (see docs/HAPTICS.md). All output numbers are integers so
 //! records stay inside QorTime's JCS no-float profile.
@@ -33,6 +37,11 @@ pub const MIN_DUR_US: u64 = 20_000;
 pub const COINCIDE_US: u64 = 30_000;
 pub const BASELINE_TAU_US: f64 = 3_000_000.0;
 pub const LOW_CONF_CAP: u32 = 250;
+/// Peak gyro RMS (raw counts, square-root of windowed energy) below this is an accel jolt, not actuator
+/// vibration. Idle-grip recordings on a DualSense Edge stayed at or under 18; fire haptics sit higher.
+pub const GRIP_GYRO_RMS_MIN: u64 = 22;
+/// Peak accel RMS above this is the shell being moved, not the voice-coil level seen in fire haptics.
+pub const HAND_ACCEL_RMS_MAX: u64 = 450;
 const FLOOR: f64 = 1.0;
 
 #[derive(Clone, Copy, Default)]
@@ -122,7 +131,8 @@ impl Detector {
     pub fn params() -> Value {
         json!({"detector": DETECTOR, "hp_cutoff_hz": HP_CUTOFF_HZ as u64, "band_top_hz": BAND_TOP_HZ as u64, "window_ms": WINDOW_US / 1000,
             "calibration_ms": CALIB_US / 1000, "on_x_baseline": K_ON as u64, "off_x_baseline": K_OFF as u64,
-            "min_duration_ms": MIN_DUR_US / 1000, "button_coincidence_ms": COINCIDE_US / 1000})
+            "min_duration_ms": MIN_DUR_US / 1000, "button_coincidence_ms": COINCIDE_US / 1000,
+            "grip_gyro_rms_min": GRIP_GYRO_RMS_MIN, "hand_accel_rms_max": HAND_ACCEL_RMS_MAX})
     }
 
     fn redesign(&mut self, fs: f64) {
@@ -232,13 +242,18 @@ impl Detector {
         let mut conf = (300.0 + 450.0 * strength + 250.0 * length).round().min(1000.0) as u32;
         let mut flags: Vec<&str> = vec![];
         if near { conf = conf.min(LOW_CONF_CAP); flags.push("button_coincident"); }
+        // Same cap as a button jolt. The burst is still recorded; it is just not treated as convincing rumble.
+        let peak_accel_rms = o.peak_a.sqrt().round().min(u64::MAX as f64) as u64;
+        let peak_gyro_rms = o.peak_g.sqrt().round().min(u64::MAX as f64) as u64;
+        if peak_gyro_rms < GRIP_GYRO_RMS_MIN { conf = conf.min(LOW_CONF_CAP); flags.push("grip_jolt"); }
+        if peak_accel_rms > HAND_ACCEL_RMS_MAX { conf = conf.min(LOW_CONF_CAP); flags.push("hand_motion"); }
         let label = if conf >= 500 { "high" } else { "low" };
         self.live.events += 1;
         if label == "low" { self.live.low_confidence += 1; }
         let peak = o.peak.round().min(u32::MAX as f64) as u32;
         self.live.last = Some((peak, dur_ms));
         json!({"type": "haptic", "t_us": o.t0, "t_mono_ms": o.t0 / 1000, "t_wall_ms": self.wall_anchor_ms + o.t0 / 1000,
-            "duration_ms": dur_ms, "peak": peak, "peak_accel_rms": o.peak_a.sqrt().round() as u64, "peak_gyro_rms": o.peak_g.sqrt().round() as u64,
+            "duration_ms": dur_ms, "peak": peak, "peak_accel_rms": peak_accel_rms, "peak_gyro_rms": peak_gyro_rms,
             "energy": o.energy.round() as u64, "confidence": conf, "confidence_label": label, "flags": flags, "imu_rate_hz": self.fs.round() as u64})
     }
 }
@@ -374,6 +389,31 @@ mod tests {
         assert_eq!(ev[0]["flags"][0], "button_coincident");
         assert_eq!(ev[1]["confidence_label"], "high");
         assert!(ev[1]["flags"].as_array().unwrap().is_empty());
+    }
+    #[test]
+    fn accel_only_burst_is_a_grip_jolt() {
+        // Same shape as a detected rumble burst, but the gyro is quiet: a grip shift, not an actuator.
+        let ev = run(&stream(12.0, |t| {
+            let v = burst(t, 6.0, 0.25, 180.0, 60.0);
+            ([v, 0.4 * v, 0.0], [0.0; 3], 0)
+        }));
+        assert_eq!(ev.len(), 1, "{ev:#?}");
+        assert_eq!(ev[0]["confidence_label"], "low");
+        assert!(ev[0]["confidence"].as_u64().unwrap() <= super::LOW_CONF_CAP as u64);
+        assert!(ev[0]["flags"].as_array().unwrap().iter().any(|f| f == "grip_jolt"), "{ev:#?}");
+        assert!(ev[0]["peak_gyro_rms"].as_u64().unwrap() < super::GRIP_GYRO_RMS_MIN);
+    }
+    #[test]
+    fn violent_burst_is_hand_motion() {
+        // A hard swing of the whole pad: accel RMS far above fire-haptic levels, gyro moving with it.
+        let ev = run(&stream(12.0, |t| {
+            let v = burst(t, 6.0, 0.2, 3000.0, 35.0);
+            ([v, 0.5 * v, 0.0], [0.35 * v, 0.0, 0.0], 0)
+        }));
+        assert_eq!(ev.len(), 1, "{ev:#?}");
+        assert_eq!(ev[0]["confidence_label"], "low");
+        assert!(ev[0]["flags"].as_array().unwrap().iter().any(|f| f == "hand_motion"), "{ev:#?}");
+        assert!(ev[0]["peak_accel_rms"].as_u64().unwrap() > super::HAND_ACCEL_RMS_MAX);
     }
     #[test]
     fn no_imu_means_no_events_and_imu_absent() {

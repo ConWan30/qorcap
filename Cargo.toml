@@ -27,6 +27,10 @@ rcgen = { version = "0.13.2", default-features = false, features = ["pem", "ring
 # Pure-Rust Windows HID backend (no C toolchain needed); used only to read the DualSense over USB.
 hidapi = { version = "2.6", default-features = false, features = ["windows-native"] }
 
+[dev-dependencies]
+# Pure-Rust xz reader for the haptic regression fixtures (tests/fixtures/haptics).
+lzma-rs = "0.3"
+
 [features]
 # Enables the `testpattern` pseudo-device (ffmpeg lavfi testsrc + sine) so the
 # full pipeline can be exercised without a capture card.

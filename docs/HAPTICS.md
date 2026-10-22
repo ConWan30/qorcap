@@ -23,6 +23,12 @@ accelerometer. When the actuators run, the pad shakes, and the IMU picks that up
   events shorter than 20 ms are dropped.
 * Any button press/release or big trigger jump within 30 ms of an event marks it **low confidence**
   (`flags: ["button_coincident"]`, confidence <= 250): pressing buttons jolts the pad too.
+* Hand activity is marked the same way, from the burst itself, because a touchpad swipe or a grip
+  shift often has no button edge. `grip_jolt`: peak gyro RMS stayed under 22 raw counts (an accel
+  jolt; idle-grip recordings topped out at 18). `hand_motion`: peak accel RMS went past 450 (the
+  shell was swung; fire haptics on the same Edge sit lower). The event is kept and capped at
+  confidence 250. Stored touch-contact flags were not usable for this: on the DualSense Edge
+  sessions below, `touch_active` is false for every report, including the touchpad-swipe file.
 
 ## Where it goes in the bundle
 
@@ -58,8 +64,18 @@ not suspicious by itself. Use it only to corroborate other evidence (video, inpu
 6. Press Ctrl+C. The summary shows `[ OK ] IMU readable: N IMU reports at R reports/s` or
    `[WARN] IMU not readable`. Send that output back if anything looks wrong.
 
-## Not verified yet
+## Checked against real Edge recordings
 
-Only synthetic IMU streams are tested. Not yet run on a real DualSense or Edge; thresholds, offsets on the Edge,
-the real USB report rate on Windows, and how strong real rumble looks in raw counts are all assumptions until
-Input Test is run on the laptop.
+Replayed through the live input path (rebuilt USB report 0x01, `InputLog::on_report`), ~1000 reports/s,
+timestamps saved as whole milliseconds (the pad's own sensor timestamp was not in the files):
+
+| Session | What it is | High-confidence events/min before | after |
+|---|---|---:|---:|
+| ES-P2 segment 2 | 150 s play, game fire haptics via Remote Play | 20.8 | 16.8 |
+| ES-P2 segment 1 | 150 s idle grip, notes say no haptics | 3.2 | 0.0 |
+| P2 touchpad swipes | 19.6 s, no game | 42.9 | 3.1 |
+
+Total events are unchanged: hand activity is down-weighted, the same way a button jolt is, not deleted.
+One swipe burst (gyro RMS 36, accel RMS 226) still looks like a fire haptic and stays high-confidence.
+Remote Play haptic timing is not the same as Bluetooth haptics from the PS5, and 1 ms timestamps quantize
+the ~1000 Hz stream. Thresholds are raw counts from this Edge, not a calibrated rad/s².
