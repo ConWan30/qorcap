@@ -693,10 +693,10 @@ def test_observed_handles_go_into_the_signed_receipt(tmp_path):
 
 
 @needs_bin
-def test_finalize_role_correction_resigns_for_the_corrected_side(tmp_path):
+def test_finalize_role_correction_resigns_for_the_corrected_side(tmp_path, capsys):
     """QorCap was left on home but the player was away: finalize --role away records the correction in bundle.json,
     re-signs the checkpoints offline for away (the live countersignatures are bound to home) and never edits the
-    recorded evidence."""
+    recorded evidence. That bundle is not submittable and is not offered for upload."""
     pytest.importorskip("numpy")
     from qor_receipt.receipt import verify_receipt
     env = dict(os.environ, QORCAP_HOME=str(tmp_path / "home"))
@@ -710,7 +710,14 @@ def test_finalize_role_correction_resigns_for_the_corrected_side(tmp_path):
     kw = dict(qt=QT, qorcap=str(_qorcap_bin()), ffmpeg=shutil.which("ffmpeg"), key_dir=tmp_path / "home" / "keys",
               core_factory=_ScriptCore)
     assert qm.finalize(b, role="away", role_reason="on-screen banners show the recorder owner on the away side", **kw) == 0
+    out = capsys.readouterr().out
     meta = json.loads((b / "bundle.json").read_text())
+    assert meta["submittable"] is False
+    assert "NOT SUBMITTABLE" in out
+    assert "Submit for Verification" not in out and "Submit now?" not in out
+    assert qm.offer_submit(b, None, ask=lambda _p: pytest.fail("submit offered")) is None
+    offer = capsys.readouterr().out
+    assert "NOT SUBMITTABLE" in offer and "Submit for Verification" not in offer and "Submit now?" not in offer
     assert meta["role"] == "away" and meta["role_correction"]["from"] == "home" and meta["role_correction"]["to"] == "away"
     assert "away side" in meta["role_correction"]["reason"]
     rec = json.loads((b / "receipt.json").read_text())
@@ -725,8 +732,10 @@ def test_finalize_role_correction_resigns_for_the_corrected_side(tmp_path):
     assert qm.finalize(b, **kw) == 0  # a later plain finalize keeps the corrected side
     meta2 = json.loads((b / "bundle.json").read_text())
     assert meta2["role"] == "away" and meta2["role_correction"]["corrected_ms"] == when
+    assert meta2["submittable"] is False
     assert list(json.loads((b / "receipt.json").read_text())["checkpoints"]) == ["away"]
     assert qm.finalize(b, role="home", **kw) == 0  # back to the recorded side: record removed, live sigs reused
     meta3 = json.loads((b / "bundle.json").read_text())
     assert meta3["role"] == "home" and "role_correction" not in meta3
+    assert meta3.get("submittable") is not False and "submittable" not in meta3
     assert json.loads((b / "receipt.json").read_text())["referee"]["key_kind"] == qm.REFEREE_KIND

@@ -1222,10 +1222,50 @@ def ask_with_timeout(prompt: str, timeout_s: float = SUBMIT_PROMPT_TIMEOUT_S, *,
     return ""
 
 
+def bundle_submittable(bundle: Path) -> bool:
+    """False only when bundle.json records ``submittable: false`` (a side correction).
+
+    qorcap-bundle.v0.json allows extra fields, so the mark lives on bundle.json. A missing file
+    or a bundle that never recorded the field is still offered.
+    """
+    try:
+        meta = json.loads((bundle / "bundle.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return True
+    return not isinstance(meta, dict) or meta.get("submittable") is not False
+
+
+def set_bundle_submittable(bundle: Path, submittable: bool) -> None:
+    """Write or clear ``submittable`` on bundle.json. No rewrite when the file already says that."""
+    p = bundle / "bundle.json"
+    try:
+        meta = json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return
+    if not isinstance(meta, dict):
+        return
+    if submittable:
+        if "submittable" not in meta:
+            return
+        meta.pop("submittable", None)
+    else:
+        if meta.get("submittable") is False:
+            return
+        meta["submittable"] = False
+    p.write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
+
+
 def offer_submit(bundle: Path, referee_url: str | None, *, auto: bool = False, ask=input) -> int | None:
-    """End-of-match 'Submit for Verification' prompt. Uploading needs an explicit yes (or --submit)."""
+    """End-of-match 'Submit for Verification' prompt. Uploading needs an explicit yes (or --submit).
+
+    A side-corrected bundle is not offered: its receipt was re-signed offline, and the live
+    countersignatures still cover the recorded side.
+    """
     from qorcap_submit import OFFICIAL_URL, submit
 
+    if not bundle_submittable(bundle):
+        say("NOT SUBMITTABLE")
+        return None
     say("")
     say("Submit for Verification: send this match to the QorTime official referee. It re-checks everything")
     say("independently (uploads the match files and ~10-20% of the video) and, if every check passes,")
@@ -1311,7 +1351,7 @@ def opt_in_challenge_rule(bundle: Path, rule: int = CHALLENGE_RULE_V2) -> None:
 
 def sign_and_report(bundle: Path, draft: dict, cps: list[dict], device, referee, *, match_id: str, role: str,
                     started_ms: int, qt: Path, qorcap: str, no_open: bool, referee_kind: str = REFEREE_KIND,
-                    note: str | None = None) -> int:
+                    note: str | None = None, submittable: bool = True) -> int:
     """Shared by Start Match and finalize: build + sign receipt.json, run both verifiers, print the summary."""
     opt_in_challenge_rule(bundle)
     draft = fill_challenge_results(bundle, draft)
@@ -1356,7 +1396,8 @@ def sign_and_report(bundle: Path, draft: dict, cps: list[dict], device, referee,
         say(f"  Not checked:  {', '.join(v['partial'][:6])}")
     say("  Trust level:  SELF-ATTESTED. Signed by this PC's device key and a LOCAL referee key. It proves the")
     say("                video was not changed after recording; it does not prove who was playing.")
-    say("                For VERIFIED, use 'Submit for Verification' (QorTime official referee re-checks it).")
+    if submittable:
+        say("                For VERIFIED, use 'Submit for Verification' (QorTime official referee re-checks it).")
     if note:
         say(f"  Offline:      {note}")
     say(f"\n  Folder:       {bundle}")
@@ -2234,24 +2275,34 @@ def finalize(bundle: Path, *, qt: Path, qorcap: str, ffmpeg: str, key_dir: Path,
         say("  The receipt uses the last score read: this is NOT a confirmed final.")
 
     live = read_jsonl(bundle / "countersigned.jsonl")
-    if role != rec_role and live:
+    side_changed = role != rec_role
+    if side_changed and live:
         say(f"  The live countersignatures were signed for side {rec_role}; re-signing the checkpoints for {role} offline.")
-    if live and role == rec_role and len(live) >= len(qcps) and all(a["hash"] == b["hash"] for a, b in zip(live, qcps)):
+        say("  Those live signatures cover the recorded side. This receipt is not sent to the referee.")
+    if live and not side_changed and len(live) >= len(qcps) and all(a["hash"] == b["hash"] for a, b in zip(live, qcps)):
         cps, kind, note = live[:len(qcps)], REFEREE_KIND, "scores read after the fact; checkpoint signatures are the live ones from Start Match."
     else:
+        # Offline re-sign only. Nothing here rebuilds a live countersignature on the recorded side.
         cs = Countersigner(referee, match_id, role)
         cs.ts_of = lambda cp: int(cp["t_ms"])  # stamped with QorCap's recording clock, not observed live
         for c in qcps:
             cs.offer(c)
         cps, kind = cs.signed, REFEREE_KIND_OFFLINE
-        note = (f"the live countersignatures are bound to the recorded side {rec_role}; " if role != rec_role and live
+        note = (f"the live countersignatures are bound to the recorded side {rec_role}; " if side_changed and live
                 else "no live countersignatures; ") + (
                 "the local referee signed QorCap's checkpoints after the fact, "
                 "stamped with QorCap's recording times (referee key_kind local-self-attested-offline).")
+    if side_changed:
+        say("NOT SUBMITTABLE")
     report_recording_audio(bundle, ffmpeg)
     say("\nSigning the receipt ...")
-    return sign_and_report(bundle, draft, cps, device, referee, match_id=match_id, role=role, started_ms=started_ms,
-                           qt=qt, qorcap=qorcap, no_open=no_open, referee_kind=kind, note=note)
+    code = sign_and_report(bundle, draft, cps, device, referee, match_id=match_id, role=role, started_ms=started_ms,
+                           qt=qt, qorcap=qorcap, no_open=no_open, referee_kind=kind, note=note,
+                           submittable=not side_changed)
+    # After sign_and_report: it may rewrite bundle.json (challenge rule). The mark is the last write.
+    # Restoring the recorded side clears it and reuses the live signatures already on disk.
+    set_bundle_submittable(bundle, not side_changed)
+    return code
 
 
 def finalize_main(argv) -> int:
