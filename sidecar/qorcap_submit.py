@@ -43,7 +43,7 @@ META_FILES = ("bundle.json", "manifest.jsonl", "checkpoints.jsonl", "countersign
               "challenges.jsonl", "official_challenges.jsonl", "anchors.jsonl", "referee.pub",
               "challenge_gates.jsonl", "challenge_results.jsonl", "pairing.json", "device_attest.v0.json")
 HERE = Path(__file__).resolve().parent
-CLIENT_VERSION = "0.3.29"
+CLIENT_VERSION = "0.3.30"
 SUBMIT_TYPE = "qortime-submit/v1"   # = QorTime contracts compat.json submit_auth.request_type
 POW_PREFIX = "qortime-pow/v1|"      # = compat.json submit_auth.pow_prefix
 # Same wire value as qorcap_match.REFEREE_KIND_OFFLINE. A receipt carrying it was signed on this PC
