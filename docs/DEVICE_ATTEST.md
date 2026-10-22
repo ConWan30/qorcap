@@ -28,11 +28,18 @@ The software key is a P-256 PKCS#8 file, `device-attest-v0.p256.pkcs8`, in the k
 
 ## Bytes that are signed
 
-The message is 88 bytes. It is the UTF-8 prefix `qorcap-device-attest/v0` followed by one newline (`0x0A`), then the 64 lowercase hex characters of the chain head. There is no newline after the hex.
+The message is 89 bytes. It is the ASCII text
 
-The chain head is the `hash` of the last checkpoint in the only non-empty array under `checkpoints`. That array is `home` or `away`. If both are non-empty, the command stops and does not pick one. This hash is the checkpoint hash (`SHA-256` of the checkpoint body). It is not the video segment `chain_head`.
+```
+qorcap-device-attest/v0
+<64 lowercase hex characters of the final checkpoint hash>
+```
 
-ECDSA P-256 signs SHA-256 of those 88 bytes. The sidecar stores raw `r || s` (64 bytes), standard base64. RSA-2048 signs the same SHA-256 with RSASSA-PKCS1-v1_5. That signature is 256 bytes, standard base64. The public key is a SubjectPublicKeyInfo, DER, standard base64.
+including the newline after the prefix and the newline after the hex. That is the same byte string the QorTime referee verifies.
+
+The final checkpoint hash is `receipt.checkpoints[role][-1].hash`, where `role` is the receipt player (`players[0].role`) when that chain is non-empty. If the receipt has no player role, it is the only non-empty `home` or `away` chain. Both chains and no player role is an error. This hash is the checkpoint hash (`SHA-256` of the checkpoint body). It is not the video segment `chain_head`.
+
+ECDSA P-256 signs SHA-256 of those 89 bytes. The sidecar stores the signature as DER, standard base64. RSA-2048 signs the same SHA-256 with RSASSA-PKCS1-v1_5. That signature is 256 bytes, standard base64. The public key is a SubjectPublicKeyInfo, DER, standard base64, stored as both `public_key_spki_b64` and `public_key_spki_der_b64`.
 
 `key_provider`, `non_exportable`, and the `tpm` object are not part of the signed message. Changing them does not make the signature fail. A verifier that only checks the signature cannot trust those fields.
 
@@ -41,12 +48,13 @@ ECDSA P-256 signs SHA-256 of those 88 bytes. The sidecar stores raw `r || s` (64
 | Field | Meaning |
 |---|---|
 | `schema` | `qorcap-device-attest/v0` |
-| `key_provider` | `Microsoft Platform Crypto Provider` or `software`. A label. Not signed. |
-| `algorithm` | `ECDSA_P256` or `RSA_2048` |
-| `public_key_spki_der_b64` | SPKI DER, standard base64. The signature is checked against this key. |
+| `key_provider` | `platform-crypto` for the Windows TPM key, or `software`. A label. Not signed. The CNG provider that was opened is still `Microsoft Platform Crypto Provider`. |
+| `algorithm` | `ECDSA_P256` or `RSA_2048`. The referee accepts `ECDSA_P256` as `ecdsa-p256-sha256`. It does not verify `RSA_2048`. |
+| `public_key_spki_b64` | SPKI DER, standard base64. The name the referee reads. |
+| `public_key_spki_der_b64` | The same SPKI. |
 | `non_exportable` | See below. `null` if the provider did not report a policy. Not signed. |
 | `chain_head` | The checkpoint hash that was signed. Verification recomputes it from the receipt and requires the two to match. |
-| `signature_b64` | Signature over the 88 bytes above. |
+| `signature_b64` | Signature over the 89 bytes above. P-256 is DER. |
 | `tpm` | Optional. Omitted when the provider returned nothing. |
 
 `tpm.key_attestation_b64` is the blob from `NCryptCreateClaim` when that export exists and the call succeeds. `tpm.key_attestation_claim` is `NCRYPT_CLAIM_PLATFORM` (`0x00010000`) or, if that claim type fails, `NCRYPT_CLAIM_SUBJECT_ONLY` (`0x00000002`). The call is loaded with `GetProcAddress`. A missing export does not stop `init`.
@@ -55,7 +63,7 @@ ECDSA P-256 signs SHA-256 of those 88 bytes. The sidecar stores raw `r || s` (64
 
 ## What this proves
 
-A signature that verifies proves that the private key for `public_key_spki_der_b64` signed that one checkpoint hash.
+A signature that verifies proves that the private key for `public_key_spki_b64` signed that one checkpoint hash.
 
 `non_exportable: true` means that, when the value was read, CNG `Export Policy` had none of `NCRYPT_ALLOW_EXPORT_FLAG` (`0x1`), `NCRYPT_ALLOW_PLAINTEXT_EXPORT_FLAG` (`0x2`), `NCRYPT_ALLOW_ARCHIVING_FLAG` (`0x4`), or `NCRYPT_ALLOW_PLAINTEXT_ARCHIVING_FLAG` (`0x8`). For a software key the field is false.
 

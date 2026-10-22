@@ -33,31 +33,40 @@ const EXPORT_BITS: u32 = 0x1 | 0x2 | 0x4 | 0x8;
 
 pub fn default_key_dir() -> PathBuf { crate::credentials::default_key_dir() }
 
-/// `qorcap-device-attest/v0\n` + 64 lowercase hex characters. 88 bytes, no trailing newline.
+/// ASCII `qorcap-device-attest/v0\n` + 64 lowercase hex + `\n`. 89 bytes.
+/// Same message the QorTime referee verifies (`device_signed_bytes`).
 pub fn signing_bytes(chain_head_hex: &str) -> Result<Vec<u8>, String> {
     hex64(chain_head_hex)?;
-    let mut m = SIGNED_PREFIX.as_bytes().to_vec();
-    m.extend_from_slice(chain_head_hex.as_bytes());
-    Ok(m)
+    Ok(format!("{SIGNED_PREFIX}{chain_head_hex}\n").into_bytes())
 }
 
-/// Last checkpoint `hash` in the only non-empty `checkpoints.home` or `checkpoints.away` array.
+fn last_checkpoint_hash(receipt: &Value, role: &str) -> Option<String> {
+    let arr = receipt.get("checkpoints")?.get(role)?.as_array()?;
+    if arr.is_empty() { return None; }
+    let hash = arr.last()?.get("hash")?.as_str()?;
+    hex64(hash).ok()?;
+    Some(hash.to_string())
+}
+
+/// `receipt.checkpoints[role][-1].hash`. Role is the receipt player when that chain is non-empty.
+/// Otherwise the only non-empty home or away chain. Both chains and no player role is an error.
 pub fn chain_head_of(receipt: &Value) -> Result<String, String> {
-    let cps = receipt.get("checkpoints").and_then(|c| c.as_object())
-        .ok_or("receipt has no checkpoints object")?;
+    let player_role = receipt.get("players").and_then(|p| p.as_array()).and_then(|a| a.first())
+        .and_then(|p| p.get("role")).and_then(|r| r.as_str())
+        .filter(|r| *r == "home" || *r == "away");
+    if let Some(role) = player_role {
+        if let Some(hash) = last_checkpoint_hash(receipt, role) {
+            return Ok(hash);
+        }
+    }
     let mut found = vec![];
     for role in ["home", "away"] {
-        if let Some(arr) = cps.get(role).and_then(|v| v.as_array()) {
-            if !arr.is_empty() { found.push((role, arr)); }
+        if let Some(hash) = last_checkpoint_hash(receipt, role) {
+            found.push((role, hash));
         }
     }
     match found.as_slice() {
-        [(role, arr)] => {
-            let hash = arr.last().and_then(|c| c.get("hash")).and_then(|h| h.as_str())
-                .ok_or_else(|| format!("checkpoints.{role} last entry has no hash"))?;
-            hex64(hash)?;
-            Ok(hash.to_string())
-        }
+        [(_, hash)] => Ok(hash.clone()),
         [] => Err("receipt has no checkpoint chain head (home and away are both empty)".into()),
         _ => Err("receipt has checkpoint chains for both home and away; device attestation signs one chain head and will not choose".into()),
     }
@@ -106,6 +115,8 @@ pub struct Sidecar {
     pub key_provider: String,
     pub algorithm: String,
     pub public_key_spki_der_b64: String,
+    /// Same SPKI as `public_key_spki_der_b64`. The referee reads this name.
+    pub public_key_spki_b64: String,
     pub non_exportable: Option<bool>,
     pub chain_head: String,
     pub signature_b64: String,
@@ -234,10 +245,13 @@ fn write_sidecar(key_dir: &Path, bundle: &Path) -> Result<String, String> {
     let message = signing_bytes(&chain_head)?;
     let key = read_key(key_dir)?;
     let (sig, tpm) = sign_with(&key, key_dir, &message)?;
+    let provider = sidecar_provider(&key);
+    let sig = if key.algorithm == ALG_P256 { p256_signature_der(&sig) } else { sig };
     let side = Sidecar {
         schema: SCHEMA.into(),
-        key_provider: key.key_provider,
-        algorithm: key.algorithm,
+        key_provider: provider,
+        algorithm: key.algorithm.clone(),
+        public_key_spki_b64: key.public_key_spki_der_b64.clone(),
         public_key_spki_der_b64: key.public_key_spki_der_b64,
         non_exportable: key.non_exportable,
         chain_head,
@@ -278,7 +292,12 @@ fn verify_dir(key_dir: &Path, bundle: &Path) -> Result<VerifyReport, String> {
         detail = format!("sidecar chain_head {} does not match the receipt checkpoint hash {expected}", side.chain_head);
     }
     let message = signing_bytes(&side.chain_head)?;
-    let spki = b64_dec(&side.public_key_spki_der_b64)?;
+    if !side.public_key_spki_b64.is_empty() && side.public_key_spki_b64 != side.public_key_spki_der_b64 {
+        ok = false;
+        detail = "public_key_spki_b64 does not match public_key_spki_der_b64".into();
+    }
+    let spki_b64 = if side.public_key_spki_b64.is_empty() { &side.public_key_spki_der_b64 } else { &side.public_key_spki_b64 };
+    let spki = b64_dec(spki_b64)?;
     let sig = b64_dec(&side.signature_b64)?;
     if ok {
         if let Err(e) = verify_sig(&side.algorithm, &spki, &message, &sig) {
@@ -305,14 +324,14 @@ fn verify_dir(key_dir: &Path, bundle: &Path) -> Result<VerifyReport, String> {
 
 fn check_sidecar(s: &Sidecar) -> Result<(), String> {
     if s.schema != SCHEMA { return Err(format!("schema is {}, expected {SCHEMA}", s.schema)); }
-    if s.key_provider != PROVIDER_TPM && s.key_provider != PROVIDER_SOFTWARE {
-        return Err(format!("key_provider {} is not {PROVIDER_TPM} or {PROVIDER_SOFTWARE}", s.key_provider));
+    if !sidecar_provider_ok(&s.key_provider) {
+        return Err(format!("key_provider {} is not platform-crypto, {PROVIDER_TPM}, or {PROVIDER_SOFTWARE}", s.key_provider));
     }
     if s.algorithm != ALG_P256 && s.algorithm != ALG_RSA {
         return Err(format!("algorithm {} is not {ALG_P256} or {ALG_RSA}", s.algorithm));
     }
     hex64(&s.chain_head)?;
-    if s.public_key_spki_der_b64.is_empty() || s.signature_b64.is_empty() {
+    if s.public_key_spki_der_b64.is_empty() || s.public_key_spki_b64.is_empty() || s.signature_b64.is_empty() {
         return Err("public key or signature is empty".into());
     }
     if let Some(t) = &s.tpm {
@@ -335,7 +354,7 @@ fn attest_note(side: &Sidecar, key_dir: &Path, spki: &[u8]) -> (String, Option<b
     if tpm.key_attestation_b64.is_none() && tpm.ek_cert_b64.is_none() {
         return ("absent".into(), None, String::new());
     }
-    if side.key_provider != PROVIDER_TPM {
+    if !is_tpm_provider(&side.key_provider) {
         return ("present_unverified".into(), None, "key_provider is software, so the TPM fields are not treated as proof".into());
     }
     let claim = match &tpm.key_attestation_b64 {
@@ -420,6 +439,52 @@ fn hex64(s: &str) -> Result<(), String> {
     else { Err(format!("chain head is not 64 lowercase hex characters")) }
 }
 
+fn is_tpm_provider(name: &str) -> bool {
+    name == "platform-crypto" || name == PROVIDER_TPM
+}
+
+fn sidecar_provider_ok(name: &str) -> bool {
+    name == PROVIDER_SOFTWARE || is_tpm_provider(name)
+}
+
+/// Sidecar label the referee accepts. The CNG open name stays `PROVIDER_TPM`.
+fn sidecar_provider(key: &KeyRecord) -> String {
+    if key.active == "tpm" || key.key_provider == PROVIDER_TPM { "platform-crypto".into() }
+    else { PROVIDER_SOFTWARE.into() }
+}
+
+/// P-256 signatures on the sidecar are DER, which is what the referee verifies.
+/// `ring` and CNG produce raw `r || s` (64 bytes).
+fn p256_signature_der(sig: &[u8]) -> Vec<u8> {
+    if sig.len() != 64 { return sig.to_vec(); }
+    let r = der_int(&sig[..32]);
+    let s = der_int(&sig[32..]);
+    der_seq(&[&r, &s])
+}
+
+fn p256_signature_raw(sig: &[u8]) -> Result<Vec<u8>, String> {
+    if sig.len() == 64 { return Ok(sig.to_vec()); }
+    let mut d = Der { s: sig, i: 0 };
+    let (tag, body) = d.tlv()?;
+    if tag != 0x30 || d.i != sig.len() { return Err("P-256 signature is not a DER SEQUENCE".into()); }
+    let mut d = Der { s: body, i: 0 };
+    let (t1, r) = d.tlv()?;
+    let (t2, s) = d.tlv()?;
+    if t1 != 0x02 || t2 != 0x02 || d.i != body.len() { return Err("P-256 signature is not two INTEGERs".into()); }
+    let mut raw = vec![0u8; 64];
+    raw[..32].copy_from_slice(&int32(r)?);
+    raw[32..].copy_from_slice(&int32(s)?);
+    Ok(raw)
+}
+
+fn int32(v: &[u8]) -> Result<[u8; 32], String> {
+    let v = if v.len() > 1 && v.first() == Some(&0) { &v[1..] } else { v };
+    if v.is_empty() || v.len() > 32 { return Err("ECDSA integer is not 1 to 32 bytes".into()); }
+    let mut o = [0u8; 32];
+    o[32 - v.len()..].copy_from_slice(v);
+    Ok(o)
+}
+
 fn generate_p256() -> Result<(Vec<u8>, Vec<u8>), String> {
     let rng = ::ring::rand::SystemRandom::new();
     let doc = ::ring::signature::EcdsaKeyPair::generate_pkcs8(&::ring::signature::ECDSA_P256_SHA256_FIXED_SIGNING, &rng)
@@ -446,8 +511,9 @@ fn sign_p256(pkcs8: &[u8], message: &[u8]) -> Result<Vec<u8>, String> {
 fn verify_sig(alg: &str, spki: &[u8], message: &[u8], sig: &[u8]) -> Result<(), String> {
     match (alg, parse_spki(spki)?) {
         (ALG_P256, Inner::P256(point)) => {
+            let raw = p256_signature_raw(sig)?;
             let key = ::ring::signature::UnparsedPublicKey::new(&::ring::signature::ECDSA_P256_SHA256_FIXED, &point);
-            key.verify(message, sig).map_err(|_| "ECDSA P-256 signature did not verify".to_string())
+            key.verify(message, &raw).map_err(|_| "ECDSA P-256 signature did not verify".to_string())
         }
         (ALG_RSA, Inner::Rsa(pkcs1)) => {
             let n = rsa_modulus_octets(&pkcs1)?;
@@ -590,7 +656,6 @@ fn der_seq(parts: &[&[u8]]) -> Vec<u8> {
     for p in parts { body.extend_from_slice(p); }
     der_tlv(0x30, &body)
 }
-#[cfg(any(windows, test))]
 fn der_int(bytes: &[u8]) -> Vec<u8> {
     let mut v = bytes;
     while v.len() > 1 && v[0] == 0 { v = &v[1..]; }
@@ -966,12 +1031,19 @@ mod tests {
     fn head() -> String { "ab".repeat(32) }
 
     #[test]
-    fn signed_message_is_prefix_plus_chain_head() {
+    fn signed_message_is_prefix_plus_chain_head_and_a_trailing_newline() {
         let m = signing_bytes(&head()).unwrap();
-        assert_eq!(m.len(), 88);
-        assert!(m.starts_with(SIGNED_PREFIX.as_bytes()));
-        assert_eq!(&m[SIGNED_PREFIX.len()..], head().as_bytes());
+        assert_eq!(m, format!("qorcap-device-attest/v0\n{}\n", head()).into_bytes());
+        assert_eq!(m.len(), 89);
+        assert_eq!(*m.last().unwrap(), b'\n');
         assert!(signing_bytes(&"AB".repeat(32)).is_err());
+    }
+
+    #[test]
+    fn chain_head_follows_the_player_role_when_both_chains_exist() {
+        let both = json!({"players": [{"role": "away"}], "checkpoints": {
+            "home": [{"hash": head()}], "away": [{"hash": "cd".repeat(32)}]}});
+        assert_eq!(chain_head_of(&both).unwrap(), "cd".repeat(32));
     }
 
     #[test]
@@ -1023,6 +1095,11 @@ mod tests {
         let _ = mode;
         let report = verify_dir(&keys, &bundle).unwrap();
         assert!(report.signature_ok, "{}", report.detail);
+        let parsed_ok: Sidecar = serde_json::from_str(&side).unwrap();
+        assert_eq!(parsed_ok.public_key_spki_b64, parsed_ok.public_key_spki_der_b64);
+        let sig_bytes = b64_dec(&parsed_ok.signature_b64).unwrap();
+        assert_eq!(sig_bytes[0], 0x30, "P-256 signature is DER");
+        assert!(sig_bytes.len() > 64);
         assert_eq!(report.tpm_attestation, "absent");
         let mut parsed: Sidecar = serde_json::from_str(&side).unwrap();
         let mut sig = b64_dec(&parsed.signature_b64).unwrap();
