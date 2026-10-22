@@ -3,7 +3,7 @@
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <title>QorCap — signal to seal</title>
 <meta name="description" content="QorCap is a lean Windows capture-card recorder for QorTime. Every ~2 s segment is SHA-256 hash-chained and checkpointed, and a finished match can be submitted to the official QorTime referee for an independent verdict.">
-<meta name="qorcap-version" content="v0.3.11">
+<meta name="qorcap-version" content="v0.3.30">
 <meta name="theme-color" content="#04050a"><meta name="color-scheme" content="dark">
 <link rel="icon" href="assets/favicon.svg" type="image/svg+xml"><link rel="icon" href="assets/favicon-32.png" sizes="32x32" type="image/png"><link rel="apple-touch-icon" href="assets/apple-touch-icon.png">
 <meta property="og:title" content="QorCap — signal to seal"><meta property="og:type" content="website"><meta property="og:url" content="https://conwan30.github.io/qorcap/"><meta property="og:image" content="https://conwan30.github.io/qorcap/assets/og-image.png"><meta property="og:image:width" content="1200"><meta property="og:image:height" content="630"><meta property="og:image:alt" content="QorCap — HDMI in. Hash chain out."><meta name="twitter:card" content="summary_large_image"><meta name="twitter:title" content="QorCap — signal to seal"><meta name="twitter:description" content="HDMI in. Hash chain out. Hash-chained capture-card recording for QorTime match receipts."><meta name="twitter:image" content="https://conwan30.github.io/qorcap/assets/og-image.png"><meta property="og:description" content="Hash-chained capture-card recording for QorTime match receipts.">
@@ -112,10 +112,10 @@
   <div class="prof">
    <div><code>madden27_standard</code><span class="pill ok">supported</span></div>
    <div><code>madden27_monday_night</code><span class="pill ok">supported · v0.3.5</span></div>
-   <div><code>Sunday Night</code><span class="pill un">untested</span></div>
-   <div><code>Thursday Night</code><span class="pill un">untested</span></div>
+   <div><code>madden27_sunday_night</code><span class="pill pa">partial</span></div>
+   <div><code>madden27_thursday_night</code><span class="pill ok">supported</span></div>
   </div>
-  <p class="note">Sunday Night and Thursday Night presentations are not verified. They read as <code>layout_unknown</code>, so no score is recorded from them. Other games: none.</p>
+  <p class="note">Thursday Night: supported (real footage). Sunday Night: partial. The live referee loads <code>madden27_thursday_night</code> and <code>madden27_sunday_night</code>. Other games: none.</p>
  </div>
  <div class="clips glass rv">
   <div class="screen" id="screen"><div class="yard"></div><div class="rec">REC · mock match</div><div class="roi"></div>
@@ -152,6 +152,7 @@
   <p class="kicker">06 · Submit for Verification</p>
   <h2>Metadata, then <em>video</em> on request.</h2>
   <p class="lede">A bundle signed only by your laptop is <b>SELF_ATTESTED</b>. To aim for <b>VERIFIED</b>, double-click <code>Submit for Verification</code>, answer <code>y</code> at the end of Start Match, or run <code>qorcap submit</code>. No account is needed: the request is signed with this PC's <b>install key</b>, the same device key that recorded the match.</p>
+  <p class="note">A side-corrected receipt, or an offline re-sign while <code>countersigned.jsonl</code> still exists, is refused before any upload. <code>qorcap submit</code> exits 4 and writes <code>submission.json</code> with state <code>not_submitted</code>.</p>
   <ol class="steps2">
    <li><b>1</b><p>QorCap fetches a single-use nonce, solves a small proof-of-work and signs the request and the bundle's manifest hash with the install key.</p></li>
    <li><b>2</b><p>It uploads the small metadata only: manifest, checkpoints, inputs, receipts. No video yet.</p></li>
@@ -206,6 +207,8 @@ verify.official.txt
   <div class="lim glass rv"><span class="ic">Audio precheck</span><h3>Game audio levels</h3><p>Start Match records 4 s of the card's audio before the match (<code>audio_precheck.json</code>), and Start Match and Finalize measure the recorded audio (<code>audio_check.json</code>). A silent card gets a loud warning with the likely fixes.</p></div>
   <div class="lim glass rv"><span class="ic">Controller input</span><h3>Inputs on the video clock</h3><p>With the DualSense on the PS5 over Bluetooth and USB-plugged into the laptop, QorCap logs its HID reports to <code>inputs.jsonl</code>. Each chunk's hash goes into that segment's checkpoint, so the inputs are part of the chain. <span class="adv">Advisory evidence, not proof</span></p></div>
   <div class="lim glass rv"><span class="ic">Haptics</span><h3>Rumble from the IMU</h3><p>The PS5 sends rumble over Bluetooth, which the laptop can't see, so QorCap watches the pad's gyro and accelerometer for vibration bursts (<code>haptics.jsonl</code>). <span class="adv">Advisory evidence, not proof</span></p></div>
+  <div class="lim glass rv"><span class="ic">Pad identity</span><h3>Sealed on each connect</h3><p>Every connect and reconnect stores the controller's USB serial, or the Windows device instance id, in the sealed <code>inputs.jsonl</code>. If that identity changes mid-match, the local input proof fails controller corroboration. That is the second-pad check. Old logs with no identity are left as they are. The referee does not receive a pad-identity field and does not check the pad.</p></div>
+  <div class="lim glass rv"><span class="ic">Pairing</span><h3>Two recordings, one match</h3><p><code>qorcap pair create</code> asks the referee for a pairing token (<code>POST /v1/pairings</code>) and prints a code. The other player joins with <code>qorcap pair join</code> or Start Match <code>--pair-code</code>. Both write <code>pairing.json</code> beside the receipt, never inside it. Corroboration does not change the verdict.</p></div>
  </div>
  <p class="note rv">The input proof's human-likeness score is a hand-set heuristic, and input-video alignment is reported against a chance baseline. Neither shows who held the controller.</p>
 </div></section>
@@ -317,10 +320,11 @@ verify.official.txt
  <div class="lims">
   <div class="lim glass rv"><span class="ic">Proves</span><h3>Integrity &amp; timing</h3><p>Which exact video bytes, in what order, seen when. With official challenges and anchors, the official referee ties the chain to real time.</p></div>
   <div class="lim glass rv no"><span class="ic">Does not prove</span><h3>Who is playing</h3><p>No proof of player identity. Inputs and haptics show a controller plugged into this laptop was in use, not who held it.</p></div>
-  <div class="lim glass rv no"><span class="ic">No attestation</span><h3>Software keys</h3><p>Install keys are software Ed25519 keys with no hardware attestation. They bind a submission to the recorder and deter floods; they don't prove a genuine device.</p></div>
+  <div class="lim glass rv no"><span class="ic">No attestation</span><h3>Software keys</h3><p>The install key is still a software Ed25519 key, with no hardware attestation. It binds a submission to the recorder and deters floods. <code>qorcap device-key</code> can add an opt-in TPM device key. The referee reports that key only as claimed or unverified, never attested or hardware-verified.</p></div>
   <div class="lim glass rv no"><span class="ic">Sampled</span><h3>Spot-check</h3><p>By default the referee inspects the tail, the challenge windows and 16 random segments. A laptop missing a fraction <i>f</i> of segments passes the random part with probability (1−<i>f</i>)<sup>16</sup>. Unsampled content isn't inspected. <code>--full</code> uploads everything.</p></div>
   <div class="lim glass rv no"><span class="ic">Before hashing</span><h3>Pre-capture edits</h3><p>Footage fabricated or edited before QorCap hashed it, outside anchored windows, isn't detected. The local countersignatures on your PC don't prove liveness.</p></div>
-  <div class="lim glass rv no"><span class="ic">Platform</span><h3>Windows only</h3><p>Windows x64, DirectShow, tuned on one generic "USB3.0 Video" card. Madden 27 only; Sunday Night and Thursday Night scorebugs are untested.</p></div>
+  <div class="lim glass rv no"><span class="ic">Platform</span><h3>Windows only</h3><p>Windows x64, DirectShow, tuned on one generic "USB3.0 Video" card. Madden 27 only. Thursday Night: supported (real footage). Sunday Night: partial.</p></div>
+  <div class="lim glass rv no"><span class="ic">Red team</span><h3>Missed and weak</h3><p><code>qorcap redteam</code> scores the attacks that already ship. A virtual capture device is missed. Relays under about 2.5–3 s, and a splice that is rehashed and re-signed, are weak. The matrix is <a href="REDTEAM.md">docs/REDTEAM.md</a>.</p></div>
   <div class="lim glass rv no"><span class="ic">Advisory</span><h3>Heuristics</h3><p>The human-likeness score and haptic thresholds are hand-set, not trained. The referee re-checks input hashes and counts, but doesn't re-run that model.</p></div>
   <div class="lim glass rv no"><span class="ic">Scope</span><h3>No chain, no token</h3><p>Nothing goes on a blockchain. The "chain" is a SHA-256 hash chain in local files; the referee's transparency log is a hash-chained file it publishes.</p></div>
   <div class="lim glass rv"><span class="ic">This page</span><h3>Simulations, labelled</h3><p>Every live-looking demo here runs in your browser. No stats, no testimonials, no real match data.</p></div>
