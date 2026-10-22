@@ -41,16 +41,13 @@ OFFICIAL_PUB = "a5aa0c9121db2c517284bf1c49eeec199829ca832a2b665f26e872e01192feea
 META_FILES = ("bundle.json", "manifest.jsonl", "checkpoints.jsonl", "countersigned.jsonl", "inputs.jsonl",
               "haptics.jsonl", "input_proof.json", "receipt.json", "receipt.draft.json", "timeline.jsonl",
               "challenges.jsonl", "official_challenges.jsonl", "anchors.jsonl", "referee.pub",
-              "challenge_gates.jsonl", "challenge_results.jsonl", "pairing.json", "device_attest.v0.json")
-# Sidecars that are not in the vendored compat meta list. QorTime owns that list. These are still
-# zipped when the bundle has them. A referee that does not list the name skips it; it does not
-# reject the zip. score_timeline.json is the signed timeline (#59). It is not a receipt field.
-OPTIONAL_META_FILES = ("score_timeline.json",)
+              "challenge_gates.jsonl", "challenge_results.jsonl", "pairing.json", "device_attest.v0.json",
+              "score_timeline.json")
 
 
 def upload_names() -> tuple[str, ...]:
-    """Files meta_zip sends. Registry names first, then optional sidecars. Missing files are skipped."""
-    return META_FILES + OPTIONAL_META_FILES
+    """Files meta_zip sends when they exist. Same order as contracts/compat.json bundle_files.meta."""
+    return META_FILES
 HERE = Path(__file__).resolve().parent
 CLIENT_VERSION = "0.3.30"
 SUBMIT_TYPE = "qortime-submit/v1"   # = QorTime contracts compat.json submit_auth.request_type

@@ -24,12 +24,16 @@ def _token(**over):
     return token
 
 
-def test_upload_names_keep_the_registry_and_add_the_score_timeline():
+def test_upload_names_match_the_vendored_registry():
     compat = json.loads((ROOT / "contracts" / "compat.json").read_text(encoding="utf-8"))
     assert list(qs.META_FILES) == compat["bundle_files"]["meta"]
-    assert qs.upload_names() == qs.META_FILES + ("score_timeline.json",)
-    for name in ("score_timeline.json", "device_attest.v0.json", "pairing.json"):
-        assert name in qs.upload_names()
+    assert qs.upload_names() == qs.META_FILES
+    assert qs.META_FILES[-3:] == ("pairing.json", "device_attest.v0.json", "score_timeline.json")
+    assert compat["pairing"]["type"] == "qortime-pairing/v1"
+    assert compat["pairing"]["file"] == "pairing.json"
+    assert compat["pairing"]["body"].startswith("ignored")
+    assert compat["score_timeline"]["schema"] == "qorcap-score-timeline/v0"
+    assert compat["score_timeline"]["file"] == "score_timeline.json"
 
 
 def test_meta_zip_includes_optional_sidecars_only_when_present(tmp_path):
@@ -54,24 +58,26 @@ def test_meta_zip_includes_optional_sidecars_only_when_present(tmp_path):
 
 def test_pairing_code_round_trips_and_file_does_not_touch_the_receipt(tmp_path):
     token = _token(sig="AB" * 64)
-    code = pair.token_code(token)
+    raw = json.dumps(token, separators=(",", ":")).encode()
+    code = pair.code_for(raw)
     assert code.startswith("qorpair1.")
     assert "\n" not in code
-    assert pair.token_from_code(code)["sig"] == "AB" * 64
-    assert pair.token_from_code(json.dumps(token))["pairing_id"] == token["pairing_id"]
+    assert pair.raw_from_code(code) == raw
+    assert pair.parse_raw(pair.raw_from_code(json.dumps(token)))["pairing_id"] == token["pairing_id"]
 
     bundle = tmp_path / "match"
     bundle.mkdir()
     receipt_bytes = b'{"schema":"qor-receipt/v0","match":{"match_id":"m"}}\n'
     (bundle / "receipt.json").write_bytes(receipt_bytes)
-    path = pair.write_pairing(bundle, token)
+    path = pair.write_pairing(bundle, raw)
     assert path.name == "pairing.json"
+    assert path.read_bytes() == raw
     assert (bundle / "receipt.json").read_bytes() == receipt_bytes
     written = json.loads(path.read_text(encoding="utf-8"))
     assert written["type"] == "qortime-pairing/v1"
     assert written["sig"] == "AB" * 64
     assert "pairing" not in json.loads(receipt_bytes)
-    text = "\n".join(pair.describe(token))
+    text = "\n".join(pair.describe(raw))
     assert "does not change VERIFIED" in text
     assert code in text
 
@@ -115,7 +121,7 @@ def test_join_writes_the_shared_token(tmp_path, capsys):
     (bundle).mkdir()
     receipt = b'{"schema":"qor-receipt/v0"}\n'
     (bundle / "receipt.json").write_bytes(receipt)
-    assert pair.apply_pairing(bundle, create=False, code=pair.token_code(token), base="https://unused") == 0
+    assert pair.apply_pairing(bundle, create=False, code=pair.code_for(json.dumps(token).encode()), base="https://unused") == 0
     assert (bundle / "receipt.json").read_bytes() == receipt
     assert json.loads((bundle / "pairing.json").read_text(encoding="utf-8"))["pairing_id"] == token["pairing_id"]
     capsys.readouterr()

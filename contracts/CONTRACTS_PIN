@@ -1,1 +1,1 @@
-ef9d24a0b57e8cf57199c4ccb4d96130a874ca31  (ConWan30/qortime main schema/contracts + schema/receipt.v0.json; re-vendor with: cp ../qortime/schema/contracts/*.json ../qortime/schema/receipt.v0.json contracts/ && (cd contracts && sha256sum *.json > SHA256SUMS))
+315f649fd731368760775e65c4f176552bea446c  (ConWan30/qortime PR #54 branch cursor/score-timeline-sidecar-2f4b, schema/contracts/compat.json; not merged to qortime main. Runtime verifier pin stays 0204e6d until that PR merges. Re-vendor with: cp the PR file to contracts/compat.json && sha256sum contracts/compat.json)
