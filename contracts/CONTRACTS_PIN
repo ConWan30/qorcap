@@ -1,1 +1,1 @@
-315f649fd731368760775e65c4f176552bea446c  (ConWan30/qortime PR #54 branch cursor/score-timeline-sidecar-2f4b, schema/contracts/compat.json; not merged to qortime main. Runtime verifier pin stays 0204e6d until that PR merges. Re-vendor with: cp the PR file to contracts/compat.json && sha256sum contracts/compat.json)
+f5ad659299f572d15726572cf83880edfc1ad7da  (ConWan30/qortime main after #54 a81f03e and #55 f5ad659. compat.json matches a81f03e: score_timeline.json in the meta list, plus the pairing and score_timeline objects. Runtime verifier pin stays 0204e6d.)
