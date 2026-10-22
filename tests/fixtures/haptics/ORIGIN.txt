@@ -1,0 +1,13 @@
+Excerpts from Con's own QorTroller recordings of a DualSense Edge (USB, report 0x01, about 1000 Hz).
+The pad's sensor timestamp was not saved; host timestamps are whole milliseconds.
+
+  firing_prefix_20s.qhf.xz   first 20 s of es_p2_seg2_firing (2026-07-08). 150 s session, game fire haptics via Remote Play. Notes: continuous fire bursts.
+  idle_grip_prefix_15s.qhf.xz first 15 s of es_p2_seg1_idle_grip (2026-07-08). Notes: idle grip, menu, no haptics.
+  touchpad_swipes.qhf.xz     full 19.6 s of touchpad_swipes_20260405T032414Z (P2, no game). touch_active is false on every report; the swipe is in the IMU.
+
+QHF1 (little-endian), then xz: magic "QHF1", u32 sample count, then for each sample
+u16 milliseconds since the previous sample (the first delta is from 0),
+i16 gyro x/y/z, i16 accel x/y/z (raw counts, not deltas),
+u8 buttons_0, buttons_1, l2, r2.
+Sticks are not stored. The haptic detector does not read them; replay uses stick center 128.
+buttons_2 was not in the source JSON.

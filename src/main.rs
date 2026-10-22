@@ -271,7 +271,10 @@ fn input_test(secs: Option<u64>) -> i32 {
             if let Some(e) = pend {
                 println!("\r{:>8.2}s  HAPTIC  peak={}x dur={}ms energy={} confidence={} ({}){}{}", e["t_us"].as_u64().unwrap_or(0) as f64 / 1e6,
                     e["peak"], e["duration_ms"], e["energy"], e["confidence"], e["confidence_label"].as_str().unwrap_or(""),
-                    if e["flags"].as_array().map(|a| !a.is_empty()).unwrap_or(false) { " [near a button press]" } else { "" }, " ".repeat(20));
+                    match e["flags"].as_array().filter(|a| !a.is_empty()) {
+                        Some(a) => format!(" [{}]", a.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join(",")),
+                        None => String::new(),
+                    }, " ".repeat(12));
             }
             seen_haptic = lv.haptic.events;
         }
@@ -296,7 +299,7 @@ fn input_test(secs: Option<u64>) -> i32 {
             ((hl.imu_rate_hz as f64 * 0.45) as u32).min(qorcap::haptics::BAND_TOP_HZ as u32));
         if hl.imu_rate_hz < 150 { println!("[WARN] IMU rate is low; short or high-pitched vibrations may be missed."); }
         if hl.calibrating { println!("[WARN] Test ended before the 3 s still-baseline finished; run it longer."); }
-        println!("       haptic events: {} ({} low-confidence, near a button press)", hl.events, hl.low_confidence);
+        println!("       haptic events: {} ({} low-confidence: button, grip, or a hard hand motion)", hl.events, hl.low_confidence);
         if hl.events == 0 && !hl.calibrating { println!("       No vibration seen. If the PS5 was rumbling, note it: detection is advisory and varies by game."); }
     } else {
         println!("[WARN] IMU not readable: reports carried no gyro/accelerometer data, so haptic detection is OFF.");
