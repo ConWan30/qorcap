@@ -1,6 +1,6 @@
 use clap::Parser;
 use log::{error, info, LevelFilter};
-use qorcap::{api, cli::{Cli, Cmd}, engine::Engine, ffmpeg};
+use qorcap::{api, cli::{Cli, Cmd, DeviceKeyCmd}, engine::Engine, ffmpeg};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
@@ -494,6 +494,25 @@ fn main() {
             match qorcap::inputproof::apply(d, if no_video { None } else { Some(ff.as_str()) }, frames) {
                 Ok(p) => { println!("{}", serde_json::to_string_pretty(&p).unwrap()); if p["status"] == "ok" { 0 } else { 1 } }
                 Err(e) => { eprintln!("error: {e}"); 2 }
+            }
+        }
+        Cmd::DeviceKey { action } => {
+            let (bundle, software, key_dir, initializing) = match action {
+                DeviceKeyCmd::Init { bundle, software, key_dir } => (bundle, software, key_dir, true),
+                DeviceKeyCmd::Status { bundle, key_dir } => (bundle, false, key_dir, false),
+            };
+            let dir = key_dir.map(std::path::PathBuf::from).unwrap_or_else(qorcap::device_attest::default_key_dir);
+            let bundle = bundle.as_deref().map(std::path::Path::new);
+            if initializing {
+                match qorcap::device_attest::init(&dir, software, bundle) {
+                    Ok(v) => { println!("{}", serde_json::to_string_pretty(&v).unwrap()); 0 }
+                    Err(e) => { eprintln!("error: {e}"); 2 }
+                }
+            } else {
+                match qorcap::device_attest::status(&dir, bundle) {
+                    Ok(v) => { let code = v.exit_code(bundle.is_some()); println!("{}", serde_json::to_string_pretty(&v).unwrap()); code }
+                    Err(e) => { eprintln!("error: {e}"); 2 }
+                }
             }
         }
         Cmd::Record(mut a) => {

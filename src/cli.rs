@@ -173,6 +173,38 @@ pub enum Cmd {
         #[arg(long)]
         markdown: Option<String>,
     },
+    /// Opt-in device signing key. Writes `device_attest.v0.json` beside a receipt.
+    /// Does not modify `receipt.json` and does not write to a controller.
+    #[command(name = "device-key")]
+    DeviceKey {
+        #[command(subcommand)]
+        action: DeviceKeyCmd,
+    },
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum DeviceKeyCmd {
+    /// Create the device key if needed. On Windows, try the TPM first unless --software is set.
+    Init {
+        /// Match bundle folder. Writes device_attest.v0.json next to receipt.json.
+        #[arg(long)]
+        bundle: Option<String>,
+        /// Use a P-256 software key even when the Windows TPM provider opens.
+        #[arg(long)]
+        software: bool,
+        /// Key directory. Default: the QorCap keys directory (`QORCAP_HOME` or `%LOCALAPPDATA%\QorCap\keys`).
+        #[arg(long)]
+        key_dir: Option<String>,
+    },
+    /// Print the device key, and check a bundle's device_attest.v0.json when --bundle is set.
+    Status {
+        /// Match bundle folder containing receipt.json and device_attest.v0.json.
+        #[arg(long)]
+        bundle: Option<String>,
+        /// Key directory. Default: the QorCap keys directory.
+        #[arg(long)]
+        key_dir: Option<String>,
+    },
 }
 
 #[derive(Subcommand, Debug, Clone)]

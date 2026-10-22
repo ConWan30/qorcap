@@ -18,3 +18,4 @@ pub mod glimpse;
 pub mod credentials;
 pub mod clip;
 pub mod redteam;
+pub mod device_attest;

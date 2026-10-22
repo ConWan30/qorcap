@@ -2051,6 +2051,7 @@ dependencies = [
 name = "qorcap"
 version = "0.3.28"
 dependencies = [
+ "base64 0.22.1",
  "c2pa",
  "clap",
  "ctrlc",
@@ -2060,6 +2061,7 @@ dependencies = [
  "log",
  "lzma-rs",
  "rcgen",
+ "ring",
  "serde",
  "serde_json",
  "sha2 0.10.9",

@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "qorcap-device-attest/v0",
+  "title": "QorCap device attestation sidecar",
+  "description": "Sits beside receipt.json. receipt.v0.json rejects unknown fields, so this object is not a receipt field. See docs/DEVICE_ATTEST.md for what each field proves.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "key_provider", "algorithm", "public_key_spki_b64", "public_key_spki_der_b64", "non_exportable", "chain_head", "signature_b64"],
+  "properties": {
+    "schema": {"const": "qorcap-device-attest/v0"},
+    "key_provider": {"enum": ["platform-crypto", "Microsoft Platform Crypto Provider", "software"]},
+    "algorithm": {"enum": ["ECDSA_P256", "RSA_2048"]},
+    "public_key_spki_b64": {"type": "string", "minLength": 1, "description": "SubjectPublicKeyInfo, DER, standard base64. The name the referee reads."},
+    "public_key_spki_der_b64": {"type": "string", "minLength": 1, "description": "Same SPKI as public_key_spki_b64."},
+    "non_exportable": {"type": ["boolean", "null"], "description": "CNG Export Policy at creation, or false for a software key, or null if the provider did not report. Not covered by the signature."},
+    "chain_head": {"type": "string", "pattern": "^[0-9a-f]{64}$", "description": "Checkpoint hash that was signed. Not the video segment chain_head."},
+    "signature_b64": {"type": "string", "minLength": 1, "description": "P-256: DER ECDSA-SHA256. RSA-2048: PKCS#1 v1.5 SHA-256. Standard base64, over the bytes in docs/DEVICE_ATTEST.md."},
+    "tpm": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Present only when the provider returned attestation material. Optional. An unverified blob is not proof.",
+      "properties": {
+        "key_attestation_b64": {"type": "string"},
+        "key_attestation_claim": {"enum": ["NCRYPT_CLAIM_PLATFORM", "NCRYPT_CLAIM_SUBJECT_ONLY"]},
+        "ek_cert_b64": {"type": "string"},
+        "ek_cert_property": {"enum": ["PCP_ECC_EKNVCERT", "PCP_RSA_EKNVCERT", "PCP_EKNVCERT"]},
+        "platform_type": {"type": "string"}
+      }
+    }
+  }
+}
