@@ -1,0 +1,52 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "qorcap-score-timeline/v0",
+  "title": "QorCap signed score timeline sidecar",
+  "description": "signals.score_timeline.events for two-sided corroboration. Not a field of receipt.v0.json.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "signals", "chain", "chain_head", "checkpoint_head", "signature"],
+  "properties": {
+    "schema": {"const": "qorcap-score-timeline/v0"},
+    "signals": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["score_timeline"],
+      "properties": {
+        "score_timeline": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["events"],
+          "properties": {
+            "events": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["t_ms", "home", "away", "quarter"],
+                "properties": {
+                  "t_ms": {"type": "integer", "minimum": 0},
+                  "home": {"type": "integer", "minimum": 0},
+                  "away": {"type": "integer", "minimum": 0},
+                  "quarter": {"type": "integer", "minimum": 1}
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "chain": {"type": "array"},
+    "chain_head": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "checkpoint_head": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "signature": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["pub", "sig"],
+      "properties": {
+        "pub": {"type": "string"},
+        "sig": {"type": "string"}
+      }
+    }
+  }
+}
