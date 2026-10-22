@@ -245,7 +245,7 @@ footer nav{display:flex;gap:18px;flex-wrap:wrap}footer a{color:var(--mute)}foote
 .prof div{display:flex;justify-content:space-between;align-items:center;gap:12px;font:13px var(--mono);border-bottom:1px dashed var(--line);padding-bottom:8px;color:var(--ink)}
 .pill{font:700 10.5px/1 var(--mono);letter-spacing:.1em;text-transform:uppercase;padding:6px 9px;border-radius:999px;white-space:nowrap}
 .pill.ok{color:var(--cy);border:1px solid rgba(46,242,255,.5);background:rgba(46,242,255,.07)}
-.pill.pa{color:var(--gold);border:1px solid rgba(255,194,61,.55);background:rgba(255,194,61,.08)}
+.pill.pa{color:var(--mute);border:1px dashed rgba(151,160,186,.55);background:rgba(151,160,186,.06)}
 .pill.un{color:#ff8c97;border:1px dashed rgba(255,77,94,.5);background:rgba(255,77,94,.05)}
 .ladder{padding:clamp(18px,3vw,30px)}
 .ladder ol{list-style:none;display:grid;gap:10px;margin:18px 0 4px}
