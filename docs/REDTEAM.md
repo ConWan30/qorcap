@@ -4,7 +4,7 @@ Synthetic bundles built from the in-tree fixtures (`humanlike::synth`, the hash 
 
 Run `qorcap redteam` to print the JSON matrix. `qorcap redteam --out tests/redteam/matrix.v0.json --markdown docs/REDTEAM.md` rewrites these two files. `cargo test --test redteam` checks that a fresh run matches both files.
 
-Rule v2 ceiling is 2500 ms. Successful latencies must sit within ±300 ms of their median (a gap of exactly 300 ms passes). `verify-bundle` re-hashes bytes. It does not score human-likeness, alignment, the receipt schema, or rule v2.
+Rule v2 ceiling is 2500 ms. Successful latencies must sit within ±300 ms of their median (a gap of exactly 300 ms passes). `verify-bundle` re-hashes bytes. It does not score human-likeness, alignment, the controller-identity claim, the receipt schema, or rule v2.
 
 ## Matrix
 
@@ -22,11 +22,11 @@ Rule v2 ceiling is 2500 ms. Successful latencies must sit within ±300 ms of the
 | `splice_sealed_segment` | edited or spliced video segment | caught | hash chain | FAIL |
 | `splice_rehashed_resigned` | edited or spliced video segment | weak | — | OK |
 | `turbo_macro` | turbo or macro input | caught | humanlike check | OK |
-| `second_pad` | second pad mid-match | missed | — | OK |
+| `second_pad` | second pad mid-match | caught | input proof | OK |
 | `receipt_tamper_score` | receipt field tampering | caught | signature | OK |
 | `receipt_extra_field` | receipt extra field | caught | schema | OK |
 
-`weak` means a layer reports the attack and still accepts the bundle. `missed` means every layer accepts it. `caught` means a layer rejects it. The human-likeness catch is advisory: the label is bot-like and `verify-bundle` stays OK.
+`weak` means a layer reports the attack and still accepts the bundle. `missed` means every layer accepts it. `caught` means a layer rejects it. The human-likeness catch is advisory: the label is bot-like and `verify-bundle` stays OK. The controller-identity catch fails the input-proof `controller_corroboration` claim; `verify-bundle` stays OK.
 
 ## Missed and weak rows
 
@@ -99,21 +99,13 @@ Closing this takes hardware attestation or capture-before-PC.
 
 - **referee-only** (weak): A fresh submit is hashed against the manifest the submitter just built. The sampled scorebug re-read can miss a splice outside that sample. Weak, and it does not close the row.
 
-### `second_pad`
-
-second pad mid-match — different serial and descriptor after an unplug.
-
-The log holds two connected status lines, serial=AAAA1111 then serial=BBBB2222. verify-bundle re-hashes the chunk and does not compare serials. The Windows reader stores "DualSense Edge (USB)" and does not store a serial, so two Edge pads of the same model can look identical. Software can close this by recording the USB serial (or the hidraw id) on each connect and failing the input proof when it changes. That check does not need a new capture device. It is not added here.
-
-Software can close this. The check is not added in this suite.
-
-
 ## Caught rows, in short
 
 - `replay_stale_no_fresh_nonce`: challenge rule v2: kickoff: no_pause_press; halftime: no_pause_press; end: no_pause_press
 - `relay_3_0s`: challenge rule v2: kickoff: video_latency_too_high; halftime: video_latency_too_high; end: video_latency_too_high
 - `splice_sealed_segment`: hash chain: segment 3 (video.mp4@288): SHA-256 mismatch (video bytes altered)
 - `turbo_macro`: humanlike check: label bot-like patterns (macro/turbo/injection suspected), score_permille 50. Advisory: verify-bundle stays OK and input_proof status stays ok
+- `second_pad`: input proof: controller corroboration FAIL: pad identity changed mid-match (serial:AAAA1111 -> serial:BBBB2222)
 - `receipt_tamper_score`: signature: player signature: signature error: Verification equation was not satisfied
 - `receipt_extra_field`: schema: /device_attest: additional property
 

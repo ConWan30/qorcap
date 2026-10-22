@@ -13,6 +13,7 @@
     "challenge rule v2",
     "humanlike check",
     "input-video alignment",
+    "input proof",
     "schema",
     "referee-only"
   ],
@@ -51,6 +52,11 @@
           "name": "input-video alignment",
           "result": "pass",
           "detail": "match_permille 1000 chance_permille 0 offset_ms 200 presses_tested 100"
+        },
+        {
+          "name": "input proof",
+          "result": "pass",
+          "detail": "controller corroboration holds: pad identity serial:HONEST0001"
         },
         {
           "name": "schema",
@@ -102,6 +108,11 @@
           "detail": "the replayed pad log still lines up with the replayed picture; the fresh nonce is the check that sees staleness"
         },
         {
+          "name": "input proof",
+          "result": "pass",
+          "detail": "controller corroboration holds: pad identity serial:HONEST0001"
+        },
+        {
           "name": "schema",
           "result": "pass",
           "detail": "receipt.v0.json accepts this object"
@@ -149,6 +160,11 @@
           "name": "input-video alignment",
           "result": "weak",
           "detail": "injected delay 500 ms; match_permille 1000 chance_permille 0 offset_ms 700 presses_tested 100. The ±3 s search keeps the match and records the delay as the offset; nothing rejects the bundle"
+        },
+        {
+          "name": "input proof",
+          "result": "pass",
+          "detail": "controller corroboration holds: pad identity serial:HONEST0001"
         },
         {
           "name": "schema",
@@ -205,6 +221,11 @@
           "detail": "injected delay 1000 ms; match_permille 990 chance_permille 0 offset_ms 1200 presses_tested 100. The ±3 s search keeps the match and records the delay as the offset; nothing rejects the bundle"
         },
         {
+          "name": "input proof",
+          "result": "pass",
+          "detail": "controller corroboration holds: pad identity serial:HONEST0001"
+        },
+        {
           "name": "schema",
           "result": "pass",
           "detail": "receipt.v0.json accepts this object"
@@ -257,6 +278,11 @@
           "name": "input-video alignment",
           "result": "weak",
           "detail": "injected delay 1500 ms; match_permille 990 chance_permille 0 offset_ms 1700 presses_tested 100. The ±3 s search keeps the match and records the delay as the offset; nothing rejects the bundle"
+        },
+        {
+          "name": "input proof",
+          "result": "pass",
+          "detail": "controller corroboration holds: pad identity serial:HONEST0001"
         },
         {
           "name": "schema",
@@ -313,6 +339,11 @@
           "detail": "injected delay 2000 ms; match_permille 990 chance_permille 167 offset_ms 2200 presses_tested 100. The ±3 s search keeps the match and records the delay as the offset; nothing rejects the bundle"
         },
         {
+          "name": "input proof",
+          "result": "pass",
+          "detail": "controller corroboration holds: pad identity serial:HONEST0001"
+        },
+        {
           "name": "schema",
           "result": "pass",
           "detail": "receipt.v0.json accepts this object"
@@ -365,6 +396,11 @@
           "name": "input-video alignment",
           "result": "weak",
           "detail": "injected delay 2400 ms; match_permille 990 chance_permille 167 offset_ms 2600 presses_tested 100. The ±3 s search keeps the match and records the delay as the offset; nothing rejects the bundle"
+        },
+        {
+          "name": "input proof",
+          "result": "pass",
+          "detail": "controller corroboration holds: pad identity serial:HONEST0001"
         },
         {
           "name": "schema",
@@ -423,6 +459,11 @@
           "detail": "injected delay 3000 ms; match_permille 990 chance_permille 167 offset_ms 3200 presses_tested 100. The ±3 s search keeps the match and records the delay as the offset; nothing rejects the bundle"
         },
         {
+          "name": "input proof",
+          "result": "pass",
+          "detail": "controller corroboration holds: pad identity serial:HONEST0001"
+        },
+        {
           "name": "schema",
           "result": "pass",
           "detail": "receipt.v0.json accepts this object"
@@ -468,6 +509,11 @@
           "name": "input-video alignment",
           "result": "pass",
           "detail": "device identity is a manifest string; press timing is unchanged"
+        },
+        {
+          "name": "input proof",
+          "result": "pass",
+          "detail": "controller corroboration holds: pad identity serial:HONEST0001"
         },
         {
           "name": "schema",
@@ -524,6 +570,11 @@
           "detail": "press times are unchanged; the edited bytes are not a decoded picture"
         },
         {
+          "name": "input proof",
+          "result": "pass",
+          "detail": "controller corroboration holds: pad identity serial:HONEST0001"
+        },
+        {
           "name": "schema",
           "result": "pass",
           "detail": "receipt.v0.json accepts this object"
@@ -571,6 +622,11 @@
           "name": "input-video alignment",
           "result": "pass",
           "detail": "press times are unchanged; the edited bytes are not a decoded picture"
+        },
+        {
+          "name": "input proof",
+          "result": "pass",
+          "detail": "controller corroboration holds: pad identity serial:HONEST0001"
         },
         {
           "name": "schema",
@@ -627,6 +683,11 @@
           "detail": "match_permille 1000 chance_permille 0 offset_ms 200 presses_tested 8"
         },
         {
+          "name": "input proof",
+          "result": "pass",
+          "detail": "controller corroboration holds: pad identity serial:HONEST0001"
+        },
+        {
           "name": "schema",
           "result": "pass",
           "detail": "receipt.v0.json accepts this object"
@@ -642,8 +703,10 @@
       "id": "second_pad",
       "attack": "second pad mid-match",
       "variant": "different serial and descriptor after an unplug",
-      "verdict": "missed",
-      "caught_by": [],
+      "verdict": "caught",
+      "caught_by": [
+        "input proof"
+      ],
       "weak_layers": [],
       "blocks_verify_bundle": false,
       "fail_closed": false,
@@ -674,6 +737,11 @@
           "detail": "status lines in the sealed log: connected DualSense Edge (USB) serial=AAAA1111 path=hid#vid_054c&pid_0df2#1 | unplugged usb disconnect | connected DualSense Edge (USB) serial=BBBB2222 path=hid#vid_054c&pid_0df2#2 descriptor=054c:0df2. Alignment does not read the serial"
         },
         {
+          "name": "input proof",
+          "result": "fail",
+          "detail": "controller corroboration FAIL: pad identity changed mid-match (serial:AAAA1111 -> serial:BBBB2222)"
+        },
+        {
           "name": "schema",
           "result": "pass",
           "detail": "receipt.v0.json accepts this object"
@@ -683,12 +751,7 @@
           "result": "pass",
           "detail": "no referee-only check rejects this row beyond the layers above"
         }
-      ],
-      "closure": {
-        "software_can_close": true,
-        "hardware_required": false,
-        "note": "The log holds two connected status lines, serial=AAAA1111 then serial=BBBB2222. verify-bundle re-hashes the chunk and does not compare serials. The Windows reader stores \"DualSense Edge (USB)\" and does not store a serial, so two Edge pads of the same model can look identical. Software can close this by recording the USB serial (or the hidraw id) on each connect and failing the input proof when it changes. That check does not need a new capture device. It is not added here."
-      }
+      ]
     },
     {
       "id": "receipt_tamper_score",
@@ -726,6 +789,11 @@
           "name": "input-video alignment",
           "result": "pass",
           "detail": "the video and the pad log are untouched"
+        },
+        {
+          "name": "input proof",
+          "result": "pass",
+          "detail": "controller corroboration holds: pad identity serial:HONEST0001"
         },
         {
           "name": "schema",
@@ -775,6 +843,11 @@
           "name": "input-video alignment",
           "result": "pass",
           "detail": "the video and the pad log are untouched"
+        },
+        {
+          "name": "input proof",
+          "result": "pass",
+          "detail": "controller corroboration holds: pad identity serial:HONEST0001"
         },
         {
           "name": "schema",

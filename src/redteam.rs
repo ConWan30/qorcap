@@ -6,7 +6,7 @@
 //! [`crate::align::align_tracks`], and `contracts/receipt.v0.json` (`additionalProperties: false`).
 //! Nothing here widens a bound or skips a failing check to make a row look caught.
 
-use crate::{align, bundle, evidence as ev, hid, humanlike, inputs};
+use crate::{align, bundle, evidence as ev, hid, humanlike, inputproof, inputs};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -18,12 +18,13 @@ pub const RULE2_MAX_LATENCY_MS: i64 = 2_500;
 /// QorTime `qor_receipt.challenge.RULE2_CONSISTENCY_MS`. A difference of exactly this passes.
 pub const RULE2_CONSISTENCY_MS: i64 = 300;
 const RULE2_MAX_WINDOW_MS: i64 = 120_000;
-const LAYERS: [&str; 7] = [
+const LAYERS: [&str; 8] = [
     "hash chain",
     "signature",
     "challenge rule v2",
     "humanlike check",
     "input-video alignment",
+    "input proof",
     "schema",
     "referee-only",
 ];
@@ -237,12 +238,7 @@ fn row_second_pad() -> Row {
     let statuses: Vec<String> = built.recs.iter().filter(|r| r["type"] == "status")
         .map(|r| format!("{} {}", r["state"].as_str().unwrap_or(""), r["detail"].as_str().unwrap_or(""))).collect();
     let align = pass_layer("input-video alignment", format!("status lines in the sealed log: {}. Alignment does not read the serial", statuses.join(" | ")));
-    let closure = Some(Closure {
-        software_can_close: true,
-        hardware_required: false,
-        note: "The log holds two connected status lines, serial=AAAA1111 then serial=BBBB2222. verify-bundle re-hashes the chunk and does not compare serials. The Windows reader stores \"DualSense Edge (USB)\" and does not store a serial, so two Edge pads of the same model can look identical. Software can close this by recording the USB serial (or the hidraw id) on each connect and failing the input proof when it changes. That check does not need a new capture device. It is not added here.".into(),
-    });
-    finish("second_pad", "second pad mid-match", "different serial and descriptor after an unplug", &built, align, closure)
+    finish("second_pad", "second pad mid-match", "different serial and descriptor after an unplug", &built, align, None)
 }
 
 fn row_tamper() -> Row {
@@ -268,7 +264,8 @@ fn finish(id: &str, attack: &str, variant: &str, built: &Built, align: Layer, cl
     let human = human_layer(&built.recs);
     let schema = schema_layer(&built.receipt);
     let referee = referee_layer(id, &hash, &challenge);
-    let mut layers = vec![hash, sig, challenge, human, align, schema, referee];
+    let proof = input_proof_layer(&built.recs);
+    let mut layers = vec![hash, sig, challenge, human, align, proof, schema, referee];
     // Keep the published layer order even if a helper returns a different name.
     layers.sort_by_key(|l| LAYERS.iter().position(|n| *n == l.name).unwrap_or(99));
     let caught_by: Vec<String> = layers.iter().filter(|l| l.result == "fail").map(|l| l.name.clone()).collect();
@@ -366,7 +363,7 @@ fn build(plan: &Plan) -> Built {
 }
 
 fn load_synth(log: &mut inputs::InputLog, macro_bot: bool) -> u64 {
-    log.on_status(1_000, "connected", "DualSense Edge (USB)");
+    log.on_status_with_id(1_000, "connected", "DualSense Edge (USB) serial=HONEST0001", Some("serial:HONEST0001"));
     let recs = if macro_bot { humanlike::synth::macro_bot().0 } else { humanlike::synth::human(1).0 };
     let mut max_t = 1_000u64;
     for r in &recs {
@@ -378,7 +375,7 @@ fn load_synth(log: &mut inputs::InputLog, macro_bot: bool) -> u64 {
 }
 
 fn load_second_pad(log: &mut inputs::InputLog) -> u64 {
-    log.on_status(1_000, "connected", "DualSense Edge (USB) serial=AAAA1111 path=hid#vid_054c&pid_0df2#1");
+    log.on_status_with_id(1_000, "connected", "DualSense Edge (USB) serial=AAAA1111 path=hid#vid_054c&pid_0df2#1", Some("serial:AAAA1111"));
     let (recs, _) = humanlike::synth::human(1);
     let mid = recs.len() / 2;
     let mut max_t = 1_000u64;
@@ -387,7 +384,7 @@ fn load_second_pad(log: &mut inputs::InputLog) -> u64 {
         max_t = max_t.max(t);
         if i == mid {
             log.on_status(t, "unplugged", "usb disconnect");
-            log.on_status(t + 1_000, "connected", "DualSense Edge (USB) serial=BBBB2222 path=hid#vid_054c&pid_0df2#2 descriptor=054c:0df2");
+            log.on_status_with_id(t + 1_000, "connected", "DualSense Edge (USB) serial=BBBB2222 path=hid#vid_054c&pid_0df2#2 descriptor=054c:0df2", Some("serial:BBBB2222"));
         }
         log.on_report(t, &pad_from(r));
     }
@@ -562,6 +559,12 @@ fn challenge_layer(recs: &[Value], phases: &[Phase]) -> Layer {
     } else {
         fail_layer("challenge rule v2", reasons.join("; "))
     }
+}
+
+fn input_proof_layer(recs: &[Value]) -> Layer {
+    let claim = inputproof::controller_corroboration(recs);
+    let detail = claim["detail"].as_str().unwrap_or("").to_string();
+    if claim["ok"] == json!(true) { pass_layer("input proof", detail) } else { fail_layer("input proof", detail) }
 }
 
 fn human_layer(recs: &[Value]) -> Layer {
@@ -906,7 +909,7 @@ fn render_markdown(m: &Matrix) -> String {
     s.push_str("`cargo test --test redteam` checks that a fresh run matches both files.\n\n");
     s.push_str(&format!("Rule v2 ceiling is {} ms. Successful latencies must sit within ±{} ms of their median (a gap of exactly {} ms passes). ",
         RULE2_MAX_LATENCY_MS, RULE2_CONSISTENCY_MS, RULE2_CONSISTENCY_MS));
-    s.push_str("`verify-bundle` re-hashes bytes. It does not score human-likeness, alignment, the receipt schema, or rule v2.\n\n");
+    s.push_str("`verify-bundle` re-hashes bytes. It does not score human-likeness, alignment, the controller-identity claim, the receipt schema, or rule v2.\n\n");
     s.push_str("## Matrix\n\n");
     s.push_str("| id | attack | verdict | caught by | verify-bundle |\n");
     s.push_str("|---|---|---|---|---|\n");
@@ -915,7 +918,7 @@ fn render_markdown(m: &Matrix) -> String {
         let vb = if r.blocks_verify_bundle { "FAIL" } else { "OK" };
         s.push_str(&format!("| `{}` | {} | {} | {} | {} |\n", r.id, r.attack, r.verdict, caught, vb));
     }
-    s.push_str("\n`weak` means a layer reports the attack and still accepts the bundle. `missed` means every layer accepts it. `caught` means a layer rejects it. The human-likeness catch is advisory: the label is bot-like and `verify-bundle` stays OK.\n\n");
+    s.push_str("\n`weak` means a layer reports the attack and still accepts the bundle. `missed` means every layer accepts it. `caught` means a layer rejects it. The human-likeness catch is advisory: the label is bot-like and `verify-bundle` stays OK. The controller-identity catch fails the input-proof `controller_corroboration` claim; `verify-bundle` stays OK.\n\n");
     s.push_str("## Missed and weak rows\n\n");
     for r in m.rows.iter().filter(|r| r.verdict == "missed" || r.verdict == "weak") {
         s.push_str(&format!("### `{}`\n\n", r.id));
@@ -995,7 +998,7 @@ mod tests {
             ("splice_sealed_segment", "caught", Some("hash chain")),
             ("splice_rehashed_resigned", "weak", None),
             ("turbo_macro", "caught", Some("humanlike check")),
-            ("second_pad", "missed", None),
+            ("second_pad", "caught", Some("input proof")),
             ("receipt_tamper_score", "caught", Some("signature")),
             ("receipt_extra_field", "caught", Some("schema")),
         ];
@@ -1021,8 +1024,10 @@ mod tests {
             let r = row(&m, id);
             assert!(r.weak_layers.iter().any(|n| n == "input-video alignment"), "{id} {:?}", r.weak_layers);
             assert!(r.layers.iter().any(|l| l.name == "challenge rule v2" && l.result == "pass"), "{id}");
+            assert!(r.layers.iter().any(|l| l.name == "input proof" && l.result == "pass"), "{id}");
             let c = r.closure.as_ref().unwrap();
             assert!(c.software_can_close && !c.hardware_required, "{id}");
+            assert!(c.note.contains("does not add that bound"), "{id}");
         }
         let v = row(&m, "virtual_capture_device");
         assert!(!v.blocks_verify_bundle);
@@ -1040,10 +1045,13 @@ mod tests {
         assert!(!mac.blocks_verify_bundle && !mac.fail_closed);
         let pad = row(&m, "second_pad");
         assert!(!pad.blocks_verify_bundle);
-        let c = pad.closure.as_ref().unwrap();
-        assert!(c.software_can_close && !c.hardware_required);
-        assert!(c.note.contains("AAAA1111") && c.note.contains("BBBB2222"));
+        assert!(pad.closure.is_none());
+        assert_eq!(pad.caught_by, vec!["input proof".to_string()]);
+        let proof = pad.layers.iter().find(|l| l.name == "input proof").unwrap();
+        assert_eq!(proof.result, "fail");
+        assert!(proof.detail.contains("serial:AAAA1111") && proof.detail.contains("serial:BBBB2222"), "{}", proof.detail);
         let logged = pad.layers.iter().find(|l| l.name == "input-video alignment").unwrap();
+        assert_eq!(logged.result, "pass");
         assert!(logged.detail.contains("serial=AAAA1111") && logged.detail.contains("serial=BBBB2222"), "{}", logged.detail);
         let tamper = row(&m, "receipt_tamper_score");
         assert!(tamper.layers.iter().any(|l| l.name == "schema" && l.result == "pass"));

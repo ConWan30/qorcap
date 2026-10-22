@@ -140,10 +140,33 @@ impl Pad {
 // ------------------------------------------------------------------------------------------- devices
 
 /// Something that yields raw HID input reports.
+///
+/// Implementations read input reports only. They must not write an output report or a feature report.
 pub trait ReportSource: Send {
-    /// Read one report; Ok(None) on timeout; Err when the device is gone.
+    /// Read one input report; Ok(None) on timeout; Err when the device is gone.
     fn read(&mut self, buf: &mut [u8], timeout_ms: i32) -> Result<Option<usize>, String>;
     fn name(&self) -> String;
+    /// Identity recorded in the sealed pad log on connect. USB serial when the device has one,
+    /// otherwise a device instance id or a hidraw id. Empty when none of those is available.
+    fn pad_id(&self) -> String;
+}
+
+/// `serial:<usb serial>`, else `instance:<stable id>`, else `hidraw:<node>`.
+/// Enumeration metadata only: this does not touch the HID report channel.
+pub fn pad_identity(serial: Option<&str>, instance: Option<&str>, hidraw: Option<&str>) -> String {
+    fn clean(v: Option<&str>) -> Option<&str> { v.map(str::trim).filter(|s| !s.is_empty()) }
+    if let Some(s) = clean(serial) { return format!("serial:{s}"); }
+    if let Some(s) = clean(instance) { return format!("instance:{s}"); }
+    if let Some(s) = clean(hidraw) { return format!("hidraw:{s}"); }
+    String::new()
+}
+
+/// Linux identity from a hidraw `uevent` plus an optional sysfs `serial` file.
+/// `HID_UNIQ` and the USB `serial` file win over `HID_PHYS`, which wins over the hidraw node name.
+pub fn linux_pad_id(uevent: &str, serial_file: Option<&str>, hidraw_name: &str) -> String {
+    let line = |key: &str| uevent.lines().find_map(|l| l.strip_prefix(key)).map(str::trim).filter(|s| !s.is_empty());
+    let serial = line("HID_UNIQ=").or(serial_file.map(str::trim).filter(|s| !s.is_empty()));
+    pad_identity(serial, line("HID_PHYS="), Some(hidraw_name))
 }
 
 /// Open the first USB DualSense / DualSense Edge. Err(reason) when none is present.
@@ -154,12 +177,20 @@ pub fn model_name(pid: u16) -> &'static str { if pid == PID_DUALSENSE_EDGE { "Du
 #[cfg(windows)]
 mod os {
     use super::*;
-    pub struct Dev { d: hidapi::HidDevice, name: String }
+    pub struct Dev { d: hidapi::HidDevice, name: String, pad_id: String }
     impl ReportSource for Dev {
         fn read(&mut self, buf: &mut [u8], t: i32) -> Result<Option<usize>, String> {
+            // Input reports only. Do not call write() or send_feature_report().
             match self.d.read_timeout(buf, t) { Ok(0) => Ok(None), Ok(n) => Ok(Some(n)), Err(e) => Err(e.to_string()) }
         }
         fn name(&self) -> String { self.name.clone() }
+        fn pad_id(&self) -> String { self.pad_id.clone() }
+    }
+    fn device_pad_id(info: &hidapi::DeviceInfo) -> String {
+        let path = info.path().to_string_lossy();
+        let instance = if path.is_empty() { None } else { Some(path.as_ref()) };
+        // serial_number() is the string from device enumeration, not a feature report.
+        pad_identity(info.serial_number(), instance, None)
     }
     pub fn open() -> Result<Box<dyn ReportSource>, String> {
         let api = hidapi::HidApi::new().map_err(|e| format!("HID init failed: {e}"))?;
@@ -170,8 +201,10 @@ mod os {
         cands.sort_by_key(|d| (!(d.usage_page() == 1 && d.usage() == 5), d.product_id() != PID_DUALSENSE_EDGE));
         let mut last = String::new();
         for c in cands {
+            let pad_id = device_pad_id(c);
+            let name = format!("{} (USB)", model_name(c.product_id()));
             match c.open_device(&api) {
-                Ok(d) => return Ok(Box::new(Dev { d, name: format!("{} (USB)", model_name(c.product_id())) })),
+                Ok(d) => return Ok(Box::new(Dev { d, name, pad_id })),
                 Err(e) => last = e.to_string(),
             }
         }
@@ -183,9 +216,10 @@ mod os {
 mod os {
     use super::*;
     use std::io::Read;
-    pub struct Dev { f: std::fs::File, name: String }
+    pub struct Dev { f: std::fs::File, name: String, pad_id: String }
     impl ReportSource for Dev {
         fn read(&mut self, buf: &mut [u8], t: i32) -> Result<Option<usize>, String> {
+            // Read-only file. No HIDIOC output or feature ioctl.
             use std::os::unix::io::AsRawFd;
             let mut p = libc::pollfd { fd: self.f.as_raw_fd(), events: libc::POLLIN, revents: 0 };
             let r = unsafe { libc::poll(&mut p, 1, t) };
@@ -194,6 +228,19 @@ mod os {
             self.f.read(buf).map(Some).map_err(|e| e.to_string())
         }
         fn name(&self) -> String { self.name.clone() }
+        fn pad_id(&self) -> String { self.pad_id.clone() }
+    }
+    /// USB serial from sysfs, walking up from the hidraw device node. Read-only.
+    fn sysfs_serial(hidraw: &std::path::Path) -> Option<String> {
+        let mut dir = hidraw.join("device");
+        for _ in 0..8 {
+            if let Ok(s) = std::fs::read_to_string(dir.join("serial")) {
+                let s = s.trim();
+                if !s.is_empty() { return Some(s.to_string()); }
+            }
+            dir = dir.parent()?.to_path_buf();
+        }
+        None
     }
     pub fn open() -> Result<Box<dyn ReportSource>, String> {
         let rd = std::fs::read_dir("/sys/class/hidraw").map_err(|_| "no hidraw devices".to_string())?;
@@ -205,9 +252,14 @@ mod os {
             if p.len() != 3 || p[0] != "0003" { continue; }
             let (vid, pid) = (u32::from_str_radix(p[1], 16).unwrap_or(0), u32::from_str_radix(p[2], 16).unwrap_or(0));
             if vid != SONY_VID as u32 || !(pid == PID_DUALSENSE as u32 || pid == PID_DUALSENSE_EDGE as u32) { continue; }
-            let dev = format!("/dev/{}", e.file_name().to_string_lossy());
-            return std::fs::File::open(&dev).map(|f| Box::new(Dev { f, name: format!("{} (USB {dev})", model_name(pid as u16)) }) as Box<dyn ReportSource>)
-                .map_err(|e| format!("{dev}: {e}"));
+            let node = e.file_name().to_string_lossy().into_owned();
+            let serial = sysfs_serial(&e.path());
+            let pad_id = linux_pad_id(&uevent, serial.as_deref(), &node);
+            let dev = format!("/dev/{node}");
+            // File::open is read-only. The pad log records pad_id; nothing is written to the controller.
+            return std::fs::File::open(&dev).map(|f| Box::new(Dev {
+                f, name: format!("{} (USB)", model_name(pid as u16)), pad_id,
+            }) as Box<dyn ReportSource>).map_err(|e| format!("{dev}: {e}"));
         }
         Err("no DualSense found on USB".into())
     }
@@ -266,5 +318,18 @@ mod tests {
     fn rejects_other_reports() {
         assert!(parse(&[0x05; 64]).is_none());
         assert!(parse(&[0x01; 10]).is_none());
+    }
+    #[test]
+    fn pad_identity_prefers_usb_serial_then_instance_then_hidraw() {
+        assert_eq!(pad_identity(Some("ABC123"), Some("usb-1"), Some("hidraw0")), "serial:ABC123");
+        assert_eq!(pad_identity(Some("  "), Some("usb-1"), Some("hidraw0")), "instance:usb-1");
+        assert_eq!(pad_identity(None, None, Some("hidraw3")), "hidraw:hidraw3");
+        assert!(pad_identity(None, Some(""), None).is_empty());
+        let uevent = "HID_ID=0003:0000054C:00000DF2\nHID_UNIQ=AAAA1111\nHID_PHYS=usb-0000:00:14.0-1/input0\n";
+        assert_eq!(linux_pad_id(uevent, None, "hidraw0"), "serial:AAAA1111");
+        let bare = "HID_ID=0003:0000054C:00000CE6\nHID_UNIQ=\nHID_PHYS=usb-0000:00:14.0-2/input0\n";
+        assert_eq!(linux_pad_id(bare, Some("\n"), "hidraw1"), "instance:usb-0000:00:14.0-2/input0");
+        assert_eq!(linux_pad_id("HID_ID=0003:0000054C:00000CE6\n", Some("BBBB2222"), "hidraw2"), "serial:BBBB2222");
+        assert_eq!(linux_pad_id("", None, "hidraw4"), "hidraw:hidraw4");
     }
 }
