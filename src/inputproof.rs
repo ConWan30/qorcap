@@ -14,6 +14,72 @@ fn jsonl(p: &Path) -> Vec<Value> {
     inputs::read_shared_string(p).map(|s| s.lines().filter_map(|l| serde_json::from_str(l).ok()).collect()).unwrap_or_default()
 }
 
+fn detail_token(detail: &str, key: &str) -> Option<String> {
+    let rest = detail.get(detail.find(key)? + key.len()..)?;
+    let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+    let v = rest[..end].trim();
+    if v.is_empty() { None } else { Some(v.to_string()) }
+}
+
+fn normalize_pad_id(raw: &str) -> Option<String> {
+    let raw = raw.trim();
+    if raw.is_empty() { return None; }
+    if raw.starts_with("serial:") || raw.starts_with("instance:") || raw.starts_with("hidraw:") {
+        return Some(raw.to_string());
+    }
+    Some(format!("serial:{raw}"))
+}
+
+fn identity_of(status: &Value) -> Option<String> {
+    if let Some(id) = status["pad_id"].as_str().and_then(normalize_pad_id) { return Some(id); }
+    let detail = status["detail"].as_str().unwrap_or("");
+    if let Some(s) = detail_token(detail, "serial=") { return Some(format!("serial:{s}")); }
+    detail_token(detail, "id=").and_then(|s| normalize_pad_id(&s))
+}
+
+/// Controller-corroboration claim: one USB pad for the whole match.
+///
+/// A log with no recorded identity (bundles sealed before pad ids existed) does not fail.
+/// A new log (`header.pad_identity = required`) must record an identity on every connect, and
+/// that identity must not change. A recorded identity that changes fails even on an older header.
+pub fn controller_corroboration(recs: &[Value]) -> Value {
+    let required = recs.iter().any(|r| r["type"] == "header" && r["pad_identity"] == "required");
+    let mut ids: Vec<String> = vec![];
+    let mut missing = 0u32;
+    let mut connects = 0u32;
+    for r in recs.iter().filter(|r| r["type"] == "status" && r["state"] == "connected") {
+        connects += 1;
+        match identity_of(r) {
+            Some(id) => { if !ids.iter().any(|s| s == &id) { ids.push(id); } }
+            None => missing += 1,
+        }
+    }
+    let has_inputs = recs.iter().any(|r| r["type"] == "in");
+    let (ok, checked, reason, detail) = if missing > 0 && (required || !ids.is_empty()) {
+        (false, true, "pad_identity_missing",
+            "controller corroboration FAIL: a connected controller has no recorded pad identity".to_string())
+    } else if connects == 0 && required && has_inputs {
+        (false, true, "pad_identity_missing",
+            "controller corroboration FAIL: a connected controller has no recorded pad identity".to_string())
+    } else if ids.len() > 1 {
+        (false, true, "pad_identity_changed",
+            format!("controller corroboration FAIL: pad identity changed mid-match ({})", ids.join(" -> ")))
+    } else if ids.len() == 1 && missing == 0 {
+        (true, true, "ok", format!("controller corroboration holds: pad identity {}", ids[0]))
+    } else {
+        (true, false, "identity_not_recorded",
+            "controller corroboration not checked: no pad identity on this log (older bundle)".to_string())
+    };
+    json!({
+        "claim": "one_usb_controller",
+        "ok": ok,
+        "checked": checked,
+        "reason": reason,
+        "identities": ids,
+        "detail": detail,
+    })
+}
+
 /// Build the proof for bundle `dir`. `ffmpeg = None` skips frame differencing.
 pub fn build(dir: &Path, ffmpeg: Option<&str>, n_frames: usize) -> Value {
     let p = dir.join("inputs.jsonl");
@@ -52,17 +118,21 @@ pub fn build(dir: &Path, ffmpeg: Option<&str>, n_frames: usize) -> Value {
         Err(_) => (None, if committed.is_empty() { None } else { Some(false) }),
     };
     let haptics_v = haptics::summarize(&recs, &timeline, anchor, hsha, hmatch);
-    let status = if n_in == 0 { "no_controller_reports" } else if !errs.is_empty() { "integrity_errors" } else { "ok" };
+    let claim = controller_corroboration(&recs);
+    let claim_fail = claim["ok"] != json!(true);
+    let status = if n_in == 0 { "no_controller_reports" } else if !errs.is_empty() { "integrity_errors" } else if claim_fail { "controller_corroboration_failed" } else { "ok" };
     let mut warnings: Vec<String> = errs.clone();
     if n_in == 0 { warnings.push("The controller was never read over USB during this recording, so there is no input proof.".into()); }
     if hmatch == Some(false) { warnings.push("haptics.jsonl does not match the haptic records committed in inputs.jsonl".into()); }
     if haptics_v["imu_present"] == json!(false) { warnings.push("Controller reports carried no IMU data: haptic detection was not possible.".into()); }
     if gaps > 0 { warnings.push(format!("{gaps} controller dropout/missing period(s) recorded; see status lines in inputs.jsonl")); }
+    if claim_fail && n_in > 0 { warnings.push(claim["detail"].as_str().unwrap_or("controller corroboration failed").to_string()); }
     json!({
         "schema": SCHEMA, "status": status, "device": device,
         "inputs_file": "inputs.jsonl", "inputs_sha256": file_sha, "inputs_chain_head": head, "chunks": chunks.len(), "reports_logged": n_in,
         "clock": "inputs t_us and manifest/checkpoint mono_ms come from the same QorCap monotonic clock",
-        "human": human, "alignment": alignment, "haptics": haptics_v, "score_source": score_source, "warnings": warnings, "limit": LIMIT,
+        "human": human, "alignment": alignment, "haptics": haptics_v, "score_source": score_source,
+        "controller_corroboration": claim, "warnings": warnings, "limit": LIMIT,
     })
 }
 
@@ -76,6 +146,11 @@ pub fn receipt_fields(proof: &Value) -> Value {
         "inputs_sha256": proof["inputs_sha256"], "inputs_chain_head": proof["inputs_chain_head"],
         "haptic_events": proof["haptics"]["events"], "haptic_high_confidence": proof["haptics"]["high_confidence"],
         "haptics_sha256": proof["haptics"]["haptics_sha256"],
+        "controller_corroboration": {
+            "ok": proof["controller_corroboration"]["ok"],
+            "checked": proof["controller_corroboration"]["checked"],
+            "reason": proof["controller_corroboration"]["reason"],
+        },
         "claims": LIMIT,
     })
 }
@@ -146,7 +221,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("qorcap-proof-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir); std::fs::create_dir_all(&dir).unwrap();
         let mut l = InputLog::new(Some(dir.join("inputs.jsonl")), true, 1_000);
-        l.on_status(5, "connected", "DualSense Edge (USB)");
+        l.on_status_with_id(5, "connected", "DualSense Edge (USB)", Some("serial:EDGE1"));
         let (recs, _) = humanlike::synth::human(3);
         for r in &recs {
             let p = Pad { buttons: r["b"].as_u64().unwrap() as u32, lx: r["lx"].as_u64().unwrap() as u8, ly: r["ly"].as_u64().unwrap() as u8,
@@ -160,6 +235,8 @@ mod tests {
         let proof = apply(&dir, None, 15).unwrap();
         assert_eq!(proof["status"], "ok");
         assert_eq!(proof["device"], "DualSense Edge (USB)");
+        assert_eq!(proof["controller_corroboration"]["ok"], true);
+        assert_eq!(proof["controller_corroboration"]["reason"], "ok");
         let r: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("receipt.draft.json")).unwrap()).unwrap();
         assert!(r["signals"]["motion_permille"].is_object(), "existing signal kept");
         assert!(r["signals"]["input"]["human_permille"].as_i64().unwrap() >= 700);
@@ -176,7 +253,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir); std::fs::create_dir_all(&dir).unwrap();
         let anchor = 1_700_000_000_000u64;
         let mut l = InputLog::new(Some(dir.join("inputs.jsonl")), true, anchor);
-        l.on_status(5, "connected", "DualSense Edge (USB)");
+        l.on_status_with_id(5, "connected", "DualSense Edge (USB)", Some("serial:EDGE1"));
         let s = haptics::synth::stream(14.0, |t| {
             let v = if (5.0..5.25).contains(&t) || (11.0..11.2).contains(&t) { 150.0 * (2.0 * std::f64::consts::PI * 60.0 * t).sin() } else { 0.0 };
             ([v, 0.0, 0.0], [v, 0.0, 0.0], 0)
@@ -243,7 +320,7 @@ mod tests {
         assert!(st.success());
         std::fs::write(dir.join("manifest.jsonl"), "{\"type\":\"segment\",\"seq\":0,\"kind\":\"init\",\"file\":\"video.mp4\",\"mono_ms\":0}\n").unwrap();
         let mut l = InputLog::new(Some(dir.join("inputs.jsonl")), true, 0);
-        l.on_status(1, "connected", "DualSense (USB)");
+        l.on_status_with_id(1, "connected", "DualSense (USB)", Some("serial:DS1"));
         for k in 0..9u64 {
             let t = (1_800 + 3_000 * k) * 1000;
             l.on_report(t, &Pad { buttons: hid::CROSS, ..Pad::neutral() });
@@ -257,6 +334,89 @@ mod tests {
         assert!(a["chance_permille"].as_i64().unwrap_or(0) <= 500, "{a:#}");
         let off = a["offset_ms"].as_i64().unwrap();
         assert!((133..=300).contains(&off), "offset {off}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn seal_connects(dir: &std::path::Path, legacy: bool, connects: &[(&str, Option<&str>)]) {
+        let _ = std::fs::remove_dir_all(dir);
+        std::fs::create_dir_all(dir).unwrap();
+        let mut l = InputLog::new(Some(dir.join("inputs.jsonl")), true, 1);
+        if legacy { l.test_clear_pad_identity_requirement(); }
+        let mut t = 1_000u64;
+        for (i, (detail, id)) in connects.iter().enumerate() {
+            if i > 0 {
+                l.on_status(t, "unplugged", "usb disconnect");
+                t += 1_000;
+            }
+            l.on_status_with_id(t, "connected", detail, *id);
+            t += 1_000;
+            l.on_report(t, &Pad { buttons: hid::CROSS, ..Pad::neutral() });
+            t += 1_000;
+            l.on_report(t, &Pad::neutral());
+        }
+        l.seal(1, t);
+    }
+
+    #[test]
+    fn same_pad_reconnect_keeps_the_claim() {
+        let dir = std::env::temp_dir().join(format!("qorcap-pad-same-{}", std::process::id()));
+        seal_connects(&dir, false, &[
+            ("DualSense Edge (USB) serial=SAME", Some("serial:SAME")),
+            ("DualSense Edge (USB) serial=SAME", Some("serial:SAME")),
+        ]);
+        let p = build(&dir, None, 15);
+        assert_eq!(p["status"], "ok", "{p:#}");
+        assert_eq!(p["controller_corroboration"]["ok"], true);
+        assert_eq!(p["controller_corroboration"]["checked"], true);
+        assert_eq!(p["controller_corroboration"]["identities"], json!(["serial:SAME"]));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn identity_change_fails_the_claim_and_a_missing_id_on_a_new_log_fails() {
+        let dir = std::env::temp_dir().join(format!("qorcap-pad-swap-{}", std::process::id()));
+        seal_connects(&dir, false, &[
+            ("DualSense Edge (USB) serial=AAAA1111", Some("serial:AAAA1111")),
+            ("DualSense Edge (USB) serial=BBBB2222", Some("serial:BBBB2222")),
+        ]);
+        let p = build(&dir, None, 15);
+        assert_eq!(p["status"], "controller_corroboration_failed", "{p:#}");
+        assert_eq!(p["controller_corroboration"]["ok"], false);
+        assert_eq!(p["controller_corroboration"]["reason"], "pad_identity_changed");
+        assert!(p["warnings"].as_array().unwrap().iter().any(|w| w.as_str().unwrap().contains("FAIL")));
+        let fields = receipt_fields(&p);
+        assert_eq!(fields["controller_corroboration"]["ok"], false);
+        ev::jcs(&json!({"x": fields})).expect("receipt fields stay JCS-safe");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let dir = std::env::temp_dir().join(format!("qorcap-pad-missing-{}", std::process::id()));
+        seal_connects(&dir, false, &[("DualSense Edge (USB)", None)]);
+        let p = build(&dir, None, 15);
+        assert_eq!(p["status"], "controller_corroboration_failed");
+        assert_eq!(p["controller_corroboration"]["reason"], "pad_identity_missing");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn old_bundle_without_a_serial_does_not_fail_and_a_recorded_swap_still_does() {
+        let dir = std::env::temp_dir().join(format!("qorcap-pad-old-{}", std::process::id()));
+        seal_connects(&dir, true, &[("DualSense Edge (USB)", None), ("DualSense (USB)", None)]);
+        let p = build(&dir, None, 15);
+        assert_eq!(p["status"], "ok", "{p:#}");
+        assert_eq!(p["controller_corroboration"]["ok"], true);
+        assert_eq!(p["controller_corroboration"]["checked"], false);
+        assert_eq!(p["controller_corroboration"]["reason"], "identity_not_recorded");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let dir = std::env::temp_dir().join(format!("qorcap-pad-old-swap-{}", std::process::id()));
+        seal_connects(&dir, true, &[
+            ("DualSense Edge (USB) serial=AAAA1111 path=hid#1", None),
+            ("DualSense Edge (USB) serial=BBBB2222 path=hid#2", None),
+        ]);
+        let p = build(&dir, None, 15);
+        assert_eq!(p["status"], "controller_corroboration_failed", "{p:#}");
+        assert_eq!(p["controller_corroboration"]["reason"], "pad_identity_changed");
+        assert_eq!(p["controller_corroboration"]["identities"], json!(["serial:AAAA1111", "serial:BBBB2222"]));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -12,7 +12,9 @@
 //!
 //! A chunk with no records hashes to SHA-256(JCS([])), exactly what QorCap <= 0.2.2 wrote, so bundles without a
 //! controller stay byte-compatible. Controller presence changes (`connected` / `missing` / `unplugged` /
-//! `stalled`) are themselves records, so absence is committed rather than hidden.
+//! `stalled`) are themselves records, so absence is committed rather than hidden. Each `connected` record
+//! on a new log carries `pad_id` (USB serial, or a device instance id / hidraw id). The reader never writes
+//! an output report or a feature report.
 //!
 //! Since 0.3.1 the IMU haptic detector (`haptics.rs`) runs on the same reports. Its events are `{"type":"haptic"}`
 //! records in the same chunks (so they are covered by `input_hash` and the inputs chain exactly like button
@@ -110,6 +112,8 @@ pub struct Live {
     /// off | searching | connected | missing | unplugged | stalled
     pub state: String,
     pub device: Option<String>,
+    /// USB serial, device instance id, or hidraw id of the connected pad. Cleared when it drops.
+    pub pad_id: Option<String>,
     pub reports: u64,
     pub logged: u64,
     pub presses: u64,
@@ -146,7 +150,9 @@ impl InputLog {
         if enabled {
             l.pending.push(json!({"type": "header", "schema": SCHEMA, "t_us": 0,
                 "clock": "qorcap-mono-us (same Instant as manifest/checkpoint mono_ms)", "wall_anchor_ms": wall_anchor_ms,
-                "transport": "usb-hid", "haptics": Detector::params(), "limit": "Proves inputs came from the USB-connected controller in sync with the video, not who held it."}));
+                "transport": "usb-hid", "haptics": Detector::params(),
+                "pad_identity": "required",
+                "limit": "Proves inputs came from the USB-connected controller in sync with the video, not who held it."}));
         }
         l
     }
@@ -181,7 +187,19 @@ impl InputLog {
     }
 
     pub fn on_status(&mut self, t_us: u64, state: &str, detail: &str) {
-        if self.live.state == state { return; }
+        self.on_status_with_id(t_us, state, detail, None);
+    }
+
+    /// `pad_id` is the USB serial (`serial:…`), a device instance id (`instance:…`), or a hidraw id
+    /// (`hidraw:…`). A new recording requires it on every `connected` line. Passing `None` does not
+    /// clear an id already stored for this same `connected` stretch.
+    pub fn on_status_with_id(&mut self, t_us: u64, state: &str, detail: &str, pad_id: Option<&str>) {
+        let id = pad_id.map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
+        let same_id = match &id {
+            None => true,
+            Some(new) => self.live.pad_id.as_ref() == Some(new),
+        };
+        if self.live.state == state && same_id { return; }
         self.live.state = state.into();
         self.live.warning = match state {
             "connected" => None,
@@ -192,13 +210,38 @@ impl InputLog {
         };
         if state == "connected" {
             self.live.device = Some(detail.into());
+            if id.is_some() { self.live.pad_id = id.clone(); }
             // Fresh filters + calibration after every (re)connect; keep the run's event counters.
             let (e, lc) = (self.detector.live.events, self.detector.live.low_confidence);
             self.detector = Detector::new(self.wall_anchor_ms);
             self.detector.live.events = e; self.detector.live.low_confidence = lc;
+        } else {
+            self.live.pad_id = None;
         }
-        self.pending.push(json!({"type": "status", "t_us": t_us, "state": state, "detail": detail}));
+        let mut rec = json!({"type": "status", "t_us": t_us, "state": state, "detail": detail});
+        if state == "connected" {
+            if let Some(id) = &id { rec["pad_id"] = json!(id); }
+        }
+        self.pending.push(rec);
         if state != "connected" { self.last_logged = None; }
+    }
+
+    /// Human-readable connect line. The structured `pad_id` is what the proof compares.
+    pub fn connect_detail(name: &str, pad_id: &str) -> String {
+        if let Some(serial) = pad_id.strip_prefix("serial:") {
+            format!("{name} serial={serial}")
+        } else if pad_id.is_empty() {
+            name.to_string()
+        } else {
+            format!("{name} id={pad_id}")
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_clear_pad_identity_requirement(&mut self) {
+        if let Some(h) = self.pending.iter_mut().find(|r| r["type"] == "header") {
+            if let Some(o) = h.as_object_mut() { o.remove("pad_identity"); }
+        }
     }
 
     /// Records not yet sealed (used by `input-test`, which never seals).
@@ -288,8 +331,10 @@ where F: Fn() -> Result<Box<dyn ReportSource>, String> + Send + 'static {
                 }
                 Ok(mut dev) => {
                     let name = dev.name();
-                    info!("CONTROLLER: reading {name} HID reports on the QorCap clock");
-                    log.lock().unwrap_or_else(|e| e.into_inner()).on_status(us(), "connected", &name);
+                    let pad_id = dev.pad_id();
+                    let detail = InputLog::connect_detail(&name, &pad_id);
+                    info!("CONTROLLER: reading {name} id={pad_id} HID reports on the QorCap clock");
+                    log.lock().unwrap_or_else(|e| e.into_inner()).on_status_with_id(us(), "connected", &detail, Some(&pad_id));
                     let mut last_rx = Instant::now();
                     while !stop.load(Ordering::SeqCst) {
                         match dev.read(&mut buf, 100) {
@@ -297,7 +342,7 @@ where F: Fn() -> Result<Box<dyn ReportSource>, String> + Send + 'static {
                                 let t = us();
                                 if let Some(p) = hid::parse(&buf[..n]) {
                                     let mut l = log.lock().unwrap_or_else(|e| e.into_inner());
-                                    if l.live.state != "connected" { l.on_status(t, "connected", &name); }
+                                    if l.live.state != "connected" { l.on_status_with_id(t, "connected", &detail, Some(&pad_id)); }
                                     l.on_report(t, &p);
                                     last_rx = Instant::now();
                                 }
@@ -449,6 +494,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(1)); Ok(Some(r.len()))
         }
         fn name(&self) -> String { "Fake DualSense (USB)".into() }
+        fn pad_id(&self) -> String { "serial:FAKE0001".into() }
     }
     #[test]
     fn logger_reads_reports_then_handles_unplug() {
@@ -467,5 +513,9 @@ mod tests {
         assert!(l.live.state == "missing" || l.live.state == "unplugged");
         let states: Vec<&str> = l.pending.iter().filter_map(|r| r["state"].as_str()).collect();
         assert_eq!(&states[..2], &["connected", "unplugged"]);
+        let connected = l.pending.iter().find(|r| r["state"] == "connected").unwrap();
+        assert_eq!(connected["pad_id"], "serial:FAKE0001");
+        assert!(connected["detail"].as_str().unwrap().contains("serial=FAKE0001"), "{}", connected["detail"]);
+        assert!(l.pending.iter().any(|r| r["type"] == "header" && r["pad_identity"] == "required"));
     }
 }
