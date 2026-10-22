@@ -1,0 +1,456 @@
+{
+ "frames": {
+  "m4-021718": {
+   "basis": "reader-lock:match-20261017-021003:1792221414",
+   "grade": "B",
+   "label": {
+    "away": 13,
+    "home": 0
+   },
+   "layout": "primetime",
+   "match": "match-20261017-021003",
+   "state": "active"
+  },
+  "m4-021902": {
+   "basis": "reader-lock:match-20261017-021003:1792221414",
+   "grade": "B",
+   "label": {
+    "away": 13,
+    "home": 0
+   },
+   "layout": "primetime",
+   "match": "match-20261017-021003",
+   "state": "active"
+  },
+  "m4-023808": {
+   "basis": "reader-lock:match-20261017-021003:1792222472",
+   "grade": "B",
+   "label": {
+    "away": 20,
+    "home": 21
+   },
+   "layout": "primetime",
+   "match": "match-20261017-021003",
+   "state": "active"
+  },
+  "m4-023816": {
+   "basis": "reader-lock:match-20261017-021003:1792222472",
+   "grade": "B",
+   "label": {
+    "away": 20,
+    "home": 21
+   },
+   "layout": "primetime",
+   "match": "match-20261017-021003",
+   "state": "active"
+  },
+  "m4-024241": {
+   "basis": "reader-lock:match-20261017-021003:1792222937",
+   "grade": "B",
+   "label": {
+    "away": 20,
+    "home": 28
+   },
+   "layout": "primetime",
+   "match": "match-20261017-021003",
+   "state": "active"
+  },
+  "m4-024257": {
+   "basis": "reader-lock:match-20261017-021003:1792222937",
+   "grade": "B",
+   "label": {
+    "away": 20,
+    "home": 28
+   },
+   "layout": "primetime",
+   "match": "match-20261017-021003",
+   "state": "active"
+  },
+  "mnp-f_0030000": {
+   "basis": "8bb26b4ed29dbc9ae16201f42ccfd053469ffe17041b55a51f787462873f5d76",
+   "grade": "B",
+   "label": {
+    "away": 0,
+    "home": 0
+   },
+   "layout": "monday_night",
+   "match": "match-20261017-162055",
+   "state": "active"
+  },
+  "mnp-f_0070000": {
+   "basis": "8bb26b4ed29dbc9ae16201f42ccfd053469ffe17041b55a51f787462873f5d76",
+   "grade": "B",
+   "label": {
+    "away": 0,
+    "home": 0
+   },
+   "layout": "monday_night",
+   "match": "match-20261017-162055",
+   "state": "active"
+  },
+  "mnp-f_0370000": {
+   "basis": "dd56de50e4ce5ef8b129887a3f8221cc60073d622907a7d8624d5cd2dedcef82",
+   "grade": "B",
+   "label": {
+    "away": 0,
+    "home": 14
+   },
+   "layout": "monday_night",
+   "match": "match-20261017-162055",
+   "state": "active"
+  },
+  "mnp-f_0450000": {
+   "basis": "dd56de50e4ce5ef8b129887a3f8221cc60073d622907a7d8624d5cd2dedcef82",
+   "grade": "B",
+   "label": {
+    "away": 0,
+    "home": 14
+   },
+   "layout": "monday_night",
+   "match": "match-20261017-162055",
+   "state": "active"
+  },
+  "mnp-f_0530000": {
+   "basis": "dd56de50e4ce5ef8b129887a3f8221cc60073d622907a7d8624d5cd2dedcef82",
+   "grade": "B",
+   "label": {
+    "away": 0,
+    "home": 14
+   },
+   "layout": "monday_night",
+   "match": "match-20261017-162055",
+   "state": "active"
+  },
+  "mnp-f_0550000": {
+   "basis": "dd56de50e4ce5ef8b129887a3f8221cc60073d622907a7d8624d5cd2dedcef82",
+   "grade": "B",
+   "label": {
+    "away": 0,
+    "home": 14
+   },
+   "layout": "monday_night",
+   "match": "match-20261017-162055",
+   "state": "active"
+  },
+  "mnp-f_0610000": {
+   "basis": "dd56de50e4ce5ef8b129887a3f8221cc60073d622907a7d8624d5cd2dedcef82",
+   "grade": "B",
+   "label": {
+    "away": 0,
+    "home": 14
+   },
+   "layout": "monday_night",
+   "match": "match-20261017-162055",
+   "state": "active"
+  },
+  "mnp-f_0630000": {
+   "basis": "dd56de50e4ce5ef8b129887a3f8221cc60073d622907a7d8624d5cd2dedcef82",
+   "grade": "B",
+   "label": {
+    "away": 0,
+    "home": 14
+   },
+   "layout": "monday_night",
+   "match": "match-20261017-162055",
+   "state": "active"
+  },
+  "mnp-f_0690000": {
+   "basis": "dd56de50e4ce5ef8b129887a3f8221cc60073d622907a7d8624d5cd2dedcef82",
+   "grade": "B",
+   "label": {
+    "away": 0,
+    "home": 14
+   },
+   "layout": "monday_night",
+   "match": "match-20261017-162055",
+   "state": "active"
+  },
+  "mnp-f_0760500": {
+   "basis": "6ead85b6c9f96de88874440dd3b57fb75020c0e99ad1add9dd705f75d2bca981",
+   "grade": "B",
+   "label": {
+    "away": 6,
+    "home": 14
+   },
+   "layout": "monday_night",
+   "match": "match-20261017-162055",
+   "state": "active"
+  },
+  "mnp-f_0790000": {
+   "basis": "6ead85b6c9f96de88874440dd3b57fb75020c0e99ad1add9dd705f75d2bca981",
+   "grade": "B",
+   "label": {
+    "away": 6,
+    "home": 14
+   },
+   "layout": "monday_night",
+   "match": "match-20261017-162055",
+   "state": "active"
+  },
+  "mnp-f_0810000": {
+   "basis": "6ead85b6c9f96de88874440dd3b57fb75020c0e99ad1add9dd705f75d2bca981",
+   "grade": "B",
+   "label": {
+    "away": 6,
+    "home": 14
+   },
+   "layout": "monday_night",
+   "match": "match-20261017-162055",
+   "state": "active"
+  },
+  "mnp-f_0830000": {
+   "basis": "6ead85b6c9f96de88874440dd3b57fb75020c0e99ad1add9dd705f75d2bca981",
+   "grade": "B",
+   "label": {
+    "away": 6,
+    "home": 14
+   },
+   "layout": "monday_night",
+   "match": "match-20261017-162055",
+   "state": "active"
+  },
+  "mnp-f_0837500": {
+   "basis": "6ead85b6c9f96de88874440dd3b57fb75020c0e99ad1add9dd705f75d2bca981",
+   "grade": "B",
+   "label": {
+    "away": 6,
+    "home": 14
+   },
+   "layout": "monday_night",
+   "match": "match-20261017-162055",
+   "state": "active"
+  },
+  "mnp-f_0850000": {
+   "basis": "6ead85b6c9f96de88874440dd3b57fb75020c0e99ad1add9dd705f75d2bca981",
+   "grade": "B",
+   "label": {
+    "away": 6,
+    "home": 14
+   },
+   "layout": "monday_night",
+   "match": "match-20261017-162055",
+   "state": "active"
+  },
+  "mnp-f_0930000": {
+   "basis": "6ead85b6c9f96de88874440dd3b57fb75020c0e99ad1add9dd705f75d2bca981",
+   "grade": "B",
+   "label": {
+    "away": 6,
+    "home": 14
+   },
+   "layout": "monday_night",
+   "match": "match-20261017-162055",
+   "state": "active"
+  },
+  "mnp-f_0950000": {
+   "basis": "6ead85b6c9f96de88874440dd3b57fb75020c0e99ad1add9dd705f75d2bca981",
+   "grade": "B",
+   "label": {
+    "away": 6,
+    "home": 14
+   },
+   "layout": "monday_night",
+   "match": "match-20261017-162055",
+   "state": "active"
+  },
+  "mnp-f_1010000": {
+   "basis": "6ead85b6c9f96de88874440dd3b57fb75020c0e99ad1add9dd705f75d2bca981",
+   "grade": "B",
+   "label": {
+    "away": 6,
+    "home": 14
+   },
+   "layout": "monday_night",
+   "match": "match-20261017-162055",
+   "state": "active"
+  },
+  "mnp-f_1030000": {
+   "basis": "6ead85b6c9f96de88874440dd3b57fb75020c0e99ad1add9dd705f75d2bca981",
+   "grade": "B",
+   "label": {
+    "away": 6,
+    "home": 14
+   },
+   "layout": "monday_night",
+   "match": "match-20261017-162055",
+   "state": "active"
+  },
+  "mnp-f_1049500": {
+   "basis": "6ead85b6c9f96de88874440dd3b57fb75020c0e99ad1add9dd705f75d2bca981",
+   "grade": "B",
+   "label": {
+    "away": 6,
+    "home": 14
+   },
+   "layout": "monday_night",
+   "match": "match-20261017-162055",
+   "state": "active"
+  },
+  "snp-099": {
+   "basis": "reader-lock:match-20261017-002326:1792214990",
+   "grade": "B",
+   "label": {
+    "away": 7,
+    "home": 0
+   },
+   "layout": "primetime",
+   "match": "match-20261017-002326",
+   "state": "active"
+  },
+  "tnp-062": {
+   "basis": "reader-lock:match-20261017-010703:1792217780",
+   "grade": "B",
+   "label": {
+    "away": 7,
+    "home": 7
+   },
+   "layout": "thursday_night",
+   "match": "match-20261017-010703",
+   "state": "active"
+  },
+  "tnp-092": {
+   "basis": "reader-lock:match-20261017-010703:1792217981",
+   "grade": "B",
+   "label": {
+    "away": 7,
+    "home": 14
+   },
+   "layout": "thursday_night",
+   "match": "match-20261017-010703",
+   "state": "active"
+  },
+  "tnp-093": {
+   "basis": "reader-lock:match-20261017-010703:1792217981",
+   "grade": "B",
+   "label": {
+    "away": 7,
+    "home": 14
+   },
+   "layout": "thursday_night",
+   "match": "match-20261017-010703",
+   "state": "active"
+  },
+  "tnp-219": {
+   "basis": "reader-lock:match-20261017-010703:1792219199",
+   "grade": "B",
+   "label": {
+    "away": 27,
+    "home": 20
+   },
+   "layout": "thursday_night",
+   "match": "match-20261017-010703",
+   "state": "active"
+  },
+  "tnp-261": {
+   "basis": "reader-lock:match-20261017-010703:1792219448",
+   "grade": "B",
+   "label": {
+    "away": 34,
+    "home": 20
+   },
+   "layout": "thursday_night",
+   "match": "match-20261017-010703",
+   "state": "active"
+  },
+  "tnp-264": {
+   "basis": "reader-lock:match-20261017-010703:1792219448",
+   "grade": "B",
+   "label": {
+    "away": 34,
+    "home": 20
+   },
+   "layout": "thursday_night",
+   "match": "match-20261017-010703",
+   "state": "active"
+  },
+  "tnp-268": {
+   "basis": "reader-lock:match-20261017-010703:1792219448",
+   "grade": "B",
+   "label": {
+    "away": 34,
+    "home": 20
+   },
+   "layout": "thursday_night",
+   "match": "match-20261017-010703",
+   "state": "active"
+  },
+  "tnp-277": {
+   "basis": "reader-lock:match-20261017-010703:1792219448",
+   "grade": "B",
+   "label": {
+    "away": 34,
+    "home": 20
+   },
+   "layout": "thursday_night",
+   "match": "match-20261017-010703",
+   "state": "active"
+  },
+  "tnp-289": {
+   "basis": "reader-lock:match-20261017-010703:1792219769",
+   "grade": "B",
+   "label": {
+    "away": 34,
+    "home": 26
+   },
+   "layout": "thursday_night",
+   "match": "match-20261017-010703",
+   "state": "active"
+  }
+ },
+ "games": [
+  "match-20261016-125430",
+  "match-20261017-002326",
+  "match-20261017-010703",
+  "match-20261017-021003",
+  "match-20261017-162055"
+ ],
+ "looks": {
+  "monday_night": 0,
+  "primetime": 0,
+  "thursday_night": 0
+ },
+ "tuned": {
+  "m4-021910": "match-20261017-021003",
+  "m4-021918": "match-20261017-021003",
+  "m4-023744": "match-20261017-021003",
+  "m4-023848": "match-20261017-021003",
+  "m4-024729": "match-20261017-021003",
+  "mnp-f_0015250": "match-20261017-162055",
+  "mnp-f_0015500": "match-20261017-162055",
+  "mnp-f_0192000": "match-20261017-162055",
+  "mnp-f_0210000": "match-20261017-162055",
+  "mnp-f_0230000": "match-20261017-162055",
+  "mnp-f_0250000": "match-20261017-162055",
+  "mnp-f_0270000": "match-20261017-162055",
+  "mnp-f_0350000": "match-20261017-162055",
+  "mnp-f_0390000": "match-20261017-162055",
+  "mnp-f_0410000": "match-20261017-162055",
+  "mnp-f_0430000": "match-20261017-162055",
+  "mnp-f_0540250": "match-20261017-162055",
+  "mnp-f_0570000": "match-20261017-162055",
+  "mnp-f_0590000": "match-20261017-162055",
+  "mnp-f_0650000": "match-20261017-162055",
+  "mnp-f_0670000": "match-20261017-162055",
+  "mnp-f_0770000": "match-20261017-162055",
+  "mnp-f_0870000": "match-20261017-162055",
+  "mnp-f_0890000": "match-20261017-162055",
+  "mnp-f_0910000": "match-20261017-162055",
+  "mnp-f_0930500": "match-20261017-162055",
+  "mnp-f_0970000": "match-20261017-162055",
+  "mnp-f_0990000": "match-20261017-162055",
+  "mnp-f_1050000": "match-20261017-162055",
+  "mnp-f_1070000": "match-20261017-162055",
+  "tnp-018": "match-20261017-010703",
+  "tnp-089": "match-20261017-010703",
+  "tnp-113": "match-20261017-010703",
+  "tnp-114": "match-20261017-010703",
+  "tnp-153": "match-20261017-010703",
+  "tnp-160": "match-20261017-010703",
+  "tnp-167": "match-20261017-010703",
+  "tnp-171": "match-20261017-010703",
+  "tnp-193": "match-20261017-010703",
+  "tnp-263": "match-20261017-010703",
+  "tnp-278": "match-20261017-010703",
+  "tnp-295": "match-20261017-010703"
+ }
+}

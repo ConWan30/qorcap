@@ -1,0 +1,42 @@
+{
+ "match": "match-20261017-002326",
+ "layout": "primetime",
+ "chain": {
+  "verified": false,
+  "head": null,
+  "n": 5
+ },
+ "champion": "full_v0",
+ "frames_cached": 17,
+ "labelled": 1,
+ "grades": {
+  "B": 1
+ },
+ "bank_added": 1,
+ "tune": 0,
+ "bank_stats": {
+  "primetime:active": 1
+ },
+ "candidates": [],
+ "lesson": null,
+ "pending": null,
+ "decision": null,
+ "champion_on_game": {
+  "right": 0,
+  "wrong": 0,
+  "abstain": 1,
+  "other": 0,
+  "missing": 4
+ },
+ "hard": {
+  "wrong": [],
+  "unsure": [],
+  "disagree_reader": []
+ },
+ "review_queue": [
+  "snp-122"
+ ],
+ "spend_usd": 0.0,
+ "would_cost_live_usd": 0.0,
+ "lab_version": "glimpse-lab/0.1.0-proposal"
+}

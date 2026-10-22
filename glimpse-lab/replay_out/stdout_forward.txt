@@ -1,0 +1,27 @@
+== match-20261016-125430 [regular] chain_verified=True frames=0 labelled=0 {} audit=0/0 (n/a 0)
+   free-label capacity if sampled every 4 s: {'sampled': 184, 'labelled': 106, 'step_s': 4}; review queue: 0
+   champion=watch_012 on game {'right': 0, 'wrong': 0, 'abstain': 0, 'other': 0, 'missing': 0} hard={'wrong': 0, 'unsure': 0, 'disagree_reader': 0}
+   lesson: NO_ENTRY
+   pending: None  bank: {}  spend $0.00  live-equivalent $0.0
+== match-20261017-002326 [primetime] chain_verified=False frames=17 labelled=1 {'B': 1} audit=1/1 (n/a 0)
+   free-label capacity if sampled every 4 s: {'sampled': 150, 'labelled': 89, 'step_s': 4}; review queue: 4
+   champion=watch_012 on game {'right': 1, 'wrong': 0, 'abstain': 0, 'other': 0, 'missing': 0} hard={'wrong': 0, 'unsure': 0, 'disagree_reader': 0}
+   lesson: NO_ENTRY
+   pending: None  bank: {'primetime:active': 1}  spend $0.00  live-equivalent $0.0
+== match-20261017-010703 [thursday_night] chain_verified=False frames=55 labelled=21 {'B': 21} audit=13/13 (n/a 8)
+   free-label capacity if sampled every 4 s: {'sampled': 776, 'labelled': 608, 'step_s': 4}; review queue: 18
+   champion=watch_012 on game {'right': 13, 'wrong': 0, 'abstain': 0, 'other': 8, 'missing': 0} hard={'wrong': 0, 'unsure': 0, 'disagree_reader': 0}
+   lesson: NO_ENTRY
+   pending: None  bank: {'primetime:active': 1, 'thursday_night:active': 9}  spend $0.00  live-equivalent $0.0
+== match-20261017-021003 [primetime] chain_verified=False frames=43 labelled=11 {'B': 11} audit=9/9 (n/a 2)
+   free-label capacity if sampled every 4 s: {'sampled': 582, 'labelled': 257, 'step_s': 4}; review queue: 20
+   champion=watch_012 on game {'right': 9, 'wrong': 0, 'abstain': 0, 'other': 2, 'missing': 0} hard={'wrong': 0, 'unsure': 0, 'disagree_reader': 0}
+   lesson: NO_ENTRY
+   pending: None  bank: {'primetime:active': 7, 'thursday_night:active': 9}  spend $0.00  live-equivalent $0.0
+== match-20261017-162055 [monday_night] chain_verified=True frames=90 labelled=45 {'B': 45} audit=45/45 (n/a 0)
+   free-label capacity if sampled every 4 s: {'sampled': 392, 'labelled': 224, 'step_s': 4}; review queue: 3
+   champion=watch_012 on game {'right': 45, 'wrong': 0, 'abstain': 0, 'other': 0, 'missing': 0} hard={'wrong': 0, 'unsure': 0, 'disagree_reader': 0}
+   lesson: NO_ENTRY
+   pending: None  bank: {'primetime:active': 7, 'thursday_night:active': 9, 'monday_night:active': 20}  spend $0.00  live-equivalent $0.0
+lesson ledger verified=True entries=5; spend ledger verified=True entries=5
+final champion: watch_012; pending: []
