@@ -2,7 +2,7 @@
 
 # QorCap
 
-**Website:** https://conwan30.github.io/qorcap/ · **Download:** [v0.3.29](https://github.com/ConWan30/qorcap/releases/tag/v0.3.29) ([latest release](https://github.com/ConWan30/qorcap/releases/latest))
+**Website:** https://conwan30.github.io/qorcap/ · **Download:** [v0.3.30](https://github.com/ConWan30/qorcap/releases/tag/v0.3.30) ([latest release](https://github.com/ConWan30/qorcap/releases/latest))
 
 A small Windows recorder for a USB HDMI capture card (built for a generic **"USB3.0 Video"** card carrying a PS5),
 made for **[QorTime](https://github.com/ConWan30/qortime)** match receipts. It does two jobs:
@@ -26,7 +26,7 @@ with a local control surface). QorCap copies only that design idea, no code. No 
 
 ## Quickstart: double-click Start Match
 
-1. Download `qorcap-v0.3.29-windows-x64.zip` from the [latest release](https://github.com/ConWan30/qorcap/releases/latest)
+1. Download `qorcap-v0.3.30-windows-x64.zip` from the [latest release](https://github.com/ConWan30/qorcap/releases/latest)
    and unzip it, for example to `C:\QorCap` (right-click the zip, *Extract All*).
 2. Connect PS5 HDMI out to the **USB3.0 Video** card, and the card to a blue USB 3 port. Close OBS or the Camera app.
 3. Double-click **`Start Match`**. On the first run it downloads ffmpeg, installs Python 3.12 through winget if it
@@ -386,7 +386,7 @@ Global: `--port 8788`, `--ffmpeg PATH`, `--log FILE` (default `qorcap.log`, or `
 ## Run on Windows by hand (PowerShell, advanced)
 
 ```powershell
-# 1. unzip qorcap-v0.3.29-windows-x64.zip to C:\QorCap, then:
+# 1. unzip qorcap-v0.3.30-windows-x64.zip to C:\QorCap, then:
 cd C:\QorCap
 Unblock-File .\qorcap.exe, .\get-ffmpeg.ps1
 powershell -ExecutionPolicy Bypass -File .\get-ffmpeg.ps1     # puts ffmpeg.exe next to qorcap.exe
@@ -423,6 +423,8 @@ continues), replay save, challenge stamp visible in the video, score/final event
 written, `verify-bundle` OK, and a single flipped byte reported as FAIL.
 
 **Tested on Windows (v0.2.0–v0.2.1 era, MyTurn, USB3.0 Video):** `--input-format mjpeg` 1280x720@30 with `h264_mf` at 29.7 fps. v0.2.1 fixed audio / auto-format / OBS.
+
+**v0.3.30:** the TPM device key is created on Intel PTT. PR #62: `qorcap device-key init` called `NCryptIsAlgSupported` with `NCRYPT_SILENT_FLAG`, which the Microsoft Platform Crypto Provider rejects with `NTE_BAD_FLAGS` (`0x80090009`), so neither ECDSA P-256 nor RSA-2048 was tried and init fell back to the software key. The algorithm check and `NCryptDeleteKey` now pass flags 0, and a fallback records each call's HRESULT. Run `qorcap device-key init` again on a PC that fell back to replace the software key record with a TPM key. `receipt.v0.json` is unchanged and the software fallback is kept.
 
 **v0.3.29:** device key, red team, and pad identity. This release collects the changes that landed after v0.3.28. PR #53: manifest and clip paths outside the bundle are refused, the signer keeps only the properties `receipt.v0.json` allows, the Glimpse observer key moves to `QORCAP_HOME/keys` with owner-only creation, the pinned QorTime download refuses zip-slip members, and an unusable OpenRouter cost is booked at the worst-case estimate. PR #54: haptic bursts that look like a grip jolt or hand motion are low-confidence instead of high-confidence; they are not dropped. PR #55: `qorcap redteam` scores synthetic replay, relay, splice, and receipt attacks with the checks that already ship (see [docs/REDTEAM.md](docs/REDTEAM.md)). PR #56: README corrections (a DualSense was read; the QorTime referee is live). PR #57: `qorcap device-key init|status` creates an opt-in TPM-backed (or software fallback) device key and writes the `device_attest.v0.json` sidecar; `receipt.json` gains no fields. PR #58: `qorcap submit` refuses a side-corrected or offline-re-signed receipt before any network call (exit 4, `state: not_submitted`). PR #59: a signed `score_timeline.json` sidecar for two-sided corroboration. PR #60: the controller identity is sealed into `inputs.jsonl` and `input-proof` fails corroboration when the pad changes mid-match. `receipt.v0.json` is unchanged, Glimpse stays observer-only, `QORCAP_GLIMPSE_TD_VETO` stays off, and nothing is written to the controller.
 
