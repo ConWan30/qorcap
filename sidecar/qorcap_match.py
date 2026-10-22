@@ -857,6 +857,10 @@ def main(argv=None) -> int:
         argv.remove("submit")
         from qorcap_submit import main as submit_main
         return submit_main(argv)
+    if "pair" in argv:  # `qorcap_match.py pair create|join` -> pairing.json beside the receipt
+        argv.remove("pair")
+        from qorcap_pairing import main as pair_main
+        return pair_main(argv)
     ap = argparse.ArgumentParser(description="QorCap one-click match")
     ap.add_argument("--test-pattern", action="store_true", help="no capture card: synthetic video + scripted scores")
     ap.add_argument("--test-secs", type=float, default=20.0, help="test-pattern game length")
@@ -892,6 +896,14 @@ def main(argv=None) -> int:
                          "Start Match passes this. A failure does not change the receipt or the submission.")
     ap.add_argument("--no-auto-highlights", action="store_true",
                     help="do not cut highlight clips after the match (overrides --auto-highlights)")
+    pair = ap.add_mutually_exclusive_group()
+    pair.add_argument("--pair", choices=["create"], default=None,
+                      help="ask the referee for a pairing token (POST /v1/pairings), write pairing.json "
+                           "beside the receipt, and print a code the other player joins with. "
+                           "Corroboration does not change the verdict.")
+    pair.add_argument("--pair-code", default=None,
+                      help="join the other player's pairing code. Writes the same pairing.json. "
+                           "Does not modify receipt.json.")
     a = ap.parse_args(argv)
     if a.no_official_challenges:
         a.official_challenges = False
@@ -955,6 +967,14 @@ def main(argv=None) -> int:
         if alive:
             say(f"QorCap is already running (pid {pid}). Close that Start Match window first.")
             return 4
+
+    if a.pair or a.pair_code:
+        from qorcap_pairing import apply_pairing
+        from qorcap_submit import OFFICIAL_URL
+        paired = apply_pairing(bundle, create=a.pair == "create", code=a.pair_code,
+                               base=a.referee_url or OFFICIAL_URL)
+        if paired != 0:
+            return paired
 
     cmd = [qorcap, "--port", str(a.port)] + (["--ffmpeg", a.ffmpeg] if a.ffmpeg else []) + [
         "record", "--device", "testpattern" if a.test_pattern else a.device, "--res", a.res, "--fps", a.fps,

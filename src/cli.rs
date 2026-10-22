@@ -180,6 +180,29 @@ pub enum Cmd {
         #[command(subcommand)]
         action: DeviceKeyCmd,
     },
+    /// Create or join a referee pairing token. Writes `pairing.json` beside the receipt.
+    /// Does not modify `receipt.json`. Corroboration does not change a verdict.
+    Pair {
+        /// Match bundle folder. `pairing.json` is written here.
+        #[arg(long, global = true)]
+        bundle: Option<String>,
+        /// Python interpreter (default: QorCap's venv, then py/python3/python)
+        #[arg(long, global = true)]
+        python: Option<String>,
+        /// Referee service URL (default: the official QorTime referee)
+        #[arg(long, global = true)]
+        referee: Option<String>,
+        #[command(subcommand)]
+        action: PairCmd,
+    },
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum PairCmd {
+    /// POST /v1/pairings and print a code the other player joins with.
+    Create,
+    /// Write the other player's pairing code into `pairing.json`.
+    Join { code: String },
 }
 
 #[derive(Subcommand, Debug, Clone)]
@@ -406,6 +429,8 @@ mod tests {
         assert!(matches!(Cli::try_parse_from(["qorcap", "input-test"]).unwrap().cmd, Cmd::InputTest { secs: None }));
         assert!(matches!(Cli::try_parse_from(["qorcap", "submit", "b", "--full"]).unwrap().cmd, Cmd::Submit { full: true, .. }));
         assert!(matches!(Cli::try_parse_from(["qorcap", "submit"]).unwrap().cmd, Cmd::Submit { bundle: None, full: false, yes: false, .. }));
+        assert!(matches!(Cli::try_parse_from(["qorcap", "pair", "create", "--bundle", "b"]).unwrap().cmd, Cmd::Pair { action: PairCmd::Create, .. }));
+        assert!(matches!(Cli::try_parse_from(["qorcap", "pair", "join", "qorpair1.abc", "--bundle", "b"]).unwrap().cmd, Cmd::Pair { action: PairCmd::Join { .. }, .. }));
         assert!(matches!(Cli::try_parse_from(["qorcap", "input-proof", "b", "--frames", "10"]).unwrap().cmd, Cmd::InputProof { frames: 10, .. }));
         if let Cmd::Record(r) = Cli::try_parse_from(["qorcap", "record", "--no-controller"]).unwrap().cmd { assert!(r.no_controller); assert!(!r.frame_clock); } else { panic!() }
         if let Cmd::Record(r) = Cli::try_parse_from(["qorcap", "record", "--frame-clock"]).unwrap().cmd { assert!(r.frame_clock); } else { panic!() }
