@@ -163,6 +163,16 @@ pub enum Cmd {
         #[arg(long)]
         force: bool,
     },
+    /// Adversarial bundles from the in-tree fixtures. Prints which current check catches each attack.
+    /// Does not change a verification rule. Exit 0: a MISSED row is a result, not a command failure.
+    Redteam {
+        /// Write the matrix JSON here
+        #[arg(long)]
+        out: Option<String>,
+        /// Write docs/REDTEAM.md here
+        #[arg(long)]
+        markdown: Option<String>,
+    },
 }
 
 #[derive(Subcommand, Debug, Clone)]

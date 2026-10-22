@@ -177,9 +177,8 @@ pub fn score(recs: &[Value]) -> Value {
            "presses": total_presses, "samples": s.len(), "disclaimer": DISCLAIMER})
 }
 
-#[cfg(test)]
 pub mod synth {
-    //! Deterministic synthetic sessions used by tests (and documented as the reference fixtures).
+    //! Deterministic synthetic sessions used by tests and `qorcap redteam`.
     use crate::hid::{self, Pad};
     use crate::inputs::record;
     use serde_json::Value;

@@ -2054,6 +2054,7 @@ dependencies = [
  "c2pa",
  "clap",
  "ctrlc",
+ "ed25519-dalek",
  "hidapi",
  "libc",
  "log",
