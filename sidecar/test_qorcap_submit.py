@@ -318,3 +318,97 @@ def test_submit_prompt_times_out_to_no(tmp_path, capsys):
     assert "No answer" in capsys.readouterr().out
     # the timeout answer is a plain No: nothing is submitted
     assert qm.offer_submit(tmp_path, None, ask=lambda p: qm.ask_with_timeout(p, 0.1, stdin=open(os.devnull))) is None
+
+
+class _NoNet:
+    """Client stand-in. submit() must not call it when the receipt is not submittable."""
+
+    def __init__(self):
+        self.calls = 0
+
+    def call(self, *a, **k):
+        self.calls += 1
+        raise OSError("network")
+
+
+def _resign(cp, key, match_id, role, ts):
+    from qor_receipt.checkpoints import countersign
+
+    body = {k: cp[k] for k in ("seq", "t_ms", "frames_hash", "input_hash", "prev", "hash")}
+    return countersign(key, match_id, role, body, int(ts))
+
+
+def _refused(bundle, capsys):
+    net = _NoNet()
+    code = qs.submit(bundle, base="http://referee.test", client=net)
+    out = capsys.readouterr().out
+    sub = json.loads((bundle / "submission.json").read_text())
+    assert net.calls == 0, out
+    assert code == 4, out
+    assert sub["state"] == "not_submitted"
+    return sub, out
+
+
+def test_side_corrected_bundle_refused_before_network(tmp_path, capsys):
+    """finalize --role re-signs every checkpoint offline. The referee rejects that; so does submit(), first."""
+    from qor_receipt.keys import SoftwareKey
+
+    _env(tmp_path)
+    b = tmp_path / "match-1"
+    rec = json.loads((b / "receipt.json").read_text())
+    meta = json.loads((b / "bundle.json").read_text())
+    local = SoftwareKey()
+    mid = rec["match"]["match_id"]
+    rec["checkpoints"] = {"away": [_resign(cp, local, mid, "away", cp["t_ms"]) for cp in rec["checkpoints"]["home"]]}
+    rec["players"][0]["role"] = "away"
+    rec["referee"]["key_kind"] = qs.OFFLINE_KEY_KIND
+    meta["role"] = "away"
+    (b / "receipt.json").write_text(json.dumps(rec), encoding="utf-8")
+    (b / "bundle.json").write_text(json.dumps(meta), encoding="utf-8")
+    sub, out = _refused(b, capsys)
+    assert sub["checkpoint"] == 0 and sub["field"] == "referee_sig"
+    assert "checkpoint 0" in out and "checkpoint 0" in sub["error"]
+
+
+def test_tampered_timestamp_resigned_offline_is_refused(tmp_path, capsys):
+    """One checkpoint's referee timestamp, re-signed offline, is not the live countersignature."""
+    from qor_receipt.keys import SoftwareKey
+
+    _env(tmp_path)
+    b = tmp_path / "match-1"
+    rec = json.loads((b / "receipt.json").read_text())
+    local = SoftwareKey()
+    mid = rec["match"]["match_id"]
+    cps = rec["checkpoints"]["home"]
+    cps[0] = _resign(cps[0], local, mid, "home", int(cps[0]["referee_ts_ms"]) + 5_000)
+    rec["checkpoints"]["home"] = cps
+    rec["referee"]["key_kind"] = qs.OFFLINE_KEY_KIND
+    (b / "receipt.json").write_text(json.dumps(rec), encoding="utf-8")
+    sub, out = _refused(b, capsys)
+    assert sub["checkpoint"] == 0 and sub["field"] == "referee_sig"
+    assert "checkpoint 0" in sub["error"] and "NOT SUBMITTABLE" in out
+
+
+def test_offline_signed_receipt_refused_when_live_countersigned_log_exists(tmp_path, capsys):
+    """Copied live signatures still must not be submitted under an offline key kind."""
+    _env(tmp_path)
+    b = tmp_path / "match-1"
+    rec = json.loads((b / "receipt.json").read_text())
+    rec["referee"]["key_kind"] = qs.OFFLINE_KEY_KIND
+    (b / "receipt.json").write_text(json.dumps(rec), encoding="utf-8")
+    sub, _out = _refused(b, capsys)
+    assert sub["checkpoint"] == 0 and sub["field"] == "key_kind"
+    (b / "countersigned.jsonl").unlink()
+    assert qs.countersigned_mismatch(b) is None
+
+
+def test_live_signed_bundle_still_passes(tmp_path, capsys):
+    F, key, fx, client = _env(tmp_path)
+    b = tmp_path / "match-1"
+    assert (b / "countersigned.jsonl").stat().st_size > 0
+    assert qs.countersigned_mismatch(b) is None
+    code = qs.submit(b, base="http://referee.test", client=client, device=fx["device"])
+    out = capsys.readouterr().out
+    assert code == 1, out
+    assert json.loads((b / "submission.json").read_text())["state"] == "complete"
+    assert "NOT SUBMITTABLE" not in out

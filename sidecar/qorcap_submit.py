@@ -46,6 +46,9 @@ HERE = Path(__file__).resolve().parent
 CLIENT_VERSION = "0.3.28"
 SUBMIT_TYPE = "qortime-submit/v1"   # = QorTime contracts compat.json submit_auth.request_type
 POW_PREFIX = "qortime-pow/v1|"      # = compat.json submit_auth.pow_prefix
+# Same wire value as qorcap_match.REFEREE_KIND_OFFLINE. A receipt carrying it was signed on this PC
+# after the fact; it is not the live countersigned log.
+OFFLINE_KEY_KIND = "local-self-attested-offline"
 
 
 def say(msg: str = "") -> None:
@@ -200,6 +203,71 @@ def print_checks(review: dict | None) -> None:
         say(f"    {st.upper():8s} {name}: {d}")
 
 
+def _jsonl_dicts(path: Path) -> list[dict]:
+    """JSONL objects, blank and corrupt lines skipped. Same inclusion rule as the referee's parse_jsonl."""
+    if not path.exists():
+        return []
+    out = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            v = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(v, dict):
+            out.append(v)
+    return out
+
+
+def countersigned_mismatch(bundle: Path) -> dict | None:
+    """First receipt checkpoint that is not the live countersigned log, or an offline re-sign of one.
+
+    Port of qortime ``qor_receipt/review/bundle.py`` ``check_receipt_binding`` (the countersigned
+    loop, pin 0204e6d lines 241-245). The referee zips ``receipt.checkpoints[role]`` with
+    ``countersigned.jsonl`` and stops at the first pair whose ``hash`` or ``referee_sig`` differs.
+    Role is ``bundle.json`` role, else the receipt player, else ``home`` (Bundle.role).
+
+    Also refuses ``referee.key_kind == local-self-attested-offline`` when that live log exists,
+    even if the checkpoint strings were copied across. There is no path here that rebuilds a
+    live countersignature.
+
+    Returns ``{checkpoint, field, error}`` or None. ``field`` is ``hash``, ``referee_sig``, or
+    ``key_kind``.
+    """
+    receipt = json.loads((bundle / "receipt.json").read_text(encoding="utf-8"))
+    meta = json.loads((bundle / "bundle.json").read_text(encoding="utf-8"))
+    if not isinstance(receipt, dict):
+        receipt = {}
+    if not isinstance(meta, dict):
+        meta = {}
+    role = str(meta.get("role") or (receipt.get("players") or [{}])[0].get("role") or "home")
+    cps = (receipt.get("checkpoints") or {}).get(role) or []
+    if not isinstance(cps, list):
+        cps = []
+    countersigned = _jsonl_dicts(bundle / "countersigned.jsonl")
+    if not countersigned:
+        return None
+    for i, (x, y) in enumerate(zip(cps, countersigned)):
+        # qor_receipt.review.bundle.check_receipt_binding:
+        #   if x.get("hash") != y.get("hash") or x.get("referee_sig") != y.get("referee_sig"):
+        #       errs.append(f"receipt checkpoint {i} differs from countersigned.jsonl")
+        x = x if isinstance(x, dict) else {}
+        y = y if isinstance(y, dict) else {}
+        hash_differs = x.get("hash") != y.get("hash")
+        sig_differs = x.get("referee_sig") != y.get("referee_sig")
+        if hash_differs or sig_differs:
+            field = "hash" if hash_differs else "referee_sig"
+            return {"checkpoint": i, "field": field,
+                    "error": f"receipt checkpoint {i} {field} differs from countersigned.jsonl"}
+    kind = str((receipt.get("referee") or {}).get("key_kind") or "")
+    if kind == OFFLINE_KEY_KIND:
+        return {"checkpoint": 0, "field": "key_kind",
+                "error": "offline-signed receipt (key_kind local-self-attested-offline) "
+                         "while countersigned.jsonl exists"}
+    return None
+
+
 def submit(bundle: Path, *, base: str, full: bool = False, key_path: Path | None = None, client: Client | None = None,
            device=None, out_name: str = "receipt.official.json") -> int:
     bundle = bundle.resolve()
@@ -207,6 +275,17 @@ def submit(bundle: Path, *, base: str, full: bool = False, key_path: Path | None
         if not (bundle / need).exists():
             say(f"PROBLEM: {bundle} has no {need}. Run Start Match (or 'qorcap finalize') first so receipt.json exists.")
             return 2
+    # Before any network call. A side-corrected or offline-resigned receipt is not_submitted
+    # here; the referee would answer HTTP 422.
+    mismatch = countersigned_mismatch(bundle)
+    if mismatch is not None:
+        say(f"NOT SUBMITTABLE: {mismatch['error']}")
+        say("Nothing was sent to the referee.")
+        log = {"referee": base, "bundle": str(bundle), "started": int(time.time()),
+               "state": "not_submitted", "checkpoint": mismatch["checkpoint"], "field": mismatch["field"],
+               "error": mismatch["error"]}
+        (bundle / "submission.json").write_text(json.dumps(log, indent=2), encoding="utf-8")
+        return 4
     c = client or Client(base)
     log: dict = {"referee": base, "bundle": str(bundle), "started": int(time.time())}
 
