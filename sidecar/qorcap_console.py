@@ -374,13 +374,23 @@ def _want_unicode(env: dict, stream) -> bool:
 
 
 def enable_windows_vt(stream) -> bool:
-    """Turn on VT processing and UTF-8 for conhost and Windows Terminal. No-op elsewhere."""
+    """Turn on VT processing and UTF-8 for the caller's conhost or Windows Terminal.
+
+    A no-op off Windows. The stream's own handle is used. The process standard
+    output is a pipe under CI, and probing that pipe refused the branded layout
+    for a different terminal. A stand-in with no Win32 handle has no mode bit to
+    set. A real console whose mode cannot be set still returns False.
+    """
     if os.name != "nt":
         return True
     try:
         import ctypes
+        import msvcrt
+        try:
+            handle = msvcrt.get_osfhandle(stream.fileno())
+        except (AttributeError, OSError, ValueError):
+            return True
         kernel = ctypes.windll.kernel32
-        handle = kernel.GetStdHandle(-11)
         mode = ctypes.c_uint()
         if not kernel.GetConsoleMode(handle, ctypes.byref(mode)):
             return False

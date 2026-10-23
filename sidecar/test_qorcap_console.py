@@ -1,7 +1,6 @@
 """Snapshots and fallbacks for the Start Match console. Presentation only."""
 import io
 import json
-import os
 import subprocess
 import sys
 import threading
@@ -182,20 +181,14 @@ def test_color_and_plain_policy():
     assert qc.branded_requested(False, Tty(), {"QORCAP_PLAIN": "1"}) is False
     assert qc.branded_requested(False, Tty(), {"TERM": "dumb"}) is False
     assert qc.branded_requested(False, io.StringIO(), {"TERM": "xterm-256color"}) is False
+    assert qc.branded_requested(False, Tty(), {"NO_COLOR": "1", "TERM": "xterm-256color"}) is True
     assert qc._color_level({"NO_COLOR": "", "QORCAP_COLOR": "truecolor"}) == "none"
     assert qc._color_level({"WT_SESSION": "1"}) == "truecolor"
     assert qc._color_level({"COLORTERM": "truecolor"}) == "truecolor"
     assert qc._color_level({"TERM": "xterm-256color"}) == "256"
     assert qc._color_level({"QORCAP_COLOR": "16", "TERM": "xterm-256color"}) == "16"
-    # NO_COLOR keeps the branded layout and drops color. On Windows the layout also
-    # needs virtual-terminal mode; a host with no console stays on the plain line.
-    no_color = {"NO_COLOR": "1", "TERM": "xterm-256color"}
-    vt_ok = os.name != "nt" or qc.enable_windows_vt(sys.stdout)
-    assert qc.branded_requested(False, Tty(), no_color) is vt_ok
-    ui = qc.MatchConsole(out=Tty(), env=no_color)
-    assert ui.branded is vt_ok
-    if vt_ok:
-        assert ui.level == "none"
+    ui = qc.MatchConsole(out=Tty(), env={"NO_COLOR": "1", "TERM": "xterm-256color"})
+    assert ui.branded and ui.level == "none"
     buf = io.StringIO()
     plain = qc.MatchConsole(plain=True, out=buf, env={"TERM": "xterm-256color"})
     assert not plain.branded
