@@ -106,10 +106,10 @@ _BUTTON_COLOR = {
 
 _SPINNER = "|/-\\"
 _HOLD_S = 8.0
-# Madden's pause menu uses CIRCLE to leave a menu and CROSS to select. Enter those
-# last when the pattern includes them, so a menu click does not eat the button.
-# Shown on the challenge card only when the row fits. Pattern order is unchanged.
-PAUSE_MENU_HINT = "CIRCLE backs out, CROSS selects. Enter them last."
+# The pattern is pressed in the order on the card. CIRCLE closes Madden's pause
+# menu, so the line says to stay there until the pattern is finished. Shown only
+# when CIRCLE or CROSS is in the pattern and one row fits. Pattern order is unchanged.
+PAUSE_MENU_HINT = "In the order shown. CIRCLE closes menu; stay until done."
 _BANNED = ("attested", "attestation", "hardware-verified", "hardware verified")
 
 _TRUE = {
