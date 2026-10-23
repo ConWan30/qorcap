@@ -58,7 +58,8 @@ OFFLINE_KEY_KIND = "local-self-attested-offline"
 
 
 def say(msg: str = "") -> None:
-    print(msg, flush=True)
+    from qorcap_console import emit
+    emit(msg)
 
 
 class RefereeError(Exception):
@@ -492,13 +493,14 @@ class OfficialLive:
 
     def __init__(self, base: str, bundle: Path, match_id: str, role: str, api, *, challenges: bool = False,
                  client: Client | None = None, clock=time.monotonic, wall=lambda: int(time.time() * 1000),
-                 gate=None, beep=None) -> None:
+                 gate=None, beep=None, console=None) -> None:
         self.c = client or Client(base, timeout=8)
         self.bundle, self.match_id, self.role, self.api = bundle, match_id, role, api
         self.challenges = challenges
         self.clock, self.wall = clock, wall
         self.gate = gate or (lambda: None)
         self.beep = beep if beep is not None else _beep
+        self.console = console
         self.last_anchor = None
         self.issued: set[str] = set()
         self.skipped: set[str] = set()
@@ -586,7 +588,18 @@ class OfficialLive:
                f"{' '.join(t['pattern'][1:])}, then resume. You have {secs} seconds; if the snap comes first, "
                f"do it at the next play. <<<\n")
         self.prompts.append(msg)
-        say(msg)
+        shown = False
+        if self.console is not None:
+            try:
+                # Store the card and return. Painting happens on the console thread, after this
+                # challenge has already been posted to the referee and to QorCap.
+                shown = bool(self.console.show_challenge(
+                    phase=phase, label=label, pattern=list(t.get("pattern") or []),
+                    issued_ms=int(t["issued_ms"]), deadline_ms=int(t["deadline_ms"])))
+            except Exception:
+                shown = False
+        if not shown:
+            say(msg)
         try:
             self.beep()
         except Exception:

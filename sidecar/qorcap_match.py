@@ -51,7 +51,8 @@ WIN = sys.platform == "win32"
 
 
 def say(msg: str = "") -> None:
-    print(msg, flush=True)
+    from qorcap_console import emit
+    emit(msg)
 
 
 def data_dir() -> Path:
@@ -881,6 +882,9 @@ def main(argv=None) -> int:
     ap.add_argument("--input-format", default="mjpeg", help="mjpeg works on USB3.0 Video at 720p30; 'auto' probes the card")
     ap.add_argument("--audio", default="auto", help="card audio device ('auto'), a device name, or 'none'")
     ap.add_argument("--no-open", action="store_true")
+    ap.add_argument("--plain", action="store_true",
+                    help="classic one-line status and the one-line challenge prompt. Also QORCAP_PLAIN=1. "
+                         "Logs are unchanged either way. NO_COLOR keeps the new layout without color.")
     ap.add_argument("--referee-url", default=None, help="QorTime official referee (default: the public service)")
     ap.add_argument("--no-anchors", action="store_true", help="do not timestamp the video chain with the official referee")
     ap.add_argument("--official-challenges", action="store_true",
@@ -1041,18 +1045,35 @@ def main(argv=None) -> int:
         start_reader(api, stop, state, bundle=bundle)
     key_watcher(stop, state)
     live = None
+    ui = None
+    try:
+        from qorcap_console import MatchConsole
+        ui = MatchConsole(plain=bool(a.plain), out=sys.stdout,
+                          status_getter=lambda: api.get("/status", timeout=0.25))
+    except Exception:
+        ui = None
     if not a.no_anchors or a.official_challenges:
         try:
             from qorcap_submit import OFFICIAL_URL, OfficialLive, start_official_live
             live = OfficialLive(a.referee_url or OFFICIAL_URL, bundle, match_id, a.role, api, challenges=a.official_challenges,
-                                gate=lambda: state.get("gate"))
-            start_official_live(live, stop)
+                                gate=lambda: state.get("gate"), console=ui)
             if a.official_challenges:
                 say("Official QorTime challenges are ON (3 per game: game start, second half, 4th quarter).")
                 say("A CHALLENGE line appears only when Madden lets you pause: after the kickoff, once a play is called.")
                 say("Then, at the line before the snap, press OPTIONS and the shown buttons (90 seconds; if the snap")
                 say("comes first, do it at the next play). Kickoffs never count: you cannot pause during them.\n")
         except Exception as e:  # never block a recording on the network helper
+            say(f"(official referee link unavailable: {e})")
+            live = None
+    if ui is not None:
+        try:
+            ui.start()
+        except Exception:
+            ui.disable()
+    if live is not None:
+        try:
+            start_official_live(live, stop)
+        except Exception as e:
             say(f"(official referee link unavailable: {e})")
 
     reported = {"seq": -1}
@@ -1088,8 +1109,20 @@ def main(argv=None) -> int:
             info = {"segments": (got or {}).get("segments", 0),
                     "score": (tl.get("score") if isinstance(tl, dict) else None),
                     "clips": len(tl.get("clips", [])) if isinstance(tl, dict) else 0}
-            sys.stdout.write("\r" + status_line(st, info, len(cs.signed)).ljust(110))
-            sys.stdout.flush()
+            line = status_line(st, info, len(cs.signed))
+            if ui is not None and ui.branded:
+                try:
+                    from qorcap_console import console_snapshot
+                    ui.update(console_snapshot(st, info, len(cs.signed), live))
+                    held = ((st.get("input") or {}).get("buttons")) or []
+                    ui.observe_buttons(held, trusted=False)
+                except Exception:
+                    ui.disable()
+                    sys.stdout.write("\r" + line.ljust(110))
+                    sys.stdout.flush()
+            else:
+                sys.stdout.write("\r" + line.ljust(110))
+                sys.stdout.flush()
             f = state.get("final")
             if f and is_end_menu_final(f) and not state.get("end_menu_seen"):
                 state["end_menu_seen"] = True
@@ -1110,6 +1143,12 @@ def main(argv=None) -> int:
     except KeyboardInterrupt:
         stop_reason = "ctrl_c"
         say("\n\nStopping (Ctrl+C) ...")
+    finally:
+        if ui is not None:
+            try:
+                ui.close()
+            except Exception:
+                pass
     stop.set()
     ignore_ctrl_c()  # from here on, a Ctrl+C must not abort signing (it caused 'receipt failed' + Y/N prompt)
     say("\n\nStopping QorCap: sealing and countersigning the final checkpoints ...")
@@ -2340,6 +2379,7 @@ def finalize_main(argv) -> int:
     ap.add_argument("--key-dir")
     ap.add_argument("--hz", type=float, default=FIN_HZ)
     ap.add_argument("--no-open", action="store_true")
+    ap.add_argument("--plain", action="store_true", help=argparse.SUPPRESS)
     ap.add_argument("--recover", action="store_true",
                     help="rebuild receipt.draft.json and bundle.json from manifest, checkpoints, inputs, challenges and timeline")
     ap.add_argument("--role", choices=["home", "away"],

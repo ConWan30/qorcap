@@ -31,7 +31,7 @@ with a local control surface). QorCap copies only that design idea, no code. No 
 2. Connect PS5 HDMI out to the **USB3.0 Video** card, and the card to a blue USB 3 port. Close OBS or the Camera app.
 3. Double-click **`Start Match`**. On the first run it downloads ffmpeg, installs Python 3.12 through winget if it
    is missing, and sets up its Python packages in `%LOCALAPPDATA%\QorCap\venv`. This happens once.
-4. Play. One window shows `[REC] time | AWAY x - HOME y  Qn m:ss | segments | signed | clips`.
+4. Play. The Start Match window is a QorCap console: match state, capture fps, controller, referee link, score, disk, and elapsed time. A referee challenge takes the window over with the button pattern and a countdown. `Start Match.cmd --plain` (or `QORCAP_PLAIN=1`) keeps the old one-line status. `NO_COLOR` keeps the new layout without color. Preview the console without recording anything: `py sidecar\qorcap_console.py`.
 5. Recording stops by itself when the final score is read from Madden's **end-of-game menu** (authoritative; a scorebug-only final waits up to 120 s for that menu). You can also press **Enter** (or Q, or Ctrl+C).
 6. It signs `receipt.json`, runs `qortime verify` and `qorcap verify-bundle`, prints **VERIFIED / PARTIAL / FAIL**,
    and opens the match folder (`Documents\QorCap Matches\match-YYYYMMDD-HHMMSS`).
