@@ -1,0 +1,171 @@
+{
+  "synthetic": true,
+  "note": "Invented fixture. This repository has no published match bundle. These scores were not played.",
+  "context": {
+    "game": "synthetic-game",
+    "controller_family": "dualsense",
+    "console": "hdmi-console",
+    "capture": "usb3_hdmi"
+  },
+  "score": {"away": 14, "home": 21},
+  "proposals": {
+    "confirmed": {
+      "schema": "qorcap-ai-proposal/v0",
+      "proposal_id": "p-confirmed",
+      "match_id": "synthetic-match",
+      "model_version": "reader-0",
+      "calibration_version": "cal-0",
+      "kind": "score_read",
+      "abstain": false,
+      "confidence_permille": 800,
+      "context": {
+        "game": "synthetic-game",
+        "controller_family": "dualsense",
+        "console": "hdmi-console",
+        "capture": "usb3_hdmi"
+      },
+      "relates_to": ["final_reread"],
+      "value": {"away": 14, "home": 21},
+      "t_ms": 1000
+    },
+    "abstain": {
+      "schema": "qorcap-ai-proposal/v0",
+      "proposal_id": "p-abstain",
+      "match_id": "synthetic-match",
+      "model_version": "reader-0",
+      "calibration_version": "cal-0",
+      "kind": "score_read",
+      "abstain": true,
+      "confidence_permille": null,
+      "context": {
+        "game": "synthetic-game",
+        "controller_family": "dualsense",
+        "console": "hdmi-console",
+        "capture": "usb3_hdmi"
+      },
+      "relates_to": ["final_reread"],
+      "value": null,
+      "t_ms": 1000
+    },
+    "miss_not_run": {
+      "schema": "qorcap-ai-proposal/v0",
+      "proposal_id": "p-miss-run",
+      "match_id": "synthetic-match",
+      "model_version": "reader-0",
+      "calibration_version": "cal-0",
+      "kind": "explanation",
+      "abstain": false,
+      "confidence_permille": 400,
+      "context": {
+        "game": "synthetic-game",
+        "controller_family": "dualsense",
+        "console": "hdmi-console",
+        "capture": "usb3_hdmi"
+      },
+      "relates_to": ["motion"],
+      "value": null,
+      "explanation": {
+        "text": "The motion check passed.",
+        "citations": [{"check_id": "motion", "state": "pass"}]
+      },
+      "t_ms": 1000
+    },
+    "miss_state": {
+      "schema": "qorcap-ai-proposal/v0",
+      "proposal_id": "p-miss-state",
+      "match_id": "synthetic-match",
+      "model_version": "reader-0",
+      "calibration_version": "cal-0",
+      "kind": "explanation",
+      "abstain": false,
+      "confidence_permille": 400,
+      "context": {
+        "game": "synthetic-game",
+        "controller_family": "dualsense",
+        "console": "hdmi-console",
+        "capture": "usb3_hdmi"
+      },
+      "relates_to": ["final_reread"],
+      "value": null,
+      "explanation": {
+        "text": "The final re-read passed.",
+        "citations": [{"check_id": "final_reread", "state": "pass"}]
+      },
+      "t_ms": 1000
+    },
+    "grounded": {
+      "schema": "qorcap-ai-proposal/v0",
+      "proposal_id": "p-grounded",
+      "match_id": "synthetic-match",
+      "model_version": "reader-0",
+      "calibration_version": "cal-0",
+      "kind": "explanation",
+      "abstain": false,
+      "confidence_permille": 700,
+      "context": {
+        "game": "synthetic-game",
+        "controller_family": "dualsense",
+        "console": "hdmi-console",
+        "capture": "usb3_hdmi"
+      },
+      "relates_to": ["final_reread"],
+      "value": null,
+      "explanation": {
+        "text": "The final re-read failed.",
+        "citations": [{"check_id": "final_reread", "state": "fail"}]
+      },
+      "t_ms": 1000
+    }
+  },
+  "views": {
+    "pass_match": {
+      "schema": "qorcap-ai-label-view/v0",
+      "source": "referee",
+      "match_id": "synthetic-match",
+      "checks": {
+        "final_reread": {"state": "pass", "value": {"away": 14, "home": 21}},
+        "bundle_structure": {"state": "pass"}
+      }
+    },
+    "fail_match": {
+      "schema": "qorcap-ai-label-view/v0",
+      "source": "referee",
+      "match_id": "synthetic-match",
+      "checks": {
+        "final_reread": {"state": "fail", "value": {"away": 14, "home": 21}}
+      }
+    },
+    "value_mismatch": {
+      "schema": "qorcap-ai-label-view/v0",
+      "source": "referee",
+      "match_id": "synthetic-match",
+      "checks": {
+        "final_reread": {"state": "pass", "value": {"away": 10, "home": 21}}
+      }
+    },
+    "partial": {
+      "schema": "qorcap-ai-label-view/v0",
+      "source": "referee",
+      "match_id": "synthetic-match",
+      "checks": {
+        "final_reread": {"state": "partial", "value": {"away": 14, "home": 21}}
+      }
+    },
+    "prose_only": {
+      "schema": "qorcap-ai-label-view/v0",
+      "source": "referee",
+      "match_id": "synthetic-match",
+      "checks": {
+        "final_reread": {"state": "pass", "detail": "HOME 21 - AWAY 14"}
+      }
+    },
+    "owner_disagrees": {
+      "schema": "qorcap-ai-label-view/v0",
+      "source": "human_review",
+      "match_id": "synthetic-match",
+      "checks": {
+        "final_reread": {"state": "pass", "value": {"away": 17, "home": 21}}
+      }
+    }
+  }
+}

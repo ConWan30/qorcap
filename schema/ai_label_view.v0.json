@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://conwan30.github.io/qorcap/schema/ai_label_view.v0.json",
+  "title": "QorCap AI label view v0",
+  "description": "Input to the join. source is referee or human_review. Model documents are rejected. detail is ignored when pairing.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "source", "match_id", "checks"],
+  "properties": {
+    "schema": {"const": "qorcap-ai-label-view/v0"},
+    "source": {"enum": ["referee", "human_review"]},
+    "match_id": {"type": "string", "pattern": "^[a-z0-9][a-z0-9._:-]{0,63}$"},
+    "checks": {
+      "type": "object",
+      "maxProperties": 32,
+      "propertyNames": {"pattern": "^[a-z][a-z0-9_]{0,63}$"},
+      "additionalProperties": {"$ref": "#/$defs/check"}
+    }
+  },
+  "$defs": {
+    "check": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["state"],
+      "properties": {
+        "state": {"enum": ["pass", "partial", "fail"]},
+        "value": {
+          "type": "object", "minProperties": 1, "maxProperties": 16,
+          "propertyNames": {"pattern": "^[a-z][a-z0-9_]{0,31}$"},
+          "additionalProperties": {"anyOf": [
+            {"type": "string", "minLength": 1, "maxLength": 64},
+            {"type": "integer", "minimum": 0, "maximum": 9007199254740991},
+            {"type": "boolean"},
+            {"type": "null"}
+          ]}
+        },
+        "detail": {"type": "string", "maxLength": 400}
+      }
+    }
+  }
+}

@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://conwan30.github.io/qorcap/schema/ai_stance.v0.json",
+  "title": "QorCap AI stance v0",
+  "description": "The model's accept, dispute, or abstain stance. Separate from the receipt. Not a verdict and not a label.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "match_id", "model_version", "calibration_version", "stance", "proposal_ids", "note"],
+  "properties": {
+    "schema": {"const": "qorcap-ai-stance/v0"},
+    "match_id": {"type": "string", "pattern": "^[a-z0-9][a-z0-9._:-]{0,63}$"},
+    "model_version": {"type": "string", "pattern": "^[A-Za-z0-9._+-]{1,64}$"},
+    "calibration_version": {"type": "string", "pattern": "^[A-Za-z0-9._+-]{1,64}$"},
+    "stance": {"enum": ["accept", "dispute", "abstain"]},
+    "proposal_ids": {
+      "type": "array", "minItems": 1, "uniqueItems": true,
+      "items": {"type": "string", "pattern": "^[a-z0-9][a-z0-9._:-]{0,63}$"}
+    },
+    "note": {"const": "Model stance. The receipt verdict stays with the referee."}
+  }
+}
