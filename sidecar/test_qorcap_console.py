@@ -92,7 +92,10 @@ def test_challenge_cards_pending_pass_fail_expired():
     assert "####" in pending  # block title, not the one-line fallback
     for name in ("OPTIONS", "CROSS", "CIRCLE", "SQUARE", "TRIANGLE"):
         assert name in pending
+    assert qc.PAUSE_MENU_HINT in pending
+    assert "Enter them last" not in pending
     passed = _text(qc.layout_challenge(qc.sample_card("pass"), width=78, height=30, tick=1, now_ms=now))
+    assert "stay until done" not in passed
     assert "Buttons matched on this pad. Not a referee result." in passed
     assert "The referee reads the controller log and the pause." in passed
     failed = _text(qc.layout_challenge(qc.sample_card("fail"), width=78, height=30, tick=1, now_ms=now))
@@ -104,11 +107,31 @@ def test_challenge_cards_pending_pass_fail_expired():
             assert word not in _low(text)
 
 
+def test_pause_menu_hint_only_when_the_buttons_fit():
+    now = 19_000
+    card = qc.ChallengeCard("kickoff", "game start", ["OPTIONS", "UP", "DOWN", "LEFT"], 1_000, 91_000, matched=1)
+    plain = _text(qc.layout_challenge(card, width=78, height=30, tick=0, now_ms=now))
+    assert "stay until done" not in plain
+    assert "UP" in plain
+    narrow = _text(qc.layout_challenge(qc.sample_card(matched=1), width=40, height=30, tick=0, now_ms=now))
+    assert "stay until done" not in narrow
+    assert "CROSS" in narrow and "TRIANGLE" in narrow
+    floor = _text(qc.layout_challenge(qc.sample_card(matched=1), width=60, height=24, tick=0, now_ms=now))
+    assert qc.PAUSE_MENU_HINT in floor
+    assert "Enter them last" not in floor
+    for word in BANNED:
+        assert word not in _low(plain) and word not in _low(narrow)
+
+
 def test_short_console_keeps_the_pattern_and_the_seconds():
     text = _text(qc.layout_challenge(qc.sample_card(matched=1), width=78, height=20, tick=0, now_ms=19_000))
     assert "GAME START" in text
     assert "72 seconds left" in text and "entered 1 of 5" in text
     assert "CROSS" in text and "TRIANGLE" in text
+    full = _text(qc.layout_challenge(qc.sample_card(matched=1), width=78, height=24, tick=0, now_ms=19_000))
+    assert qc.PAUSE_MENU_HINT in full
+    assert "Enter them last" not in full
+    assert "72 seconds left" in full and "snap comes first" in full and "TRIANGLE" in full
     packed = _text(qc.layout_challenge(qc.sample_card(matched=1), width=60, height=24, tick=0, now_ms=19_000, unicode=False))
     assert len(packed.splitlines()[0]) == 60
     assert "72 seconds left" in packed and "█" not in packed and "#" in packed

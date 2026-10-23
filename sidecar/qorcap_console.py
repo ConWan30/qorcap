@@ -106,6 +106,10 @@ _BUTTON_COLOR = {
 
 _SPINNER = "|/-\\"
 _HOLD_S = 8.0
+# The pattern is pressed in the order on the card. CIRCLE closes Madden's pause
+# menu, so the line says to stay there until the pattern is finished. Shown only
+# when CIRCLE or CROSS is in the pattern and one row fits. Pattern order is unchanged.
+PAUSE_MENU_HINT = "In the order shown. CIRCLE closes menu; stay until done."
 _BANNED = ("attested", "attestation", "hardware-verified", "hardware verified")
 
 _TRUE = {
@@ -370,13 +374,23 @@ def _want_unicode(env: dict, stream) -> bool:
 
 
 def enable_windows_vt(stream) -> bool:
-    """Turn on VT processing and UTF-8 for conhost and Windows Terminal. No-op elsewhere."""
+    """Turn on VT processing and UTF-8 for the caller's conhost or Windows Terminal.
+
+    A no-op off Windows. The stream's own handle is used. The process standard
+    output is a pipe under CI, and probing that pipe refused the branded layout
+    for a different terminal. A stand-in with no Win32 handle has no mode bit to
+    set. A real console whose mode cannot be set still returns False.
+    """
     if os.name != "nt":
         return True
     try:
         import ctypes
+        import msvcrt
+        try:
+            handle = msvcrt.get_osfhandle(stream.fileno())
+        except (AttributeError, OSError, ValueError):
+            return True
         kernel = ctypes.windll.kernel32
-        handle = kernel.GetStdHandle(-11)
         mode = ctypes.c_uint()
         if not kernel.GetConsoleMode(handle, ctypes.byref(mode)):
             return False
@@ -624,6 +638,13 @@ def _clip(text: str, n: int) -> str:
     return text[: n - 3] + "..."
 
 
+def _pause_hint_fits(pattern: list[str], width: int) -> bool:
+    names = {str(name).upper() for name in pattern}
+    if "CIRCLE" not in names and "CROSS" not in names:
+        return False
+    return len(PAUSE_MENU_HINT) <= max(0, width - 4)
+
+
 def _pattern_rows(pattern: list[str], width: int) -> int:
     if not pattern:
         return 0
@@ -688,6 +709,15 @@ def layout_challenge(card: ChallengeCard, *, width: int = 78, height: int = 36, 
     inner = max(1, height - 2)
     while sum(spec_height(s) for s in specs) > inner and any(s[0] == "gap" for s in specs):
         specs.remove(next(s for s in specs if s[0] == "gap"))
+    # A blank row is room. The pattern, the clock, and the snap line stay.
+    if card.result is None and _pause_hint_fits(card.pattern, width):
+        hint = ("center", PAUSE_MENU_HINT, "dim")
+        if sum(spec_height(s) for s in specs) + 1 <= inner:
+            specs.append(hint)
+        elif any(s[0] == "gap" for s in specs):
+            specs.remove(next(s for s in specs if s[0] == "gap"))
+            if sum(spec_height(s) for s in specs) + 1 <= inner:
+                specs.append(hint)
     content_h = sum(spec_height(s) for s in specs)
     y = 1 + max(0, (inner - content_h) // 2)
     for spec in specs:

@@ -137,5 +137,7 @@ def test_fill_challenge_results_uses_the_recorder_recheck():
     chal = (HERE / "qorcap_challenge.py").read_text(encoding="utf-8")
     assert "max_latency_ms=CAPTURE_PAUSE_MAX_LATENCY_MS" in chal
     assert 'res["reverified_by"] = "recorder"' in chal
+    body = chal.split("def challenge_results", 1)[1]
+    assert 'res["rule"]' not in body and "res['rule']" not in body
     assert "capture_pause_max_ms=CAPTURE_PAUSE_MAX_LATENCY_MS" in chal
     assert 'return {"result": res if res["ok"] else None, "local": local}' in chal
