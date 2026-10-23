@@ -1,0 +1,71 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://conwan30.github.io/qorcap/schema/ai_proposal.v0.json",
+  "title": "QorCap AI proposal v0",
+  "description": "One line of ai_proposals.jsonl. A model proposal. It is not a receipt field and it is not a label.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "proposal_id", "match_id", "model_version", "calibration_version", "kind", "abstain", "confidence_permille", "context", "relates_to", "value", "t_ms"],
+  "properties": {
+    "schema": {"const": "qorcap-ai-proposal/v0"},
+    "proposal_id": {"type": "string", "pattern": "^[a-z0-9][a-z0-9._:-]{0,63}$"},
+    "match_id": {"type": "string", "pattern": "^[a-z0-9][a-z0-9._:-]{0,63}$"},
+    "model_version": {"type": "string", "pattern": "^[A-Za-z0-9._+-]{1,64}$"},
+    "calibration_version": {"type": "string", "pattern": "^[A-Za-z0-9._+-]{1,64}$"},
+    "kind": {"enum": ["score_read", "event_label", "clip_pick", "explanation"]},
+    "abstain": {"type": "boolean"},
+    "confidence_permille": {"type": ["integer", "null"], "minimum": 0, "maximum": 1000},
+    "context": {"$ref": "#/$defs/context"},
+    "relates_to": {"type": "array", "minItems": 1, "maxItems": 16, "uniqueItems": true,
+                   "items": {"type": "string", "pattern": "^[a-z][a-z0-9_]{0,63}$"}},
+    "value": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/value"}]},
+    "explanation": {"$ref": "#/$defs/explanation"},
+    "t_ms": {"type": "integer", "minimum": 0, "maximum": 9007199254740991}
+  },
+  "allOf": [
+    {"if": {"properties": {"kind": {"const": "explanation"}}, "required": ["kind"]},
+     "then": {"required": ["explanation"]}},
+    {"if": {"properties": {"abstain": {"const": true}}, "required": ["abstain"]},
+     "then": {"properties": {"confidence_permille": {"type": "null"}, "value": {"type": "null"}}}}
+  ],
+  "$defs": {
+    "context": {
+      "type": "object", "additionalProperties": false,
+      "required": ["game", "controller_family", "console", "capture"],
+      "properties": {
+        "game": {"type": "string", "pattern": "^[A-Za-z0-9._+-]{1,64}$"},
+        "controller_family": {"type": "string", "pattern": "^[A-Za-z0-9._+-]{1,64}$"},
+        "console": {"type": "string", "pattern": "^[A-Za-z0-9._+-]{1,64}$"},
+        "capture": {"type": "string", "pattern": "^[A-Za-z0-9._+-]{1,64}$"}
+      }
+    },
+    "value": {
+      "type": "object", "minProperties": 1, "maxProperties": 16,
+      "propertyNames": {"pattern": "^[a-z][a-z0-9_]{0,31}$"},
+      "additionalProperties": {"anyOf": [
+        {"type": "string", "minLength": 1, "maxLength": 64},
+        {"type": "integer", "minimum": 0, "maximum": 9007199254740991},
+        {"type": "boolean"},
+        {"type": "null"}
+      ]}
+    },
+    "explanation": {
+      "type": "object", "additionalProperties": false,
+      "required": ["text", "citations"],
+      "properties": {
+        "text": {"type": "string", "minLength": 1, "maxLength": 2000},
+        "citations": {
+          "type": "array", "minItems": 1, "maxItems": 16,
+          "items": {
+            "type": "object", "additionalProperties": false,
+            "required": ["check_id", "state"],
+            "properties": {
+              "check_id": {"type": "string", "pattern": "^[a-z][a-z0-9_]{0,63}$"},
+              "state": {"enum": ["pass", "partial", "fail"]}
+            }
+          }
+        }
+      }
+    }
+  }
+}
