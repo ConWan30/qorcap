@@ -25,7 +25,7 @@ jobs:
       - run: cargo test --locked
         env:
           QORTIME: ${{ github.workspace }}/qortime
-      - run: python -m pytest -q sidecar/test_pairing.py sidecar/test_qorcap_highlights.py sidecar/test_auto_highlights.py sidecar/test_final_screen_pause.py sidecar/test_start_match_glimpse.py sidecar/test_qorcap_ai_loop.py sidecar/test_qorcap_console.py tools/test_frame_clock_ab.py
+      - run: python -m pytest -q sidecar/test_pairing.py sidecar/test_qorcap_highlights.py sidecar/test_auto_highlights.py sidecar/test_final_screen_pause.py sidecar/test_start_match_glimpse.py sidecar/test_qorcap_ai_loop.py sidecar/test_qorcap_console.py sidecar/test_qorcap_release.py tools/test_frame_clock_ab.py
   windows:
     runs-on: windows-latest
     steps:
@@ -41,13 +41,15 @@ jobs:
           git -C qortime remote add origin https://github.com/ConWan30/qortime.git
           git -C qortime fetch --depth 1 origin 0204e6d8082f8c40ea1fe5e09bf16402aaee3ff2
           git -C qortime checkout --detach FETCH_HEAD
-      - run: pip install cryptography
+      - run: pip install cryptography pytest
       # No ffmpeg on this job. Clip tests that cut with ffmpeg skip; sign/verify uses tests/fixtures/tiny_clip.mp4.
       # c2pa is built with rust_native_crypto (no OpenSSL, no HTTP). This job is the Windows compile check.
       - run: cargo test --locked
         env:
           QORTIME: ${{ github.workspace }}/qortime
       - run: cargo build --release --locked
+      # Same release-layout check as Linux. No numpy: this test only stages files and loads the schema.
+      - run: python -m pytest -q sidecar/test_qorcap_release.py sidecar/test_qorcap_console.py
       # No controller is the expected result: input-test returns 1.
       # pwsh forwards that native code as the step result unless the script exits 0 itself.
       - shell: pwsh

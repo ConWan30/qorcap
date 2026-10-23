@@ -106,6 +106,10 @@ _BUTTON_COLOR = {
 
 _SPINNER = "|/-\\"
 _HOLD_S = 8.0
+# Madden's pause menu uses CIRCLE to leave a menu and CROSS to select. Enter those
+# last when the pattern includes them, so a menu click does not eat the button.
+# Shown on the challenge card only when the row fits. Pattern order is unchanged.
+PAUSE_MENU_HINT = "CIRCLE backs out, CROSS selects. Enter them last."
 _BANNED = ("attested", "attestation", "hardware-verified", "hardware verified")
 
 _TRUE = {
@@ -624,6 +628,13 @@ def _clip(text: str, n: int) -> str:
     return text[: n - 3] + "..."
 
 
+def _pause_hint_fits(pattern: list[str], width: int) -> bool:
+    names = {str(name).upper() for name in pattern}
+    if "CIRCLE" not in names and "CROSS" not in names:
+        return False
+    return len(PAUSE_MENU_HINT) <= max(0, width - 4)
+
+
 def _pattern_rows(pattern: list[str], width: int) -> int:
     if not pattern:
         return 0
@@ -688,6 +699,15 @@ def layout_challenge(card: ChallengeCard, *, width: int = 78, height: int = 36, 
     inner = max(1, height - 2)
     while sum(spec_height(s) for s in specs) > inner and any(s[0] == "gap" for s in specs):
         specs.remove(next(s for s in specs if s[0] == "gap"))
+    # A blank row is room. The pattern, the clock, and the snap line stay.
+    if card.result is None and _pause_hint_fits(card.pattern, width):
+        hint = ("center", PAUSE_MENU_HINT, "dim")
+        if sum(spec_height(s) for s in specs) + 1 <= inner:
+            specs.append(hint)
+        elif any(s[0] == "gap" for s in specs):
+            specs.remove(next(s for s in specs if s[0] == "gap"))
+            if sum(spec_height(s) for s in specs) + 1 <= inner:
+                specs.append(hint)
     content_h = sum(spec_height(s) for s in specs)
     y = 1 + max(0, (inner - content_h) // 2)
     for spec in specs:

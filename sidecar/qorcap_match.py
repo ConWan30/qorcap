@@ -220,13 +220,30 @@ def wait_and_countersign(proc, path: Path, cs: "Countersigner", timeout: float =
     return proc.returncode == 0
 
 
+def receipt_schema_path() -> Path:
+    """receipt.v0.json beside sidecar/. The Windows zip has to ship contracts/ for this to exist."""
+    return HERE.parent / "contracts" / "receipt.v0.json"
+
+
 def _closed_props(section: str) -> frozenset:
     """Property names receipt.v0.json allows. The object sets additionalProperties to false."""
-    schema = json.loads((HERE.parent / "contracts" / "receipt.v0.json").read_text(encoding="utf-8"))
-    node = schema["properties"][section]
-    if node.get("additionalProperties") is not False:
-        raise RuntimeError(f"receipt.v0.json {section} is not closed")
-    return frozenset(node["properties"])
+    path = receipt_schema_path()
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError:
+        raise SystemExit(
+            "QorCap cannot sign this match: the receipt schema is missing "
+            f"({path}). The install must include contracts/receipt.v0.json next to the sidecar folder."
+        )
+    try:
+        schema = json.loads(raw)
+    except json.JSONDecodeError:
+        raise SystemExit(f"QorCap cannot sign this match: {path} is not valid JSON.")
+    node = schema.get("properties", {}).get(section) if isinstance(schema, dict) else None
+    props = node.get("properties") if isinstance(node, dict) else None
+    if not isinstance(node, dict) or node.get("additionalProperties") is not False or not isinstance(props, dict):
+        raise SystemExit(f"QorCap cannot sign this match: {path.name} has no closed {section} object.")
+    return frozenset(props)
 
 
 def closed_result(result: dict) -> dict:
@@ -1408,6 +1425,40 @@ def opt_in_challenge_rule(bundle: Path, rule: int = CHALLENGE_RULE_V2) -> None:
     p.write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
 
 
+def explain_local_partials(partial) -> list[str]:
+    """Player-facing lines for the local ``qortime verify`` summary.
+
+    A recorder result carries no ``rule`` field, so the verifier keeps the rule-1
+    ceiling of 600 ms. An honest pause on this capture path is about 1.6 s and the
+    recorder already accepted it, which is why the summary used to say
+    ``Not checked: away:kickoff:challenge_latency_out_of_range`` after a pass.
+    The official referee applies its own rule. This text does not change the receipt.
+    """
+    if not isinstance(partial, list):
+        return []
+    latency, other = [], []
+    mark = "challenge_latency_out_of_range"
+    for item in partial:
+        if not isinstance(item, str):
+            continue
+        if item == mark or item.endswith(":" + mark):
+            latency.append(item)
+        else:
+            other.append(item)
+    lines = []
+    if other:
+        lines.append("  Not checked:  " + ", ".join(other[:6]))
+    if latency:
+        labels = []
+        for item in latency[:6]:
+            bits = item.split(":")
+            labels.append(f"{bits[0]} {bits[1]}" if len(bits) >= 3 else item)
+        lines.append("  Local challenge check: " + ", ".join(labels) + ".")
+        lines.append("  The recorder on this PC accepted the pause. This receipt check still uses the 600 ms ceiling,")
+        lines.append("  because the recorder does not stamp a rule on its own result. The official referee decides with its own rule.")
+    return lines
+
+
 def sign_and_report(bundle: Path, draft: dict, cps: list[dict], device, referee, *, match_id: str, role: str,
                     started_ms: int, qt: Path, qorcap: str, no_open: bool, referee_kind: str = REFEREE_KIND,
                     note: str | None = None, submittable: bool = True) -> int:
@@ -1456,8 +1507,8 @@ def sign_and_report(bundle: Path, draft: dict, cps: list[dict], device, referee,
     say(f"  Signatures:   {v['status']}  (QorTime verify; tier {v.get('trust_tier')})")
     if v.get("errors"):
         say(f"  Problems:     {', '.join(v['errors'][:6])}")
-    if v.get("partial"):
-        say(f"  Not checked:  {', '.join(v['partial'][:6])}")
+    for line in explain_local_partials(v.get("partial")):
+        say(line)
     say("  Trust level:  SELF-ATTESTED. Signed by this PC's device key and a LOCAL referee key. It proves the")
     say("                video was not changed after recording; it does not prove who was playing.")
     if submittable:

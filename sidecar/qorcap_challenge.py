@@ -234,6 +234,7 @@ def challenge_results(d: str | Path, challenges: list[dict[str, Any]], *, decode
             max_latency_ms=CAPTURE_PAUSE_MAX_LATENCY_MS,
         ).to_dict()
         res["hid_sha256"] = sha256_hex(win)
+        # Leave the rule field off. Stamping 2 would let this PC's receipt check use the wider ceiling.
         res["reverified_by"] = "recorder"
         local = dict(res, phase=c.get("phase"), id=c.get("id"), presses_in_window=len(win),
                      capture_pause_max_ms=CAPTURE_PAUSE_MAX_LATENCY_MS)

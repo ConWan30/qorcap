@@ -11,6 +11,9 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
       - uses: dtolnay/rust-toolchain@stable
       - name: Build qorcap.exe
         run: cargo build --release --locked
@@ -47,6 +50,9 @@ jobs:
           Copy-Item docs\FRAME_CLOCK_AB.md (Join-Path $root "docs")
           Copy-Item sidecar (Join-Path $root "sidecar") -Recurse
           Get-ChildItem (Join-Path $root "sidecar") -Recurse -Directory -Filter __pycache__ | Remove-Item -Recurse -Force
+          # contracts/ sits next to sidecar/. Signing reads contracts\receipt.v0.json from there.
+          # compat.json is the vendored registry and ships with it. A missing file fails this step.
+          Copy-Item contracts (Join-Path $root "contracts") -Recurse
           # Witness, burst, and attest ship as sidecar\qorcap_glimpse_watch.py, qorcap_glimpse_side.py,
           # qorcap_glimpse_attest.py, and sidecar\glimpse\ prompts. Python deps are not vendored:
           # start-match.ps1 installs numpy, opencv-python-headless, and cryptography (Ed25519 attest).
@@ -55,14 +61,25 @@ jobs:
             "docs\GLIMPSE_WATCH.md",
             "docs\CONTENT_CREDENTIALS.md",
             "docs\FRAME_CLOCK_AB.md",
+            "contracts\receipt.v0.json",
+            "contracts\compat.json",
+            "sidecar\qorcap_match.py",
+            "sidecar\qorcap_console.py",
+            "sidecar\qorcap_ai_loop.py",
+            "sidecar\qorcap_challenge.py",
             "sidecar\qorcap_glimpse_watch.py",
             "sidecar\qorcap_glimpse_side.py",
             "sidecar\qorcap_glimpse_attest.py",
             "sidecar\glimpse\ROLE_v1.md",
+            "sidecar\glimpse\CROP_TASK_v1.md",
+            "sidecar\glimpse\crop_v1.json",
+            "sidecar\glimpse\LIVE_CONTEXT_v1.md",
             "start-match.ps1"
           )) {
             if (-not (Test-Path (Join-Path $root $need))) { throw "package missing $need" }
           }
+          python sidecar\qorcap_release.py --install-root $root
+          if ($LASTEXITCODE -ne 0) { throw "release is missing a file the sidecar reads" }
           $launcher = Get-Content (Join-Path $root "start-match.ps1") -Raw
           if ($launcher -notmatch "numpy opencv-python-headless cryptography") {
             throw "start-match.ps1 does not install the Glimpse Python packages"
