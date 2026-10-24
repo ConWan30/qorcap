@@ -25,6 +25,11 @@ ALWAYS_INSTALL_FILES = ("contracts/compat.json",)
 
 # Existence probes and programs the release installs separately.
 _OPTIONAL_INSTALL = frozenset({"qorcap", "qorcap.exe", "ffmpeg", "ffmpeg.exe", "qortime"})
+# The banner fragment pack is optional. qorcap_banner treats a missing file as no banner.
+# A release with no pack must still install and load the signing schema.
+_OPTIONAL_RUNTIME_FILES = frozenset({
+    "sidecar/packs/madden27_banner_fragments.npz",
+})
 _READ_TEXT = frozenset({"read_text", "read_bytes"})
 _FILE_SUFFIXES = (".json", ".md", ".npz", ".txt")
 
@@ -121,7 +126,7 @@ def _rel(origin: _Origin) -> str | None:
         rel = "sidecar/" + "/".join(origin.parts)
     else:
         rel = "/".join(origin.parts)
-    if rel in _OPTIONAL_INSTALL or rel.startswith("target/"):
+    if rel in _OPTIONAL_INSTALL or rel in _OPTIONAL_RUNTIME_FILES or rel.startswith("target/"):
         return None
     return rel
 
