@@ -27,6 +27,9 @@ ALLOWED = {
     "test_tampered_timestamp_resigned_offline_is_refused",
     "test_offline_signed_receipt_refused_when_live_countersigned_log_exists",
     "test_live_signed_bundle_still_passes",
+    # ask_with_timeout uses select() on the stdin pipe. Windows select() does not
+    # accept pipes, and the fallback readline() blocks, so the sidecar job would hang.
+    "test_submit_prompt_times_out_to_no",
 }
 
 

@@ -178,8 +178,10 @@ jobs:
       # No ffmpeg here: sidecar/test_qorcap_highlights.py and sidecar/test_qorcap_challenge.py
       # run on Linux, where ffmpeg is installed, so those tests are required there.
       # Skip allowlist matches Linux (opponent PSN frames, plus the submit tests that need
-      # ffmpeg). This job does not install ffmpeg, so those submit tests skip. The ones
-      # that do not need ffmpeg still run. fastapi and httpx are installed above.
+      # ffmpeg). This job does not install ffmpeg, so those submit tests skip. The prompt
+      # timeout test also skips here: select() cannot wait on a pipe, and readline() would
+      # block the job. The submit tests that do not need ffmpeg still run.
+      # fastapi and httpx are installed above.
       - name: Sidecar tests
         shell: bash
         env:

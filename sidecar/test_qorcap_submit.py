@@ -316,6 +316,10 @@ def test_fill_challenge_results_on_real_fmp4(tmp_path, capsys):
     assert fx is not None
 
 
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="select() cannot wait on a pipe on Windows; readline would block the sidecar job",
+)
 def test_submit_prompt_times_out_to_no(tmp_path, capsys):
     """v0.3.23: an unattended "Submit now?" prompt answers No after the timeout instead of waiting forever."""
     import os
