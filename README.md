@@ -292,8 +292,8 @@ From v0.3.11:
   window stays empty. Up to v0.3.10 every challenge stayed empty (`challenge_unanswered`). A challenge with
   no OPTIONS press still stays empty, and the reason is in `challenge_results.jsonl`. A withheld mismatch
   adds `withheld: controller_log` on that line. That file is not a contract file.
-  From 0.3.34 every segment writes a chunk row, including an idle pad (`n` 0), while the HID reader is alive.
-  A hung HID read writes no row, so that gap withholds the mismatch.
+  From 0.3.34 a chunk row, including an empty one, is written every segment while the HID reader is alive.
+  A hung read writes none, so a hang that spans a whole segment leaves a gap and withholds.
 
 ### Signed submissions (v0.3.10)
 

@@ -283,8 +283,12 @@ impl InputLog {
         }
         let sha = ev::jcs_sha(&Value::Array(recs.clone()));
         let n = recs.len();
-        let reader_alive = self.hid_beats != self.sealed_beats;
+        // Spend the beat before the append. A failed write must not leave it for a later empty
+        // seal: that seal did not see a new `dev.read` return.
+        let beats = self.hid_beats;
+        let reader_alive = beats != self.sealed_beats;
         if n == 0 && !reader_alive { return (sha, self.head.clone(), 0); }
+        if reader_alive { self.sealed_beats = beats; }
         let prev = self.head.clone();
         let head = ev::link(&prev, self.chunks, &sha);
         let chunk = json!({"type": "chunk", "seq": self.chunks, "seg": seg, "n": n, "sha256": sha, "prev": prev, "head": head, "t_us": t_us});
@@ -295,12 +299,12 @@ impl InputLog {
             if let Err(e) = append_bytes(p, body.as_bytes()) {
                 // The chunk is not on disk, so the chain must not move. The records stay pending and
                 // the next segment seals them. A checkpoint for this segment then commits the empty hash.
+                // The beat stays spent.
                 warn!("cannot write {}: {e}; input chunk not sealed (chain unchanged)", p.display());
                 self.pending = recs;
                 return (empty_hash(), self.head.clone(), 0);
             }
         }
-        if reader_alive { self.sealed_beats = self.hid_beats; }
         if let Some(hp) = &self.haptic_path {
             let hs: String = recs.iter().filter(|r| r["type"] == "haptic").map(|r| format!("{r}\n")).collect();
             if !hs.is_empty() {
@@ -572,5 +576,219 @@ mod tests {
         assert_eq!(connected["pad_id"], "serial:FAKE0001");
         assert!(connected["detail"].as_str().unwrap().contains("serial=FAKE0001"), "{}", connected["detail"]);
         assert!(l.pending.iter().any(|r| r["type"] == "header" && r["pad_identity"] == "required"));
+    }
+
+    fn wait_for(log: &Mutex<InputLog>, mut pred: impl FnMut(&InputLog) -> bool) {
+        let end = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < end {
+            if pred(&log.lock().unwrap_or_else(|e| e.into_inner())) { return; }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        panic!("timed out waiting for the HID logger");
+    }
+
+    /// `read` returns `Ok(None)` and never a report. Dropping `note_hid_alive` on that arm
+    /// leaves both empty seals unwritten.
+    struct TimeoutForever;
+    impl ReportSource for TimeoutForever {
+        fn read(&mut self, _buf: &mut [u8], _t: i32) -> Result<Option<usize>, String> { Ok(None) }
+        fn name(&self) -> String { "Timeout DualSense".into() }
+        fn pad_id(&self) -> String { "serial:TIMEOUT".into() }
+    }
+
+    /// `read` does not return until `release` is set.
+    struct HangRead { release: Arc<AtomicBool> }
+    impl ReportSource for HangRead {
+        fn read(&mut self, _buf: &mut [u8], _t: i32) -> Result<Option<usize>, String> {
+            while !self.release.load(Ordering::SeqCst) { std::thread::sleep(Duration::from_millis(10)); }
+            Err("stopped".into())
+        }
+        fn name(&self) -> String { "Hung DualSense".into() }
+        fn pad_id(&self) -> String { "serial:HUNG".into() }
+    }
+
+    /// One real report, then further `Ok(Some)` returns that do not parse. The empty seals
+    /// after the first have no new records, so a row exists only because the report arm
+    /// called `note_hid_alive`.
+    struct ReportThenBytes { sent: bool }
+    impl ReportSource for ReportThenBytes {
+        fn read(&mut self, buf: &mut [u8], _t: i32) -> Result<Option<usize>, String> {
+            if !self.sent {
+                self.sent = true;
+                let r = hid::pack_usb(&pad(0, 0));
+                buf[..r.len()].copy_from_slice(&r);
+                return Ok(Some(r.len()));
+            }
+            buf[0] = 0;
+            Ok(Some(1))
+        }
+        fn name(&self) -> String { "Report DualSense".into() }
+        fn pad_id(&self) -> String { "serial:REPORT".into() }
+    }
+
+    /// First `read` is `Err`. Later `open` calls block so they add no further status row.
+    struct ErrOnce;
+    impl ReportSource for ErrOnce {
+        fn read(&mut self, _buf: &mut [u8], _t: i32) -> Result<Option<usize>, String> { Err("gone".into()) }
+        fn name(&self) -> String { "Err DualSense".into() }
+        fn pad_id(&self) -> String { "serial:ERR".into() }
+    }
+
+    fn flush_open(log: &Arc<Mutex<InputLog>>) -> u64 {
+        wait_for(log, |l| l.pending.iter().any(|r| r["state"] == "connected"));
+        let mut l = log.lock().unwrap_or_else(|e| e.into_inner());
+        let (_, _, n) = l.seal(0, 1_000);
+        assert!(n >= 1, "header and connected status seal");
+        l.chunks
+    }
+
+    #[test]
+    fn timeout_reads_write_two_empty_chunks() {
+        let dir = std::env::temp_dir().join(format!("qorcap-inputs-timeout-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let p = dir.join("inputs.jsonl");
+        let log = Arc::new(Mutex::new(InputLog::new(Some(p.clone()), true, 0)));
+        let stop = Arc::new(AtomicBool::new(false));
+        let h = spawn_logger_with(log.clone(), Instant::now(), stop.clone(), || Ok(Box::new(TimeoutForever) as Box<dyn ReportSource>));
+        let base = flush_open(&log);
+        for seg in 1..=2 {
+            std::thread::sleep(Duration::from_millis(40));
+            let mut l = log.lock().unwrap_or_else(|e| e.into_inner());
+            assert!(l.pending.is_empty(), "timeout must not add a record before the stall lag: {:?}", l.pending);
+            let (_, _, n) = l.seal(seg, seg * 2_000_000);
+            assert_eq!(n, 0);
+            assert_eq!(l.chunks, base + seg, "each timeout between seals writes an empty chunk");
+        }
+        let chunks = read_file(&p).unwrap().1;
+        assert_eq!(chunks.len() as u64, base + 2);
+        assert_eq!(chunks[chunks.len() - 1]["n"].as_u64(), Some(0));
+        assert_eq!(chunks[chunks.len() - 2]["n"].as_u64(), Some(0));
+        stop.store(true, Ordering::SeqCst);
+        h.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn hung_read_writes_no_empty_chunk() {
+        let dir = std::env::temp_dir().join(format!("qorcap-inputs-hang-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let p = dir.join("inputs.jsonl");
+        let log = Arc::new(Mutex::new(InputLog::new(Some(p.clone()), true, 0)));
+        let stop = Arc::new(AtomicBool::new(false));
+        let release = Arc::new(AtomicBool::new(false));
+        let rel = release.clone();
+        let h = spawn_logger_with(log.clone(), Instant::now(), stop.clone(), move || {
+            Ok(Box::new(HangRead { release: rel.clone() }) as Box<dyn ReportSource>)
+        });
+        let base = flush_open(&log);
+        std::thread::sleep(Duration::from_millis(50));
+        {
+            let mut l = log.lock().unwrap_or_else(|e| e.into_inner());
+            assert_eq!(l.hid_beats, 0, "a blocked read has not returned");
+            let (_, _, n1) = l.seal(1, 2_000_000);
+            let (_, _, n2) = l.seal(2, 4_000_000);
+            assert_eq!((n1, n2, l.chunks), (0, 0, base));
+        }
+        assert_eq!(read_file(&p).unwrap().1.len() as u64, base);
+        release.store(true, Ordering::SeqCst);
+        stop.store(true, Ordering::SeqCst);
+        h.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn report_reads_write_empty_chunks_after_the_records_are_sealed() {
+        let dir = std::env::temp_dir().join(format!("qorcap-inputs-report-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let p = dir.join("inputs.jsonl");
+        let log = Arc::new(Mutex::new(InputLog::new(Some(p.clone()), true, 0)));
+        let stop = Arc::new(AtomicBool::new(false));
+        let h = spawn_logger_with(log.clone(), Instant::now(), stop.clone(), || Ok(Box::new(ReportThenBytes { sent: false }) as Box<dyn ReportSource>));
+        wait_for(&log, |l| l.live.reports >= 1);
+        let base = {
+            let mut l = log.lock().unwrap_or_else(|e| e.into_inner());
+            let (_, _, n) = l.seal(0, 1_000);
+            assert!(n >= 1 && l.live.reports >= 1);
+            l.chunks
+        };
+        for seg in 1..=2 {
+            std::thread::sleep(Duration::from_millis(40));
+            let mut l = log.lock().unwrap_or_else(|e| e.into_inner());
+            assert!(l.pending.is_empty(), "later report returns must not add records: {:?}", l.pending);
+            let (_, _, n) = l.seal(seg, seg * 2_000_000);
+            assert_eq!(n, 0);
+            assert_eq!(l.chunks, base + seg);
+        }
+        let chunks = read_file(&p).unwrap().1;
+        assert!(chunks.len() as u64 >= base + 2);
+        assert_eq!(chunks.last().unwrap()["n"].as_u64(), Some(0));
+        stop.store(true, Ordering::SeqCst);
+        h.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn error_read_counts_as_alive_for_one_empty_seal() {
+        let dir = std::env::temp_dir().join(format!("qorcap-inputs-err-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let p = dir.join("inputs.jsonl");
+        let log = Arc::new(Mutex::new(InputLog::new(Some(p.clone()), true, 0)));
+        let stop = Arc::new(AtomicBool::new(false));
+        let release = Arc::new(AtomicBool::new(false));
+        let opened = Arc::new(AtomicBool::new(false));
+        let (rel, once) = (release.clone(), opened.clone());
+        let h = spawn_logger_with(log.clone(), Instant::now(), stop.clone(), move || {
+            if once.swap(true, Ordering::SeqCst) {
+                while !rel.load(Ordering::SeqCst) { std::thread::sleep(Duration::from_millis(10)); }
+                return Err("stopped".into());
+            }
+            Ok(Box::new(ErrOnce) as Box<dyn ReportSource>)
+        });
+        wait_for(&log, |l| l.live.state == "unplugged" && l.hid_beats >= 1);
+        {
+            let mut l = log.lock().unwrap_or_else(|e| e.into_inner());
+            assert!(l.hid_beats >= 1, "Err from dev.read is a live read");
+            // Drop the unplugged status so this seal is empty. The beat is the only reason it writes.
+            l.pending.clear();
+            let (_, _, n) = l.seal(1, 2_000_000);
+            assert_eq!(n, 0);
+            assert_eq!(l.chunks, 1, "the error return must write the empty chunk");
+            let (_, _, n2) = l.seal(2, 4_000_000);
+            assert_eq!((n2, l.chunks), (0, 1), "one error covers one empty seal");
+        }
+        assert_eq!(read_file(&p).unwrap().1.len(), 1);
+        assert_eq!(read_file(&p).unwrap().1[0]["n"].as_u64(), Some(0));
+        release.store(true, Ordering::SeqCst);
+        stop.store(true, Ordering::SeqCst);
+        h.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn failed_write_spends_the_hid_beat() {
+        let dir = std::env::temp_dir().join(format!("qorcap-inputs-spend-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("inputs.jsonl");
+        let mut l = InputLog::new(Some(p), true, 0);
+        let (_, head0, n0) = l.seal(0, 1_000);
+        assert!(n0 >= 1 && l.chunks == 1);
+        l.note_hid_alive();
+        let bad = dir.join("not-a-file");
+        std::fs::create_dir(&bad).unwrap();
+        l.path = Some(bad);
+        let (_, head_fail, n_fail) = l.seal(1, 2_000_000);
+        assert_eq!((n_fail, l.chunks, head_fail.as_str()), (0, 1, head0.as_str()));
+        let again = dir.join("again.jsonl");
+        l.path = Some(again.clone());
+        let (_, head2, n2) = l.seal(2, 4_000_000);
+        assert_eq!((n2, l.chunks, head2.as_str()), (0, 1, head0.as_str()), "a failed append must spend the beat");
+        assert!(read_file(&again).is_err());
+        l.note_hid_alive();
+        let (_, head3, n3) = l.seal(2, 6_000_000);
+        assert_eq!(n3, 0);
+        assert_eq!(l.chunks, 2);
+        assert_ne!(head3, head0);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

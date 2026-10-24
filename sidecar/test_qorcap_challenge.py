@@ -811,3 +811,74 @@ def test_issued_equal_deadline_with_a_chunk_at_that_instant_stores(tmp_path):
     assert filled["challenges"][0]["result"]["reason"] == "pattern_mismatch"
     line = json.loads((tmp_path / "equal" / "challenge_results.jsonl").read_text(encoding="utf-8").splitlines()[0])
     assert line["reason"] == "pattern_mismatch" and "withheld" not in line
+
+
+def test_float_chunk_time_is_ignored(tmp_path):
+    """A float t_us is not an integer, so it does not close the window."""
+    import qorcap_challenge as C
+
+    kick = _kickoff()
+    issued, deadline = kick["issued_ms"], kick["deadline_ms"]
+    rows = [*_mismatch_head(kick), *_chunk_span(issued, deadline)]
+    assert rows[-1]["t_us"] == deadline * 1000
+    rows[-1]["t_us"] = float(deadline * 1000)
+    assert C.chunks_cover(rows, issued_ms=issued, deadline_ms=deadline, anchor_ms=0) is False
+    stored, local = _boundary(tmp_path, "float-chunk", rows)
+    assert stored is None and local["reason"] == "pattern_mismatch" and local["withheld"] == "controller_log"
+
+
+def test_bool_chunk_time_is_ignored(tmp_path):
+    """A bool t_us is not a timestamp. Treating True as 1 would open coverage at 0."""
+    import qorcap_challenge as C
+
+    assert C.chunks_cover([{"type": "chunk", "t_us": True}], issued_ms=0, deadline_ms=0, anchor_ms=0) is False
+    assert C.chunks_cover([{"type": "chunk", "t_us": False}], issued_ms=0, deadline_ms=0, anchor_ms=0) is False
+    assert C.chunks_cover([{"type": "chunk", "t_us": 0}], issued_ms=0, deadline_ms=0, anchor_ms=0) is True
+    kick = _challenge("00112233445566778899aabbccddeeff", "kickoff", 0)
+    rows = [
+        _header(),
+        _status(0, "connected"),
+        _press(1_000, "OPTIONS"),
+        _press(1_400, _wrong_button(kick["pattern"])),
+        {"type": "chunk", "seq": 0, "seg": 0, "n": 0, "sha256": "ab" * 32,
+         "prev": "cd" * 32, "head": "ef" * 32, "t_us": True},
+        *_chunk_span(0, kick["deadline_ms"], start=2_000),
+    ]
+    filled = _fill(tmp_path / "bool-chunk", rows, [kick])
+    assert filled["challenges"][0]["result"] is None
+    line = json.loads((tmp_path / "bool-chunk" / "challenge_results.jsonl").read_text(encoding="utf-8").splitlines()[0])
+    assert line["reason"] == "pattern_mismatch" and line["withheld"] == "controller_log"
+
+
+def test_non_string_status_state_withholds(tmp_path):
+    """A status state that is not a string fails closed. An unknown string does too."""
+    import qorcap_challenge as C
+
+    kick = _kickoff()
+    issued, deadline = kick["issued_ms"], kick["deadline_ms"]
+    span = _chunk_span(issued, deadline)
+    head = _mismatch_head(kick)
+    number = [*head, {"type": "status", "t_us": (issued + 500) * 1000, "state": 1, "detail": "1", "seg": 0}, *span]
+    assert C.pad_connected_through(number, issued_ms=issued, deadline_ms=deadline, anchor_ms=0) is False
+    stored, local = _boundary(tmp_path, "state-number", number)
+    assert stored is None and local["reason"] == "pattern_mismatch" and local["withheld"] == "controller_log"
+    asleep = [*head, _status(issued + 500, "asleep"), *span]
+    assert C.pad_connected_through(asleep, issued_ms=issued, deadline_ms=deadline, anchor_ms=0) is False
+    stored, local = _boundary(tmp_path, "state-asleep", asleep)
+    assert stored is None and local["reason"] == "pattern_mismatch" and local["withheld"] == "controller_log"
+
+
+def test_bool_status_time_withholds(tmp_path):
+    """A bool status t_us is not an integer. True would otherwise be time 0 and stay connected."""
+    import qorcap_challenge as C
+
+    kick = _kickoff()
+    issued, deadline = kick["issued_ms"], kick["deadline_ms"]
+    rows = [
+        *_mismatch_head(kick),
+        {"type": "status", "t_us": True, "state": "connected", "detail": "connected", "seg": 0},
+        *_chunk_span(issued, deadline),
+    ]
+    assert C.pad_connected_through(rows, issued_ms=issued, deadline_ms=deadline, anchor_ms=0) is False
+    stored, local = _boundary(tmp_path, "bool-status", rows)
+    assert stored is None and local["reason"] == "pattern_mismatch" and local["withheld"] == "controller_log"
