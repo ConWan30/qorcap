@@ -571,41 +571,6 @@ def _running_gate_accept():
     return h, accepted_t
 
 
-def _run_confirmed_hold():
-    """A held contradiction of the running gate's own completing read.
-
-    A one-frame tick after that read drops the confirmation, so the hold is the
-    next sample.
-    """
-    h, accepted_t = _running_gate_accept()
-    hold = h.last_s + 12
-    for t in range(accepted_t + 100, accepted_t + 4_100, 100):
-        h.filter(hold, 1, t)
-    assert h.suspended
-    accepted = h._blocked_line if h._blocked_line and h._blocked_line[2] != "hold" else h._blocked_other
-    assert accepted is not None and accepted[2] == "run"
-    return h
-
-
-def _projection_at_first_sample(h: ClockHistory, t0: int) -> float:
-    """The accepted clock, projected 1:1 from the held line. This is the spec, not the code."""
-    pair_hold = h._blocked_other if h._blocked_other and h._blocked_other[2] == "hold" else h._blocked_line
-    pair_acc = h._blocked_line if pair_hold is h._blocked_other else h._blocked_other
-    assert pair_hold is not None and pair_acc is not None and pair_acc[2] == "run"
-    dt = (t0 - int(pair_hold[0])) / 1000.0
-    offset = int(pair_hold[1]) - int(pair_acc[1])
-    return (int(pair_hold[1]) - dt) - offset
-
-
-def _stoppage_adopts(secs: int, t0: int) -> bool:
-    h = _run_confirmed_hold()
-    for i in range(40):
-        out = h.filter(secs, 1, t0 + i * 100)
-        if out is not None:
-            return out == secs
-    return False
-
-
 def test_one_frame_accept_drops_a_running_gate_confirmation():
     """A one-frame tick does not keep the running-gate confirmation.
 
@@ -618,67 +583,36 @@ def test_one_frame_accept_drops_a_running_gate_confirmation():
     assert h._baseline_kind == "frame"
 
 
-def test_running_gate_confirmed_clock_may_return_within_one_second():
-    """The stoppage return is the running gate's own read, within one second.
-
-    The integer just above the projection sits inside that one-second bin and
-    outside half a second. The projection counts down, so the integer only
-    moves further away. A half-second bin does not adopt it. The next second
-    above the bin does not return either.
-    """
-    h = _run_confirmed_hold()
-    chosen = None
-    for t0 in range(h.last_t + 100, h.last_t + 20_000, 100):
-        exact = _projection_at_first_sample(h, t0)
-        if exact == int(exact):
-            continue
-        above = int(exact) + 1
-        # An equal published second returns without using this bin.
-        if above == h._published_s:
-            continue
-        dist = above - exact
-        if 0.5 < dist <= 1.0:
-            chosen = (t0, exact, above)
-            break
-    assert chosen is not None
-    t0, exact, above = chosen
-    assert _stoppage_adopts(above, t0), (above, exact)
-    outside = above + 1
-    if outside == h._published_s:
-        outside = above + 2
-    assert abs(outside - exact) > 1.0
-    assert not _stoppage_adopts(outside, t0)
-    below = above - 1
-    if abs(below - exact) <= 1.0 and below != h._published_s:
-        assert _stoppage_adopts(below, t0)
-
-
-def test_held_line_is_checked_before_the_running_gate_return():
-    """A second the held line could already have shown stays blocked.
-
-    The running gate confirmed 77. A hold of 79 (offset 2) voids both. Two
-    seconds later, 76 is within one displayed second of that clock's
-    projection, so the return would adopt it. 76 is also on the held line's
-    countdown. Checking the held line first keeps it blank. Dropping that
-    check publishes 76.
-    """
-    h = ClockHistory()
-    assert h.filter(60, 1, 0) == 60
-    for t in (100, 800, 1_500, 2_100):
-        h.filter(70, 1, t)
-    accepted_t = None
-    for i in range(40):
-        t = 9_000 + i * 100
-        got = h.filter(80 - i // 10, 1, t)
-        if got is not None:
-            accepted_t = t
-            break
-    assert accepted_t == 12_000 and h._baseline_kind == "run" and h.last_s == 77
+def _hold_the_frame_after_the_running_gate():
+    """Running-gate accept of 77, then a hold of 89 starting on the next frame."""
+    h, accepted_t = _running_gate_accept()
+    assert accepted_t == 12_000 and h.last_s == 77 and h._baseline_kind == "run"
     for t in range(accepted_t + 100, accepted_t + 4_100, 100):
-        assert h.filter(79, 1, t) is None
+        assert h.filter(89, 1, t) is None
     assert h.suspended
-    hold = h._blocked_other if h._blocked_other and h._blocked_other[2] == "hold" else h._blocked_line
-    assert hold == (16_000, 79, "hold")
+    accepted = h._blocked_line if h._blocked_line and h._blocked_line[2] != "hold" else h._blocked_other
+    hold = h._blocked_other if accepted is h._blocked_line else h._blocked_line
+    assert accepted == (12_000, 77, "run")
+    assert hold == (16_000, 89, "hold")
+    return h
+
+
+def test_hold_on_the_next_frame_uses_the_held_line():
+    """A hold starting the frame after a running-gate accept is a held line.
+
+    The countdown of that held second stays blank. A later stoppage of 76,
+    the second a separate return used to adopt, stays blank too.
+    """
+    h = _hold_the_frame_after_the_running_gate()
+    published = []
+    for i in range(100):
+        t = 16_100 + i * 100
+        read = 89 - (t - 16_000) // 1000
+        out = h.filter(read, 1, t)
+        if out is not None:
+            published.append((t, out))
+    assert published == []
+    h = _hold_the_frame_after_the_running_gate()
     published = []
     for i in range(40):
         out = h.filter(76, 1, 16_100 + i * 100)
@@ -746,9 +680,12 @@ def _w4_wrong_after_detection(off: int, gap_s: int) -> int:
     return wrong
 
 
-@pytest.mark.parametrize("off,gap", [(2, 1), (2, 2), (2, 7), (5, 4), (5, 5), (5, 10)])
+@pytest.mark.parametrize(
+    "off,gap",
+    [(2, 1), (2, 2), (2, 7), (5, 4), (5, 5), (5, 10), (10, 9), (10, 10), (10, 15)],
+)
 def test_one_frame_misread_does_not_return_on_a_later_stoppage(off, gap):
-    """W4. Offsets 2 and 5. Inheriting the running-gate flag publishes 60 values."""
+    """W4. Offsets 2, 5, and 10. Inheriting the running-gate flag publishes 60 values."""
     assert _w4_wrong_after_detection(off, gap) == 0
 
 
@@ -782,7 +719,7 @@ def test_increase_void_blocks_the_running_dispute_not_the_held_second():
     """R5-h. A higher line that completes as a run is blocked from its own origin.
 
     Storing the last held second instead lets a 0.66x continuation back in:
-    67 wrong values on this window, for each of the four higher offsets.
+    68 wrong values on this window, for each of the four higher offsets.
     """
     for offset in (3, 5, 10, 30):
         h = ClockHistory()

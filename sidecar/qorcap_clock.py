@@ -44,13 +44,12 @@ end of the hold, for the rest of the quarter. A read above 15:00 still moves tha
 before it is rejected. The true clock stays blank through that whole countdown, not only
 while the higher second is held. While suspended, a stoppage
 re-anchor cannot be above the last clock published in that quarter. An equal second may.
-It cannot adopt a second a contradicted line could already have shown. The held line is
-checked first, so a second that line could have shown stays blocked even when it also
-matches the other line's projection. A clock may return on a later stoppage only when
-the running gate itself accepted that read, within one displayed second of its
-projection. A later one-frame accept does not keep that confirmation, and a clock
-adopted on a stoppage does not have it. A higher clock that is neither blocked line returns through
-the running-clock gate or a quarter change, which clears both lines. While that blank holds,
+It cannot adopt a second a contradicted line could already have shown. Both lines stay
+blocked on their trajectories. A hold that starts on the frame after the running gate
+accepted is that same block: the held countdown stays blank, and a later stoppage does
+not bring the accepted clock back. A higher clock that is neither
+blocked line returns through the running-clock gate or a quarter change, which clears
+both lines. While that blank holds,
 nothing is emitted except the read that completes the re-anchor. A quarterless read is not
 emitted and does not join it. A lone runoff has no second line, so the running-clock gate
 still adopts it (FU1).
@@ -181,7 +180,7 @@ class ClockHistory:
         self._published_s: int | None = None
         # How the current baseline was confirmed: "run" (running gate), "stop"
         # (stoppage gate), or "frame" (one frame, including the first accept and
-        # a quarter change). A one-frame continuation keeps a run or stop.
+        # a quarter change). A one-frame continuation keeps only "stop".
         self._baseline_kind = "frame"
 
     def _clear_cand(self) -> None:
@@ -219,8 +218,7 @@ class ClockHistory:
         elif self.reanchored and self.reanchor_kind == "stop":
             self._baseline_kind = "stop"
         elif self.continuation and self._baseline_kind == "stop":
-            # A one-frame tick keeps a stoppage adoption a stoppage. It does not
-            # earn the running-gate return.
+            # A one-frame tick keeps a stoppage adoption a stoppage.
             pass
         else:
             # A one-frame accept never inherits a running-gate confirmation,
@@ -279,27 +277,6 @@ class ClockHistory:
         drop = s0 - int(secs)
         return lo * dt - self.run_tol_s <= drop <= hi * dt + self.run_tol_s
 
-    def _held_and_accepted(self):
-        """The held line and the accepted line from one held contradiction, if that is the pair."""
-        origins = [o for o in (self._blocked_line, self._blocked_other) if o]
-        holds = [o for o in origins if (o[2] if len(o) > 2 else "run") == "hold"]
-        runs = [o for o in origins if (o[2] if len(o) > 2 else "run") != "hold"]
-        if len(holds) == 1 and len(runs) == 1:
-            return holds[0], runs[0]
-        return None
-
-    def _on_accepted_parallel(self, hold, accepted, secs: int, t_ms: int) -> bool:
-        """True when ``secs`` is the accepted clock, projected from the hold anchor.
-
-        The offset is the gap between the two stored seconds. ``t_ms`` is the time to
-        project from, so a stoppage can keep the second that matched on its first read.
-        """
-        offset = int(hold[1]) - int(accepted[1])
-        t0, s0 = int(hold[0]), int(hold[1])
-        dt = (int(t_ms) - t0) / 1000.0
-        projected = s0 if dt < 0 else s0 - dt
-        return abs(int(secs) - (projected - offset)) <= self.run_tol_s
-
     def _on_line(self, origin, samples) -> bool:
         """True when every sample still sits on this contradicted line.
 
@@ -352,31 +329,12 @@ class ClockHistory:
     def _second_blocked(self, secs: int, t_ms: int) -> bool:
         """True when this second is one either contradicted line could already have shown.
 
-        An equal published second is exempt: that stoppage may return. A second
-        the held line could already have shown is blocked before any other
-        exemption: that check is what keeps a small-offset misread out. The
-        accepted clock may return only when the running gate itself confirmed
-        that read, and this second matched its projection at the first sample
-        of the hold. A later one-frame accept does not keep that confirmation.
+        An equal published second is exempt: that stoppage may return. Every other
+        second on either line's trajectory stays blocked, including the clock the
+        running gate accepted on the frame before a hold.
         """
         if self._published_s is not None and int(secs) == int(self._published_s):
             return False
-        pair = self._held_and_accepted()
-        if pair is not None:
-            hold, accepted = pair
-            if self._on_trajectory(hold, secs, t_ms):
-                return True
-            when = int(t_ms)
-            if (
-                self._cand is not None
-                and int(self._cand) == int(secs)
-                and self._cand_t0 is not None
-            ):
-                when = int(self._cand_t0)
-            kind = accepted[2] if len(accepted) > 2 else "frame"
-            if kind == "run" and self._on_accepted_parallel(hold, accepted, secs, when):
-                return False
-            return self._on_trajectory(accepted, secs, t_ms)
         return self._on_trajectory(self._blocked_line, secs, t_ms) or self._on_trajectory(
             self._blocked_other, secs, t_ms)
 
@@ -434,10 +392,9 @@ class ClockHistory:
         While suspended, a second above the last clock published in the quarter
         does not join this candidate and is not adopted. An equal second may.
         A second either contradicted line could already have shown does not,
-        including after a projection has moved on. After a held
-        contradiction, a clock the running gate confirmed may return: a hold of
-        the second that matched it on the first read of this candidate is that
-        clock. A clock adopted on a stoppage does not get that return.
+        including after a projection has moved on. A hold that starts on the
+        frame after a running-gate accept is the same block: that clock does
+        not come back on a later stoppage.
         A higher clock that is not one of those lines returns through the
         running-clock gate or a quarter change.
         """
