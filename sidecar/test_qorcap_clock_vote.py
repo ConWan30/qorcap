@@ -393,6 +393,109 @@ def test_a_steady_five_high_line_publishes_nothing_wrong_after_detection():
     assert det is not None and wrong_after == []
 
 
+def test_plus_five_accepted_first_then_alternating_does_not_return():
+    """The +5 line is accepted first, alternates with the truth, then runs alone.
+
+    The lower-path void has to block that already-accepted line. Dropping it
+    publishes the misread again (170 values on this probe).
+    """
+    h = ClockHistory()
+    det = None
+    wrong = 0
+    for i, t in enumerate(range(0, 24_000, 100)):
+        truth = 250 - t // 1000
+        mis = truth + 5
+        if t == 0:
+            read = mis
+        elif t < 4_000:
+            read = mis if i % 2 == 0 else truth
+        else:
+            read = mis
+        out = h.filter(read, 1, t)
+        if h.rule_note == "clock_disagree" and det is None:
+            det = t
+        if det is not None and t > det and out is not None and out != truth:
+            wrong += 1
+    assert det is not None and wrong == 0
+
+
+def test_stoppage_does_not_keep_a_second_the_blocked_line_already_showed():
+    """A hold of a second on the contradicted line stays blank past the 1.0x crossing.
+
+    The stoppage bar is 2 s. A 1.0x projection only overlaps a held second for about
+    that long. The refusal has to cover the second after the projection has moved on.
+    """
+    h = ClockHistory()
+    det = None
+    for t in range(0, 5_000, 100):
+        truth = 200 - t // 1000
+        h.filter(truth if t == 0 else truth + 5, 1, t)
+        if h.suspended and det is None:
+            det = t
+    assert det is not None and h._blocked_line is not None
+    t0, s0 = int(h._blocked_line[0]), int(h._blocked_line[1])
+    held = 189
+    t_cross = t0 + (s0 - held) * 1000
+    assert t_cross > det
+    # Past the ~2 s 1.0x overlap and past the 0.7x–1.3x band of both blocked
+    # lines, so a check that only fires while this second is still on a projection
+    # does not pass.
+    adopted = []
+    for t in range(t_cross - 3_000, t_cross + 22_000, 100):
+        out = h.filter(held, 1, t)
+        if out is not None:
+            adopted.append((t, out))
+    assert adopted == [] and h.last_s is None
+
+
+def test_a_held_void_does_not_anchor_the_second_line_on_a_stale_dispute():
+    """Accepted ticks leave a parallel dispute in place. A later hold must not use it."""
+    h = ClockHistory()
+    assert h.filter(100, 1, 0) == 100
+    assert h.filter(90, 1, 100) is None
+    assert h._dispute and h._dispute[0][1] == 90
+    assert h.filter(99, 1, 2_000) == 99
+    assert h._dispute, "an ordinary accept keeps the parallel dispute running"
+    for t in range(3_000, 5_200, 100):
+        assert h.filter(110, 1, t) is None
+    assert h.suspended
+    assert h._blocked_other is not None
+    assert h._blocked_other[1] == 110 and h._blocked_other[2] == "hold"
+    assert h._blocked_other[1] != 90
+
+
+def test_stoppage_does_not_adopt_a_higher_second_off_the_contradicted_line():
+    """The published-second ceiling is what refuses a higher hold that is not either blocked line."""
+    h = ClockHistory()
+    assert h.filter(60, 1, 0) == 60
+    for t in (100, 800, 1_500, 2_100):
+        assert h.filter(70, 1, t) is None
+    assert h.suspended and h._published_s == 60
+    adopted = []
+    for t in range(8_000, 12_000, 100):
+        out = h.filter(90, 1, t)
+        if out is not None:
+            adopted.append((t, out))
+    assert adopted == [] and h.last_s is None
+
+
+@pytest.mark.parametrize("rate", [0.85, 0.9, 1.0, 1.1, 1.15])
+def test_blocked_line_holds_across_the_running_gate_rate_band(rate):
+    """A contradicted misread at a rate the running gate accepts stays blocked."""
+    h = ClockHistory()
+    det = None
+    wrong = 0
+    for t in range(0, 17_001, 100):
+        truth = int(120 - t / 1000.0)
+        mis = int(round(125 - rate * t / 1000.0))
+        out = h.filter(truth if t == 0 else mis, 1, t)
+        if h.rule_note == "clock_disagree" and det is None:
+            det = t
+        if det is not None and t > det and out is not None and out != truth:
+            wrong += 1
+    assert det is not None and wrong == 0
+
+
 def test_a_third_line_can_reanchor_after_both_contradicted_lines_are_blocked():
     """A countdown on neither contradicted line may still complete the running gate."""
     h = ClockHistory()

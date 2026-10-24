@@ -13,9 +13,10 @@ a reject. A read with no quarter does not become the baseline, so it cannot blan
 that follows. An upward step inside a quarter is impossible: it is blanked and noted as
 ``clock_increase``. One frame cannot re-anchor. The same higher second, held for the
 stoppage bar, blanks both clocks. While suspended, the stoppage gate does not adopt a
-second above the last clock published in that quarter. An equal second may. A higher
-clock returns through the running-clock gate or a quarter change. A drop bigger than
-the time since the last accepted clock is not accepted on that frame.
+second above the last clock published in that quarter, or a second either contradicted
+line could already have shown. An equal second may. A higher clock that is not one of
+those lines returns through the running-clock gate or a quarter change. A drop bigger
+than the time since the last accepted clock is not accepted on that frame.
 
 Two ways back in, both stricter than one frame:
 
@@ -34,12 +35,16 @@ Two ways back in, both stricter than one frame:
 
 A second sustained line that disagrees with the accepted clock, higher or lower, blanks both.
 So does one higher second held for the stoppage bar. Both contradicted lines stay blocked
-until a quarter change, or until a line that is neither of them completes a gate. While
-suspended, a stoppage re-anchor cannot be above the last clock published in that quarter.
-An equal second may. A higher truth returns through the running-clock gate or a quarter
-change. While that blank holds, nothing is emitted except the read that completes the
-re-anchor. A quarterless read is not emitted and does not join it. A lone runoff has no
-second line, so the running-clock gate still adopts it (FU1).
+until a quarter change, or until a line that is neither of them completes a gate. The block
+follows the same slope band as the running gate (about 0.7x–1.3x), not one exact 1.0x
+projection, so a contradicted misread at a rate that gate accepts does not come back.
+While suspended, a stoppage re-anchor cannot be above the last clock published in that
+quarter, and it cannot adopt a second either contradicted line has already shown. An
+equal second may. A higher truth returns through the running-clock gate or a quarter
+change only when it is not one of those two lines; a contradicted line stays blank for
+the rest of the quarter. While that blank holds, nothing is emitted except the read that
+completes the re-anchor. A quarterless read is not emitted and does not join it. A lone
+runoff has no second line, so the running-clock gate still adopts it (FU1).
 
 Stoppage is a hold. With no ``t_ms`` the digits are read and the history is left alone.
 """
@@ -154,9 +159,10 @@ class ClockHistory:
         self.continuation = False
         self._dispute: list[tuple[int, int]] = []
         self.suspended = False
-        # (t_ms, seconds) of the two lines a disagreement rejected. Neither may re-enter.
-        self._blocked_line: tuple[int, int] | None = None
-        self._blocked_other: tuple[int, int] | None = None
+        # (t_ms, seconds, "run"|"hold") of the two lines a disagreement rejected.
+        # Neither may re-enter. A run is blocked across the running gate's slope band.
+        self._blocked_line: tuple[int, int, str] | None = None
+        self._blocked_other: tuple[int, int, str] | None = None
         # A higher second held against the accepted clock. The stoppage bar voids both.
         self._held: int | None = None
         self._held_n = 0
@@ -183,6 +189,10 @@ class ClockHistory:
         self.last_accept_t = int(t_ms)
         self._clear_cand()
         self._clear_run()
+        # An ordinary accept does not clear ``_dispute``. A parallel lower line has to
+        # outlast those ticks to complete. ``_extend`` restarts the list when a sample
+        # leaves its line, so the anchor read at completion is the line that just
+        # finished, not an older one. A held disagreement does not use this list.
         if self.reanchored:
             # A new anchor replaces the dispute. The blocked line stays blocked.
             self._dispute = []
@@ -203,16 +213,59 @@ class ClockHistory:
             return [sample]
         return trial
 
+    def _accepted_rate_band(self) -> tuple[float, float]:
+        """Rates the running gate can keep accepting, about 0.7x–1.3x.
+
+        One window allows ``|drop - dt| <= run_tol_s``. A constant rate inside
+        ``1 ± tol/span`` stays inside a restarted window. 2x does not.
+        """
+        span_s = self.run_span_ms / 1000.0
+        if span_s <= 0:
+            return 1.0, 1.0
+        slack = self.run_tol_s / span_s
+        return 1.0 - slack, 1.0 + slack
+
     def _on_line(self, origin, samples) -> bool:
-        """True when every sample still sits on the countdown through ``origin``."""
+        """True when every sample still sits on this contradicted line.
+
+        A running line matches the running gate's slope band from its origin, not one
+        exact 1.0x projection. A held line is that one second.
+        """
         if not origin or not samples:
             return False
-        t0, s0 = origin
+        t0, s0 = int(origin[0]), int(origin[1])
+        kind = origin[2] if len(origin) > 2 else "run"
+        lo, hi = self._accepted_rate_band()
         for t, s in samples:
-            expected = int(s0) - (int(t) - int(t0)) / 1000.0
-            if abs(int(s) - expected) > self.run_tol_s:
+            dt = (int(t) - t0) / 1000.0
+            if dt < 0:
+                return False
+            if kind == "hold":
+                if abs(int(s) - s0) > self.run_tol_s:
+                    return False
+                continue
+            drop = s0 - int(s)
+            if drop < lo * dt - self.run_tol_s or drop > hi * dt + self.run_tol_s:
                 return False
         return True
+
+    def _on_trajectory(self, origin, secs: int, t_ms: int) -> bool:
+        """True when ``secs`` is a value this line could already have shown.
+
+        The check covers the whole slope band up to now, so a held second stays
+        blocked after a 1.0x projection has moved past it.
+        """
+        if not origin or int(t_ms) < int(origin[0]):
+            return False
+        t0, s0 = int(origin[0]), int(origin[1])
+        kind = origin[2] if len(origin) > 2 else "run"
+        if kind == "hold":
+            return abs(int(secs) - s0) <= self.run_tol_s
+        dt = (int(t_ms) - t0) / 1000.0
+        _lo, hi = self._accepted_rate_band()
+        low = s0 - hi * dt - self.run_tol_s
+        high = s0 + self.run_tol_s
+        return low <= int(secs) <= high
 
     def _line_blocked(self, samples) -> bool:
         """True when every sample still sits on a line a disagreement already rejected."""
@@ -223,19 +276,30 @@ class ClockHistory:
         return self._on_line(self._blocked_other, samples)
 
     def _second_blocked(self, secs: int, t_ms: int) -> bool:
-        """True when this one second still lies on either contradicted line."""
-        return self._on_line(self._blocked_line, [(t_ms, secs)]) or self._on_line(
-            self._blocked_other, [(t_ms, secs)])
+        """True when this second is one either contradicted line could already have shown.
 
-    def _void(self, block: tuple[int, int] | None, also: tuple[int, int] | None = None) -> None:
+        An equal published second is exempt: that stoppage may return.
+        """
+        if self._published_s is not None and int(secs) == int(self._published_s):
+            return False
+        return self._on_trajectory(self._blocked_line, secs, t_ms) or self._on_trajectory(
+            self._blocked_other, secs, t_ms)
+
+    def _line(self, block, kind: str) -> tuple[int, int, str] | None:
+        if block is None:
+            return None
+        stored = block[2] if len(block) > 2 else kind
+        return (int(block[0]), int(block[1]), str(stored))
+
+    def _void(self, block: tuple | None, also: tuple | None = None) -> None:
         """Drop the accepted clock and adopt neither of the two lines that contradicted.
 
         ``block`` and ``also`` are those lines. A later read is kept only when it is on
         neither of them, or the quarter changes.
         """
         if block is not None:
-            self._blocked_line = (int(block[0]), int(block[1]))
-        self._blocked_other = None if also is None else (int(also[0]), int(also[1]))
+            self._blocked_line = self._line(block, "run")
+        self._blocked_other = self._line(also, "run")
         self.last_s = None
         self.last_accept_t = None
         self.suspended = True
@@ -274,8 +338,10 @@ class ClockHistory:
 
         While suspended, a second above the last clock published in the quarter
         does not join this candidate and is not adopted. An equal second may.
-        A second still on either contradicted line does not. A higher clock
-        returns through the running-clock gate or a quarter change.
+        A second either contradicted line could already have shown does not,
+        including after a 1.0x projection has moved on. A higher clock that is
+        not one of those lines returns through the running-clock gate or a
+        quarter change.
         """
         if self.suspended and self._published_s is not None and int(secs) > int(self._published_s):
             self._clear_cand()
@@ -428,18 +494,20 @@ class ClockHistory:
             self.rule_note = "clock_increase"
             self._clear_run()
             self._clear_cand()
-            contradicted = self._held_disagreement(secs, t_ms)
-            if not contradicted:
-                contradicted = self._offer_dispute(secs, t_ms)
-            if contradicted:
+            # A hold completes on its own. Do not attach a dispute that was not
+            # extended on this frame: accepted ticks leave that list running, so
+            # an older ``_dispute[0]`` is not this line's anchor.
+            held_done = self._held_disagreement(secs, t_ms)
+            dispute_done = False if held_done else self._offer_dispute(secs, t_ms)
+            if held_done or dispute_done:
                 block = None
                 if self.last_accept_t is not None and self.last_s is not None:
-                    block = (int(self.last_accept_t), int(self.last_s))
+                    block = (int(self.last_accept_t), int(self.last_s), "run")
                 other = None
-                if self._dispute:
-                    other = (int(self._dispute[0][0]), int(self._dispute[0][1]))
+                if dispute_done and self._dispute:
+                    other = (int(self._dispute[0][0]), int(self._dispute[0][1]), "run")
                 elif self._held_t0 is not None and self._held is not None:
-                    other = (int(self._held_t0), int(self._held))
+                    other = (int(self._held_t0), int(self._held), "hold")
                 self._void(block, other)
             return None
         self._clear_held()
@@ -454,10 +522,12 @@ class ClockHistory:
         # here on its completing frame. A lower line that has outlasted the accepted clock
         # (the accepted ticks cleared ``_run`` and left ``_dispute`` running) blanks both.
         if self._offer_dispute(secs, t_ms):
-            origin = self._dispute[0] if self._dispute else None
+            origin = None
+            if self._dispute:
+                origin = (int(self._dispute[0][0]), int(self._dispute[0][1]), "run")
             old = None
             if self.last_accept_t is not None and self.last_s is not None:
-                old = (int(self.last_accept_t), int(self.last_s))
+                old = (int(self.last_accept_t), int(self.last_s), "run")
             self._void(origin, old)
         return None
 
