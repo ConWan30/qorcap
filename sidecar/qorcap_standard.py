@@ -12,8 +12,10 @@ counts down, or re-anchors. A running clock may re-anchor after a consistent 1:1
 An increase inside a quarter is blanked. A FIELD GOAL or TOUCHDOWN banner blanks the scores
 and still returns quarter and clock. No banner fragment is shipped: the only ones cut for this
 reader came from held-out 170123 frames. The score grammar can abstain or re-anchor; it cannot
-raise a read. A disagreement abstains the final only after it persists across the vote. An
-unreadable quarter may be carried in ``detail`` as inferred; the quarter field stays empty.
+raise a read. A pending new score inside the vote gap abstains the final before the vote
+has persisted; a single forged decrease does not. A disagreement abstains the final once
+the vote persists. An unreadable quarter may be carried in ``detail`` as inferred; the
+quarter field stays empty.
 See ``qorcap_score_grammar`` and ``docs/SCOREBUG_CLOCK_VOTE.md``. ``model_id`` hashes every
 stacked template plus the grammar, vote, and clock parameters.
 """
@@ -39,7 +41,7 @@ ANCHOR_SEARCH_PX = 8
 # Bumped when clock, vote, or inferred-quarter behaviour changes. Hashed into model_id.
 # Issue #78 also wants this id emitted for a referee. That upload is issue #80; this file
 # only moves the id. The banner pack is hashed so a future pack cannot keep this id.
-READER_LOGIC_REV = "2026-10-24-clock-vote-infer-r3"
+READER_LOGIC_REV = "2026-10-24-clock-vote-infer-r4"
 
 
 QUARTER_FAIL = {"quarter_unsure", "quarter_missing", "quarter_unknown", "quarter_no_templates"}

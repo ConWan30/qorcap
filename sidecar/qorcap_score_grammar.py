@@ -29,19 +29,22 @@ Re-anchor (constructor arguments; these constants are the default):
 
 A re-anchor stays unconfirmed until ``note_lock`` records that same pair (the agreement window
 locked it). While a disagreement has persisted across the vote, or the last re-anchor is still
-unconfirmed, ``allows_final_fallback`` is false. The match final must abstain instead of
+unconfirmed, ``allows_final_fallback`` is false. It is also false while a pending new score,
+not a decrease, is still inside the vote gap. The match final must abstain instead of
 publishing the frozen anchor.
 
 The vote uses the agreement window's numbers: ``vote_reads`` 3, ``vote_interval_ms`` 200,
 ``vote_span_ms`` 400, ``vote_gap_ms`` 2_000. A sample closer than the interval is not new
-evidence and is not a reset. One illegal frame blanks that frame and does not flip
-``allows_final_fallback``. The same illegal run, persisted across the vote, does. A gap longer
-than ``vote_gap_ms`` starts the count over and does not clear a disagreement that already
-persisted. A read of the locked score does not reset that count when a pending read is a new
-score (not a decrease). Three consecutive reads of the locked score, with the same interval,
-span, and gap, clear a disagreement that has persisted. One does not. An older lower score
-between reads of the lock is dismissed by those reads, so a forged decrease interleaved with
-the true lock does not abstain it. ``suspicious_reads`` 9
+evidence and is not a reset. One illegal frame blanks that frame and does not set
+``disagreeing``. A pending new score inside the 2 s gap withholds the fallback even when
+that vote has not yet persisted; a pending decrease does not. The same illegal run, persisted
+across the vote, does abstain. A gap longer than ``vote_gap_ms`` starts the count over and
+does not clear a disagreement that already persisted. A read of the locked score does not
+reset that count when a pending read is a new score (not a decrease). Three consecutive
+reads of the locked score, with the same interval, span, and gap, clear a disagreement that
+has persisted. One does not. An older lower score between reads of the lock is dismissed by
+those reads, so a forged decrease interleaved with the true lock does not abstain it.
+``suspicious_reads`` 9
 over ``suspicious_span_ms``
 2_000 is the agreement window's bar for an implausible jump, so a short forged decrease still
 cannot confirm a re-anchor. See ``docs/SCOREBUG_CLOCK_VOTE.md``.
@@ -325,11 +328,27 @@ class ScoreGrammar:
         span = t_ms - (t_ms if self._cand_t0 is None else int(self._cand_t0))
         return self._cand_n >= int(self.reanchor_reads) and span >= int(self.reanchor_span_ms)
 
+    def _pending_new_score_inside_gap(self) -> bool:
+        """A new score still inside the vote gap withholds the fallback.
+
+        Two frames do not meet the 3-read vote, and they must still keep a stale
+        lock off the final. A window of only decreases does not: that is FU2.
+        Compared with ``last_t``, which a blank frame moves forward.
+        """
+        if self.locked is None or not self._vote_pairs or self._vote_last is None or self.last_t is None:
+            return False
+        if int(self.last_t) - int(self._vote_last) > int(self.vote_gap_ms):
+            return False
+        la, lh = int(self.locked[0]), int(self.locked[1])
+        return any(int(a) >= la and int(h) >= lh for a, h in self._vote_pairs)
+
     def allows_final_fallback(self) -> bool:
         """False when a frozen anchor must not be published as the match score."""
         if self.disagreeing:
             return False
         if self.reanchor_pair is not None and not self.reanchor_confirmed:
+            return False
+        if self._pending_new_score_inside_gap():
             return False
         return True
 

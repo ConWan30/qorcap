@@ -87,11 +87,11 @@ def test_clock_increase_inside_a_quarter_blanks_and_is_noted():
     assert h.reanchored is False
 
 
-def test_a_held_increase_voids_on_the_stoppage_bar_and_does_not_adopt_that_frame():
+def test_a_held_increase_voids_on_the_stoppage_bar_and_is_not_adopted():
     """One higher second does not move the baseline. Held for the stoppage bar, it blanks both.
 
-    The frame that completes the bar is not a re-anchor. A fresh stoppage after the blank may
-    adopt the held second.
+    While suspended, the stoppage gate does not adopt that higher second. It stays blank
+    until a running clock comes back through the running-clock gate.
     """
     h = ClockHistory()
     assert h.filter(60, 1, 0) == 60
@@ -102,11 +102,10 @@ def test_a_held_increase_voids_on_the_stoppage_bar_and_does_not_adopt_that_frame
     assert h.filter(61, 1, 2_100) is None
     assert h.rule_note == "clock_disagree" and h.suspended and h.last_s is None
     assert h.reanchor_kind is None
-    assert h.filter(61, 1, 2_200) is None
-    assert h.filter(61, 1, 2_900) is None
-    assert h.filter(61, 1, 3_600) is None
-    assert h.filter(61, 1, 4_200) == 61
-    assert h.reanchor_kind == "stop" and h.last_s == 61
+    for t in (2_200, 2_900, 3_600, 4_200, 8_000):
+        assert h.filter(61, 1, t) is None
+        assert h.last_s is None and h.reanchor_kind is None and h.suspended
+    assert h._published_s == 60
 
 
 def test_clock_resets_at_a_higher_quarter_and_rejects_above_the_cap():
@@ -317,9 +316,12 @@ def test_mixq_five_high_and_ten_low_emit_nothing_wrong_after_detection():
         assert wrong == [], (off, wrong)
 
 
-def test_held_true_clock_voids_a_ten_second_low_stoppage_and_reanchors():
-    """A 10 s-low misread can stick on a stoppage. The true second, held, must blank it
-    and then come back through the stoppage gate. Nothing wrong is emitted after the blank."""
+def test_held_true_clock_voids_a_ten_second_low_stoppage_and_stays_blank():
+    """A 10 s-low misread can stick on a stoppage. The true second, held, blanks it.
+
+    While the clock stays stopped, that higher second is not adopted. Nothing is
+    emitted after the blank. The true clock returns only when it runs.
+    """
     h = ClockHistory()
     assert h.filter(90, 1, 0) == 90
     assert h.filter(80, 1, 100) is None
@@ -329,21 +331,83 @@ def test_held_true_clock_voids_a_ten_second_low_stoppage_and_reanchors():
     assert h.reanchor_kind == "stop"
     wrong = []
     detected = None
-    recovered = None
     t = 2_200
-    for _ in range(16):
+    for _ in range(20):
         got = h.filter(90, 1, t)
         if h.rule_note == "clock_disagree" and detected is None:
             detected = t
             assert got is None and h.last_s is None and h.suspended
-        if detected is not None and got is not None and got != 90:
+        if detected is not None and got is not None:
             wrong.append((t, got))
-        if got == 90:
-            recovered = t
-            break
         t += 700
-    assert detected is not None and recovered is not None and wrong == []
-    assert h.reanchor_kind == "stop" and h.last_s == 90
+    assert detected is not None and wrong == []
+    assert h.last_s is None and h.suspended and h._published_s == 80
+
+
+def test_jump_forward_sixty_to_one_twenty_held_is_never_kept():
+    h = ClockHistory()
+    assert h.filter(60, 1, 0) == 60
+    kept = []
+    for i in range(50):
+        got = h.filter(120, 1, 100 + 100 * i)
+        if got is not None:
+            kept.append(got)
+    assert kept == []
+    assert h.last_s in (None, 60)
+    assert h._published_s == 60
+
+
+def test_held_five_high_stoppage_emits_nothing_wrong_after_detection():
+    """True clock 60 held, misread 65 held from 3 s to 9 s. 65 is never published."""
+    h = ClockHistory()
+    det = None
+    wrong_after = []
+    emitted_high = []
+    for t in range(0, 18_000, 100):
+        truth = 60
+        read = 65 if 3_000 <= t < 9_000 else 60
+        out = h.filter(read, 1, t)
+        if h.rule_note == "clock_disagree" and det is None:
+            det = t
+        if out == 65:
+            emitted_high.append(t)
+        if det is not None and t > det and out is not None and out != truth:
+            wrong_after.append((t, out, truth))
+    assert det is not None and wrong_after == [] and emitted_high == []
+    assert h.last_s == 60  # the same second may return; the higher one does not
+
+
+def test_a_higher_countdown_returns_only_through_the_running_gate():
+    h = ClockHistory()
+    assert h.filter(60, 1, 0) == 60
+    for t in (100, 800, 1_500, 2_100):
+        assert h.filter(70, 1, t) is None
+    assert h.suspended and h.last_s is None and h._published_s == 60
+    assert h.filter(70, 1, 8_000) is None
+    assert h.last_s is None and h.reanchor_kind is None
+    accepted = []
+    kind = None
+    for i in range(40):
+        t = 9_000 + i * 100
+        secs = 80 - i // 10
+        got = h.filter(secs, 1, t)
+        if got is not None:
+            if kind is None:
+                kind = h.reanchor_kind
+            accepted.append((t, got))
+    assert accepted and kind == "run"
+    assert accepted[0][1] > 60 and h.last_s == accepted[-1][1] > 60
+
+
+def test_quarter_change_while_suspended_starts_a_new_baseline():
+    """A new quarter while suspended is a fresh baseline, even above the old clock."""
+    h = ClockHistory()
+    assert h.filter(80, 1, 0) == 80
+    for t in (100, 800, 1_500, 2_100):
+        h.filter(90, 1, t)
+    assert h.suspended and h.last_s is None
+    assert h.filter(400, 2, 3_000) == 400
+    assert h.last_q == 2 and h.suspended is False and h.last_s == 400
 
 
 def test_fuzz_suspended_emits_only_through_a_reanchor():
@@ -386,12 +450,14 @@ def test_vote_gap_restarts_an_unpersisted_disagreement():
     g = _locked(7, 14)
     assert g.filter(_fr(11, 14), 1_000, None).left_score is None
     assert g.filter(_fr(12, 14), 1_200, None).left_score is None
-    assert g.allows_final_fallback() is True
+    assert g.disagreeing is False
+    # The two new-score reads are still inside the gap, so the fallback stays off.
+    assert g.allows_final_fallback() is False
     # 3.3 s after the previous illegal read. A gap restarts the count at 1.
     assert g.filter(_fr(16, 14), 4_500, None).left_score is None
-    assert g.allows_final_fallback() is True
+    assert g.disagreeing is False and g._vote_n == 1
     assert g.filter(_fr(11, 14), 4_700, None).left_score is None
-    assert g.allows_final_fallback() is True
+    assert g.disagreeing is False and g._vote_n == 2
 
 
 def test_one_outlier_does_not_move_the_lock_or_the_final():
@@ -409,9 +475,9 @@ def test_a_persistent_disagreement_abstains_and_a_gap_does_not_clear_it():
     g = _locked(7, 14)
     # +4, +5 and +9 are illegal. +2 would be a safety and would clear the vote.
     assert g.filter(_fr(11, 14), 1_000, None).left_score is None
-    assert g.allows_final_fallback() is True
+    assert g.disagreeing is False and g.allows_final_fallback() is False
     assert g.filter(_fr(12, 14), 1_200, None).left_score is None
-    assert g.allows_final_fallback() is True
+    assert g.disagreeing is False and g.allows_final_fallback() is False
     assert g.filter(_fr(16, 14), 1_400, None).left_score is None
     assert g.locked == (7, 14) and g.allows_final_fallback() is False
     # Three seconds of silence, then one more illegal frame. The vote count restarts.
@@ -674,6 +740,41 @@ def test_f5_forged_seven_seven_for_one_and_a_half_seconds_does_not_name_it():
     assert g.locked == (7, 14) and g.allows_final_fallback() is False
     blocked = _final_from(g, {"home": 14, "away": 7, "quarter": 4, "t_ms": end})
     assert (blocked["away_score"], blocked["home_score"], blocked["winner"]) == (None, None, "unknown")
+
+
+def test_two_new_score_frames_at_the_end_do_not_publish_the_stale_lock():
+    """Two frames of a new score do not meet the vote, and they must not publish the lock."""
+    g = _locked(7, 14)
+    assert g.filter(_fr(7, 24), 2_000, None).left_score is None
+    assert g.filter(_fr(7, 24), 2_200, None).left_score is None
+    assert g.disagreeing is False and g._vote_n == 2
+    assert g.allows_final_fallback() is False
+    published = _final_from(g, {"home": 14, "away": 7, "quarter": 4, "t_ms": 2_200})
+    assert (published["home_score"], published["away_score"], published["winner"]) == (None, None, "unknown")
+    # A single forged decrease still publishes the lock (FU2).
+    down = _locked(7, 14)
+    assert down.filter(_fr(7, 7), 2_000, None).left_score is None
+    assert down.filter(_fr(7, 7), 2_200, None).left_score is None
+    assert down.disagreeing is False and down.allows_final_fallback() is True
+    kept = _final_from(down, {"home": 14, "away": 7, "quarter": 4, "t_ms": 2_200})
+    assert (kept["away_score"], kept["home_score"]) == (7, 14)
+
+
+def test_a_new_disagreeing_read_resets_the_clear_streak():
+    """A new disagreeing read breaks the clear streak before it can restore the lock."""
+    g = _locked(7, 14)
+    g.filter(_fr(11, 14), 1_000, None)
+    g.filter(_fr(12, 14), 1_200, None)
+    g.filter(_fr(16, 14), 1_400, None)
+    assert g.disagreeing is True
+    assert g.filter(_fr(7, 14), 4_000, None).pair == (7, 14)
+    assert g.filter(_fr(7, 14), 4_200, None).pair == (7, 14)
+    assert g.disagreeing is True and g._clear_n == 2
+    assert g.filter(_fr(11, 14), 4_400, None).left_score is None
+    assert g._vote_n == 1 and g.disagreeing is True and g._clear_n == 0
+    assert g.filter(_fr(7, 14), 4_600, None).pair == (7, 14)
+    assert g.filter(_fr(7, 14), 4_800, None).pair == (7, 14)
+    assert g._clear_n == 2 and g.disagreeing is True
 
 
 def test_interleaved_true_frames_do_not_lock_the_forgery():

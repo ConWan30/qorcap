@@ -12,8 +12,10 @@ is not guessed). A quarter that goes backwards is a cut: the baseline starts ove
 a reject. A read with no quarter does not become the baseline, so it cannot blank the quarter
 that follows. An upward step inside a quarter is impossible: it is blanked and noted as
 ``clock_increase``. One frame cannot re-anchor. The same higher second, held for the
-stoppage bar, blanks both clocks; a fresh stoppage after that blank may adopt it. A drop
-bigger than the time since the last accepted clock is not accepted on that frame.
+stoppage bar, blanks both clocks. While suspended, the stoppage gate does not adopt a
+second above the last clock published in that quarter. A higher clock returns only
+through the running-clock gate. A drop bigger than the time since the last accepted
+clock is not accepted on that frame.
 
 Two ways back in, both stricter than one frame:
 
@@ -31,11 +33,12 @@ Two ways back in, both stricter than one frame:
   may be kept. The kept value is the read itself. See ``docs/SCOREBUG_CLOCK_VOTE.md``.
 
 A second sustained line that disagrees with the accepted clock, higher or lower, blanks both.
-So does one higher second held for the stoppage bar: the returning clock cannot show three
-distinct seconds while it is stopped. The contradicted line stays blocked. A different run,
-or a stoppage, may re-anchor. While that blank holds, nothing is emitted except the read
-that completes the re-anchor. A quarterless read is not emitted and does not join it. A lone
-runoff has no second line, so the running-clock gate still adopts it (FU1).
+So does one higher second held for the stoppage bar. The contradicted line stays blocked.
+While suspended, a stoppage re-anchor cannot be above the last clock published in that
+quarter. A higher truth returns only through the running-clock gate. While that blank holds,
+nothing is emitted except the read that completes the re-anchor. A quarterless read is not
+emitted and does not join it. A lone runoff has no second line, so the running-clock gate
+still adopts it (FU1).
 
 Stoppage is a hold. With no ``t_ms`` the digits are read and the history is left alone.
 """
@@ -156,6 +159,9 @@ class ClockHistory:
         self._held: int | None = None
         self._held_n = 0
         self._held_t0: int | None = None
+        # Last clock published in the current quarter. A void does not clear it.
+        # While suspended, the stoppage gate cannot adopt a second above this.
+        self._published_s: int | None = None
 
     def _clear_cand(self) -> None:
         self._cand = None
@@ -168,6 +174,7 @@ class ClockHistory:
     def _accept(self, secs: int, quarter, t_ms: int) -> int:
         prev_q = self.last_q
         self.last_s = int(secs)
+        self._published_s = int(secs)
         q = _quarter(quarter)
         if q is not None:
             self.last_q = q
@@ -247,7 +254,15 @@ class ClockHistory:
         return self._held_n >= self.reanchor_reads and span >= self.reanchor_span_ms
 
     def _reanchor(self, secs: int, t_ms: int) -> bool:
-        """Stoppage: the same lower second, held. An increase never reaches this."""
+        """Stoppage: the same second, held, and not above the last published clock.
+
+        While suspended, a second above the last clock published in the quarter
+        does not join this candidate and is not adopted. A higher clock returns
+        only through the running-clock gate.
+        """
+        if self.suspended and self._published_s is not None and int(secs) > int(self._published_s):
+            self._clear_cand()
+            return False
         if secs != self._cand:
             self._cand = int(secs)
             self._cand_n = 1

@@ -180,15 +180,20 @@ def test_a_stable_illegal_score_reanchors_without_raising_confidence():
 
 def test_an_unconfirmed_reanchor_or_a_persistent_disagreement_blocks_the_final():
     from qorcap_match import apply_final
+    # One forged decrease blanks that frame and does not abstain the final (FU2).
+    down = _locked(0, 6)
+    assert down.filter(_fr(0, 5), 1_000, None).left_score is None
+    assert down.locked == (0, 6) and down.disagreeing is False
+    assert down.allows_final_fallback() is True
+    # A new score inside the gap withholds the fallback before the vote has persisted.
     stuck = _locked(0, 6)
     assert stuck.filter(_fr(0, 7), 1_000, None).left_score is None
     assert stuck.locked == (0, 6)
-    # One illegal frame blanks that frame. It does not abstain the final (FU2).
-    assert stuck.allows_final_fallback() is True
+    assert stuck.disagreeing is False and stuck.allows_final_fallback() is False
     assert stuck.filter(_fr(0, 7), 1_200, None).left_score is None
-    assert stuck.allows_final_fallback() is True
+    assert stuck.disagreeing is False and stuck.allows_final_fallback() is False
     assert stuck.filter(_fr(0, 7), 1_400, None).left_score is None
-    assert stuck.allows_final_fallback() is False
+    assert stuck.disagreeing is True and stuck.allows_final_fallback() is False
     base = {"home_score": 6, "away_score": 0, "quarter": 1, "final_t_ms": 5, "winner": "home",
             "method": "last_scorebug_read_unconfirmed"}
     frozen = {"home": 6, "away": 0, "quarter": 1, "t_ms": 5}
