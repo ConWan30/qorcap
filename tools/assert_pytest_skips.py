@@ -20,11 +20,12 @@ testcase, and at least ``MIN_COLLECTED`` testcases. Dropping a file drops the
 count below the floor. Zero testcases fail even when the floor is zero. A floor
 below the number of listed entries fails on its own.
 
-Every ``sidecar/test_*.py`` and ``tools/test_*.py`` must be named by
-``LINUX_FILES`` or ``WINDOWS_FILES`` (a node id covers its file) or by
-``EXCLUDED_TEST_FILES`` with a reason. The skip message is compared as recorded,
-including surrounding whitespace. ``xfail(strict=False)`` in those files fails
-the suite: it would override ``-o xfail_strict=true``.
+Every ``sidecar/test_*.py`` and ``tools/test_*.py``, including a file in a
+subfolder, must be named by that suite's own list (a node id covers its file)
+or excluded from that suite with a reason. A Linux-only file stays on the
+Linux list and carries a separate Windows reason. The skip message is compared
+as recorded, including surrounding whitespace. ``xfail(strict=False)`` in those
+files fails the suite: it would override ``-o xfail_strict=true``.
 """
 import re
 import sys
@@ -144,21 +145,36 @@ WINDOWS_FILES = (
 )
 # pytest --collect-only -q of each --list with QORTIME importable. Pin the same
 # numbers in tools/test_assert_pytest_skips.py. See README "Sidecar CI suite list".
-# A dropped file or node id lands under the floor. Re-collect after any list or
-# test change. 535/517 before sidecar/test_post_final_tail.py (21) and the six
-# guard tests in tools/test_assert_pytest_skips.py: 535+21+6 and 517+21+6.
-LINUX_MIN_COLLECTED = 562
-WINDOWS_MIN_COLLECTED = 544
+# The floor is a minimum. A PR that adds tests, and any merge resolution, must
+# re-collect and set both floors to those exact counts. Leaving the old floor
+# keeps a dropped test green.
+# 562/544 before #98's 10 post-final-tail tests and test_nested_test_module_is_unlisted.
+LINUX_MIN_COLLECTED = 573
+WINDOWS_MIN_COLLECTED = 555
 
-# Present on disk, but not part of either sidecar suite. A reason is required.
-# An empty reason is treated as unlisted.
+# Absent from both sidecar suites. A reason is required; whitespace does not count.
 EXCLUDED_TEST_FILES = {
     "sidecar/test_contracts.py": (
         "the contracts job runs this against unpinned qortime main, not the sidecar suite"
     ),
 }
 
-_TEST_GLOBS = ("sidecar/test_*.py", "tools/test_*.py")
+# On the Linux list, and not on the Windows list. The reason is for Windows only.
+WINDOWS_ONLY_EXCLUSIONS = {
+    "sidecar/test_qorcap_highlights.py": (
+        "needs ffmpeg; the Windows sidecar job does not install it"
+    ),
+    "sidecar/test_qorcap_challenge.py": (
+        "needs ffmpeg; the Windows sidecar job does not install it"
+    ),
+    "sidecar/test_qorcap_hl170123.py": (
+        "cuts clips with ffmpeg; the Windows sidecar job does not install it"
+    ),
+    "sidecar/test_qorcap_seq125430.py": (
+        "cuts clips with ffmpeg; the Windows sidecar job does not install it"
+    ),
+}
+
 _LOOSE_XFAIL = re.compile(r"xfail\s*\([^)]*strict\s*=\s*False", re.DOTALL)
 
 
@@ -182,35 +198,55 @@ def _repo_root() -> Path:
     return Path(__file__).resolve().parents[1]
 
 
-def _covered_files() -> set[str]:
+def _covered_files(suite: str) -> set[str]:
     covered = set()
-    for entry in (*LINUX_FILES, *WINDOWS_FILES):
+    for entry in suite_files(suite):
         covered.add(entry.split("::", 1)[0].replace("\\", "/"))
     return covered
 
 
-def unlisted_test_files(root: Path | None = None) -> list[str]:
-    """Test modules that are neither listed nor excluded with a reason.
+def _exclusion_reason(suite: str, rel: str) -> str | None:
+    if suite == "windows" and rel in WINDOWS_ONLY_EXCLUSIONS:
+        return WINDOWS_ONLY_EXCLUSIONS[rel]
+    if rel in EXCLUDED_TEST_FILES:
+        return EXCLUDED_TEST_FILES[rel]
+    return None
 
-    Reads the suite tuples and ``EXCLUDED_TEST_FILES`` at call time. A node id
-    covers its file. Dropping a path from both tuples makes that file unlisted.
+
+def _test_modules(root: Path) -> list[str]:
+    """``test_*.py`` under sidecar/ and tools/, including subfolders."""
+    found = set()
+    for base in ("sidecar", "tools"):
+        directory = root / base
+        if not directory.is_dir():
+            continue
+        for path in directory.rglob("test_*.py"):
+            if path.is_file():
+                found.add(path.relative_to(root).as_posix())
+    return sorted(found)
+
+
+def unlisted_test_files(root: Path | None = None) -> list[str]:
+    """Test modules missing from one suite list and not excluded from that suite.
+
+    Reads the suite tuples and the exclusion maps at call time. A node id covers
+    its file for that list only. A Linux-only file needs a Windows reason of its
+    own; sharing one reason across both lists does not excuse it.
     """
     root = root or _repo_root()
-    covered = _covered_files()
     problems = []
-    for pattern in _TEST_GLOBS:
-        for path in sorted(root.glob(pattern)):
-            rel = path.relative_to(root).as_posix()
-            if rel in covered:
+    for rel in _test_modules(root):
+        for suite in ("linux", "windows"):
+            if rel in _covered_files(suite):
                 continue
-            reason = EXCLUDED_TEST_FILES.get(rel)
+            reason = _exclusion_reason(suite, rel)
             if isinstance(reason, str) and reason.strip():
                 continue
-            if rel in EXCLUDED_TEST_FILES:
-                problems.append(f"{rel}: exclusion has no reason")
+            if reason is not None:
+                problems.append(f"{rel}: {suite} exclusion has no reason")
             else:
                 problems.append(
-                    f"{rel}: not in LINUX_FILES, WINDOWS_FILES, or EXCLUDED_TEST_FILES"
+                    f"{rel}: not in the {suite} suite list or excluded with a reason"
                 )
     return problems
 
@@ -219,12 +255,10 @@ def loose_xfails(root: Path | None = None) -> list[str]:
     """``xfail(strict=False)`` overrides the CI ini and must not appear."""
     root = root or _repo_root()
     problems = []
-    for pattern in _TEST_GLOBS:
-        for path in sorted(root.glob(pattern)):
-            text = path.read_text(encoding="utf-8")
-            if _LOOSE_XFAIL.search(text):
-                rel = path.relative_to(root).as_posix()
-                problems.append(f"{rel}: xfail(strict=False) overrides xfail_strict")
+    for rel in _test_modules(root):
+        text = (root / rel).read_text(encoding="utf-8")
+        if _LOOSE_XFAIL.search(text):
+            problems.append(f"{rel}: xfail(strict=False) overrides xfail_strict")
     return problems
 
 

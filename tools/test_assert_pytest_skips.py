@@ -181,22 +181,44 @@ def test_floor_below_listed_entries_fails(tmp_path, monkeypatch):
 def test_unlisted_test_module_fails_the_suite(tmp_path, monkeypatch, capsys):
     assert skips.unlisted_test_files() == []
     dropped = "sidecar/test_pairing.py"
-    monkeypatch.setattr(
-        skips, "LINUX_FILES", tuple(f for f in skips.LINUX_FILES if f != dropped)
-    )
-    monkeypatch.setattr(
-        skips, "WINDOWS_FILES", tuple(f for f in skips.WINDOWS_FILES if f != dropped)
-    )
-    assert any(dropped in line for line in skips.unlisted_test_files())
+    linux = skips.LINUX_FILES
+    windows = skips.WINDOWS_FILES
+    monkeypatch.setattr(skips, "LINUX_FILES", tuple(f for f in linux if f != dropped))
+    linux_bad = skips.unlisted_test_files()
+    assert any(dropped in line and "linux" in line for line in linux_bad)
+    assert not any(dropped in line and "windows" in line for line in linux_bad)
+    monkeypatch.setattr(skips, "LINUX_FILES", linux)
+    monkeypatch.setattr(skips, "WINDOWS_FILES", tuple(f for f in windows if f != dropped))
+    windows_bad = skips.unlisted_test_files()
+    assert any(dropped in line and "windows" in line for line in windows_bad)
+    assert not any(dropped in line and "linux" in line for line in windows_bad)
+    highlight = "sidecar/test_qorcap_highlights.py"
+    kept = skips.WINDOWS_ONLY_EXCLUSIONS[highlight]
+    monkeypatch.setitem(skips.WINDOWS_ONLY_EXCLUSIONS, highlight, "   ")
+    blank = skips.unlisted_test_files()
+    assert any(highlight in line and "windows" in line and "no reason" in line for line in blank)
+    assert not any(highlight in line and "linux" in line for line in blank)
+    monkeypatch.setitem(skips.WINDOWS_ONLY_EXCLUSIONS, highlight, kept)
     reason = skips.EXCLUDED_TEST_FILES["sidecar/test_contracts.py"]
     monkeypatch.setitem(skips.EXCLUDED_TEST_FILES, "sidecar/test_contracts.py", "   ")
     assert any("test_contracts.py" in line and "no reason" in line for line in skips.unlisted_test_files())
     monkeypatch.setitem(skips.EXCLUDED_TEST_FILES, "sidecar/test_contracts.py", reason)
+    monkeypatch.setattr(skips, "LINUX_FILES", tuple(f for f in linux if f != dropped))
     files = tuple(f for f in skips.LINUX_FILES if f != dropped)
     path = _suite_xml(tmp_path, files, skips.LINUX_MIN_COLLECTED)
     monkeypatch.setattr(skips.sys, "platform", "linux")
     assert skips.main(["assert_pytest_skips.py", "--suite", "linux", path]) == 1
     assert dropped in capsys.readouterr().err
+
+
+def test_nested_test_module_is_unlisted(tmp_path):
+    nested = tmp_path / "sidecar" / "nested"
+    nested.mkdir(parents=True)
+    (tmp_path / "tools").mkdir()
+    (nested / "test_hidden.py").write_text("def test_x():\n    pass\n", encoding="utf-8")
+    bad = skips.unlisted_test_files(tmp_path)
+    assert any("sidecar/nested/test_hidden.py" in line and "linux" in line for line in bad)
+    assert any("sidecar/nested/test_hidden.py" in line and "windows" in line for line in bad)
 
 
 def _loose_mark(body: str) -> str:
@@ -262,59 +284,51 @@ def _git_bash() -> str:
 def _list_guard_script(suite: str, command: str) -> str:
     """The workflow's list capture, with ``command`` in place of ``python --list``.
 
-    The assignment and the empty-array ``if`` are taken from ci.yml. A printed
-    line plus a non-zero status stands in for a crashing ``--list`` that still
-    wrote a path: ``mapfile < <(...)`` keeps that path and would continue.
-    ``:`` stands in for an empty successful list.
+    The whole capture line must match, prefix included. ``declare -a`` or
+    ``readonly`` in front of the assignment hides the command-substitution
+    status, and slicing the line at ``SIDECAR_TESTS`` would drop that prefix.
+    ``:`` is an empty list. A path plus ``exit 3`` is a crashing ``--list``
+    that still wrote an id, so the empty-array check would not stop it.
     """
     text = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
     py = f"python tools/assert_pytest_skips.py --list {suite}"
-    inner = f"$({py})"
-    needle = f"SIDECAR_TESTS=({inner})"
-    mapfile_line = f"mapfile -t SIDECAR_TESTS < <({py})"
-    if needle in text:
-        start = text.index(needle)
-        source, repl = inner, f"$({command})"
-    elif mapfile_line in text:
-        start = text.index(mapfile_line)
-        source, repl = f"<({py})", f"<({command})"
-    else:
-        raise AssertionError(f"no suite list capture for {suite}")
+    expected = f"_suite_list=$({py})"
+    lines = text.splitlines()
+    matches = [line for line in lines if py in line]
+    if len(matches) != 1:
+        raise AssertionError(f"{suite} capture lines: {matches}")
+    actual = matches[0].strip()
+    if actual != expected:
+        raise AssertionError(f"{suite} capture line is {actual!r}, expected {expected!r}")
+    start = text.index(matches[0])
     stop = text.index("python -m pytest", start)
-    return text[start:stop].replace(source, repl, 1) + "echo ran\n"
+    return text[start:stop].replace(f"$({py})", f"$({command})", 1) + "echo ran\n"
 
 
 def test_list_failure_and_an_empty_list_do_not_run_pytest():
-    """Run the ci.yml guard under ``bash -e``, the same flag GitHub passes.
+    """Run both ci.yml blocks under ``bash -e``, the same flag GitHub passes.
 
-    A failing ``$(...)`` must not reach ``echo ran`` even when it printed a
-    path. An empty array must take the workflow's ``if`` and exit 1.
+    Each block must reject a failing ``--list`` and an empty list. A missing
+    ``exit 1`` on only one block, or ``|| true`` on only the other, stays red.
     """
     bash = _git_bash()
-    # Prints one path, then exits 3. Errexit must stop before pytest; an empty
-    # array check would not, because the array has that path.
-    crash = subprocess.run(
-        [
-            bash,
-            "-e",
-            "-o",
-            "pipefail",
-            "-c",
-            _list_guard_script("linux", "echo sidecar/test_pairing.py; exit 3"),
-        ],
-        capture_output=True,
-        text=True,
-    )
-    assert crash.returncode != 0, (crash.returncode, crash.stdout, crash.stderr)
-    assert "ran" not in crash.stdout, (crash.returncode, crash.stdout, crash.stderr)
-    empty = subprocess.run(
-        [bash, "-e", "-o", "pipefail", "-c", _list_guard_script("windows", ":")],
-        capture_output=True,
-        text=True,
-    )
-    assert empty.returncode == 1, (empty.returncode, empty.stdout, empty.stderr)
-    assert "empty" in empty.stderr, (empty.returncode, empty.stdout, empty.stderr)
-    assert "ran" not in empty.stdout, (empty.returncode, empty.stdout, empty.stderr)
+    crash_cmd = "echo sidecar/test_pairing.py; exit 3"
+    for suite in ("linux", "windows"):
+        crash = subprocess.run(
+            [bash, "-e", "-o", "pipefail", "-c", _list_guard_script(suite, crash_cmd)],
+            capture_output=True,
+            text=True,
+        )
+        assert crash.returncode != 0, (suite, crash.returncode, crash.stdout, crash.stderr)
+        assert "ran" not in crash.stdout, (suite, crash.returncode, crash.stdout, crash.stderr)
+        empty = subprocess.run(
+            [bash, "-e", "-o", "pipefail", "-c", _list_guard_script(suite, ":")],
+            capture_output=True,
+            text=True,
+        )
+        assert empty.returncode == 1, (suite, empty.returncode, empty.stdout, empty.stderr)
+        assert "empty" in empty.stderr, (suite, empty.returncode, empty.stdout, empty.stderr)
+        assert "ran" not in empty.stdout, (suite, empty.returncode, empty.stdout, empty.stderr)
 
 
 def test_missing_required_file_fails_even_when_the_count_is_high(tmp_path):
@@ -343,16 +357,18 @@ def test_sidecar_ci_sets_xfail_strict_and_the_suite_gate():
     assert text.count("-o junit_family=xunit1") == 2
     assert "--list linux" in text and "--suite linux" in text
     assert "--list windows" in text and "--suite windows" in text
-    assert "SIDECAR_TESTS=($(python tools/assert_pytest_skips.py --list linux))" in text
-    assert "SIDECAR_TESTS=($(python tools/assert_pytest_skips.py --list windows))" in text
+    assert "_suite_list=$(python tools/assert_pytest_skips.py --list linux)" in text
+    assert "_suite_list=$(python tools/assert_pytest_skips.py --list windows)" in text
+    assert 'SIDECAR_TESTS+=("${_suite_line}")' in text
     assert text.count("suite list is empty") == 2
+    assert text.count("must re-collect") == 2
     assert "< <(" not in text
     assert "mapfile" not in text
     for files in (skips.LINUX_FILES, skips.WINDOWS_FILES):
         pause = files.index("sidecar/test_final_screen_pause.py")
         assert files[pause + 1] == "sidecar/test_post_final_tail.py"
-    assert skips.LINUX_MIN_COLLECTED == 562
-    assert skips.WINDOWS_MIN_COLLECTED == 544
+    assert skips.LINUX_MIN_COLLECTED == 573
+    assert skips.WINDOWS_MIN_COLLECTED == 555
 
 
 def test_xfail_strict_rejects_an_unexpected_pass(tmp_path):

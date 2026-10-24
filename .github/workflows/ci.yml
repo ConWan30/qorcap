@@ -64,14 +64,21 @@ jobs:
         run: |
           python -c "import cv2, numpy, cryptography"
           python -c "import os, pathlib; p=pathlib.Path(os.environ['QORTIME']); assert (p/'qor_receipt').is_dir(), p; assert (p/'tests/fixtures/madden27_live/q1_6-0.png').is_file(), 'pinned QorTime scorebug fixture missing'"
-          # File list and the collected-count floor live in tools/assert_pytest_skips.py.
+          # Floor is a minimum. Any PR that adds tests must set both
+          # LINUX_MIN_COLLECTED and WINDOWS_MIN_COLLECTED to the new collect-only
+          # counts, and a merge resolution must re-collect. Leaving the old floor
+          # keeps a dropped test green.
           # xfail_strict fails an unexpected pass. junit_family=xunit1 keeps the file
-          # attribute so the skip guard can match the full node id. A dropped file
-          # falls under the floor and is absent from the junit report. A test module
-          # that is in neither suite list nor EXCLUDED_TEST_FILES fails the suite check.
-          # $(...) so a failing --list trips errexit. An empty array would make pytest
+          # attribute so the skip guard can match the full node id.
+          # _suite_list=$(...) so a failing --list trips errexit. Each id is quoted,
+          # so file.py::test[a] is not a glob. An empty array would make pytest
           # collect the whole repo.
-          SIDECAR_TESTS=($(python tools/assert_pytest_skips.py --list linux))
+          _suite_list=$(python tools/assert_pytest_skips.py --list linux)
+          SIDECAR_TESTS=()
+          while IFS= read -r _suite_line || [[ -n "${_suite_line}" ]]; do
+            [[ -n "${_suite_line}" ]] || continue
+            SIDECAR_TESTS+=("${_suite_line}")
+          done <<< "${_suite_list}"
           if [[ ${#SIDECAR_TESTS[@]} -eq 0 ]]; then
             echo "sidecar linux suite list is empty" >&2
             exit 1
@@ -177,9 +184,18 @@ jobs:
         run: |
           python -c "import cv2, numpy, cryptography"
           python -c "import os, pathlib; p=pathlib.Path(os.environ['QORTIME']); assert (p/'qor_receipt').is_dir(), p; assert (p/'tests/fixtures/madden27_live/q1_6-0.png').is_file(), 'pinned QorTime scorebug fixture missing'"
+          # Floor is a minimum. Any PR that adds tests must set both
+          # LINUX_MIN_COLLECTED and WINDOWS_MIN_COLLECTED to the new collect-only
+          # counts, and a merge resolution must re-collect. Leaving the old floor
+          # keeps a dropped test green.
           # Same gate as the Linux job. --suite windows checks this runner, the
           # exact skip reasons, the full node ids, and the collected-count floor.
-          SIDECAR_TESTS=($(python tools/assert_pytest_skips.py --list windows))
+          _suite_list=$(python tools/assert_pytest_skips.py --list windows)
+          SIDECAR_TESTS=()
+          while IFS= read -r _suite_line || [[ -n "${_suite_line}" ]]; do
+            [[ -n "${_suite_line}" ]] || continue
+            SIDECAR_TESTS+=("${_suite_line}")
+          done <<< "${_suite_list}"
           if [[ ${#SIDECAR_TESTS[@]} -eq 0 ]]; then
             echo "sidecar windows suite list is empty" >&2
             exit 1
