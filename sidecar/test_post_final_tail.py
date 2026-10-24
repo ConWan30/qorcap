@@ -743,9 +743,9 @@ def test_flushed_touchdown_between_menus_is_not_a_scorebug_that_came_back():
 def test_disputed_final_stays_unconfirmed_after_stop(tmp_path):
     """7-0 menu, then a 10-0 menu, then stop. The re-read must not confirm the first score.
 
-    Live keeps 7-0 with final_confirmed false and the dispute note. ``tail_final_check``
-    stops at the first end-menu agreement, so a reader that only sees 7-0 would exact-match
-    and upgrade it. Deleting that guard makes this re-read post confirmed=True and drops the note.
+    Live keeps 7-0 with final_confirmed false and the dispute note. A disputed live final
+    is not re-read. A reader that only sees 7-0 would exact-match and upgrade it. Deleting
+    that guard makes this re-read post confirmed=True and drops the note.
     """
     score = {"t_ms": 1_000, "home": 0, "away": 7, "quarter": 4, "clock_s": 0, "clock_red": True}
     reader = _SwitchScore((7, 0), (10, 0), at=9_000)
@@ -792,6 +792,135 @@ def test_disputed_final_stays_unconfirmed_after_stop(tmp_path):
     assert (res["away_score"], res["home_score"]) == (7, 0)
     kept = " ".join(n for n in res.get("notes") or [] if isinstance(n, str))
     assert "disagreed with the posted" in kept and "not replaced" in kept
+
+
+def _missed_tail(tmp_path, name, frames, reader, scorebug=None):
+    """Stop-time re-read with no live final. Frame time is the manifest clock."""
+    score = {"t_ms": 1_000, "home": 0, "away": 7, "quarter": 4, "clock_s": 0, "clock_red": True}
+    bundle = tmp_path / name
+    bundle.mkdir()
+    (bundle / "timeline.jsonl").write_text(json.dumps(score) + "\n", encoding="utf-8")
+    (bundle / "video.mp4").write_bytes(b"not-a-real-video")
+    (bundle / "manifest.jsonl").write_text(json.dumps({
+        "type": "segment", "seq": 0, "file": "video.mp4", "wall_ms": frames[-1][0],
+    }) + "\n", encoding="utf-8")
+    draft = {"result": {"home_score": 0, "away_score": 7, "quarter": 4, "winner": "away",
+                        "method": "last_scorebug_read_unconfirmed", "final_confirmed": False}}
+
+    def factory(post, reader=reader, scorebug=scorebug):
+        agree = _Agree() if scorebug is not None else None
+        pause = None if scorebug is not None else _Paused()
+        core = ReaderCore(post, scorebug, agree, pause, _detect_final,
+                          final_screen_detector=madden_final_screen, end_menu_reader=reader,
+                          end_menu_agree=EndMenuAgreement())
+        real = core.on_frame
+
+        def on_frame(t, img, reader=reader, real=real):
+            if hasattr(reader, "t"):
+                reader.t = t
+            return real(t, img)
+
+        core.on_frame = on_frame
+        return core
+
+    got = qm.tail_final_check(
+        bundle, draft, ffmpeg="ffmpeg", core_factory=factory, frames=frames)
+    tail = json.loads((bundle / "final.tail.json").read_text(encoding="utf-8"))
+    return got, tail
+
+
+def _two_menus(gap_img):
+    """7-0 menu, a gap, then another menu. The gap image is blank or a scorebug frame."""
+    return (_menu_frames(5_000, 8_000)
+            + [(t, gap_img) for t in (12_000, 13_000, 14_000)]
+            + _menu_frames(25_000, 28_000))
+
+
+def test_recorded_menus_that_disagree_stay_unconfirmed_when_live_missed_the_final(tmp_path):
+    """No live final. Recorded menus read 7-0 and then 10-0. The signed score stays 7-0, unconfirmed.
+
+    The note is the one live writes. A scorebug row between the menus adds the came-back
+    phrase. Without one, the note is the previous sentence. Stopping at the first agreement
+    signs 7-0 confirmed. The look-back stays ``TAIL_SECS``.
+    """
+    assert qm.TAIL_SECS == 240
+    frames = _two_menus(_blank())
+    got, tail = _missed_tail(tmp_path, "missed-disagree", frames, _SwitchScore((7, 0), (10, 0), at=20_000))
+    fin, res = tail["final"], got["result"]
+    assert (res["away_score"], res["home_score"]) == (7, 0)
+    assert res["final_confirmed"] is False
+    assert tail["frames"]["frames"] == len(frames)
+    assert res["method"] == "end_menu_read"
+    assert res["notes"][0] == _NO_SCOREBUG_DISPUTE_NOTE
+    assert fin["final_confirmed"] is False and fin.get("end_menu_disputed") is True
+    assert fin["notes"][0] == _NO_SCOREBUG_DISPUTE_NOTE
+    assert tail["end_menu"]["until_ms"] == 8_000
+
+    bug = _two_menus(_blank())
+    got_b, back = _missed_tail(tmp_path, "missed-scorebug", bug, _SwitchScore((7, 0), (10, 0), at=20_000),
+                               scorebug=_Scorebug(7, 0, 4, 0, True))
+    assert back["frames"]["frames"] == len(bug)
+    assert got_b["result"]["final_confirmed"] is False
+    assert (got_b["result"]["away_score"], got_b["result"]["home_score"]) == (7, 0)
+    assert got_b["result"]["notes"][0] == _SCOREBUG_DISPUTE_NOTE
+    assert back["final"].get("end_menu_disputed") is True
+    assert "scorebug read came back" in back["final"]["notes"][0]
+
+
+def test_two_agreeing_recorded_menus_still_confirm(tmp_path):
+    """Two showings of the same menu still confirm. The second showing is read.
+
+    A gap that is not a scorebug read does not dispute the first score. Stopping at the
+    first agreement would leave ``until_ms`` on the first showing.
+    """
+    frames = _two_menus(_blank())
+    got, tail = _missed_tail(tmp_path, "two-agree", frames, _MenuReader(7, 0))
+    res = got["result"]
+    assert tail["frames"]["frames"] == len(frames)
+    assert (res["away_score"], res["home_score"]) == (7, 0)
+    assert res["final_confirmed"] is True
+    assert res["method"] == "end_menu_read"
+    assert tail["final"].get("end_menu_disputed") is not True
+    assert tail["end_menu"]["until_ms"] == 28_000
+
+
+def test_menu_then_gameplay_then_the_same_menu_still_confirms(tmp_path):
+    """A scorebug read between two showings of the same menu does not drop the confirmation.
+
+    The gameplay score is a different pair. The later menu agrees with the first menu.
+    The first score stays confirmed.
+    """
+    frames = _two_menus(_blank())
+    got, tail = _missed_tail(tmp_path, "gameplay-agrees", frames, _MenuReader(7, 0),
+                             scorebug=_Scorebug(10, 0, 4, 0, True))
+    res = got["result"]
+    assert tail["frames"]["frames"] == len(frames)
+    assert (res["away_score"], res["home_score"]) == (7, 0)
+    assert res["final_confirmed"] is True
+    assert tail["final"].get("end_menu_disputed") is not True
+    assert tail["end_menu"]["until_ms"] == 28_000
+    assert "scorebug read came back" not in " ".join(res.get("notes") or [])
+
+
+def test_one_recorded_menu_signs_the_same_result_to_the_end_of_the_tail(tmp_path):
+    """One menu, read to the end, signs the same result as stopping when it first agrees.
+
+    ``finalize`` and ``--recover`` never call ``tail_final_check``. They already feed every
+    frame through ``run_offline_reader``, so a single menu's offline receipt does not change.
+    """
+    import inspect
+    assert "tail_final_check" not in inspect.getsource(qm.finalize)
+    assert "tail_final_check" not in inspect.getsource(qm.recover_bundle)
+    short_got, short = _missed_tail(tmp_path, "one-menu-short", _menu_frames(5_000, 6_000), _MenuReader(7, 0))
+    long_got, long = _missed_tail(tmp_path, "one-menu-long", _menu_frames(5_000, 12_000), _MenuReader(7, 0))
+    assert short_got["result"]["final_confirmed"] is True
+    assert long["frames"]["frames"] > short["frames"]["frames"]
+    assert json.dumps(long_got["result"], sort_keys=True) == json.dumps(short_got["result"], sort_keys=True)
+    assert long["final"]["away"] == short["final"]["away"] == 7
+    assert long["final"]["home"] == short["final"]["home"] == 0
+    assert long["final"]["final_confirmed"] is True and short["final"]["final_confirmed"] is True
+    assert long["final"].get("notes") == short["final"].get("notes")
+    assert long["final"].get("end_menu_disputed") is None and short["final"].get("end_menu_disputed") is None
 
 
 def test_tied_walkoff_input_after_the_end_screen_does_not_confirm(tmp_path):

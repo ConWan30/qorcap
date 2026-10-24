@@ -2656,10 +2656,18 @@ def tail_final_check(bundle: Path, draft: dict, *, ffmpeg: str, secs: int = TAIL
     and final.tail.json. Checkpoints are untouched (the chain is sealed at stop); only the draft result changes.
 
     The live post-final tail (``post_final_tail_s``) only keeps the recorder running before this. It does not
-    change the result written here. ``hz`` stays ``TAIL_HZ``.
+    change the result written here. ``hz`` stays ``TAIL_HZ``. The look-back stays ``secs``
+    (``TAIL_SECS``, 240). It is not shortened.
 
-    A disputed live final is not re-read. The re-read stops at the first end-menu agreement, so a
-    later disagreeing menu is invisible and the first score would be posted again as an exact match.
+    The window is decoded before any end menu is considered (``list`` of the frame generator).
+    Reading past the first menu does not decode more video. It only runs the reader on frames
+    that were already decoded.
+
+    A disputed live final is not re-read. Every other tail is fed through the last frame, on one
+    ``ReaderCore``. A later menu that disagrees keeps the first score, with ``final_confirmed``
+    false and ``end_menu_disputed`` true. The note is the one ``_note_end_menu_disagreement``
+    writes: a scorebug between the menus is named only when a real scorebug row lies strictly
+    between them. Stopping at the first agreement would sign that first score confirmed.
     """
     if end_menu_was_disputed(live_final):
         return _disputed_final_result(draft, live_final, grammar_unresolved=grammar_unresolved)
@@ -2731,8 +2739,6 @@ def tail_final_check(bundle: Path, draft: dict, *, ffmpeg: str, secs: int = TAIL
         if t <= last_t:
             continue
         core.on_frame(t, img)
-        if getattr(core, "end_menu", None) is not None:
-            break
     fin = core.final
     out = {"final": fin, "end_menu": getattr(core, "end_menu", None), "end_menu_rejected": getattr(core, "end_menu_rejected", None),
            "frames": core.stats, "window_secs": secs, "video": vids[-1].name,
