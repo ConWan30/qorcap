@@ -1096,8 +1096,9 @@ class ReaderCore:
         # end-of-game context, and treat an OPTIONS press that hid the scorebug as a pause until
         # the picture has stayed up long enough that it cannot be the scripted pause menu.
         if self.final_screen_detector is not None and self.final_screen_detector(img):
-            # This return is before the pause-cap reset. An end-menu frame is not a pause.
-            self._pause_since = None
+            # This return is before the pause branch. A frame that only looks like
+            # the end menu does not reset the pause cap. The clock clears when that
+            # menu is accepted and sets the final.
             self._note_end_screen_time(t_ms)
             if self._pixel_match_since is None:
                 self._pixel_match_since = t_ms
@@ -1727,6 +1728,8 @@ class ReaderCore:
                       "delta_corroboration": corr}
         if prev is not None:
             self.final["amends"] = {k: prev.get(k) for k in ("basis", "home", "away", "t_ms")}
+        # Same acceptance that sets this final. A lookalike frame is not.
+        self._pause_since = None
         self._close_spans()
         tag = "CONFIRMED" if confirmed else "UNCONFIRMED"
         print(f"FINAL (end-of-game menu, {st['frames']} frames, {tag}): away {st['away']} - home {st['home']}"
@@ -1820,6 +1823,9 @@ class ReaderCore:
             self._close_spans()
             self.final = {"type": "final", "basis": fin.basis, "home": fin.home, "away": fin.away,
                           "quarter": fin.quarter, "t_ms": fin.t_ms}
+            if fin.basis == "final_screen":
+                # Same acceptance that sets this final. A lookalike frame is not.
+                self._pause_since = None
             print(f"FINAL ({fin.basis}): away {fin.away} - home {fin.home}"
                   + ("  (scorebug; waiting for the end-of-game menu to confirm)" if self.end_menu_reader else ""), file=sys.stderr)
             self.note_progress(int(self.final.get("t_ms") or t_ms))

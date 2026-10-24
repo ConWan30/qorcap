@@ -769,8 +769,12 @@ def test_long_pause_is_not_a_reader_stall():
     assert posts == []
 
 
-def _drive_stuck_pause(seconds: int):
-    """Every frame is paused. One second apart, under the agreement gap."""
+def _drive_stuck_pause(seconds: int, lookalike_every_s: int | None = None):
+    """Every frame is paused. One second apart, under the agreement gap.
+
+    ``lookalike_every_s`` turns the end-menu detector on for that one frame.
+    Those frames are not an accepted end menu.
+    """
     from qorcap_reader import ReaderCore
 
     class Pause:
@@ -779,14 +783,28 @@ def _drive_stuck_pause(seconds: int):
         def update(self, _t, _img):
             return None
 
+    class Screen:
+        on = False
+
+        def __call__(self, _img):
+            return self.on
+
     posts = []
-    core = ReaderCore(posts.append, None, None, Pause(), _no_final)
+    screen = Screen() if lookalike_every_s else None
+    core = ReaderCore(posts.append, None, None, Pause(), _no_final, final_screen_detector=screen)
     written = []
     core.health_write = written.append
+    step = None if lookalike_every_s is None else lookalike_every_s * 1000
     for t in range(0, seconds * 1000 + 1, 1000):
+        if screen is not None:
+            screen.on = step is not None and t > 0 and t % step == 0
         core.on_frame(t, None)
         core.consider_stall(t)
     return core, written, posts
+
+
+def _stalls(written):
+    return [row for row in written if row.get("kind") == "reader_stalled"]
 
 
 def test_stuck_pause_past_the_cap_writes_one_stalled_notice():
@@ -813,7 +831,13 @@ def test_four_minute_pause_writes_no_stall():
 
 
 def test_end_menu_frame_clears_the_pause_cap_clock():
-    """An end-menu frame returns before the pause check, and still clears the cap clock."""
+    """The pause clock clears when an end menu is accepted and sets the final.
+
+    A frame that only looks like the menu leaves the clock alone, and so does one
+    frame that passes the label before the final is set.
+    """
+    from qor_receipt.final_detect import detect_final
+
     from qorcap_reader import ReaderCore
 
     class Pause:
@@ -829,9 +853,115 @@ def test_end_menu_frame_clears_the_pause_cap_clock():
             return self.on
 
     screen = Screen()
-    core = ReaderCore(lambda body: None, None, None, Pause(), _no_final, final_screen_detector=screen)
+    posts = []
+    core = ReaderCore(posts.append, None, None, Pause(), detect_final, final_screen_detector=screen)
     core.on_frame(0, None)
     assert core._pause_since == 0
     screen.on = True
     core.on_frame(1000, None)
+    assert core._pause_since == 0
+    assert core.final is None
+    screen.on = False
+    core.on_frame(2000, None)
+    assert core._pause_since == 0
+    core.timeline = [{"t_ms": 1000 + i * 500, "home": 14, "away": 7, "quarter": 4, "clock_s": c, "clock_red": True}
+                     for i, c in enumerate([5, 5, 3, 0])]
+    screen.on = True
+    core.on_frame(5000, None)
+    assert core.final is None
+    assert core._pause_since == 0
+    for k in range(1, 20):
+        core.on_frame(5000 + k * 250, None)
+    fin = [p for p in posts if p.get("type") == "final"]
+    assert fin and fin[0]["basis"] == "final_screen" and (fin[0]["home"], fin[0]["away"]) == (14, 7)
     assert core._pause_since is None
+    # The score-panel acceptance sets the final too. One readable frame is not enough.
+    from qorcap_endmenu import EndMenuAgreement
+
+    class Read:
+        ok = True
+        away = 7
+        home = 14
+        reason = "ok"
+        conf = 0.9
+        margin = 0.4
+        digits = [{"source": "t", "xcheck": "n/a"}]
+
+    class Reader:
+        def read(self, _img):
+            return Read()
+
+    posts2 = []
+    screen2 = Screen()
+    core2 = ReaderCore(posts2.append, None, None, Pause(), _no_final, final_screen_detector=screen2,
+                       end_menu_reader=Reader(), end_menu_agree=EndMenuAgreement())
+    core2.on_frame(0, None)
+    assert core2._pause_since == 0
+    core2.timeline = [{"t_ms": 1000, "home": 14, "away": 7, "quarter": 4, "clock_s": 0, "clock_red": True}]
+    screen2.on = True
+    core2.on_frame(5000, None)
+    assert core2.final is None and core2._pause_since == 0
+    core2.on_frame(5200, None)
+    core2.on_frame(5400, None)
+    fin2 = [p for p in posts2 if p.get("type") == "final"]
+    assert fin2 and fin2[0]["basis"] == "end_menu" and fin2[0]["final_confirmed"] is True
+    assert (fin2[0]["home"], fin2[0]["away"]) == (14, 7)
+    assert core2._pause_since is None
+
+
+def test_end_menu_lookalike_does_not_hide_a_stuck_pause():
+    """Fifteen minutes stuck on paused, with one end-menu lookalike every 60 s, still stalls.
+
+    No lookalike writes 1 notice. A lookalike every 60 s writes 10, and every 240 s
+    writes 3: the same counts as a cap that is not reset by the look. Each lookalike
+    is a timeline row, so it can add a notice. It must not erase them. Putting the
+    pause-clock reset back on the look yields 0.
+    """
+    _core, plain_written, plain_posts = _drive_stuck_pause(15 * 60)
+    plain = _stalls(plain_written)
+    _core, flick_written, flick_posts = _drive_stuck_pause(15 * 60, lookalike_every_s=60)
+    flick = _stalls(flick_written)
+    _core, wide_written, wide_posts = _drive_stuck_pause(15 * 60, lookalike_every_s=240)
+    wide = _stalls(wide_written)
+    assert len(plain) == 1 and plain[0]["paused_s"] >= 300
+    assert len(flick) == 10 and flick[0]["paused_s"] >= 300
+    assert len(wide) == 3 and wide[0]["paused_s"] >= 300
+    assert [p for p in plain_posts + flick_posts + wide_posts if p.get("type") in ("score", "final")] == []
+
+
+def test_play_between_pauses_restarts_the_pause_cap():
+    """A normal frame clears the pause clock.
+
+    Without that reset the second pause keeps the first clock and writes
+    reader_stalled inside a pause that is still under the cap.
+    """
+    from qorcap_reader import ReaderCore
+
+    class Pause:
+        paused = True
+
+        def update(self, _t, _img):
+            return None
+
+    posts = []
+    pause = Pause()
+    core = ReaderCore(posts.append, None, None, pause, _no_final)
+    written = []
+    core.health_write = written.append
+    for t in range(0, 240_000 + 1, 1000):
+        core.on_frame(t, None)
+        core.consider_stall(t)
+    assert core._pause_since == 0
+    assert _stalls(written) == []
+    pause.paused = False
+    core.on_frame(241_000, None)
+    core.consider_stall(241_000)
+    assert core._pause_since is None
+    pause.paused = True
+    core.on_frame(242_000, None)
+    assert core._pause_since == 242_000
+    for t in range(243_000, 242_000 + 240_000 + 1, 1000):
+        core.on_frame(t, None)
+        core.consider_stall(t)
+    assert _stalls(written) == []
+    assert posts == []
