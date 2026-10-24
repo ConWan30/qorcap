@@ -1634,8 +1634,10 @@ class ReaderCore:
         from qorcap_endmenu import EndMenuRead
         sc = min(v["score"] for v in c["sides"].values())
         mg = min(v["score"] - v["alt_score"] for v in c["sides"].values())
-        return EndMenuRead(True, last["away"], last["home"], "corroborated", sc, mg,
-                           [dict(side=k, source="corroborated", xcheck="n/a", **v) for k, v in c["sides"].items()])
+        built = EndMenuRead(True, last["away"], last["home"], "corroborated", sc, mg,
+                            [dict(side=k, source="corroborated", xcheck="n/a", **v) for k, v in c["sides"].items()])
+        stamp = getattr(self.end_menu_reader, "stamp", None)
+        return stamp(built) if stamp else built
 
     def _check_final(self, t_ms: int) -> None:
         if self.final is not None:

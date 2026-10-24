@@ -434,8 +434,10 @@ def test_tail_final_check_confirms_from_recorded_frames(tmp_path):
     r = qm.tail_final_check(b, draft, ffmpeg="ffmpeg-missing", core_factory=fac0, frames=frames)["result"]
     assert r["final_basis"] == "final_screen" and (r["away_score"], r["home_score"]) == (0, 17)
     assert r["method"] == "agreed_scorebug_final" and r["final_confirmed"] is False
-    from qorcap_endmenu import EndMenuReader
-    em = EndMenuReader()
+    from qorcap_endmenu import LEGACY_END_MENU_SHA256, LEGACY_PACK_ID, EndMenuReader
+    # The pinned pack, not whatever harvest is installed. A partial or complete
+    # end-menu harvest must not change this recorded-frame check.
+    em = EndMenuReader(use_harvest=False)
     fac = lambda post: ReaderCore(post, None, None, Paused(), detect_final, final_screen_detector=madden_final_screen,  # noqa: E731
                                   end_menu_reader=em)
     out = qm.tail_final_check(b, draft, ffmpeg="ffmpeg-missing", core_factory=fac, frames=frames)
@@ -456,6 +458,9 @@ def test_tail_final_check_confirms_from_recorded_frames(tmp_path):
     assert r2["final_confirmed"] is True
     tail = json.loads((b / "final.tail.json").read_text())
     assert tail["final"]["basis"] == "end_menu" and tail["end_menu"]["frames"] >= 3
+    assert tail["end_menu"]["pack_id"] == LEGACY_PACK_ID
+    assert tail["end_menu"]["pack_sha256"] == LEGACY_END_MENU_SHA256
+    assert tail["end_menu"]["end_menu_model_id"].startswith(f"end_menu:{LEGACY_PACK_ID}:")
     # no end screen in the tail -> draft unchanged
     (b / "final.tail.json").unlink()
     black = end * 0

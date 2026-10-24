@@ -14,9 +14,12 @@ refused.
 
 Two labels for the same slot and frame are refused. The standard reader
 abstains until score digits 0-9 and clock digits 0-9 are all present. The
-end-menu reader abstains until end-menu digits 0-9 are all present. Do not
-stop once both games' final screens are labelled. Sunday, Monday, Thursday,
-and PSN have no regions, so this harvest does not bring those readers back.
+end-menu reader abstains until end-menu digits 0-9 are all present. Leave
+end-menu labels out of the label file unless all ten digits are labelled. A
+partial end-menu set is not a harvest: do not commit one. Do not stop once
+both games' final screens are labelled if those frames do not supply digits
+0-9. Sunday, Monday, Thursday, and PSN have no regions, so this harvest does
+not bring those readers back.
 
 Labels are UTF-8 JSON. A BOM is accepted. Each game block copies
 `docs\templates\labels.example.json` into place. Edit that copy before the
@@ -32,8 +35,10 @@ the printed fps: `frame_index / fps * 1000`.
 
 `sidecar\packs\held_out_sha256.json` holds public frame and clip hashes, not
 the hash of a full match video. The guard is the allowlisted folder plus the
-pinned sha256 of that match's `video.mp4`. The pin tool requires the video's
-folder to be the allowlisted match folder (`match-20261024-102332` or
+pinned sha256 of that match's `video.mp4`. The pin tool and the harvester
+resolve symlinks (`realpath`) before that check. A `video.mp4` link whose
+target sits in a held-out folder is refused. The pin tool requires the video's
+real folder to be the allowlisted match folder (`match-20261024-102332` or
 `match-20261024-111640`). It refuses a path that contains a held-out id
 (`170123`, `021003`, `125430`, `084523`, `193534`) and a sha256 listed in
 that table. `pin_template_source.py` and `merge_template_provenance.py` write
@@ -77,7 +82,8 @@ Copy-Item -Force docs\templates\labels.example.json "$docs\QorCap Templates\labe
 
 ## Install into the repo
 
-From the same checkout, after both games, including end-menu digits 0-9:
+From the same checkout, after both games. Include end-menu digits only when
+0-9 are all labelled. If they are not, leave the `end_menu` rows out:
 
 ```powershell
 cd "$env:USERPROFILE\src\qorcap"

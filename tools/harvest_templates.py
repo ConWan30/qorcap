@@ -695,8 +695,10 @@ def harvest(match_dir: Path, out_dir: Path, labels_path: Path, allow_path: Path,
             f"warning: QorTime commit {qortime_commit} differs from the Start Match pin {QORTIME_PIN}",
             file=sys.stderr,
         )
-    match_dir = match_dir.resolve()
-    out_dir = out_dir.resolve()
+    # realpath, not the path as given: a symlink named like an allowlisted match
+    # still has the held-out folder on the other side of the link.
+    match_dir = Path(os.path.realpath(match_dir))
+    out_dir = Path(os.path.realpath(out_dir))
     if not match_dir.is_dir():
         raise Refuse(f"refusing: {match_dir} is not a match folder. no templates written.")
     before = _snapshot(match_dir)
@@ -729,9 +731,10 @@ def harvest(match_dir: Path, out_dir: Path, labels_path: Path, allow_path: Path,
     if not (match_dir / "timeline.jsonl").is_file() and not (match_dir / "anchors.jsonl").is_file():
         raise Refuse("refusing: match folder has no timeline.jsonl or anchors.jsonl. no templates written.")
     for path in match_dir.rglob("*"):
-        found = _held_hit(path.name, held)
+        real = os.path.realpath(path)
+        found = _held_hit(path.name, held) or _held_hit(real, held)
         if found:
-            raise Refuse(f"refusing held-out name {path.name} ({found}). no templates written.")
+            raise Refuse(f"refusing held-out name {path.name} ({found}) at {real}. no templates written.")
     try:
         table = _held_out_hashes(hash_path)
     except (OSError, ValueError) as exc:

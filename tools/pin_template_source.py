@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -31,6 +32,11 @@ def _held_in_path(video: Path) -> str | None:
         if item in text:
             return item
     return None
+
+
+def _realpath(path: Path) -> Path:
+    """Follow symlinks. A link whose target names a held-out id is still that video."""
+    return Path(os.path.realpath(path))
 
 
 def _blocklist(path: Path) -> dict[str, str]:
@@ -67,14 +73,15 @@ def pin(match_id: str, video: Path, sources_path: Path, hash_path: Path | None =
         raise SystemExit(
             f"refusing: allowlist folder {folder!r} is not the folder for {match_id}. allowlist not written."
         )
-    held = _held_in_path(video)
+    real = _realpath(video)
+    held = _held_in_path(video) or _held_in_path(real)
     if held:
         raise SystemExit(
             f"refusing: {video} contains held-out id {held}. allowlist not written."
         )
-    if video.parent.name != folder:
+    if video.parent.name != folder or real.parent.name != folder:
         raise SystemExit(
-            f"refusing: {video.parent.name} is not the allowlisted folder {folder} for {match_id}. "
+            f"refusing: {real.parent.name} is not the allowlisted folder {folder} for {match_id}. "
             "allowlist not written."
         )
     digest = sha256_file(video)

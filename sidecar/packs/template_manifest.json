@@ -1,7 +1,8 @@
 {
   "schema": "qorcap-template-manifest/v0",
-  "status": "no templates shipped",
+  "status": "end-menu pack shipped; scorebug templates not shipped",
   "see": "docs/TEMPLATE_PROVENANCE.md",
   "provenance": "templates/provenance.json",
-  "note": "Glyph packs that used to live in this directory were removed. The scorebug reader abstains until an allowlisted harvest is committed. This file is not a receipt."
+  "end_menu_pack": "sidecar/packs/madden27_end_menu_v2.npz",
+  "note": "Score and clock packs are not shipped. The scorebug reader abstains until an allowlisted harvest is committed. sidecar/packs/madden27_end_menu_v2.npz is a hash-pinned pack for the recorded-frame final check. It is not an allowlisted harvest and it is not a per-glyph provenance row. Digits 1, 4, and 7 are Hershey stand-ins from tools/make_end_menu_hershey.py. This file is not a receipt."
 }

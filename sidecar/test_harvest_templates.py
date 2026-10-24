@@ -749,3 +749,72 @@ def test_pin_refuses_a_sha_listed_in_held_out_sha256(tmp_path):
     else:
         raise AssertionError("a blocklisted video sha was pinned")
     assert sources.read_text(encoding="utf-8") == before
+
+
+def test_pin_refuses_a_symlinked_held_out_video(tmp_path):
+    """The path we were given is the allowlisted folder. The real file is not."""
+    import pin_template_source as pin
+
+    folder = _match(tmp_path, "102332")
+    held = tmp_path / "elsewhere" / "match-20261024-125430"
+    held.mkdir(parents=True)
+    target = held / "video.mp4"
+    target.write_bytes((folder / "video.mp4").read_bytes())
+    link = folder / "video.mp4"
+    link.unlink()
+    link.symlink_to(target)
+    sources = tmp_path / "sources.json"
+    before = _sources_copy(sources)
+    try:
+        pin.pin("102332", link, sources)
+    except SystemExit as exc:
+        assert "125430" in str(exc.code)
+    else:
+        raise AssertionError("a symlinked held-out video was pinned")
+    assert sources.read_text(encoding="utf-8") == before
+
+
+def test_harvest_refuses_a_symlinked_held_out_video(tmp_path):
+    folder = _match(tmp_path, "102332")
+    held = tmp_path / "elsewhere" / "match-20261024-170123"
+    held.mkdir(parents=True)
+    target = held / "video.mp4"
+    target.write_bytes((folder / "video.mp4").read_bytes())
+    link = folder / "video.mp4"
+    link.unlink()
+    link.symlink_to(target)
+    allow = tmp_path / "allow.json"
+    _allow(allow, folder)
+    labels = tmp_path / "labels.json"
+    _labels(labels)
+    out = tmp_path / "out"
+    before = _snap(folder)
+    try:
+        H.harvest(folder, out, labels, allow, HELD, HASHES, now=NOW)
+    except H.Refuse as exc:
+        assert "170123" in str(exc)
+    else:
+        raise AssertionError("a symlinked held-out video was harvested")
+    assert _snap(folder) == before
+    assert not out.exists()
+
+
+def test_harvest_refuses_a_symlinked_held_out_match_folder(tmp_path):
+    (tmp_path / "real").mkdir()
+    held = _match(tmp_path / "real", "125430")
+    link = tmp_path / "match-20261024-102332"
+    link.symlink_to(held)
+    allow = tmp_path / "allow.json"
+    _allow(allow, link)
+    labels = tmp_path / "labels.json"
+    _labels(labels)
+    out = tmp_path / "out"
+    before = _snap(held)
+    try:
+        H.harvest(link, out, labels, allow, HELD, HASHES, now=NOW)
+    except H.Refuse as exc:
+        assert "125430" in str(exc)
+    else:
+        raise AssertionError("a symlinked held-out match folder was harvested")
+    assert _snap(held) == before
+    assert not out.exists()

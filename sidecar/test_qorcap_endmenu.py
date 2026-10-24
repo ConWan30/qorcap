@@ -2,7 +2,8 @@
 
 Digit packs that included match 125430 are removed. Policy tests use ScriptedEndMenu.
 The 125430 FINISH GAME frame is held-out evaluation: the score read skips until
-end-menu templates load. Harvesting from 125430 stays refused.
+end-menu digits 0-9 are all present. A partial harvest stays skipped. Harvesting
+from 125430 stays refused.
 """
 
 import json
@@ -125,15 +126,189 @@ def test_a_complete_end_menu_set_loads(monkeypatch, tmp_path):
     reader = EndMenuReader()
     assert reader._missing is False
     assert set(reader.labels) >= set("0123456789")
+    assert reader.pack_id == "harvested-end-menu"
+    assert reader.end_menu_model_id.startswith("end_menu:harvested-end-menu:")
+
+
+def _committed_arrays():
+    import qorcap_endmenu as em
+
+    with np.load(em.PACK) as blob:
+        return (
+            [str(x) for x in blob["labels"]],
+            [str(x) for x in blob["source"]],
+            np.array(blob["vecs"], np.float32, copy=True),
+            np.array(blob["ot_vec"], np.float32, copy=True),
+        )
+
+
+def _save_pack(path: Path, labels, sources, vecs, ot) -> None:
+    np.savez_compressed(
+        path,
+        labels=np.array(labels),
+        vecs=np.asarray(vecs, np.float32),
+        source=np.array(sources),
+        ot_vec=np.asarray(ot, np.float32),
+    )
+
+
+def _accept_pack(monkeypatch, path: Path) -> None:
+    import hashlib
+
+    import qorcap_endmenu as em
+
+    monkeypatch.setattr(em, "PACK", path)
+    monkeypatch.setattr(em, "LEGACY_END_MENU_SHA256", hashlib.sha256(path.read_bytes()).hexdigest())
+
+
+def test_legacy_pack_rejects_a_sha_mismatch(monkeypatch, tmp_path):
+    import qorcap_endmenu as em
+
+    labels, sources, vecs, ot = _committed_arrays()
+    vecs = vecs.copy()
+    vecs[0, 0] = float(vecs[0, 0]) + 0.25
+    path = tmp_path / "pack.npz"
+    _save_pack(path, labels, sources, vecs, ot)
+    monkeypatch.setattr(em, "PACK", path)
+    assert em._legacy_end_menu(path) is False
+
+
+def test_legacy_pack_rejects_a_different_path(monkeypatch, tmp_path):
+    import hashlib
+
+    import qorcap_endmenu as em
+
+    labels, sources, vecs, ot = _committed_arrays()
+    path = tmp_path / "pack.npz"
+    _save_pack(path, labels, sources, vecs, ot)
+    monkeypatch.setattr(em, "LEGACY_END_MENU_SHA256", hashlib.sha256(path.read_bytes()).hexdigest())
+    assert path.resolve() != em.PACK.resolve()
+    assert em._legacy_end_menu(path) is False
+
+
+def test_legacy_pack_rejects_a_missing_digit(monkeypatch, tmp_path):
+    import qorcap_endmenu as em
+
+    labels, sources, vecs, ot = _committed_arrays()
+    keep = [i for i, lab in enumerate(labels) if lab != "9"]
+    path = tmp_path / "pack.npz"
+    _save_pack(path, [labels[i] for i in keep], [sources[i] for i in keep], vecs[keep], ot)
+    _accept_pack(monkeypatch, path)
+    assert em._legacy_end_menu(path) is False
+
+
+def test_legacy_pack_rejects_a_held_out_source_string(monkeypatch, tmp_path):
+    import qorcap_endmenu as em
+
+    labels, sources, vecs, ot = _committed_arrays()
+    sources = list(sources)
+    sources[0] = "real:95"
+    path = tmp_path / "pack.npz"
+    _save_pack(path, labels, sources, vecs, ot)
+    _accept_pack(monkeypatch, path)
+    assert em._legacy_end_menu(path) is False
+
+
+def test_125430_rows_relabelled_synthetic_are_rejected(monkeypatch, tmp_path):
+    """The source string no longer says 125430. The glyph bytes still do."""
+    import qorcap_endmenu as em
+
+    assert {
+        "0542479ccb5e17ec9e3476c9e5eaaaa94cccccf6b9732b4db275c2b27a2969ac",
+        "4b0bf1393685df0c33a43fda2a40cc2f459ba859e8c2c808179441a37100bbdb",
+        "84744bfaa6535b0e643f09f913e53a103187e721775cec5730de8129e7cceaf7",
+    } <= em._HELD_OUT_GLYPH_SHA256
+    labels, sources, vecs, ot = _committed_arrays()
+    row = np.zeros((1, vecs.shape[1]), np.float32)
+    row[0, 0] = 0.5
+    glyph = em._glyph_sha(row[0])
+    monkeypatch.setattr(em, "_HELD_OUT_GLYPH_SHA256", em._HELD_OUT_GLYPH_SHA256 | {glyph})
+    path = tmp_path / "pack.npz"
+    _save_pack(
+        path,
+        labels + ["1"],
+        sources + ["synthetic"],
+        np.vstack([vecs, row]),
+        ot,
+    )
+    _accept_pack(monkeypatch, path)
+    assert em._legacy_end_menu(path) is False
+
+
+def test_partial_harvest_does_not_fall_back_to_the_pinned_pack(monkeypatch):
+    import qorcap_template_guard as guard
+
+    def partial(role, profile=None, path=None):
+        if role == "end_menu":
+            return {"0": np.zeros((1, 12 * 18), np.float32)}
+        return {}
+
+    monkeypatch.setattr(guard, "harvested_vectors", partial)
+    reader = EndMenuReader()
+    assert reader._missing
+    assert reader.pack_id == "missing"
+
+
+def test_hershey_stays_in_the_provenance_list():
+    from qorcap_endmenu import provenance_tokens
+
+    assert "hershey" in provenance_tokens(["synthetic:hershey", "real:600"])
+    agreed = EndMenuAgreement(n=1, min_span_ms=0)
+    read = EndMenuRead(
+        True, 0, 20, "ok", 0.9, 0.4,
+        [{"source": "synthetic:hershey", "xcheck": "skipped"}],
+        pack_id="madden27_end_menu_v2",
+        pack_sha256="ab",
+        end_menu_model_id="end_menu:madden27_end_menu_v2:0123456789abcdef",
+    )
+    stable = agreed.offer(0, read)
+    assert stable is not None
+    assert "hershey" in stable["template_sources"]
+    assert "synthetic" in stable["template_sources"]
+    assert stable["pack_id"] == "madden27_end_menu_v2"
+    assert stable["pack_sha256"] == "ab"
+    assert stable["end_menu_model_id"].startswith("end_menu:")
+
+
+def test_hershey_rows_match_the_generator():
+    sys.path.insert(0, str(HERE.parent / "tools"))
+    from make_end_menu_hershey import rows_match
+
+    assert rows_match()
+
+
+def test_partial_end_menu_harvest_keeps_the_recorded_final_green(monkeypatch, tmp_path):
+    """A partial end-menu harvest abstains and does not turn the tail check red."""
+    import qorcap_template_guard as guard
+    from qorcap_template_guard import TEMPLATES_MISSING, digits_complete
+
+    real = guard.harvested_vectors
+
+    def partial(role, profile=None, path=None):
+        if role == "end_menu":
+            row = np.zeros((1, 12 * 18), np.float32)
+            return {digit: row for digit in "012345678"}
+        return real(role, profile=profile, path=path)
+
+    monkeypatch.setattr(guard, "harvested_vectors", partial)
+    assert digits_complete("end_menu") is False
+    ambient = EndMenuReader()
+    assert ambient._missing
+    assert ambient.read(np.zeros((360, 640, 3), np.uint8)).reason == TEMPLATES_MISSING
+    os.environ.setdefault("QORTIME", "/tmp/qortime")
+    from test_qorcap_match import test_tail_final_check_confirms_from_recorded_frames
+
+    test_tail_final_check_confirms_from_recorded_frames(tmp_path)
 
 
 def test_held_out_125430_finish_menu_reads_7_14():
     """Grade the 125430 finish menu once end-menu glyphs are allowlisted."""
     import pytest
-    from qorcap_template_guard import has_role
+    from qorcap_template_guard import digits_complete
 
-    if not has_role("end_menu"):
-        pytest.skip("templates_missing: held-out 125430 end-menu evaluation waits for allowlisted end-menu templates")
+    # A partial harvest still has the role. The grader runs only once 0-9 are all present.
+    if not digits_complete("end_menu"):
+        pytest.skip("templates_missing: held-out 125430 end-menu evaluation waits for end-menu digits 0-9")
     fin = cv2.imread(str(HERE / "fixtures" / "m27_end_menu_finish.jpg"))
     assert fin is not None
     reader = EndMenuReader()
