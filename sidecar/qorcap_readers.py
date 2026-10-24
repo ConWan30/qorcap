@@ -12,11 +12,31 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import sys
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 
 SCHEMA = "qorcap-readers/v0"
+# Same path rule as qortime schema/contracts/qorcap-readers.v0.json at 585ccc4.
+PATH_PATTERN = (
+    r"^(?!.*(?:^|/)[^/]*(?:\.| )(?:/|$))"
+    r"(?!.*\.(?:[Kk][Ee][Yy]|[Pp][Ee][Mm]|[Pp]12|[Pp][Ff][Xx]|[Jj][Ww][Kk]|[Pp][Pp][Kk]|[Jj][Kk][Ss])$)"
+    r"(?!.*(?:^|/)[Kk][Ee][Yy][Ss](?:/|$))"
+    r"(?!.*(?:^|/)[Ss][Ee][Cc][Rr][Ee][Tt][Ss]?(?:/|$))"
+    r"(?!.*(?:^|/)[^/]*_[Kk][Ee][Yy](?:\.[^/]*)?(?:/|$))"
+    r"(?!.*(?:^|/)[Ii][Dd]_(?:[Rr][Ss][Aa]|[Dd][Ss][Aa]|[Ee][Cc][Dd][Ss][Aa](?:_[Ss][Kk])?|[Ee][Dd]25519(?:_[Ss][Kk])?|[Ee][Dd]448(?:_[Ss][Kk])?)(?:\.[^/]*)?(?:/|$))"
+    r"(?:[A-Za-z0-9_][A-Za-z0-9_.+-]*/)*[A-Za-z0-9_][A-Za-z0-9_.+-]*$"
+)
+_PATH_RE = re.compile(PATH_PATTERN)
+_RUNTIME_ID_RE = re.compile(r"^[A-Za-z0-9._+-]{1,80}$")
+_HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
+_DEVICE_STEMS = frozenset(
+    {"con", "nul", "aux", "prn"}
+    | {f"com{i}" for i in range(1, 10)}
+    | {f"lpt{i}" for i in range(1, 10)}
+)
 _ON = {"1", "true", "yes", "on"}
 _LOCAL_MODULES = (
     "qorcap_standard",
@@ -35,7 +55,6 @@ _QORTIME_MODULES = (
     "qor_receipt.final_detect",
     "qor_receipt.agent.pause_detect",
 )
-_KEY_SUFFIXES = (".key", ".pem", ".p12", ".pfx")
 
 
 def frame_bind_enabled(raw: str | None = None) -> bool:
@@ -53,18 +72,27 @@ class LoadedFile:
     rel: str
 
 
+def path_identity(path: str) -> str:
+    """NFC, then casefold, then strip trailing dots and spaces on each segment."""
+    folded = unicodedata.normalize("NFC", path).casefold()
+    return "/".join(part.rstrip(". ") for part in folded.split("/"))
+
+
+def token_identity(value: str) -> str:
+    """Reader and runtime ids: NFC, casefold, then strip trailing dots and spaces."""
+    return unicodedata.normalize("NFC", value).casefold().rstrip(". ")
+
+
+def _device_segment(part: str) -> bool:
+    return part.split(".", 1)[0].casefold() in _DEVICE_STEMS
+
+
 def safe_rel_path(path: str) -> bool:
-    if not path or len(path) > 240 or "\0" in path:
+    if not isinstance(path, str) or not path or len(path) > 240 or "\0" in path or not path.isascii():
         return False
-    if path.startswith(("/", "\\")) or ":" in path:
+    if _PATH_RE.fullmatch(path) is None:
         return False
-    lower = path.lower()
-    if lower.endswith(_KEY_SUFFIXES):
-        return False
-    for part in path.replace("\\", "/").split("/"):
-        if part in ("", ".", "..", "keys") or part.lower() == "keys":
-            return False
-    return True
+    return not any(_device_segment(part) for part in path.split("/"))
 
 
 def _rel(root: Path, path: Path) -> str | None:
@@ -120,14 +148,48 @@ def vendored_scorebug_packs(mod) -> list[Path]:
     return [found[-1]] if found else []
 
 
-def build_manifest(files: list[LoadedFile], *, qorcap_version: str, python: str = "0",
-                   numpy: str | None = None, opencv: dict | None = None,
-                   ffmpeg: dict | None = None, glimpse: dict | None = None) -> dict:
+def _runtime_row(row: dict) -> dict:
+    if set(row) != {"id", "version", "sha256"}:
+        raise ValueError("runtime has unknown keys")
+    ident = row["id"]
+    version = row["version"]
+    sha = row["sha256"]
+    if not isinstance(ident, str) or _RUNTIME_ID_RE.fullmatch(ident) is None:
+        raise ValueError("runtime id is not an ASCII build name")
+    if not isinstance(version, str) or not version.strip() or len(version) > 80:
+        raise ValueError("runtime version is empty or too long")
+    if not isinstance(sha, str) or _HEX64_RE.fullmatch(sha) is None:
+        raise ValueError("runtime sha256 must be 64 lowercase hex chars")
+    return {"id": ident, "version": version, "sha256": sha}
+
+
+def runtimes_from_builds(ffmpeg: dict | None, opencv: dict | None) -> list[dict]:
+    """ffmpeg and cv2 are the builds the merged schema names. Unbound builds are omitted."""
+    out = []
+    if isinstance(ffmpeg, dict) and "sha256" in ffmpeg and "version" in ffmpeg:
+        ver = str(ffmpeg["version"]).strip()[:80]
+        sha = str(ffmpeg["sha256"])
+        if ver and _HEX64_RE.fullmatch(sha):
+            out.append({"id": "ffmpeg", "version": ver, "sha256": sha})
+    if isinstance(opencv, dict) and opencv.get("version") and opencv.get("build_sha256"):
+        ver = str(opencv["version"]).strip()[:80]
+        sha = str(opencv["build_sha256"])
+        if ver and _HEX64_RE.fullmatch(sha):
+            out.append({"id": "cv2", "version": ver, "sha256": sha})
+    return out
+
+
+def build_manifest(files: list[LoadedFile], *, qorcap_version: str,
+                   runtimes: list[dict] | None = None, ffmpeg: dict | None = None,
+                   opencv: dict | None = None) -> dict:
     """Group loaded files by reader id. Unsafe paths are dropped, not hashed.
 
-    The object is closed: QorCap rejects any key that is not in this shape, including a forged
-    ``reader_verified_by_referee``. Hashes are of the raw file bytes.
+    The object is the closed ``qorcap-readers/v0`` shape: schema, qorcap_version, readers,
+    runtimes. Reader ids, runtime ids, and paths are unique after NFC, casefolding, and
+    trailing-dot/space stripping. A path cannot be both code and pack.
     """
+    if not isinstance(qorcap_version, str) or not qorcap_version.strip() or len(qorcap_version) > 80:
+        raise ValueError("qorcap_version is empty or too long")
     grouped: dict[tuple[str, str], list[dict]] = {}
     for item in files:
         if item.kind not in ("code", "pack"):
@@ -138,20 +200,54 @@ def build_manifest(files: list[LoadedFile], *, qorcap_version: str, python: str 
         grouped.setdefault((item.reader_id, item.version), []).append(row)
     readers = []
     for (reader_id, version), rows in grouped.items():
+        if not isinstance(reader_id, str) or not reader_id.strip() or len(reader_id) > 80:
+            raise ValueError("reader id is empty or too long")
+        if not isinstance(version, str) or not version.strip() or len(version) > 80:
+            raise ValueError("reader version is empty or too long")
         rows.sort(key=lambda r: (r["kind"], r["path"]))
         readers.append({"id": reader_id, "version": version, "files": rows})
     readers.sort(key=lambda r: r["id"])
     if not readers:
         raise ValueError("no reader code or packs were loaded")
+    seen_ids: dict[str, str] = {}
+    for reader in readers:
+        key = token_identity(reader["id"])
+        if not key:
+            raise ValueError("reader id is empty after normalization")
+        if key in seen_ids:
+            raise ValueError(f"reader id {reader['id']} collides with {seen_ids[key]}")
+        seen_ids[key] = reader["id"]
+    seen_paths: dict[str, str] = {}
+    for reader in readers:
+        for item in reader["files"]:
+            ident = path_identity(item["path"])
+            if not ident:
+                raise ValueError("path is empty after normalization")
+            prev = seen_paths.get(ident)
+            if prev is not None:
+                if prev != item["kind"]:
+                    raise ValueError(f"{item['path']} is listed as both code and pack")
+                raise ValueError(f"duplicate path {item['path']}")
+            seen_paths[ident] = item["kind"]
+    if runtimes is None:
+        runtimes = runtimes_from_builds(ffmpeg, opencv)
+    checked = [_runtime_row(row) for row in runtimes]
+    if not checked:
+        raise ValueError("no runtime build was bound")
+    seen_rt: dict[str, str] = {}
+    for row in checked:
+        key = token_identity(row["id"])
+        if not key:
+            raise ValueError("runtime id is empty after normalization")
+        if key in seen_rt:
+            raise ValueError(f"runtime id {row['id']} collides with {seen_rt[key]}")
+        seen_rt[key] = row["id"]
+    checked.sort(key=lambda r: r["id"])
     return {
         "schema": SCHEMA,
         "qorcap_version": qorcap_version,
-        "python": python,
-        "numpy": numpy,
-        "opencv": opencv,
-        "ffmpeg": ffmpeg or {"state": "unbound"},
-        "glimpse": glimpse or {"state": "unbound"},
         "readers": readers,
+        "runtimes": checked,
     }
 
 
@@ -299,7 +395,7 @@ def write_prerecord_manifest(path: Path, *, ffmpeg: str | None = None, root: Pat
     except Exception:
         qorcap_version = "0"
     _import_live_stack()
-    py, numpy_v, opencv = _runtime_versions()
+    _py, _numpy_v, opencv = _runtime_versions()
     files = collect_from_process(root, qorcap_version=qorcap_version)
     match = root / "sidecar" / "qorcap_match.py"
     if match.is_file():
@@ -309,11 +405,8 @@ def write_prerecord_manifest(path: Path, *, ffmpeg: str | None = None, root: Pat
     manifest = build_manifest(
         files,
         qorcap_version=qorcap_version,
-        python=py,
-        numpy=numpy_v,
-        opencv=opencv,
         ffmpeg=ffmpeg_binding(ffmpeg),
-        glimpse=glimpse_binding(),
+        opencv=opencv,
     )
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json_compact(manifest), encoding="utf-8")

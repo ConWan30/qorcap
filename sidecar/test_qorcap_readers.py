@@ -4,9 +4,15 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
+
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import qorcap_readers as R  # noqa: E402
+
+
+def _runtime():
+    return [{"id": "ffmpeg", "version": "n7.0.1", "sha256": "11" * 32}]
 
 
 def test_manifest_hashes_loaded_files_and_skips_keys(tmp_path):
@@ -27,7 +33,7 @@ def test_manifest_hashes_loaded_files_and_skips_keys(tmp_path):
         R.LoadedFile("scorebug", "0.3.32", "code", hidden, "keys/root.pem"),
         R.LoadedFile("scorebug", "0.3.32", "code", code, "../reader.py"),
     ]
-    man = R.build_manifest(files, qorcap_version="0.3.32")
+    man = R.build_manifest(files, qorcap_version="0.3.32", runtimes=_runtime())
     assert man["schema"] == "qorcap-readers/v0"
     assert man["readers"][0]["id"] == "scorebug"
     paths = [f["path"] for f in man["readers"][0]["files"]]
@@ -35,9 +41,8 @@ def test_manifest_hashes_loaded_files_and_skips_keys(tmp_path):
     by_path = {f["path"]: f["sha256"] for f in man["readers"][0]["files"]}
     assert by_path["sidecar/reader.py"] == hashlib.sha256(b"print(1)\n").hexdigest()
     assert by_path["sidecar/packs/pack.npz"] == hashlib.sha256(b"NPZ-bytes").hexdigest()
-    assert set(man) == {
-        "schema", "qorcap_version", "python", "numpy", "opencv", "ffmpeg", "glimpse", "readers",
-    }
+    assert set(man) == {"schema", "qorcap_version", "readers", "runtimes"}
+    assert man["runtimes"] == _runtime()
     assert "reader_verified_by_referee" not in man
     blob = json.dumps(man)
     assert "SECRET-KEY-MATERIAL" not in blob
@@ -50,10 +55,14 @@ def test_unsafe_paths_and_flag_words():
     assert not R.frame_bind_enabled("0")
     assert R.frame_bind_enabled("1")
     assert R.frame_bind_enabled(" true ")
-    for bad in ("../x.py", "/etc/passwd", "C:video.py", "keys/a.py", "a/../../b.py", "a.key", ""):
+    for bad in ("../x.py", "/etc/passwd", "C:video.py", "keys/a.py", "a/../../b.py", "a.key", "",
+                "sidecar/reader.py.", "sidecar/reader.py ", "café.py", "sidecar/CON.py", "nul.txt",
+                "COM1.py", "lpt9.txt", "aux", "PRN.py", "sidecar/id_ed25519", "secret/a.py"):
         assert not R.safe_rel_path(bad), bad
     assert R.safe_rel_path("sidecar/qorcap_standard.py")
     assert R.safe_rel_path("qor_receipt/_vendor/qoresence/vision/local_scorebug/reader.py")
+    assert R.safe_rel_path("sidecar/console.py")
+    assert R.safe_rel_path("sidecar/com10.py")
 
 
 def test_vendored_pack_is_the_file_load_would_open(tmp_path):
@@ -80,8 +89,54 @@ def test_glimpse_binding_is_closed_and_does_not_claim_a_veto_already_ran():
 
 def test_empty_load_is_not_a_reader_claim(tmp_path):
     try:
-        R.build_manifest([], qorcap_version="0.3.32")
+        R.build_manifest([], qorcap_version="0.3.32", runtimes=_runtime())
     except ValueError as e:
         assert "no reader" in str(e)
     else:
         raise AssertionError("an empty manifest must not look like a bound reader")
+
+
+def test_duplicate_ids_paths_case_and_trailing_dots_are_refused(tmp_path):
+    code = tmp_path / "reader.py"
+    code.write_bytes(b"print(1)\n")
+    other = tmp_path / "other.py"
+    other.write_bytes(b"print(2)\n")
+
+    def files(*rows):
+        return [R.LoadedFile(*row) for row in rows]
+
+    with pytest.raises(ValueError, match="reader id"):
+        R.build_manifest(files(
+            ("Scorebug", "1", "code", code, "sidecar/reader.py"),
+            ("scorebug", "1", "code", other, "sidecar/other.py"),
+        ), qorcap_version="0.3.32", runtimes=_runtime())
+
+    with pytest.raises(ValueError, match="duplicate path"):
+        R.build_manifest(files(
+            ("scorebug", "1", "code", code, "sidecar/Reader.py"),
+            ("vision", "1", "code", other, "Sidecar/reader.py"),
+        ), qorcap_version="0.3.32", runtimes=_runtime())
+
+    with pytest.raises(ValueError, match="both code and pack"):
+        R.build_manifest(files(
+            ("scorebug", "1", "code", code, "sidecar/reader.py"),
+            ("scorebug", "1", "pack", code, "sidecar/reader.py"),
+        ), qorcap_version="0.3.32", runtimes=_runtime())
+
+    with pytest.raises(ValueError, match="no reader"):
+        R.build_manifest(files(
+            ("scorebug", "1", "code", code, "sidecar/reader.py."),
+        ), qorcap_version="0.3.32", runtimes=_runtime())
+
+    with pytest.raises(ValueError, match="runtime id"):
+        R.build_manifest(files(
+            ("scorebug", "1", "code", code, "sidecar/reader.py"),
+        ), qorcap_version="0.3.32", runtimes=[
+            {"id": "ffmpeg", "version": "n7", "sha256": "11" * 32},
+            {"id": "FFmpeg.", "version": "n8", "sha256": "22" * 32},
+        ])
+
+    with pytest.raises(ValueError, match="no runtime"):
+        R.build_manifest(files(
+            ("scorebug", "1", "code", code, "sidecar/reader.py"),
+        ), qorcap_version="0.3.32", ffmpeg={"state": "unbound"}, opencv=None)

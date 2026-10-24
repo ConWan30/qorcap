@@ -48,9 +48,8 @@ META_FILES = ("bundle.json", "manifest.jsonl", "checkpoints.jsonl", "countersign
 def upload_names() -> tuple[str, ...]:
     """Files meta_zip sends when they exist.
 
-    The prefix matches contracts/compat.json bundle_files.meta. ``frames.jsonl`` and ``readers.json``
-    are appended so a referee can fetch them. They are not in compat.json until QorTime adds them
-    and this repo re-copies the contract. Do not treat the suffix as a published schema.
+    The list matches contracts/compat.json bundle_files.meta, including ``frames.jsonl`` and
+    ``readers.json`` from the vendored QorTime registry.
     """
     return META_FILES
 HERE = Path(__file__).resolve().parent

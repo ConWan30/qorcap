@@ -1202,18 +1202,14 @@ mod tests {
         let manifest = serde_json::json!({
             "schema": "qorcap-readers/v0",
             "qorcap_version": "0.3.32",
-            "python": "3.12.0",
-            "numpy": null,
-            "opencv": null,
-            "ffmpeg": {"state": "unbound"},
-            "glimpse": {"state": "unbound"},
             "readers": [{"id": "scorebug", "version": "0.3.32", "files": [
                 {"kind": "code", "path": "sidecar/qorcap_standard.py", "sha256": "ab".repeat(32)}
-            ]}]
+            ]}],
+            "runtimes": [{"id": "ffmpeg", "version": "n7.0.1", "sha256": "11".repeat(32)}]
         });
         e.bind_readers(&manifest).unwrap();
         e.frame_bind.append_frame(0, 0, 0, 0, b"au-0").unwrap();
-        e.frame_bind.append_frame(0, 30, 1120, 90_000, b"au-30").unwrap();
+        e.frame_bind.append_frame(0, 1, 1120, 90_000, b"au-1").unwrap();
         let video = dir.join("video.mp4");
         std::fs::write(&video, b"hashed-segment").unwrap();
         e.on_segment(video.to_str().unwrap(), 0, b"hashed-segment");
@@ -1230,7 +1226,7 @@ mod tests {
         assert_eq!(report.frame_status, "verified", "{:?}", report.errors);
         assert!(report.reader_claim, "{:?}", report.errors);
         assert_eq!(report.tail, "open", "this test does not write the stop seal");
-        assert!(report.skew.iter().any(|s| s.frame == 30 && s.skew_ms == 120), "{:?}", report.skew);
+        assert!(report.skew.iter().any(|s| s.frame == 1 && s.skew_ms == 120), "{:?}", report.skew);
         let mut raw = std::fs::read(dir.join("frames.jsonl")).unwrap();
         raw[40] ^= 0x01;
         std::fs::write(dir.join("frames.jsonl"), &raw).unwrap();
