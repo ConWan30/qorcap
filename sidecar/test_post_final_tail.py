@@ -1007,6 +1007,193 @@ def test_trailing_q3_misread_does_not_let_a_later_showing_confirm(tmp_path):
     assert tail["end_menu"]["until_ms"] == 23_000
 
 
+def _quarter_rows(quarters):
+    """Live score rows in this order. The last row is the latest ``t_ms``."""
+    rows = []
+    last_i = len(quarters) - 1
+    for i, q in enumerate(quarters):
+        last = i == last_i
+        clock = 0 if last and isinstance(q, int) and not isinstance(q, bool) and q >= 4 else 40 - i
+        row = {"t_ms": 1_000 if last else 100 * (i + 1), "home": 10, "away": 10,
+               "quarter": q, "clock_s": clock}
+        if clock == 0:
+            row["clock_red"] = True
+        rows.append(row)
+    return rows
+
+
+def _q3_then_later_menu():
+    """One Q3 frame, the first menu, a scorebug return, then a later showing."""
+    return ([(2_000, _blank())]
+            + _menu_frames(5_000, 8_000)
+            + [(t, _blank()) for t in (12_000, 13_000, 14_000)]
+            + _menu_frames(20_000, 23_000))
+
+
+def _bundle_tail(tmp_path, name, rows, frames, *, menu=None, scorebug=None, corr=None,
+                 live_final=None, draft=None):
+    """Stop-time re-read. The returned core is the one ``tail_final_check`` seeded."""
+    bundle = tmp_path / name
+    bundle.mkdir()
+    (bundle / "timeline.jsonl").write_text(
+        "".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+    (bundle / "video.mp4").write_bytes(b"not-a-real-video")
+    (bundle / "manifest.jsonl").write_text(json.dumps({
+        "type": "segment", "seq": 0, "file": "video.mp4", "wall_ms": frames[-1][0],
+    }) + "\n", encoding="utf-8")
+    if draft is None:
+        draft = {"result": {"home_score": 10, "away_score": 10, "quarter": 4, "winner": "unknown",
+                            "method": "last_scorebug_read_unconfirmed", "final_confirmed": False}}
+    held = []
+
+    def factory(post, menu=menu, scorebug=scorebug, corr=corr):
+        agree = _Agree() if scorebug is not None else None
+        pause = None if scorebug is not None else _Paused()
+        core = ReaderCore(post, scorebug, agree, pause, _detect_final,
+                          final_screen_detector=madden_final_screen, end_menu_reader=menu,
+                          end_menu_agree=EndMenuAgreement() if menu is not None else None)
+        if corr:
+            core.delta_corroboration = list(corr)
+        held.append(core)
+        if scorebug is None:
+            return core
+        real = core.on_frame
+
+        def on_frame(t, img, scorebug=scorebug, real=real):
+            scorebug.t = t
+            return real(t, img)
+
+        core.on_frame = on_frame
+        return core
+
+    got = qm.tail_final_check(
+        bundle, draft, ffmpeg="ffmpeg", core_factory=factory, frames=frames, live_final=live_final)
+    tail_path = bundle / "final.tail.json"
+    tail = json.loads(tail_path.read_text(encoding="utf-8")) if tail_path.is_file() else None
+    return got, tail, held[0]
+
+
+def test_tail_keeps_an_end_screen_from_before_the_last_live_row(tmp_path):
+    """Live saw an end screen, the scorebug returned, and live missed the later menu.
+
+    The first screen is in the decoded window but before the last live row, so the tail
+    does not read it again. Input during that screen must not confirm the later menu.
+    Dropping the ``_note_end_screen_time`` seed signs the later menu confirmed.
+    """
+    rows = [
+        {"t_ms": 1_000, "home": 10, "away": 10, "quarter": 4, "clock_s": 30, "clock_red": False},
+        {"t_ms": 12_000, "home": 10, "away": 10, "quarter": 4, "clock_s": 0, "clock_red": True},
+    ]
+    frames = _menu_frames(5_000, 8_000) + _menu_frames(20_000, 23_000)
+    got, tail, core = _bundle_tail(
+        tmp_path, "early-screen", rows, frames, menu=_MenuReader(10, 16),
+        corr=[{"kind": "input_activity", "t_ms": 6_000}])
+    res = got["result"]
+    assert (res["away_score"], res["home_score"]) == (10, 16)
+    assert res["final_confirmed"] is False
+    assert core._end_screen_seen_ms == 5_000
+    assert res["method"] == "end_menu_read"
+    assert res["final_t_ms"] == 20_000
+    assert tail["final"]["t_ms"] == 20_000 and tail["final"]["final_confirmed"] is False
+
+
+def test_quarter_floor_is_the_max_across_1_4_3(tmp_path):
+    """Quarters 1, then 4, then 3. The floor is 4, so the trailing Q3 misread is not posted.
+
+    The last live row is itself Q3, so the menu gate is not the signal. The minimum of
+    these quarters is 1 and the last row is 3. Either mutant posts the misread and
+    leaves ``_max_quarter`` below 4.
+    """
+    got, _tail, core = _bundle_tail(
+        tmp_path, "quarters-1-4-3", _quarter_rows([1, 4, 3]), _q3_then_later_menu(),
+        menu=_MenuReader(10, 16), scorebug=_Q3MisreadThenQ4(),
+        corr=[{"kind": "input_activity", "t_ms": 16_000}])
+    assert core._max_quarter == 4
+    assert not any(isinstance(r, dict) and r.get("t_ms") == 2_000 and r.get("quarter") == 3
+                   for r in core.timeline)
+    assert got["result"]["method"] == "end_menu_read"
+
+
+def test_quarter_floor_is_the_max_across_4_2_4(tmp_path):
+    """Quarters 4, then 2, then 4. The floor is 4, so the first menu stays unconfirmed.
+
+    The minimum of these quarters is 2. That mutant keeps the trailing Q3, the Q4 gate
+    rejects the first showing, and the later showing confirms. The last row is already 4.
+    """
+    got, tail, core = _bundle_tail(
+        tmp_path, "quarters-4-2-4", _quarter_rows([4, 2, 4]), _q3_then_later_menu(),
+        menu=_MenuReader(10, 16), scorebug=_Q3MisreadThenQ4(),
+        corr=[{"kind": "input_activity", "t_ms": 16_000}])
+    res, fin = got["result"], tail["final"]
+    assert core._max_quarter == 4
+    assert (res["away_score"], res["home_score"]) == (10, 16)
+    assert res["final_confirmed"] is False
+    assert res["final_t_ms"] == 5_000
+    assert fin["t_ms"] == 5_000 and fin["final_confirmed"] is False
+    assert tail["end_menu"]["t_ms"] == 5_000
+
+
+def test_quarter_below_one_leaves_the_floor_unset(tmp_path):
+    """Zero and negative are not a quarter. The floor stays None, the same as live.
+
+    A 4 among them is still the floor. Taking the max without the ``q >= 1`` check, or
+    keeping the last row, sets 0 or a negative instead.
+    """
+    frames = [(2_000, _blank())]
+    _got, _tail, none_core = _bundle_tail(
+        tmp_path, "quarter-none", _quarter_rows([0, -3]), frames)
+    assert none_core._max_quarter is None
+    _got, _tail, kept = _bundle_tail(
+        tmp_path, "quarter-kept", _quarter_rows([4, 0, -1]), frames)
+    assert kept._max_quarter == 4
+
+
+def _unconfirmed_live_final():
+    return {
+        "type": "final", "basis": "end_menu", "method": "end_menu_read",
+        "home": 16, "away": 10, "quarter": 4, "t_ms": 5_000, "final_confirmed": False,
+        "end_menu": {"away": 10, "home": 16, "t_ms": 5_000, "until_ms": 8_000, "frames": 7},
+    }
+
+
+def test_scorebug_after_an_unconfirmed_final_is_not_upgraded(tmp_path):
+    """Live posted an unconfirmed menu and a scorebug read returned after it.
+
+    Input after that return would confirm a fresh read of the later menu. The tail
+    leaves the final unconfirmed. A flushed touchdown hold, or a scorebug at the
+    menu's last millisecond, is not that return, so the same input still confirms.
+    """
+    live_final = _unconfirmed_live_final()
+    base = {"home_score": 10, "away_score": 10, "quarter": 4, "winner": "unknown",
+            "method": "last_scorebug_read_unconfirmed", "final_confirmed": False}
+    draft = {"result": qm.apply_final(dict(base), live_final)}
+    assert draft["result"]["final_confirmed"] is False
+    frames = _menu_frames(5_000, 8_000) + _menu_frames(20_000, 23_000)
+    corr = [{"kind": "input_activity", "t_ms": 16_000}]
+    early = {"t_ms": 1_000, "home": 10, "away": 10, "quarter": 4, "clock_s": 0, "clock_red": True}
+
+    def run(name, later):
+        return _bundle_tail(
+            tmp_path, name, [early, later], frames, menu=_MenuReader(10, 16),
+            corr=corr, live_final=live_final, draft=draft)
+
+    got, tail, _core = run("after-scorebug", {
+        "t_ms": 12_000, "home": 10, "away": 10, "quarter": 4, "clock_s": 0, "clock_red": True})
+    assert got["result"]["final_confirmed"] is False
+    assert (got["result"]["away_score"], got["result"]["home_score"]) == (10, 16)
+    assert got["result"]["method"] == "end_menu_read"
+    assert tail["final"]["final_confirmed"] is False
+
+    held, _tail, _core = run("after-hold", {
+        "t_ms": 12_000, "home": 10, "away": 10, "quarter": 4, "clock_s": 0, "clock_red": True,
+        "touchdown_hold": True})
+    assert held["result"]["final_confirmed"] is True
+
+    same_ms, _tail, _core = run("at-until", {
+        "t_ms": 8_000, "home": 10, "away": 10, "quarter": 4, "clock_s": 0, "clock_red": True})
+    assert same_ms["result"]["final_confirmed"] is True
+
+
 def test_tied_walkoff_input_after_the_end_screen_does_not_confirm(tmp_path):
     """Tied Q4 0:00 10-10 to menu 10-16, and tied OT 13-13 to menu 13-16.
 

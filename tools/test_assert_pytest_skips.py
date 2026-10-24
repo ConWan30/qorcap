@@ -384,8 +384,8 @@ def test_sidecar_ci_sets_xfail_strict_and_the_suite_gate():
             "sidecar/test_qorcap_match.py::test_reader_timing_log_names_the_three_clocks"
         )
         assert files[timing - len(stall_ids):timing] == stall_ids
-    assert skips.LINUX_MIN_COLLECTED == 596
-    assert skips.WINDOWS_MIN_COLLECTED == 578
+    assert skips.LINUX_MIN_COLLECTED == 607
+    assert skips.WINDOWS_MIN_COLLECTED == 589
 
 
 def test_xfail_strict_rejects_an_unexpected_pass(tmp_path):

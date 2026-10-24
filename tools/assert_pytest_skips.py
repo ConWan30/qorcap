@@ -168,11 +168,11 @@ WINDOWS_FILES = (
 # The floor is a minimum. A PR that adds tests, and any merge resolution, must
 # re-collect and set both floors to those exact counts. Leaving the old floor
 # keeps a dropped test green.
-# Collect-only of these lists on main 59009ad plus the guard tests in
-# tools/test_assert_pytest_skips.py. #96's suite, before those guard tests,
-# collected 580 linux / 562 windows. Re-collect after any list or test change.
-LINUX_MIN_COLLECTED = 596
-WINDOWS_MIN_COLLECTED = 578
+# Collect-only of these lists after the tail tests in sidecar/test_post_final_tail.py.
+# Main e00d374, including the guard tests, collected 596 linux / 578 windows.
+# Re-collect after any list or test change.
+LINUX_MIN_COLLECTED = 607
+WINDOWS_MIN_COLLECTED = 589
 
 # Absent from both sidecar suites. A reason is required; whitespace does not count.
 EXCLUDED_TEST_FILES = {
