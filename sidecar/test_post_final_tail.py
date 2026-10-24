@@ -26,6 +26,7 @@ from qorcap_reader import (  # noqa: E402
     FINAL_SCREEN_MIN_SPAN_MS,
     ReaderCore,
     end_menu_delta_corroborated,
+    end_screen_evidence_cutoff_ms,
     madden_final_screen,
 )
 
@@ -584,6 +585,59 @@ def test_later_end_menu_score_does_not_replace_a_posted_final():
     assert not any(p.get("home") == 0 and p.get("away") == 10 and p.get("final_confirmed") is True for p in posts)
 
 
+def _feed_menu_scorebug_return_then_other_menu():
+    """Exact 7-0 menu, then the scorebug comes back, then a different 10-0 menu.
+
+    The haptic is early enough to confirm a fresh +3 if the first menu were forgotten.
+    """
+    menu_reader = _SwitchScore((7, 0), (10, 0), at=20_000)
+    posts = []
+    core = ReaderCore(posts.append, _Scorebug(7, 0, 4, 0, True), _Agree(), None, _detect_final,
+                      final_screen_detector=madden_final_screen, end_menu_reader=menu_reader,
+                      end_menu_agree=EndMenuAgreement())
+    core.delta_corroboration = [{"kind": "haptic", "t_ms": 1_500}]
+    menu, blank = _menu(), _blank()
+    for t in (1_000, 2_000):
+        menu_reader.t = t
+        core.on_frame(t, blank)
+    for t, img in _menu_frames(5_000, 8_000):
+        menu_reader.t = t
+        core.on_frame(t, img)
+    for t in (12_000, 13_000, 14_000):
+        menu_reader.t = t
+        core.on_frame(t, blank)
+    for t, img in _menu_frames(25_000, 28_000):
+        menu_reader.t = t
+        core.on_frame(t, img)
+    return core, posts
+
+
+def test_scorebug_between_menus_keeps_the_first_score_unconfirmed():
+    """A scorebug read between two different end menus does not reopen the final.
+
+    The first score stays. The later score is not adopted. Confirmation stays false.
+    Clearing ``end_menu`` when the scorebug returns posts that menu again. Posting the
+    later score instead of noting the disagreement confirms 10-0 from the early haptic.
+    """
+    core, posts = _feed_menu_scorebug_return_then_other_menu()
+    assert core.end_menu is not None
+    assert (core.end_menu["away"], core.end_menu["home"]) == (7, 0)
+    assert (core.final["away"], core.final["home"]) == (7, 0)
+    assert core.final["final_confirmed"] is False
+    assert core.final.get("end_menu_disputed") is True
+    assert "amends" not in core.final
+    note = " ".join(n for n in core.final.get("notes") or [] if isinstance(n, str))
+    assert "disagreed with the posted" in note and "not replaced" in note
+    finals = [p for p in posts if p.get("type") == "final"]
+    # One confirmed post, then the dispute. A scorebug read must not post the menu again.
+    assert len(finals) == 2
+    assert finals[0]["final_confirmed"] is True and "amends" not in finals[0]
+    assert (finals[0]["away"], finals[0]["home"]) == (7, 0)
+    assert finals[1]["final_confirmed"] is False and finals[1].get("end_menu_disputed") is True
+    assert not any(
+        p.get("away") == 10 and p.get("home") == 0 and p.get("final_confirmed") is True for p in posts)
+
+
 def test_disputed_final_stays_unconfirmed_after_stop(tmp_path):
     """7-0 menu, then a 10-0 menu, then stop. The re-read must not confirm the first score.
 
@@ -603,9 +657,13 @@ def test_disputed_final_stays_unconfirmed_after_stop(tmp_path):
     # The flag and the note are one dispute. Either one is enough, and the sentence the
     # reader writes is the sentence the matcher looks for.
     sentence = next(n for n in core.final["notes"] if "not replaced" in n)
-    assert qm.end_menu_was_disputed({"end_menu_disputed": True, "notes": []}) is True
-    assert qm.end_menu_was_disputed({"notes": [sentence]}) is True
-    assert qm.end_menu_was_disputed({"final_confirmed": False, "notes": ["final_confirmed=false"]}) is False
+    assert qm.end_menu_was_disputed({"basis": "end_menu", "end_menu_disputed": True, "notes": []}) is True
+    assert qm.end_menu_was_disputed({"method": "end_menu_read", "notes": [sentence]}) is True
+    assert qm.end_menu_was_disputed(
+        {"basis": "end_menu", "final_confirmed": False, "notes": ["final_confirmed=false"]}) is False
+    # The same flag and sentence on a scorebug final are not a dispute.
+    assert qm.end_menu_was_disputed(
+        {"basis": "clock_zero", "end_menu_disputed": True, "notes": [sentence]}) is False
 
     bundle = tmp_path / "match-dispute"
     bundle.mkdir()
@@ -842,6 +900,64 @@ def test_scorebug_return_clears_the_earliest_end_screen_match():
     assert after.final.get("delta_corroboration") is None
 
 
+def _feed_labelled_screen_then_scorebug_then_menu(input_t):
+    """A committed end screen, then the scorebug comes back, then the real walk-off menu."""
+    menu_reader = _LateDigits(10, 16, ready_at=20_000)
+    posts = []
+    core = ReaderCore(posts.append, _Scorebug(10, 10, 4, 0, True), _Agree(), None, _detect_final,
+                      final_screen_detector=madden_final_screen, end_menu_reader=menu_reader,
+                      end_menu_agree=EndMenuAgreement())
+    core.timeline = [{"t_ms": 1_000, "home": 10, "away": 10, "quarter": 4, "clock_s": 0, "clock_red": True}]
+    core.delta_corroboration = [{"kind": "input_activity", "t_ms": input_t}]
+    menu = _menu()
+    for t in (2_000, 3_200, 4_400, 5_600, 6_800):
+        menu_reader.t = t
+        core.on_frame(t, menu)
+    for t in (8_000, 9_000, 10_000):
+        menu_reader.t = t
+        core.on_frame(t, _blank())
+    for t, img in _menu_frames(20_000, 22_000):
+        menu_reader.t = t
+        core.on_frame(t, img)
+    return core
+
+
+def test_cutoff_ignores_end_screens_from_before_the_scorebug_returned():
+    """A labelled end screen from before the scorebug came back is not the cutoff.
+
+    Input at 12 s, after that screen and after the scorebug read, still confirms the
+    one-step walk-off. Input after the real menu does not. Counting every ``final_screen``
+    row again makes the 12 s input miss. With no scorebug row, the old screen still counts.
+    """
+    old = [{"t_ms": 2_000, "until_ms": 6_800, "obs": "final_screen", "n": 5},
+           {"t_ms": 10_000, "home": 10, "away": 10, "quarter": 4, "clock_s": 0}]
+    assert end_screen_evidence_cutoff_ms(old, menu_t_ms=20_000, pixel_match_ms=2_000) == 20_000
+    assert end_screen_evidence_cutoff_ms(
+        [{"t_ms": 2_000, "obs": "final_screen", "n": 5}], menu_t_ms=20_000, pixel_match_ms=2_000) == 2_000
+    st = {"away": 10, "home": 16, "t_ms": 20_000}
+    last = {"away": 10, "home": 10, "t_ms": 10_000}
+    got = end_menu_delta_corroborated(
+        st, last, old, [{"kind": "input_activity", "t_ms": 12_000}], pixel_match_ms=20_000)
+    assert got and got["kind"] == "input_activity" and got["t_ms"] == 12_000
+    assert end_menu_delta_corroborated(
+        st, last, old, [{"kind": "input_activity", "t_ms": 21_000}], pixel_match_ms=20_000) is None
+
+    back = _feed_labelled_screen_then_scorebug_then_menu(12_000)
+    screens = [r for r in back.timeline if isinstance(r, dict) and r.get("obs") == "final_screen"]
+    scores = [r for r in back.timeline if isinstance(r, dict) and "home" in r and "obs" not in r]
+    assert screens and int(screens[0]["t_ms"]) < int(scores[-1]["t_ms"])
+    assert scores[-1]["t_ms"] >= 10_000
+    assert back.final["basis"] == "end_menu"
+    assert (back.final["away"], back.final["home"]) == (10, 16)
+    assert back.final["final_confirmed"] is True
+    assert back.final["delta_corroboration"]["kind"] == "input_activity"
+    assert back.final["delta_corroboration"]["t_ms"] == 12_000
+
+    after = _feed_labelled_screen_then_scorebug_then_menu(21_000)
+    assert after.final["final_confirmed"] is False
+    assert after.final.get("delta_corroboration") is None
+
+
 def test_offline_finalize_does_not_upgrade_a_disputed_end_menu():
     """The first end-menu event is confirmed. The dispute post is later. Finalize signs the dispute.
 
@@ -864,6 +980,40 @@ def test_offline_finalize_does_not_upgrade_a_disputed_end_menu():
     assert (res["away_score"], res["home_score"]) == (7, 0)
     kept = " ".join(n for n in res.get("notes") or [] if isinstance(n, str))
     assert "disagreed with the posted" in kept and "not replaced" in kept
+
+
+def test_note_only_end_menu_dispute_is_not_confirmed_offline():
+    """The dispute note is enough. ``apply_final`` treats a missing ``final_confirmed`` as True.
+
+    Skipping the rewrite in ``apply_offline_final`` signs this confirmed. A scorebug final
+    that carries the same note and flag is not a dispute, and an unresolved grammar abstains.
+    """
+    note = ("later end-of-game menu read AWAY 10 - HOME 0 disagreed with the posted "
+            "final AWAY 7 - HOME 0; score not replaced; final_confirmed=false")
+    event = {"type": "final", "basis": "end_menu", "method": "end_menu_read",
+             "home": 0, "away": 7, "quarter": 4, "t_ms": 5_000, "notes": [note]}
+    fin, res = qm.apply_offline_final(
+        {"home_score": 0, "away_score": 7, "quarter": 4, "winner": "away"}, [event])
+    assert fin is event
+    assert res["final_confirmed"] is False
+    assert (res["away_score"], res["home_score"]) == (7, 0)
+    assert res["method"] == "end_menu_read"
+    kept = " ".join(n for n in res.get("notes") or [] if isinstance(n, str))
+    assert "disagreed with the posted" in kept and "not replaced" in kept
+
+    bug = {"type": "final", "basis": "clock_zero", "home": 0, "away": 7, "quarter": 4,
+           "t_ms": 5_000, "notes": [note], "end_menu_disputed": True}
+    assert qm.end_menu_was_disputed(bug) is False
+    _fin, abstained = qm.apply_offline_final(
+        {"home_score": 0, "away_score": 7, "quarter": 4, "winner": "away"}, [bug], grammar_unresolved=True)
+    assert abstained["away_score"] is None and abstained["home_score"] is None
+    assert abstained["winner"] == "unknown"
+    assert abstained["method"] == "last_scorebug_read_unconfirmed"
+    assert any("abstains" in n for n in abstained.get("notes") or [])
+    forced = qm._disputed_final_result({"result": {}}, bug, grammar_unresolved=True)["result"]
+    assert forced["away_score"] is None and forced["home_score"] is None
+    assert forced["method"] == "last_scorebug_read_unconfirmed"
+    assert any("abstains" in n for n in forced.get("notes") or [])
 
 
 # ---------------------------------------------------------------- chain model (tests only)

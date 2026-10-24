@@ -1341,6 +1341,8 @@ class ReaderCore:
                 self.periods.release_for_new_quarter()
             self.periods.note(t_ms, rd.get("clock_s"))
         # The scorebug is back. A new end screen starts its own cutoff.
+        # A posted end menu stays posted. A later menu with a different score does not
+        # replace it and does not confirm it (see ``_note_end_menu_disagreement``).
         self._end_screen_earliest = None
         self._close_spans()  # a fresh score read ends any absence span
         self._check_final(t_ms)
@@ -1574,7 +1576,12 @@ class ReaderCore:
         self.post(jcs_safe(self.final))
 
     def _note_end_menu_disagreement(self, st: dict) -> None:
-        """Keep the posted score and drop confirmation. Do not adopt the new score."""
+        """Keep the first posted score and leave it unconfirmed. Do not adopt the new score.
+
+        A scorebug read between two end menus does not reopen the final. The first
+        score stays. The later score is not the result. Confirmation stays false.
+        A contradicting later menu must never become a confirmed final.
+        """
         if getattr(self, "_end_menu_disputed", False):
             return
         self._end_menu_disputed = True
@@ -1669,11 +1676,12 @@ def end_menu_delta_corroborated(st: dict, last: dict | None, timeline: list[dict
 
     Button and haptic evidence at or after the end screen does not count. That time is
     the first pixel match or the first agreeing menu frame, and also any ``final_screen``
-    row already on the timeline. A missing label is not a missing screen: the menu frame
-    and the pixel match are enough. Menu navigation during the post-final tail must not
-    flip ``final_confirmed``. A score-change clip from that same moment onward is ignored
-    for the same reason. A scorebug read already on the timeline still counts: that is
-    the score, not an input.
+    row already on the timeline, but only when that time is after the latest scorebug
+    read. A screen from before the scorebug came back is not this end. A missing label
+    is not a missing screen: the menu frame and the pixel match are enough. Menu
+    navigation during the post-final tail must not flip ``final_confirmed``. A
+    score-change clip from that same moment onward is ignored for the same reason. A
+    scorebug read already on the timeline still counts: that is the score, not an input.
     """
     if last is None:
         return {"kind": "no_scorebug"}
@@ -1715,12 +1723,27 @@ def end_screen_evidence_cutoff_ms(timeline: list[dict] | None, *, menu_t_ms=None
     timeline row is the same picture when the classifier labelled it. The cutoff is the
     earliest of those. Dropped flashes are not on the timeline, and a tie that was labelled
     is not required: the menu frame or the pixel match is enough on its own.
+
+    Only times strictly after the latest scorebug read count. A labelled screen from
+    before that read is an earlier picture: the scorebug came back, so it is not the end.
+    With no scorebug read on the timeline, every one of those times still counts.
     """
+    scorebug_t = None
+    for r in timeline or []:
+        if not isinstance(r, dict) or "obs" in r or "home" not in r:
+            continue
+        t = r.get("t_ms")
+        if isinstance(t, bool) or not isinstance(t, int):
+            continue
+        if scorebug_t is None or t > scorebug_t:
+            scorebug_t = t
     cut = None
 
     def consider(t):
         nonlocal cut
         if isinstance(t, bool) or not isinstance(t, int):
+            return
+        if scorebug_t is not None and t <= scorebug_t:
             return
         if cut is None or t < cut:
             cut = t
