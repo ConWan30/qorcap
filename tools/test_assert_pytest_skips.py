@@ -1,5 +1,6 @@
 """A Windows-only submit skip must fail the job when it is recorded on Linux."""
-import shlex
+import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -229,8 +230,21 @@ def test_explicit_xfail_strict_false_fails(tmp_path, monkeypatch, capsys):
     assert needle in capsys.readouterr().err
 
 
+def _bash_python() -> str:
+    """PATH name bash can exec. CI runs ``python``.
+
+    ``sys.executable`` on Windows is a backslash path. Inside ``$(...)``, Git bash
+    does not run that path, the substitution fails, and the empty-list guard
+    never prints its message.
+    """
+    name = "python" if os.name == "nt" or not shutil.which("python3") else "python3"
+    if any(ch in name for ch in "\\/ \t"):
+        raise RuntimeError(name)
+    return name
+
+
 def test_list_failure_and_an_empty_list_do_not_run_pytest():
-    py = shlex.quote(sys.executable)
+    py = _bash_python()
     crash = subprocess.run(
         ["bash", "-c", f"set -e\nSIDECAR_TESTS=($({py} -c 'import sys; sys.exit(3)'))\necho ran\n"],
         capture_output=True,
@@ -242,7 +256,7 @@ def test_list_failure_and_an_empty_list_do_not_run_pytest():
         [
             "bash",
             "-c",
-            f"set -e\n"
+            "set -e\n"
             f"SIDECAR_TESTS=($({py} -c 'import sys'))\n"
             'if [[ ${#SIDECAR_TESTS[@]} -eq 0 ]]; then\n'
             '  echo "sidecar linux suite list is empty" >&2\n'
@@ -253,7 +267,7 @@ def test_list_failure_and_an_empty_list_do_not_run_pytest():
         capture_output=True,
         text=True,
     )
-    assert empty.returncode == 1
+    assert empty.returncode == 1, (empty.returncode, empty.stdout, empty.stderr)
     assert "empty" in empty.stderr
     assert "ran" not in empty.stdout
 
