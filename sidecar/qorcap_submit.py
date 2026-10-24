@@ -28,6 +28,7 @@ import base64
 import hashlib
 import io
 import json
+import logging
 import os
 import sys
 import time
@@ -60,6 +61,19 @@ OFFLINE_KEY_KIND = "local-self-attested-offline"
 def say(msg: str = "") -> None:
     from qorcap_console import emit
     emit(msg)
+
+
+def _alert_warn(backend: str, detail: object) -> None:
+    """Stderr only. A failed import has no alert module to log through."""
+    logging.getLogger("qorcap.challenge_alert").warning("challenge alert %s failed: %s", backend, detail)
+
+
+try:
+    from qorcap_challenge_alert import notify_challenge
+    from qorcap_challenge_alert import warn_once as _alert_warn
+except Exception as _alert_import_error:
+    notify_challenge = None  # type: ignore[assignment]
+    _alert_warn("import", _alert_import_error)
 
 
 class RefereeError(Exception):
@@ -604,6 +618,13 @@ class OfficialLive:
             self.beep()
         except Exception:
             pass
+        # After the challenge is on disk and posted. The alert queue must not move
+        # issued_ms, deadline_ms, prompt_wall_ms, or the body sent to QorCap.
+        if notify_challenge is not None:
+            try:
+                notify_challenge(msg)
+            except Exception as exc:
+                _alert_warn("schedule", exc)
 
 
 def _beep() -> None:

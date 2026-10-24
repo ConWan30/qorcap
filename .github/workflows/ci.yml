@@ -54,6 +54,10 @@ jobs:
       - name: Sidecar tests
         env:
           QORTIME: ${{ github.workspace }}/qortime
+          # Other OfficialLive tests must not play a challenge beep or spawn PowerShell.
+          QORCAP_CHALLENGE_BEEP: "0"
+          QORCAP_CHALLENGE_TOAST: "0"
+          QORCAP_CHALLENGE_FLASH: "0"
         run: |
           python -c "import cv2, numpy, cryptography"
           python -c "import os, pathlib; p=pathlib.Path(os.environ['QORTIME']); assert (p/'qor_receipt').is_dir(), p; assert (p/'tests/fixtures/madden27_live/q1_6-0.png').is_file(), 'pinned QorTime scorebug fixture missing'"
@@ -81,6 +85,7 @@ jobs:
             sidecar/test_qorcap_playcall.py \
             sidecar/test_qorcap_psn.py \
             sidecar/test_qorcap_challenge.py \
+            sidecar/test_qorcap_challenge_alert.py \
             sidecar/test_qorcap_paths.py \
             sidecar/test_qorcap_sidepick.py \
             sidecar/test_score_timeline.py \
@@ -174,6 +179,10 @@ jobs:
         shell: bash
         env:
           QORTIME: ${{ github.workspace }}/qortime
+          # Other OfficialLive tests must not play a challenge beep or spawn PowerShell.
+          QORCAP_CHALLENGE_BEEP: "0"
+          QORCAP_CHALLENGE_TOAST: "0"
+          QORCAP_CHALLENGE_FLASH: "0"
         run: |
           python -c "import cv2, numpy, cryptography"
           python -c "import os, pathlib; p=pathlib.Path(os.environ['QORTIME']); assert (p/'qor_receipt').is_dir(), p; assert (p/'tests/fixtures/madden27_live/q1_6-0.png').is_file(), 'pinned QorTime scorebug fixture missing'"
@@ -198,6 +207,7 @@ jobs:
             sidecar/test_qorcap_playcall.py \
             sidecar/test_qorcap_psn.py \
             sidecar/test_qorcap_paths.py \
+            sidecar/test_qorcap_challenge_alert.py \
             sidecar/test_qorcap_sidepick.py \
             sidecar/test_score_timeline.py \
             sidecar/test_qorcap_glimpse_watch.py \
