@@ -2418,10 +2418,15 @@ def record_post_final_tail(bundle: Path, *, configured_s: float, start_reason: s
 def end_menu_was_disputed(fin) -> bool:
     """The live end menu disagreed with itself. That final stays unconfirmed.
 
+    Only an end-menu final counts. A scorebug final (``clock_zero``, ``final_screen``,
+    ``scorebug_gone``) that carries the same flag or the same sentence is not a dispute.
+    That gate is defensive: the reader sets the flag only on an end-menu final.
+
     The flag is on the posted final. The note is the receipt-visible record: receipt
-    schema drops unknown result fields, and this note is already one of them.
+    schema drops unknown result fields, and this note is already one of them. Either
+    one, on an end-menu final, keeps it unconfirmed.
     """
-    if not isinstance(fin, dict):
+    if not isinstance(fin, dict) or not is_end_menu_final(fin):
         return False
     if fin.get("end_menu_disputed") is True:
         return True
@@ -2450,13 +2455,21 @@ def apply_offline_final(result: dict, events, *, fallback=None, grammar_unresolv
     fin = select_offline_final(events)
     res = apply_final(result, fin, fallback=fallback, grammar_unresolved=grammar_unresolved)
     if end_menu_was_disputed(fin):
-        res = _disputed_final_result({"result": res}, fin)["result"]
+        res = _disputed_final_result({"result": res}, fin, grammar_unresolved=grammar_unresolved)["result"]
     return fin, res
 
 
-def _disputed_final_result(draft: dict, live_final: dict) -> dict:
-    """Keep the posted score and the dispute note. Do not let a re-read confirm it."""
-    result = apply_final(draft.get("result") or {}, live_final)
+def _disputed_final_result(draft: dict, live_final: dict, *, grammar_unresolved: bool = False) -> dict:
+    """Keep the posted score and the dispute note. Do not let a re-read confirm it.
+
+    A final that is not an end menu is not rewritten here. ``grammar_unresolved`` still
+    reaches ``apply_final``, so a scorebug final abstains instead of being forced into
+    the dispute shape. Both are defensive. Only an end-menu final is disputed, and
+    ``apply_final`` ignores the grammar flag for those.
+    """
+    result = apply_final(draft.get("result") or {}, live_final, grammar_unresolved=grammar_unresolved)
+    if not is_end_menu_final(live_final):
+        return dict(draft, result=result)
     result["final_confirmed"] = False
     notes = [n for n in (live_final.get("notes") or []) if isinstance(n, str)]
     if notes:
@@ -2478,7 +2491,7 @@ def tail_final_check(bundle: Path, draft: dict, *, ffmpeg: str, secs: int = TAIL
     later disagreeing menu is invisible and the first score would be posted again as an exact match.
     """
     if end_menu_was_disputed(live_final):
-        return _disputed_final_result(draft, live_final)
+        return _disputed_final_result(draft, live_final, grammar_unresolved=grammar_unresolved)
     live = [r for r in read_jsonl(bundle / "timeline.jsonl") if "obs" not in r and "home" in r]
     if not live:
         return draft
