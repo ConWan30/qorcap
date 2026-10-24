@@ -745,13 +745,17 @@ def test_finalize_role_correction_resigns_for_the_corrected_side(tmp_path, capsy
 
 def test_reader_timing_log_names_the_three_clocks(tmp_path):
     row = qm.reader_timing_row(1_000, [250, 300, 280], 12.4, [8, 9], [20, 22],
-                               {"reader_lag": {"obs": "reader_lag", "n": 1, "max_gap_ms": 2100}})
+                               {"reader_lag": {"obs": "reader_lag", "n": 1, "max_gap_ms": 2100}},
+                               refresh_age_ms=1500.4)
     assert row["kind"] == "timing"
     assert row["frame_period_ms"]["n"] == 3 and row["frame_period_ms"]["max_ms"] == 300
     assert row["refresh_ms"] == 12
+    assert row["refresh_age_ms"] == 1500
     assert row["on_frame_ms"]["mean_ms"] == 8 or row["on_frame_ms"]["mean_ms"] == 9
     text = qm.format_reader_timing(row)
-    assert "frame_period_ms" in text and "refresh_ms" in text and "on_frame_ms" in text
+    assert "frame_period_ms" in text and "refresh_ms" in text and "refresh_age_ms" in text and "on_frame_ms" in text
+    missing = qm.reader_timing_row(1_000, [], None, [], [])
+    assert "refresh_age_ms" in missing and missing["refresh_age_ms"] is None
     path = tmp_path / "reader_health.jsonl"
     qm.append_reader_health(path, row)
     got = json.loads(path.read_text(encoding="utf-8").strip())
@@ -1326,3 +1330,667 @@ def test_closed_health_span_is_written_when_the_reader_crashes(tmp_path, monkeyp
     lags = [row for row in rows if row.get("obs") == "reader_lag"]
     assert len(lags) == 1 and lags[0]["t_ms"] == 2100 and lags[0]["n"] == 1
     assert "open_at_exit" not in lags[0]
+
+
+def _health_rows(path: Path) -> list:
+    if not path.is_file():
+        return []
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+
+def _menu_frame(items: int, bg: int):
+    import numpy as np
+
+    img = np.full((360, 640, 3), bg, np.uint8)
+    img[22:42, 20:150] = 230
+    for k in range(1, items):
+        y = 30 + 15 * k
+        img[y:y + 6, 25:110] = 200
+    img[30:60, 300:420] = 220
+    return img
+
+
+def test_large_inputs_file_keeps_frames_bounded_and_reaches_final(tmp_path, monkeypatch):
+    """A ~20 MB inputs.jsonl is parsed once. Later frames stay fast and still reach final_screen.
+
+    The file is generated here and is not part of the tree. A full re-parse on the frame
+    thread blows the per-frame bound. Clock 0:05 red is low enough for final_screen and
+    is not the 0:00 clock_zero basis.
+    """
+    import urllib.request
+
+    import cv2
+    import numpy as np
+
+    import qorcap_endmenu
+    import qorcap_mnp
+    import qorcap_reader
+    from qor_receipt._vendor.qoresence.vision.local_scorebug.reader import FrameRead
+    from qor_receipt.agent import pause_detect
+
+    bundle = tmp_path / "m"
+    bundle.mkdir()
+    target = 20 * 1024 * 1024
+    inputs = bundle / "inputs.jsonl"
+    with inputs.open("wb") as fh:
+        n = 0
+        while fh.tell() < target:
+            blob = "".join(f'{{"type":"in","b":0,"t_ms":{n + k}}}\n' for k in range(8000))
+            fh.write(blob.encode())
+            n += 8000
+    assert inputs.stat().st_size >= target
+
+    def full_parse_ms(path: Path) -> float:
+        t0 = time.perf_counter()
+        with path.open("rb") as fh:
+            for line in fh:
+                if line.strip():
+                    json.loads(line)
+        return (time.perf_counter() - t0) * 1000.0
+
+    full_ms = full_parse_ms(inputs)
+    assert full_ms > 200, full_ms
+
+    class _Auto:
+        def __init__(self, *_a, **_k):
+            self.wants_full_res = False
+
+        def read(self, _img, t_ms=None):
+            return FrameRead(True, "ok", "madden27_standard", left_score=10, right_score=7,
+                             quarter=4, clock_seconds=5, clock_red=True)
+
+        def reference_band(self, _img):
+            return np.zeros((8, 8), np.uint8), None
+
+    class _Pause:
+        paused = False
+
+        def update(self, _t, _img):
+            return None
+
+    class _End:
+        def read(self, _img):
+            return qorcap_endmenu.EndMenuRead(False, None, None, "unread", 0.0, 0.0, [])
+
+    monkeypatch.setattr(qorcap_mnp, "AutoProfileReader", _Auto)
+    monkeypatch.setattr(pause_detect, "PauseDetector", lambda *_a, **_k: _Pause())
+    monkeypatch.setattr(qorcap_endmenu, "EndMenuReader", lambda *_a, **_k: _End())
+    monkeypatch.setattr(qm.Api, "get", lambda self, path, timeout=3: {})
+    monkeypatch.setattr(qm.Api, "post", lambda self, path, body=None, timeout=5: {})
+
+    real_on = qorcap_reader.ReaderCore.on_frame
+    gaps = []
+    prev = {"t": None}
+    calls = {"n": 0}
+
+    def on_frame(self, t, img):
+        now = time.perf_counter()
+        if prev["t"] is not None:
+            gaps.append(now - prev["t"])
+        prev["t"] = now
+        calls["n"] += 1
+        return real_on(self, t, img)
+
+    monkeypatch.setattr(qorcap_reader.ReaderCore, "on_frame", on_frame)
+    score_frames = []
+    for i in range(24):
+        img = np.zeros((8, 8, 3), np.uint8)
+        img[:, :, 0] = i + 1
+        ok, buf = cv2.imencode(".png", img)
+        assert ok
+        score_frames.append(bytes(buf))
+    phase = {"menu": False, "n": 0}
+
+    def urlopen(url, timeout=3):
+        if phase["menu"]:
+            frame = _menu_frame(6, 2)
+            frame = frame.copy()
+            frame[0, 0] = (phase["n"] * 3) % 250
+            ok, buf = cv2.imencode(".png", frame)
+            assert ok
+            data = bytes(buf)
+        else:
+            data = score_frames[phase["n"] % len(score_frames)]
+        phase["n"] += 1
+        return _Body(data)
+
+    monkeypatch.setattr(urllib.request, "urlopen", urlopen)
+    stop = threading.Event()
+    state = {}
+    thread = qm.start_reader(qm.Api(8797), stop, state, bundle=bundle)
+    try:
+        # The one full read happens before the frame thread. Later refreshes stay on the tail.
+        share = qorcap_reader.shared_inputs(inputs)
+        assert share.tail.off == inputs.stat().st_size
+        first = state.get("refresh_ms")
+        time.sleep(0.8)
+        steady = state.get("refresh_ms")
+        assert isinstance(first, (int, float)) and isinstance(steady, (int, float))
+        assert first < full_ms / 5, (first, full_ms)
+        assert steady < full_ms / 5, (steady, full_ms)
+        # New bytes only. A refresh that re-reads the whole file is not under full_ms/5.
+        extra = ('{"type":"in","b":0,"t_ms":9}\n' * 40000).encode()
+        assert len(extra) >= 1024 * 1024
+        grown = inputs.stat().st_size
+        with inputs.open("ab") as fh:
+            fh.write(extra)
+        caught = time.monotonic() + 3
+        while time.monotonic() < caught and share.tail.off < grown + len(extra):
+            time.sleep(0.05)
+        assert share.tail.off >= grown + len(extra), (share.tail.off, grown, len(extra))
+        assert state.get("refresh_ms") < full_ms / 5, (state.get("refresh_ms"), full_ms)
+        deadline = time.monotonic() + 8
+        scores = []
+        while time.monotonic() < deadline:
+            core = state.get("core")
+            scores = [r for r in (core.timeline if core is not None else []) if "home" in r and "obs" not in r]
+            if len(scores) >= 3:
+                break
+            time.sleep(0.05)
+        assert len(scores) >= 3, scores
+        phase["menu"] = True
+        time.sleep(3.6)
+    finally:
+        stop.set()
+        thread.join(timeout=8)
+    assert not thread.is_alive()
+    assert gaps, calls["n"]
+    # A full re-parse of this file costs full_ms and cannot hide inside the 4 Hz period.
+    assert max(gaps) < 0.75, (max(gaps), full_ms, calls["n"])
+    assert calls["n"] >= 16, (calls["n"], full_ms)
+    fin = state.get("final")
+    assert fin and fin.get("basis") == "final_screen", fin
+    assert (fin.get("home"), fin.get("away")) == (7, 10)
+    screens = [r for r in state["core"].timeline if r.get("obs") == "final_screen"]
+    assert screens and screens[0]["n"] >= 3 and screens[0]["until_ms"] - screens[0]["t_ms"] >= 3000
+
+
+def test_reader_stalled_notice_when_frames_arrive_without_rows(tmp_path, monkeypatch):
+    """Frames keep arriving and no row is written for 30 s: one notice, then one resume.
+
+    The timing line does not count. Removing the loop call, or emptying consider_stall,
+    leaves this file without reader_stalled. 29.9 s of quiet is not yet a stall.
+    """
+    import urllib.request
+
+    import qorcap_reader
+
+    assert qorcap_reader.READER_STALL_MS == 30_000
+    bundle = tmp_path / "m"
+    bundle.mkdir()
+    health = bundle / "reader_health.jsonl"
+    clock = {"t": 1_700_000_000.0}
+    monkeypatch.setattr(time, "time", lambda: clock["t"])
+    phase = {"go": False}
+    posted = []
+
+    def on_frame(self, t, _img):
+        if phase["go"]:
+            self.note_progress(int(t))
+
+    monkeypatch.setattr(qorcap_reader.ReaderCore, "on_frame", on_frame)
+    monkeypatch.setattr(urllib.request, "urlopen", lambda url, timeout=3: _Body(_still_jpeg()))
+    monkeypatch.setattr(qm.Api, "get", lambda self, path, timeout=3: {})
+    monkeypatch.setattr(qm.Api, "post", lambda self, path, body=None, timeout=5: posted.append(body) or {})
+    stop = threading.Event()
+    state = {}
+    thread = qm.start_reader(qm.Api(8798), stop, state, bundle=bundle)
+    try:
+        time.sleep(0.3)
+        base = clock["t"]
+        clock["t"] = base + 29.9
+        time.sleep(0.45)
+        assert not any(row.get("kind") == "reader_stalled" for row in _health_rows(health)), _health_rows(health)
+        clock["t"] = base + 31
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline and not any(
+            row.get("kind") == "reader_stalled" for row in _health_rows(health)
+        ):
+            time.sleep(0.05)
+        stalls = [row for row in _health_rows(health) if row.get("kind") == "reader_stalled"]
+        assert len(stalls) == 1, _health_rows(health)
+        assert stalls[0]["last_row_age_s"] >= 30
+        assert "obs" not in stalls[0]
+        monkeypatch.setattr(qm, "READER_HEALTH_LOG_S", 0.0)
+        clock["t"] += 5
+        time.sleep(0.6)
+        rows = _health_rows(health)
+        assert len([row for row in rows if row.get("kind") == "reader_stalled"]) == 1
+        assert [row for row in rows if row.get("kind") == "reader_resumed"] == []
+        assert any(row.get("kind") == "timing" for row in rows)
+        phase["go"] = True
+        clock["t"] += 1
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline and not any(
+            row.get("kind") == "reader_resumed" for row in _health_rows(health)
+        ):
+            time.sleep(0.05)
+        resumed = [row for row in _health_rows(health) if row.get("kind") == "reader_resumed"]
+        assert len(resumed) == 1, _health_rows(health)
+        assert resumed[0]["last_row_age_s"] >= 30
+        assert not any(isinstance(body, dict) and body.get("kind") == "reader_stalled" for body in posted)
+        assert not any(row.get("kind") == "reader_stalled" for row in state["core"].timeline)
+    finally:
+        stop.set()
+        thread.join(timeout=5)
+
+
+def test_hung_inputs_read_does_not_confirm_final(tmp_path, monkeypatch):
+    """The lock wait is bounded and the final stays unconfirmed.
+
+    Repro shape of live.py <sidecar> hung_inputs_read. The match still returns a draft,
+    so signing can seal it, and a notice row is written. Dropping the timeout leaves
+    this thread blocked at the join.
+    """
+    import qorcap_reader
+
+    bundle = tmp_path / "m"
+    bundle.mkdir()
+    inputs = bundle / "inputs.jsonl"
+    inputs.write_text('{"type":"in","b":0,"t_ms":1}\n', encoding="utf-8")
+    (bundle / "timeline.jsonl").write_text(
+        json.dumps({"t_ms": 1000, "home": 7, "away": 10, "quarter": 4, "clock_s": 5}) + "\n",
+        encoding="utf-8")
+    (bundle / "manifest.jsonl").write_text(
+        json.dumps({"type": "segment", "file": "video.mp4", "wall_ms": 5000, "seq": 0}) + "\n",
+        encoding="utf-8")
+    (bundle / "video.mp4").write_bytes(b"")
+    monkeypatch.setattr(qorcap_reader, "INPUTS_LOCK_TIMEOUT_S", 0.2)
+    share = qorcap_reader.shared_inputs(inputs)
+    assert share._lock.acquire(timeout=1)
+    draft = {"result": {"method": "agreed_scorebug_final", "final_confirmed": True,
+                        "home_score": 7, "away_score": 10}}
+
+    def factory(post):
+        return qorcap_reader.ReaderCore(post, None, None, None, lambda _tl: None)
+
+    box = {}
+
+    def run():
+        t0 = time.perf_counter()
+        try:
+            box["out"] = qm.tail_final_check(bundle, draft, ffmpeg="ffmpeg", core_factory=factory)
+            box["err"] = None
+        except Exception as exc:
+            box["err"] = exc
+        box["dt"] = time.perf_counter() - t0
+
+    th = threading.Thread(target=run)
+    th.start()
+    try:
+        th.join(1.5)
+        assert not th.is_alive()
+        assert box.get("err") is None, box.get("err")
+        assert box["dt"] < 1.5
+        out = box["out"]
+        assert out["result"]["final_confirmed"] is False
+        notices = [row for row in _health_rows(bundle / "reader_health.jsonl")
+                   if row.get("kind") == "inputs_unavailable"]
+        assert len(notices) == 1
+        assert "final_confirmed" not in notices[0]
+    finally:
+        share._lock.release()
+        th.join(3)
+
+
+def test_reader_joined_and_health_sealed_before_sign(tmp_path, monkeypatch):
+    """The exit flush lands before the health file is sealed, and a later row is dropped.
+
+    Removing the join returns while the reader is still in that flush. Setting the
+    flag before the join makes the flush observe it. Dropping the flag check keeps
+    the late row.
+    """
+    import inspect
+    import urllib.request
+
+    import qorcap_reader
+
+    src = inspect.getsource(qm.main)
+    sign_at = src.index("sign_and_report(")
+    mark_at = src.rindex("mark_health_sealed(", 0, sign_at)
+    tail_at = src.rindex("tail_final_check(", 0, mark_at)
+    wait_at = src.index("wait_and_countersign(")
+    seal_at = src.index("seal_reader(")
+    stop_at = src.rindex("stop.set()", 0, wait_at)
+    assert stop_at < wait_at < seal_at < tail_at < mark_at < sign_at
+    assert "seal_reader(" not in src[stop_at:wait_at]
+    assert qm.READER_JOIN_S <= 10
+
+    bundle = tmp_path / "m"
+    bundle.mkdir()
+    health = bundle / "reader_health.jsonl"
+    monkeypatch.setattr(qorcap_reader.ReaderCore, "on_frame", lambda *_a, **_k: None)
+    monkeypatch.setattr(urllib.request, "urlopen", lambda url, timeout=3: _Body(_still_jpeg()))
+    monkeypatch.setattr(qm.Api, "get", lambda self, path, timeout=3: {})
+    entered = threading.Event()
+    release = threading.Event()
+    seen = {}
+    real = qorcap_reader.ReaderCore.flush_health
+
+    def flush(self):
+        seen["sealed_during_flush"] = state.get("health_sealed") is True
+        entered.set()
+        release.wait(3)
+        return real(self)
+
+    monkeypatch.setattr(qorcap_reader.ReaderCore, "flush_health", flush)
+    stop = threading.Event()
+    state = {}
+    thread = qm.start_reader(qm.Api(8799), stop, state, bundle=bundle)
+    time.sleep(0.3)
+    box = {}
+
+    def do_seal():
+        box["joined"] = qm.seal_reader(stop, state, timeout=1.0)
+
+    sealer = threading.Thread(target=do_seal)
+    sealer.start()
+    try:
+        assert entered.wait(2)
+        assert state.get("health_sealed") is not True
+        assert seen.get("sealed_during_flush") is False
+    finally:
+        release.set()
+    sealer.join(2)
+    assert not sealer.is_alive()
+    assert box.get("joined") is True
+    assert not thread.is_alive()
+    qm.mark_health_sealed(state)
+    state["core"].health_write({"kind": "late", "t_ms": 1})
+    text = health.read_text(encoding="utf-8") if health.is_file() else ""
+    assert "late" not in text
+
+
+def test_stall_shapes_do_not_skew_the_verified_chain(tmp_path):
+    """A stuck reader must not delay countersigning past the skew limit.
+
+    Checkpoints are written on the same ~2 s cadence QorCap uses. hung_inputs_read
+    blocks the reader for the 5 s refresh join, slow_disk for 1.5 s, and
+    hung_on_frame until the default join cap. Each signed checkpoint stays
+    inside 1 s of its t_ms, so verify_chain reports no clock_skew. A single
+    unsliced join, or a slice of several seconds, leaves one of these late.
+    """
+    import inspect
+
+    src = inspect.getsource(qm.main)
+    wait_at = src.index("wait_and_countersign(")
+    seal_at = src.index("seal_reader(")
+    assert wait_at < seal_at < src.index("tail_final_check(")
+    assert "seal_reader(" not in src[src.rindex("stop.set()", 0, wait_at):wait_at]
+    assert qm.READER_JOIN_S <= 10
+    assert qm.COUNTERSIGN_SLICE_S <= 1.0
+
+    _dev, ref = qm.load_keys(tmp_path / "keys")
+    shapes = (
+        ("hung_inputs_read", 5.0, (0.15, 2.15, 4.15), True),
+        ("slow_disk", 1.5, (0.15,), True),
+        ("hung_on_frame", None, (0.15, 2.15, 4.15), False),
+    )
+    for name, block_s, writes_at, expect_joined in shapes:
+        _assert_shape_has_no_clock_skew(tmp_path / name, ref, name, block_s, writes_at, expect_joined)
+
+
+def _assert_shape_has_no_clock_skew(directory, ref, name, block_s, writes_at, expect_joined):
+    from qor_receipt.checkpoints import Chain, verify_chain
+
+    directory.mkdir()
+    path = directory / "checkpoints.jsonl"
+    path.write_text("", encoding="utf-8")
+    cs = qm.Countersigner(ref, "stall-shape", "home")
+    chain = Chain()
+    file_lock = threading.Lock()
+    release = threading.Event()
+    entered = threading.Event()
+    go = threading.Event()
+
+    def write_cp():
+        cp = chain.next(int(time.time() * 1000), "a" * 64, "b" * 64)
+        line = json.dumps(cp) + "\n"
+        with file_lock:
+            with path.open("a", encoding="utf-8") as fh:
+                fh.write(line)
+
+    def sweep():
+        with file_lock:
+            qm.countersign_new_from_file(path, cs)
+
+    def reader():
+        entered.set()
+        if block_s is None:
+            release.wait()
+            return
+        end = time.monotonic() + block_s
+        while time.monotonic() < end:
+            if release.wait(min(0.05, end - time.monotonic())):
+                return
+
+    def writer():
+        if not go.wait(2):
+            return
+        t0 = time.monotonic()
+        for at in writes_at:
+            delay = at - (time.monotonic() - t0)
+            if delay > 0 and release.wait(delay):
+                return
+            write_cp()
+
+    reader_thread = threading.Thread(target=reader, name=f"reader-{name}")
+    writer_thread = threading.Thread(target=writer, name=f"writer-{name}")
+    state = {"reader_thread": reader_thread}
+    reader_thread.start()
+    writer_thread.start()
+    try:
+        assert entered.wait(2), name
+        write_cp()
+        sweep()
+        assert cs.signed, name
+        seal_start = time.monotonic()
+        go.set()
+        joined = qm.seal_reader(threading.Event(), state, sweep=sweep)
+        elapsed = time.monotonic() - seal_start
+        if expect_joined:
+            assert joined is True, name
+            assert elapsed < block_s + 1.5, (name, elapsed)
+        else:
+            assert joined is False, name
+            assert qm.READER_JOIN_S - 0.4 <= elapsed < qm.READER_JOIN_S + 1.5, (name, elapsed, qm.READER_JOIN_S)
+        pre = cs.signed[0]["t_ms"]
+        during = [cp for cp in cs.signed if cp["t_ms"] > pre]
+        assert during, (name, [(cp["seq"], cp["t_ms"]) for cp in cs.signed])
+        delays = [abs(cp["referee_ts_ms"] - cp["t_ms"]) for cp in cs.signed]
+        assert max(delays) < 1000, (name, delays)
+        errs = verify_chain(cs.signed, match_id="stall-shape", role="home", referee_pub=ref.pubkey_hex,
+                            start_ms=cs.signed[0]["t_ms"], end_ms=cs.signed[-1]["referee_ts_ms"])
+        assert not any("clock_skew" in err for err in errs), (name, errs, delays)
+    finally:
+        release.set()
+        go.set()
+        reader_thread.join(2)
+        writer_thread.join(2)
+
+
+def _tail_bundle(tmp_path: Path) -> Path:
+    bundle = tmp_path / "m"
+    bundle.mkdir()
+    (bundle / "inputs.jsonl").write_text('{"type":"in","b":0,"t_ms":1}\n', encoding="utf-8")
+    (bundle / "haptics.jsonl").write_text('{"t_ms":1}\n', encoding="utf-8")
+    (bundle / "timeline.jsonl").write_text(
+        json.dumps({"t_ms": 1000, "home": 7, "away": 10, "quarter": 4, "clock_s": 5}) + "\n",
+        encoding="utf-8")
+    (bundle / "manifest.jsonl").write_text(
+        json.dumps({"type": "segment", "file": "video.mp4", "wall_ms": 5000, "seq": 0}) + "\n",
+        encoding="utf-8")
+    (bundle / "video.mp4").write_bytes(b"")
+    return bundle
+
+
+def _hung_bundle_lock(bundle: Path, lock: threading.Lock, kind: str) -> None:
+    import qorcap_reader
+
+    assert qorcap_reader.INPUTS_LOCK_TIMEOUT_S <= 5
+    assert lock.acquire(timeout=1)
+    draft = {"result": {"method": "agreed_scorebug_final", "final_confirmed": True,
+                        "home_score": 7, "away_score": 10}}
+
+    def factory(post):
+        return qorcap_reader.ReaderCore(post, None, None, None, lambda _tl: None)
+
+    box = {}
+
+    def run():
+        t0 = time.perf_counter()
+        try:
+            box["out"] = qm.tail_final_check(bundle, draft, ffmpeg="ffmpeg", core_factory=factory)
+            box["err"] = None
+        except Exception as exc:
+            box["err"] = exc
+        box["dt"] = time.perf_counter() - t0
+
+    th = threading.Thread(target=run)
+    th.start()
+    try:
+        th.join(5)
+        assert not th.is_alive(), kind
+        assert box.get("err") is None, box.get("err")
+        assert box["dt"] < qorcap_reader.INPUTS_LOCK_TIMEOUT_S + 1.5, (kind, box.get("dt"))
+        assert box["out"]["result"]["final_confirmed"] is False
+        notices = [row for row in _health_rows(bundle / "reader_health.jsonl") if row.get("kind") == kind]
+        assert len(notices) == 1, _health_rows(bundle / "reader_health.jsonl")
+        assert "final_confirmed" not in notices[0]
+    finally:
+        lock.release()
+        th.join(3)
+
+
+def test_hung_haptics_read_does_not_confirm_final(tmp_path):
+    """The default lock timeout bounds a haptics read. No monkeypatch: 3600 s stays blocked."""
+    import qorcap_reader
+
+    bundle = _tail_bundle(tmp_path)
+    tail = qorcap_reader.bundle_corr_tail(bundle)
+    _hung_bundle_lock(bundle, tail.haptics._lock, "haptics_unavailable")
+
+
+def test_hung_manifest_read_does_not_confirm_final(tmp_path):
+    """The same deadline bounds the manifest lock. The final stays unconfirmed."""
+    import qorcap_reader
+
+    bundle = _tail_bundle(tmp_path)
+    tail = qorcap_reader.bundle_corr_tail(bundle)
+    _hung_bundle_lock(bundle, tail.manifest._lock, "manifest_unavailable")
+
+
+def test_hung_on_frame_is_noticed_from_the_status_loop(tmp_path, monkeypatch):
+    """A hung on_frame writes no consider_stall row. The status loop does.
+
+    Removing watch_reader_stall from main, or the reader_tick stamp before
+    on_frame, leaves this file without a frame_thread notice.
+    """
+    import inspect
+    import urllib.request
+
+    import qorcap_reader
+
+    src = inspect.getsource(qm.main)
+    assert src.index('api.get("/status")') < src.index("watch_reader_stall(") < src.index("1.0 / TAIL_HZ")
+    loop = inspect.getsource(qm.start_reader)
+    assert loop.index('state["reader_tick"]') < loop.index("core.on_frame(")
+    assert qorcap_reader.READER_STALL_MS == 30_000
+
+    bundle = tmp_path / "m"
+    bundle.mkdir()
+    health = bundle / "reader_health.jsonl"
+    posted = []
+    release = threading.Event()
+    blocked = threading.Event()
+
+    def on_frame(self, _t, _img):
+        blocked.set()
+        release.wait(5)
+
+    monkeypatch.setattr(qorcap_reader.ReaderCore, "on_frame", on_frame)
+    monkeypatch.setattr(urllib.request, "urlopen", lambda url, timeout=3: _Body(_still_jpeg()))
+    monkeypatch.setattr(qm.Api, "get", lambda self, path, timeout=3: {})
+    monkeypatch.setattr(qm.Api, "post", lambda self, path, body=None, timeout=5: posted.append(body) or {})
+    stop = threading.Event()
+    state = {}
+    thread = qm.start_reader(qm.Api(8800), stop, state, bundle=bundle)
+    try:
+        assert blocked.wait(2)
+        time.sleep(0.05)
+        tick = state.get("reader_tick")
+        assert isinstance(tick, int)
+        assert state.get("reader_tick") == tick
+        qm.watch_reader_stall(state, {"recording_secs": 10}, tick, health)
+        qm.watch_reader_stall(state, {"recording_secs": 10}, tick + 45_000, health)
+        assert [row for row in _health_rows(health) if row.get("kind") == "reader_stalled"] == []
+        qm.watch_reader_stall(state, {"recording_secs": 11}, tick + 29_900, health)
+        assert [row for row in _health_rows(health) if row.get("kind") == "reader_stalled"] == []
+        qm.watch_reader_stall(state, {"recording_secs": 12}, tick + 30_000, health)
+        stalls = [row for row in _health_rows(health) if row.get("kind") == "reader_stalled"]
+        assert len(stalls) == 1, _health_rows(health)
+        assert stalls[0]["where"] == "frame_thread"
+        assert stalls[0]["last_row_age_s"] >= 30
+        assert "obs" not in stalls[0]
+        qm.watch_reader_stall(state, {"recording_secs": 13}, tick + 40_000, health)
+        assert len([row for row in _health_rows(health) if row.get("kind") == "reader_stalled"]) == 1
+        release.set()
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline and state.get("reader_tick") == tick:
+            time.sleep(0.05)
+        assert state.get("reader_tick") != tick
+        qm.watch_reader_stall(state, {"recording_secs": 14}, int(time.time() * 1000), health)
+        resumed = [row for row in _health_rows(health) if row.get("kind") == "reader_resumed"]
+        assert len(resumed) == 1, _health_rows(health)
+        assert resumed[0]["where"] == "frame_thread"
+        assert not any(row.get("kind") == "reader_stalled" for row in state["core"].timeline)
+        assert not any(isinstance(body, dict) and body.get("kind") == "reader_stalled" for body in posted)
+    finally:
+        release.set()
+        stop.set()
+        thread.join(5)
+
+
+def test_hung_refresh_shows_refresh_age_ms(tmp_path, monkeypatch):
+    """The timing row carries the age of the last finished refresh.
+
+    Dropping refresh_age_ms, or not passing it from the frame loop, leaves
+    this row without a growing age while refresh is stuck.
+    """
+    import urllib.request
+
+    import qorcap_reader
+
+    bundle = tmp_path / "m"
+    bundle.mkdir()
+    (bundle / "inputs.jsonl").write_text('{"type":"in","b":0,"t_ms":1}\n', encoding="utf-8")
+    health = bundle / "reader_health.jsonl"
+    monkeypatch.setattr(qm, "READER_HEALTH_LOG_S", 0.0)
+    monkeypatch.setattr(urllib.request, "urlopen", lambda url, timeout=3: _Body(_still_jpeg()))
+    monkeypatch.setattr(qm.Api, "get", lambda self, path, timeout=3: {})
+    monkeypatch.setattr(qm.Api, "post", lambda self, path, body=None, timeout=5: {})
+    monkeypatch.setattr(qorcap_reader.ReaderCore, "on_frame", lambda *_a, **_k: None)
+    gate = threading.Event()
+    calls = {"n": 0}
+    real = qorcap_reader.note_options_from_inputs
+
+    def wrapped(core, path, timeout=None):
+        calls["n"] += 1
+        if calls["n"] >= 2:
+            gate.wait(5)
+            return None
+        return real(core, path, timeout=timeout)
+
+    monkeypatch.setattr(qorcap_reader, "note_options_from_inputs", wrapped)
+    stop = threading.Event()
+    state = {}
+    thread = qm.start_reader(qm.Api(8801), stop, state, bundle=bundle)
+    try:
+        time.sleep(1.1)
+        rows = [row for row in _health_rows(health) if row.get("kind") == "timing"]
+        assert rows, _health_rows(health)
+        assert any(isinstance(row.get("refresh_age_ms"), int) and row["refresh_age_ms"] >= 400 for row in rows), rows
+    finally:
+        gate.set()
+        stop.set()
+        thread.join(5)
