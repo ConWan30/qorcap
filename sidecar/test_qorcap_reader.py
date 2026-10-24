@@ -493,27 +493,82 @@ def test_health_rows_merge_inside_thirty_seconds_and_keep_milliseconds(capsys):
     assert [p for p in posts if p.get("type") == "score"] == []
 
 
-def test_fold_skips_one_bad_row_and_keeps_the_rest(capsys):
-    """A row that raises is logged once. The rows around it still fold."""
-    import qorcap_reader as qr
-    from qorcap_reader import _fold_activity, options_presses_ms
+def test_fold_skips_one_bad_row_and_keeps_the_rest(tmp_path, capsys):
+    """A row that raises is logged once per inputs file. The rows around it still fold."""
+    from qorcap_reader import InputsShare, _fold_activity, _fold_options, options_presses_ms
 
     class Boom(dict):
         def get(self, *a, **k):
             raise RuntimeError("bad row")
 
-    qr._fold_skip_logged = False
     presses = options_presses_ms([
         {"type": "in", "b": 512, "t_ms": 10},
         Boom(),
         {"type": "in", "b": 0, "t_ms": 15},
         {"type": "in", "b": 512, "t_ms": 20},
     ])
-    activity = _fold_activity([
+    assert presses == [10, 20]
+    assert capsys.readouterr().err.count("inputs fold skipped a row") == 1
+    # A later fold is not silenced by an earlier one. The flag is not process-wide.
+    options_presses_ms([Boom()])
+    assert capsys.readouterr().err.count("inputs fold skipped a row") == 1
+
+    first = InputsShare(tmp_path / "match-a" / "inputs.jsonl")
+    second = InputsShare(tmp_path / "match-b" / "inputs.jsonl")
+    _fold_options([Boom()], [], False, None, first._fold_log)
+    kept = _fold_activity([
         {"type": "in", "b": 1, "t_ms": 1},
         Boom(),
         {"type": "in", "b": 2, "t_ms": 2},
-    ])
-    assert presses == [10, 20]
-    assert [row["t_ms"] for row in activity] == [1, 2]
+    ], first._fold_log)
+    assert [row["t_ms"] for row in kept] == [1, 2]
     assert capsys.readouterr().err.count("inputs fold skipped a row") == 1
+    _fold_options([Boom()], [], False, None, first._fold_log)
+    assert capsys.readouterr().err.count("inputs fold skipped a row") == 0
+    _fold_activity([Boom()], second._fold_log)
+    assert capsys.readouterr().err.count("inputs fold skipped a row") == 1
+
+
+def test_lag_flap_longer_than_a_minute_writes_at_least_two_rows():
+    """A flap past 60 s writes during the match. The window starts at the first t_ms.
+
+    Anchoring the wait on the span's growing end merges every new span and writes nothing.
+    """
+    from qorcap_reader import HEALTH_CLEAR_FRAMES, ReaderCore
+
+    posts = []
+    unread = NS(ok=False, reason="layout_unknown", left_score=None, right_score=None, quarter=None,
+                clock_seconds=None, clock_red=False, pair=None)
+    core = ReaderCore(posts.append, _StubReader(unread), Agree(), None, detect_final)
+    written = []
+    core.health_write = written.append
+    t = 0
+    core.on_frame(t, None)
+    while t <= 70_000:
+        t += 2100
+        core.on_frame(t, None)
+        for _ in range(HEALTH_CLEAR_FRAMES):
+            t += 400
+            core.on_frame(t, None)
+    lags = [row for row in written if row.get("obs") == "reader_lag"]
+    assert t > 60_000
+    assert len(lags) >= 2
+    assert [p for p in posts if p.get("type") == "score"] == []
+
+
+def test_flush_health_writes_a_span_that_is_still_open():
+    """Stopping mid-span still records it. An open stall is not dropped."""
+    from qorcap_reader import ReaderCore
+
+    posts = []
+    unread = NS(ok=False, reason="layout_unknown", left_score=None, right_score=None, quarter=None,
+                clock_seconds=None, clock_red=False, pair=None)
+    core = ReaderCore(posts.append, _StubReader(unread), Agree(), None, detect_final)
+    written = []
+    core.health_write = written.append
+    core.on_frame(0, None)
+    core.on_frame(2100, None)
+    assert written == [] and core._lag is not None
+    core.flush_health()
+    assert len(written) == 1 and written[0]["obs"] == "reader_lag" and written[0]["n"] >= 1
+    assert core._lag is None and core._health_pending == {}

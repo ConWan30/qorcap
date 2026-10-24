@@ -78,6 +78,7 @@ jobs:
             sidecar/test_qorcap_match.py::test_options_press_is_known_before_end_menu_can_lock \
             sidecar/test_qorcap_match.py::test_reader_crash_leaves_enter_and_the_heartbeat_running \
             sidecar/test_qorcap_match.py::test_refresh_thread_is_joined_before_the_reader_returns \
+            sidecar/test_qorcap_match.py::test_closed_health_span_is_written_when_the_reader_stops \
             sidecar/test_qorcap_match.py::test_reader_timing_log_names_the_three_clocks \
             sidecar/test_qorcap_standard.py \
             sidecar/test_qorcap_score_grammar.py \
@@ -209,6 +210,7 @@ jobs:
             sidecar/test_qorcap_match.py::test_options_press_is_known_before_end_menu_can_lock \
             sidecar/test_qorcap_match.py::test_reader_crash_leaves_enter_and_the_heartbeat_running \
             sidecar/test_qorcap_match.py::test_refresh_thread_is_joined_before_the_reader_returns \
+            sidecar/test_qorcap_match.py::test_closed_health_span_is_written_when_the_reader_stops \
             sidecar/test_qorcap_match.py::test_reader_timing_log_names_the_three_clocks \
             sidecar/test_qorcap_standard.py \
             sidecar/test_qorcap_score_grammar.py \

@@ -71,8 +71,10 @@ UNAGREED_MS = 10_000
 # end-menu lock uses, and it is still well under a second at 4 Hz.
 HEALTH_CLEAR_FRAMES = 3
 # One console warning per open span, and never again inside this window of frame time.
-# A closed span is held and merged with the next span of the same kind that starts
-# inside this window, so reader_health.jsonl gets at most one row per kind per 30 s.
+# A closed span is held and merged with later spans of the same kind that start
+# inside 30 s of the held row's first t_ms. The end of the span does not move that
+# window, so a flap still writes about one row per 30 s. Whatever is still held
+# or open is written when the reader exits.
 HEALTH_WARN_MS = 30_000
 
 
@@ -520,20 +522,23 @@ def prep(img):
     return cv2.resize(img, READER_SIZE, interpolation=cv2.INTER_AREA)
 
 
-_fold_skip_logged = False
+def _new_fold_log() -> dict:
+    """One 'skipped a row' line per inputs file, not per process."""
+    return {"logged": False}
 
 
-def _skip_fold_row(exc: BaseException) -> None:
+def _skip_fold_row(log: dict, exc: BaseException) -> None:
     """One line for a bad inputs row. The rest of the batch is still folded."""
-    global _fold_skip_logged
-    if _fold_skip_logged:
+    if log.get("logged"):
         return
-    _fold_skip_logged = True
+    log["logged"] = True
     print(f"inputs fold skipped a row: {type(exc).__name__}: {exc}", file=sys.stderr)
 
 
-def _fold_options(records, presses: list[int], prev: bool, anchor):
+def _fold_options(records, presses: list[int], prev: bool, anchor, log=None):
     """Fold ``records`` into an OPTIONS rising-edge list. ``presses`` is updated in place."""
+    if log is None:
+        log = _new_fold_log()
     for r in records:
         try:
             if not isinstance(r, dict):
@@ -559,12 +564,14 @@ def _fold_options(records, presses: list[int], prev: bool, anchor):
                     presses.append(int(anchor + t_us // 1000))
             prev = down
         except Exception as e:
-            _skip_fold_row(e)
+            _skip_fold_row(log, e)
     return presses, prev, anchor
 
 
-def _fold_activity(records) -> list[dict]:
+def _fold_activity(records, log=None) -> list[dict]:
     """Input rows that ``collect_delta_corroboration`` would emit, in the same order."""
+    if log is None:
+        log = _new_fold_log()
     out: list[dict] = []
     for r in records or []:
         try:
@@ -582,7 +589,7 @@ def _fold_activity(records) -> list[dict]:
                 continue
             out.append({"kind": "input_activity", "t_ms": int(t_ms)})
         except Exception as e:
-            _skip_fold_row(e)
+            _skip_fold_row(log, e)
     return out
 
 
@@ -745,6 +752,7 @@ class InputsShare:
         self._published_presses: list[int] = []
         self._published_activity: list[dict] = []
         self._saw_extra = False
+        self._fold_log = _new_fold_log()
 
     def view(self) -> tuple[list[int], list[dict]]:
         """Current presses and input-activity rows, including a valid partial last line."""
@@ -757,15 +765,17 @@ class InputsShare:
                 self._activity = []
                 self._saw_extra = False
             if new:
-                self._presses, self._prev, self._anchor = _fold_options(new, self._presses, self._prev, self._anchor)
-                self._activity.extend(_fold_activity(new))
+                self._presses, self._prev, self._anchor = _fold_options(
+                    new, self._presses, self._prev, self._anchor, self._fold_log)
+                self._activity.extend(_fold_activity(new, self._fold_log))
             if reset or new or (extra is not None) or self._saw_extra:
                 if extra is None:
                     self._published_presses = list(self._presses)
                     self._published_activity = list(self._activity)
                 else:
-                    self._published_presses, _, _ = _fold_options([extra], list(self._presses), self._prev, self._anchor)
-                    self._published_activity = self._activity + _fold_activity([extra])
+                    self._published_presses, _, _ = _fold_options(
+                        [extra], list(self._presses), self._prev, self._anchor, self._fold_log)
+                    self._published_activity = self._activity + _fold_activity([extra], self._fold_log)
                 self._saw_extra = extra is not None
             return self._published_presses, self._published_activity
 
@@ -1172,15 +1182,19 @@ class ReaderCore:
             cur["max_gap_ms"] = max(int(cur.get("max_gap_ms") or 0), int(max_gap_ms))
         return cur
 
+    def _health_due(self, row: dict, t_ms: int) -> bool:
+        """The 30 s window opens at the held row's first t_ms, not its growing end."""
+        return int(t_ms) >= int(row.get("t_ms") or 0) + HEALTH_WARN_MS
+
     def _commit_health(self, span: dict) -> None:
-        """Hold a closed span. The next one of the same kind inside 30 s merges into it."""
+        """Hold a closed span. Later spans of the same kind merge until the window is due."""
         row = dict(span)
         if "reasons" in span:
             row["reasons"] = dict(span["reasons"])
         row["count"] = 1
         kind = str(row.get("obs") or "")
         pending = self._health_pending.get(kind)
-        if pending is not None and int(row.get("t_ms") or 0) <= int(pending.get("until_ms") or 0) + HEALTH_WARN_MS:
+        if pending is not None and not self._health_due(pending, int(row.get("t_ms") or 0)):
             pending["count"] = int(pending.get("count") or 1) + 1
             pending["n"] = int(pending.get("n") or 0) + int(row.get("n") or 0)
             pending["until_ms"] = max(int(pending.get("until_ms") or 0), int(row.get("until_ms") or 0))
@@ -1197,10 +1211,22 @@ class ReaderCore:
         self._health_pending[kind] = row
 
     def _flush_due_health(self, t_ms: int) -> None:
-        """Write a held row once frame time is 30 s past the span it covers."""
+        """Write a held row once frame time is 30 s past the row's first t_ms."""
         for kind, row in list(self._health_pending.items()):
-            if t_ms >= int(row.get("until_ms") or 0) + HEALTH_WARN_MS:
+            if self._health_due(row, t_ms):
                 self._emit_health(kind)
+
+    def flush_health(self) -> None:
+        """Write held rows and any span still open. Runs when the reader thread exits."""
+        for attr in ("_lag", "_unagreed"):
+            span = getattr(self, attr, None)
+            if span is not None:
+                self._commit_health(span)
+                setattr(self, attr, None)
+        self._lag_clear = 0
+        self._unagreed_clear = 0
+        for kind in list(self._health_pending):
+            self._emit_health(kind)
 
     def _emit_health(self, kind: str) -> None:
         row = self._health_pending.pop(kind, None)

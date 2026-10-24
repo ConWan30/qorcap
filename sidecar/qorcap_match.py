@@ -488,13 +488,21 @@ def start_reader(api: Api, stop: threading.Event, state: dict, bundle: Path | No
             # tail_final_check reuses this process's bundle tail. Wait until the refresh
             # thread has left it, but don't hang shutdown on a stuck read. refresh_stop
             # is not the match stop, so a crash here leaves ENTER/Q and the heartbeat up.
+            # Held and still-open health rows are written here. A stall that ends with
+            # the match would otherwise stay in memory.
+            try:
+                core.flush_health()
+            except Exception as e:
+                print(f"reader health flush failed: {type(e).__name__}: {e}", file=sys.stderr)
             refresh_stop.set()
             refresh_thread.join(timeout=5.0)
 
     refresh()
     refresh_thread = threading.Thread(target=refresh_worker, name="qorcap-refresh", daemon=True)
+    state["refresh_thread"] = refresh_thread
     refresh_thread.start()
     t = threading.Thread(target=loop, name="qorcap-reader", daemon=True)
+    state["reader_thread"] = t
     t.start()
     return t
 

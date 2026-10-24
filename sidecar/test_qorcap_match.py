@@ -1180,19 +1180,77 @@ def test_refresh_thread_is_joined_before_the_reader_returns(monkeypatch):
     stop = threading.Event()
     state = {}
     thread = qm.start_reader(qm.Api(8794), stop, state, bundle=None)
+    refresh = state["refresh_thread"]
+    assert refresh is not thread
     try:
         assert entered.wait(2.0), calls["n"]
         stop.set()
         time.sleep(0.6)
         assert thread.is_alive()
-        assert any(th.name == "qorcap-refresh" and th.is_alive() for th in threading.enumerate())
+        assert refresh.is_alive()
     finally:
         hold.set()
     thread.join(timeout=2)
     assert not thread.is_alive()
-    deadline = time.monotonic() + 2
-    while time.monotonic() < deadline and any(
-        th.name == "qorcap-refresh" and th.is_alive() for th in threading.enumerate()
-    ):
-        time.sleep(0.02)
-    assert not any(th.name == "qorcap-refresh" and th.is_alive() for th in threading.enumerate())
+    refresh.join(timeout=2)
+    assert not refresh.is_alive()
+
+
+def test_closed_health_span_is_written_when_the_reader_stops(tmp_path, monkeypatch):
+    """A span that closes just before stop is in reader_health.jsonl after the join.
+
+    The 30 s hold would otherwise drop it. The write is in the reader thread's cleanup.
+    """
+    import json
+    import urllib.request
+
+    import cv2
+    import numpy as np
+
+    import qorcap_reader
+
+    bundle = tmp_path / "m"
+    bundle.mkdir()
+    health = bundle / "reader_health.jsonl"
+    script = [0, 2100, 2500, 2900, 3300]
+    step = {"i": 0}
+    closed = threading.Event()
+
+    def on_frame(self, _t, _img):
+        i = step["i"]
+        if i >= len(script):
+            closed.set()
+            return
+        step["i"] = i + 1
+        self._note_frame_time(script[i])
+
+    monkeypatch.setattr(qorcap_reader.ReaderCore, "on_frame", on_frame)
+    # Unique frames. A repeated snapshot is skipped for up to a second, and this
+    # script needs a call per step.
+    frames = []
+    for i in range(16):
+        img = np.zeros((8, 8, 3), np.uint8)
+        img[:, :, 0] = i + 1
+        ok, buf = cv2.imencode(".png", img)
+        assert ok
+        frames.append(bytes(buf))
+    seq = {"i": 0}
+
+    def urlopen(url, timeout=3):
+        data = frames[seq["i"] % len(frames)]
+        seq["i"] += 1
+        return _Body(data)
+
+    monkeypatch.setattr(urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(qm.Api, "get", lambda self, path, timeout=3: {})
+    stop = threading.Event()
+    state = {}
+    thread = qm.start_reader(qm.Api(8795), stop, state, bundle=bundle)
+    assert closed.wait(3), step["i"]
+    assert not health.is_file() or "reader_lag" not in health.read_text(encoding="utf-8")
+    stop.set()
+    thread.join(timeout=5)
+    assert not thread.is_alive()
+    rows = [json.loads(line) for line in health.read_text(encoding="utf-8").splitlines() if line.strip()]
+    lags = [row for row in rows if row.get("obs") == "reader_lag"]
+    assert len(lags) == 1 and lags[0]["t_ms"] == 2100 and lags[0]["n"] == 1
