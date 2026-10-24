@@ -623,10 +623,15 @@ class OfficialLive:
         except Exception:
             pass
         # After the challenge is on disk and posted. notify_challenge logs its own
-        # failures and returns. It must not move issued_ms, deadline_ms,
-        # prompt_wall_ms, or the body sent to QorCap.
+        # failures and returns. The guard here is defence in depth: if that
+        # function itself raises, log it and continue. It must not move
+        # issued_ms, deadline_ms, prompt_wall_ms, or the body sent to QorCap.
         if notify_challenge is not None:
-            notify_challenge(msg)
+            try:
+                notify_challenge(msg)
+            except Exception as exc:
+                logging.getLogger("qorcap.challenge_alert").warning(
+                    "challenge alert schedule failed: %s", exc)
 
 
 def _beep() -> None:

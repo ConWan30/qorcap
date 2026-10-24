@@ -388,7 +388,8 @@ def test_schedule_failure_is_logged_and_the_record_stands(tmp_path, monkeypatch,
     def boom(*_args, **_kwargs):
         raise RuntimeError("schedule down")
 
-    # notify_challenge catches this. qorcap_submit does not wrap the call again.
+    # notify_challenge catches a failure inside _schedule. The submit call site
+    # also catches a raise from notify_challenge itself.
     monkeypatch.setattr(alert, "_schedule", boom)
     _live, api, _marks = _fire(tmp_path, legacy=[])
     assert any("schedule down" in rec.getMessage() for rec in caplog.records)
@@ -668,7 +669,7 @@ def test_negative_volume_warns_and_plays_at_full_scale(monkeypatch, caplog):
     assert alert.drain(2)
     assert _names(calls) == ["toast", "flash", "beep"]
     assert calls[-1][2].beep_volume == 1.0
-    assert any("-1" in rec.getMessage() and "full scale" in rec.getMessage() for rec in caplog.records)
+    assert any("volume '-1'" in rec.getMessage() and "full scale" in rec.getMessage() for rec in caplog.records)
     half = _cfg("-0.5")
     assert half.beep_volume == 1.0 and half.beep and half.toast and half.flash
     alert._WARNED.discard("beep_volume")
@@ -677,6 +678,40 @@ def test_negative_volume_warns_and_plays_at_full_scale(monkeypatch, caplog):
     assert signed_zero.beep_volume == 1.0 and signed_zero.beep and signed_zero.toast and signed_zero.flash
     assert _cfg("-0.0").beep_volume == 1.0 and _cfg("-0.0").beep is True
     assert any("volume '-0'" in rec.getMessage() and "full scale" in rec.getMessage() for rec in caplog.records)
+
+
+def test_plus_zero_volume_warns_and_plays_at_full_scale(monkeypatch, caplog):
+    alert._WARNED.discard("beep_volume")
+    caplog.set_level(logging.WARNING, logger="qorcap.challenge_alert")
+    calls = []
+    monkeypatch.setattr(alert, "default_backends", lambda: _backends(calls))
+    env = dict(_ON)
+    env["QORCAP_CHALLENGE_BEEP_VOLUME"] = "+0"
+    alert.notify_challenge("QORTIME CHALLENGE", env=env)
+    assert alert.drain(2)
+    assert _names(calls) == ["toast", "flash", "beep"]
+    assert calls[-1][2].beep_volume == 1.0
+    assert any("volume '+0'" in rec.getMessage() and "full scale" in rec.getMessage() for rec in caplog.records)
+    assert _cfg("0").beep is False and _cfg("0").beep_volume == 0.0
+    assert _cfg("0.0").beep is False and _cfg("0%").beep is False
+    assert _cfg("+0.0").beep_volume == 1.0 and _cfg("+0.0").beep is True
+    assert _cfg("+0%").beep_volume == 1.0 and _cfg("+0%").beep is True
+    assert _cfg("+1").beep_volume == 1.0
+    assert _cfg("+2").beep_volume == 0.02
+    assert _cfg("+0.5").beep_volume == 0.5
+
+
+def test_notify_challenge_raising_is_logged_and_the_record_stands(tmp_path, monkeypatch, caplog):
+    caplog.set_level(logging.WARNING, logger="qorcap.challenge_alert")
+
+    def boom(_msg):
+        raise RuntimeError("notify blew up")
+
+    monkeypatch.setattr(qs, "notify_challenge", boom)
+    _live, api, _marks = _fire(tmp_path, legacy=[])
+    assert any("notify blew up" in rec.getMessage() and "schedule failed" in rec.getMessage() for rec in caplog.records)
+    assert _digests(_snapshot(tmp_path)) == _digests(_expected_files())
+    assert api.posted == [("/challenge", _expected_post())]
 
 
 def _players():

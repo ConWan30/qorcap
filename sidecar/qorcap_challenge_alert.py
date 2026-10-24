@@ -33,8 +33,9 @@ Environment (unset means on):
   is 100% (full scale), not one percent. ``50`` is half. ``100`` is full scale.
   A decimal strictly between 0 and 1 is a fraction (``0.5`` is half). ``1.0``
   is full scale, the same loudness as bare ``1`` and ``100``.
-  Anything else (``1.5``, ``loud``, ``inf``, ``-1``, ``-0``) logs one warning and stays at full scale.
-  ``-0`` is a negative, not a mute: mute is ``0``, ``0.0``, and ``0%`` with no sign.
+  Anything else (``1.5``, ``loud``, ``inf``, ``-1``, ``-0``, ``+0``) logs one warning and stays at full scale.
+  ``-0`` and ``+0`` are signed, not mutes. Mute is ``0``, ``0.0``, and ``0%`` with no sign.
+  A signed zero stays audible: one warning, then full scale.
 * ``QORCAP_CHALLENGE_TOAST=0`` skips the toast.
 * ``QORCAP_CHALLENGE_FLASH=0`` skips flashing the console window and its taskbar button.
 
@@ -163,6 +164,18 @@ def _hz(raw: str | None) -> int:
     return hz
 
 
+def _is_positive_zero(text: str) -> bool:
+    """True for ``+0``, ``+0.0``, and ``+0%``. ``+1`` and ``+0.5`` are not zero."""
+    if not text.startswith("+"):
+        return False
+    body = text[:-1].strip() if text.endswith("%") else text
+    try:
+        value = float(body)
+    except (TypeError, ValueError):
+        return False
+    return math.isfinite(value) and value == 0.0
+
+
 def _warn_volume(text: str) -> float:
     warn_once("beep_volume", f"unusable volume {text!r}; using full scale")
     return DEFAULT_VOLUME
@@ -186,6 +199,7 @@ def _volume(raw: str | None) -> float:
     * A float strictly between 0 and 1 is a fraction (``0.5`` is half).
     * ``0.0`` is silence and ``1.0`` is full scale, the same loudness as ``0`` and bare ``1``.
     * A leading minus, including ``-0`` and ``-0.0``, is a negative: one warning and full scale.
+    * A leading plus on zero (``+0``, ``+0.0``, ``+0%``) is not a mute: one warning and full scale.
     * Anything else logs one warning and uses full scale.
 
     This never raises. Volume does not turn the toast or the flash off.
@@ -196,9 +210,10 @@ def _volume(raw: str | None) -> float:
     low = text.lower()
     if low in _MUTE_VOLUME:
         return 0.0
-    # "-0" and "-0.0" compare equal to zero, but they are signed. Mute is an
-    # unsigned 0 / 0.0 / 0%. A leading minus warns and plays at full scale.
-    if text.startswith("-"):
+    # "-0" and "+0" compare equal to zero, but they are signed. Mute is an
+    # unsigned 0 / 0.0 / 0%. A sign warns and plays at full scale, so the alert
+    # stays audible.
+    if text.startswith("-") or _is_positive_zero(text):
         return _warn_volume(text)
     try:
         if low.endswith("%"):
