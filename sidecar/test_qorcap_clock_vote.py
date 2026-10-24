@@ -448,8 +448,8 @@ def test_held_misread_continuation_stays_blocked_for_the_quarter():
     """A +5 misread held through a stoppage, then run, publishes nothing wrong.
 
     Blocking only the held second lets the running gate adopt the countdown:
-    162 values from 6300 ms through 22400 ms. The true clock, held afterwards,
-    may return. It is the line the hold contradicted, not the misread.
+    162 values from 6300 ms through 22400 ms. The accepted 60 was one frame,
+    so a later stoppage of the true countdown stays blocked too.
     """
     h = ClockHistory()
     assert h.filter(60, 1, 0) == 60
@@ -463,14 +463,212 @@ def test_held_misread_continuation_stays_blocked_for_the_quarter():
         if out is not None and out != truth:
             wrong += 1
     assert wrong == 0 and h.last_s is None
-    returned = None
+    # The accepted 60 was one frame, not a running-gate confirmation, so a later
+    # stoppage of the true countdown is not exempt. Publishing it was the
+    # stoppage-return path that also republished a rejected misread.
     for i in range(40):
         t = 23_000 + i * 100
-        out = h.filter(41, 1, t)
+        assert h.filter(41, 1, t) is None
+    assert h.last_s is None
+
+
+@pytest.mark.parametrize("rate", [0.85, 1.15])
+def test_held_misread_continuation_stays_blocked_across_the_rate_band(rate):
+    """A held +5 that then runs at a rate inside the running-gate band stays blocked.
+
+    Exact 1:1 from the end of the hold lets 0.85x and 1.15x through that gate.
+    The held countdown has to use the same slope band as a running line.
+    """
+    h = ClockHistory()
+    assert h.filter(60, 1, 0) == 60
+    for t in range(100, 3_000, 100):
+        assert h.filter(65, 1, t) is None
+    assert h.suspended and h._blocked_other is not None
+    assert h._blocked_other[2] == "hold"
+    wrong = 0
+    for t in range(3_000, 23_000, 100):
+        elapsed = (t - 3_000) / 1000.0
+        truth = int(round(60 - rate * elapsed))
+        out = h.filter(truth + 5, 1, t)
+        if out is not None and out != truth:
+            wrong += 1
+    assert wrong == 0 and h.last_s is None
+
+
+def test_rejected_stoppage_misread_does_not_return_on_a_later_stoppage():
+    """W1. A misread adopted on a stoppage must not come back after it is rejected.
+
+    Truth holds at 60. A misread of 50 holds and is adopted before the
+    disagreement. Truth at 60 then voids both. The clock runs down to 50, a
+    misread of 40 holds, and then the true 50 holds. Exempting the accepted
+    line's projection publishes 40 (60 values) and the true 50 never returns.
+    The accepted 50 was a stoppage, not a running-gate confirmation.
+    """
+    h = ClockHistory()
+    for t in range(0, 3_000, 100):
+        assert h.filter(60, 1, t) == 60
+    adopted = None
+    for t in range(3_000, 6_000, 100):
+        out = h.filter(50, 1, t)
+        if out is not None and adopted is None:
+            adopted = (t, out, h.reanchor_kind)
+    assert adopted is not None and adopted[2] == "stop" and h._baseline_kind == "stop"
+    detected = None
+    for t in range(6_000, 8_100, 100):
+        assert h.filter(60, 1, t) is None
+        if h.rule_note == "clock_disagree" and detected is None:
+            detected = t
+    assert detected == 8_000
+    accepted = h._blocked_line if h._blocked_line and h._blocked_line[2] != "hold" else h._blocked_other
+    assert accepted is not None and accepted[2] == "stop"
+    wrong = []
+    truth_kept = []
+    # 10 s of the true clock, from 60 down to 50. The held line's countdown blocks it.
+    for t in range(8_100, 18_100, 100):
+        truth = 60 - (t - 8_000) // 1000
+        out = h.filter(truth, 1, t)
+        if out is not None and out != truth:
+            wrong.append((t, out, truth))
+        if out == truth:
+            truth_kept.append(t)
+    # 8 s stop. Truth is 50. The read is 40, the same -10 offset as the rejected misread.
+    for t in range(18_100, 26_100, 100):
+        out = h.filter(40, 1, t)
+        if out is not None and out != 50:
+            wrong.append((t, out, 50))
+        if out == 50:
+            truth_kept.append(t)
+    # 10 s of the true 50. It equals the last published second, so it may return.
+    # The misread must not have taken that slot.
+    returned = None
+    for t in range(26_100, 36_100, 100):
+        out = h.filter(50, 1, t)
+        if out is not None and out != 50:
+            wrong.append((t, out, 50))
+        if out == 50:
+            if returned is None:
+                returned = (t, h.reanchor_kind)
+            truth_kept.append(t)
+    assert wrong == []
+    assert len(truth_kept) == 80 and returned == (28_100, "stop")
+
+
+def _run_confirmed_hold():
+    """A held contradiction whose accepted clock was confirmed by the running gate."""
+    h = ClockHistory()
+    assert h.filter(60, 1, 0) == 60
+    for t in (100, 800, 1_500, 2_100):
+        h.filter(70, 1, t)
+    for i in range(40):
+        h.filter(80 - i // 10, 1, 9_000 + i * 100)
+    assert h._baseline_kind == "run"
+    before = h.last_s
+    assert h.filter(before - 1, 1, 13_000) == before - 1
+    assert h._baseline_kind == "run"
+    hold = h.last_s + 12
+    for t in range(13_100, 16_000, 100):
+        h.filter(hold, 1, t)
+    assert h.suspended
+    return h
+
+
+def _projection_at_first_sample(h: ClockHistory, t0: int) -> float:
+    """The accepted clock, projected 1:1 from the held line. This is the spec, not the code."""
+    pair_hold = h._blocked_other if h._blocked_other and h._blocked_other[2] == "hold" else h._blocked_line
+    pair_acc = h._blocked_line if pair_hold is h._blocked_other else h._blocked_other
+    assert pair_hold is not None and pair_acc is not None and pair_acc[2] == "run"
+    dt = (t0 - int(pair_hold[0])) / 1000.0
+    offset = int(pair_hold[1]) - int(pair_acc[1])
+    return (int(pair_hold[1]) - dt) - offset
+
+
+def _stoppage_adopts(secs: int) -> bool:
+    h = _run_confirmed_hold()
+    for i in range(40):
+        out = h.filter(secs, 1, 20_000 + i * 100)
         if out is not None:
-            returned = (t, out, h.reanchor_kind)
-            break
-    assert returned == (25_000, 41, "stop")
+            return out == secs
+    return False
+
+
+def test_running_gate_confirmed_clock_may_return_within_one_second():
+    """The stoppage return is only for a clock the running gate confirmed.
+
+    A displayed second within the one-second bin of that clock's projection may
+    return. A second outside the bin may not. Shifting the offset by one adopts
+    a second this test rejects, and drops a second it requires.
+    """
+    h = _run_confirmed_hold()
+    exact = _projection_at_first_sample(h, 20_000)
+    # The projection counts down, so a second just below the bin is reached later
+    # and the first-sample lock keeps it. The high side moves away and stays blocked.
+    inside = [s for s in range(int(exact) - 2, int(exact) + 3) if abs(s - exact) <= 1]
+    high = max(inside)
+    assert high - 1 in inside
+    assert _stoppage_adopts(high)
+    assert _stoppage_adopts(high - 1)
+    assert not _stoppage_adopts(high + 1)
+
+
+def test_low_misread_then_true_countdown_stays_blank():
+    """E4. After a low stoppage is voided by the true second, that countdown stays blank.
+
+    The blank is the whole countdown, not only the time the higher second is held.
+    """
+    h = ClockHistory()
+    assert h.filter(120, 1, 0) == 120
+    for t in (100, 800, 1_500, 2_100):
+        h.filter(110, 1, t)
+    assert h.last_s == 110 and h.reanchor_kind == "stop"
+    detected = None
+    for t in range(2_200, 5_000, 100):
+        h.filter(120, 1, t)
+        if h.rule_note == "clock_disagree" and detected is None:
+            detected = t
+    assert detected is not None and h.suspended
+    published = []
+    for i in range(200):
+        t = 5_000 + i * 100
+        truth = 120 - (t - 5_000) // 1000
+        out = h.filter(truth, 1, t)
+        if out is not None:
+            published.append((t, out))
+    assert published == [] and h.last_s is None
+
+
+def test_quarter_change_clears_a_held_line():
+    """A new quarter forgets both contradicted lines, including the held one.
+
+    Keeping either line blocks that line's countdown after the change. The first
+    frame of the new quarter is accepted either way, so the countdown is the check.
+    """
+    h = ClockHistory()
+    assert h.filter(60, 1, 0) == 60
+    for t in range(100, 2_200, 100):
+        assert h.filter(65, 1, t) is None
+    assert h.suspended and h._blocked_other is not None and h._blocked_other[2] == "hold"
+    assert h.filter(400, 2, 3_000) == 400
+    assert h._blocked_line is None and h._blocked_other is None and h.suspended is False
+    held_kept = []
+    for i in range(40):
+        t = 3_100 + i * 100
+        out = h.filter(64 - i // 10, 2, t)
+        if out is not None:
+            held_kept.append(out)
+    assert held_kept
+
+    h = ClockHistory()
+    assert h.filter(60, 1, 0) == 60
+    for t in range(100, 2_200, 100):
+        h.filter(65, 1, t)
+    assert h.filter(400, 2, 3_000) == 400
+    accepted_kept = []
+    for i in range(40):
+        t = 3_100 + i * 100
+        out = h.filter(57 - i // 10, 2, t)
+        if out is not None:
+            accepted_kept.append(out)
+    assert accepted_kept
 
 
 def test_held_pre_kickoff_fifteen_does_not_return_when_it_runs():
