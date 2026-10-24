@@ -81,6 +81,7 @@ jobs:
             sidecar/test_qorcap_playcall.py \
             sidecar/test_qorcap_psn.py \
             sidecar/test_qorcap_challenge.py \
+            sidecar/test_qorcap_challenge_alert.py \
             sidecar/test_qorcap_paths.py \
             sidecar/test_qorcap_sidepick.py \
             sidecar/test_score_timeline.py \
@@ -198,6 +199,7 @@ jobs:
             sidecar/test_qorcap_playcall.py \
             sidecar/test_qorcap_psn.py \
             sidecar/test_qorcap_paths.py \
+            sidecar/test_qorcap_challenge_alert.py \
             sidecar/test_qorcap_sidepick.py \
             sidecar/test_score_timeline.py \
             sidecar/test_qorcap_glimpse_watch.py \

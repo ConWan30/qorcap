@@ -604,6 +604,13 @@ class OfficialLive:
             self.beep()
         except Exception:
             pass
+        # After the challenge is on disk and posted. The alert thread must not move
+        # issued_ms, deadline_ms, prompt_wall_ms, or the body sent to QorCap.
+        try:
+            from qorcap_challenge_alert import notify_challenge
+            notify_challenge(msg)
+        except Exception:
+            pass
 
 
 def _beep() -> None:
