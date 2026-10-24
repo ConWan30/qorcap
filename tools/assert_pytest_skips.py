@@ -168,10 +168,11 @@ WINDOWS_FILES = (
 # The floor is a minimum. A PR that adds tests, and any merge resolution, must
 # re-collect and set both floors to those exact counts. Leaving the old floor
 # keeps a dropped test green.
-# Collect-only of these lists on main 59009ad plus the guard tests in
-# tools/test_assert_pytest_skips.py. #96's suite, before those guard tests,
+# Re-collected after rebasing onto main e00d374, QORTIME pin 0204e6d.
+# Linux includes sidecar/test_qorcap_challenge.py (638). Windows does not run
+# that file, so its count stays 578. #96's suite, before the guard tests,
 # collected 580 linux / 562 windows. Re-collect after any list or test change.
-LINUX_MIN_COLLECTED = 596
+LINUX_MIN_COLLECTED = 638
 WINDOWS_MIN_COLLECTED = 578
 
 # Absent from both sidecar suites. A reason is required; whitespace does not count.
