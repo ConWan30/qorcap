@@ -1726,12 +1726,15 @@ def fill_challenge_results(bundle: Path, draft: dict, *, ffmpeg: str | None = No
 
     QorCap <= 0.3.10 always signed ``result: null``, so a correctly answered challenge still verified as
     ``challenge_unanswered`` (match 2026-10-17 #4, 44b8d01f). An ok result goes into the receipt
-    (``reverified_by: recorder``). A ``pattern_mismatch`` is written when the pad stayed connected
-    and un-stalled for the whole window and ``inputs.jsonl`` is intact, including OPTIONS alone and
-    a pattern whose later buttons fall after the deadline. Verify then reports ``challenge_failed``,
-    and Start Match exits 2 without the submit prompt. A stall, an unplug, a reconnect gap, or a
-    partial last line stays null. ``video_before_input`` and ``video_latency_too_high`` stay null.
-    The jsonl line always keeps the recheck."""
+    (``reverified_by: recorder``). A ``pattern_mismatch`` is written when every line of
+    ``inputs.jsonl`` parses, the committed log (including chunk rows) reaches the deadline, and
+    the pad stayed connected from issue through 2.5 s after the deadline. OPTIONS alone and a
+    pattern whose later buttons fall after the deadline count. Verify then reports
+    ``challenge_failed``, and Start Match exits 2 without the submit prompt. Submit for
+    Verification still works later. A stall, including one recorded just after the deadline, an
+    unplug, a reconnect gap, a torn line, or a log that ends inside the window stays null.
+    ``video_before_input`` and ``video_latency_too_high`` stay null. The jsonl line always keeps
+    the recheck. A withheld mismatch adds ``withheld: controller_log``. That file is not a contract."""
     chs = list(draft.get("challenges") or [])
     if not chs:
         return draft

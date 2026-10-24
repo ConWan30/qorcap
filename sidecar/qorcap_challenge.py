@@ -48,14 +48,17 @@ v2 (``bundle.json`` ``challenge_rule`` = 2): pause 0..2500 ms, and the successfu
 ±300 ms of their median. A bundle with no ``challenge_rule`` stays on rule v1 (``segment_ranges``,
 0..600 ms). Nothing here is submitted to the referee. A pass is ``reverified_by: recorder``
 and carries no ``rule`` field, so that pass stays on the v1 evidence check.
-A ``pattern_mismatch`` is stored only when ``inputs.jsonl`` is intact and the pad stayed
-``connected`` (not ``stalled``, not ``unplugged``, not ``missing``) for the whole window.
-The verifier then reports ``challenge_failed`` and does not run the evidence check.
-OPTIONS alone, and OPTIONS before the deadline with the rest of the pattern after it, are
-that failure when the log is trustworthy: the referee says ``pattern_mismatch`` too.
-A stall, an unplug, a reconnect gap, or a partial last line leaves ``result`` null.
-``video_before_input``, ``video_latency_too_high``, ``pause_not_seen_on_video``, and
-``no_pause_press`` stay null as well.
+A ``pattern_mismatch`` is stored only when ``inputs.jsonl`` can support it: every
+non-empty line parses, some committed record (including a per-segment chunk row) is
+stamped at or after the deadline, and the pad stayed ``connected`` from ``issued_ms``
+through ``deadline_ms + 2500``. The extra 2500 ms is the stall-detection lag. The
+verifier then reports ``challenge_failed`` and does not run the evidence check.
+OPTIONS alone, and OPTIONS before the deadline with the rest of the pattern after it,
+are that failure when the log passes. A stall, including one written just after the
+deadline, an unplug, a reconnect gap, a torn line anywhere in the file, or a log that
+ends inside the window leaves ``result`` null. ``video_before_input``,
+``video_latency_too_high``, ``pause_not_seen_on_video``, and ``no_pause_press`` stay
+null as well.
 """
 from __future__ import annotations
 
@@ -64,6 +67,8 @@ from pathlib import Path
 from typing import Any
 
 CAPTURE_PAUSE_MAX_LATENCY_MS = 2_500
+# inputs.rs writes "stalled" only after 2 s with no HID reports, on the next 100 ms read timeout.
+STALL_LAG_MS = 2_500
 # Measured pause menus: kickoff full 16.2–16.6, end full 21.1 / lower 13.3. Gameplay on the same
 # capture is luma 60–110. 26 / 16 sits between those and still requires the white-text fraction.
 CAPTURE_PAUSE_MAX_LUMA = 26.0
@@ -199,11 +204,11 @@ def receipt_result(res: dict[str, Any] | None) -> dict[str, Any] | None:
 
 
 def inputs_log_intact(path: str | Path) -> bool:
-    """False when ``inputs.jsonl`` is missing or its last record is truncated.
+    """False when ``inputs.jsonl`` is missing or any non-empty line does not parse.
 
-    A finished file ends on a complete JSON line. A partial last line does not parse.
-    The recheck's JSONL reader skips that line, so the presses that remain can look
-    like a short pattern. That is not a player failure.
+    The recheck's JSONL reader skips a corrupt line, so the presses that remain can
+    look like a short pattern. A torn line in the middle of the file does that too,
+    not only a partial last line. That is not a player failure.
     """
     try:
         raw = Path(path).read_bytes()
@@ -211,25 +216,26 @@ def inputs_log_intact(path: str | Path) -> bool:
         return False
     if not raw:
         return True
-    last = ""
     for line in raw.decode("utf-8", "replace").splitlines():
-        if line.strip():
-            last = line
-    if not last:
-        return True
-    try:
-        json.loads(last)
-    except json.JSONDecodeError:
-        return False
+        if not line.strip():
+            continue
+        try:
+            json.loads(line)
+        except json.JSONDecodeError:
+            return False
     return True
 
 
 def pad_connected_through(records: list, *, issued_ms: int, deadline_ms: int, anchor_ms: int) -> bool:
-    """True when status records show ``connected`` across the whole challenge window.
+    """True when status records show ``connected`` from issue through the stall lag.
 
-    ``stalled``, ``unplugged``, and ``missing`` anywhere in ``[issued_ms, deadline_ms]``
-    fail the check, including an unplug that reconnects before the deadline. Times are
-    the same wall clock as ``press_events`` (header ``wall_anchor_ms`` plus ``t_us``).
+    ``stalled``, ``unplugged``, and ``missing`` anywhere in
+    ``[issued_ms, deadline_ms + STALL_LAG_MS]`` fail the check, including an unplug
+    that reconnects before the deadline. A ``stalled`` row is written only after 2 s
+    with no reports, so the check runs 2.5 s past the deadline. A status row whose
+    ``t_us`` is not an integer, or whose ``state`` is not a string, fails closed.
+    Times are the same wall clock as ``press_events`` (header ``wall_anchor_ms`` plus
+    ``t_us``).
     """
     events: list[tuple[int, str]] = []
     for r in records:
@@ -237,7 +243,7 @@ def pad_connected_through(records: list, *, issued_ms: int, deadline_ms: int, an
             continue
         t_us, state = r.get("t_us"), r.get("state")
         if isinstance(t_us, bool) or not isinstance(t_us, int) or not isinstance(state, str):
-            continue
+            return False
         events.append((anchor_ms + t_us // 1000, state))
     events.sort()
     state: str | None = None
@@ -247,18 +253,31 @@ def pad_connected_through(records: list, *, issued_ms: int, deadline_ms: int, an
         i += 1
     if state != "connected":
         return False
-    while i < len(events) and events[i][0] <= deadline_ms:
+    while i < len(events) and events[i][0] <= deadline_ms + STALL_LAG_MS:
         if events[i][1] != "connected":
             return False
         i += 1
     return True
 
 
+def log_covers(records: list, *, deadline_ms: int, anchor_ms: int) -> bool:
+    """Some committed record is stamped at or after the deadline.
+
+    Chunk, press, status, and imu rows all count. A crash or an early stop drops the
+    pending batch and can leave a file that ends on a complete line inside the window.
+    A normal recording seals a chunk row every segment, so it reaches the deadline.
+    """
+    ts = [anchor_ms + r["t_us"] // 1000 for r in records
+          if isinstance(r, dict) and isinstance(r.get("t_us"), int) and not isinstance(r.get("t_us"), bool)]
+    return bool(ts) and max(ts) >= deadline_ms
+
+
 def mismatch_log_trustworthy(bundle: str | Path, records: list, *, issued_ms: int, deadline_ms: int,
                              anchor_ms: int) -> bool:
     """A pattern mismatch may be signed only when the controller log can support it."""
     return inputs_log_intact(Path(bundle) / "inputs.jsonl") and pad_connected_through(
-        records, issued_ms=issued_ms, deadline_ms=deadline_ms, anchor_ms=anchor_ms)
+        records, issued_ms=issued_ms, deadline_ms=deadline_ms, anchor_ms=anchor_ms) and log_covers(
+        records, deadline_ms=deadline_ms, anchor_ms=anchor_ms)
 
 
 def frame_mono_ms(clock: tuple[float, float], pts0_ms: float, n: int, hz: float) -> int:
@@ -332,7 +351,8 @@ def challenge_results(d: str | Path, challenges: list[dict[str, Any]], *, decode
         stored = receipt_result(res)
         if stored is not None and res.get("reason") == "pattern_mismatch":
             anchor = B.wall_anchor(b) or 0
-            if not mismatch_log_trustworthy(d, b.inputs, issued_ms=issued, deadline_ms=deadline, anchor_ms=anchor):
+            if not mismatch_log_trustworthy(
+                    d, b.inputs + b.input_chunks, issued_ms=issued, deadline_ms=deadline, anchor_ms=anchor):
                 stored = None
                 local["withheld"] = "controller_log"
         return {"result": stored, "local": local}
