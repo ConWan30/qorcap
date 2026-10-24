@@ -30,7 +30,7 @@ jobs:
       # The receipt check is the real `python -m qor_receipt.cli verify`, not a stub.
       - run: sudo apt-get update && sudo apt-get install -y ffmpeg
       # opencv-python-headless: CPU scorebug reads. No GPU, no capture card, no HID.
-      - run: pip install cryptography pytest numpy opencv-python-headless
+      - run: pip install cryptography pytest numpy opencv-python-headless fastapi httpx
       - name: QorTime pin
         run: |
           git init qortime
@@ -47,8 +47,10 @@ jobs:
       # Allowlisted: test_local_021003_both_players (opponent frames are not in the repo).
       # Not this step, on purpose:
       # - sidecar/test_contracts.py stays in the "contracts (qortime main)" job (unpinned main).
-      # - sidecar/test_qorcap_submit.py drives the in-process referee (fastapi), not the reader.
       # - sidecar/test_qorcap_match.py launcher recording needs a built qorcap; it is not the glyph gate.
+      # sidecar/test_qorcap_submit.py is in this step. fastapi and httpx are installed above
+      # for the in-process referee. Tests that build a bundle skip without ffmpeg and are
+      # allowlisted for the Windows job, which does not install ffmpeg.
       # ffmpeg is installed above, so the highlights clip test and
       # test_close_stamp_lag_does_not_move_the_pause run here. They are not skipped.
       - name: Sidecar tests
@@ -90,7 +92,8 @@ jobs:
             sidecar/test_qorcap_sidepick.py \
             sidecar/test_score_timeline.py \
             sidecar/test_qorcap_glimpse_watch.py \
-            sidecar/test_qorcap_glimpse_witness.py
+            sidecar/test_qorcap_glimpse_witness.py \
+            sidecar/test_qorcap_submit.py
           python tools/assert_pytest_skips.py "$RUNNER_TEMP/sidecar-pytest.xml"
   # Contract bytes are compared to qortime main, not to QORTIME_PIN. The linux and windows
   # jobs keep fetching 0204e6d so `cargo test` and the bundled verifier stay reproducible.
@@ -164,7 +167,7 @@ jobs:
       # opencv-python-headless: CPU scorebug reads. No GPU, no capture card, no HID.
       # No ffmpeg on this job. Rust clip tests that cut with ffmpeg skip; sign/verify uses tests/fixtures/tiny_clip.mp4.
       # Pytest modules that need ffmpeg stay on the Linux job, where a missing ffmpeg fails the reader step.
-      - run: pip install cryptography pytest numpy opencv-python-headless
+      - run: pip install cryptography pytest numpy opencv-python-headless fastapi httpx
       # c2pa is built with rust_native_crypto (no OpenSSL, no HTTP). This job is the Windows compile check.
       - run: cargo test --locked
         env:
@@ -174,7 +177,9 @@ jobs:
       # stages files and loads the schema; numpy and opencv are for the readers.
       # No ffmpeg here: sidecar/test_qorcap_highlights.py and sidecar/test_qorcap_challenge.py
       # run on Linux, where ffmpeg is installed, so those tests are required there.
-      # Skip allowlist matches Linux (opponent PSN frames only).
+      # Skip allowlist matches Linux (opponent PSN frames, plus the submit tests that need
+      # ffmpeg). This job does not install ffmpeg, so those submit tests skip. The ones
+      # that do not need ffmpeg still run. fastapi and httpx are installed above.
       - name: Sidecar tests
         shell: bash
         env:
@@ -211,7 +216,8 @@ jobs:
             sidecar/test_qorcap_sidepick.py \
             sidecar/test_score_timeline.py \
             sidecar/test_qorcap_glimpse_watch.py \
-            sidecar/test_qorcap_glimpse_witness.py
+            sidecar/test_qorcap_glimpse_witness.py \
+            sidecar/test_qorcap_submit.py
           python tools/assert_pytest_skips.py "$RUNNER_TEMP/sidecar-pytest.xml"
       # No controller is the expected result: input-test returns 1.
       # pwsh forwards that native code as the step result unless the script exits 0 itself.

@@ -5,9 +5,12 @@ goes unseen. This module makes the same challenge audible and visible without
 moving the challenge, the response window, or anything written to the bundle.
 
 Nothing here is recorded. A miss stays unanswered. ``notify_challenge`` only
-enqueues work and returns. One daemon worker runs the beep, toast, and flash.
-The queue holds two jobs; a third is dropped. On any other platform the Windows
-calls are skipped and this module does not raise.
+enqueues work and returns. One daemon worker runs each alert: the toast, then
+the flash, then the beep. The queue holds two jobs; a third is dropped. Toast
+and flash do not wait on the sound player. If playback is still going after
+``_BEEP_TIMEOUT_S`` the player is abandoned, one warning is logged, and the
+worker is replaced so a later alert still runs. On any other platform the
+Windows calls are skipped and this module does not raise.
 
 A failed backend logs one warning per process on the ``qorcap.challenge_alert``
 logger (stderr when nothing else is configured). It never writes a bundle file,
@@ -16,11 +19,19 @@ a checkpoint, or a receipt field.
 Environment (unset means on):
 
 * ``QORCAP_CHALLENGE_BEEP=0`` skips the three-beep. ``false`` / ``no`` / ``off`` too.
-* ``QORCAP_CHALLENGE_BEEP_HZ`` tone frequency, default 2400, kept inside 200..8000.
-* ``QORCAP_CHALLENGE_BEEP_VOLUME`` amplitude. A value with a decimal point is a
-  fraction from 0 to 1 (``1.0`` full, ``0.5`` half). An integer is a percent
-  from 0 to 100 (``100`` full, ``50`` half, ``1`` is one percent). ``0`` and
-  ``0.0`` turn the beep off. Anything else, including ``1.5``, stays at full scale.
+* ``QORCAP_CHALLENGE_BEEP_HZ`` tone frequency, default 2400. A non-finite or
+  unreadable value logs one warning and uses 2400. A finite value outside
+  200..8000 is clamped into that range and logs one warning. A bad value never
+  turns off the toast or the flash.
+* ``QORCAP_CHALLENGE_BEEP_VOLUME`` amplitude, default full scale. This does not
+  affect the toast or the flash.
+  Mute, any case: ``off``, ``false``, ``no``, ``0``. ``0.0`` and ``0%`` are
+  silence too.
+  An explicit percent is ``80%`` or a bare integer from 0 to 100. A bare ``1``
+  is 100% (full scale), not one percent. ``50`` is half. ``100`` is full scale.
+  A decimal strictly between 0 and 1 is a fraction (``0.5`` is half). ``1.0``
+  is full scale, the same loudness as bare ``1`` and ``100``.
+  Anything else (``1.5``, ``loud``, ``inf``) logs one warning and stays at full scale.
 * ``QORCAP_CHALLENGE_TOAST=0`` skips the toast.
 * ``QORCAP_CHALLENGE_FLASH=0`` skips flashing the console window and its taskbar button.
 
@@ -37,12 +48,15 @@ import queue
 import subprocess
 import sys
 import threading
+import time
 import wave
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 
 _LOG = logging.getLogger("qorcap.challenge_alert")
 _OFF = {"0", "false", "no", "off"}
+# Volume mute tokens. ``0`` is also the integer percent 0. Matched case-insensitively.
+_MUTE_VOLUME = {"off", "false", "no", "0"}
 _RATE = 44100
 _BEEP_S = 0.16
 _GAP_S = 0.10
@@ -53,12 +67,16 @@ DEFAULT_VOLUME = 1.0
 _HZ_MIN = 200
 _HZ_MAX = 8000
 _QUEUE_MAX = 2
+# A normal three-beep is under a second. A PlaySound that is still blocked after
+# this is treated as hung: the player thread is abandoned and the worker replaced.
+_BEEP_TIMEOUT_S = 5.0
 
 _WARNED: set[str] = set()
 _WARN_LOCK = threading.Lock()
 _WAV_CACHE: dict[tuple[int, float], bytes] = {}
 _JOBS: queue.Queue[Callable[[], None]] | None = None
 _WORKER_LOCK = threading.Lock()
+_WORKER_GEN = 0
 _TOAST_PROCS: list[subprocess.Popen] = []
 
 # PowerShell's own AUMID. An unpackaged console has none. Some Windows builds
@@ -111,48 +129,103 @@ def _enabled(env: Mapping[str, str], name: str) -> bool:
     return raw.strip().lower() not in _OFF
 
 
+def _is_int_token(text: str) -> bool:
+    body = text[1:] if text[:1] in "+-" else text
+    return bool(body) and body.isascii() and body.isdigit()
+
+
 def _hz(raw: str | None) -> int:
+    """Default 2400. Non-finite values fall back; finite values clamp to 200..8000.
+
+    Either path logs one warning. This function does not raise, so a bad frequency
+    cannot skip the toast or the flash.
+    """
     if raw is None or not str(raw).strip():
         return DEFAULT_HZ
+    text = str(raw).strip()
     try:
-        hz = int(float(str(raw).strip()))
+        value = float(text)
     except (TypeError, ValueError):
+        warn_once("beep_hz", f"unusable frequency {text!r}; using {DEFAULT_HZ}")
         return DEFAULT_HZ
+    if not math.isfinite(value):
+        warn_once("beep_hz", f"non-finite frequency {text!r}; using {DEFAULT_HZ}")
+        return DEFAULT_HZ
+    hz = int(value)
     if hz < _HZ_MIN or hz > _HZ_MAX:
-        return DEFAULT_HZ
+        clamped = min(_HZ_MAX, max(_HZ_MIN, hz))
+        warn_once("beep_hz", f"frequency {hz} Hz outside {_HZ_MIN}..{_HZ_MAX}; clamped to {clamped}")
+        return clamped
     return hz
 
 
-def _volume(raw: str | None) -> float:
-    """Fraction ``0..1`` if the text has a decimal point, otherwise percent ``0..100``.
+def _warn_volume(text: str) -> float:
+    warn_once("beep_volume", f"unusable volume {text!r}; using full scale")
+    return DEFAULT_VOLUME
 
-    ``0`` and ``0.0`` are silence. ``1.5`` is neither a fraction nor a percent, so
-    the default full scale is kept. ``1`` is one percent; full scale is ``1.0`` or ``100``.
+
+def _as_percent(body: str, original: str) -> float:
+    try:
+        percent = float(int(body, 10)) if _is_int_token(body) else float(body)
+    except (TypeError, ValueError):
+        return _warn_volume(original)
+    if not math.isfinite(percent) or percent < 0.0 or percent > 100.0:
+        return _warn_volume(original)
+    return percent / 100.0
+
+
+def _volume(raw: str | None) -> float:
+    """Percent, fraction, or mute. Bare ``1`` is 100 percent, not 1 percent.
+
+    * ``off`` / ``false`` / ``no`` / ``0`` (any case) mute the beep.
+    * ``80%`` or an integer 0..100 is a percent. Bare ``1`` is full scale.
+    * A float strictly between 0 and 1 is a fraction (``0.5`` is half).
+    * ``0.0`` is silence and ``1.0`` is full scale, the same loudness as ``0`` and bare ``1``.
+    * Anything else logs one warning and uses full scale.
+
+    This never raises. Volume does not turn the toast or the flash off.
     """
     if raw is None or not str(raw).strip():
         return DEFAULT_VOLUME
     text = str(raw).strip()
+    low = text.lower()
+    if low in _MUTE_VOLUME:
+        return 0.0
     try:
-        if any(mark in text for mark in ".eE"):
-            vol = float(text)
-            if 0.0 <= vol <= 1.0:
-                return vol
-            return DEFAULT_VOLUME
-        percent = int(text, 10)
+        if low.endswith("%"):
+            return _as_percent(text[:-1].strip(), text)
+        if _is_int_token(text):
+            # Integers are percents (50 is half). A bare 1 is the ambiguous case:
+            # it used to mean one percent. It is full scale, same as 100 and 1.0.
+            if int(text, 10) == 1:
+                return DEFAULT_VOLUME
+            return _as_percent(text, text)
+        vol = float(text)
     except (TypeError, ValueError):
-        return DEFAULT_VOLUME
-    if percent < 0 or percent > 100:
-        return DEFAULT_VOLUME
-    return percent / 100.0
+        return _warn_volume(text)
+    if not math.isfinite(vol):
+        return _warn_volume(text)
+    if vol == 0.0 or vol == 1.0 or 0.0 < vol < 1.0:
+        return vol
+    return _warn_volume(text)
 
 
 def config_from_env(env: Mapping[str, str]) -> AlertConfig:
-    volume = _volume(env.get("QORCAP_CHALLENGE_BEEP_VOLUME"))
+    try:
+        volume = _volume(env.get("QORCAP_CHALLENGE_BEEP_VOLUME"))
+    except Exception as exc:
+        warn_once("beep_volume", exc)
+        volume = DEFAULT_VOLUME
+    try:
+        hz = _hz(env.get("QORCAP_CHALLENGE_BEEP_HZ"))
+    except Exception as exc:
+        warn_once("beep_hz", exc)
+        hz = DEFAULT_HZ
     return AlertConfig(
         beep=_enabled(env, "QORCAP_CHALLENGE_BEEP") and volume > 0.0,
         toast=_enabled(env, "QORCAP_CHALLENGE_TOAST"),
         flash=_enabled(env, "QORCAP_CHALLENGE_FLASH"),
-        beep_hz=_hz(env.get("QORCAP_CHALLENGE_BEEP_HZ")),
+        beep_hz=hz,
         beep_volume=volume,
     )
 
@@ -201,14 +274,24 @@ def _cached_wav(hz: int, volume: float) -> bytes:
     return hit
 
 
+def _is_windows() -> bool:
+    """True on Windows. Tests replace this instead of patching ``os.name``.
+
+    ``ctypes`` reads ``os.name`` at import and looks for a Windows-only symbol,
+    so a test that patches the global breaks later imports.
+    """
+    return os.name == "nt"
+
+
 def _play_wav(data: bytes) -> None:
     """Play a memory WAV on the alert worker. No-op off Windows. Logs once on failure.
 
     Flags are ``SND_MEMORY | SND_NODEFAULT`` and not ``SND_ASYNC``. CPython raises
     ``RuntimeError: Cannot play asynchronously from memory`` for that pair, which
-    used to hide the clip and fall through to a quiet ``Beep``.
+    used to hide the clip and fall through to a quiet ``Beep``. The alert worker
+    bounds this call: a stuck ``PlaySound`` does not hold later alerts.
     """
-    if os.name != "nt" or not data:
+    if not _is_windows() or not data:
         return
     try:
         import winsound
@@ -238,7 +321,7 @@ def show_toast(prompt: str, cfg: AlertConfig) -> None:
     A spawn or WinRT failure is logged once and ignored.
     """
     del cfg
-    if os.name != "nt":
+    if not _is_windows():
         return
     try:
         flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
@@ -270,7 +353,7 @@ def flash_console(prompt: str, cfg: AlertConfig) -> None:
     process has no console. A failure is logged once.
     """
     del prompt, cfg
-    if os.name != "nt":
+    if not _is_windows():
         return
     try:
         import ctypes
@@ -319,42 +402,98 @@ def _safe(backend: str, fn: Callable[[], None]) -> None:
         warn_once(backend, exc)
 
 
-def _worker_loop() -> None:
+def _worker_loop(gen: int) -> None:
     jobs = _JOBS
     if jobs is None:
         return
     while True:
         job = jobs.get()
+        if gen != _WORKER_GEN:
+            # Retired while waiting. Put the job back for the live worker.
+            try:
+                jobs.put_nowait(job)
+            except queue.Full:
+                warn_once("queue", "dropped; alert worker is busy")
+            jobs.task_done()
+            return
         try:
             job()
         except Exception as exc:
             warn_once("worker", exc)
         finally:
             jobs.task_done()
+        if gen != _WORKER_GEN:
+            return
+
+
+def _start_worker_locked(gen: int) -> None:
+    threading.Thread(
+        target=_worker_loop, args=(gen,), name="qorcap-challenge-alert", daemon=True,
+    ).start()
 
 
 def _ensure_worker() -> queue.Queue[Callable[[], None]]:
-    global _JOBS
+    global _JOBS, _WORKER_GEN
     with _WORKER_LOCK:
         if _JOBS is None:
             _JOBS = queue.Queue(maxsize=_QUEUE_MAX)
-            threading.Thread(target=_worker_loop, name="qorcap-challenge-alert", daemon=True).start()
+            _WORKER_GEN += 1
+            _start_worker_locked(_WORKER_GEN)
         return _JOBS
 
 
+def _replace_worker() -> None:
+    """Drop the worker blocked behind a hung player and start one on the same queue."""
+    global _WORKER_GEN
+    with _WORKER_LOCK:
+        if _JOBS is None:
+            return
+        _WORKER_GEN += 1
+        _start_worker_locked(_WORKER_GEN)
+
+
 def drain(timeout: float = 5.0) -> bool:
-    """Wait until queued alert jobs finish. Used by tests so one sleep cannot block the next."""
+    """Wait until queued alert jobs finish. Used by tests so one sleep cannot block the next.
+
+    ``Queue.join`` cannot time out. This waits on the same condition, on the caller
+    thread, so a drain does not start a thread of its own.
+    """
     jobs = _JOBS
     if jobs is None:
         return True
-    done = threading.Event()
+    deadline = time.monotonic() + timeout
+    with jobs.all_tasks_done:
+        while jobs.unfinished_tasks:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            jobs.all_tasks_done.wait(remaining)
+        return True
 
-    def _join() -> None:
-        jobs.join()
-        done.set()
 
-    threading.Thread(target=_join, name="qorcap-challenge-alert-drain", daemon=True).start()
-    return done.wait(timeout)
+def _beep_bounded(fn: Callable[[], None]) -> None:
+    """Run the beep off the worker. A stuck PlaySound is abandoned after the timeout.
+
+    The player thread is a daemon and is not joined past the timeout, so it cannot
+    drop later alerts. One warning is logged and the worker is replaced.
+    """
+    error: list[BaseException] = []
+
+    def play() -> None:
+        try:
+            fn()
+        except Exception as exc:
+            error.append(exc)
+
+    player = threading.Thread(target=play, name="qorcap-challenge-beep", daemon=True)
+    player.start()
+    player.join(_BEEP_TIMEOUT_S)
+    if player.is_alive():
+        warn_once("beep-timeout", "playback timed out; replacing the alert worker")
+        _replace_worker()
+        return
+    if error:
+        warn_once("beep", error[0])
 
 
 def _schedule(prompt: str, *, env: Mapping[str, str] | None, backends: AlertBackends | None) -> None:
@@ -364,12 +503,14 @@ def _schedule(prompt: str, *, env: Mapping[str, str] | None, backends: AlertBack
     backs = backends if backends is not None else default_backends()
 
     def run() -> None:
-        if cfg.beep:
-            _safe("beep", lambda: backs.beep(prompt, cfg))
+        # Toast and flash first. A stuck beep must not hold them, including the
+        # ones that belong to this same alert.
         if cfg.toast:
             _safe("toast", lambda: backs.toast(prompt, cfg))
         if cfg.flash:
             _safe("flash", lambda: backs.flash(prompt, cfg))
+        if cfg.beep:
+            _beep_bounded(lambda: backs.beep(prompt, cfg))
 
     try:
         _ensure_worker().put_nowait(run)

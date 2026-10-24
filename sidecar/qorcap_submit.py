@@ -622,13 +622,11 @@ class OfficialLive:
             self.beep()
         except Exception:
             pass
-        # After the challenge is on disk and posted. The alert queue must not move
-        # issued_ms, deadline_ms, prompt_wall_ms, or the body sent to QorCap.
+        # After the challenge is on disk and posted. notify_challenge logs its own
+        # failures and returns. It must not move issued_ms, deadline_ms,
+        # prompt_wall_ms, or the body sent to QorCap.
         if notify_challenge is not None:
-            try:
-                notify_challenge(msg)
-            except Exception as exc:
-                _alert_warn("schedule", exc)
+            notify_challenge(msg)
 
 
 def _beep() -> None:

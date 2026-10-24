@@ -12,8 +12,12 @@ import pytest
 HERE = Path(__file__).resolve().parent
 QT = next((Path(p) for p in [os.getenv("QORTIME", ""), HERE.parent / "qortime", HERE.parent.parent / "qortime"]
            if p and (Path(p) / "qor_receipt" / "review").exists()), None)
-pytestmark = [pytest.mark.skipif(QT is None, reason="no qortime checkout with the referee service"),
-              pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="needs ffmpeg")]
+pytestmark = pytest.mark.skipif(QT is None, reason="no qortime checkout with the referee service")
+# ffmpeg builds the in-process referee bundle. The Windows sidecar job does not install it.
+requires_ffmpeg = pytest.mark.skipif(
+    shutil.which("ffmpeg") is None,
+    reason="needs ffmpeg; the Windows sidecar job does not install it",
+)
 if QT:
     sys.path.insert(0, str(QT))
     sys.path.insert(0, str(QT / "tests"))
@@ -67,6 +71,7 @@ def _env(tmp_path, tokens=True, core=None):
     return F, key, fx, qs.Client("http://referee.test", opener=_opener(tc))
 
 
+@requires_ffmpeg
 def test_submit_spot_check_end_to_end(tmp_path, capsys):
     F, key, fx, client = _env(tmp_path)
     code = qs.submit(tmp_path / "match-1", base="http://referee.test", client=client, device=fx["device"])
@@ -80,6 +85,7 @@ def test_submit_spot_check_end_to_end(tmp_path, capsys):
     assert "referee asked for" in out and "OFFICIAL RESULT" in out
 
 
+@requires_ffmpeg
 def test_submit_reports_refusal(tmp_path, capsys):
     import review_fixture as F0
 
@@ -90,6 +96,7 @@ def test_submit_reports_refusal(tmp_path, capsys):
     assert not (tmp_path / "b" / "match-1" / "receipt.official.json").exists()
 
 
+@requires_ffmpeg
 def test_submit_rejected_bundle(tmp_path, capsys):
     F, key, fx, client = _env(tmp_path)
     p = tmp_path / "match-1" / "inputs.jsonl"
@@ -99,6 +106,7 @@ def test_submit_rejected_bundle(tmp_path, capsys):
     assert code == 2 and "REJECTED" in out
 
 
+@requires_ffmpeg
 def test_official_live_anchors_and_challenges(tmp_path):
     """v0.3.11: challenges open only at pause-capable moments from the gate (never on a timer / at a kickoff),
     one phase per quarter band, one open window at a time; anchors keep their 60 s cadence."""
@@ -209,6 +217,7 @@ def test_offer_submit_needs_explicit_yes(tmp_path, capsys):
     assert "Not submitted" in capsys.readouterr().out
 
 
+@requires_ffmpeg
 def test_submit_is_install_key_signed_and_unsigned_is_refused(tmp_path, capsys):
     """0.3.10: the POST carries X-Qor-Submit signed by the device (recorder) key; an unsigned POST (<= 0.3.9) gets 426."""
     F, key, fx, client = _env(tmp_path)
@@ -231,6 +240,7 @@ def test_submit_is_install_key_signed_and_unsigned_is_refused(tmp_path, capsys):
     assert ei.value.code == 426 and "0.3.10" in json.dumps(ei.value.body)
 
 
+@requires_ffmpeg
 def test_submit_from_another_pc_key_is_rejected(tmp_path, capsys):
     from qor_receipt.keys import SoftwareKey
 
@@ -279,6 +289,7 @@ def test_official_key_status_accepts_only_root_or_valid_delegation():
     assert not ok and "delegation" in why
 
 
+@requires_ffmpeg
 def test_fill_challenge_results_on_real_fmp4(tmp_path, capsys):
     """v0.3.11 fix for match 4 (44b8d01f): the receipt carried result=null although the presses matched. Finalize now
     re-runs the referee's rules on the bundle's own video + controller log: answered challenges become ok."""
@@ -349,6 +360,7 @@ def _refused(bundle, capsys):
     return sub, out
 
 
+@requires_ffmpeg
 def test_side_corrected_bundle_refused_before_network(tmp_path, capsys):
     """finalize --role re-signs every checkpoint offline. The referee rejects that; so does submit(), first."""
     from qor_receipt.keys import SoftwareKey
@@ -370,6 +382,7 @@ def test_side_corrected_bundle_refused_before_network(tmp_path, capsys):
     assert "checkpoint 0" in out and "checkpoint 0" in sub["error"]
 
 
+@requires_ffmpeg
 def test_tampered_timestamp_resigned_offline_is_refused(tmp_path, capsys):
     """One checkpoint's referee timestamp, re-signed offline, is not the live countersignature."""
     from qor_receipt.keys import SoftwareKey
@@ -389,6 +402,7 @@ def test_tampered_timestamp_resigned_offline_is_refused(tmp_path, capsys):
     assert "checkpoint 0" in sub["error"] and "NOT SUBMITTABLE" in out
 
 
+@requires_ffmpeg
 def test_offline_signed_receipt_refused_when_live_countersigned_log_exists(tmp_path, capsys):
     """Copied live signatures still must not be submitted under an offline key kind."""
     _env(tmp_path)
@@ -402,6 +416,7 @@ def test_offline_signed_receipt_refused_when_live_countersigned_log_exists(tmp_p
     assert qs.countersigned_mismatch(b) is None
 
 
+@requires_ffmpeg
 def test_live_signed_bundle_still_passes(tmp_path, capsys):
     F, key, fx, client = _env(tmp_path)
     b = tmp_path / "match-1"

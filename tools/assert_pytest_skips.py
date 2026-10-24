@@ -12,6 +12,21 @@ ALLOWED = {
     # Match 021003 frames show the opponent and are not committed.
     # Set QORCAP_PSN_FRAMES locally to run sidecar/test_qorcap_psn.py::test_local_021003_both_players.
     "test_local_021003_both_players",
+    # sidecar/test_qorcap_submit.py builds an in-process referee bundle with ffmpeg.
+    # Linux installs ffmpeg and runs these. The Windows sidecar job does not install
+    # ffmpeg, so requires_ffmpeg skips them there. A skip on Linux is also allowed by
+    # this list; the Linux job is still expected to execute them.
+    "test_submit_spot_check_end_to_end",
+    "test_submit_reports_refusal",
+    "test_submit_rejected_bundle",
+    "test_official_live_anchors_and_challenges",
+    "test_submit_is_install_key_signed_and_unsigned_is_refused",
+    "test_submit_from_another_pc_key_is_rejected",
+    "test_fill_challenge_results_on_real_fmp4",
+    "test_side_corrected_bundle_refused_before_network",
+    "test_tampered_timestamp_resigned_offline_is_refused",
+    "test_offline_signed_receipt_refused_when_live_countersigned_log_exists",
+    "test_live_signed_bundle_still_passes",
 }
 
 
