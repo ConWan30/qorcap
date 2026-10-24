@@ -133,8 +133,8 @@ WINDOWS_FILES = (
 )
 # pytest --collect-only of the lists above (QORTIME importable). A dropped file
 # or node id lands under the floor.
-LINUX_MIN_COLLECTED = 534
-WINDOWS_MIN_COLLECTED = 516
+LINUX_MIN_COLLECTED = 535
+WINDOWS_MIN_COLLECTED = 517
 
 
 def suite_files(suite: str) -> tuple[str, ...]:
@@ -236,8 +236,11 @@ def main(argv: list[str]) -> int:
         except ValueError:
             print("usage: assert_pytest_skips.py --list linux|windows", file=sys.stderr)
             return 2
+        # Windows Python translates print() newlines to CRLF. Pytest then looks
+        # for "file.py\r" and reports that the file is missing. Write LF only.
+        out = sys.stdout.buffer
         for name in files:
-            print(name)
+            out.write(name.encode("ascii") + b"\n")
         return 0
 
     platform = "linux"

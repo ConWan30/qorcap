@@ -157,14 +157,26 @@ def test_missing_required_file_fails_even_when_the_count_is_high(tmp_path):
     assert any("no collected test" in line for line in bad)
 
 
+def test_suite_list_uses_lf_only():
+    proc = subprocess.run(
+        [sys.executable, str(ROOT / "tools" / "assert_pytest_skips.py"), "--list", "linux"],
+        capture_output=True,
+        check=True,
+    )
+    assert b"\r" not in proc.stdout
+    assert proc.stdout.splitlines()[0] == b"sidecar/test_pairing.py"
+    source = (ROOT / "tools" / "assert_pytest_skips.py").read_text(encoding="utf-8")
+    assert "sys.stdout.buffer" in source
+
+
 def test_sidecar_ci_sets_xfail_strict_and_the_suite_gate():
     text = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
     assert text.count("-o xfail_strict=true") == 2
     assert text.count("-o junit_family=xunit1") == 2
     assert "--list linux" in text and "--suite linux" in text
     assert "--list windows" in text and "--suite windows" in text
-    assert skips.LINUX_MIN_COLLECTED == 534
-    assert skips.WINDOWS_MIN_COLLECTED == 516
+    assert skips.LINUX_MIN_COLLECTED == 535
+    assert skips.WINDOWS_MIN_COLLECTED == 517
 
 
 def test_xfail_strict_rejects_an_unexpected_pass(tmp_path):
