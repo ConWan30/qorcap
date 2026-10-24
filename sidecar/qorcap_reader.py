@@ -88,6 +88,9 @@ READER_STALL_MS = 30_000
 # stuck inside the file read holds that lock; waiting forever blocks the receipt.
 # On timeout the check fails closed (no confirmed final, one notice row).
 INPUTS_LOCK_TIMEOUT_S = 2.0
+# A pause counts as progress for at most this long. After that, a detector
+# stuck on paused is a silent reader again.
+PAUSE_PROGRESS_CAP_MS = 300_000
 
 
 def _seconds_text(ms: float) -> str:
@@ -1005,6 +1008,7 @@ class ReaderCore:
         # reader_stalled / reader_resumed do not move this. The timing summary does not either.
         self._last_progress_ms: int | None = None
         self._stall_open = False
+        self._pause_since: int | None = None
 
     def note_options(self, presses_ms) -> None:
         """Remember OPTIONS press times (wall ms). Repeating a time is a no-op."""
@@ -1092,6 +1096,8 @@ class ReaderCore:
         # end-of-game context, and treat an OPTIONS press that hid the scorebug as a pause until
         # the picture has stayed up long enough that it cannot be the scripted pause menu.
         if self.final_screen_detector is not None and self.final_screen_detector(img):
+            # This return is before the pause-cap reset. An end-menu frame is not a pause.
+            self._pause_since = None
             self._note_end_screen_time(t_ms)
             if self._pixel_match_since is None:
                 self._pixel_match_since = t_ms
@@ -1118,10 +1124,14 @@ class ReaderCore:
                 self._close_spans()
                 if self.gate is not None:
                     self.gate.on_frame(t_ms, False, paused=True)
-                # A pause menu writes no timeline row. Counting the frame as
-                # progress keeps a long in-game pause from looking like a silent reader.
-                self.note_progress(t_ms)
+                # A pause menu writes no timeline row. It counts as progress only
+                # until the cap, so a detector stuck on paused cannot hide a stall.
+                if self._pause_since is None:
+                    self._pause_since = t_ms
+                if t_ms - self._pause_since < PAUSE_PROGRESS_CAP_MS:
+                    self.note_progress(t_ms)
                 return
+        self._pause_since = None
         if self.gate is not None:
             pc = False
             if self.playcall is not None:
@@ -1214,6 +1224,8 @@ class ReaderCore:
             "t_ms": int(t_ms),
             "last_row_age_s": round(max(0, int(age_ms)) / 1000.0, 3),
         }
+        if kind == "reader_stalled" and self._pause_since is not None:
+            row["paused_s"] = round((int(t_ms) - int(self._pause_since)) / 1000.0, 3)
         self.health.append(row)
         write = self.health_write
         if write is None:

@@ -767,3 +767,71 @@ def test_long_pause_is_not_a_reader_stall():
     assert [row for row in written if row.get("kind") == "reader_stalled"] == []
     assert core.stats["paused"] == 181
     assert posts == []
+
+
+def _drive_stuck_pause(seconds: int):
+    """Every frame is paused. One second apart, under the agreement gap."""
+    from qorcap_reader import ReaderCore
+
+    class Pause:
+        paused = True
+
+        def update(self, _t, _img):
+            return None
+
+    posts = []
+    core = ReaderCore(posts.append, None, None, Pause(), _no_final)
+    written = []
+    core.health_write = written.append
+    for t in range(0, seconds * 1000 + 1, 1000):
+        core.on_frame(t, None)
+        core.consider_stall(t)
+    return core, written, posts
+
+
+def test_stuck_pause_past_the_cap_writes_one_stalled_notice():
+    """A detector frozen on paused for 360 s writes one reader_stalled row, with paused_s.
+
+    Removing the cap keeps calling note_progress, and this notice disappears.
+    """
+    from qorcap_reader import PAUSE_PROGRESS_CAP_MS
+
+    assert PAUSE_PROGRESS_CAP_MS == 300_000
+    _core, written, posts = _drive_stuck_pause(360)
+    stalls = [row for row in written if row.get("kind") == "reader_stalled"]
+    assert len(stalls) == 1, written
+    assert stalls[0]["paused_s"] >= 300
+    assert "obs" not in stalls[0]
+    assert posts == []
+
+
+def test_four_minute_pause_writes_no_stall():
+    """Four minutes is inside the cap, so a real pause menu stays quiet."""
+    _core, written, posts = _drive_stuck_pause(4 * 60)
+    assert [row for row in written if row.get("kind") == "reader_stalled"] == []
+    assert posts == []
+
+
+def test_end_menu_frame_clears_the_pause_cap_clock():
+    """An end-menu frame returns before the pause check, and still clears the cap clock."""
+    from qorcap_reader import ReaderCore
+
+    class Pause:
+        paused = True
+
+        def update(self, _t, _img):
+            return None
+
+    class Screen:
+        on = False
+
+        def __call__(self, _img):
+            return self.on
+
+    screen = Screen()
+    core = ReaderCore(lambda body: None, None, None, Pause(), _no_final, final_screen_detector=screen)
+    core.on_frame(0, None)
+    assert core._pause_since == 0
+    screen.on = True
+    core.on_frame(1000, None)
+    assert core._pause_since is None
