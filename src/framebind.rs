@@ -31,6 +31,8 @@ pub const FRAMES_FILE: &str = "frames.jsonl";
 pub const READERS_FILE: &str = "readers.json";
 pub const ENV: &str = "QORCAP_FRAME_BIND";
 pub const PTS_TIMESCALE: u64 = 90_000;
+/// qortime `MAX_READERS_BYTES` at 585ccc4. The file is JCS plus one newline.
+pub const MAX_READERS_BYTES: usize = 64 * 1024;
 const MONO_STEP_MAX_MS: u64 = 600_000;
 const MONO_ABS_MAX_MS: u64 = 48 * 60 * 60 * 1000;
 
@@ -495,6 +497,12 @@ impl FrameBind {
         validate_readers(manifest)?;
         let mut bytes = ev::jcs(manifest)?.into_bytes();
         bytes.push(b'\n');
+        if bytes.len() > MAX_READERS_BYTES {
+            return Err(format!(
+                "readers.json is {} bytes; the cap is {MAX_READERS_BYTES}",
+                bytes.len()
+            ));
+        }
         let sha = ev::sha256_hex(&bytes);
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if g.opening_claimed {
@@ -1194,16 +1202,15 @@ fn path_segment_ok(part: &str) -> bool {
         return false;
     }
     let lower = part.to_ascii_lowercase();
-    if matches!(
-        lower.as_str(),
-        "keys" | "secret" | "secrets"
-    ) {
+    if matches!(lower.as_str(), "keys" | "secret" | "secrets") {
+        return false;
+    }
+    // qortime PATH_PATTERN: `_key` anywhere in the segment when the next char is `.` or the end.
+    // `x.y_key.py` and `a.b_KEY.txt` match. `my_keyfile.py` does not.
+    if segment_contains_key_suffix(&lower) || device_stem(part) {
         return false;
     }
     let stem = lower.split('.').next().unwrap_or(&lower);
-    if stem.ends_with("_key") || device_stem(part) {
-        return false;
-    }
     if matches!(
         stem,
         "id_rsa"
@@ -1218,6 +1225,21 @@ fn path_segment_ok(part: &str) -> bool {
         return false;
     }
     true
+}
+
+fn segment_contains_key_suffix(lower: &str) -> bool {
+    let bytes = lower.as_bytes();
+    let mut i = 0;
+    while i + 4 <= bytes.len() {
+        if &bytes[i..i + 4] == b"_key" {
+            let after = i + 4;
+            if after == bytes.len() || bytes[after] == b'.' {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
 }
 
 fn safe_rel_path(path: &str) -> bool {
@@ -1240,6 +1262,236 @@ fn safe_rel_path(path: &str) -> bool {
         return false;
     }
     path.split('/').all(path_segment_ok)
+}
+
+/// The bytes qortime will hash. Same cap and canonical-JSON rule as `verify_frame_bind` at 585ccc4.
+fn readers_file_ok(bytes: &[u8]) -> Result<(), String> {
+    if bytes.len() > MAX_READERS_BYTES {
+        return Err(format!(
+            "readers.json is {} bytes; the cap is {MAX_READERS_BYTES}",
+            bytes.len()
+        ));
+    }
+    if !bytes.ends_with(b"\n") || bytes.ends_with(b"\n\n") || bytes.contains(&b'\r') {
+        return Err("readers.json must be one JSON object and a single trailing newline".into());
+    }
+    let body = &bytes[..bytes.len() - 1];
+    match json_has_duplicate_keys(body) {
+        Some(true) => return Err("readers.json has a duplicate key".into()),
+        Some(false) => {}
+        None => return Err("readers.json is not JSON".into()),
+    }
+    let v: Value = serde_json::from_slice(body).map_err(|_| "readers.json is not JSON".to_string())?;
+    let canon = ev::jcs(&v)?;
+    if canon.as_bytes() != body {
+        return Err("readers.json is not canonical JSON".into());
+    }
+    validate_readers(&v)
+}
+
+/// `Some(true)` when an object repeats a key. `None` when `body` is not JSON.
+/// qortime's loader rejects duplicate keys; `serde_json` keeps the last one.
+fn json_has_duplicate_keys(body: &[u8]) -> Option<bool> {
+    let mut i = 0;
+    let dup = scan_json_value(body, &mut i)?;
+    skip_json_ws(body, &mut i);
+    if i != body.len() {
+        return None;
+    }
+    Some(dup)
+}
+
+fn skip_json_ws(b: &[u8], i: &mut usize) {
+    while *i < b.len() && matches!(b[*i], b' ' | b'\t' | b'\n' | b'\r') {
+        *i += 1;
+    }
+}
+
+fn scan_json_value(b: &[u8], i: &mut usize) -> Option<bool> {
+    skip_json_ws(b, i);
+    if *i >= b.len() {
+        return None;
+    }
+    match b[*i] {
+        b'{' => scan_json_object(b, i),
+        b'[' => scan_json_array(b, i),
+        b'"' => {
+            scan_json_string(b, i)?;
+            Some(false)
+        }
+        b't' | b'f' | b'n' => {
+            let n = if b[*i] == b't' || b[*i] == b'n' { 4 } else { 5 };
+            if *i + n > b.len() {
+                return None;
+            }
+            *i += n;
+            Some(false)
+        }
+        b'-' | b'0'..=b'9' => {
+            scan_json_number(b, i)?;
+            Some(false)
+        }
+        _ => None,
+    }
+}
+
+fn scan_json_object(b: &[u8], i: &mut usize) -> Option<bool> {
+    *i += 1;
+    skip_json_ws(b, i);
+    if *i < b.len() && b[*i] == b'}' {
+        *i += 1;
+        return Some(false);
+    }
+    let mut keys = Vec::new();
+    let mut dup = false;
+    loop {
+        skip_json_ws(b, i);
+        let key = scan_json_string(b, i)?;
+        if keys.iter().any(|seen: &String| seen == &key) {
+            dup = true;
+        }
+        keys.push(key);
+        skip_json_ws(b, i);
+        if *i >= b.len() || b[*i] != b':' {
+            return None;
+        }
+        *i += 1;
+        if scan_json_value(b, i)? {
+            dup = true;
+        }
+        skip_json_ws(b, i);
+        if *i >= b.len() {
+            return None;
+        }
+        match b[*i] {
+            b',' => {
+                *i += 1;
+            }
+            b'}' => {
+                *i += 1;
+                return Some(dup);
+            }
+            _ => return None,
+        }
+    }
+}
+
+fn scan_json_array(b: &[u8], i: &mut usize) -> Option<bool> {
+    *i += 1;
+    skip_json_ws(b, i);
+    if *i < b.len() && b[*i] == b']' {
+        *i += 1;
+        return Some(false);
+    }
+    let mut dup = false;
+    loop {
+        if scan_json_value(b, i)? {
+            dup = true;
+        }
+        skip_json_ws(b, i);
+        if *i >= b.len() {
+            return None;
+        }
+        match b[*i] {
+            b',' => {
+                *i += 1;
+            }
+            b']' => {
+                *i += 1;
+                return Some(dup);
+            }
+            _ => return None,
+        }
+    }
+}
+
+fn scan_json_string(b: &[u8], i: &mut usize) -> Option<String> {
+    if *i >= b.len() || b[*i] != b'"' {
+        return None;
+    }
+    *i += 1;
+    let mut out = String::new();
+    while *i < b.len() {
+        match b[*i] {
+            b'"' => {
+                *i += 1;
+                return Some(out);
+            }
+            b'\\' => {
+                *i += 1;
+                if *i >= b.len() {
+                    return None;
+                }
+                let e = b[*i];
+                *i += 1;
+                match e {
+                    b'"' | b'\\' | b'/' => out.push(e as char),
+                    b'b' => out.push('\u{0008}'),
+                    b'f' => out.push('\u{000c}'),
+                    b'n' => out.push('\n'),
+                    b'r' => out.push('\r'),
+                    b't' => out.push('\t'),
+                    b'u' => {
+                        if *i + 4 > b.len() {
+                            return None;
+                        }
+                        let hex = std::str::from_utf8(&b[*i..*i + 4]).ok()?;
+                        let unit = u32::from_str_radix(hex, 16).ok()?;
+                        *i += 4;
+                        let ch = char::from_u32(unit)?;
+                        out.push(ch);
+                    }
+                    _ => return None,
+                }
+            }
+            c if c < 0x20 => return None,
+            c if c < 0x80 => {
+                out.push(c as char);
+                *i += 1;
+            }
+            _ => {
+                let rest = std::str::from_utf8(&b[*i..]).ok()?;
+                let ch = rest.chars().next()?;
+                out.push(ch);
+                *i += ch.len_utf8();
+            }
+        }
+    }
+    None
+}
+
+fn scan_json_number(b: &[u8], i: &mut usize) -> Option<()> {
+    if *i < b.len() && b[*i] == b'-' {
+        *i += 1;
+    }
+    if *i >= b.len() || !b[*i].is_ascii_digit() {
+        return None;
+    }
+    while *i < b.len() && b[*i].is_ascii_digit() {
+        *i += 1;
+    }
+    if *i < b.len() && b[*i] == b'.' {
+        *i += 1;
+        if *i >= b.len() || !b[*i].is_ascii_digit() {
+            return None;
+        }
+        while *i < b.len() && b[*i].is_ascii_digit() {
+            *i += 1;
+        }
+    }
+    if *i < b.len() && (b[*i] == b'e' || b[*i] == b'E') {
+        *i += 1;
+        if *i < b.len() && (b[*i] == b'+' || b[*i] == b'-') {
+            *i += 1;
+        }
+        if *i >= b.len() || !b[*i].is_ascii_digit() {
+            return None;
+        }
+        while *i < b.len() && b[*i].is_ascii_digit() {
+            *i += 1;
+        }
+    }
+    Some(())
 }
 
 fn sidecar_lines(bytes: &[u8]) -> Vec<&[u8]> {
@@ -1506,6 +1758,10 @@ fn check_readers(dir: &Path, checkpoints: &[Value], frame_bind: bool, report: &m
                 report.reader_status = "broken".into();
                 report.reader_reason = "readers.json does not match the first checkpoint".into();
                 report.errors.push(report.reader_reason.clone());
+            } else if let Err(e) = readers_file_ok(&bytes) {
+                report.reader_status = "broken".into();
+                report.reader_reason = e.clone();
+                report.errors.push(e);
             } else {
                 report.reader_status = "verified".into();
                 report.reader_claim = true;

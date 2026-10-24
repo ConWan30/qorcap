@@ -57,9 +57,11 @@ def test_unsafe_paths_and_flag_words():
     assert R.frame_bind_enabled(" true ")
     for bad in ("../x.py", "/etc/passwd", "C:video.py", "keys/a.py", "a/../../b.py", "a.key", "",
                 "sidecar/reader.py.", "sidecar/reader.py ", "café.py", "sidecar/CON.py", "nul.txt",
-                "COM1.py", "lpt9.txt", "aux", "PRN.py", "sidecar/id_ed25519", "secret/a.py"):
+                "COM1.py", "lpt9.txt", "aux", "PRN.py", "sidecar/id_ed25519", "secret/a.py",
+                "x.y_key.py", "a.b_key", "a.b_KEY.txt", "sub/x.y_key/z.py", "a._key", "X.Y_Key"):
         assert not R.safe_rel_path(bad), bad
     assert R.safe_rel_path("sidecar/qorcap_standard.py")
+    assert R.safe_rel_path("sidecar/my_keyfile.py")
     assert R.safe_rel_path("qor_receipt/_vendor/qoresence/vision/local_scorebug/reader.py")
     assert R.safe_rel_path("sidecar/console.py")
     assert R.safe_rel_path("sidecar/com10.py")

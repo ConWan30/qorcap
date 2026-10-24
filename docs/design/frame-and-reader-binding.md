@@ -106,7 +106,9 @@ or, after a write error:
 {"schema":"qorcap-frame-bind/v0","n":12,"head":"<hash of lines that landed>","state":"failed"}
 ```
 
-`n` is a prefix. It grows as lines land and must not go backwards. The last checkpoint's `n` equals the number of lines in the file. `tail: sealed` means the stop checkpoint covers every line. Dropping that checkpoint leaves a consistent prefix with `tail: open`. That prefix is not a frame claim. Lines past the last checkpoint fail verification. Because `frames_hash` covers `frame_bind`, changing a line, dropping one, inserting one, or editing `mono_ms` changes a checkpoint hash unless the whole chain is rebuilt. Rebuilding the chain changes `hash`, which is what the referee signature covers. `verify-bundle` itself only checks consistency; the referee signature is still QorTime's job. QorTime's commitment schema is `{schema, n, head}` only. QorCap still adds `state: failed` after a write error so its own checker can tell that from a hash mismatch. QorTime's `verify_frame_bind` treats the extra key as broken.
+`n` is a prefix. It grows as lines land and must not go backwards. The last checkpoint's `n` equals the number of lines in the file. `tail: sealed` means the stop checkpoint covers every line. Dropping that checkpoint leaves a consistent prefix with `tail: open`. That prefix is not a frame claim. Lines past the last checkpoint fail verification. Because `frames_hash` covers `frame_bind`, changing a line, dropping one, inserting one, or editing `mono_ms` changes a checkpoint hash unless the whole chain is rebuilt. Rebuilding the chain changes `hash`, which is what the referee signature covers. `verify-bundle` itself only checks consistency; the referee signature is still QorTime's job.
+
+QorTime's commitment schema is `{schema, n, head}` only. QorCap still adds `state: failed` after a write error. That extra key deliberately does not match the vendored checkpoint schema. qortime 585ccc4 `verify_frame_bind` reads the bundle as `broken`, which is fail-closed: it is not a frame claim. A later qortime change should accept `state: failed` as an honest failed write, distinct from tampering. Until then the key stays. Omitting the commitment looks like a stripped sidecar, and freezing the last good `{n, head}` would make an incomplete file look sealed.
 
 ## Reader sidecar
 
@@ -133,7 +135,7 @@ File: `readers.json`. One JSON object, JCS, plus a trailing newline. The commitm
 }
 ```
 
-The object is closed. Unknown keys, including `reader_verified_by_referee`, `python`, `numpy`, and `glimpse`, are rejected. `runtimes` is required and names the builds that produced the reads (`ffmpeg`, `cv2`). A build that is not on the machine is omitted. If neither build has a hash, no `readers.json` is written and checkpoint 0 stays unbound. Reader ids and runtime ids are unique after NFC and casefolding, including a trailing dot or space. Paths are unique the same way, ASCII only, and a path cannot be both code and pack. Windows device names (`CON`, `NUL`, `AUX`, `PRN`, `COM1`–`COM9`, `LPT1`–`LPT9`, including `CON.py` and `nul.txt`) are not emitted.
+The object is closed. Unknown keys, including `reader_verified_by_referee`, `python`, `numpy`, and `glimpse`, are rejected. `runtimes` is required and names the builds that produced the reads (`ffmpeg`, `cv2`). A build that is not on the machine is omitted. If neither build has a hash, no `readers.json` is written and checkpoint 0 stays unbound. Reader ids and runtime ids are unique after NFC and casefolding, including a trailing dot or space. Paths are unique the same way, ASCII only, and a path cannot be both code and pack. A path segment is refused when `_key` (any case) is followed by `.` or the end of that segment, including `x.y_key.py`. Windows device names (`CON`, `NUL`, `AUX`, `PRN`, `COM1`–`COM9`, `LPT1`–`LPT9`, including `CON.py` and `nul.txt`) are not emitted. The file is JCS plus one newline and is refused above 64 KiB, the cap qortime uses.
 
 `path` is relative (`sidecar/...` or `qor_receipt/...`). Absolute paths, `..`, a `keys` path component, and names ending in `.key`, `.pem`, `.p12`, `.pfx`, `.jwk`, `.ppk`, or `.jks` are rejected. Key material is not hashed and not written. Hashes are raw file bytes. `.gitattributes` pins `*.py` to LF and `*.npz` as binary so a Windows checkout hashes the same bytes as the repo.
 
@@ -239,3 +241,5 @@ Same words as the other QorCap switches: `1`, `true`, `yes`, `on`. Default off. 
 ## Schemas
 
 `receipt.v0.json` stays frozen, and `frames_hash` stays `SHA-256(JCS(qorcap))`. The sidecar schemas are vendored from QorTime `585ccc4`: `contracts/qorcap-frame-bind.v0.json` and `contracts/qorcap-readers.v0.json`. Absence of the sidecars remains "no claim," not a failed match. The flag does not change a published verdict.
+
+The bundled runtime verifier stays at `0204e6d`. That checkout does not run `verify_frame_bind`. Bump it to at least `585ccc4` before `--frame-bind` is turned on by default.

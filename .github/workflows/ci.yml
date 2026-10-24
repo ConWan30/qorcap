@@ -131,6 +131,46 @@ jobs:
           QORCAP_E2E: "0"
           QORCAP_CONTRACTS_REQUIRED: "1"
         run: python -m pytest -q sidecar/test_contracts.py
+  # Pinned 585ccc4 is the required contract check. This job only notices when qortime main
+  # moves past that pin. A failure here does not fail the workflow.
+  contracts-main:
+    name: contracts (qortime main)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: QorTime main
+        run: |
+          git init qortime-main
+          git -C qortime-main remote add origin https://github.com/ConWan30/qortime.git
+          git -C qortime-main fetch --depth 1 origin refs/heads/main
+          git -C qortime-main checkout --detach FETCH_HEAD
+          git -C qortime-main rev-parse HEAD
+      - name: Drift against qortime main
+        env:
+          QORTIME: ${{ github.workspace }}/qortime-main
+        run: |
+          python - <<'PY'
+          import os, subprocess
+          from pathlib import Path
+          qt = Path(os.environ["QORTIME"])
+          c = Path("contracts")
+          head = subprocess.check_output(["git", "-C", str(qt), "rev-parse", "HEAD"], text=True).strip()
+          print("qortime main", head)
+          bad = []
+          for p in sorted((qt / "schema" / "contracts").glob("*.json")):
+              vendored = c / p.name
+              if not vendored.is_file() or vendored.read_bytes() != p.read_bytes():
+                  bad.append(p.name)
+          if (c / "receipt.v0.json").read_bytes() != (qt / "schema" / "receipt.v0.json").read_bytes():
+              bad.append("receipt.v0.json")
+          if bad:
+              raise SystemExit("drift from qortime main:\n" + "\n".join(bad))
+          print("no drift from qortime main")
+          PY
   windows:
     runs-on: windows-latest
     steps:
