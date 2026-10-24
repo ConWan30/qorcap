@@ -12,10 +12,25 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      # .gitattributes pins contracts/ to LF. Fail if a checkout or a commit still has CR.
+      - name: Contract files have no carriage returns
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          root = Path("contracts")
+          files = [p for p in root.rglob("*") if p.is_file()]
+          bad = sorted(str(p) for p in files if b"\r" in p.read_bytes())
+          if not files:
+              raise SystemExit("contracts/ has no files")
+          if bad:
+              raise SystemExit("carriage return in:\n" + "\n".join(bad))
+          PY
       # ffmpeg and the pinned QorTime verifier run inside `cargo test` (clip credentials).
       # The receipt check is the real `python -m qor_receipt.cli verify`, not a stub.
       - run: sudo apt-get update && sudo apt-get install -y ffmpeg
-      - run: pip install cryptography pytest numpy
+      # opencv-python-headless: CPU scorebug reads. No GPU, no capture card, no HID.
+      - run: pip install cryptography pytest numpy opencv-python-headless
       - name: QorTime pin
         run: |
           git init qortime
@@ -25,7 +40,50 @@ jobs:
       - run: cargo test --locked
         env:
           QORTIME: ${{ github.workspace }}/qortime
-      - run: python -m pytest -q sidecar/test_pairing.py sidecar/test_qorcap_highlights.py sidecar/test_auto_highlights.py sidecar/test_final_screen_pause.py sidecar/test_start_match_glimpse.py sidecar/test_qorcap_ai_loop.py sidecar/test_qorcap_console.py sidecar/test_qorcap_release.py tools/test_frame_clock_ab.py
+      # Headless sidecar tests, including the scorebug readers (standard bar, Thursday /
+      # Sunday / Monday night, end menu, touchdown lock, play-call, PSN banner, and the
+      # capture-pause fixtures). QORTIME is the pin above. A missing cv2/numpy/fixture
+      # fails this step: tools/assert_pytest_skips.py rejects any skip that is not allowlisted.
+      # Allowlisted: test_local_021003_both_players (opponent frames are not in the repo).
+      # Not this step, on purpose:
+      # - sidecar/test_contracts.py stays in the "contracts (qortime main)" job (unpinned main).
+      # - sidecar/test_qorcap_submit.py drives the in-process referee (fastapi), not the reader.
+      # - sidecar/test_qorcap_match.py launcher recording needs a built qorcap; it is not the glyph gate.
+      # ffmpeg is installed above, so the highlights clip test and
+      # test_close_stamp_lag_does_not_move_the_pause run here. They are not skipped.
+      - name: Sidecar tests
+        env:
+          QORTIME: ${{ github.workspace }}/qortime
+        run: |
+          python -c "import cv2, numpy, cryptography"
+          python -c "import os, pathlib; p=pathlib.Path(os.environ['QORTIME']); assert (p/'qor_receipt').is_dir(), p; assert (p/'tests/fixtures/madden27_live/q1_6-0.png').is_file(), 'pinned QorTime scorebug fixture missing'"
+          python -m pytest -q --tb=short --junitxml="$RUNNER_TEMP/sidecar-pytest.xml" \
+            sidecar/test_pairing.py \
+            sidecar/test_qorcap_highlights.py \
+            sidecar/test_auto_highlights.py \
+            sidecar/test_final_screen_pause.py \
+            sidecar/test_start_match_glimpse.py \
+            sidecar/test_qorcap_ai_loop.py \
+            sidecar/test_qorcap_console.py \
+            sidecar/test_qorcap_release.py \
+            tools/test_frame_clock_ab.py \
+            sidecar/test_qorcap_reader.py \
+            sidecar/test_qorcap_standard.py \
+            sidecar/test_qorcap_tnp.py \
+            sidecar/test_qorcap_snp.py \
+            sidecar/test_qorcap_mnp.py \
+            sidecar/test_qorcap_endmenu.py \
+            sidecar/test_qorcap_touchdown.py \
+            sidecar/test_qorcap_td_glimpse.py \
+            sidecar/test_qorcap_playcall.py \
+            sidecar/test_qorcap_psn.py \
+            sidecar/test_qorcap_challenge.py \
+            sidecar/test_qorcap_paths.py \
+            sidecar/test_qorcap_sidepick.py \
+            sidecar/test_score_timeline.py \
+            sidecar/test_qorcap_glimpse_watch.py \
+            sidecar/test_qorcap_glimpse_witness.py
+          python tools/assert_pytest_skips.py "$RUNNER_TEMP/sidecar-pytest.xml"
   # Contract bytes are compared to qortime main, not to QORTIME_PIN. The linux and windows
   # jobs keep fetching 0204e6d so `cargo test` and the bundled verifier stay reproducible.
   # This job goes red when qortime main changes schema/contracts or schema/receipt.v0.json.
@@ -39,6 +97,19 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - name: Contract files have no carriage returns
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          root = Path("contracts")
+          files = [p for p in root.rglob("*") if p.is_file()]
+          bad = sorted(str(p) for p in files if b"\r" in p.read_bytes())
+          if not files:
+              raise SystemExit("contracts/ has no files")
+          if bad:
+              raise SystemExit("carriage return in:\n" + "\n".join(bad))
+          PY
       - run: pip install pytest
       - name: QorTime main (unpinned)
         run: |
@@ -61,6 +132,20 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      # .gitattributes pins contracts/ to LF. This job's schema pin hashes raw checkout bytes.
+      - name: Contract files have no carriage returns
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          root = Path("contracts")
+          files = [p for p in root.rglob("*") if p.is_file()]
+          bad = sorted(str(p) for p in files if b"\r" in p.read_bytes())
+          if not files:
+              raise SystemExit("contracts/ has no files")
+          if bad:
+              raise SystemExit("carriage return in:\n" + "\n".join(bad))
+          PY
       - name: QorTime pin
         shell: bash
         run: |
@@ -68,15 +153,52 @@ jobs:
           git -C qortime remote add origin https://github.com/ConWan30/qortime.git
           git -C qortime fetch --depth 1 origin 0204e6d8082f8c40ea1fe5e09bf16402aaee3ff2
           git -C qortime checkout --detach FETCH_HEAD
-      - run: pip install cryptography pytest
-      # No ffmpeg on this job. Clip tests that cut with ffmpeg skip; sign/verify uses tests/fixtures/tiny_clip.mp4.
+      # opencv-python-headless: CPU scorebug reads. No GPU, no capture card, no HID.
+      # No ffmpeg on this job. Rust clip tests that cut with ffmpeg skip; sign/verify uses tests/fixtures/tiny_clip.mp4.
+      # Pytest modules that need ffmpeg stay on the Linux job, where a missing ffmpeg fails the reader step.
+      - run: pip install cryptography pytest numpy opencv-python-headless
       # c2pa is built with rust_native_crypto (no OpenSSL, no HTTP). This job is the Windows compile check.
       - run: cargo test --locked
         env:
           QORTIME: ${{ github.workspace }}/qortime
       - run: cargo build --release --locked
-      # Same release-layout check as Linux. No numpy: this test only stages files and loads the schema.
-      - run: python -m pytest -q sidecar/test_qorcap_release.py sidecar/test_qorcap_console.py
+      # Release-layout check plus the headless scorebug readers. The release test only
+      # stages files and loads the schema; numpy and opencv are for the readers.
+      # No ffmpeg here: sidecar/test_qorcap_highlights.py and sidecar/test_qorcap_challenge.py
+      # run on Linux, where ffmpeg is installed, so those tests are required there.
+      # Skip allowlist matches Linux (opponent PSN frames only).
+      - name: Sidecar tests
+        shell: bash
+        env:
+          QORTIME: ${{ github.workspace }}/qortime
+        run: |
+          python -c "import cv2, numpy, cryptography"
+          python -c "import os, pathlib; p=pathlib.Path(os.environ['QORTIME']); assert (p/'qor_receipt').is_dir(), p; assert (p/'tests/fixtures/madden27_live/q1_6-0.png').is_file(), 'pinned QorTime scorebug fixture missing'"
+          python -m pytest -q --tb=short --junitxml="$RUNNER_TEMP/sidecar-pytest.xml" \
+            sidecar/test_pairing.py \
+            sidecar/test_auto_highlights.py \
+            sidecar/test_final_screen_pause.py \
+            sidecar/test_start_match_glimpse.py \
+            sidecar/test_qorcap_ai_loop.py \
+            sidecar/test_qorcap_console.py \
+            sidecar/test_qorcap_release.py \
+            tools/test_frame_clock_ab.py \
+            sidecar/test_qorcap_reader.py \
+            sidecar/test_qorcap_standard.py \
+            sidecar/test_qorcap_tnp.py \
+            sidecar/test_qorcap_snp.py \
+            sidecar/test_qorcap_mnp.py \
+            sidecar/test_qorcap_endmenu.py \
+            sidecar/test_qorcap_touchdown.py \
+            sidecar/test_qorcap_td_glimpse.py \
+            sidecar/test_qorcap_playcall.py \
+            sidecar/test_qorcap_psn.py \
+            sidecar/test_qorcap_paths.py \
+            sidecar/test_qorcap_sidepick.py \
+            sidecar/test_score_timeline.py \
+            sidecar/test_qorcap_glimpse_watch.py \
+            sidecar/test_qorcap_glimpse_witness.py
+          python tools/assert_pytest_skips.py "$RUNNER_TEMP/sidecar-pytest.xml"
       # No controller is the expected result: input-test returns 1.
       # pwsh forwards that native code as the step result unless the script exits 0 itself.
       - shell: pwsh
