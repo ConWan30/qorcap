@@ -1730,8 +1730,8 @@ def fill_challenge_results(bundle: Path, draft: dict, *, ffmpeg: str | None = No
     ``inputs.jsonl`` is one JSON object, there is a single header, chunk rows cover the window
     with no gap over 3 s, and the pad stayed connected from issue through 2.5 s after the
     deadline. From 0.3.34 a chunk row, including an empty one, is written every segment while
-    the HID reader has returned from a read since the previous seal. A hung read writes none,
-    so a hang that spans a whole segment leaves a gap and withholds. OPTIONS alone and a
+    the HID reader is alive (it has returned from a read since the previous seal). A hung read
+    writes none, so a hang that spans a whole segment leaves a gap and withholds. OPTIONS alone and a
     pattern whose later buttons fall after the deadline count. Verify then reports
     ``challenge_failed``, and Start Match exits 2 without the submit prompt. Submit for
     Verification still works later. A stall, including one recorded just after the deadline, an

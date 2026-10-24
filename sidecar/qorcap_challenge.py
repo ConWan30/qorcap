@@ -241,11 +241,13 @@ def inputs_log_intact(path: str | Path) -> bool:
 def pad_connected_through(records: list, *, issued_ms: int, deadline_ms: int, anchor_ms: int) -> bool:
     """True when status records show ``connected`` from issue through the stall lag.
 
-    Any status other than ``connected`` anywhere in
-    ``[issued_ms, deadline_ms + STALL_LAG_MS]`` fails the check, including an unplug
-    that reconnects before the deadline. A ``stalled`` row is written only after 2 s
-    with no reports, so the check runs 2.5 s past the deadline. A status row whose
-    ``t_us`` is not an integer, or whose ``state`` is not a string, fails closed.
+    Every status row at the latest wall time at or before ``issued_ms`` must be
+    ``connected``. A non-connected row at that same millisecond withholds, whichever
+    row would sort last. Any later status other than ``connected`` through
+    ``deadline_ms + STALL_LAG_MS`` fails too, including an unplug that reconnects
+    before the deadline. A ``stalled`` row is written only after 2 s with no reports,
+    so the check runs 2.5 s past the deadline. A status row whose ``t_us`` is not an
+    integer, or whose ``state`` is not a string, fails closed even outside that span.
     Times are the same wall clock as ``press_events`` (header ``wall_anchor_ms`` plus
     ``t_us``).
     """
@@ -258,18 +260,16 @@ def pad_connected_through(records: list, *, issued_ms: int, deadline_ms: int, an
             return False
         events.append((anchor_ms + t_us // 1000, state))
     events.sort()
-    state: str | None = None
-    i = 0
-    while i < len(events) and events[i][0] <= issued_ms:
-        state = events[i][1]
-        i += 1
-    if state != "connected":
+    last_open: int | None = None
+    for t, _state in events:
+        if t <= issued_ms:
+            last_open = t
+        else:
+            break
+    if last_open is None or any(state != "connected" for t, state in events if t == last_open):
         return False
-    while i < len(events) and events[i][0] <= deadline_ms + STALL_LAG_MS:
-        if events[i][1] != "connected":
-            return False
-        i += 1
-    return True
+    end = deadline_ms + STALL_LAG_MS
+    return all(state == "connected" for t, state in events if last_open < t <= end)
 
 
 def chunks_cover(records: list, *, issued_ms: int, deadline_ms: int, anchor_ms: int) -> bool:

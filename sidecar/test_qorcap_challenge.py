@@ -850,6 +850,78 @@ def test_bool_chunk_time_is_ignored(tmp_path):
     assert line["reason"] == "pattern_mismatch" and line["withheld"] == "controller_log"
 
 
+def test_non_string_status_outside_the_window_withholds(tmp_path):
+    """A non-string state outside the span still fails closed.
+
+    Inside the window, ``state != connected`` would withhold an integer anyway. Before
+    issue, a later ``connected`` row is the state at the open. After ``deadline + 2500``
+    the window scan never reads the row. Only the whole-file type check withholds these.
+    """
+    import qorcap_challenge as C
+
+    kick = _kickoff()
+    issued, deadline = kick["issued_ms"], kick["deadline_ms"]
+    t0 = issued + 1_000
+    presses = [_press(t0, "OPTIONS"), _press(t0 + 400, _wrong_button(kick["pattern"]))]
+    span = _chunk_span(issued, deadline)
+    past = deadline + C.STALL_LAG_MS + 1
+    cases = {
+        "before-issue": [
+            _header(),
+            {"type": "status", "t_us": 0, "state": 1, "detail": "1", "seg": 0},
+            _status(issued, "connected"),
+            *presses,
+            *span,
+        ],
+        "after-lag-number": [
+            *_mismatch_head(kick),
+            {"type": "status", "t_us": past * 1000, "state": 1, "detail": "1", "seg": 0},
+            *span,
+        ],
+        "after-lag-null": [
+            *_mismatch_head(kick),
+            {"type": "status", "t_us": past * 1000, "state": None, "detail": "null", "seg": 0},
+            *span,
+        ],
+    }
+    for name, rows in cases.items():
+        assert C.pad_connected_through(rows, issued_ms=issued, deadline_ms=deadline, anchor_ms=0) is False
+        stored, local = _boundary(tmp_path, name, rows)
+        assert stored is None and local["reason"] == "pattern_mismatch" and local["withheld"] == "controller_log"
+
+
+def test_mixed_status_at_the_opening_millisecond_withholds(tmp_path):
+    """Every status row at the last wall time <= issued_ms must be connected.
+
+    ``asleep`` sorts before ``connected``, so a last-row-wins sort would store the tie.
+    A non-connected row at an earlier millisecond does not, once a later connected row
+    is the opening time.
+    """
+    import qorcap_challenge as C
+
+    kick = _kickoff()
+    issued, deadline = kick["issued_ms"], kick["deadline_ms"]
+    t0 = issued + 1_000
+    presses = [_press(t0, "OPTIONS"), _press(t0 + 400, _wrong_button(kick["pattern"]))]
+    span = _chunk_span(issued, deadline)
+    for name, order in (("asleep-then-connected", ("asleep", "connected")),
+                        ("connected-then-asleep", ("connected", "asleep"))):
+        rows = [_header(), *[_status(issued, state) for state in order], *presses, *span]
+        assert C.pad_connected_through(rows, issued_ms=issued, deadline_ms=deadline, anchor_ms=0) is False
+        stored, local = _boundary(tmp_path, name, rows)
+        assert stored is None and local["reason"] == "pattern_mismatch" and local["withheld"] == "controller_log"
+    earlier = [
+        _header(),
+        _status(issued - 1, "asleep"),
+        _status(issued, "connected"),
+        *presses,
+        *span,
+    ]
+    assert C.pad_connected_through(earlier, issued_ms=issued, deadline_ms=deadline, anchor_ms=0) is True
+    stored, local = _boundary(tmp_path, "earlier-ms", earlier)
+    assert stored["reason"] == "pattern_mismatch" and "withheld" not in local
+
+
 def test_non_string_status_state_withholds(tmp_path):
     """A status state that is not a string fails closed. An unknown string does too."""
     import qorcap_challenge as C
