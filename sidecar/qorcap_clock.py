@@ -25,9 +25,13 @@ Two ways back in, both stricter than one frame:
   can still land inside a ±1 s bin; over 3 s it cannot), ``run_min_distinct`` 3 (a hold is the
   stoppage path; three displayed seconds is what a 1:1 clock shows and a frozen one does not),
   ``run_tol_s`` 1 (a displayed second is a one-second bin, so a perfect 1:1 line stays within
-  1 s at every sample; the check is per sample, not just the endpoints). This is the one place
-  a clock #76 blanked may be kept. The kept value is the read itself, and it has to obey the
-  countdown. See ``docs/SCOREBUG_CLOCK_VOTE.md``.
+  1 s at every sample; the check is per sample, not just the endpoints). Over that window a
+  rate of about 0.7x–1.3x still fits; 2x does not. This is the one place a clock #76 blanked
+  may be kept. The kept value is the read itself. See ``docs/SCOREBUG_CLOCK_VOTE.md``.
+
+A second sustained line that disagrees with the accepted clock, higher or lower, blanks both.
+The contradicted line stays blocked. A different run, or a stoppage, may re-anchor. A lone
+runoff has no second line, so the running-clock gate still adopts it (FU1).
 
 Stoppage is a hold. With no ``t_ms`` the digits are read and the history is left alone.
 """
@@ -140,6 +144,10 @@ class ClockHistory:
         self.rule_note: str | None = None
         self.accepted_now = False
         self.continuation = False
+        self._dispute: list[tuple[int, int]] = []
+        self.suspended = False
+        # (t_ms, seconds) of a line that disagreed and must not be adopted again.
+        self._blocked_line: tuple[int, int] | None = None
 
     def _clear_cand(self) -> None:
         self._cand = None
@@ -158,10 +166,55 @@ class ClockHistory:
         self.last_accept_t = int(t_ms)
         self._clear_cand()
         self._clear_run()
+        if self.reanchored:
+            # A new anchor replaces the dispute. The blocked line stays blocked.
+            self._dispute = []
+            self.suspended = False
         self.accepted_now = True
         # Same quarter as the one already observed. A reset or a cut is not a continuation.
         self.continuation = prev_q is not None and self.last_q == prev_q
         return int(secs)
+
+    def _extend(self, series, secs: int, t_ms: int):
+        """Append one sample. A sample that breaks the 1:1 line starts a new run."""
+        sample = (int(t_ms), int(secs))
+        if not series:
+            return [sample]
+        trial = list(series) + [sample]
+        if not countdown_run_ok(trial, self.run_tol_s):
+            return [sample]
+        return trial
+
+    def _line_blocked(self, samples) -> bool:
+        """True when every sample still sits on the line a disagreement already rejected."""
+        if not self._blocked_line or not samples:
+            return False
+        t0, s0 = self._blocked_line
+        for t, s in samples:
+            expected = int(s0) - (int(t) - int(t0)) / 1000.0
+            if abs(int(s) - expected) > self.run_tol_s:
+                return False
+        return True
+
+    def _void(self, block: tuple[int, int] | None) -> None:
+        """Drop the accepted clock and do not adopt the run that contradicted it.
+
+        ``block`` is the line that must not re-enter: the stuck clock when the truth is
+        higher, the misread when the truth is what we had been accepting.
+        """
+        if block is not None:
+            self._blocked_line = (int(block[0]), int(block[1]))
+        self.last_s = None
+        self.last_accept_t = None
+        self.suspended = True
+        self._clear_run()
+        self._clear_cand()
+        self._dispute = []
+        self.accepted_now = False
+        self.continuation = False
+        self.reanchored = False
+        self.reanchor_kind = None
+        self.rule_note = "clock_disagree"
 
     def _reanchor(self, secs: int, t_ms: int) -> bool:
         """Stoppage: the same lower second, held. An increase never reaches this."""
@@ -192,26 +245,27 @@ class ClockHistory:
             return False
         if abs(drop - span / 1000.0) > self.run_tol_s:
             return False
+        # Every sample, not the endpoints. A mid-run jump fails here.
         return countdown_run_ok(samples, self.run_tol_s)
 
     def _offer_run(self, secs: int, t_ms: int) -> bool:
         """Append one gated sample. True when the run is a consistent 1:1 countdown."""
-        sample = (int(t_ms), int(secs))
-        if not self._run:
-            self._run = [sample]
-            return False
-        trial = self._run + [sample]
-        if not countdown_run_ok(trial, self.run_tol_s):
-            self._run = [sample]
-            return False
-        self._run = trial
+        self._run = self._extend(self._run, secs, t_ms)
         if not self._run_complete(self._run):
+            return False
+        if self._line_blocked(self._run):
+            self._clear_run()
             return False
         self.reanchored = True
         self.reanchor_kind = "run"
         self.last_run = list(self._run)
         self._clear_run()
         return True
+
+    def _offer_dispute(self, secs: int, t_ms: int) -> bool:
+        """A second 1:1 line that disagrees with the accepted clock. Completion voids both."""
+        self._dispute = self._extend(self._dispute, secs, t_ms)
+        return self._run_complete(self._dispute)
 
     def _too_high(self, secs: int) -> bool:
         if secs > QUARTER_CLOCK_MAX_S:
@@ -259,13 +313,26 @@ class ClockHistory:
                 return secs
             if self._too_high(secs):
                 return None
+            quarter_break = q is not None and self.last_q is not None and q != self.last_q
+            if self.suspended and not quarter_break:
+                # Blank until a different run, or a stoppage, re-anchors.
+                if self._reanchor(secs, t_ms) or self._offer_run(secs, t_ms):
+                    self.suspended = False
+                    return self._accept(secs, q, t_ms)
+                return None
+            self.suspended = False
+            self._blocked_line = None
             return self._accept(secs, q, t_ms)
         if q is not None and self.last_q is not None and q < self.last_q:
             # A quarter going backwards is a cut, not a reject.
+            self._blocked_line = None
+            self.suspended = False
             if self._too_high(secs):
                 return None
             return self._accept(secs, q, t_ms)
         if q is not None and (self.last_q is None or q > self.last_q):
+            self._blocked_line = None
+            self.suspended = False
             if 0 <= secs <= QUARTER_CLOCK_MAX_S:
                 return self._accept(secs, q, t_ms)
             self.rule_note = "clock_above_max"
@@ -273,10 +340,16 @@ class ClockHistory:
             self._clear_cand()
             return None
         if secs > self.last_s:
-            # Inside a quarter the clock cannot go up, not even if the higher second is held.
+            # Higher than the accepted clock. One frame is an increase. A sustained 1:1
+            # line (or a lower one, below) contradicts it: blank both, adopt neither.
             self.rule_note = "clock_increase"
             self._clear_run()
             self._clear_cand()
+            if self._offer_dispute(secs, t_ms):
+                block = None
+                if self.last_accept_t is not None and self.last_s is not None:
+                    block = (int(self.last_accept_t), int(self.last_s))
+                self._void(block)
             return None
         elapsed_s = 0 if self.last_accept_t is None else max(0.0, (t_ms - self.last_accept_t) / 1000.0)
         if self.last_s - secs <= int(elapsed_s) + 1:
@@ -285,6 +358,12 @@ class ClockHistory:
             return self._accept(secs, q, t_ms)
         if self._offer_run(secs, t_ms):
             return self._accept(secs, q, t_ms)
+        # Lower twin of the increase path. A lone runoff is accepted above and never gets
+        # here on its completing frame. A lower line that has outlasted the accepted clock
+        # (the accepted ticks cleared ``_run`` and left ``_dispute`` running) blanks both.
+        if self._offer_dispute(secs, t_ms):
+            origin = self._dispute[0] if self._dispute else None
+            self._void(origin)
         return None
 
 

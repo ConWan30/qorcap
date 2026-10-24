@@ -24,7 +24,7 @@ Why these numbers:
 * **4 reads.** One to three gated reads cannot finish the run. Same count as the stoppage gate.
 * **3 seconds.** Over two seconds a perfect 1:1 clock drops one or two displayed seconds, and a doubled clock can still sit inside a ±1 second bin. Over three seconds a doubled clock is about three seconds off that bin.
 * **3 distinct seconds.** A hold belongs to the stoppage gate. Three different displayed seconds is what three seconds of a 1:1 clock shows.
-* **Tolerance of 1 second, at every sample.** A displayed second is a one-second bin. A perfect 1:1 line `s0 - wall_seconds` stays within that bin. The tolerance is the bin, not slack for a faster rate. A jump in the middle fails even when the first and last samples would match.
+* **Tolerance of 1 second, at every sample.** Rates of about 0.7x–1.3x are accepted over the 3 s window (the values read are still the true display) and 2x is rejected. A displayed second is a one-second bin. A perfect 1:1 line `s0 - wall_seconds` stays within that bin at every sample. A jump in the middle fails even when the first and last samples would match.
 
 ## Vote
 
@@ -40,7 +40,9 @@ A score, a quarter, and a clock lock through the existing agreement window. The 
 | `suspicious_span_ms` | 2000 | `min_span_suspicious_ns` |
 | `jump_memory_ms` | 30000 | `jump_memory_ns` |
 
-A sample closer than 200 ms is not new evidence and does not reset the vote. One illegal frame blanks that frame and does not flip `allows_final_fallback`. The same disagreement, persisted across the vote, does. A gap longer than 2 s starts the count over. It does not clear a disagreement that already persisted. A legal read of a score the grammar accepts does.
+A sample closer than 200 ms is not new evidence and does not reset the vote. One illegal frame blanks that frame and does not flip `allows_final_fallback`. The same disagreement, persisted across the vote, does. A gap longer than 2 s starts the count over. It does not clear a disagreement that already persisted. Clearing takes the same 3 reads of the locked score. One read that matches the stale lock does not clear it.
+
+A clock that has been accepted, and is then contradicted by another sustained 1:1 line at this same bar (higher or lower), blanks both values. The contradicted line does not re-enter. A different run, or a stoppage, can re-anchor. A lone runoff is still adopted: that is the running-clock gate.
 
 An implausible jump still needs 9 samples over 2 s before the agreement window will lock it. A forged decrease can re-anchor inside the grammar and still leave the final abstaining, because the re-anchor stays unconfirmed until that window locks the same pair.
 

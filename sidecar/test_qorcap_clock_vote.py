@@ -181,6 +181,94 @@ def test_running_clock_reanchor_rejects_an_increase():
     assert h.filter(95, 1, 20_000) is None and h.rule_note == "clock_increase"
 
 
+def test_running_gate_rejects_a_mid_run_jump():
+    """(a) The every-sample countdown check. Endpoints sit on 1:1; the middle jumps."""
+    h = ClockHistory()
+    assert h.filter(120, 1, 0) == 120
+    # 80, 79, then 90, then back to 77. First and last are 80 - wall_seconds.
+    for t, secs in ((100, 80), (1_100, 79), (2_100, 90), (3_100, 77)):
+        assert h.filter(secs, 1, t) is None
+    assert h.last_s == 120 and h.reanchor_kind is None
+
+
+def test_running_gate_checks_every_sample_against_tolerance():
+    """(b) Per-sample tolerance. Monotonic, endpoints on 1:1, one middle sample 1.5 s off."""
+    h = ClockHistory()
+    assert h.filter(120, 1, 0) == 120
+    # From 80: t=2600 expects 77.5. 79 is 1.5 s high. Endpoints drop 3 s in 3 s.
+    for t, secs in ((100, 80), (1_100, 79), (2_100, 79), (2_600, 79), (3_100, 77)):
+        assert h.filter(secs, 1, t) is None
+    assert h.last_s == 120 and h.reanchor_kind is None
+
+
+def test_running_gate_needs_three_distinct_seconds():
+    """(d) Two displayed seconds over 3 s is not a running clock."""
+    h = ClockHistory()
+    assert h.filter(120, 1, 0) == 120
+    # 80, 80, 77, 77. Each sample is within 1 s of 80 - wall_seconds. Only two seconds.
+    for t, secs in ((100, 80), (1_100, 80), (2_100, 77), (3_100, 77)):
+        assert h.filter(secs, 1, t) is None
+    assert h.last_s == 120 and h.reanchor_kind is None
+
+
+def test_running_gate_does_not_finish_on_two_reads():
+    """(e) The read-count check in the real gate. Two samples cannot show three seconds,
+    so distinct is lowered only to keep that other rule from hiding a broken count."""
+    h = ClockHistory(run_min_distinct=1)
+    assert h.run_reads == 4
+    assert h.filter(120, 1, 0) == 120
+    assert h.filter(80, 1, 100) is None
+    assert h.filter(77, 1, 3_100) is None
+    assert h.last_s == 120 and h.reanchor_kind is None
+
+
+def test_ten_second_low_misread_emits_nothing_wrong_after_disagreement():
+    """A 1:1 track 10 s low can enter through the running gate. Once a sustained line
+    disagrees with it, both go blank, and the low line does not come back."""
+    h = ClockHistory()
+    assert h.filter(80, 1, 0) == 80
+    entered = False
+    detected = False
+    wrong_after = []
+    for i in range(1, 70):
+        t = i * 500
+        truth = 80 - t // 1000
+        if t < 8_000:
+            read = truth - 10
+        elif t < 16_000:
+            read = truth
+        else:
+            read = truth - 10
+        got = h.filter(read, 1, t)
+        if t < 8_000 and got is not None and got == read:
+            entered = True
+        if h.rule_note == "clock_disagree":
+            detected = True
+        if detected and got is not None and got != truth:
+            wrong_after.append((t, got, truth))
+    assert entered and detected
+    assert wrong_after == []
+    assert h.last_s is None or h.last_s == 80 - h.last_accept_t // 1000
+
+
+def test_a_lower_ten_second_misread_blanks_both_once_it_persists():
+    """The other direction: truth is still being read, and a 10 s-low line lasts the run bar."""
+    h = ClockHistory()
+    assert h.filter(80, 1, 0) == 80
+    detected = False
+    wrong = []
+    for i in range(1, 50):
+        t = i * 500
+        truth = 80 - t // 1000
+        read = truth if detected or i % 2 else truth - 10
+        got = h.filter(read, 1, t)
+        if h.rule_note == "clock_disagree":
+            detected = True
+        if detected and got is not None and got != truth:
+            wrong.append((t, got, truth))
+    assert detected and wrong == []
+
+
 def test_stoppage_reanchor_still_accepts_a_held_lower_clock():
     h = ClockHistory()
     assert h.filter(90, 1, 0) == 90
@@ -199,6 +287,19 @@ def test_lock_vote_matches_the_agreement_window():
     assert cfg == AgreementConfig()
     assert cfg.need == 3 and cfg.min_span_ns == 400_000_000
     assert cfg.need_suspicious == 9 and cfg.min_span_suspicious_ns == 2_000_000_000
+
+
+def test_vote_gap_restarts_an_unpersisted_disagreement():
+    """(c) Samples more than 2 s apart do not add up to a persisted disagreement."""
+    g = _locked(7, 14)
+    assert g.filter(_fr(11, 14), 1_000, None).left_score is None
+    assert g.filter(_fr(12, 14), 1_200, None).left_score is None
+    assert g.allows_final_fallback() is True
+    # 3.3 s after the previous illegal read. A gap restarts the count at 1.
+    assert g.filter(_fr(16, 14), 4_500, None).left_score is None
+    assert g.allows_final_fallback() is True
+    assert g.filter(_fr(11, 14), 4_700, None).left_score is None
+    assert g.allows_final_fallback() is True
 
 
 def test_one_outlier_does_not_move_the_lock_or_the_final():
@@ -237,8 +338,17 @@ def test_a_legal_read_clears_a_disagreement_and_a_close_burst_is_one_sample():
     for t in (0, 50, 100, 150):
         g.filter(_fr(7, 7), t, None)
     assert g.allows_final_fallback() is True  # closer than 200 ms: one sample
-    back = g.filter(_fr(7, 14), 500, None)
-    assert back.pair == (7, 14) and g.locked == (7, 14)
+    # One read of the locked score does not clear a disagreement that already persisted.
+    g.filter(_fr(11, 14), 1_000, None)
+    g.filter(_fr(12, 14), 1_200, None)
+    g.filter(_fr(16, 14), 1_400, None)
+    assert g.allows_final_fallback() is False
+    assert g.filter(_fr(7, 14), 1_800, None).pair == (7, 14)
+    assert g.locked == (7, 14) and g.allows_final_fallback() is False
+    # The same vote that sets a disagreement: 3 reads, 200 ms apart, spanning 400 ms.
+    assert g.filter(_fr(7, 14), 2_000, None).pair == (7, 14)
+    assert g.allows_final_fallback() is False
+    assert g.filter(_fr(7, 14), 2_200, None).pair == (7, 14)
     assert g.allows_final_fallback() is True
 
 
@@ -295,6 +405,39 @@ def test_forged_frames_do_not_name_7_7():
             published = fr.pair
     assert published is None and g.allows_final_fallback() is False
     assert _final_from(g, fallback)["winner"] == "unknown"
+
+
+def test_mirror_f3_true_final_interleaved_with_stale_reshows_does_not_publish_the_stale_lock():
+    """Stale re-shows of the lock, interleaved with a true new final, last read true.
+
+    One matching read must not clear the disagreement. The published result is an abstain
+    or the true final, never the stale lock: those two re-shows did not persist.
+    """
+    g = ScoreGrammar()
+    agree = AgreementWindow(lock_agreement_config())
+    end = _seed(g, agree, 7, 7, 4, t0=0)
+    # Far enough from the seed that the agreement window does not still be holding 7-7.
+    t0 = end + 3_000
+    for i, pair in enumerate(((7, 11), (7, 12), (7, 16))):
+        t = t0 + i * 200
+        fr = g.filter(_fr(*pair), t, None)
+        agree.offer(fr, clock_ns=t * 1_000_000, crop_hash="crop", session_id="s")
+    assert g.locked == (7, 7) and g.allows_final_fallback() is False
+    published = None
+    # True 7-14 (+7, abstain) interleaved with the stale 7-7. Last read is the true final.
+    seq = ((7, 14), (7, 7), (7, 14), (7, 7), (7, 14))
+    for i, pair in enumerate(seq):
+        t = t0 + 1_000 + i * 400
+        fr = g.filter(_fr(*pair), t, None)
+        res = agree.offer(fr, clock_ns=t * 1_000_000, crop_hash="crop", session_id="s")
+        if res.agreed and fr.pair is not None:
+            g.note_lock(t, fr.pair[0], fr.pair[1])
+            published = fr.pair
+    assert g.allows_final_fallback() is False
+    final = _final_from(g, {"home": 7, "away": 7, "quarter": 4, "t_ms": t0})
+    assert published in (None, (7, 14))
+    assert (final["away_score"], final["home_score"]) != (7, 7)
+    assert final["winner"] == "unknown" or (final["away_score"], final["home_score"]) == (7, 14)
 
 
 def test_interleaved_true_frames_do_not_lock_the_forgery():

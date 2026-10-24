@@ -37,7 +37,9 @@ The vote uses the agreement window's numbers: ``vote_reads`` 3, ``vote_interval_
 evidence and is not a reset. One illegal frame blanks that frame and does not flip
 ``allows_final_fallback``. The same illegal run, persisted across the vote, does. A gap longer
 than ``vote_gap_ms`` starts the count over and does not clear a disagreement that already
-persisted. ``suspicious_reads`` 9 over ``suspicious_span_ms``
+persisted. Clearing takes the same persistence: 3 reads of the locked score, spanning the vote,
+inside the gap. One read that matches the stale lock does not clear it. ``suspicious_reads`` 9
+over ``suspicious_span_ms``
 2_000 is the agreement window's bar for an implausible jump, so a short forged decrease still
 cannot confirm a re-anchor. See ``docs/SCOREBUG_CLOCK_VOTE.md``.
 
@@ -172,6 +174,10 @@ class ScoreGrammar:
         self._vote_n = 0
         self._vote_t0: int | None = None
         self._vote_last: int | None = None
+        self._clear_n = 0
+        self._clear_t0: int | None = None
+        self._clear_last: int | None = None
+        self._clear_pair: tuple[int, int] | None = None
 
     def _cut(self) -> None:
         """Drop the anchor. Keep an open try so the same score can be re-locked legally."""
@@ -247,6 +253,25 @@ class ScoreGrammar:
         if self._vote_n >= int(self.vote_reads) and span >= int(self.vote_span_ms):
             self.disagreeing = True
 
+    def _note_clear(self, t_ms: int, pair: tuple[int, int]) -> None:
+        """A read of the locked score. One does not clear ``disagreeing``."""
+        t_ms = int(t_ms)
+        last = self._clear_last
+        if (pair != self._clear_pair or last is None or t_ms < last
+                or t_ms - last > int(self.vote_gap_ms)):
+            self._clear_pair = pair
+            self._clear_n = 1
+            self._clear_t0 = t_ms
+            self._clear_last = t_ms
+            return
+        if t_ms - last < int(self.vote_interval_ms):
+            return
+        self._clear_n += 1
+        self._clear_last = t_ms
+        span = t_ms - (t_ms if self._clear_t0 is None else int(self._clear_t0))
+        if self._clear_n >= int(self.vote_reads) and span >= int(self.vote_span_ms):
+            self.disagreeing = False
+
     def _reanchor(self, pair: tuple[int, int], t_ms: int) -> bool:
         """True when this gated pair has agreed for K reads spanning T milliseconds."""
         t_ms = int(t_ms)
@@ -285,7 +310,16 @@ class ScoreGrammar:
         if decision != "abstain":
             self._clear_cand()
             self._clear_vote()
-            self.disagreeing = False
+            # Matching the lock can clear a disagreement, but only after the same vote
+            # that sets one. One stale re-show does not. A different legal score does not
+            # either: that would publish the stale lock through the fallback.
+            if self.locked is not None and pair == self.locked:
+                self._note_clear(int(t_ms), pair)
+            else:
+                self._clear_pair = None
+                self._clear_n = 0
+                self._clear_t0 = None
+                self._clear_last = None
             return fr
         self._note_disagreement(int(t_ms))
         if not self._reanchor(pair, t_ms):
