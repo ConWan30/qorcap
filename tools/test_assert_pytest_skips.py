@@ -1,4 +1,6 @@
 """A Windows-only submit skip must fail the job when it is recorded on Linux."""
+import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -228,39 +230,91 @@ def test_explicit_xfail_strict_false_fails(tmp_path, monkeypatch, capsys):
     assert needle in capsys.readouterr().err
 
 
-def test_list_failure_and_an_empty_list_do_not_run_pytest():
-    """A failing ``$(...)`` trips errexit, and an empty array does not run pytest.
+def _git_bash() -> str:
+    """Bash CI actually runs. On Windows, ``bash`` on PATH is the WSL stub.
 
-    Builtins, not ``python``. On the Windows runner a nested bash resolves
-    ``python`` to the Store alias, which writes a UTF-16 "to install" line to
-    stdout and exits before the empty-list guard. The workflow's own ``python``
-    is the interpreter setup-python put on PATH.
+    That stub writes a UTF-16 "Windows Subsystem for Linux ... to install"
+    line and exits 1, so a test that calls it never reaches the suite guard.
+    GitHub's shell is ``C:\\Program Files\\Git\\bin\\bash.EXE -e``.
     """
+    if os.name != "nt":
+        return "bash"
+    candidates = []
+    exepath = os.environ.get("EXEPATH", "")
+    if exepath:
+        candidates.append(os.path.join(exepath, "bin", "bash.exe"))
+        candidates.append(os.path.join(exepath, "usr", "bin", "bash.exe"))
+    candidates.extend(
+        [
+            r"C:\Program Files\Git\bin\bash.exe",
+            r"C:\Program Files\Git\usr\bin\bash.exe",
+        ]
+    )
+    for path in candidates:
+        if os.path.isfile(path):
+            return path
+    found = shutil.which("bash") or ""
+    if found and "system32" not in found.replace("/", "\\").lower():
+        return found
+    raise RuntimeError(f"Git bash not found; refusing the WSL stub {found!r}")
+
+
+def _list_guard_script(suite: str, command: str) -> str:
+    """The workflow's list capture, with ``command`` in place of ``python --list``.
+
+    The assignment and the empty-array ``if`` are taken from ci.yml. A printed
+    line plus a non-zero status stands in for a crashing ``--list`` that still
+    wrote a path: ``mapfile < <(...)`` keeps that path and would continue.
+    ``:`` stands in for an empty successful list.
+    """
+    text = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+    py = f"python tools/assert_pytest_skips.py --list {suite}"
+    inner = f"$({py})"
+    needle = f"SIDECAR_TESTS=({inner})"
+    mapfile_line = f"mapfile -t SIDECAR_TESTS < <({py})"
+    if needle in text:
+        start = text.index(needle)
+        source, repl = inner, f"$({command})"
+    elif mapfile_line in text:
+        start = text.index(mapfile_line)
+        source, repl = f"<({py})", f"<({command})"
+    else:
+        raise AssertionError(f"no suite list capture for {suite}")
+    stop = text.index("python -m pytest", start)
+    return text[start:stop].replace(source, repl, 1) + "echo ran\n"
+
+
+def test_list_failure_and_an_empty_list_do_not_run_pytest():
+    """Run the ci.yml guard under ``bash -e``, the same flag GitHub passes.
+
+    A failing ``$(...)`` must not reach ``echo ran`` even when it printed a
+    path. An empty array must take the workflow's ``if`` and exit 1.
+    """
+    bash = _git_bash()
+    # Prints one path, then exits 3. Errexit must stop before pytest; an empty
+    # array check would not, because the array has that path.
     crash = subprocess.run(
-        ["bash", "-c", "set -e\nSIDECAR_TESTS=($(false))\necho ran\n"],
+        [
+            bash,
+            "-e",
+            "-o",
+            "pipefail",
+            "-c",
+            _list_guard_script("linux", "echo sidecar/test_pairing.py; exit 3"),
+        ],
         capture_output=True,
         text=True,
     )
-    assert crash.returncode != 0
-    assert "ran" not in crash.stdout
+    assert crash.returncode != 0, (crash.returncode, crash.stdout, crash.stderr)
+    assert "ran" not in crash.stdout, (crash.returncode, crash.stdout, crash.stderr)
     empty = subprocess.run(
-        [
-            "bash",
-            "-c",
-            "set -e\n"
-            "SIDECAR_TESTS=($(:))\n"
-            'if [[ ${#SIDECAR_TESTS[@]} -eq 0 ]]; then\n'
-            '  echo "sidecar linux suite list is empty" >&2\n'
-            "  exit 1\n"
-            "fi\n"
-            "echo ran\n",
-        ],
+        [bash, "-e", "-o", "pipefail", "-c", _list_guard_script("windows", ":")],
         capture_output=True,
         text=True,
     )
     assert empty.returncode == 1, (empty.returncode, empty.stdout, empty.stderr)
     assert "empty" in empty.stderr, (empty.returncode, empty.stdout, empty.stderr)
-    assert "ran" not in empty.stdout
+    assert "ran" not in empty.stdout, (empty.returncode, empty.stdout, empty.stderr)
 
 
 def test_missing_required_file_fails_even_when_the_count_is_high(tmp_path):
