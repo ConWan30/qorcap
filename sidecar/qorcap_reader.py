@@ -756,12 +756,16 @@ class ReaderCore:
                 self.stats["pause_capable"] = self.stats.get("pause_capable", 0) + 1
                 print(f"pause-capable moment ({ev.basis}): Q{ev.quarter} -> {ev.phase} challenge may open", file=sys.stderr)
         try:
-            fr = self.reader.read(rimg)
+            if getattr(self.reader, "accepts_time", False):
+                fr = self.reader.read(rimg, t_ms=t_ms)
+            else:
+                fr = self.reader.read(rimg)
             band, _ = self.reader.reference_band(rimg) if hasattr(self.reader, "reference_band") else (None, None)
         except Exception as e:  # never silent
             self.stats["errors"] += 1
             print(f"scorebug reader error: {type(e).__name__}: {e}", file=sys.stderr)
             return
+        self._note_reanchor(t_ms, fr)
         fr = self._hold_quarter(fr, t_ms)
         absent = (not fr.ok) and fr.reason in NOT_VISIBLE
         self._observe(t_ms, img, absent)
@@ -800,8 +804,38 @@ class ReaderCore:
         self.score_lock.remember(got.pair, t_ms * 1_000_000)
         self._post_agreed(t_ms, got, True)
 
+    def _note_reanchor(self, t_ms: int, fr) -> None:
+        """Record a re-anchor on the sidecar callback. The score event itself is unchanged.
+
+        ``score_timeline.v0`` has no field for these flags, and the checkpoint evidence
+        is the existing score object. The note stays out of both.
+        """
+        detail = getattr(fr, "detail", None) or {}
+        grammar = detail.get("grammar_reanchor") is True
+        clock = detail.get("clock_reanchor") is True
+        if not grammar and not clock:
+            return
+        row = {
+            "t_ms": int(t_ms),
+            "away": getattr(fr, "left_score", None),
+            "home": getattr(fr, "right_score", None),
+        }
+        quarter = getattr(fr, "quarter", None)
+        if quarter is not None:
+            row["quarter"] = quarter
+        if grammar:
+            row["grammar_reanchor"] = True
+        if clock:
+            row["clock_reanchor"] = True
+        note = getattr(self, "reanchor_note", None)
+        if note is not None:
+            note(row)
+
     def _post_agreed(self, t_ms: int, read, soft: bool) -> None:
         from types import SimpleNamespace
+        note = getattr(self.reader, "note_lock", None)
+        if note is not None and getattr(read, "left_score", None) is not None and getattr(read, "right_score", None) is not None:
+            note(t_ms, read.left_score, read.right_score)
         res = SimpleNamespace(read=read)
         if soft and hasattr(self.agree, "last_agreed"):
             self.agree.last_agreed = res.read.pair

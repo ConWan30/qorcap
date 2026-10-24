@@ -411,10 +411,11 @@ class AutoProfileReader:
     only tried when the active one stops seeing its layout). ``profile_counts`` is reported in the bundle."""
 
     wants_full_res = True
+    accepts_time = True
 
     def __init__(self, standard, extra: list | None = None, prep=None) -> None:
         self.readers = [standard] + list(extra if extra is not None else default_extra_readers())
-        self.prep = prep  # downscale applied to frames for the standard reader (keeps it bit-identical to before)
+        self.prep = prep  # readers that do not take the full frame still see the 640x360 prep
         self.active = 0
         self.profile_counts: dict[str, int] = {}
         self._last = 0
@@ -432,12 +433,12 @@ class AutoProfileReader:
     def _frame_for(self, r, img):
         return img if getattr(r, "wants_full_res", False) or self.prep is None else self.prep(img)
 
-    def read(self, img):
+    def read(self, img, t_ms=None):
         order = [self.active] + [i for i in range(len(self.readers)) if i != self.active]
         first = None
         for i in order:
             r = self.readers[i]
-            fr = r.read(self._frame_for(r, img))
+            fr = self._read_one(r, img, t_ms)
             if first is None:
                 first = (i, fr)
             if fr.ok or fr.reason not in NOT_VISIBLE:
@@ -452,6 +453,21 @@ class AutoProfileReader:
                 return fr
         self._last = first[0]
         return first[1]
+
+    def _read_one(self, r, img, t_ms):
+        frame = self._frame_for(r, img)
+        if t_ms is not None and getattr(r, "accepts_time", False):
+            return r.read(frame, t_ms=t_ms)
+        return r.read(frame)
+
+    def note_lock(self, t_ms: int, away: int, home: int) -> None:
+        """Forward a lock only for the standard bar. Primetime locks do not enter that grammar."""
+        r = self.readers[self._last]
+        if self._pid(r) != "madden27_standard":
+            return
+        note = getattr(r, "note_lock", None)
+        if note is not None:
+            note(t_ms, away, home)
 
     def reference_band(self, img):
         r = self.readers[self._last]

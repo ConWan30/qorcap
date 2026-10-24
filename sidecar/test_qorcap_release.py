@@ -15,6 +15,22 @@ import qorcap_release as rel  # noqa: E402
 BANNED = ("attested", "attestation", "hardware-verified", "hardware verified")
 
 
+def test_release_without_a_banner_pack_installs_and_runs(tmp_path):
+    files, _dynamic, bad = rel.discover_runtime_files(HERE)
+    assert bad == []
+    assert "sidecar/packs/madden27_banner_fragments.npz" not in files
+    root = rel.stage_runtime_layout(ROOT, tmp_path / "qorcap-v0-windows-x64")
+    assert not (root / "sidecar" / "packs" / "madden27_banner_fragments.npz").is_file()
+    assert rel.check_install(root) == []
+    script = root / "sidecar" / "qorcap_banner.py"
+    spec = importlib.util.spec_from_file_location("qorcap_banner_staged", script)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    assert module._load() == (None, None)
+    assert module.detect_banner(object(), None) is None
+
+
 def test_audit_finds_the_schema_and_skips_optional_programs():
     files, _dynamic, bad = rel.discover_runtime_files(HERE)
     assert bad == []
