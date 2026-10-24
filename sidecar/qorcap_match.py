@@ -1186,6 +1186,8 @@ def main(argv=None) -> int:
                 say("\n\nStopping (you pressed a key) ...")
                 break
             if reason in ("final", "post_final_tail"):
+                # post_final_tail is not produced here: final_seen_at is set only when a
+                # final object exists, and capture_stop_reason returns None without that clock.
                 stop_reason = reason
                 _remember_tail_stop(state, now_mono, int(time.time() * 1000))
                 if reason == "post_final_tail":
@@ -1274,10 +1276,11 @@ def main(argv=None) -> int:
     elif unresolved:
         draft = apply_stopped_match_final(draft, None, grammar_unresolved=True)
     if not a.test_pattern and draft["result"].get("method") != "end_menu_read" and a.ffmpeg:
-        draft = tail_final_check(bundle, draft, ffmpeg=a.ffmpeg, grammar_unresolved=unresolved)
+        draft = tail_final_check(bundle, draft, ffmpeg=a.ffmpeg, grammar_unresolved=unresolved, live_final=live_fin)
     elif not a.test_pattern and draft["result"].get("method") == "end_menu_read" and draft["result"].get("final_confirmed") is not True and a.ffmpeg:
         # Stop-time fallback: re-read with bundle haptics/clips so a live-uncorroborated delta can still confirm.
-        draft = tail_final_check(bundle, draft, ffmpeg=a.ffmpeg, grammar_unresolved=unresolved)
+        # A disputed end menu is not re-read: the first agreeing frame would exact-match and upgrade it.
+        draft = tail_final_check(bundle, draft, ffmpeg=a.ffmpeg, grammar_unresolved=unresolved, live_final=live_fin)
     from qorcap_reanchor_notes import record_unresolved_final
     record_unresolved_final(bundle, draft.get("result"))
     if not a.test_pattern and a.audio != "none":
@@ -2126,16 +2129,56 @@ def _final_was_posted(state: dict) -> bool:
     return isinstance(got, dict)
 
 
+def _scorebug_tied_not_over(row) -> bool:
+    """A tied OT scorebug, or any tie at 0:00, does not start the tail from the screen span.
+
+    The shared classifier still labels that picture. A posted end-menu final after the
+    same scorebug (regulation 10-10, menu 10-16) still starts the tail.
+    """
+    if not isinstance(row, dict):
+        return False
+    home, away = row.get("home"), row.get("away")
+    if isinstance(home, bool) or isinstance(away, bool):
+        return False
+    if not isinstance(home, int) or not isinstance(away, int) or home != away:
+        return False
+    q = row.get("quarter")
+    if isinstance(q, int) and not isinstance(q, bool) and q >= 5:
+        return True
+    return row.get("clock_s") == 0
+
+
+def _latest_scorebug_row(core):
+    timeline = getattr(core, "timeline", None)
+    if not isinstance(timeline, list):
+        return None
+    found = None
+    found_t = None
+    for row in timeline:
+        if not isinstance(row, dict) or "obs" in row or "home" not in row:
+            continue
+        t = _ms(row.get("t_ms"))
+        if t is None:
+            continue
+        if found_t is None or t >= found_t:
+            found, found_t = row, t
+    return found
+
+
 def observe_final_screen(state: dict, now: float, *, wall_ms: int | None = None) -> bool:
     """Start the tail from a committed final_screen span or a posted end-screen final.
 
     ``stats['final_screen']`` counts every accepted frame and is not this trigger.
     A scorebug read after the screen clears the clock. The next call can start again
     only from a screen or final that is newer than that read.
+    A committed span whose latest scorebug is still tied (OT, or 0:00) does not start
+    the tail. The posted end-menu final after that tie still does.
     """
     core = state.get("core")
     after = _latest_scorebug_t(core) if core is not None else None
     span = _committed_final_screen(core, after) if core is not None else None
+    if span is not None and _scorebug_tied_not_over(_latest_scorebug_row(core)):
+        span = None
     fin = None if span is not None else _posted_screen_final(state, after)
     if span is None and fin is None:
         if state.get("final_screen_mono") is not None:
@@ -2165,6 +2208,12 @@ def capture_stop_reason(state: dict, now: float, *, tail_s: float) -> str | None
     No posted-final clock means no auto-stop. A screen by itself does not invent one.
     ``tail_s`` == 0 is today's rule. The reason is ``final`` only when a final was posted.
     Otherwise a stop that got here is ``post_final_tail``.
+
+    ``main()`` sets ``final_seen_at`` only when a final object already exists, and this
+    function returns None when that clock is missing. The live loop therefore does not
+    emit ``post_final_tail``. The return stays so a deadline with no final object is not
+    reported as ``final``. ``test_screen_alone_does_not_stop_and_a_stop_without_a_final_is_not_final``
+    locks it.
     """
     err = state.get("source_error")
     if isinstance(err, str) and err:
@@ -2180,6 +2229,9 @@ def capture_stop_reason(state: dict, now: float, *, tail_s: float) -> str | None
     screen_at = _mono(state.get("final_screen_mono"))
     if tail_s > 0 and screen_at is not None and now - screen_at < tail_s:
         return None
+    # Unreachable from main(): that loop does not set final_seen_at without a final
+    # object, and a missing clock already returned None above. Kept so this shape is
+    # not called "final". The unit test calls it directly.
     if not _final_was_posted(state):
         return "post_final_tail"
     return "final"
@@ -2240,15 +2292,44 @@ def record_post_final_tail(bundle: Path, *, configured_s: float, start_reason: s
     (bundle / POST_FINAL_TAIL_NAME).write_text(json.dumps(rec, indent=2) + "\n", encoding="utf-8")
 
 
+def end_menu_was_disputed(fin) -> bool:
+    """The live end menu disagreed with itself. That final stays unconfirmed.
+
+    The flag is on the posted final. The note is the receipt-visible record: receipt
+    schema drops unknown result fields, and this note is already one of them.
+    """
+    if not isinstance(fin, dict):
+        return False
+    if fin.get("end_menu_disputed") is True:
+        return True
+    return any(isinstance(n, str) and "disagreed with the posted" in n for n in (fin.get("notes") or []))
+
+
+def _disputed_final_result(draft: dict, live_final: dict) -> dict:
+    """Keep the posted score and the dispute note. Do not let a re-read confirm it."""
+    result = apply_final(draft.get("result") or {}, live_final)
+    result["final_confirmed"] = False
+    notes = [n for n in (live_final.get("notes") or []) if isinstance(n, str)]
+    if notes:
+        result["notes"] = notes
+    return dict(draft, result=result)
+
+
 def tail_final_check(bundle: Path, draft: dict, *, ffmpeg: str, secs: int = TAIL_SECS, hz: float = TAIL_HZ,
-                     core_factory=None, frames=None, grammar_unresolved: bool = False) -> dict:
+                     core_factory=None, frames=None, grammar_unresolved: bool = False,
+                     live_final=None) -> dict:
     """Live final missed: read the last ``secs`` of the recorded video (end-of-game menu) with the same reader,
     seeded with the live timeline, and confirm the final from recorded frames. Saves clips/final-recorded.mp4
     and final.tail.json. Checkpoints are untouched (the chain is sealed at stop); only the draft result changes.
 
     The live post-final tail (``post_final_tail_s``) only keeps the recorder running before this. It does not
     change the result written here. ``hz`` stays ``TAIL_HZ``.
+
+    A disputed live final is not re-read. The re-read stops at the first end-menu agreement, so a
+    later disagreeing menu is invisible and the first score would be posted again as an exact match.
     """
+    if end_menu_was_disputed(live_final):
+        return _disputed_final_result(draft, live_final)
     live = [r for r in read_jsonl(bundle / "timeline.jsonl") if "obs" not in r and "home" in r]
     if not live:
         return draft

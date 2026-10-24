@@ -697,32 +697,13 @@ class ReaderCore:
             return True
         return False
 
-    def _tied_score_is_not_over(self, last: dict | None) -> bool:
-        """A tied scorebug is not the end of the game.
-
-        ``_clock_ready_for_end_menu`` is true for every OT read, including a tie
-        with time left (OT 14-14 at 4:00), and for Q4 at 0:00 even when the
-        score is tied and the game is heading to overtime. Those two paths must
-        not label ``final_screen``. The end-menu reader still runs, so a later
-        untied menu (regulation 10-10, menu 10-16) can post.
-        """
-        if not last:
-            return False
-        home, away = last.get("home"), last.get("away")
-        if isinstance(home, bool) or isinstance(away, bool):
-            return False
-        if not isinstance(home, int) or not isinstance(away, int) or home != away:
-            return False
-        q = last.get("quarter")
-        if isinstance(q, int) and not isinstance(q, bool) and q >= 5:
-            return True
-        return last.get("clock_s") == 0
-
     def _accept_final_screen(self, t_ms: int) -> bool:
-        """Label ``final_screen`` only in end-of-game context, and not on an OPTIONS pause unless it stays up."""
+        """Label ``final_screen`` only in end-of-game context, and not on an OPTIONS pause unless it stays up.
+
+        A tied scorebug is still this picture. QorTime imports ``ReaderCore``. Whether that
+        tie starts the post-final tail is decided in the match runner, not here.
+        """
         if not self._end_context(t_ms):
-            return False
-        if self._tied_score_is_not_over(self._scorebug_for_final()):
             return False
         held = 0 if self._pixel_match_since is None else max(0, t_ms - self._pixel_match_since)
         if self._opened_by_options(t_ms) and held < OPTIONS_COINCIDENT_HOLD_MS:
@@ -1003,8 +984,6 @@ class ReaderCore:
         """
         q_last = last.get("quarter")
         # A walk-off can leave time on the clock, so OT stays clock-ready here.
-        # A tied OT (or a tied Q4 at 0:00) is not a final screen: ``_accept_final_screen``
-        # refuses those via ``_tied_score_is_not_over``. The menu reader still runs.
         if isinstance(q_last, int) and not isinstance(q_last, bool) and q_last >= 5:
             return True
         if t_ms is not None and self.periods.reached_end_of_game(t_ms):
@@ -1085,7 +1064,8 @@ class ReaderCore:
         sb = {"home": last["home"], "away": last["away"], "quarter": last["quarter"], "clock_s": last.get("clock_s"),
               "t_ms": last["t_ms"]}
         notes = list(notes_c)
-        corr = end_menu_delta_corroborated(st, last, self.timeline, self.delta_corroboration)
+        corr = end_menu_delta_corroborated(
+            st, last, self.timeline, self.delta_corroboration, pixel_match_ms=self._pixel_match_since)
         confirmed = corr is not None and corr.get("kind") != "no_scorebug"
         if (sb["away"], sb["home"]) != (st["away"], st["home"]):
             notes.append(f"final play score not shown on scorebug: last scorebug read AWAY {sb['away']} - HOME {sb['home']}"
@@ -1126,6 +1106,7 @@ class ReaderCore:
             "final_confirmed=false")
         self.final = dict(self.final)
         self.final["final_confirmed"] = False
+        self.final["end_menu_disputed"] = True
         self.final["notes"] = notes
         print(f"END MENU disagreed: posted AWAY {self.final.get('away')} - HOME {self.final.get('home')} kept, "
               f"later read AWAY {st['away']} - HOME {st['home']} not used; final_confirmed=false",
@@ -1196,7 +1177,7 @@ def end_menu_consistency(st: dict, last: dict | None) -> str | None:
 
 
 def end_menu_delta_corroborated(st: dict, last: dict | None, timeline: list[dict] | None,
-                                external: list[dict] | None) -> dict | None:
+                                external: list[dict] | None, pixel_match_ms: int | None = None) -> dict | None:
     """For a one-legal-step end-menu delta, return a corroboration record or None.
 
     Acceptable evidence (any one):
@@ -1205,10 +1186,13 @@ def end_menu_delta_corroborated(st: dict, last: dict | None, timeline: list[dict
     - input / haptic activity flagged near the last scorebug / end-menu window
     Exact match (no delta) needs no corroboration and returns {"kind": "exact_match"}.
 
-    Button and haptic evidence at or after the first end-screen span does not count.
-    Menu navigation during the post-final tail must not flip ``final_confirmed``.
-    A score-change clip from that same span onward is ignored for the same reason.
-    A scorebug read already on the timeline still counts: that is the score, not an input.
+    Button and haptic evidence at or after the end screen does not count. That time is
+    the first pixel match or the first agreeing menu frame, and also any ``final_screen``
+    row already on the timeline. A missing label is not a missing screen: the menu frame
+    and the pixel match are enough. Menu navigation during the post-final tail must not
+    flip ``final_confirmed``. A score-change clip from that same moment onward is ignored
+    for the same reason. A scorebug read already on the timeline still counts: that is
+    the score, not an input.
     """
     if last is None:
         return {"kind": "no_scorebug"}
@@ -1224,7 +1208,8 @@ def end_menu_delta_corroborated(st: dict, last: dict | None, timeline: list[dict
             return {"kind": "scorebug_final_play", "t_ms": r.get("t_ms"), "home": r["home"], "away": r["away"]}
     lo = int(last.get("t_ms") or 0) - 30_000
     hi = int(st.get("t_ms") or last.get("t_ms") or 0) + 120_000
-    cutoff = end_screen_evidence_cutoff_ms(timeline)
+    menu_t = st.get("t_ms") if isinstance(st, dict) else None
+    cutoff = end_screen_evidence_cutoff_ms(timeline, menu_t_ms=menu_t, pixel_match_ms=pixel_match_ms)
     for ev in external or []:
         kind = ev.get("kind") or ""
         t = ev.get("t_ms")
@@ -1241,17 +1226,29 @@ def end_menu_delta_corroborated(st: dict, last: dict | None, timeline: list[dict
     return None
 
 
-def end_screen_evidence_cutoff_ms(timeline: list[dict] | None) -> int | None:
-    """Start of the first end-screen span, open or committed. Dropped flashes are not on the timeline."""
+def end_screen_evidence_cutoff_ms(timeline: list[dict] | None, *, menu_t_ms=None,
+                                  pixel_match_ms=None) -> int | None:
+    """When the end screen appeared, so later button, haptic, and clip evidence does not count.
+
+    The screen is the first pixel match or the first agreeing menu frame. A ``final_screen``
+    timeline row is the same picture when the classifier labelled it. The cutoff is the
+    earliest of those. Dropped flashes are not on the timeline, and a tie that was labelled
+    is not required: the menu frame or the pixel match is enough on its own.
+    """
     cut = None
-    for r in timeline or []:
-        if not isinstance(r, dict) or r.get("obs") != "final_screen":
-            continue
-        t = r.get("t_ms")
+
+    def consider(t):
+        nonlocal cut
         if isinstance(t, bool) or not isinstance(t, int):
-            continue
+            return
         if cut is None or t < cut:
             cut = t
+
+    consider(menu_t_ms)
+    consider(pixel_match_ms)
+    for r in timeline or []:
+        if isinstance(r, dict) and r.get("obs") == "final_screen":
+            consider(r.get("t_ms"))
     return cut
 
 

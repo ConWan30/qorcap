@@ -424,15 +424,24 @@ def _menu_frames(t0, t1, step=500):
     return out
 
 
-def test_single_frame_in_ot_or_q4_tie_does_not_stop():
-    """One end-menu-like frame must not start the tail or stop. A tied game is not a final screen.
+def _committed_screen(timeline):
+    return any(
+        r.get("obs") == "final_screen" and (r.get("n") or 0) >= FINAL_SCREEN_MIN_FRAMES
+        and int(r.get("until_ms") or 0) - int(r.get("t_ms") or 0) >= FINAL_SCREEN_MIN_SPAN_MS
+        for r in timeline)
 
-    OT 14-14 with 4:00 left, and Q4 0:00 tied 21-21, stay that way even if the picture
-    is held for several seconds. A single frame of a real Q4 0:00 lead is counted, and
-    it still must not start the clock: ``stats['final_screen']`` is not the trigger.
-    Replacing ``observe_final_screen`` with ``return False`` does not satisfy the later
-    test that the tail runs past the 4 s hold. Starting the clock from ``stats['final_screen'] > 0``
-    fails the single-frame lead case below.
+
+def test_single_frame_in_ot_or_q4_tie_does_not_stop():
+    """One end-menu-like frame must not start the tail or stop. A tied picture is still labelled.
+
+    OT 14-14 with 4:00 left, and Q4 0:00 tied 21-21, are ``final_screen`` frames. Holding
+    that picture commits a span. The tail does not start from it, and nothing stops,
+    because the scorebug is still tied. Restoring the tie rule in ``_accept_final_screen``
+    leaves ``stats['final_screen']`` at 0 and commits no span.
+    A single frame of a real Q4 0:00 lead is counted, and it still must not start the
+    clock: ``stats['final_screen']`` is not the trigger. Replacing ``observe_final_screen``
+    with ``return False`` does not satisfy the later test that the tail runs past the 4 s
+    hold. Starting the clock from ``stats['final_screen'] > 0`` fails the single-frame lead.
     """
     cases = [
         {"t_ms": 1_000, "home": 14, "away": 14, "quarter": 5, "clock_s": 240, "clock_red": False},
@@ -446,18 +455,15 @@ def test_single_frame_in_ot_or_q4_tie_does_not_stop():
         assert state.get("final_screen_mono") is None
         assert qm.capture_stop_reason(state, 20.0, tail_s=10) is None
         assert core.final is None
-        assert core.stats.get("final_screen", 0) == 0
+        assert core.stats.get("final_screen", 0) > 0
         long_core, _ = _core(score)
         reason, stopped, long_state, seen = _drive(long_core, _menu_frames(5_000, 10_000), 10)
         assert reason is None and stopped is None
         assert long_state.get("final_screen_mono") is None
         assert long_core.final is None
-        assert long_core.stats.get("final_screen", 0) == 0
+        assert long_core.stats.get("final_screen", 0) > 0
         assert seen[-1] == 10_000
-        assert not any(
-            r.get("obs") == "final_screen" and (r.get("n") or 0) >= FINAL_SCREEN_MIN_FRAMES
-            and int(r.get("until_ms") or 0) - int(r.get("t_ms") or 0) >= FINAL_SCREEN_MIN_SPAN_MS
-            for r in long_core.timeline)
+        assert _committed_screen(long_core.timeline)
 
     lead = {"t_ms": 1_000, "home": 0, "away": 7, "quarter": 4, "clock_s": 0, "clock_red": True}
     core, _posts = _core(lead)
@@ -576,6 +582,128 @@ def test_later_end_menu_score_does_not_replace_a_posted_final():
     assert core.final["final_confirmed"] is False
     assert any("not replaced" in n for n in core.final.get("notes") or [])
     assert not any(p.get("home") == 0 and p.get("away") == 10 and p.get("final_confirmed") is True for p in posts)
+
+
+def test_disputed_final_stays_unconfirmed_after_stop(tmp_path):
+    """7-0 menu, then a 10-0 menu, then stop. The re-read must not confirm the first score.
+
+    Live keeps 7-0 with final_confirmed false and the dispute note. ``tail_final_check``
+    stops at the first end-menu agreement, so a reader that only sees 7-0 would exact-match
+    and upgrade it. Deleting that guard makes this re-read post confirmed=True and drops the note.
+    """
+    score = {"t_ms": 1_000, "home": 0, "away": 7, "quarter": 4, "clock_s": 0, "clock_red": True}
+    reader = _SwitchScore((7, 0), (10, 0), at=9_000)
+    core, _posts = _core(score, reader=reader)
+    _drive(core, _menu_frames(5_000, 12_000), 10, reader)
+    assert (core.final["away"], core.final["home"]) == (7, 0)
+    assert core.final["final_confirmed"] is False
+    assert core.final.get("end_menu_disputed") is True
+    note = " ".join(n for n in core.final.get("notes") or [] if isinstance(n, str))
+    assert "disagreed with the posted" in note and "not replaced" in note
+
+    bundle = tmp_path / "match-dispute"
+    bundle.mkdir()
+    (bundle / "timeline.jsonl").write_text(json.dumps(score) + "\n", encoding="utf-8")
+    (bundle / "video.mp4").write_bytes(b"not-a-real-video")
+    (bundle / "manifest.jsonl").write_text(json.dumps({
+        "type": "segment", "seq": 0, "file": "video.mp4", "wall_ms": 12_000,
+    }) + "\n", encoding="utf-8")
+    draft = {"result": qm.apply_final(
+        {"home_score": 0, "away_score": 7, "quarter": 4, "winner": "away"}, core.final)}
+    assert draft["result"]["final_confirmed"] is False
+    assert "not replaced" in " ".join(draft["result"].get("notes") or [])
+
+    def factory(_post):
+        # A re-read that only sees the first menu exact-matches 7-0 and would confirm it.
+        fresh, _ = _core(score, reader=_MenuReader(7, 0))
+        return fresh
+
+    out = qm.tail_final_check(
+        bundle, draft, ffmpeg="ffmpeg", core_factory=factory,
+        frames=_menu_frames(5_000, 12_000), live_final=core.final)
+    res = out["result"]
+    assert res["final_confirmed"] is False
+    assert (res["away_score"], res["home_score"]) == (7, 0)
+    kept = " ".join(n for n in res.get("notes") or [] if isinstance(n, str))
+    assert "disagreed with the posted" in kept and "not replaced" in kept
+
+
+def test_tied_walkoff_input_after_the_end_screen_does_not_confirm(tmp_path):
+    """Tied Q4 0:00 10-10 to menu 10-16, and tied OT 13-13 to menu 13-16.
+
+    Input one second into the menu does not confirm. The picture is still labelled
+    ``final_screen``. The posted menu starts the tail. An input from before the screen
+    still confirms. The stop-time re-read, given only that late input, stays unconfirmed.
+    """
+    cases = [
+        {"t_ms": 1_000, "home": 10, "away": 10, "quarter": 4, "clock_s": 0, "clock_red": True,
+         "menu": (10, 16)},
+        {"t_ms": 1_000, "home": 13, "away": 13, "quarter": 5, "clock_s": 240, "clock_red": False,
+         "menu": (13, 16)},
+    ]
+    for score in cases:
+        away, home = score["menu"]
+        row = {k: score[k] for k in ("t_ms", "home", "away", "quarter", "clock_s", "clock_red")}
+        late = [{"kind": "input_activity", "t_ms": 6_000}]
+        reader = _MenuReader(away, home)
+        core, _posts = _core(row, reader=reader, corr=late)
+        reason, _stopped, state, _seen = _drive(core, _menu_frames(5_000, 12_000), 10, reader)
+        assert core.stats.get("final_screen", 0) > 0
+        assert core.final["basis"] == "end_menu"
+        assert (core.final["away"], core.final["home"]) == (away, home)
+        assert core.final["final_confirmed"] is False
+        assert core.final.get("delta_corroboration") is None
+        assert state.get("final_screen_mono") is not None
+        assert reason is None
+
+        early, _ = _core(row, reader=_MenuReader(away, home), corr=[{"kind": "input_activity", "t_ms": 1_500}])
+        _drive(early, _menu_frames(5_000, 8_000), 10)
+        assert early.final["final_confirmed"] is True
+        assert early.final["delta_corroboration"]["kind"] == "input_activity"
+
+        bundle = tmp_path / f"match-walkoff-{away}-{home}"
+        bundle.mkdir()
+        (bundle / "timeline.jsonl").write_text(json.dumps(row) + "\n", encoding="utf-8")
+        (bundle / "video.mp4").write_bytes(b"not-a-real-video")
+        (bundle / "manifest.jsonl").write_text(json.dumps({
+            "type": "segment", "seq": 0, "file": "video.mp4", "wall_ms": 12_000,
+        }) + "\n", encoding="utf-8")
+        draft = {"result": {"home_score": home, "away_score": away, "quarter": row["quarter"],
+                            "method": "last_scorebug_read_unconfirmed", "final_confirmed": False}}
+
+        def factory(_post, row=row, away=away, home=home, late=late):
+            fresh, _ = _core(row, reader=_MenuReader(away, home), corr=late)
+            return fresh
+
+        out = qm.tail_final_check(
+            bundle, draft, ffmpeg="ffmpeg", core_factory=factory, frames=_menu_frames(5_000, 12_000))
+        res = out["result"]
+        assert res["method"] == "end_menu_read"
+        assert (res["away_score"], res["home_score"]) == (away, home)
+        assert res["final_confirmed"] is False, res
+
+
+def test_end_screen_cutoff_does_not_need_a_final_screen_label():
+    """No ``final_screen`` row. The agreeing menu frame, or the first pixel match, is the cutoff.
+
+    Input at or after that time does not confirm. Input from before the screen still does.
+    Reading the cutoff only from ``final_screen`` labels makes the late input confirm.
+    """
+    last = {"away": 10, "home": 10, "t_ms": 1_000}
+    timeline = [{"t_ms": 1_000, "home": 10, "away": 10, "quarter": 4, "clock_s": 0}]
+    late = [{"kind": "input_activity", "t_ms": 6_000}]
+    early = [{"kind": "input_activity", "t_ms": 1_000}]
+    st = {"away": 10, "home": 16, "t_ms": 5_000}
+    assert end_menu_delta_corroborated(st, last, timeline, late) is None
+    assert end_menu_delta_corroborated(st, last, timeline, [{"kind": "input_activity", "t_ms": 5_000}]) is None
+    got = end_menu_delta_corroborated(st, last, timeline, early)
+    assert got and got["kind"] == "input_activity"
+    st_pixel = {"away": 13, "home": 16}
+    assert end_menu_delta_corroborated(st_pixel, {"away": 13, "home": 13, "t_ms": 1_000}, timeline, late,
+                                       pixel_match_ms=5_000) is None
+    haptic = end_menu_delta_corroborated(st_pixel, {"away": 13, "home": 13, "t_ms": 1_000}, timeline, early,
+                                         pixel_match_ms=5_000)
+    assert haptic and haptic["kind"] == "input_activity"
 
 
 # ---------------------------------------------------------------- chain model (tests only)
