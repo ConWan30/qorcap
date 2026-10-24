@@ -165,7 +165,10 @@ class Countersigner:
 
 STATIC_FRAME_S = 1.0
 FRAME_PERIOD_S = 0.25  # the frame loop aims at 4 Hz, subtracting the work already done
-REFRESH_PERIOD_S = 2.0  # bundle tail runs on its own thread, not on the frame thread
+# OPTIONS presses ride this refresh. The end menu locks on 3 frames (~0.75 s at 4 Hz),
+# so a 2 s period can accept a pause menu before the press is known. 0.5 s stays inside
+# that window. A refresh with no new bytes is a short stat and read.
+REFRESH_PERIOD_S = 0.5
 READER_HEALTH_LOG_S = 30.0
 SHUTDOWN_TIMEOUT_S = 900  # input proof decodes the whole video once; never kill QorCap mid-bundle
 
@@ -437,47 +440,54 @@ def start_reader(api: Api, stop: threading.Event, state: dict, bundle: Path | No
         prev_tick = None
         periods, ons, fetches = [], [], []
         window_start = time.monotonic()
-        while not stop.is_set():
-            tick = time.perf_counter()
-            if prev_tick is not None:
-                periods.append((tick - prev_tick) * 1000.0)
-            prev_tick = tick
-            try:
-                tf = time.perf_counter()
-                with urllib.request.urlopen(api.base + "/snapshot.jpg", timeout=3) as r:
-                    data = r.read()
-                fetches.append((time.perf_counter() - tf) * 1000.0)
-            except Exception:
-                if stop.wait(0.5):
+        try:
+            while not stop.is_set():
+                tick = time.perf_counter()
+                if prev_tick is not None:
+                    periods.append((tick - prev_tick) * 1000.0)
+                prev_tick = tick
+                try:
+                    tf = time.perf_counter()
+                    with urllib.request.urlopen(api.base + "/snapshot.jpg", timeout=3) as r:
+                        data = r.read()
+                    fetches.append((time.perf_counter() - tf) * 1000.0)
+                except Exception:
+                    if stop.wait(0.5):
+                        return
+                    continue
+                h = hashlib.sha256(data).digest()
+                # A perfectly static screen (end-of-game menu) can produce byte-identical snapshots; still feed
+                # it about once a second so time-based spans (final_screen >= 3 s) can grow.
+                if h != last or time.monotonic() - last_t >= STATIC_FRAME_S:
+                    last, last_t = h, time.monotonic()
+                    img = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
+                    if img is not None:
+                        try:
+                            t_on = time.perf_counter()
+                            core.on_frame(int(time.time() * 1000), img)
+                            ons.append((time.perf_counter() - t_on) * 1000.0)
+                        except Exception as e:  # never let one bad frame kill the reader thread
+                            state["reader_error"] = f"{type(e).__name__}: {e}"
+                now = time.monotonic()
+                if now - window_start >= READER_HEALTH_LOG_S:
+                    row = reader_timing_row(int(time.time() * 1000), periods, state.get("refresh_ms"), ons, fetches,
+                                            open_reader_health(core))
+                    print(format_reader_timing(row), file=sys.stderr)
+                    _write_health(row)
+                    periods, ons, fetches = [], [], []
+                    window_start = now
+                remain = FRAME_PERIOD_S - (time.perf_counter() - tick)
+                if remain > 0 and stop.wait(remain):
                     return
-                continue
-            h = hashlib.sha256(data).digest()
-            # A perfectly static screen (end-of-game menu) can produce byte-identical snapshots; still feed
-            # it about once a second so time-based spans (final_screen >= 3 s) can grow.
-            if h != last or time.monotonic() - last_t >= STATIC_FRAME_S:
-                last, last_t = h, time.monotonic()
-                img = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
-                if img is not None:
-                    try:
-                        t_on = time.perf_counter()
-                        core.on_frame(int(time.time() * 1000), img)
-                        ons.append((time.perf_counter() - t_on) * 1000.0)
-                    except Exception as e:  # never let one bad frame kill the reader thread
-                        state["reader_error"] = f"{type(e).__name__}: {e}"
-            now = time.monotonic()
-            if now - window_start >= READER_HEALTH_LOG_S:
-                row = reader_timing_row(int(time.time() * 1000), periods, state.get("refresh_ms"), ons, fetches,
-                                        open_reader_health(core))
-                print(format_reader_timing(row), file=sys.stderr)
-                _write_health(row)
-                periods, ons, fetches = [], [], []
-                window_start = now
-            remain = FRAME_PERIOD_S - (time.perf_counter() - tick)
-            if remain > 0 and stop.wait(remain):
-                return
+        finally:
+            # tail_final_check reuses this process's bundle tail. Wait until the refresh
+            # thread has left it, but don't hang shutdown on a stuck read.
+            stop.set()
+            refresh_thread.join(timeout=5.0)
 
     refresh()
-    threading.Thread(target=refresh_worker, name="qorcap-refresh", daemon=True).start()
+    refresh_thread = threading.Thread(target=refresh_worker, name="qorcap-refresh", daemon=True)
+    refresh_thread.start()
     t = threading.Thread(target=loop, name="qorcap-reader", daemon=True)
     t.start()
     return t

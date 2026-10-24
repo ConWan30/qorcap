@@ -760,7 +760,11 @@ def test_reader_timing_log_names_the_three_clocks(tmp_path):
 
 
 def test_refresh_off_the_frame_thread_keeps_four_hertz(monkeypatch):
-    """A 1.5 s refresh must not run on the frame thread. 6 s still yields at least 16 frames."""
+    """A 1.5 s refresh must not run on the frame thread.
+
+    Sleep releases the GIL (at least 16 frames in 6 s). A CPU burn holds the GIL and
+    still has to stay at or above 3 Hz.
+    """
     import urllib.request
 
     import cv2
@@ -776,9 +780,11 @@ def test_refresh_off_the_frame_thread_keeps_four_hertz(monkeypatch):
     monkeypatch.setattr(qorcap_reader.ReaderCore, "on_frame", fast)
     frames = []
     for i in range(40):
+        # Lossless and unique. JPEG quantization collapsed some of these 8x8 frames
+        # onto the same bytes, and the loop then skipped them for up to a second.
         img = np.zeros((8, 8, 3), np.uint8)
-        img[0, 0, 0] = i * 6
-        ok, buf = cv2.imencode(".jpg", img)
+        img[:, :, 0] = i
+        ok, buf = cv2.imencode(".png", img)
         assert ok
         frames.append(bytes(buf))
     seq = {"i": 0}
@@ -803,21 +809,35 @@ def test_refresh_off_the_frame_thread_keeps_four_hertz(monkeypatch):
 
     monkeypatch.setattr(urllib.request, "urlopen", urlopen)
 
-    def slow_get(self, path, timeout=3):
-        time.sleep(1.5)
-        return {}
+    def drive(mode, floor):
+        def slow_get(self, path, timeout=3):
+            # Sleep releases the GIL. The CPU burn holds it for 1.5 s, which is what a
+            # refresh stuck back on the frame thread would do. Off-thread, the frame
+            # loop still has to clear 3 Hz.
+            if mode == "sleep":
+                time.sleep(1.5)
+            else:
+                deadline = time.perf_counter() + 1.5
+                x = 0
+                while time.perf_counter() < deadline:
+                    x = (x * 1103515245 + 12345) & 0x7FFFFFFF
+            return {}
 
-    monkeypatch.setattr(qm.Api, "get", slow_get)
-    stop = threading.Event()
-    state = {}
-    thread = qm.start_reader(qm.Api(8791), stop, state, bundle=None)
-    time.sleep(0.3)
-    n0 = len(counts)
-    time.sleep(6.0)
-    n1 = len(counts)
-    stop.set()
-    thread.join(timeout=3)
-    assert n1 - n0 >= 16, n1 - n0
+        monkeypatch.setattr(qm.Api, "get", slow_get)
+        stop = threading.Event()
+        state = {}
+        before = len(counts)
+        thread = qm.start_reader(qm.Api(8791), stop, state, bundle=None)
+        time.sleep(0.3)
+        n0 = len(counts)
+        time.sleep(6.0)
+        n1 = len(counts)
+        stop.set()
+        thread.join(timeout=5)
+        assert n1 - n0 >= floor, (mode, n1 - n0, n0 - before)
+
+    drive("sleep", 16)
+    drive("cpu", 18)  # 3 Hz over 6 s; the burn holds the GIL
 
 
 def _full_jsonl(path: Path) -> list:
@@ -911,3 +931,109 @@ def test_incremental_tail_matches_full_parse(tmp_path):
     check()
     inputs.write_bytes(b'{"type":"in","b":512,"t_us":4000}\n{"type":"in","b":')  # truncated, partial again
     check()
+
+
+def test_tail_reparse_when_the_window_before_the_offset_changes(tmp_path):
+    """A rewrite that keeps the 64-byte prefix and grows past the old offset is parsed again.
+
+    The shrink is not observed: write_bytes replaces the bytes in place, and the next read
+    sees a larger file. The window just before the old offset is what shows the body changed.
+    """
+    from qorcap_reader import load_delta_corroboration_from_bundle, note_options_from_inputs, options_presses_ms
+
+    bundle = tmp_path / "m"
+    bundle.mkdir()
+    (bundle / "bundle.json").write_text("{}\n", encoding="utf-8")
+    (bundle / "manifest.jsonl").write_bytes(b"")
+    (bundle / "haptics.jsonl").write_bytes(b"")
+    inputs = bundle / "inputs.jsonl"
+    blob = b'{"type":"in","b":0,"t_us":1}\n' * 20
+    inputs.write_bytes(blob)
+
+    class _Opt:
+        presses: list = []
+
+        def set_options(self, presses):
+            self.presses = list(presses)
+
+    opt = _Opt()
+
+    def check():
+        note_options_from_inputs(opt, inputs)
+        assert opt.presses == options_presses_ms(_full_jsonl(inputs))
+        assert load_delta_corroboration_from_bundle(bundle) == _full_corr(bundle)
+
+    check()
+    new = blob[:64] + (b'{"type":"in","b":512,"t_ms":10}\n' * 40)
+    assert len(new) > len(blob) and new[:64] == blob[:64]
+    assert new[len(blob) - 64:len(blob)] != blob[-64:]
+    inputs.write_bytes(new)
+    check()
+    with open(inputs, "ab") as fh:
+        fh.write(b'{"type":"in","b":512,"t_ms":77}')  # valid JSON, no newline yet
+    check()
+
+
+def test_options_press_is_known_before_end_menu_can_lock(tmp_path, monkeypatch):
+    """An OPTIONS press appended just after a refresh is visible before an end menu can lock.
+
+    EndMenuAgreement commits on 3 frames. At 4 Hz a menu that appears just after a frame
+    is locked by the third following frame, 3 periods later (0.75 s). A 2 s refresh
+    period misses that. 0.5 s does not.
+    """
+    import urllib.request
+
+    import cv2
+    import numpy as np
+
+    import qorcap_reader
+    from qorcap_endmenu import EndMenuAgreement
+
+    agree = EndMenuAgreement()
+    lock_s = agree.n * qm.FRAME_PERIOD_S
+    assert lock_s * 1000 >= agree.min_span_ms
+    assert qm.REFRESH_PERIOD_S < lock_s, qm.REFRESH_PERIOD_S
+
+    monkeypatch.setattr(qorcap_reader.ReaderCore, "on_frame", lambda *a, **k: None)
+    ok, buf = cv2.imencode(".jpg", np.zeros((8, 8, 3), np.uint8))
+    assert ok
+    jpeg = bytes(buf)
+
+    class _Resp:
+        def __init__(self, data):
+            self._d = data
+
+        def read(self):
+            return self._d
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    monkeypatch.setattr(urllib.request, "urlopen", lambda url, timeout=3: _Resp(jpeg))
+    monkeypatch.setattr(qm.Api, "get", lambda self, path, timeout=3: {})
+
+    bundle = tmp_path / "m"
+    bundle.mkdir()
+    inputs = bundle / "inputs.jsonl"
+    inputs.write_text('{"type":"header","wall_anchor_ms":1000}\n', encoding="utf-8")
+    stop = threading.Event()
+    state = {}
+    thread = qm.start_reader(qm.Api(8792), stop, state, bundle=bundle)
+    # The synchronous refresh has already consumed the header. The worker is in its wait.
+    with open(inputs, "ab") as fh:
+        fh.write(b'{"type":"in","b":512,"t_ms":2500}\n')
+    deadline = time.monotonic() + lock_s
+    seen = False
+    while time.monotonic() < deadline:
+        if 2500 in state["core"]._options_snapshot():
+            seen = True
+            break
+        time.sleep(0.02)
+    stop.set()
+    thread.join(timeout=5)
+    assert seen, qm.REFRESH_PERIOD_S
+    alive = [th.name for th in threading.enumerate() if th.name == "qorcap-refresh" and th.is_alive()]
+    assert alive == []

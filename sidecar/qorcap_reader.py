@@ -66,6 +66,12 @@ OPTIONS_COINCIDENT_HOLD_MS = 12000
 AGREE_GAP_MS_DEFAULT = 2000.0
 # The bar can be readable for this long with no agreed row before that state is logged.
 UNAGREED_MS = 10_000
+# A single in-budget frame must not close a stall span. Alternating gaps otherwise
+# open and close a row on every pair. Three quiet frames is the same count the
+# end-menu lock uses, and it is still well under a second at 4 Hz.
+HEALTH_CLEAR_FRAMES = 3
+# One console warning per open span, and never again inside this window of frame time.
+HEALTH_WARN_MS = 30_000
 
 
 class PeriodTrack:
@@ -506,15 +512,8 @@ def prep(img):
     return cv2.resize(img, READER_SIZE, interpolation=cv2.INTER_AREA)
 
 
-def options_presses_ms(records, wall_anchor_ms=None) -> list[int]:
-    """Rising edges of OPTIONS (button bit 9) as wall-clock milliseconds.
-
-    ``records`` are ``inputs.jsonl`` objects. Wall time is ``wall_anchor_ms + t_us/1000`` from the
-    header. A record that already carries ``t_ms`` uses that.
-    """
-    presses: list[int] = []
-    prev = False
-    anchor = wall_anchor_ms
+def _fold_options(records, presses: list[int], prev: bool, anchor):
+    """Fold ``records`` into an OPTIONS rising-edge list. ``presses`` is updated in place."""
     for r in records:
         if not isinstance(r, dict):
             continue
@@ -538,6 +537,36 @@ def options_presses_ms(records, wall_anchor_ms=None) -> list[int]:
             elif anchor is not None and isinstance(t_us, int) and not isinstance(t_us, bool):
                 presses.append(int(anchor + t_us // 1000))
         prev = down
+    return presses, prev, anchor
+
+
+def _fold_activity(records) -> list[dict]:
+    """Input rows that ``collect_delta_corroboration`` would emit, in the same order."""
+    out: list[dict] = []
+    for r in records or []:
+        if not isinstance(r, dict) or r.get("type") not in ("in", "press", "buttons"):
+            continue
+        t_ms = r.get("t_ms")
+        if t_ms is None and r.get("t_us") is not None:
+            t_ms = int(r["t_us"]) // 1000
+        if t_ms is None:
+            continue
+        buttons = r.get("buttons") if r.get("buttons") is not None else r.get("b")
+        if buttons is None:
+            buttons = r.get("pressed") or r.get("pad")
+        if buttons in (None, 0, [], {}, ""):
+            continue
+        out.append({"kind": "input_activity", "t_ms": int(t_ms)})
+    return out
+
+
+def options_presses_ms(records, wall_anchor_ms=None) -> list[int]:
+    """Rising edges of OPTIONS (button bit 9) as wall-clock milliseconds.
+
+    ``records`` are ``inputs.jsonl`` objects. Wall time is ``wall_anchor_ms + t_us/1000`` from the
+    header. A record that already carries ``t_ms`` uses that.
+    """
+    presses, _, _ = _fold_options(records, [], False, wall_anchor_ms)
     return presses
 
 
@@ -554,13 +583,21 @@ def _parse_json_line(raw: bytes):
         return None
 
 
+# Bytes kept from the start of the file, and from just before the read offset.
+# A rewrite that keeps the prefix but changes the tail (truncate-then-regrow, inode
+# reuse, in-place replace) fails the second check and is parsed again from byte 0.
+_TAIL_MARK = 64
+
+
 class JsonlTail:
     """Byte-offset tail of a jsonl file.
 
     Complete lines are kept. A trailing partial line stays in the buffer until a
     newline, and is included in the snapshot when it is already valid JSON so the
-    snapshot matches a full parse of the bytes on disk. A shrink, a new inode, or
-    a changed prefix (rotation or truncation) rereads from byte 0.
+    snapshot matches a full parse of the bytes on disk. A shrink, a new inode, a
+    changed prefix, or a changed window just before the read offset rereads from
+    byte 0. ``snapshot`` and ``take`` share one lock; the end-of-match check and
+    the refresh thread can both touch a cached tail.
     """
 
     def __init__(self, path) -> None:
@@ -571,6 +608,8 @@ class JsonlTail:
         self.dev = None
         self.ino = None
         self.prefix: bytes | None = None
+        self.tail_mark: bytes | None = None
+        self._lock = threading.Lock()
 
     def _reset(self) -> None:
         self.off = 0
@@ -579,87 +618,166 @@ class JsonlTail:
         self.dev = None
         self.ino = None
         self.prefix = None
+        self.tail_mark = None
 
     def snapshot(self) -> list:
         """Parsed records equal to a full parse of the file as it is now."""
-        self._pull()
-        extra = _parse_json_line(self.buf)
-        if extra is None:
-            return list(self.rows)
-        return self.rows + [extra]
+        with self._lock:
+            reset, new = self._pull()
+            if reset:
+                self.rows = list(new)
+            else:
+                self.rows.extend(new)
+            extra = _parse_json_line(self.buf)
+            if extra is None:
+                return list(self.rows)
+            return self.rows + [extra]
 
-    def _pull(self) -> None:
+    def take(self) -> tuple[bool, list, object]:
+        """``(reset, new complete rows, provisional last object)``.
+
+        ``reset`` means the returned rows are the whole file and any aggregate
+        built from earlier rows has to be discarded. The provisional object is
+        included by a full parse and is not part of ``new``.
+        """
+        with self._lock:
+            reset, new = self._pull()
+            return reset, new, _parse_json_line(self.buf)
+
+    def _pull(self) -> tuple[bool, list]:
+        """Caller holds ``self._lock``. Newly completed rows only, unless ``reset``."""
+        reset = False
         try:
             st = os.stat(self.path)
         except OSError:
+            had = self.prefix is not None or self.off != 0 or bool(self.buf) or bool(self.rows)
             self._reset()
-            return
+            return had, []
         size = st.st_size
         ident = (getattr(st, "st_dev", None), getattr(st, "st_ino", None))
-        replaced = self.dev is not None and ident != (self.dev, self.ino)
-        shrunk = size < self.off
-        prefix_bad = False
-        if self.prefix is not None and not replaced and not shrunk:
-            try:
-                with open_shared_binary(self.path) as fh:
-                    prefix_bad = fh.read(len(self.prefix)) != self.prefix
-            except OSError:
-                self._reset()
-                return
-        if replaced or shrunk or prefix_bad:
-            self._reset()
-            try:
-                st = os.stat(self.path)
-            except OSError:
-                return
-            size = st.st_size
-            ident = (getattr(st, "st_dev", None), getattr(st, "st_ino", None))
-        if size == self.off and self.prefix is not None:
-            self.dev, self.ino = ident
-            return
         try:
             with open_shared_binary(self.path) as fh:
+                replaced = self.dev is not None and ident != (self.dev, self.ino)
+                shrunk = size < self.off
+                mismatch = False
+                if not replaced and not shrunk and (self.prefix is not None or self.tail_mark):
+                    if self.prefix is not None and fh.read(len(self.prefix)) != self.prefix:
+                        mismatch = True
+                    if self.tail_mark and self.off >= len(self.tail_mark):
+                        fh.seek(self.off - len(self.tail_mark))
+                        if fh.read(len(self.tail_mark)) != self.tail_mark:
+                            mismatch = True
+                if replaced or shrunk or mismatch:
+                    self._reset()
+                    reset = True
+                    try:
+                        st = os.stat(self.path)
+                    except OSError:
+                        return True, []
+                    size = st.st_size
+                    ident = (getattr(st, "st_dev", None), getattr(st, "st_ino", None))
+                if not reset and size == self.off and self.prefix is not None:
+                    self.dev, self.ino = ident
+                    return False, []
                 if self.prefix is None:
-                    self.prefix = fh.read(min(64, size))
+                    fh.seek(0)
+                    self.prefix = fh.read(min(_TAIL_MARK, size))
                 fh.seek(self.off)
                 data = fh.read(max(0, size - self.off))
         except OSError:
-            return
+            return reset, []
         self.dev, self.ino = ident
         self.off += len(data)
-        if not data:
-            return
-        self.buf += data
+        if data:
+            self.tail_mark = ((self.tail_mark or b"") + data)[-_TAIL_MARK:]
+            self.buf += data
         parts = self.buf.split(b"\n")
-        self.buf = parts.pop()
+        self.buf = parts.pop() if parts else b""
+        rows = []
         for line in parts:
             parsed = _parse_json_line(line)
             if parsed is not None:
-                self.rows.append(parsed)
+                rows.append(parsed)
+        return reset, rows
+
+
+class InputsShare:
+    """One incremental parse of an inputs.jsonl, shared by OPTIONS and corroboration.
+
+    Raw rows are not kept. Presses and input-activity candidates grow only with
+    newly completed lines, so a refresh does not walk the whole file under the GIL.
+    """
+
+    def __init__(self, path) -> None:
+        self.path = Path(path)
+        self.tail = JsonlTail(self.path)
+        self._lock = threading.Lock()
+        self._presses: list[int] = []
+        self._prev = False
+        self._anchor = None
+        self._activity: list[dict] = []
+        self._published_presses: list[int] = []
+        self._published_activity: list[dict] = []
+        self._saw_extra = False
+
+    def view(self) -> tuple[list[int], list[dict]]:
+        """Current presses and input-activity rows, including a valid partial last line."""
+        with self._lock:
+            reset, new, extra = self.tail.take()
+            if reset:
+                self._presses = []
+                self._prev = False
+                self._anchor = None
+                self._activity = []
+                self._saw_extra = False
+            if new:
+                self._presses, self._prev, self._anchor = _fold_options(new, self._presses, self._prev, self._anchor)
+                self._activity.extend(_fold_activity(new))
+            if reset or new or (extra is not None) or self._saw_extra:
+                if extra is None:
+                    self._published_presses = list(self._presses)
+                    self._published_activity = list(self._activity)
+                else:
+                    self._published_presses, _, _ = _fold_options([extra], list(self._presses), self._prev, self._anchor)
+                    self._published_activity = self._activity + _fold_activity([extra])
+                self._saw_extra = extra is not None
+            return self._published_presses, self._published_activity
+
+
+_INPUTS: dict[str, InputsShare] = {}
+_INPUTS_LOCK = threading.Lock()
+
+
+def shared_inputs(path) -> InputsShare:
+    """The process-wide parse of this inputs file. A second tail would keep a second copy."""
+    p = Path(path)
+    try:
+        key = str(p.resolve())
+    except OSError:
+        key = str(p)
+    with _INPUTS_LOCK:
+        share = _INPUTS.get(key)
+        if share is None:
+            share = InputsShare(key)
+            _INPUTS[key] = share
+        return share
 
 
 def note_options_from_inputs(core, path) -> None:
     """Read OPTIONS rising edges from an inputs.jsonl. Missing file is a no-op.
 
-    Repeat calls read only the bytes appended since the last call. The press list
-    is replaced by the snapshot, so a truncated or rotated file does not keep stale presses.
+    Repeat calls fold only the bytes appended since the last call. The press list
+    is replaced by that snapshot, so a truncated or rotated file does not keep stale presses.
+    The same parse feeds delta corroboration.
     """
     p = Path(path)
     if not p.is_file():
         return
     try:
-        resolved = p.resolve()
-    except OSError:
-        resolved = p
-    tail = getattr(core, "_inputs_tail", None)
-    if tail is None or tail.path != resolved:
-        tail = JsonlTail(resolved)
-        core._inputs_tail = tail
-    try:
-        recs = tail.snapshot()
+        presses, _activity = shared_inputs(p).view()
     except Exception:
         return
-    core.set_options(options_presses_ms(recs))
+    core.set_options(presses)
 
 
 def madden_final_screen(img) -> bool:
@@ -768,9 +886,12 @@ class ReaderCore:
         # They are not timeline observations and they never become a score.
         self._last_frame_ms: int | None = None
         self._lag: dict | None = None
+        self._lag_clear = 0
         self._unagreed: dict | None = None
+        self._unagreed_clear = 0
         self._unagreed_since: int | None = None
         self._unagreed_reasons: dict[str, int] = {}
+        self._warn_ms: dict[str, int] = {}
         self.health: list[dict] = []
         self.health_write = None
 
@@ -938,6 +1059,14 @@ class ReaderCore:
             return AGREE_GAP_MS_DEFAULT
         return float(ns) / 1_000_000.0
 
+    def _warn_health(self, kind: str, t_ms: int, text: str) -> None:
+        """One console line when a span opens, and at most one of those per 30 s."""
+        last = self._warn_ms.get(kind)
+        if last is not None and t_ms - last < HEALTH_WARN_MS:
+            return
+        self._warn_ms[kind] = t_ms
+        print(text, file=sys.stderr)
+
     def _note_frame_time(self, t_ms: int) -> None:
         """Open a reader_lag span when this frame is too far from the previous one to agree."""
         prev = self._last_frame_ms
@@ -947,22 +1076,39 @@ class ReaderCore:
         gap = t_ms - prev
         if gap > self._agree_gap_ms():
             self.stats["frame_gap"] = self.stats.get("frame_gap", 0) + 1
+            self._lag_clear = 0
             opening = self._lag is None
             self._lag = self._health_span(self._lag, "reader_lag", True, t_ms, max_gap_ms=gap)
             if opening:
-                print(f"Score reader behind: frames {gap / 1000:.1f} s apart; scores held", file=sys.stderr)
-        else:
-            self._lag = self._health_span(self._lag, "reader_lag", False, t_ms)
+                self._warn_health("reader_lag", t_ms, f"Score reader behind: frames {gap / 1000:.1f} s apart; scores held")
+            return
+        if self._lag is None:
+            return
+        self._lag_clear += 1
+        if self._lag_clear < HEALTH_CLEAR_FRAMES:
+            return
+        self._lag = self._health_span(self._lag, "reader_lag", False, t_ms)
+        self._lag_clear = 0
 
     def _note_agreement(self, t_ms: int, fr, absent: bool, res) -> None:
         """Log a visible bar that has not agreed. Does not invent a row."""
         visible = bool(getattr(fr, "ok", False) and not absent)
         agreed = bool(getattr(res, "agreed", False) and getattr(res, "read", None) is not None)
         if not visible or agreed:
+            if self._unagreed is None:
+                self._unagreed_since = None
+                self._unagreed_reasons = {}
+                self._unagreed_clear = 0
+                return
+            self._unagreed_clear += 1
+            if self._unagreed_clear < HEALTH_CLEAR_FRAMES:
+                return
             self._unagreed_since = None
             self._unagreed_reasons = {}
             self._unagreed = self._health_span(self._unagreed, "score_unagreed", False, t_ms)
+            self._unagreed_clear = 0
             return
+        self._unagreed_clear = 0
         reason = str(getattr(res, "reason", None) or "unagreed")
         self._unagreed_reasons[reason] = self._unagreed_reasons.get(reason, 0) + 1
         if self._unagreed_since is None:
@@ -975,7 +1121,7 @@ class ReaderCore:
             self._unagreed["reasons"] = dict(self._unagreed_reasons)
         if opening:
             held = (t_ms - self._unagreed_since) / 1000.0
-            print(f"Score visible but not agreed for {held:.1f} s; scores held", file=sys.stderr)
+            self._warn_health("score_unagreed", t_ms, f"Score visible but not agreed for {held:.1f} s; scores held")
 
     def _health_span(self, cur, name, on, t_ms, max_gap_ms=None):
         """Same shape as a timeline span. Closed spans are diagnostics, not /events posts."""
@@ -1454,21 +1600,7 @@ def collect_delta_corroboration(*, clips: list[dict] | None = None,
             continue
         out.append({"kind": "haptic", "t_ms": int(t_ms),
                     "confidence": h.get("confidence") or h.get("high_confidence")})
-    for r in input_records or []:
-        if not isinstance(r, dict) or r.get("type") not in ("in", "press", "buttons"):
-            continue
-        # Prefer records that look like discrete presses (not stick noise)
-        t_ms = r.get("t_ms")
-        if t_ms is None and r.get("t_us") is not None:
-            t_ms = int(r["t_us"]) // 1000
-        if t_ms is None:
-            continue
-        buttons = r.get("buttons") if r.get("buttons") is not None else r.get("b")
-        if buttons is None:
-            buttons = r.get("pressed") or r.get("pad")
-        if buttons in (None, 0, [], {}, ""):
-            continue
-        out.append({"kind": "input_activity", "t_ms": int(t_ms)})
+    out.extend(_fold_activity(input_records))
     return out
 
 
@@ -1529,7 +1661,8 @@ class BundleCorrTail:
         self.bundle = Path(bundle)
         self.manifest = JsonlTail(self.bundle / "manifest.jsonl")
         self.haptics = JsonlTail(self.bundle / "haptics.jsonl")
-        self.inputs = JsonlTail(self.bundle / "inputs.jsonl")
+        # Same parse note_options_from_inputs uses. A second inputs tail kept a second copy of every row.
+        self.inputs = shared_inputs(self.bundle / "inputs.jsonl")
         self._clip_sha: dict[str, tuple] = {}
 
     def snapshot(self) -> list[dict]:
@@ -1570,8 +1703,10 @@ class BundleCorrTail:
                 clips.append({"type": "clip", "name": f.stem, "file": str(f), "sha256": sha,
                               "wall_ms": int(st.st_mtime * 1000)})
         haptic_rows = [r for r in self.haptics.snapshot() if isinstance(r, dict)]
-        input_rows = [r for r in self.inputs.snapshot() if isinstance(r, dict)]
-        return collect_delta_corroboration(clips=clips, haptic_records=haptic_rows, input_records=input_rows)
+        _presses, activity = self.inputs.view()
+        out = collect_delta_corroboration(clips=clips, haptic_records=haptic_rows, input_records=None)
+        out.extend(activity)
+        return out
 
 
 _BUNDLE_TAILS: dict[str, BundleCorrTail] = {}
