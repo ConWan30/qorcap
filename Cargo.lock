@@ -2049,7 +2049,7 @@ dependencies = [
 
 [[package]]
 name = "qorcap"
-version = "0.3.32"
+version = "0.3.33"
 dependencies = [
  "base64 0.22.1",
  "c2pa",
