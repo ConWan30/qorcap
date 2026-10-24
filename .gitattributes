@@ -5,3 +5,7 @@
 # contracts/* covers files directly in contracts/; contracts/** covers nested paths.
 contracts/* text eol=lf
 contracts/** text eol=lf
+# Reader content hashes are raw bytes. Pin Python to LF so a Windows autocrlf checkout
+# matches the Linux tree and a repo-pinned referee. Do not normalize hashes in code.
+*.py text eol=lf
+*.npz binary

@@ -1022,6 +1022,15 @@ def main(argv=None) -> int:
                     say(f"  level: max {res['max_db']:.1f} dB, mean {res['mean_db']:.1f} dB" + ("  SILENT" if res["silent"] else "  OK"))
                 for line in audio_silence_hint(res, when="right now"):
                     say(line)
+    if os.environ.get("QORCAP_FRAME_BIND", "").strip().lower() in ("1", "true", "yes", "on"):
+        cmd.append("--frame-bind")
+        try:
+            from qorcap_readers import write_prerecord_manifest
+            manifest_path = bundle / "readers.input.json"
+            write_prerecord_manifest(manifest_path, ffmpeg=a.ffmpeg)
+            cmd += ["--readers-manifest", str(manifest_path)]
+        except Exception as e:
+            print(f"reader manifest was not sealed ({type(e).__name__}); checkpoint 0 has no reader claim", file=sys.stderr)
     log = open(bundle / "console.log", "w", encoding="utf-8")
     started_ms = int(time.time() * 1000)
     # Detach from this console and, when the job allows it, from the launcher job. Closing the

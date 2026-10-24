@@ -60,12 +60,31 @@ def test_qorcap_only_schemas_are_checksummed():
             )
 
 
+PIN = "585ccc4f2af3d67880d40e75553864df01b6e7b7"
+READERS_SHA = "d3a93ececcf8448c5d2234ea9d59d08c85cf3a13e5a48687c975fc47de670dd2"
+RECEIPT_SHA = "b09cef2b8f91d2a4cb066d1790965ece2c0ce17411891d6182ee5c51b93e19e4"
+
+
+def test_contract_pin_and_frozen_receipt():
+    pin = (C / "CONTRACTS_PIN").read_text(encoding="utf-8").split()[0]
+    assert pin == PIN
+    assert hashlib.sha256((C / "qorcap-readers.v0.json").read_bytes()).hexdigest() == READERS_SHA
+    assert hashlib.sha256((C / "receipt.v0.json").read_bytes()).hexdigest() == RECEIPT_SHA
+    compat = COMPAT
+    assert compat["hash_chain"]["frames_hash"] == "sha256(JCS(qorcap))"
+    assert compat["verdicts"] == ["VERIFIED", "PARTIAL", "SELF_ATTESTED", "FAIL"]
+    assert "frames.jsonl" in compat["bundle_files"]["meta"]
+    assert "readers.json" in compat["bundle_files"]["meta"]
+
+
 def test_qortime_checkout_present_when_required():
     """CI sets this. A missing checkout must fail the job, not skip the drift compare."""
     if os.getenv("QORCAP_CONTRACTS_REQUIRED") != "1":
         pytest.skip("set QORCAP_CONTRACTS_REQUIRED=1 to refuse a missing qortime checkout")
     assert QT is not None and (QT / "schema" / "contracts").is_dir(), "QORTIME checkout with schema/contracts is required"
     assert (QT / "schema" / "receipt.v0.json").is_file()
+    head = subprocess.check_output(["git", "-C", str(QT), "rev-parse", "HEAD"], text=True).strip()
+    assert head == PIN, f"qortime checkout {head} is not the vendored pin {PIN}"
 
 
 @pytest.mark.skipif(QT is None or not (QT / "schema" / "contracts").exists(), reason="no qortime checkout with schema/contracts")
@@ -117,7 +136,9 @@ def test_recorder_pause_caps_match_vendored_rule_v2():
 def test_sidecar_constants_match_registry():
     import qorcap_submit as qs
     assert qs.OFFICIAL_PUB == COMPAT["official_referee"]["pubkey"]
-    assert list(qs.META_FILES) == COMPAT["bundle_files"]["meta"]
+    pinned = tuple(COMPAT["bundle_files"]["meta"])
+    assert tuple(qs.META_FILES) == pinned
+    assert pinned[-2:] == ("frames.jsonl", "readers.json")
     src = (HERE / "qorcap_match.py").read_text(encoding="utf-8")
     for f in ("qorcap_mnp.py", "qorcap_snp.py", "qorcap_tnp.py"):
         src += (HERE / f).read_text(encoding="utf-8")

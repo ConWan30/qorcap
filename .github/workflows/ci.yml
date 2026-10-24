@@ -37,16 +37,21 @@ jobs:
           git -C qortime remote add origin https://github.com/ConWan30/qortime.git
           git -C qortime fetch --depth 1 origin 0204e6d8082f8c40ea1fe5e09bf16402aaee3ff2
           git -C qortime checkout --detach FETCH_HEAD
+          git init qortime-contracts
+          git -C qortime-contracts remote add origin https://github.com/ConWan30/qortime.git
+          git -C qortime-contracts fetch --depth 1 origin 585ccc4f2af3d67880d40e75553864df01b6e7b7
+          git -C qortime-contracts checkout --detach FETCH_HEAD
       - run: cargo test --locked
         env:
           QORTIME: ${{ github.workspace }}/qortime
+          QORTIME_CONTRACTS: ${{ github.workspace }}/qortime-contracts
       # Headless sidecar tests, including the scorebug readers (standard bar, Thursday /
       # Sunday / Monday night, end menu, touchdown lock, play-call, PSN banner, and the
       # capture-pause fixtures). QORTIME is the pin above. A missing cv2/numpy/fixture
       # fails this step: tools/assert_pytest_skips.py rejects any skip that is not allowlisted.
       # Allowlisted: test_local_021003_both_players (opponent frames are not in the repo).
       # Not this step, on purpose:
-      # - sidecar/test_contracts.py stays in the "contracts (qortime main)" job (unpinned main).
+      # - sidecar/test_contracts.py stays in the "contracts (qortime 585ccc4)" job.
       # - sidecar/test_qorcap_submit.py drives the in-process referee (fastapi), not the reader.
       # - sidecar/test_qorcap_match.py launcher recording needs a built qorcap; it is not the glyph gate.
       # ffmpeg is installed above, so the highlights clip test and
@@ -82,15 +87,17 @@ jobs:
             sidecar/test_qorcap_sidepick.py \
             sidecar/test_score_timeline.py \
             sidecar/test_qorcap_glimpse_watch.py \
-            sidecar/test_qorcap_glimpse_witness.py
+            sidecar/test_qorcap_glimpse_witness.py \
+            sidecar/test_qorcap_readers.py
           python tools/assert_pytest_skips.py "$RUNNER_TEMP/sidecar-pytest.xml"
-  # Contract bytes are compared to qortime main, not to QORTIME_PIN. The linux and windows
-  # jobs keep fetching 0204e6d so `cargo test` and the bundled verifier stay reproducible.
-  # This job goes red when qortime main changes schema/contracts or schema/receipt.v0.json.
+  # Contract bytes are compared to qortime 585ccc4 (contracts/CONTRACTS_PIN), not to the
+  # runtime verifier pin. The linux and windows jobs keep fetching 0204e6d so `cargo test`
+  # and the bundled verifier stay reproducible. They also fetch 585ccc4 as QORTIME_CONTRACTS
+  # so the frame-bind verifier from that commit runs against emitted sidecars.
   # QORCAP_E2E=0 skips the Start Match recording. That path needs a built qorcap and ffmpeg;
   # it is not the drift check.
   contracts:
-    name: contracts (qortime main)
+    name: contracts (qortime 585ccc4)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -111,11 +118,11 @@ jobs:
               raise SystemExit("carriage return in:\n" + "\n".join(bad))
           PY
       - run: pip install pytest
-      - name: QorTime main (unpinned)
+      - name: QorTime contracts pin 585ccc4
         run: |
           git init qortime-main
           git -C qortime-main remote add origin https://github.com/ConWan30/qortime.git
-          git -C qortime-main fetch --depth 1 origin refs/heads/main
+          git -C qortime-main fetch --depth 1 origin 585ccc4f2af3d67880d40e75553864df01b6e7b7
           git -C qortime-main checkout --detach FETCH_HEAD
           git -C qortime-main rev-parse HEAD
       - name: Contract unit tests
@@ -124,6 +131,46 @@ jobs:
           QORCAP_E2E: "0"
           QORCAP_CONTRACTS_REQUIRED: "1"
         run: python -m pytest -q sidecar/test_contracts.py
+  # Pinned 585ccc4 is the required contract check. This job only notices when qortime main
+  # moves past that pin. A failure here does not fail the workflow.
+  contracts-main:
+    name: contracts (qortime main)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: QorTime main
+        run: |
+          git init qortime-main
+          git -C qortime-main remote add origin https://github.com/ConWan30/qortime.git
+          git -C qortime-main fetch --depth 1 origin refs/heads/main
+          git -C qortime-main checkout --detach FETCH_HEAD
+          git -C qortime-main rev-parse HEAD
+      - name: Drift against qortime main
+        env:
+          QORTIME: ${{ github.workspace }}/qortime-main
+        run: |
+          python - <<'PY'
+          import os, subprocess
+          from pathlib import Path
+          qt = Path(os.environ["QORTIME"])
+          c = Path("contracts")
+          head = subprocess.check_output(["git", "-C", str(qt), "rev-parse", "HEAD"], text=True).strip()
+          print("qortime main", head)
+          bad = []
+          for p in sorted((qt / "schema" / "contracts").glob("*.json")):
+              vendored = c / p.name
+              if not vendored.is_file() or vendored.read_bytes() != p.read_bytes():
+                  bad.append(p.name)
+          if (c / "receipt.v0.json").read_bytes() != (qt / "schema" / "receipt.v0.json").read_bytes():
+              bad.append("receipt.v0.json")
+          if bad:
+              raise SystemExit("drift from qortime main:\n" + "\n".join(bad))
+          print("no drift from qortime main")
+          PY
   windows:
     runs-on: windows-latest
     steps:
@@ -153,6 +200,10 @@ jobs:
           git -C qortime remote add origin https://github.com/ConWan30/qortime.git
           git -C qortime fetch --depth 1 origin 0204e6d8082f8c40ea1fe5e09bf16402aaee3ff2
           git -C qortime checkout --detach FETCH_HEAD
+          git init qortime-contracts
+          git -C qortime-contracts remote add origin https://github.com/ConWan30/qortime.git
+          git -C qortime-contracts fetch --depth 1 origin 585ccc4f2af3d67880d40e75553864df01b6e7b7
+          git -C qortime-contracts checkout --detach FETCH_HEAD
       # opencv-python-headless: CPU scorebug reads. No GPU, no capture card, no HID.
       # No ffmpeg on this job. Rust clip tests that cut with ffmpeg skip; sign/verify uses tests/fixtures/tiny_clip.mp4.
       # Pytest modules that need ffmpeg stay on the Linux job, where a missing ffmpeg fails the reader step.
@@ -161,6 +212,7 @@ jobs:
       - run: cargo test --locked
         env:
           QORTIME: ${{ github.workspace }}/qortime
+          QORTIME_CONTRACTS: ${{ github.workspace }}/qortime-contracts
       - run: cargo build --release --locked
       # Release-layout check plus the headless scorebug readers. The release test only
       # stages files and loads the schema; numpy and opencv are for the readers.
@@ -197,7 +249,8 @@ jobs:
             sidecar/test_qorcap_sidepick.py \
             sidecar/test_score_timeline.py \
             sidecar/test_qorcap_glimpse_watch.py \
-            sidecar/test_qorcap_glimpse_witness.py
+            sidecar/test_qorcap_glimpse_witness.py \
+            sidecar/test_qorcap_readers.py
           python tools/assert_pytest_skips.py "$RUNNER_TEMP/sidecar-pytest.xml"
       # No controller is the expected result: input-test returns 1.
       # pwsh forwards that native code as the step result unless the script exits 0 itself.

@@ -114,11 +114,18 @@ fn sha256_range(path: &Path, start: u64, len: u64) -> Result<String, String> {
 
 pub struct Report { pub segments: u64, pub bytes: u64, pub checkpoints: u64, pub chain_head: String, pub errors: Vec<String>,
     /// Controller input chunks verified (0 when the bundle has no inputs.jsonl).
-    pub input_chunks: u64, pub input_head: Option<String> }
+    pub input_chunks: u64, pub input_head: Option<String>,
+    /// Frame sidecar: verified | missing | stripped | broken. missing and stripped are not claims.
+    pub frame_status: String, pub reader_status: String, pub frame_chain_head: String,
+    pub frame_timed: u64, pub frame_samples: u64, pub frame_gaps: u64, pub frame_au: String,
+    /// sealed | open | checkpoints_missing. open is a consistent prefix, not a finished claim.
+    pub frame_tail: String }
 
 pub fn verify(dir: &Path) -> Result<Report, String> {
     let man = lines(&dir.join("manifest.jsonl"))?;
-    let mut r = Report { segments: 0, bytes: 0, checkpoints: 0, chain_head: GENESIS.into(), errors: vec![], input_chunks: 0, input_head: None };
+    let mut r = Report { segments: 0, bytes: 0, checkpoints: 0, chain_head: GENESIS.into(), errors: vec![], input_chunks: 0, input_head: None,
+        frame_status: "missing".into(), reader_status: "missing".into(), frame_chain_head: String::new(),
+        frame_timed: 0, frame_samples: 0, frame_gaps: 0, frame_au: "unavailable".into(), frame_tail: "open".into() };
     let mut expect_off: std::collections::HashMap<String, u64> = Default::default();
     let mut heads = std::collections::HashSet::new();
     heads.insert(GENESIS.to_string());
@@ -200,9 +207,25 @@ pub fn verify(dir: &Path) -> Result<Report, String> {
             }
             r.checkpoints += 1;
         }
+        let bind = crate::framebind::check_dir(dir, &cps);
+        apply_bind(&mut r, bind);
+    } else {
+        apply_bind(&mut r, crate::framebind::check_dir(dir, &[]));
     }
     if let Some(m) = input_by_seg.as_ref() { if committed < m.len() { r.errors.push(format!("inputs: {} chunk(s) not committed by any checkpoint", m.len() - committed)); } }
     Ok(r)
+}
+
+fn apply_bind(r: &mut Report, bind: crate::framebind::BindReport) {
+    r.errors.extend(bind.errors);
+    r.frame_status = bind.frame_status;
+    r.reader_status = bind.reader_status;
+    r.frame_chain_head = bind.frame_chain_head;
+    r.frame_timed = bind.coverage.timed_frames;
+    r.frame_samples = bind.coverage.samples;
+    r.frame_gaps = bind.coverage.gap_samples;
+    r.frame_au = bind.coverage.au;
+    r.frame_tail = bind.tail;
 }
 
 #[cfg(test)]

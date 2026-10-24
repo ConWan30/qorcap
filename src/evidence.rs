@@ -8,6 +8,14 @@
 //!   (hash = SHA-256(JCS(body)), same rule as `qor_receipt/checkpoints.py`) whose
 //!   `frames_hash` commits to the QorCap evidence object (segment hash, chain head,
 //!   score/clock state, nonce) carried alongside as `qorcap`.
+//!
+//!   `frames_hash` is not redefined here. QorTime's spec (`spec/match-receipt-v0.md` §4) and
+//!   `qor_receipt.checkpoints.window_hash` describe it as a SHA-256 over the SHA-256 of each
+//!   frame in the window. QorCap has always set it to `SHA-256(JCS(qorcap))` instead, so a
+//!   frame is localized only to the ~2 s segment named in that object. The optional frame
+//!   sidecar (`framebind`) commits inside `qorcap` and does not change this formula.
+//!   `docs/design/frame-and-reader-binding.md` is the write-up, including a spec change that
+//!   is proposed and not applied.
 //! * `pattern_for`: port of QorTime's nonce -> DualSense pattern.
 //!
 //! Honesty rail: this proves footage integrity and timing (what bytes, in what
@@ -102,6 +110,8 @@ pub struct CheckpointChain { pub seq: u64, pub prev: String }
 impl Default for CheckpointChain { fn default() -> Self { Self { seq: 0, prev: GENESIS.into() } } }
 impl CheckpointChain {
     /// `ext` = QorCap evidence object; committed via frames_hash = SHA-256(JCS(ext)).
+    /// This is the segment-level object, not a hash of per-frame hashes. Do not change the
+    /// formula to match the QorTime spec's wording; that would be a silent redefinition.
     pub fn next(&mut self, t_ms: u64, ext: Value) -> Result<Value, String> { self.next_with_input(t_ms, ext, None) }
     /// `input_hash` = SHA-256(JCS([input records])) of the controller chunk sealed with this checkpoint
     /// (None = SHA-256(JCS([])), the pre-0.3.0 value).

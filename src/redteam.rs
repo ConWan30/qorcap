@@ -357,6 +357,8 @@ fn build(plan: &Plan) -> Built {
     let report = bundle::verify(&dir).unwrap_or_else(|e| bundle::Report {
         segments: 0, bytes: 0, checkpoints: 0, chain_head: String::new(),
         errors: vec![e], input_chunks: 0, input_head: None,
+        frame_status: "missing".into(), reader_status: "missing".into(), frame_chain_head: String::new(),
+        frame_timed: 0, frame_samples: 0, frame_gaps: 0, frame_au: "unavailable".into(), frame_tail: "open".into(),
     });
     let (recs, _) = inputs::read_file(&dir.join("inputs.jsonl")).unwrap_or_default();
     Built { _dir: hold, receipt, recs, phases, verify_errors: report.errors }
