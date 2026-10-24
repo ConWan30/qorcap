@@ -69,6 +69,7 @@ jobs:
             sidecar/test_qorcap_highlights.py \
             sidecar/test_auto_highlights.py \
             sidecar/test_final_screen_pause.py \
+            sidecar/test_post_final_tail.py \
             sidecar/test_start_match_glimpse.py \
             sidecar/test_qorcap_ai_loop.py \
             sidecar/test_qorcap_console.py \
@@ -208,6 +209,7 @@ jobs:
             sidecar/test_pairing.py \
             sidecar/test_auto_highlights.py \
             sidecar/test_final_screen_pause.py \
+            sidecar/test_post_final_tail.py \
             sidecar/test_start_match_glimpse.py \
             sidecar/test_qorcap_ai_loop.py \
             sidecar/test_qorcap_console.py \
