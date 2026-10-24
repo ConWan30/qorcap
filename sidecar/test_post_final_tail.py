@@ -667,6 +667,79 @@ def test_scorebug_between_menus_keeps_the_first_score_unconfirmed():
         p.get("away") == 10 and p.get("home") == 0 and p.get("final_confirmed") is True for p in posts)
 
 
+def _dispute_note(timeline, later_t=25_000):
+    """The signed sentence for a 10-0 menu after a posted 7-0, with ``timeline`` between them."""
+    bare = ReaderCore.__new__(ReaderCore)
+    bare.end_menu = {"until_ms": 8_000, "away": 7, "home": 0}
+    bare.final = {"away": 7, "home": 0, "notes": [], "final_confirmed": True,
+                  "basis": "end_menu", "method": "end_menu_read"}
+    bare.timeline = list(timeline)
+    bare.post = lambda *_a, **_k: None
+    bare._note_end_menu_disagreement({"away": 10, "home": 0, "t_ms": later_t})
+    return bare.final["notes"][0]
+
+
+def test_a_non_scorebug_row_between_menus_does_not_claim_a_scorebug_read():
+    """An observation, or a row with no home score, is not a scorebug read that came back.
+
+    The obs row carries a home score, so dropping the observation check would name a
+    scorebug. The other row has no observation and no home score, so dropping the home
+    check would name one too.
+    """
+    obs = {"t_ms": 12_000, "until_ms": 14_000, "obs": "final_screen", "n": 3, "home": 0, "away": 7}
+    no_home = {"t_ms": 12_000, "away": 7, "quarter": 4, "clock_s": 0}
+    assert _dispute_note([obs]) == _NO_SCOREBUG_DISPUTE_NOTE
+    assert _dispute_note([no_home]) == _NO_SCOREBUG_DISPUTE_NOTE
+    assert "scorebug read came back" not in _dispute_note([obs, no_home])
+
+
+class _NoBar:
+    """No scorebug on this frame. A flushed hold can still post."""
+
+    def read(self, _img):
+        return _Fin(ok=False, reason="layout_unknown", pair=None)
+
+
+def test_flushed_touchdown_between_menus_is_not_a_scorebug_that_came_back():
+    """A held touchdown posted between the menus is not the scorebug coming back.
+
+    The score event stays a normal score. The note keeps the previous sentence.
+    Counting that row would claim a scorebug read came back.
+    """
+    menu_reader = _SwitchScore((7, 0), (10, 0), at=20_000)
+    posts = []
+    core = ReaderCore(posts.append, _NoBar(), _Agree(), None, _detect_final,
+                      final_screen_detector=madden_final_screen, end_menu_reader=menu_reader,
+                      end_menu_agree=EndMenuAgreement())
+    core.timeline = [{"t_ms": 1_000, "home": 0, "away": 7, "quarter": 4, "clock_s": 0, "clock_red": True}]
+    for t, img in _menu_frames(5_000, 8_000):
+        menu_reader.t = t
+        core.on_frame(t, img)
+    assert (core.final["away"], core.final["home"]) == (7, 0)
+    assert core.end_menu["until_ms"] == 8_000
+    hold = _Fin(ok=True, reason="ok", left_score=7, right_score=6, quarter=4,
+                clock_seconds=0, clock_red=True, pair=(7, 6))
+    core.touchdown.pending = {
+        "cand": (7, 6), "old": (7, 0), "read": hold, "t0": 9_000, "due": 12_000,
+        "last_t": 9_000, "confirms": 0, "need": 0, "confusable": False,
+        "min_margin": 0.15, "id": "td-between", "verdict": None,
+    }
+    core.on_frame(12_000, _blank())
+    posted = [p for p in posts if p.get("type") == "score" and p.get("t_ms") == 12_000]
+    assert len(posted) == 1
+    assert posted[0]["home"] == 6 and posted[0]["away"] == 7
+    assert "touchdown_hold" not in posted[0]
+    held = [r for r in core.timeline if r.get("t_ms") == 12_000 and r.get("home") == 6]
+    assert len(held) == 1 and held[0].get("touchdown_hold") is True
+    for t, img in _menu_frames(25_000, 28_000):
+        menu_reader.t = t
+        core.on_frame(t, img)
+    assert (core.final["away"], core.final["home"]) == (7, 0)
+    assert core.final["final_confirmed"] is False
+    assert core.final["notes"][0] == _NO_SCOREBUG_DISPUTE_NOTE
+    assert "scorebug read came back" not in core.final["notes"][0]
+
+
 def test_disputed_final_stays_unconfirmed_after_stop(tmp_path):
     """7-0 menu, then a 10-0 menu, then stop. The re-read must not confirm the first score.
 

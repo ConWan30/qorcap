@@ -1288,7 +1288,7 @@ class ReaderCore:
         self.stats["touchdown_jump"] = self.stats.get("touchdown_jump", 0) + 1
         print(f"touchdown jump locked: away {got.left_score} - home {got.right_score}", file=sys.stderr)
         self.score_lock.remember(got.pair, t_ms * 1_000_000)
-        self._post_agreed(t_ms, got, True)
+        self._post_agreed(t_ms, got, True, touchdown_hold=True)
 
     def _note_reanchor(self, t_ms: int, fr) -> None:
         """Record a re-anchor on the sidecar callback. The score event itself is unchanged.
@@ -1317,7 +1317,7 @@ class ReaderCore:
         if note is not None:
             note(row)
 
-    def _post_agreed(self, t_ms: int, read, soft: bool) -> None:
+    def _post_agreed(self, t_ms: int, read, soft: bool, *, touchdown_hold: bool = False) -> None:
         from types import SimpleNamespace
         note = getattr(self.reader, "note_lock", None)
         if note is not None and getattr(read, "left_score", None) is not None and getattr(read, "right_score", None) is not None:
@@ -1337,7 +1337,10 @@ class ReaderCore:
         if self.gate is not None:
             self.gate.on_read(rd)
         if prev is None or key(prev) != key(rd) or rd["t_ms"] - prev["t_ms"] >= 1_000:
-            self.timeline.append(rd)
+            # The hold is a posted score. It is not a scorebug read that came back, and the
+            # flag stays on the in-memory row. The posted score event does not carry it.
+            row = dict(rd, touchdown_hold=True) if touchdown_hold else rd
+            self.timeline.append(row)
             self.post(jcs_safe({"type": "score", **rd}))
             q = rd.get("quarter")
             if isinstance(q, int) and not isinstance(q, bool) and q >= 1:
@@ -1602,6 +1605,8 @@ class ReaderCore:
 
         The posted menu's ``until_ms`` and the later menu's ``t_ms`` are the bounds. A row
         at either bound is not between them. A missing bound is not a scorebug read.
+        An observation, a row with no home score, and a flushed touchdown hold are not
+        the scorebug coming back.
         """
         menu = self.end_menu if isinstance(self.end_menu, dict) else {}
         start = _as_ms(menu.get("until_ms"))
@@ -1609,7 +1614,7 @@ class ReaderCore:
         if start is None or later is None or later <= start:
             return False
         for r in self.timeline or []:
-            if not isinstance(r, dict) or "obs" in r or "home" not in r:
+            if not isinstance(r, dict) or "obs" in r or "home" not in r or r.get("touchdown_hold") is True:
                 continue
             t = _as_ms(r.get("t_ms"))
             if t is not None and start < t < later:
@@ -1624,8 +1629,10 @@ class ReaderCore:
         A contradicting later menu must never become a confirmed final.
 
         The signed note names that scorebug only when a scorebug row lies strictly
-        between the posted menu's ``until_ms`` and the later menu's ``t_ms``. Otherwise
-        the note is the previous sentence, with no claim that a scorebug returned.
+        between the posted menu's ``until_ms`` and the later menu's ``t_ms``. An
+        observation, a row with no home score, and a flushed touchdown hold do not
+        count. Otherwise the note is the previous sentence, with no claim that a
+        scorebug returned.
         """
         if getattr(self, "_end_menu_disputed", False):
             return
