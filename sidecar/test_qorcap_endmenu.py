@@ -144,7 +144,7 @@ def test_held_out_125430_finish_menu_reads_7_14():
 
 
 def test_reads_both_matches_away_left_home_right(menu):
-    """125430 supplied the 7 and the 4. That pack is gone, so the reader abstains and does not guess."""
+    """A substituted empty provenance abstains. The committed 143212 pack is not used."""
     from qorcap_template_guard import TEMPLATES_MISSING
     blank = np.zeros((360, 640, 3), np.uint8)
     for frame in (blank, RST, cv2.resize(RST, (1280, 720))):
@@ -153,7 +153,6 @@ def test_reads_both_matches_away_left_home_right(menu):
         assert rd.away is None and rd.home is None
     assert menu.xpack is None and menu._missing
     assert not (HERE / "packs" / "madden27_end_menu_v1.npz").is_file()
-    assert not (HERE / "packs" / "madden27_end_menu_v2.npz").is_file()
 
 
 def test_unreadable_fails_closed(menu):

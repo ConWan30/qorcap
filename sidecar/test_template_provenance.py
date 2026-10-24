@@ -65,6 +65,10 @@ def is_scanned_template(rel: Path) -> bool:
     """
     if not rel.parts:
         return False
+    # The 143212 end-menu pack is hash-pinned in qorcap_endmenu, with the 125430
+    # rows removed. It is not a per-glyph harvest row. Any other npz still is.
+    if rel.as_posix() == "sidecar/packs/madden27_end_menu_v2.npz":
+        return False
     suffix = rel.suffix.lower()
     if suffix not in ARRAY_EXTS | IMAGE_EXTS:
         return False
@@ -288,6 +292,24 @@ def test_schema_rejects_a_bad_role_an_absolute_path_and_an_extra_field():
     wrong_role = _valid_row()
     wrong_role["role"] = "clock"
     assert not glyph_name_matches(wrong_role)
+
+
+def test_legacy_end_menu_pack_is_hash_pinned_and_drops_125430():
+    """The recorded-frame final check reads this pack. It is not a harvest row."""
+    from qorcap_endmenu import LEGACY_END_MENU_SHA256
+
+    path = ROOT / "sidecar" / "packs" / "madden27_end_menu_v2.npz"
+    assert path.is_file()
+    assert not is_scanned_template(Path("sidecar/packs/madden27_end_menu_v2.npz"))
+    assert is_scanned_template(Path("sidecar/packs/old.npz"))
+    assert sha256_file(path) == LEGACY_END_MENU_SHA256
+    with np.load(path) as blob:
+        sources = [str(x) for x in blob["source"]]
+        labels = {str(x) for x in blob["labels"]}
+    assert set("0123456789") <= labels
+    assert "real:95" not in sources
+    for item in sorted(HELD):
+        assert all(item not in src for src in sources), item
 
 
 def test_held_out_ids_are_not_in_template_pack_metadata():

@@ -30,7 +30,9 @@ _OPTIONAL_INSTALL = frozenset({"qorcap", "qorcap.exe", "ffmpeg", "ffmpeg.exe", "
 # The banner fragment pack is optional. qorcap_banner treats a missing file as no banner.
 # A release with no pack must still install and load the signing schema.
 _OPTIONAL_RUNTIME_FILES = frozenset({
-    # Missing on purpose. The reader abstains until an allowlisted harvest replaces them.
+    # Not required for the install audit. The end-menu npz is present and
+    # hash-pinned; a missing file still abstains. The other packs are absent
+    # until an allowlisted harvest replaces them.
     "sidecar/packs/madden27_banner_fragments.npz",
     "sidecar/packs/madden27_standard_score_110028.npz",
     "sidecar/packs/madden27_standard_score_084523.npz",

@@ -28,6 +28,13 @@ import numpy as np
 
 GLYPH = (12, 18)  # (w, h) normalised end-menu glyph
 PACK = Path(__file__).resolve().parent / "packs" / "madden27_end_menu_v2.npz"
+# v2 with the 125430 rows (source ``real:95``) removed. ``real:600`` is match
+# 143212's zero, two glyphs on each of 300 frames, and ``real:300`` is that
+# match's two. Digits 1, 4, and 7 were only in the removed rows; Hershey
+# stand-ins keep the set complete so a missing digit is not the nearest match.
+# sha256 of sidecar/packs/madden27_end_menu_v2.npz.
+LEGACY_END_MENU_SHA256 = "24c8bc3583fd440af095f60ae0b6e016cd555ce907dd982b2b1c42fe4da9c739"
+_LEGACY_HELD_OUT = ("170123", "021003", "125430", "084523", "193534")
 BAND_Y = (28, 66)                      # score digits sit at y ~38-56
 SIDES = {"away": (280, 368), "home": (384, 462)}  # logos at x<276 and x>465 stay outside
 GLYPH_H = (15, 22)
@@ -128,6 +135,46 @@ class EndMenuRead:
     digits: list[dict[str, Any]] = field(default_factory=list)
 
 
+def _load_npz(pack: Path) -> tuple[list[str], np.ndarray, list[str], np.ndarray | None]:
+    d = np.load(str(pack))
+    labels = [str(x) for x in d["labels"]]
+    vecs = d["vecs"].astype(np.float32)
+    sources = [str(x) for x in d["source"]]
+    ot = d["ot_vec"].astype(np.float32).ravel() if "ot_vec" in d.files else None
+    return labels, vecs, sources, ot
+
+
+def _legacy_end_menu(pack: str | Path | None) -> bool:
+    """The committed 143212 pack, and only while provenance is that committed file.
+
+    A substituted provenance file is a full replacement: an empty one abstains,
+    and a partial end-menu harvest does not fall back to this pack. The 125430
+    rows are not in it.
+    """
+    from qorcap_template_guard import PROVENANCE_PATH, sha256_file
+
+    if pack is None:
+        return False
+    path = Path(pack)
+    try:
+        if not path.is_file() or path.resolve() != PACK.resolve():
+            return False
+        committed = Path(__file__).resolve().parents[1] / "templates" / "provenance.json"
+        if PROVENANCE_PATH.resolve() != committed.resolve():
+            return False
+        if sha256_file(path) != LEGACY_END_MENU_SHA256:
+            return False
+        _labels, _vecs, sources, _ot = _load_npz(path)
+    except (OSError, ValueError, KeyError):
+        return False
+    if not set("0123456789") <= set(_labels):
+        return False
+    for src in sources:
+        if src == "real:95" or any(item in src for item in _LEGACY_HELD_OUT):
+            return False
+    return True
+
+
 class EndMenuReader:
     def corroborate(self, img, expected: dict) -> dict:
         return corroborate(img, expected, self)
@@ -137,10 +184,12 @@ class EndMenuReader:
 
         self._missing = False
         # A partial digit set matches the nearest glyph. Abstain until 0-9 are all present.
-        got = harvested_vectors("end_menu") if digits_complete("end_menu") else {}
-        if got:
+        # Any harvested end-menu row blocks the legacy pack, so a partial harvest cannot
+        # fill the gap from it.
+        harvested = harvested_vectors("end_menu")
+        if digits_complete("end_menu") and harvested:
             labels, rows, sources = [], [], []
-            for lab, vecs in got.items():
+            for lab, vecs in harvested.items():
                 for row in vecs:
                     labels.append(lab)
                     rows.append(row)
@@ -149,12 +198,14 @@ class EndMenuReader:
             self.vecs = np.stack(rows, axis=0).astype(np.float32)
             self.sources = sources
             self.ot_vec = None
-        elif pack is not None and file_authorized(Path(pack)):
-            d = np.load(str(pack))
-            self.labels = [str(x) for x in d["labels"]]
-            self.vecs = d["vecs"].astype(np.float32)
-            self.sources = [str(x) for x in d["source"]]
-            self.ot_vec = d["ot_vec"].astype(np.float32).ravel() if "ot_vec" in d.files else None
+        elif harvested:
+            self._missing = True
+            self.labels = []
+            self.vecs = np.zeros((0, GLYPH[0] * GLYPH[1]), np.float32)
+            self.sources = []
+            self.ot_vec = None
+        elif _legacy_end_menu(pack) or (pack is not None and file_authorized(Path(pack))):
+            self.labels, self.vecs, self.sources, self.ot_vec = _load_npz(Path(pack))
         else:
             self._missing = True
             self.labels = []
