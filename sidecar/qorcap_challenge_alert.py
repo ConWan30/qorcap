@@ -8,8 +8,9 @@ Nothing here is recorded. A miss stays unanswered. ``notify_challenge`` only
 enqueues work and returns. One daemon worker runs each alert: the toast, then
 the flash, then the beep. The queue holds two jobs; a third is dropped. Toast
 and flash do not wait on the sound player. If playback is still going after
-``_BEEP_TIMEOUT_S`` the player is abandoned, one warning is logged, and the
-worker is replaced so a later alert still runs. On any other platform the
+``_BEEP_TIMEOUT_S`` that player is left running and the timeout is logged.
+While it is alive, later alerts still toast and flash, and their beep is
+skipped and logged. The worker is not replaced. On any other platform the
 Windows calls are skipped and this module does not raise.
 
 A failed backend logs one warning per process on the ``qorcap.challenge_alert``
@@ -76,7 +77,8 @@ _WARN_LOCK = threading.Lock()
 _WAV_CACHE: dict[tuple[int, float], bytes] = {}
 _JOBS: queue.Queue[Callable[[], None]] | None = None
 _WORKER_LOCK = threading.Lock()
-_WORKER_GEN = 0
+_PLAYER: threading.Thread | None = None
+_PLAYER_LOCK = threading.Lock()
 _TOAST_PROCS: list[subprocess.Popen] = []
 
 # PowerShell's own AUMID. An unpackaged console has none. Some Windows builds
@@ -402,54 +404,27 @@ def _safe(backend: str, fn: Callable[[], None]) -> None:
         warn_once(backend, exc)
 
 
-def _worker_loop(gen: int) -> None:
+def _worker_loop() -> None:
     jobs = _JOBS
     if jobs is None:
         return
     while True:
         job = jobs.get()
-        if gen != _WORKER_GEN:
-            # Retired while waiting. Put the job back for the live worker.
-            try:
-                jobs.put_nowait(job)
-            except queue.Full:
-                warn_once("queue", "dropped; alert worker is busy")
-            jobs.task_done()
-            return
         try:
             job()
         except Exception as exc:
             warn_once("worker", exc)
         finally:
             jobs.task_done()
-        if gen != _WORKER_GEN:
-            return
-
-
-def _start_worker_locked(gen: int) -> None:
-    threading.Thread(
-        target=_worker_loop, args=(gen,), name="qorcap-challenge-alert", daemon=True,
-    ).start()
 
 
 def _ensure_worker() -> queue.Queue[Callable[[], None]]:
-    global _JOBS, _WORKER_GEN
+    global _JOBS
     with _WORKER_LOCK:
         if _JOBS is None:
             _JOBS = queue.Queue(maxsize=_QUEUE_MAX)
-            _WORKER_GEN += 1
-            _start_worker_locked(_WORKER_GEN)
+            threading.Thread(target=_worker_loop, name="qorcap-challenge-alert", daemon=True).start()
         return _JOBS
-
-
-def _replace_worker() -> None:
-    """Drop the worker blocked behind a hung player and start one on the same queue."""
-    global _WORKER_GEN
-    with _WORKER_LOCK:
-        if _JOBS is None:
-            return
-        _WORKER_GEN += 1
-        _start_worker_locked(_WORKER_GEN)
 
 
 def drain(timeout: float = 5.0) -> bool:
@@ -471,26 +446,37 @@ def drain(timeout: float = 5.0) -> bool:
         return True
 
 
+def _log_beep(detail: str) -> None:
+    """Log a beep miss every time. A stuck player must not hide the next one."""
+    _LOG.warning("challenge alert beep: %s", detail)
+
+
 def _beep_bounded(fn: Callable[[], None]) -> None:
-    """Run the beep off the worker. A stuck PlaySound is abandoned after the timeout.
+    """Run the beep off the worker. One player thread at a time.
 
-    The player thread is a daemon and is not joined past the timeout, so it cannot
-    drop later alerts. One warning is logged and the worker is replaced.
+    A stuck ``PlaySound`` is left running after the timeout, and that timeout is
+    logged. While that thread is alive the next beep is skipped and logged.
+    Toast and flash have already run. The worker keeps taking jobs.
     """
-    error: list[BaseException] = []
+    global _PLAYER
+    with _PLAYER_LOCK:
+        if _PLAYER is not None and _PLAYER.is_alive():
+            _log_beep("skipped; previous playback is still running")
+            return
+        error: list[BaseException] = []
 
-    def play() -> None:
-        try:
-            fn()
-        except Exception as exc:
-            error.append(exc)
+        def play() -> None:
+            try:
+                fn()
+            except Exception as exc:
+                error.append(exc)
 
-    player = threading.Thread(target=play, name="qorcap-challenge-beep", daemon=True)
-    player.start()
+        player = threading.Thread(target=play, name="qorcap-challenge-beep", daemon=True)
+        _PLAYER = player
+        player.start()
     player.join(_BEEP_TIMEOUT_S)
     if player.is_alive():
-        warn_once("beep-timeout", "playback timed out; replacing the alert worker")
-        _replace_worker()
+        _log_beep(f"timed out after {_BEEP_TIMEOUT_S:g}s; leaving that playback running")
         return
     if error:
         warn_once("beep", error[0])

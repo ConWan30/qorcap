@@ -657,8 +657,27 @@ def test_drain_does_not_start_a_thread():
     assert not any(t.name == "qorcap-challenge-alert-drain" for t in threading.enumerate())
 
 
+def test_negative_volume_warns_and_plays_at_full_scale(monkeypatch, caplog):
+    alert._WARNED.discard("beep_volume")
+    caplog.set_level(logging.WARNING, logger="qorcap.challenge_alert")
+    calls = []
+    monkeypatch.setattr(alert, "default_backends", lambda: _backends(calls))
+    env = dict(_ON)
+    env["QORCAP_CHALLENGE_BEEP_VOLUME"] = "-1"
+    alert.notify_challenge("QORTIME CHALLENGE", env=env)
+    assert alert.drain(2)
+    assert _names(calls) == ["toast", "flash", "beep"]
+    assert calls[-1][2].beep_volume == 1.0
+    assert any("-1" in rec.getMessage() and "full scale" in rec.getMessage() for rec in caplog.records)
+    half = _cfg("-0.5")
+    assert half.beep_volume == 1.0 and half.beep and half.toast and half.flash
+
+
+def _players():
+    return [t for t in threading.enumerate() if t.name == "qorcap-challenge-beep" and t.is_alive()]
+
+
 def test_hung_beep_does_not_block_toast_flash_or_the_next_alert(monkeypatch, caplog):
-    alert._WARNED.discard("beep-timeout")
     caplog.set_level(logging.WARNING, logger="qorcap.challenge_alert")
     monkeypatch.setattr(alert, "_BEEP_TIMEOUT_S", 0.2)
     order = []
@@ -685,8 +704,6 @@ def test_hung_beep_does_not_block_toast_flash_or_the_next_alert(monkeypatch, cap
     try:
         started = time.perf_counter()
         alert.notify_challenge("one", env=_ON)
-        # Captured after enqueue and before the player can hit the timeout.
-        gen_during = alert._WORKER_GEN
         deadline = time.monotonic() + 1.0
         while order[:2] != ["toast", "flash"] and time.monotonic() < deadline:
             time.sleep(0.01)
@@ -699,9 +716,57 @@ def test_hung_beep_does_not_block_toast_flash_or_the_next_alert(monkeypatch, cap
             time.sleep(0.01)
         assert order.count("toast") == 2
         assert order.count("flash") == 2
+        assert order.count("beep-start") == 1
         assert "beep-end" not in order
-        assert alert._WORKER_GEN > gen_during
-        timed_out = [rec.getMessage() for rec in caplog.records if "playback timed out" in rec.getMessage()]
-        assert timed_out == ["challenge alert beep-timeout failed: playback timed out; replacing the alert worker"]
+        assert len(_players()) <= 1
+        messages = [rec.getMessage() for rec in caplog.records if rec.name == "qorcap.challenge_alert"]
+        assert any("timed out" in msg for msg in messages)
+        assert any("still running" in msg for msg in messages)
     finally:
         release.set()
+        deadline = time.monotonic() + 1.0
+        while _players() and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+
+def test_twenty_five_hangs_leave_one_player_thread(monkeypatch, caplog):
+    caplog.set_level(logging.WARNING, logger="qorcap.challenge_alert")
+    monkeypatch.setattr(alert, "_BEEP_TIMEOUT_S", 0.05)
+    order = []
+    release = threading.Event()
+
+    def hung(prompt, cfg):
+        del prompt, cfg
+        order.append("beep-start")
+        release.wait(30)
+
+    def mark(kind):
+        def fn(prompt, cfg):
+            del prompt, cfg
+            order.append(kind)
+        return fn
+
+    monkeypatch.setattr(
+        alert, "default_backends",
+        lambda: alert.AlertBackends(beep=hung, toast=mark("toast"), flash=mark("flash")),
+    )
+    deadline = time.monotonic() + 1.0
+    while _players() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert _players() == []
+    try:
+        for n in range(25):
+            alert.notify_challenge(f"hang-{n}", env=_ON)
+            assert alert.drain(2)
+        assert order.count("toast") == 25
+        assert order.count("flash") == 25
+        assert order.count("beep-start") == 1
+        assert len(_players()) <= 1
+        messages = [rec.getMessage() for rec in caplog.records if rec.name == "qorcap.challenge_alert"]
+        assert sum("timed out" in msg for msg in messages) == 1
+        assert sum("still running" in msg for msg in messages) == 24
+    finally:
+        release.set()
+        deadline = time.monotonic() + 1.0
+        while _players() and time.monotonic() < deadline:
+            time.sleep(0.01)
