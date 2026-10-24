@@ -12,8 +12,9 @@
 //! does not fail the match. A mismatched committed hash does.
 //!
 //! Absence, `unbound`, a gap, a write failure, or an unverified chain is not a frame-time claim
-//! and not a reader claim. The wire format is a draft until QorTime publishes the optional
-//! schemas. This module does not add a contract file.
+//! and not a reader claim. The wire format is the vendored QorTime schemas
+//! `qorcap-frame-bind/v0` and `qorcap-readers/v0` (contracts pin `585ccc4`). This module does
+//! not change a published verdict.
 
 use crate::evidence::{self as ev, GENESIS};
 use crate::frameclock::video_pes_pts;
@@ -30,6 +31,8 @@ pub const FRAMES_FILE: &str = "frames.jsonl";
 pub const READERS_FILE: &str = "readers.json";
 pub const ENV: &str = "QORCAP_FRAME_BIND";
 pub const PTS_TIMESCALE: u64 = 90_000;
+/// qortime `MAX_READERS_BYTES` at 585ccc4. The file is JCS plus one newline.
+pub const MAX_READERS_BYTES: usize = 64 * 1024;
 const MONO_STEP_MAX_MS: u64 = 600_000;
 const MONO_ABS_MAX_MS: u64 = 48 * 60 * 60 * 1000;
 
@@ -182,8 +185,9 @@ impl Default for Coverage {
 /// Machine-readable result for a QorTime gate.
 ///
 /// `frame_status` and `reader_status` are each `verified`, `missing`, `stripped`, or `broken`.
-/// `tail` is `sealed` (the last checkpoint commits a seal line), `open` (a consistent prefix with
-/// no seal; dropping the last checkpoint and its lines looks like this), or `checkpoints_missing`.
+/// `tail` is `sealed` (the last checkpoint is the stop checkpoint and it covers every line),
+/// `open` (a consistent prefix; dropping the stop checkpoint looks like this), or
+/// `checkpoints_missing`. The merged schema has no `seal` line.
 /// `frame_claim` is true only for a sealed, gap-free, verified chain with at least one timed frame.
 /// Anything else is no frame-time claim. `reader_claim` is true only when `readers.json` matches
 /// checkpoint 0. `unbound` is `missing`, not a claim.
@@ -259,7 +263,8 @@ pub struct FrameBind {
 
 impl FrameBind {
     pub fn open(enabled: bool, bundle: Option<&Path>, fps: u32) -> Self {
-        let fps_num = fps.max(1);
+        // The merged header is a 90 kHz time base. `--fps` is not a field on that header.
+        let _ = fps;
         if !enabled {
             return Self {
                 enabled: false,
@@ -284,9 +289,7 @@ impl FrameBind {
                     "schema": SCHEMA,
                     "hash_of": HASH_OF,
                     "clock": "qorcap-mono-ms",
-                    "pts_timescale": PTS_TIMESCALE,
-                    "nominal_fps_num": fps_num,
-                    "nominal_fps_den": 1,
+                    "time_base": {"num": 1, "den": PTS_TIMESCALE},
                 });
                 if let Err(e) = inner.push_line(&header) {
                     log::error!("frame bind: header was not written ({e}); no frame claim");
@@ -419,15 +422,19 @@ impl FrameBind {
             SampleRead::NoVideo => {}
             SampleRead::Unreadable(reason) => {
                 let from = g.next_frame;
+                // The schema requires samples >= 1. An unreadable fragment has no sample count,
+                // so the gap is one index wide and the next segment continues after it.
                 if let Err(e) = g.push_line(&json!({
                     "type": "align_gap",
                     "seg": seq,
                     "from_frame": from,
-                    "samples": 0,
-                    "pts": 0,
-                    "reason": reason,
+                    "samples": 1,
+                    "bound": 0,
+                    "reason": gap_reason(&reason),
                 })) {
                     log::error!("frame bind: {e}");
+                } else {
+                    g.next_frame += 1;
                 }
             }
             SampleRead::Frames(samples) => {
@@ -461,17 +468,16 @@ impl FrameBind {
         }))
     }
 
-    /// Last line of a finished recording. The stop checkpoint must commit it.
-    /// Dropping that checkpoint and this line leaves a consistent prefix with `tail: open`.
+    /// Mark the recording finished. The merged schema has no seal line, so this does not append
+    /// one. `tail: sealed` is the stop checkpoint covering every line that landed.
     pub fn seal(&self) -> Result<(), String> {
         if !self.enabled {
             return Ok(());
         }
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        if g.sealed {
-            return Ok(());
+        if g.failed {
+            return Err("frame sidecar write already failed; no frame claim".into());
         }
-        g.push_line(&json!({"type": "seal"}))?;
         g.sealed = true;
         Ok(())
     }
@@ -491,6 +497,12 @@ impl FrameBind {
         validate_readers(manifest)?;
         let mut bytes = ev::jcs(manifest)?.into_bytes();
         bytes.push(b'\n');
+        if bytes.len() > MAX_READERS_BYTES {
+            return Err(format!(
+                "readers.json is {} bytes; the cap is {MAX_READERS_BYTES}",
+                bytes.len()
+            ));
+        }
         let sha = ev::sha256_hex(&bytes);
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if g.opening_claimed {
@@ -516,29 +528,25 @@ impl FrameBind {
     }
 }
 
+fn gap_reason(reason: &str) -> &'static str {
+    if reason.contains("composition offset") {
+        "composition_offset"
+    } else if reason.contains("regression") {
+        "pts_regression"
+    } else {
+        "unreadable"
+    }
+}
+
+/// One `align_gap` per segment that is not fully paired. The span covers every sample in that
+/// segment, and `bound` is how many of those samples became frame rows. The schema allows one
+/// gap per segment and requires those rows to sit inside the span.
 fn pair_samples(g: &mut Inner, seq: u64, samples: &[VideoSample]) -> Result<(), String> {
     let gen = g.generation;
     let mut used = vec![false; g.arrivals.len()];
-    let mut gap_from: Option<i64> = None;
-    let mut gap_n: i64 = 0;
-    let mut gap_pts: u64 = 0;
-    let flush_gap = |g: &mut Inner, gap_from: &mut Option<i64>, gap_n: &mut i64, gap_pts: &mut u64| -> Result<(), String> {
-        if *gap_n <= 0 {
-            return Ok(());
-        }
-        g.push_line(&json!({
-            "type": "align_gap",
-            "seg": seq,
-            "from_frame": gap_from.unwrap_or(g.next_frame),
-            "samples": *gap_n,
-            "pts": *gap_pts,
-            "reason": "no arrival with this sample PTS",
-        }))?;
-        *gap_from = None;
-        *gap_n = 0;
-        *gap_pts = 0;
-        Ok(())
-    };
+    let start = g.next_frame;
+    let mut frames = Vec::new();
+    let mut misses = 0i64;
     for sample in samples {
         if g.failed {
             return Err("frame sidecar write already failed; no further claim".into());
@@ -555,29 +563,33 @@ fn pair_samples(g: &mut Inner, seq: u64, samples: &[VideoSample]) -> Result<(), 
         });
         match hit {
             Some((i, mono, pts)) => {
-                flush_gap(g, &mut gap_from, &mut gap_n, &mut gap_pts)?;
-                g.push_line(&json!({
+                frames.push(json!({
                     "type": "frame",
                     "seg": seq,
                     "frame": frame,
                     "mono_ms": mono,
                     "pts": pts,
                     "au_sha256": sample.hash,
-                }))?;
+                }));
                 used[i] = true;
-                g.next_frame += 1;
             }
-            None => {
-                if gap_from.is_none() {
-                    gap_from = Some(frame);
-                    gap_pts = sample.pts90.unwrap_or(0);
-                }
-                gap_n += 1;
-                g.next_frame += 1;
-            }
+            None => misses += 1,
         }
+        g.next_frame += 1;
     }
-    flush_gap(g, &mut gap_from, &mut gap_n, &mut gap_pts)?;
+    if misses > 0 {
+        g.push_line(&json!({
+            "type": "align_gap",
+            "seg": seq,
+            "from_frame": start,
+            "samples": frames.len() as i64 + misses,
+            "bound": frames.len() as i64,
+            "reason": "sample_pes_mismatch",
+        }))?;
+    }
+    for frame in &frames {
+        g.push_line(frame)?;
+    }
     Ok(())
 }
 
@@ -1003,16 +1015,7 @@ fn validate_readers(v: &Value) -> Result<(), String> {
     ev::jcs(v)?;
     reject_unknown(
         v,
-        &[
-            "schema",
-            "qorcap_version",
-            "python",
-            "numpy",
-            "opencv",
-            "ffmpeg",
-            "glimpse",
-            "readers",
-        ],
+        &["schema", "qorcap_version", "readers", "runtimes"],
         "readers manifest",
     )?;
     if v["schema"] != READERS_SCHEMA {
@@ -1022,26 +1025,28 @@ fn validate_readers(v: &Value) -> Result<(), String> {
     if ver.is_empty() || ver.len() > 80 {
         return Err("qorcap_version is empty or too long".into());
     }
-    let py = req_str(v, "python", "readers manifest")?;
-    if py.is_empty() || py.len() > 80 {
-        return Err("python version is empty or too long".into());
-    }
-    check_opt_version(&v["numpy"], "numpy")?;
-    check_opencv(&v["opencv"])?;
-    check_ffmpeg(&v["ffmpeg"])?;
-    check_glimpse(&v["glimpse"])?;
     let readers = v["readers"]
         .as_array()
         .ok_or("readers manifest needs a readers array")?;
     if readers.is_empty() || readers.len() > 32 {
         return Err("readers manifest has no readers or too many".into());
     }
+    let mut reader_ids: Vec<String> = Vec::new();
+    let mut paths: Vec<(String, String)> = Vec::new();
     for (i, r) in readers.iter().enumerate() {
         reject_unknown(r, &["id", "version", "files"], &format!("readers[{i}]"))?;
         let id = req_str(r, "id", &format!("readers[{i}]"))?;
         if id.is_empty() || id.len() > 80 {
             return Err(format!("readers[{i}].id is empty or too long"));
         }
+        let key = token_identity(id);
+        if key.is_empty() {
+            return Err(format!("readers[{i}].id is empty after normalization"));
+        }
+        if reader_ids.iter().any(|seen| seen == &key) {
+            return Err(format!("readers[{i}].id collides with another reader id"));
+        }
+        reader_ids.push(key);
         let ver = req_str(r, "version", &format!("readers[{i}]"))?;
         if ver.is_empty() || ver.len() > 80 {
             return Err(format!("readers[{i}].version is empty or too long"));
@@ -1068,9 +1073,49 @@ fn validate_readers(v: &Value) -> Result<(), String> {
                     "readers[{i}].files[{j}].path is not a relative code or pack path"
                 ));
             }
+            let ident = path_identity(path);
+            if ident.is_empty() {
+                return Err(format!("readers[{i}].files[{j}].path is empty after normalization"));
+            }
+            if let Some((_, prev_kind)) = paths.iter().find(|(seen, _)| seen == &ident) {
+                if prev_kind != kind {
+                    return Err(format!(
+                        "readers[{i}].files[{j}].path is listed as both code and pack"
+                    ));
+                }
+                return Err(format!("readers[{i}].files[{j}].path duplicates another file"));
+            }
+            paths.push((ident, kind.to_string()));
             let sha = req_str(f, "sha256", &format!("readers[{i}].files[{j}]"))?;
             check_hex(sha, &format!("readers[{i}].files[{j}].sha256"))?;
         }
+    }
+    let runtimes = v["runtimes"]
+        .as_array()
+        .ok_or("readers manifest needs a runtimes array")?;
+    if runtimes.is_empty() || runtimes.len() > 32 {
+        return Err("readers manifest has no runtimes or too many".into());
+    }
+    let mut runtime_ids: Vec<String> = Vec::new();
+    for (i, r) in runtimes.iter().enumerate() {
+        reject_unknown(r, &["id", "version", "sha256"], &format!("runtimes[{i}]"))?;
+        let id = req_str(r, "id", &format!("runtimes[{i}]"))?;
+        if !runtime_id_ok(id) {
+            return Err(format!("runtimes[{i}].id is not an ASCII build name"));
+        }
+        let key = token_identity(id);
+        if key.is_empty() || runtime_ids.iter().any(|seen| seen == &key) {
+            return Err(format!("runtimes[{i}].id collides with another runtime id"));
+        }
+        runtime_ids.push(key);
+        let ver = req_str(r, "version", &format!("runtimes[{i}]"))?;
+        if ver.is_empty() || ver.len() > 80 {
+            return Err(format!("runtimes[{i}].version is empty or too long"));
+        }
+        check_hex(
+            req_str(r, "sha256", &format!("runtimes[{i}]"))?,
+            &format!("runtimes[{i}].sha256"),
+        )?;
     }
     Ok(())
 }
@@ -1093,75 +1138,6 @@ fn check_hex(sha: &str, what: &str) -> Result<(), String> {
     }
 }
 
-fn check_opt_version(v: &Value, what: &str) -> Result<(), String> {
-    if v.is_null() {
-        return Ok(());
-    }
-    let s = v
-        .as_str()
-        .ok_or_else(|| format!("{what} must be a string or null"))?;
-    if s.is_empty() || s.len() > 80 {
-        return Err(format!("{what} is empty or too long"));
-    }
-    Ok(())
-}
-
-fn check_opencv(v: &Value) -> Result<(), String> {
-    if v.is_null() {
-        return Ok(());
-    }
-    reject_unknown(v, &["version", "build_sha256"], "opencv")?;
-    let ver = req_str(v, "version", "opencv")?;
-    if ver.is_empty() || ver.len() > 80 {
-        return Err("opencv.version is empty or too long".into());
-    }
-    check_hex(req_str(v, "build_sha256", "opencv")?, "opencv.build_sha256")
-}
-
-fn check_ffmpeg(v: &Value) -> Result<(), String> {
-    if v.get("state").is_some() {
-        reject_unknown(v, &["state"], "ffmpeg")?;
-        if v["state"] != "unbound" {
-            return Err("ffmpeg.state must be unbound".into());
-        }
-        return Ok(());
-    }
-    reject_unknown(v, &["version", "sha256"], "ffmpeg")?;
-    let ver = req_str(v, "version", "ffmpeg")?;
-    if ver.is_empty() || ver.len() > 240 {
-        return Err("ffmpeg.version is empty or too long".into());
-    }
-    check_hex(req_str(v, "sha256", "ffmpeg")?, "ffmpeg.sha256")
-}
-
-fn check_glimpse(v: &Value) -> Result<(), String> {
-    if v.get("state").is_some() {
-        reject_unknown(v, &["state"], "glimpse")?;
-        if v["state"] != "unbound" {
-            return Err("glimpse.state must be unbound".into());
-        }
-        return Ok(());
-    }
-    reject_unknown(
-        v,
-        &["model", "version", "prompt_sha256", "veto_ran"],
-        "glimpse",
-    )?;
-    let model = req_str(v, "model", "glimpse")?;
-    let ver = req_str(v, "version", "glimpse")?;
-    if model.is_empty() || model.len() > 120 || ver.is_empty() || ver.len() > 80 {
-        return Err("glimpse model or version is empty or too long".into());
-    }
-    check_hex(
-        req_str(v, "prompt_sha256", "glimpse")?,
-        "glimpse.prompt_sha256",
-    )?;
-    if !v["veto_ran"].is_boolean() {
-        return Err("glimpse.veto_ran must be a boolean".into());
-    }
-    Ok(())
-}
-
 fn reject_unknown(v: &Value, allowed: &[&str], what: &str) -> Result<(), String> {
     let Some(map) = v.as_object() else {
         return Err(format!("{what} must be an object"));
@@ -1174,11 +1150,104 @@ fn reject_unknown(v: &Value, allowed: &[&str], what: &str) -> Result<(), String>
     Ok(())
 }
 
-fn safe_rel_path(path: &str) -> bool {
-    if path.is_empty() || path.len() > 240 || path.contains('\0') {
+fn token_identity(value: &str) -> String {
+    let lower: String = value.chars().flat_map(|c| c.to_lowercase()).collect();
+    lower.trim_end_matches(['.', ' ']).to_string()
+}
+
+fn path_identity(path: &str) -> String {
+    path.split('/')
+        .map(|part| {
+            let lower: String = part.chars().flat_map(|c| c.to_lowercase()).collect();
+            lower.trim_end_matches(['.', ' ']).to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn runtime_id_ok(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 80
+        && id
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'_' | b'+' | b'-'))
+}
+
+fn device_stem(part: &str) -> bool {
+    let stem = part.split('.').next().unwrap_or(part);
+    let lower = stem.to_ascii_lowercase();
+    matches!(lower.as_str(), "con" | "nul" | "aux" | "prn")
+        || (lower.len() == 4
+            && (lower.starts_with("com") || lower.starts_with("lpt"))
+            && lower.as_bytes()[3].is_ascii_digit()
+            && lower.as_bytes()[3] != b'0')
+}
+
+fn path_segment_ok(part: &str) -> bool {
+    let bytes = part.as_bytes();
+    if bytes.is_empty() || bytes.len() > 240 {
         return false;
     }
-    if path.starts_with('/') || path.starts_with('\\') || path.contains(':') {
+    let first = bytes[0];
+    if !(first.is_ascii_alphanumeric() || first == b'_') {
+        return false;
+    }
+    if !bytes
+        .iter()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'_' | b'+' | b'-'))
+    {
+        return false;
+    }
+    if part.ends_with('.') || part.ends_with(' ') {
+        return false;
+    }
+    let lower = part.to_ascii_lowercase();
+    if matches!(lower.as_str(), "keys" | "secret" | "secrets") {
+        return false;
+    }
+    // qortime PATH_PATTERN: `_key` anywhere in the segment when the next char is `.` or the end.
+    // `x.y_key.py` and `a.b_KEY.txt` match. `my_keyfile.py` does not.
+    if segment_contains_key_suffix(&lower) || device_stem(part) {
+        return false;
+    }
+    let stem = lower.split('.').next().unwrap_or(&lower);
+    if matches!(
+        stem,
+        "id_rsa"
+            | "id_dsa"
+            | "id_ecdsa"
+            | "id_ecdsa_sk"
+            | "id_ed25519"
+            | "id_ed25519_sk"
+            | "id_ed448"
+            | "id_ed448_sk"
+    ) {
+        return false;
+    }
+    true
+}
+
+fn segment_contains_key_suffix(lower: &str) -> bool {
+    let bytes = lower.as_bytes();
+    let mut i = 0;
+    while i + 4 <= bytes.len() {
+        if &bytes[i..i + 4] == b"_key" {
+            let after = i + 4;
+            if after == bytes.len() || bytes[after] == b'.' {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+fn safe_rel_path(path: &str) -> bool {
+    if path.is_empty() || path.len() > 240 || !path.is_ascii() || path.contains('\0') {
+        return false;
+    }
+    if path.starts_with('/') || path.starts_with('\\') || path.contains(':') || path.contains('\\')
+    {
         return false;
     }
     let lower = path.to_ascii_lowercase();
@@ -1186,15 +1255,243 @@ fn safe_rel_path(path: &str) -> bool {
         || lower.ends_with(".pem")
         || lower.ends_with(".p12")
         || lower.ends_with(".pfx")
+        || lower.ends_with(".jwk")
+        || lower.ends_with(".ppk")
+        || lower.ends_with(".jks")
     {
         return false;
     }
-    for part in path.split(['/', '\\']) {
-        if part.is_empty() || part == "." || part == ".." || part.eq_ignore_ascii_case("keys") {
-            return false;
+    path.split('/').all(path_segment_ok)
+}
+
+/// The bytes qortime will hash. Same cap and canonical-JSON rule as `verify_frame_bind` at 585ccc4.
+fn readers_file_ok(bytes: &[u8]) -> Result<(), String> {
+    if bytes.len() > MAX_READERS_BYTES {
+        return Err(format!(
+            "readers.json is {} bytes; the cap is {MAX_READERS_BYTES}",
+            bytes.len()
+        ));
+    }
+    if !bytes.ends_with(b"\n") || bytes.ends_with(b"\n\n") || bytes.contains(&b'\r') {
+        return Err("readers.json must be one JSON object and a single trailing newline".into());
+    }
+    let body = &bytes[..bytes.len() - 1];
+    match json_has_duplicate_keys(body) {
+        Some(true) => return Err("readers.json has a duplicate key".into()),
+        Some(false) => {}
+        None => return Err("readers.json is not JSON".into()),
+    }
+    let v: Value = serde_json::from_slice(body).map_err(|_| "readers.json is not JSON".to_string())?;
+    let canon = ev::jcs(&v)?;
+    if canon.as_bytes() != body {
+        return Err("readers.json is not canonical JSON".into());
+    }
+    validate_readers(&v)
+}
+
+/// `Some(true)` when an object repeats a key. `None` when `body` is not JSON.
+/// qortime's loader rejects duplicate keys; `serde_json` keeps the last one.
+fn json_has_duplicate_keys(body: &[u8]) -> Option<bool> {
+    let mut i = 0;
+    let dup = scan_json_value(body, &mut i)?;
+    skip_json_ws(body, &mut i);
+    if i != body.len() {
+        return None;
+    }
+    Some(dup)
+}
+
+fn skip_json_ws(b: &[u8], i: &mut usize) {
+    while *i < b.len() && matches!(b[*i], b' ' | b'\t' | b'\n' | b'\r') {
+        *i += 1;
+    }
+}
+
+fn scan_json_value(b: &[u8], i: &mut usize) -> Option<bool> {
+    skip_json_ws(b, i);
+    if *i >= b.len() {
+        return None;
+    }
+    match b[*i] {
+        b'{' => scan_json_object(b, i),
+        b'[' => scan_json_array(b, i),
+        b'"' => {
+            scan_json_string(b, i)?;
+            Some(false)
+        }
+        b't' | b'f' | b'n' => {
+            let n = if b[*i] == b't' || b[*i] == b'n' { 4 } else { 5 };
+            if *i + n > b.len() {
+                return None;
+            }
+            *i += n;
+            Some(false)
+        }
+        b'-' | b'0'..=b'9' => {
+            scan_json_number(b, i)?;
+            Some(false)
+        }
+        _ => None,
+    }
+}
+
+fn scan_json_object(b: &[u8], i: &mut usize) -> Option<bool> {
+    *i += 1;
+    skip_json_ws(b, i);
+    if *i < b.len() && b[*i] == b'}' {
+        *i += 1;
+        return Some(false);
+    }
+    let mut keys = Vec::new();
+    let mut dup = false;
+    loop {
+        skip_json_ws(b, i);
+        let key = scan_json_string(b, i)?;
+        if keys.iter().any(|seen: &String| seen == &key) {
+            dup = true;
+        }
+        keys.push(key);
+        skip_json_ws(b, i);
+        if *i >= b.len() || b[*i] != b':' {
+            return None;
+        }
+        *i += 1;
+        if scan_json_value(b, i)? {
+            dup = true;
+        }
+        skip_json_ws(b, i);
+        if *i >= b.len() {
+            return None;
+        }
+        match b[*i] {
+            b',' => {
+                *i += 1;
+            }
+            b'}' => {
+                *i += 1;
+                return Some(dup);
+            }
+            _ => return None,
         }
     }
-    true
+}
+
+fn scan_json_array(b: &[u8], i: &mut usize) -> Option<bool> {
+    *i += 1;
+    skip_json_ws(b, i);
+    if *i < b.len() && b[*i] == b']' {
+        *i += 1;
+        return Some(false);
+    }
+    let mut dup = false;
+    loop {
+        if scan_json_value(b, i)? {
+            dup = true;
+        }
+        skip_json_ws(b, i);
+        if *i >= b.len() {
+            return None;
+        }
+        match b[*i] {
+            b',' => {
+                *i += 1;
+            }
+            b']' => {
+                *i += 1;
+                return Some(dup);
+            }
+            _ => return None,
+        }
+    }
+}
+
+fn scan_json_string(b: &[u8], i: &mut usize) -> Option<String> {
+    if *i >= b.len() || b[*i] != b'"' {
+        return None;
+    }
+    *i += 1;
+    let mut out = String::new();
+    while *i < b.len() {
+        match b[*i] {
+            b'"' => {
+                *i += 1;
+                return Some(out);
+            }
+            b'\\' => {
+                *i += 1;
+                if *i >= b.len() {
+                    return None;
+                }
+                let e = b[*i];
+                *i += 1;
+                match e {
+                    b'"' | b'\\' | b'/' => out.push(e as char),
+                    b'b' => out.push('\u{0008}'),
+                    b'f' => out.push('\u{000c}'),
+                    b'n' => out.push('\n'),
+                    b'r' => out.push('\r'),
+                    b't' => out.push('\t'),
+                    b'u' => {
+                        if *i + 4 > b.len() {
+                            return None;
+                        }
+                        let hex = std::str::from_utf8(&b[*i..*i + 4]).ok()?;
+                        let unit = u32::from_str_radix(hex, 16).ok()?;
+                        *i += 4;
+                        let ch = char::from_u32(unit)?;
+                        out.push(ch);
+                    }
+                    _ => return None,
+                }
+            }
+            c if c < 0x20 => return None,
+            c if c < 0x80 => {
+                out.push(c as char);
+                *i += 1;
+            }
+            _ => {
+                let rest = std::str::from_utf8(&b[*i..]).ok()?;
+                let ch = rest.chars().next()?;
+                out.push(ch);
+                *i += ch.len_utf8();
+            }
+        }
+    }
+    None
+}
+
+fn scan_json_number(b: &[u8], i: &mut usize) -> Option<()> {
+    if *i < b.len() && b[*i] == b'-' {
+        *i += 1;
+    }
+    if *i >= b.len() || !b[*i].is_ascii_digit() {
+        return None;
+    }
+    while *i < b.len() && b[*i].is_ascii_digit() {
+        *i += 1;
+    }
+    if *i < b.len() && b[*i] == b'.' {
+        *i += 1;
+        if *i >= b.len() || !b[*i].is_ascii_digit() {
+            return None;
+        }
+        while *i < b.len() && b[*i].is_ascii_digit() {
+            *i += 1;
+        }
+    }
+    if *i < b.len() && (b[*i] == b'e' || b[*i] == b'E') {
+        *i += 1;
+        if *i < b.len() && (b[*i] == b'+' || b[*i] == b'-') {
+            *i += 1;
+        }
+        if *i >= b.len() || !b[*i].is_ascii_digit() {
+            return None;
+        }
+        while *i < b.len() && b[*i].is_ascii_digit() {
+            *i += 1;
+        }
+    }
+    Some(())
 }
 
 fn sidecar_lines(bytes: &[u8]) -> Vec<&[u8]> {
@@ -1376,11 +1673,8 @@ pub fn check_dir(dir: &Path, checkpoints: &[Value]) -> BindReport {
             return report;
         }
     }
-    report.tail = if lines.last().is_some_and(|l| {
-        serde_json::from_slice::<Value>(l)
-            .ok()
-            .is_some_and(|v| v["type"] == "seal")
-    }) {
+    let stop = checkpoints.last().is_some_and(|c| c["qorcap"]["trigger"] == "stop");
+    report.tail = if stop && !failed_state {
         "sealed".into()
     } else {
         "open".into()
@@ -1464,6 +1758,10 @@ fn check_readers(dir: &Path, checkpoints: &[Value], frame_bind: bool, report: &m
                 report.reader_status = "broken".into();
                 report.reader_reason = "readers.json does not match the first checkpoint".into();
                 report.errors.push(report.reader_reason.clone());
+            } else if let Err(e) = readers_file_ok(&bytes) {
+                report.reader_status = "broken".into();
+                report.reader_reason = e.clone();
+                report.errors.push(e);
             } else {
                 report.reader_status = "verified".into();
                 report.reader_claim = true;
@@ -1499,30 +1797,27 @@ fn validate_rows(dir: &Path, checkpoints: &[Value], lines: &[&[u8]]) -> Result<(
         serde_json::from_slice(lines[0]).map_err(|_| "frames.jsonl header is not JSON".to_string())?;
     reject_unknown(
         &header,
-        &[
-            "type",
-            "schema",
-            "hash_of",
-            "clock",
-            "pts_timescale",
-            "nominal_fps_num",
-            "nominal_fps_den",
-        ],
+        &["type", "schema", "hash_of", "clock", "time_base"],
         "frames.jsonl header",
     )?;
+    let base = &header["time_base"];
+    reject_unknown(base, &["num", "den"], "frames.jsonl time_base")?;
     if header["type"] != "header"
         || header["schema"] != SCHEMA
         || header["hash_of"] != HASH_OF
         || header["clock"] != "qorcap-mono-ms"
-        || header["pts_timescale"] != PTS_TIMESCALE
+        || base["num"].as_u64() != Some(1)
+        || base["den"].as_u64() != Some(PTS_TIMESCALE)
     {
         return Err("frames.jsonl header is not qorcap-frame-bind/v0".into());
     }
     let mut prev_n = 0usize;
     let mut prev_frame: Option<i64> = None;
+    let mut expect_frame: i64 = 0;
+    let mut gap_spans: Vec<(i64, i64)> = Vec::new();
     let mut prev_mono: Option<u64> = None;
-    let mut prev_pts_in_seg: Option<(u64, u64)> = None;
-    let mut saw_seal = false;
+    let mut prev_pts: Option<u64> = None;
+    let mut gap_segs: Vec<u64> = Vec::new();
     for (ci, cp) in checkpoints.iter().enumerate() {
         let n = cp["qorcap"]["frame_bind"]["n"].as_u64().unwrap_or(0) as usize;
         let expected = expected_seg(dir, cp);
@@ -1530,18 +1825,11 @@ fn validate_rows(dir: &Path, checkpoints: &[Value], lines: &[&[u8]]) -> Result<(
             let v: Value = serde_json::from_slice(line)
                 .map_err(|_| format!("checkpoint {ci}: a frames.jsonl line is not JSON"))?;
             let ty = v["type"].as_str().unwrap_or("");
-            if saw_seal {
-                return Err("a line follows the seal".into());
-            }
             match ty {
                 "header" => {
                     if prev_n != 0 || line.as_ptr() != lines[0].as_ptr() {
                         return Err("header is not the first frames.jsonl line".into());
                     }
-                }
-                "seal" => {
-                    reject_unknown(&v, &["type"], "seal line")?;
-                    saw_seal = true;
                 }
                 "frame" => {
                     reject_unknown(
@@ -1568,6 +1856,18 @@ fn validate_rows(dir: &Path, checkpoints: &[Value], lines: &[&[u8]]) -> Result<(
                     if frame < 0 || prev_frame.is_some_and(|p| frame <= p) {
                         return Err(format!("frame numbers are not strictly increasing at {frame}"));
                     }
+                    if frame > expect_frame {
+                        let covered = gap_spans
+                            .iter()
+                            .any(|(lo, hi)| *lo <= expect_frame && *hi >= frame);
+                        if !covered {
+                            return Err(format!(
+                                "frame index {frame} leaves a hole that no align_gap covers"
+                            ));
+                        }
+                    } else if frame != expect_frame {
+                        return Err(format!("frame numbers are not strictly increasing at {frame}"));
+                    }
                     if mono > MONO_ABS_MAX_MS {
                         return Err(format!("mono_ms {mono} is not a sane capture read time"));
                     }
@@ -1576,22 +1876,23 @@ fn validate_rows(dir: &Path, checkpoints: &[Value], lines: &[&[u8]]) -> Result<(
                             return Err(format!("mono_ms {mono} is not sane after {prev}"));
                         }
                     }
-                    if let Some((pseg, ppts)) = prev_pts_in_seg {
-                        if pseg == seg && pts <= ppts {
-                            return Err(format!("pts went backwards inside segment {seg}"));
+                    if let Some(ppts) = prev_pts {
+                        if pts <= ppts {
+                            return Err("pts went backwards".into());
                         }
                     }
                     if pts > (1u64 << 33) - 1 {
                         return Err("pts is outside the 33-bit MPEG range".into());
                     }
                     prev_frame = Some(frame);
+                    expect_frame = frame + 1;
                     prev_mono = Some(mono);
-                    prev_pts_in_seg = Some((seg, pts));
+                    prev_pts = Some(pts);
                 }
                 "align_gap" => {
                     reject_unknown(
                         &v,
-                        &["type", "seg", "from_frame", "samples", "pts", "reason"],
+                        &["type", "seg", "from_frame", "samples", "bound", "reason"],
                         "align_gap",
                     )?;
                     let seg = v["seg"].as_u64().ok_or("align_gap seg is not an integer")?;
@@ -1601,19 +1902,37 @@ fn validate_rows(dir: &Path, checkpoints: &[Value], lines: &[&[u8]]) -> Result<(
                             "align_gap seg {seg} does not match checkpoint segment {want}"
                         ));
                     }
-                    if v["from_frame"].as_i64().is_none_or(|n| n < 0) {
-                        return Err("align_gap from_frame is not a sane index".into());
+                    if gap_segs.contains(&seg) {
+                        return Err(format!("align_gap seg {seg} is duplicated"));
                     }
-                    if v["samples"].as_u64().is_none() {
-                        return Err("align_gap samples is not an integer".into());
-                    }
-                    if v["pts"].as_u64().is_none() {
-                        return Err("align_gap pts is not an integer".into());
+                    gap_segs.push(seg);
+                    let from = v["from_frame"]
+                        .as_i64()
+                        .filter(|n| *n >= 0)
+                        .ok_or("align_gap from_frame is not a sane index")?;
+                    let samples = v["samples"]
+                        .as_i64()
+                        .filter(|n| *n >= 1)
+                        .ok_or("align_gap samples must be at least 1")?;
+                    let bound = v["bound"]
+                        .as_i64()
+                        .filter(|n| *n >= 0)
+                        .ok_or("align_gap bound is not an integer")?;
+                    if bound > samples {
+                        return Err("align_gap bound is larger than samples".into());
                     }
                     let reason = v["reason"].as_str().unwrap_or("");
-                    if reason.is_empty() || reason.len() > 200 {
-                        return Err("align_gap reason is empty or too long".into());
+                    if !matches!(
+                        reason,
+                        "pts_regression"
+                            | "composition_offset"
+                            | "sample_pes_mismatch"
+                            | "clock_lost"
+                            | "unreadable"
+                    ) {
+                        return Err("align_gap reason is not a schema reason".into());
                     }
+                    gap_spans.push((from, from + samples));
                 }
                 _ => return Err(format!("unknown frames.jsonl line type {ty}")),
             }

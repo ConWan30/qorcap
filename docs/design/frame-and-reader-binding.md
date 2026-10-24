@@ -51,10 +51,10 @@ A later receipt version could add an explicit per-frame root. `additionalPropert
 
 File: `frames.jsonl`, one JSON line per record, RFC 8785 JCS, integers only. The newline is a separator and is not hashed.
 
-Header, written when the file is created. `nominal_fps_*` is the `--fps` flag, a label only. Pairing and skew use 90 kHz PTS, not this number.
+Header, written when the file is created. PTS is in the 90 kHz time base (`num` 1, `den` 90000). The `--fps` flag is not a field. Pairing and skew use that PTS.
 
 ```json
-{"clock":"qorcap-mono-ms","hash_of":"encoded-video-sample","nominal_fps_den":1,"nominal_fps_num":30,"pts_timescale":90000,"schema":"qorcap-frame-bind/v0","type":"header"}
+{"clock":"qorcap-mono-ms","hash_of":"encoded-video-sample","schema":"qorcap-frame-bind/v0","time_base":{"den":90000,"num":1},"type":"header"}
 ```
 
 One line per video sample that matched an arrival:
@@ -79,7 +79,7 @@ One line per video sample that matched an arrival:
 
 **Pairing is exact PTS, per segment.** Each MPEG-TS video PES start is an arrival: its 90 kHz PTS and the `mono_ms` of the read. Each fMP4 video sample gets a PTS from `tfdt` plus durations. A sample is a timed frame only when an unused arrival in the current generation has that exact PTS. The nominal `--fps` is not used to invent a time. A dropped or extra sample does not slide later frames onto the wrong arrival.
 
-A miss (no arrival at that PTS, an unreadable fragment, or a non-zero composition offset) writes one `align_gap` for that stretch and withholds `mono_ms` there. The next segment pairs on its own PTS values. A gap is not a frame-time claim and does not fail the match. The fragment is still covered by its segment hash. Only a committed hash that does not match the bytes on disk fails verification.
+A miss (no arrival at that PTS, an unreadable fragment, or a non-zero composition offset) writes one `align_gap` for that segment. `samples` is the sample count, `bound` is how many of those samples became frame rows, and `reason` is one of `sample_pes_mismatch`, `composition_offset`, `unreadable`, `pts_regression`, or `clock_lost`. An unreadable fragment has no sample count, so that gap is one index wide. The next segment pairs on its own PTS values. A gap is not a frame-time claim and does not fail the match. The fragment is still covered by its segment hash. Only a committed hash that does not match the bytes on disk fails verification.
 
 **`mono_ms` is a read time, not glass time.** It is the QorCap monotonic clock when this process read the encoder's MPEG-TS from the pipe, after encode and pipe delay. Truncated to a millisecond. Manifest `mono_ms` uses the same `Instant`. HID controller lines use the same clock base, but they are stamped when the USB report is read, not when the encoder emits a frame. A press-to-frame delta therefore includes encode and pipe latency. That delta is not a mismatch claim until the latency of that capture rig has been measured. Skew reported from the sidecar is arrival time minus PTS media time, anchored at the first timed frame so a constant offset drops out. It is not a claim that the picture left the glass at `mono_ms`.
 
@@ -90,7 +90,7 @@ head_0 = 64 zero bytes
 head_n = SHA-256(JCS({"prev": head_{n-1}, "sha256": SHA-256(line_n)}))
 ```
 
-`line_n` is the exact JCS bytes of that line, without the newline. Every non-empty line counts, including the header, any `align_gap`, and the final `seal`. Blank lines are not written. A blank line inserted later is an extra hashed line and breaks the chain.
+`line_n` is the exact JCS bytes of that line, without the newline. Every non-empty line counts, including the header and any `align_gap`. The merged schema has no seal line. Blank lines are not written. A blank line inserted later is an extra hashed line and breaks the chain.
 
 The line is written and flushed before `head` and `n` move. A write error sticks `frame_bind.state` to `failed`, commits that state on later checkpoints, and does not advance a hash for a line that did not land. `state: failed` is not a frame claim (`frame_status` is `broken`). The same rule applies to `readers.json`: the hash is stored only after the file rename succeeds. A failed readers write leaves checkpoint 0 as `readers.state: unbound`, which is `reader_status: missing`, not a reader claim.
 
@@ -106,7 +106,9 @@ or, after a write error:
 {"schema":"qorcap-frame-bind/v0","n":12,"head":"<hash of lines that landed>","state":"failed"}
 ```
 
-`n` is a prefix. It grows as lines land and must not go backwards. The last checkpoint's `n` equals the number of lines in the file. A finished recording appends `{"type":"seal"}` and the stop checkpoint commits it (`tail: sealed`). Dropping the tail checkpoint and its lines leaves a consistent prefix with `tail: open`. That prefix is not a frame claim. Lines past the last checkpoint fail verification. Because `frames_hash` covers `frame_bind`, changing a line, dropping one, inserting one, or editing `mono_ms` changes a checkpoint hash unless the whole chain is rebuilt. Rebuilding the chain changes `hash`, which is what the referee signature covers. `verify-bundle` itself only checks consistency; the referee signature is still QorTime's job.
+`n` is a prefix. It grows as lines land and must not go backwards. The last checkpoint's `n` equals the number of lines in the file. `tail: sealed` means the stop checkpoint covers every line. Dropping that checkpoint leaves a consistent prefix with `tail: open`. That prefix is not a frame claim. Lines past the last checkpoint fail verification. Because `frames_hash` covers `frame_bind`, changing a line, dropping one, inserting one, or editing `mono_ms` changes a checkpoint hash unless the whole chain is rebuilt. Rebuilding the chain changes `hash`, which is what the referee signature covers. `verify-bundle` itself only checks consistency; the referee signature is still QorTime's job.
+
+QorTime's commitment schema is `{schema, n, head}` only. QorCap still adds `state: failed` after a write error. That extra key deliberately does not match the vendored checkpoint schema. qortime 585ccc4 `verify_frame_bind` reads the bundle as `broken`, which is fail-closed: it is not a frame claim. A later qortime change should accept `state: failed` as an honest failed write, distinct from tampering. Until then the key stays. Omitting the commitment looks like a stripped sidecar, and freezing the last good `{n, head}` would make an incomplete file look sealed.
 
 ## Reader sidecar
 
@@ -116,11 +118,6 @@ File: `readers.json`. One JSON object, JCS, plus a trailing newline. The commitm
 {
   "schema": "qorcap-readers/v0",
   "qorcap_version": "0.3.32",
-  "python": "3.12.3",
-  "numpy": "2.1.0",
-  "opencv": {"version": "4.10.0", "build_sha256": "<64 hex>"},
-  "ffmpeg": {"version": "ffmpeg version ...", "sha256": "<64 hex of the binary>"},
-  "glimpse": {"model": "...", "version": "...", "prompt_sha256": "<64 hex>", "veto_ran": false},
   "readers": [
     {
       "id": "standard",
@@ -130,13 +127,17 @@ File: `readers.json`. One JSON object, JCS, plus a trailing newline. The commitm
         {"kind": "pack", "path": "sidecar/packs/madden27_standard_v2.npz", "sha256": "<64 hex>"}
       ]
     }
+  ],
+  "runtimes": [
+    {"id": "cv2", "version": "4.10.0", "sha256": "<64 hex of the cv2 build>"},
+    {"id": "ffmpeg", "version": "n7.0.1", "sha256": "<64 hex of the binary>"}
   ]
 }
 ```
 
-The object is closed. Unknown keys, including `reader_verified_by_referee`, are rejected. `numpy` and `opencv` may be JSON null when that library did not import. `ffmpeg` and `glimpse` are either the bound object or `{"state":"unbound"}`. `glimpse.veto_ran` is false: the manifest is sealed before any frame is read, so this file cannot claim the veto already ran.
+The object is closed. Unknown keys, including `reader_verified_by_referee`, `python`, `numpy`, and `glimpse`, are rejected. `runtimes` is required and names the builds that produced the reads (`ffmpeg`, `cv2`). A build that is not on the machine is omitted. If neither build has a hash, no `readers.json` is written and checkpoint 0 stays unbound. Reader ids and runtime ids are unique after NFC and casefolding, including a trailing dot or space. Paths are unique the same way, ASCII only, and a path cannot be both code and pack. A path segment is refused when `_key` (any case) is followed by `.` or the end of that segment, including `x.y_key.py`. Windows device names (`CON`, `NUL`, `AUX`, `PRN`, `COM1`–`COM9`, `LPT1`–`LPT9`, including `CON.py` and `nul.txt`) are not emitted. The file is JCS plus one newline and is refused above 64 KiB, the cap qortime uses.
 
-`path` is relative (`sidecar/...` or `qor_receipt/...`). Absolute paths, `..`, a `keys` path component, and names ending in `.key`, `.pem`, `.p12`, or `.pfx` are rejected. Key material is not hashed and not written. Hashes are raw file bytes. `.gitattributes` pins `*.py` to LF and `*.npz` as binary so a Windows checkout hashes the same bytes as the repo.
+`path` is relative (`sidecar/...` or `qor_receipt/...`). Absolute paths, `..`, a `keys` path component, and names ending in `.key`, `.pem`, `.p12`, `.pfx`, `.jwk`, `.ppk`, or `.jks` are rejected. Key material is not hashed and not written. Hashes are raw file bytes. `.gitattributes` pins `*.py` to LF and `*.npz` as binary so a Windows checkout hashes the same bytes as the repo.
 
 Start Match builds this before `qorcap record` starts (`write_prerecord_manifest`) and passes it as `--readers-manifest`. The builder hashes modules it imports for a live match (`qorcap_match`, `qorcap_psn`, the local readers, and the vendored QorTime scorebug reader when that import succeeds). A vendored pack is the last `packs/madden27_standard_v*.npz` next to that reader, the file load would open. QorCap reads the manifest in `Engine::new`, writes canonical `readers.json` (JCS plus a newline), and hashes those bytes. There is no `/events` post and no wait. A later `POST /events` with `type: readers` is rejected and cannot change the sealed file.
 
@@ -171,7 +172,7 @@ Checkpoint 0 is written as soon as recording starts (and, with the flag on, befo
 | `broken` | A commitment does not match the file, a row is invalid, an AU hash does not match the fragment, a write failed, or `frame_bind` is present without `readers` on checkpoint 0. |
 | `verified` | The chain matches and the rows are sane. A frame claim still requires `tail: sealed`, zero gap samples, and at least one timed frame. |
 
-`tail` is `sealed` (the last committed line is `{"type":"seal"}`), `open` (a consistent prefix with no seal; dropping the last checkpoint and its lines looks like this), or `checkpoints_missing` (sidecar files exist and `checkpoints.jsonl` does not). `open` and `checkpoints_missing` are not a frame claim.
+`tail` is `sealed` (the stop checkpoint covers every line), `open` (a consistent prefix; dropping the stop checkpoint looks like this), or `checkpoints_missing` (sidecar files exist and `checkpoints.jsonl` does not). `open` and `checkpoints_missing` are not a frame claim.
 
 Row checks, when a chain is present: the header matches the schema, each frame or gap `seg` is the manifest sequence of that checkpoint's segment hash, frame numbers are strictly increasing, `mono_ms` is at most 48 hours and does not jump by more than 10 minutes, and PTS does not go backwards inside a segment. When the committed fragments are in the bundle, `au` is `checked` after recomputing sample hashes, `mismatch` (and `broken`) when one disagrees, or `unavailable` when the bytes are not in the bundle. `unavailable` is not a second claim and does not by itself fail the chain.
 
@@ -196,7 +197,7 @@ That rate is the PTS spacing, not `--fps`. It measures arrival time against medi
 | Sidecar files present and `checkpoints.jsonl` missing | `broken`, `tail: checkpoints_missing`. Not a claim. |
 | Any committed line edited, including `mono_ms` | `frame_bind.head` mismatches. `frame_status: broken`. |
 | Line inserted, dropped, or appended after the last checkpoint | `broken`. The last `n` no longer matches the file. |
-| Last checkpoint and its lines dropped, seal included | Consistent prefix, `tail: open`. Not a frame claim. |
+| Stop checkpoint dropped | Consistent prefix, `tail: open`. Not a frame claim. |
 | `frame_bind` committed and `frames.jsonl` deleted | `broken`. Not a silent pass. |
 | `readers` unbound | `reader_status: missing`. Not a reader claim. |
 | `frame_bind` present and `readers` absent on checkpoint 0 | Both statuses `broken`. |
@@ -235,8 +236,10 @@ qorcap record --frame-bind --readers-manifest readers.input.json
 QORCAP_FRAME_BIND=1
 ```
 
-Same words as the other QorCap switches: `1`, `true`, `yes`, `on`. Default off. Start Match adds `--frame-bind` and writes the manifest only when the environment variable is set, then passes `--readers-manifest`. A normal match does not write the files. `frames.jsonl` and `readers.json` are included in the sidecar upload list so a referee can fetch them. They are not yet names in `contracts/compat.json`. This draft does not invent a QorTime schema for them.
+Same words as the other QorCap switches: `1`, `true`, `yes`, `on`. Default off. Start Match adds `--frame-bind` and writes the manifest only when the environment variable is set, then passes `--readers-manifest`. A normal match does not write the files. `frames.jsonl` and `readers.json` are in the vendored `contracts/compat.json` upload list.
 
-## Not published yet
+## Schemas
 
-QorCap does not add a contract file for this sidecar. `receipt.v0.json` stays frozen, and `frames_hash` stays `SHA-256(JCS(qorcap))`. The wire shapes above (`qorcap-frame-bind/v0`, `qorcap-readers/v0`) are a draft until QorTime publishes optional schemas and adds `frames.jsonl` and `readers.json` to the `compat.json` meta file list. Until that copy lands, a verifier outside this repo has no published schema to check these files against. Absence of the sidecars remains "no claim," not a failed match.
+`receipt.v0.json` stays frozen, and `frames_hash` stays `SHA-256(JCS(qorcap))`. The sidecar schemas are vendored from QorTime `585ccc4`: `contracts/qorcap-frame-bind.v0.json` and `contracts/qorcap-readers.v0.json`. Absence of the sidecars remains "no claim," not a failed match. The flag does not change a published verdict.
+
+The bundled runtime verifier stays at `0204e6d`. That checkout does not run `verify_frame_bind`. Bump it to at least `585ccc4` before `--frame-bind` is turned on by default.

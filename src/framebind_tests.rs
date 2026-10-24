@@ -12,11 +12,6 @@ fn manifest() -> Value {
     json!({
         "schema": READERS_SCHEMA,
         "qorcap_version": "0.3.32",
-        "python": "3.12.0",
-        "numpy": null,
-        "opencv": null,
-        "ffmpeg": {"state": "unbound"},
-        "glimpse": {"state": "unbound"},
         "readers": [{
             "id": "scorebug",
             "version": "0.3.32",
@@ -29,6 +24,15 @@ fn manifest() -> Value {
                 "path": "sidecar/packs/madden27_standard_score_110028.npz",
                 "sha256": "cd".repeat(32),
             }]
+        }],
+        "runtimes": [{
+            "id": "ffmpeg",
+            "version": "n7.0.1",
+            "sha256": "11".repeat(32),
+        }, {
+            "id": "cv2",
+            "version": "4.10.0",
+            "sha256": "22".repeat(32),
         }]
     })
 }
@@ -44,12 +48,12 @@ fn merge(dst: &mut Value, src: Value) {
 fn seal_two(dir: &Path) -> (FrameBind, Vec<Value>) {
     let b = FrameBind::open(true, Some(dir), 30);
     b.append_frame(1, 0, 0, 0, b"au-0").unwrap();
-    b.append_frame(1, 30, 1120, 90_000, b"au-30").unwrap();
+    b.append_frame(1, 1, 1120, 90_000, b"au-1").unwrap();
     let mut ext0 = json!({"trigger": "start", "segment_seq": 1});
     merge(&mut ext0, b.commitment(true).unwrap());
     let mut chain = CheckpointChain::default();
     let cp0 = chain.next(10, ext0).unwrap();
-    b.append_frame(2, 90, 3719, 270_000, b"au-90").unwrap();
+    b.append_frame(2, 2, 3719, 270_000, b"au-2").unwrap();
     let mut ext1 = json!({"trigger": "segment", "segment_seq": 2});
     merge(&mut ext1, b.commitment(false).unwrap());
     let cp1 = chain.next(20, ext1).unwrap();
@@ -241,8 +245,8 @@ fn timing_skew_between_clip_time_and_mono_ms_is_measurable_from_the_sidecar() {
     let report = check_dir(&dir, &cps);
     assert!(report.frame_claim, "{:?}", report.errors);
     let by_frame: Vec<(i64, i64)> = report.skew.iter().map(|s| (s.frame, s.skew_ms)).collect();
-    assert!(by_frame.contains(&(30, 120)), "{by_frame:?}");
-    assert!(by_frame.contains(&(90, 719)), "{by_frame:?}");
+    assert!(by_frame.contains(&(1, 120)), "{by_frame:?}");
+    assert!(by_frame.contains(&(2, 719)), "{by_frame:?}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -686,6 +690,527 @@ fn a4_readers_post_cannot_change_after_claim_and_extra_keys_are_rejected() {
     x["reader_verified_by_referee"] = json!(true);
     assert!(validate_readers(&x).is_err());
     let _ = std::fs::remove_dir_all(&d);
+}
+
+fn write_cps(dir: &Path, cps: &[Value]) {
+    let text = cps
+        .iter()
+        .map(|c| serde_json::to_string(c).unwrap())
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    std::fs::write(dir.join("checkpoints.jsonl"), text).unwrap();
+}
+
+fn assert_qortime_frame_bind_verified(dir: &Path) {
+    let Ok(raw) = std::env::var("QORTIME_CONTRACTS") else {
+        eprintln!("QORTIME_CONTRACTS unset; qortime frame-bind verify was not run");
+        return;
+    };
+    let qt = PathBuf::from(raw);
+    assert!(
+        qt.join("qor_receipt/review/frame_bind.py").is_file(),
+        "QORTIME_CONTRACTS is not qortime at 585ccc4"
+    );
+    let py = if cfg!(windows) { "python" } else { "python3" };
+    let script = r#"
+import sys
+sys.path.insert(0, sys.argv[1])
+from qor_receipt.review.frame_bind import is_frame_bind_verified, verify_frame_bind
+result = verify_frame_bind(sys.argv[2])
+sys.stdout.write(result.status + "\n")
+if not is_frame_bind_verified(result.status):
+    raise SystemExit(1)
+"#;
+    let out = std::process::Command::new(py)
+        .arg("-c")
+        .arg(script)
+        .arg(&qt)
+        .arg(dir)
+        .output()
+        .expect("python");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "qortime verify_frame_bind did not return verified\n{stdout}{stderr}"
+    );
+    assert!(stdout.contains("verified"), "{stdout}");
+}
+
+#[test]
+fn readers_manifest_rejects_case_collisions_device_names_and_trailing_dots() {
+    let mut dup = manifest();
+    dup["readers"].as_array_mut().unwrap().push(json!({
+        "id": "Scorebug",
+        "version": "1",
+        "files": [{"kind": "code", "path": "sidecar/other.py", "sha256": "ef".repeat(32)}]
+    }));
+    let err = validate_readers(&dup).unwrap_err();
+    assert!(err.contains("collides"), "{err}");
+
+    let mut paths = manifest();
+    paths["readers"][0]["files"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({
+            "kind": "code",
+            "path": "Sidecar/Qorcap_Standard.py",
+            "sha256": "ef".repeat(32),
+        }));
+    assert!(
+        validate_readers(&paths)
+            .unwrap_err()
+            .contains("duplicate"),
+        "casefolded paths are one file"
+    );
+
+    let mut both = manifest();
+    both["readers"][0]["files"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({
+            "kind": "pack",
+            "path": "sidecar/qorcap_standard.py",
+            "sha256": "ef".repeat(32),
+        }));
+    assert!(validate_readers(&both)
+        .unwrap_err()
+        .contains("both code and pack"));
+
+    for bad in [
+        "sidecar/qorcap_standard.py.",
+        "sidecar/CON.py",
+        "nul.txt",
+        "COM3.py",
+        "lpt1.txt",
+        // `_key` followed by `.` or the end of a segment, not only the stem before the first dot.
+        "x.y_key.py",
+        "a.b_key",
+        "a.b_KEY.txt",
+        "sub/x.y_key/z.py",
+        "a._key",
+        "X.Y_Key",
+    ] {
+        let mut row = manifest();
+        row["readers"][0]["files"][0]["path"] = json!(bad);
+        assert!(validate_readers(&row).is_err(), "{bad}");
+    }
+    let mut allowed = manifest();
+    allowed["readers"][0]["files"][0]["path"] = json!("sidecar/my_keyfile.py");
+    assert!(
+        validate_readers(&allowed).is_ok(),
+        "_key must be followed by '.' or the end of the segment"
+    );
+
+    let mut rt = manifest();
+    rt["runtimes"].as_array_mut().unwrap().push(json!({
+        "id": "FFmpeg",
+        "version": "n9",
+        "sha256": "33".repeat(32),
+    }));
+    assert!(validate_readers(&rt).unwrap_err().contains("runtime"));
+
+    let mut old = manifest();
+    old["python"] = json!("3.12.0");
+    assert!(validate_readers(&old).is_err());
+}
+
+fn canonical_readers(v: &Value) -> Vec<u8> {
+    let mut bytes = ev::jcs(v).unwrap().into_bytes();
+    bytes.push(b'\n');
+    bytes
+}
+
+fn manifest_with_path(path: &str) -> Value {
+    let mut v = manifest();
+    v["readers"][0]["files"][0]["path"] = json!(path);
+    v
+}
+
+fn oversized_readers() -> Value {
+    let mut readers = Vec::new();
+    for r in 0..8 {
+        let mut files = Vec::new();
+        for f in 0..64 {
+            let path = format!("r{r}/f{f}_{}.py", "a".repeat(180));
+            files.push(json!({
+                "kind": "code",
+                "path": path,
+                "sha256": "ab".repeat(32),
+            }));
+        }
+        readers.push(json!({
+            "id": format!("reader{r}"),
+            "version": "1",
+            "files": files,
+        }));
+    }
+    json!({
+        "schema": READERS_SCHEMA,
+        "qorcap_version": "0.3.32",
+        "readers": readers,
+        "runtimes": [{
+            "id": "ffmpeg",
+            "version": "n7.0.1",
+            "sha256": "11".repeat(32),
+        }],
+    })
+}
+
+#[test]
+fn readers_over_64kib_are_refused_and_are_not_a_claim() {
+    let dir = temp_dir("readers-cap");
+    let b = FrameBind::open(true, Some(&dir), 30);
+    let big = oversized_readers();
+    assert!(validate_readers(&big).is_ok(), "the cap is on bytes, not on the schema shape");
+    let err = b.install_readers(&big).unwrap_err();
+    assert!(err.contains("65536"), "{err}");
+    assert!(!dir.join(READERS_FILE).exists());
+
+    let bytes = canonical_readers(&big);
+    assert!(bytes.len() > MAX_READERS_BYTES);
+    std::fs::write(dir.join(READERS_FILE), &bytes).unwrap();
+    b.append_frame(0, 0, 1000, 0, b"au").unwrap();
+    let mut ext = json!({"trigger": "stop", "segment_seq": 0});
+    merge(&mut ext, b.commitment(true).unwrap());
+    ext["readers"] = json!({"schema": READERS_SCHEMA, "sha256": ev::sha256_hex(&bytes)});
+    let cp = CheckpointChain::default().next(10, ext).unwrap();
+    let report = check_dir(&dir, &[cp]);
+    assert_eq!(report.reader_status, "broken");
+    assert!(!report.reader_claim);
+    assert!(!report.frame_claim, "an oversized readers file is not a frame claim");
+    assert!(
+        report.errors.iter().any(|e| e.contains("65536")),
+        "{:?}",
+        report.errors
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn readers_file_rejects_duplicate_keys_and_noncanonical_json() {
+    let ok = canonical_readers(&manifest());
+    assert!(readers_file_ok(&ok).is_ok(), "{:?}", readers_file_ok(&ok).err());
+    let dup = b"{\"a\":1,\"a\":2}\n";
+    assert!(readers_file_ok(dup).unwrap_err().contains("duplicate"));
+    let mut spaced = ok.clone();
+    spaced.insert(1, b' ');
+    assert!(readers_file_ok(&spaced).is_err());
+}
+
+struct XorShift(u64);
+
+impl XorShift {
+    fn next_u64(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.0 = x;
+        x
+    }
+
+    fn below(&mut self, n: usize) -> usize {
+        (self.next_u64() as usize) % n
+    }
+}
+
+const READERS_PARITY_CASES: usize = 3000;
+
+fn random_readers(rng: &mut XorShift, n: usize) -> (String, Vec<u8>) {
+    let hostile = [
+        "x.y_key.py",
+        "a.b_key",
+        "a.b_KEY.txt",
+        "sub/x.y_key/z.py",
+        "a._key",
+        "X.Y_Key",
+        "sidecar/reader.py.",
+        "keys/a.py",
+        "secret/a.py",
+        "id_rsa",
+        "file.key",
+        "File.PEM",
+        "sidecar/my_keyfile.py",
+        "sidecar/com10.py",
+        "sidecar/console.py",
+    ];
+    let roll = rng.below(100);
+    if roll < 30 {
+        let path = hostile[rng.below(hostile.len())];
+        return (
+            format!("hostile:{path}"),
+            canonical_readers(&manifest_with_path(path)),
+        );
+    }
+    if roll < 36 {
+        let mut raw = canonical_readers(&manifest());
+        raw.pop();
+        return ("no-newline".into(), raw);
+    }
+    if roll < 42 {
+        let mut raw = canonical_readers(&manifest());
+        raw.insert(1, b' ');
+        return ("not-canonical".into(), raw);
+    }
+    if roll < 46 {
+        return (
+            "duplicate-key".into(),
+            b"{\"schema\":\"qorcap-readers/v0\",\"schema\":\"other\"}\n".to_vec(),
+        );
+    }
+    let readers_n = 1 + rng.below(3);
+    let mut readers = Vec::new();
+    for r in 0..readers_n {
+        let files_n = 1 + rng.below(3);
+        let mut files = Vec::new();
+        for f in 0..files_n {
+            let kind = if rng.below(2) == 0 { "code" } else { "pack" };
+            files.push(json!({
+                "kind": kind,
+                "path": format!("p{n}/r{r}/f{f}.py"),
+                "sha256": "ab".repeat(32),
+            }));
+        }
+        readers.push(json!({
+            "id": format!("id{n}_{r}"),
+            "version": "1",
+            "files": files,
+        }));
+    }
+    let v = json!({
+        "schema": READERS_SCHEMA,
+        "qorcap_version": "0.3.32",
+        "readers": readers,
+        "runtimes": [{
+            "id": "ffmpeg",
+            "version": "n7.0.1",
+            "sha256": "11".repeat(32),
+        }],
+    });
+    (format!("random:{n}"), canonical_readers(&v))
+}
+
+#[test]
+fn readers_parity_with_qortime_verify_frame_bind() {
+    let Ok(raw) = std::env::var("QORTIME_CONTRACTS") else {
+        if std::env::var_os("CI").is_some() {
+            panic!("QORTIME_CONTRACTS is required in CI");
+        }
+        eprintln!("QORTIME_CONTRACTS unset; readers parity against qortime was not run");
+        return;
+    };
+    let qt = PathBuf::from(raw);
+    assert!(
+        qt.join("qor_receipt/review/frame_bind.py").is_file(),
+        "QORTIME_CONTRACTS is not qortime at 585ccc4"
+    );
+
+    let mut cases = Vec::with_capacity(READERS_PARITY_CASES);
+    cases.push(("control".into(), canonical_readers(&manifest())));
+    for path in [
+        "x.y_key.py",
+        "a.b_key",
+        "a.b_KEY.txt",
+        "sub/x.y_key/z.py",
+        "a._key",
+        "X.Y_Key",
+    ] {
+        cases.push((
+            format!("key:{path}"),
+            canonical_readers(&manifest_with_path(path)),
+        ));
+    }
+    cases.push(("oversize".into(), canonical_readers(&oversized_readers())));
+    for path in ["sidecar/CON.py", "nul.txt", "COM1.py", "lpt9.txt", "aux", "PRN.py"] {
+        cases.push((
+            format!("device:{path}"),
+            canonical_readers(&manifest_with_path(path)),
+        ));
+    }
+    let mut folded = manifest();
+    folded["readers"].as_array_mut().unwrap().push(json!({
+        "id": "Scorebug",
+        "version": "1",
+        "files": [{"kind": "code", "path": "sidecar/other.py", "sha256": "ef".repeat(32)}],
+    }));
+    cases.push(("casefold-id".into(), canonical_readers(&folded)));
+    let mut runtime = manifest();
+    runtime["runtimes"].as_array_mut().unwrap().push(json!({
+        "id": "FFmpeg",
+        "version": "n9",
+        "sha256": "33".repeat(32),
+    }));
+    cases.push(("casefold-runtime".into(), canonical_readers(&runtime)));
+    let mut rng = XorShift(0x585c_cc4f_2af3_d678);
+    while cases.len() < READERS_PARITY_CASES {
+        let n = cases.len();
+        cases.push(random_readers(&mut rng, n));
+    }
+    assert_eq!(cases.len(), READERS_PARITY_CASES);
+
+    let root = temp_dir("readers-parity");
+    let seed = root.join("seed");
+    std::fs::create_dir_all(&seed).unwrap();
+    let bind = FrameBind::open(true, Some(&seed), 30);
+    bind.append_frame(0, 0, 1000, 0, b"au-0").unwrap();
+    bind.append_frame(0, 1, 1105, 3003, b"au-1").unwrap();
+    let committed = bind.commitment(false).unwrap();
+    let n = committed["frame_bind"]["n"].as_u64().unwrap();
+    let head = committed["frame_bind"]["head"].as_str().unwrap().to_string();
+    let frames = std::fs::read(seed.join(FRAMES_FILE)).unwrap();
+
+    let mut rust_accepts = Vec::with_capacity(cases.len());
+    for (i, (_label, readers)) in cases.iter().enumerate() {
+        let dir = root.join(format!("{i:04}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(FRAMES_FILE), &frames).unwrap();
+        std::fs::write(dir.join(READERS_FILE), readers).unwrap();
+        let ext = json!({
+            "trigger": "stop",
+            "segment_seq": 0,
+            "frame_bind": {"schema": SCHEMA, "n": n, "head": &head},
+            "readers": {"schema": READERS_SCHEMA, "sha256": ev::sha256_hex(readers)},
+        });
+        let cp = CheckpointChain::default().next(10, ext).unwrap();
+        write_cps(&dir, &[cp.clone()]);
+        let report = check_dir(&dir, &[cp]);
+        rust_accepts.push(report.reader_status == "verified" || report.frame_claim);
+    }
+
+    let py = if cfg!(windows) { "python" } else { "python3" };
+    let script = r#"
+import sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from qor_receipt.review.frame_bind import verify_frame_bind
+root = Path(sys.argv[2])
+n = int(sys.argv[3])
+lines = []
+for i in range(n):
+    try:
+        lines.append(verify_frame_bind(root / f"{i:04d}").status)
+    except Exception as exc:
+        lines.append("error:" + type(exc).__name__)
+sys.stdout.write("\n".join(lines) + "\n")
+"#;
+    let out = std::process::Command::new(py)
+        .arg("-c")
+        .arg(script)
+        .arg(&qt)
+        .arg(&root)
+        .arg(READERS_PARITY_CASES.to_string())
+        .output()
+        .expect("python");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "qortime verify_frame_bind parity run failed\n{stdout}{stderr}"
+    );
+    let statuses: Vec<&str> = stdout.lines().collect();
+    assert_eq!(statuses.len(), READERS_PARITY_CASES, "{stderr}");
+    assert!(
+        rust_accepts[0] && statuses[0] == "verified",
+        "control bundle rust={} qortime={}\n{stderr}",
+        rust_accepts[0],
+        statuses[0]
+    );
+
+    let mut looser = Vec::new();
+    let mut stricter = Vec::new();
+    for (i, ((label, _), rust_ok)) in cases.iter().zip(rust_accepts.iter()).enumerate() {
+        let qt_ok = statuses[i] == "verified";
+        if *rust_ok && !qt_ok {
+            looser.push(format!("{label} qortime={}", statuses[i]));
+        } else if !*rust_ok && qt_ok {
+            stricter.push(label.clone());
+        }
+    }
+    eprintln!(
+        "readers parity: {READERS_PARITY_CASES} cases, rust stricter on {}:",
+        stricter.len()
+    );
+    for label in &stricter {
+        eprintln!("  {label}");
+    }
+    assert!(
+        looser.is_empty(),
+        "rust accepted {} manifest(s) qortime 585ccc4 rejects:\n{}",
+        looser.len(),
+        looser.join("\n")
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn qortime_verify_accepts_emitted_readers_and_frames() {
+    let dir = temp_dir("qt-verify");
+    let b = FrameBind::open(true, Some(&dir), 30);
+    b.install_readers(&manifest()).unwrap();
+    b.append_frame(0, 0, 1000, 0, b"au-0").unwrap();
+    b.append_frame(0, 1, 1105, 3003, b"au-1").unwrap();
+    let mut ext0 = json!({"trigger": "start", "segment_seq": 0});
+    merge(&mut ext0, b.commitment(true).unwrap());
+    let mut chain = CheckpointChain::default();
+    let cp0 = chain.next(10, ext0).unwrap();
+    b.append_frame(1, 2, 1200, 6006, b"au-2").unwrap();
+    b.seal().unwrap();
+    let mut ext1 = json!({"trigger": "stop", "segment_seq": 1});
+    merge(&mut ext1, b.commitment(false).unwrap());
+    let cp1 = chain.next(20, ext1).unwrap();
+    let cps = vec![cp0, cp1];
+    write_cps(&dir, &cps);
+    let local = check_dir(&dir, &cps);
+    assert_eq!(local.frame_status, "verified", "{:?}", local.errors);
+    assert!(local.reader_claim, "{:?}", local);
+    assert_eq!(local.tail, "sealed");
+    let header = lines_of(&dir)[0].clone();
+    assert!(header.contains("\"time_base\""), "{header}");
+    assert!(!header.contains("nominal_fps"), "{header}");
+    assert!(!lines_of(&dir).iter().any(|l| l.contains("\"seal\"")));
+    assert_qortime_frame_bind_verified(&dir);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn qortime_verify_accepts_emitted_align_gap() {
+    let dir = temp_dir("qt-gap");
+    let b = FrameBind::open(true, Some(&dir), 30);
+    b.install_readers(&manifest()).unwrap();
+    b.on_segment(0, "init", &init_timed(90_000));
+    for (i, t) in [0u64, 33, 66, 100].iter().enumerate() {
+        b.observe_ts(&crate::frameclock::video_ts_packet(0x100, i as u64 * 3000), *t);
+    }
+    b.on_segment(1, "media", &media_pts(&[b"F1", b"F2", b"F3"], 3000, 3000));
+    let mut ext0 = json!({"trigger": "start", "segment_seq": 1});
+    merge(&mut ext0, b.commitment(true).unwrap());
+    let mut chain = CheckpointChain::default();
+    let cp0 = chain.next(10, ext0).unwrap();
+    b.observe_ts(&crate::frameclock::video_ts_packet(0x100, 12_000), 200);
+    b.on_segment(2, "media", &media_pts(&[b"F4", b"ORPHAN"], 15_000, 3000));
+    b.seal().unwrap();
+    let mut ext1 = json!({"trigger": "stop", "segment_seq": 2});
+    merge(&mut ext1, b.commitment(false).unwrap());
+    let cp1 = chain.next(20, ext1).unwrap();
+    let cps = vec![cp0, cp1];
+    write_cps(&dir, &cps);
+    let text = std::fs::read_to_string(dir.join(FRAMES_FILE)).unwrap();
+    assert!(text.contains("\"reason\":\"sample_pes_mismatch\""), "{text}");
+    assert!(text.contains("\"bound\":0"), "{text}");
+    let gaps: Vec<Value> = text
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .filter(|v| v["type"] == "align_gap")
+        .collect();
+    assert_eq!(gaps.len(), 1, "{text}");
+    assert!(gaps[0].get("pts").is_none(), "align_gap no longer carries pts:\n{text}");
+    let local = check_dir(&dir, &cps);
+    assert_eq!(local.frame_status, "verified", "{:?}", local.errors);
+    assert!(!local.frame_claim, "a gap is not a frame-time claim");
+    assert_qortime_frame_bind_verified(&dir);
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 fn engine(dir: &Path, manifest_path: Option<&Path>) -> std::sync::Arc<crate::engine::Engine> {

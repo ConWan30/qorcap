@@ -27,11 +27,10 @@ def _token(**over):
 def test_upload_names_match_the_vendored_registry():
     compat = json.loads((ROOT / "contracts" / "compat.json").read_text(encoding="utf-8"))
     pinned = tuple(compat["bundle_files"]["meta"])
-    # Pending a QorTime compat.json re-copy. Not a contract until that lands.
-    pending = ("frames.jsonl", "readers.json")
-    assert qs.META_FILES == pinned + pending
+    assert qs.META_FILES == pinned
     assert qs.upload_names() == qs.META_FILES
-    assert pinned[-3:] == ("pairing.json", "device_attest.v0.json", "score_timeline.json")
+    assert pinned[-5:-2] == ("pairing.json", "device_attest.v0.json", "score_timeline.json")
+    assert pinned[-2:] == ("frames.jsonl", "readers.json")
     assert compat["pairing"]["type"] == "qortime-pairing/v1"
     assert compat["pairing"]["file"] == "pairing.json"
     assert compat["pairing"]["body"].startswith("ignored")
