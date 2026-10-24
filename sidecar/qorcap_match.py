@@ -10,9 +10,13 @@ Started by ``Start Match.cmd`` on Windows. It:
      scorebug reader (QorTime's own ScorebugReader + detect_final) in this process, showing one status line;
   3. countersigns every QorCap checkpoint as it appears, using QorTime's ``checkpoints.countersign``
      with a LOCAL referee key (there is no public QorTime referee server yet);
-  4. stops on final_basis, Enter/Q, or Ctrl+C. After the first end screen it keeps
-     capturing for a short tail (``QORCAP_POST_FINAL_TAIL_S``, default 10 s; 0 is the old hold)
-     so those frames stay in the same hash chain. QorCap then finalises the bundle;
+  4. stops on final_basis, Enter/Q, or Ctrl+C. After a committed end screen (3 frames
+     and 3 s) or a posted end-menu / final_screen final, it keeps capturing for a
+     tail (``QORCAP_POST_FINAL_TAIL_S``, default 10 s, clamped 0..60). The tail only
+     adds time: it never shortens the 4 s end-menu hold or the 120 s scorebug wait.
+     0 is that older stop. What happened is ``post_final_tail.json`` beside the bundle,
+     not a receipt or bundle.json field. Those frames stay in the same hash chain.
+     QorCap then finalises the bundle;
   5. builds the receipt with QorTime's ``receipt.build`` / ``sign_referee`` / ``sign_player`` using a device
      key (QorTime ``FileKey``), writes receipt.json, then runs ``qortime verify`` and ``qorcap verify-bundle``.
 
@@ -24,6 +28,7 @@ signatures are reused; otherwise the local referee countersigns QorCap's checkpo
 QorCap's own recording time, and the referee ``key_kind`` says ``local-self-attested-offline``.
 ``finalize --recover`` rebuilds receipt.draft.json and bundle.json from the files already on disk when the
 recorder was killed before it could write them. Bytes after the last hashed segment are excluded.
+``post_final_tail.json`` is left as it was.
 
 Trust: both keys live on this PC, so the result is SELF-ATTESTED. The receipt's computed QorTime tier is
 ``single-attested`` and ``referee.key_kind`` is ``local-self-attested`` so any reader can see that the
@@ -884,7 +889,14 @@ def main(argv=None) -> int:
         argv.remove("pair")
         from qorcap_pairing import main as pair_main
         return pair_main(argv)
-    ap = argparse.ArgumentParser(description="QorCap one-click match")
+    ap = argparse.ArgumentParser(
+        description="QorCap one-click match",
+        epilog="QORCAP_POST_FINAL_TAIL_S: seconds to keep capturing after a committed end screen "
+               "(3 frames and 3 s) or a posted end-menu / final_screen final. Default 10, clamped to 0..60. "
+               "The tail only adds time. It does not shorten the 4 s end-menu hold or the 120 s scorebug wait. "
+               "0 is that older stop. Enter or Q still stops at once. What happened is written to "
+               "post_final_tail.json next to the bundle (start reason, start and stop time, actual seconds). "
+               "It is not a receipt field and not a bundle.json field. finalize --recover leaves the file in place.")
     ap.add_argument("--test-pattern", action="store_true", help="no capture card: synthetic video + scripted scores")
     ap.add_argument("--test-secs", type=float, default=20.0, help="test-pattern game length")
     ap.add_argument("--device", default="USB3.0 Video")
@@ -1145,47 +1157,57 @@ def main(argv=None) -> int:
             else:
                 sys.stdout.write("\r" + line.ljust(110))
                 sys.stdout.flush()
-            # The reader counts final_screen before the end-menu final is posted. That clock is the tail.
-            noted = observe_final_screen(state, time.monotonic(), wall_ms=int(time.time() * 1000))
+            # Committed final_screen span, or a posted end-menu / final_screen final. Not the per-frame counter.
+            now_mono = time.monotonic()
+            noted = observe_final_screen(state, now_mono, wall_ms=int(time.time() * 1000))
             f = state.get("final")
             if f and is_end_menu_final(f) and not state.get("end_menu_seen"):
                 state["end_menu_seen"] = True
-                state["final_seen_at"] = time.monotonic()
+                state["final_seen_at"] = now_mono
                 saving = "Saving final clip ..."
                 if tail_s > 0:
-                    saving = (f"Saving final clip. Capture continues for {tail_s:g} s from the end screen; "
-                              "leave that menu up.")
+                    saving = (f"Saving final clip. Capture continues for the usual hold and for {tail_s:g} s "
+                              "after the end screen, whichever is later. Leave that menu up.")
                 say(f"\n\nFINAL (end-of-game menu): AWAY {f['away']} - HOME {f['home']}. {saving}"
                     + (f"\n  note: {f['notes'][0]}" if f.get("notes") else ""))
             elif f and state.get("final_seen_at") is None:
-                state["final_seen_at"] = time.monotonic()
+                state["final_seen_at"] = now_mono
                 say(f"\n\nFINAL on the scorebug ({f['basis']}): AWAY {f['away']} - HOME {f['home']}. Waiting up to "
                     f"{END_MENU_WAIT_S} s for the end-of-game menu to confirm it (stay on that menu; do not RESTART) ...")
             if noted and tail_s > 0 and not state.get("end_menu_seen"):
-                say(f"\n\nEnd screen detected. Capture stays up for {tail_s:g} s so the end menu is in the recording.")
+                say(f"\n\nEnd screen detected. Capture stays up for at least {tail_s:g} s so the end menu is in the recording.")
             if st.get("state") == "disk_full":
                 state["source_error"] = "disk_full"
-            reason = capture_stop_reason(state, time.monotonic(), tail_s=tail_s)
+            now_mono = time.monotonic()
+            reason = capture_stop_reason(state, now_mono, tail_s=tail_s)
             if reason == "enter":
                 stop_reason = "enter"
+                _remember_tail_stop(state, now_mono, int(time.time() * 1000))
                 say("\n\nStopping (you pressed a key) ...")
                 break
-            if reason == "final":
-                stop_reason = "final"
+            if reason in ("final", "post_final_tail"):
+                stop_reason = reason
+                _remember_tail_stop(state, now_mono, int(time.time() * 1000))
+                if reason == "post_final_tail":
+                    say("\n\nStopping after the end-screen tail. No final was posted.")
                 break
             if reason:
                 stop_reason = reason
+                _remember_tail_stop(state, now_mono, int(time.time() * 1000))
                 say(f"\n\nStopping ({reason}) ...")
                 break
             time.sleep(1.0 / TAIL_HZ)
         else:
             # The process left on its own during the tail (pipe broken, device gone). Do not call that a
             # finished final, and do not keep the tail open.
-            if died_during_post_final_tail(state, time.monotonic(), tail_s) and stop_reason == "final":
+            now_mono = time.monotonic()
+            if died_during_post_final_tail(state, now_mono, tail_s) and stop_reason == "final":
                 stop_reason = "source"
                 say("\n\nCapture ended during the end-screen tail. Stopping without extending it.")
+            _remember_tail_stop(state, now_mono, int(time.time() * 1000))
     except KeyboardInterrupt:
         stop_reason = "ctrl_c"
+        _remember_tail_stop(state, time.monotonic(), int(time.time() * 1000))
         say("\n\nStopping (Ctrl+C) ...")
     finally:
         if ui is not None:
@@ -1220,8 +1242,16 @@ def main(argv=None) -> int:
                 say(msg)
     wait_and_countersign(proc, bundle / "checkpoints.jsonl", cs, timeout=SHUTDOWN_TIMEOUT_S, sweep=sweep, on_tick=tick)
     log.close()
-    # After the engine's bundle.json write. Not a receipt field.
-    record_post_final_tail(bundle, secs=tail_s, final_screen_wall_ms=state.get("final_screen_wall_ms"))
+    # Sidecar file only. Not a bundle.json field and not a receipt field.
+    if state.get("tail_stop_wall_ms") is None:
+        _remember_tail_stop(state, time.monotonic(), int(time.time() * 1000))
+    record_post_final_tail(
+        bundle,
+        configured_s=tail_s,
+        start_reason=state.get("final_screen_start_reason"),
+        start_t_ms=state.get("final_screen_wall_ms"),
+        stop_t_ms=state.get("tail_stop_wall_ms"),
+        actual_s=state.get("tail_actual_s"))
 
     # Countersign anything QorCap wrote while shutting down (still within seconds of t_ms).
     for line in (bundle / "checkpoints.jsonl").read_text(encoding="utf-8").splitlines() if (bundle / "checkpoints.jsonl").exists() else []:
@@ -1961,20 +1991,21 @@ def apply_final(res: dict, fin: dict | None, *, fallback: dict | None = None, gr
 
 TAIL_SECS = 240
 TAIL_HZ = 2.0
-# Live hold after the first final_screen, before auto-stop. This is not TAIL_SECS: that constant is how
-# far tail_final_check looks back through video that was already recorded. 0 keeps today's auto-stop.
+# Extra capture after a committed end screen. This is not TAIL_SECS: that constant is how far
+# tail_final_check looks back through video that was already recorded. The live tail only adds
+# time on top of the 4 s end-menu hold and the 120 s scorebug wait. 0 keeps today's auto-stop.
 POST_FINAL_TAIL_ENV = "QORCAP_POST_FINAL_TAIL_S"
 POST_FINAL_TAIL_DEFAULT_S = 10.0
 POST_FINAL_TAIL_MAX_S = 60.0
-_SEGMENT_GENESIS = "0" * 64
+POST_FINAL_TAIL_NAME = "post_final_tail.json"
 
 
 def post_final_tail_s(environ=None) -> float:
-    """Seconds to keep capturing after the first final_screen.
+    """Seconds the tail adds after a committed end screen or a posted end-screen final.
 
     Unset, blank, or not a finite number uses 10. Finite values clamp to 0..60.
-    0 is today's auto-stop: ``END_MENU_HOLD_S`` after an end-menu final, or
-    ``END_MENU_WAIT_S`` after a scorebug final that has not reached the end screen.
+    0 adds nothing: ``END_MENU_HOLD_S`` after an end-menu final, or
+    ``END_MENU_WAIT_S`` after a scorebug final. A positive value never shortens those.
     """
     env = os.environ if environ is None else environ
     raw = env.get(POST_FINAL_TAIL_ENV)
@@ -2004,7 +2035,7 @@ def _mono(v):
 
 
 def note_final_screen(state: dict, now: float, *, wall_ms: int | None = None) -> bool:
-    """Record the first final_screen. A later frame does not move the clock."""
+    """Record the first committed end screen. A later frame does not move the clock."""
     if state.get("final_screen_mono") is not None:
         return False
     state["final_screen_mono"] = float(now)
@@ -2013,21 +2044,111 @@ def note_final_screen(state: dict, now: float, *, wall_ms: int | None = None) ->
     return True
 
 
+def _clear_final_screen(state: dict) -> None:
+    for key in ("final_screen_mono", "final_screen_wall_ms", "final_screen_start_reason", "final_screen_span_t_ms"):
+        state.pop(key, None)
+
+
+def _ms(v):
+    if isinstance(v, bool) or not isinstance(v, int):
+        return None
+    return v
+
+
+def _latest_scorebug_t(core) -> int | None:
+    timeline = getattr(core, "timeline", None)
+    if not isinstance(timeline, list):
+        return None
+    latest = None
+    for row in timeline:
+        if not isinstance(row, dict) or "obs" in row or "home" not in row:
+            continue
+        t = _ms(row.get("t_ms"))
+        if t is None:
+            continue
+        if latest is None or t > latest:
+            latest = t
+    return latest
+
+
+def _committed_final_screen(core, after_ms: int | None):
+    """An open or posted final_screen span that meets the same bar as ``_commit_span``.
+
+    The span must start after the latest scorebug read. A scorebug that comes back
+    makes the earlier screen stale.
+    """
+    from qorcap_reader import FINAL_SCREEN_MIN_FRAMES, FINAL_SCREEN_MIN_SPAN_MS
+
+    timeline = getattr(core, "timeline", None)
+    if not isinstance(timeline, list):
+        return None
+    found = None
+    for row in timeline:
+        if not isinstance(row, dict) or row.get("obs") != "final_screen":
+            continue
+        n = row.get("n")
+        t0 = _ms(row.get("t_ms"))
+        t1 = _ms(row.get("until_ms"))
+        if isinstance(n, bool) or not isinstance(n, int) or t0 is None or t1 is None:
+            continue
+        if n < FINAL_SCREEN_MIN_FRAMES or t1 - t0 < FINAL_SCREEN_MIN_SPAN_MS:
+            continue
+        if after_ms is not None and t0 <= after_ms:
+            continue
+        if found is None or t0 < found["t_ms"]:
+            found = row
+    return found
+
+
+def _posted_screen_final(state: dict, after_ms: int | None):
+    """A posted final whose basis is the end screen, still after the latest scorebug read."""
+    fin = state.get("final")
+    if not isinstance(fin, dict):
+        core = state.get("core")
+        got = getattr(core, "final", None) if core is not None else None
+        fin = got if isinstance(got, dict) else None
+    if not isinstance(fin, dict):
+        return None
+    if fin.get("basis") != "final_screen" and not is_end_menu_final(fin):
+        return None
+    t = _ms(fin.get("t_ms"))
+    if after_ms is not None and (t is None or t <= after_ms):
+        return None
+    return fin
+
+
+def _final_was_posted(state: dict) -> bool:
+    fin = state.get("final")
+    if isinstance(fin, dict) and (fin.get("type") == "final" or "basis" in fin or "home" in fin):
+        return True
+    core = state.get("core")
+    got = getattr(core, "final", None) if core is not None else None
+    return isinstance(got, dict)
+
+
 def observe_final_screen(state: dict, now: float, *, wall_ms: int | None = None) -> bool:
-    """Note the first accepted final_screen frame, or a final whose basis is the end screen."""
+    """Start the tail from a committed final_screen span or a posted end-screen final.
+
+    ``stats['final_screen']`` counts every accepted frame and is not this trigger.
+    A scorebug read after the screen clears the clock. The next call can start again
+    only from a screen or final that is newer than that read.
+    """
+    core = state.get("core")
+    after = _latest_scorebug_t(core) if core is not None else None
+    span = _committed_final_screen(core, after) if core is not None else None
+    fin = None if span is not None else _posted_screen_final(state, after)
+    if span is None and fin is None:
+        if state.get("final_screen_mono") is not None:
+            _clear_final_screen(state)
+        return False
     if state.get("final_screen_mono") is not None:
         return False
-    core = state.get("core")
-    stats = getattr(core, "stats", None) if core is not None else None
-    seen = False
-    if isinstance(stats, dict):
-        n = stats.get("final_screen") or 0
-        seen = isinstance(n, int) and not isinstance(n, bool) and n > 0
-    fin = state.get("final")
-    if isinstance(fin, dict) and (fin.get("basis") == "final_screen" or is_end_menu_final(fin)):
-        seen = True
-    if not seen:
-        return False
+    if span is not None:
+        state["final_screen_start_reason"] = "final_screen"
+        state["final_screen_span_t_ms"] = span.get("t_ms")
+    else:
+        state["final_screen_start_reason"] = "posted_final"
+        state["final_screen_span_t_ms"] = fin.get("t_ms")
     return note_final_screen(state, now, wall_ms=wall_ms)
 
 
@@ -2035,32 +2156,33 @@ def capture_stop_reason(state: dict, now: float, *, tail_s: float) -> str | None
     """Why the recorder should stop, or None to keep capturing.
 
     A capture error or ENTER/Q (``user_stop``) stops immediately, including during the tail.
-    ``tail_s`` > 0 auto-stops ``tail_s`` seconds after the first final_screen. That replaces the
-    4 s end-menu hold, and it ends the scorebug wait once the end screen is actually up.
-    A scorebug final with no final_screen still waits ``END_MENU_WAIT_S``.
-    ``tail_s`` == 0 is today's rule, including the strict ``>`` against the 4 s hold.
+    The tail only adds time. Stop at the later of the old deadline and the end-screen tail:
 
-    The score gates are not changed here. The reader keeps running for the extra seconds, so an
-    end-menu agreement that needed those frames can still pass. This function only chooses when
-    the recorder stops.
+    - end-menu final: ``final_seen_at + END_MENU_HOLD_S`` (strict ``>``, same as today)
+    - any other posted final: ``final_seen_at + END_MENU_WAIT_S``
+    - committed end screen: ``final_screen_mono + tail_s`` when ``tail_s`` > 0
+
+    No posted-final clock means no auto-stop. A screen by itself does not invent one.
+    ``tail_s`` == 0 is today's rule. The reason is ``final`` only when a final was posted.
+    Otherwise a stop that got here is ``post_final_tail``.
     """
     err = state.get("source_error")
     if isinstance(err, str) and err:
         return err
     if state.get("user_stop"):
         return "enter"
-    screen_at = _mono(state.get("final_screen_mono"))
-    if tail_s > 0 and screen_at is not None:
-        if now - screen_at >= tail_s:
-            return "final"
-        return None
     seen = _mono(state.get("final_seen_at"))
     if seen is None:
         return None
     limit = END_MENU_HOLD_S if state.get("end_menu_seen") else END_MENU_WAIT_S
-    if now - seen > limit:
-        return "final"
-    return None
+    if not (now - seen > limit):
+        return None
+    screen_at = _mono(state.get("final_screen_mono"))
+    if tail_s > 0 and screen_at is not None and now - screen_at < tail_s:
+        return None
+    if not _final_was_posted(state):
+        return "post_final_tail"
+    return "final"
 
 
 def died_during_post_final_tail(state: dict, now: float, tail_s: float) -> bool:
@@ -2071,159 +2193,51 @@ def died_during_post_final_tail(state: dict, now: float, tail_s: float) -> bool:
     return now - screen_at < tail_s
 
 
-def _jcs_sha(obj) -> str:
-    from qor_receipt.jcs import sha256_hex
-    return sha256_hex(obj)
-
-
-def segment_link(prev: str, seq: int, sha: str) -> str:
-    """Same link as ``evidence::link``: SHA-256 of JCS({prev, seq, sha256})."""
-    return _jcs_sha({"prev": prev, "seq": seq, "sha256": sha})
-
-
-def new_segment_chain() -> dict:
-    return {"seq": 0, "head": _SEGMENT_GENESIS, "rows": []}
-
-
-def new_checkpoint_chain() -> dict:
-    return {"seq": 0, "prev": _SEGMENT_GENESIS, "rows": []}
-
-
-def commit_capture_segment(chain: dict, checkpoints: dict, payload: bytes, *, wall_ms: int) -> dict:
-    """Hash one captured segment and seal a checkpoint to its new head.
-
-    Frames after final_screen use this same function. Nothing is parked in an unsigned buffer.
-    """
-    import hashlib
-
-    sha = hashlib.sha256(payload).hexdigest()
-    prev = chain["head"]
-    seq = chain["seq"]
-    head = segment_link(prev, seq, sha)
-    row = {"type": "segment", "seq": seq, "sha256": sha, "prev": prev, "chain_head": head,
-           "bytes": len(payload), "wall_ms": int(wall_ms), "payload": bytes(payload)}
-    chain["rows"].append(row)
-    chain["seq"] = seq + 1
-    chain["head"] = head
-    ext = {"trigger": "segment", "segment_seq": seq, "chain_head": head}
-    frames_hash = _jcs_sha(ext)
-    input_hash = _jcs_sha([])
-    body = {"seq": checkpoints["seq"], "t_ms": int(wall_ms), "frames_hash": frames_hash,
-            "input_hash": input_hash, "prev": checkpoints["prev"]}
-    digest = _jcs_sha(body)
-    cp = dict(body, hash=digest, qorcap=ext)
-    checkpoints["rows"].append(cp)
-    checkpoints["seq"] += 1
-    checkpoints["prev"] = digest
-    return row
-
-
-def verify_capture_chain(segments: list[dict], checkpoints: list[dict]) -> list[str]:
-    """Walk segments and checkpoints the way ``bundle::verify`` does.
-
-    Empty means the tail sits on the same chain as the frames before it: hashes match the
-    bytes, prev links have no gap, and every checkpoint names a head that was actually committed.
-    """
-    import hashlib
-
-    errors = []
-    prev = _SEGMENT_GENESIS
-    heads = {_SEGMENT_GENESIS}
-    for i, row in enumerate(segments):
-        seq = row.get("seq")
-        tag = f"segment {i}"
-        if seq != i:
-            errors.append(f"{tag}: seq gap (expected {i})")
-        if row.get("prev") != prev:
-            errors.append(f"{tag}: prev link broken")
-        payload = row.get("payload")
-        if isinstance(payload, (bytes, bytearray)):
-            sha = hashlib.sha256(bytes(payload)).hexdigest()
-            if sha != row.get("sha256"):
-                errors.append(f"{tag}: SHA-256 mismatch")
-        else:
-            errors.append(f"{tag}: missing payload")
-        claimed_seq = seq if isinstance(seq, int) and not isinstance(seq, bool) else -1
-        claimed_sha = row.get("sha256") if isinstance(row.get("sha256"), str) else ""
-        if row.get("chain_head") != segment_link(prev, claimed_seq, claimed_sha):
-            errors.append(f"{tag}: chain head mismatch")
-        head = row.get("chain_head")
-        if isinstance(head, str):
-            heads.add(head)
-            prev = head
-    cp_prev = _SEGMENT_GENESIS
-    empty_input = _jcs_sha([])
-    for i, cp in enumerate(checkpoints):
-        tag = f"checkpoint {i}"
-        if cp.get("seq") != i:
-            errors.append(f"{tag}: seq gap")
-        if cp.get("prev") != cp_prev:
-            errors.append(f"{tag}: prev link broken")
-        body = {k: cp.get(k) for k in ("seq", "t_ms", "frames_hash", "input_hash", "prev")}
-        if _jcs_sha(body) != cp.get("hash"):
-            errors.append(f"{tag}: hash mismatch")
-        ext = cp.get("qorcap")
-        if not isinstance(ext, dict) or _jcs_sha(ext) != cp.get("frames_hash"):
-            errors.append(f"{tag}: qorcap evidence does not match frames_hash")
-        elif ext.get("chain_head") not in heads:
-            errors.append(f"{tag}: refers to unknown video chain head")
-        if cp.get("input_hash") != empty_input:
-            errors.append(f"{tag}: input_hash is not the empty chunk")
-        got = cp.get("hash")
-        cp_prev = got if isinstance(got, str) else cp_prev
-    return errors
-
-
-def run_match_capture(state, *, tail_s, source, chain, checkpoints, clock, sleep, poll_s=None,
-                      max_ticks: int = 100000):
-    """Take segments until ``capture_stop_reason`` fires.
-
-    Every segment the source yields before that stop is committed, including frames after
-    final_screen. A source error commits nothing from the failing tick. The poll is
-    ``TAIL_HZ``, the same rate ``tail_final_check`` uses when it re-reads the recording.
-    ``tail_final_check`` does not run here and does not decide the score.
-    """
-    if poll_s is None:
-        poll_s = 1.0 / TAIL_HZ
-    for _ in range(max_ticks):
-        now = clock()
-        tick = source(now, state) or {}
-        err = tick.get("error")
-        if isinstance(err, str) and err:
-            state["source_error"] = err
-        elif tick.get("alive") is False:
-            state["source_error"] = "source"
-        else:
-            for payload in tick.get("segments") or []:
-                commit_capture_segment(chain, checkpoints, payload, wall_ms=int(round(now * 1000)))
-        reason = capture_stop_reason(state, now, tail_s=tail_s)
-        if reason:
-            return reason, now
-        sleep(poll_s)
-    raise RuntimeError("capture did not stop")
-
-
-def record_post_final_tail(bundle: Path, *, secs: float, final_screen_wall_ms: int | None) -> None:
-    """Store the tail on bundle.json. receipt.v0 has no field for it.
-
-    ``secs`` is the configured duration. 0 means today's auto-stop was used.
-    ``final_screen_wall_ms`` is when the end screen was first seen, and is omitted when it never was.
-    A missing bundle.json is left missing: this does not invent a side file.
-    """
-    p = Path(bundle) / "bundle.json"
-    try:
-        meta = json.loads(p.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+def _remember_tail_stop(state: dict, now: float, wall_ms: int) -> None:
+    """Stamp the moment capture actually stopped. Later calls do not move it."""
+    if state.get("tail_stop_wall_ms") is not None:
         return
-    if not isinstance(meta, dict):
+    if isinstance(wall_ms, int) and not isinstance(wall_ms, bool):
+        state["tail_stop_wall_ms"] = wall_ms
+    screen = _mono(state.get("final_screen_mono"))
+    if screen is None:
+        state["tail_actual_s"] = None
+    else:
+        state["tail_actual_s"] = round(max(0.0, float(now) - screen), 3)
+
+
+
+def record_post_final_tail(bundle: Path, *, configured_s: float, start_reason: str | None = None,
+                           start_t_ms: int | None = None, stop_t_ms: int | None = None,
+                           actual_s: float | None = None) -> None:
+    """Write ``post_final_tail.json`` next to the bundle. Not a bundle.json or receipt field.
+
+    The file records what happened: why the tail started, the start and stop wall times,
+    and the actual seconds. ``configured_s`` is the clamped setting, including 0.
+    A missing bundle directory is left missing. ``finalize --recover`` does not delete this file.
+    """
+    bundle = Path(bundle)
+    if not bundle.is_dir():
         return
-    rec = {"secs": secs}
-    if isinstance(final_screen_wall_ms, int) and not isinstance(final_screen_wall_ms, bool):
-        rec["final_screen_wall_ms"] = final_screen_wall_ms
-    if meta.get("post_final_tail") == rec:
-        return
-    meta["post_final_tail"] = rec
-    p.write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
+
+    def _wall(v):
+        if isinstance(v, bool) or not isinstance(v, int):
+            return None
+        return v
+
+    def _secs(v):
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            return None
+        return round(float(v), 3)
+
+    rec = {
+        "configured_s": _secs(configured_s),
+        "start_reason": start_reason if isinstance(start_reason, str) and start_reason else None,
+        "start_t_ms": _wall(start_t_ms),
+        "stop_t_ms": _wall(stop_t_ms),
+        "actual_s": _secs(actual_s),
+    }
+    (bundle / POST_FINAL_TAIL_NAME).write_text(json.dumps(rec, indent=2) + "\n", encoding="utf-8")
 
 
 def tail_final_check(bundle: Path, draft: dict, *, ffmpeg: str, secs: int = TAIL_SECS, hz: float = TAIL_HZ,
@@ -2405,6 +2419,7 @@ def recover_bundle(bundle: Path) -> dict | None:
 
     Scores, challenges, match id and the stop reason come only from those files. A video tail
     past the last hashed segment is recorded and excluded. No segment is invented for it.
+    ``post_final_tail.json`` is not part of that rebuild and is left byte for byte.
     """
     import hashlib
 
@@ -2412,6 +2427,10 @@ def recover_bundle(bundle: Path) -> dict | None:
     from qor_receipt.jcs import sha256_hex
 
     bundle = bundle.resolve()
+    # The tail sidecar is QorCap's own record of what the capture did. Rebuilding
+    # bundle.json must not drop it or rewrite it.
+    tail_path = bundle / POST_FINAL_TAIL_NAME
+    tail_kept = tail_path.read_bytes() if tail_path.is_file() else None
     manifest = read_jsonl(bundle / "manifest.jsonl")
     cps = read_jsonl(bundle / "checkpoints.jsonl")
     timeline = read_jsonl(bundle / "timeline.jsonl")
@@ -2596,6 +2615,8 @@ def recover_bundle(bundle: Path) -> dict | None:
         bundle_doc["excluded_tails"] = tails
     (bundle / "receipt.draft.json").write_text(json.dumps(draft, indent=2) + "\n", encoding="utf-8")
     (bundle / "bundle.json").write_text(json.dumps(bundle_doc, indent=2) + "\n", encoding="utf-8")
+    if tail_kept is not None:
+        tail_path.write_bytes(tail_kept)
     say(f"recovered bundle ({stop_reason}); {len(segs)} hashed segment(s), {len(tails)} excluded tail(s)")
     return draft
 
