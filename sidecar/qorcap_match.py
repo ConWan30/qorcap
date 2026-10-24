@@ -2664,7 +2664,12 @@ def tail_final_check(bundle: Path, draft: dict, *, ffmpeg: str, secs: int = TAIL
     that were already decoded.
 
     A disputed live final is not re-read. Every other tail is fed through the last frame, on one
-    ``ReaderCore``. A later menu that disagrees keeps the first score, with ``final_confirmed``
+    ``ReaderCore``. The tail inherits live's quarter floor: the highest integer quarter on the
+    live rows. Bool, None, and anything else are not a quarter. A read below that floor is
+    dropped, the same as live. Without the floor a trailing Q3 misread is kept, the first menu
+    fails the Q4 gate, and a later showing can confirm.
+
+    A later menu that disagrees keeps the first score, with ``final_confirmed``
     false and ``end_menu_disputed`` true. The note is the one ``_note_end_menu_disagreement``
     writes: a scorebug between the menus is named only when a real scorebug row lies strictly
     between them. Stopping at the first agreement would sign that first score confirmed.
@@ -2685,6 +2690,15 @@ def tail_final_check(bundle: Path, draft: dict, *, ffmpeg: str, secs: int = TAIL
     from qorcap_reanchor_notes import append_note
     core.reanchor_note = lambda row, bundle=bundle: append_note(bundle, row)
     core.timeline = [dict(r) for r in live]
+    # Highest quarter live posted. Set the attribute directly: a hasattr guard would
+    # skip the seed on a rename and the tail would confirm a later showing.
+    floor = None
+    for r in live:
+        q = r.get("quarter") if isinstance(r, dict) else None
+        if isinstance(q, bool) or not isinstance(q, int):
+            continue
+        floor = q if floor is None else max(floor, q)
+    core._max_quarter = floor
     # One deadline for every lock on this path: the inputs view, and the manifest
     # and haptics tails inside the bundle snapshot. A refresh stuck in any of
     # those reads must not hang the receipt. Fail closed: unconfirmed final,

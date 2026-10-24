@@ -923,6 +923,90 @@ def test_one_recorded_menu_signs_the_same_result_to_the_end_of_the_tail(tmp_path
     assert long["final"].get("end_menu_disputed") is None and short["final"].get("end_menu_disputed") is None
 
 
+def test_reader_core_names_its_quarter_floor():
+    """The tail seeds this attribute by name. A rename fails here instead of skipping the seed."""
+    score = {"t_ms": 1_000, "home": 0, "away": 7, "quarter": 4, "clock_s": 0, "clock_red": True}
+    core, _posts = _core(score)
+    assert core._max_quarter is None
+
+
+class _Q3MisreadThenQ4:
+    """Q3 on the frame before the menu, then a Q4 scorebug once the menu has gone."""
+
+    def __init__(self):
+        self.t = 0
+
+    def read(self, _img):
+        if self.t < 10_000:
+            q, clock, red = 3, 30, False
+        elif 12_000 <= self.t <= 14_000:
+            q, clock, red = 4, 0, True
+        else:
+            return _Fin(ok=False, reason="layout_unknown", pair=None, quarter=None,
+                        clock_seconds=None, clock_red=False)
+        return _Fin(ok=True, reason="ok", left_score=10, right_score=10, quarter=q,
+                    clock_seconds=clock, clock_red=red, pair=(10, 10))
+
+
+def test_trailing_q3_misread_does_not_let_a_later_showing_confirm(tmp_path):
+    """Live already reached Q4. The tail's Q3 misread is dropped, so the first menu posts unconfirmed.
+
+    Bool, None, and a non-int quarter on the live rows are not a floor. Input after the first
+    screen does not confirm it. A scorebug return and a later showing of the same menu leave
+    that first score unconfirmed. Without the live quarter floor the Q3 read is kept, the Q4
+    gate rejects the first showing, and the later showing confirms.
+    """
+    rows = [
+        {"t_ms": 100, "home": 10, "away": 10, "quarter": True, "clock_s": 60},
+        {"t_ms": 200, "home": 10, "away": 10, "quarter": None, "clock_s": 50},
+        {"t_ms": 300, "home": 10, "away": 10, "quarter": "4", "clock_s": 40},
+        {"t_ms": 1_000, "home": 10, "away": 10, "quarter": 4, "clock_s": 0, "clock_red": True},
+    ]
+    frames = ([(2_000, _blank())]
+              + _menu_frames(5_000, 8_000)
+              + [(t, _blank()) for t in (12_000, 13_000, 14_000)]
+              + _menu_frames(20_000, 23_000))
+    bundle = tmp_path / "trailing-q3"
+    bundle.mkdir()
+    (bundle / "timeline.jsonl").write_text(
+        "".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+    (bundle / "video.mp4").write_bytes(b"not-a-real-video")
+    (bundle / "manifest.jsonl").write_text(json.dumps({
+        "type": "segment", "seq": 0, "file": "video.mp4", "wall_ms": frames[-1][0],
+    }) + "\n", encoding="utf-8")
+    draft = {"result": {"home_score": 10, "away_score": 10, "quarter": 4, "winner": "unknown",
+                        "method": "last_scorebug_read_unconfirmed", "final_confirmed": False}}
+    scorebug = _Q3MisreadThenQ4()
+    menu = _MenuReader(10, 16)
+
+    def factory(post, scorebug=scorebug, menu=menu):
+        core = ReaderCore(post, scorebug, _Agree(), None, _detect_final,
+                          final_screen_detector=madden_final_screen, end_menu_reader=menu,
+                          end_menu_agree=EndMenuAgreement())
+        core.delta_corroboration = [{"kind": "input_activity", "t_ms": 16_000}]
+        real = core.on_frame
+
+        def on_frame(t, img, scorebug=scorebug, real=real):
+            scorebug.t = t
+            return real(t, img)
+
+        core.on_frame = on_frame
+        return core
+
+    got = qm.tail_final_check(
+        bundle, draft, ffmpeg="ffmpeg", core_factory=factory, frames=frames)
+    tail = json.loads((bundle / "final.tail.json").read_text(encoding="utf-8"))
+    res, fin = got["result"], tail["final"]
+    assert (res["away_score"], res["home_score"]) == (10, 16)
+    assert res["final_confirmed"] is False
+    assert res["method"] == "end_menu_read"
+    assert res["final_t_ms"] == 5_000
+    assert fin["t_ms"] == 5_000 and fin["final_confirmed"] is False
+    assert fin.get("end_menu_disputed") is not True
+    assert tail["end_menu"]["t_ms"] == 5_000
+    assert tail["end_menu"]["until_ms"] == 23_000
+
+
 def test_tied_walkoff_input_after_the_end_screen_does_not_confirm(tmp_path):
     """Tied Q4 0:00 10-10 to menu 10-16, and tied OT 13-13 to menu 13-16.
 
