@@ -272,9 +272,9 @@ def test_hershey_stays_in_the_provenance_list():
 
 def test_hershey_rows_match_the_generator():
     sys.path.insert(0, str(HERE.parent / "tools"))
-    from make_end_menu_hershey import rows_match
+    from make_end_menu_hershey import hershey_mismatch
 
-    assert rows_match()
+    assert hershey_mismatch() is None
 
 
 def test_partial_end_menu_harvest_keeps_the_recorded_final_green(monkeypatch, tmp_path):

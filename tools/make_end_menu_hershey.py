@@ -2,9 +2,13 @@
 
 Digits 1, 4, and 7 in ``sidecar/packs/madden27_end_menu_v2.npz`` were only on
 the removed 125430 rows. These stand-ins are OpenCV Hershey simplex, not those
-pixels. The same function the reader uses (``norm_vec``) turns each tight
-mask into the stored vector, so a rerun matches the committed rows byte for
-byte.
+pixels. ``norm_vec`` (the reader's resizer) turns each tight mask into the
+stored vector.
+
+``cv2.putText`` and ``cv2.resize(..., INTER_AREA)`` are not bit-stable across
+CPU dispatches of one OpenCV wheel, so a live redraw is not the oracle.
+``tools/end_menu_hershey_rows.npz`` holds the vectors ``--write`` produced.
+``--check`` compares the pack to that snapshot.
 
     python tools/make_end_menu_hershey.py --check
     python tools/make_end_menu_hershey.py --write
@@ -19,6 +23,7 @@ import numpy as np
 
 ROOT = Path(__file__).resolve().parents[1]
 PACK = ROOT / "sidecar" / "packs" / "madden27_end_menu_v2.npz"
+SNAPSHOT = ROOT / "tools" / "end_menu_hershey_rows.npz"
 SOURCE = "synthetic:hershey"
 DIGITS = ("1", "4", "7")
 FONT = cv2.FONT_HERSHEY_SIMPLEX
@@ -38,7 +43,7 @@ def hershey_mask(digit: str) -> np.ndarray:
 
 
 def hershey_vectors() -> dict[str, np.ndarray]:
-    """One float32 ``norm_vec`` per digit, the bytes stored in the pack."""
+    """One float32 ``norm_vec`` per digit, from a live redraw on this machine."""
     sys.path.insert(0, str(ROOT / "sidecar"))
     from qorcap_endmenu import norm_vec
 
@@ -51,6 +56,27 @@ def hershey_vectors() -> dict[str, np.ndarray]:
     return out
 
 
+def snapshot_vectors(path: Path | None = None) -> dict[str, np.ndarray]:
+    """The committed stand-in vectors. These bytes are the check oracle."""
+    path = path or SNAPSHOT
+    if not path.is_file():
+        raise SystemExit(f"missing hershey snapshot {path}")
+    with np.load(path) as blob:
+        missing = [digit for digit in DIGITS if digit not in blob.files]
+        if missing:
+            raise SystemExit(f"hershey snapshot is missing {missing}")
+        return {
+            digit: np.ascontiguousarray(blob[digit], dtype=np.float32).copy()
+            for digit in DIGITS
+        }
+
+
+def write_snapshot(vectors: dict[str, np.ndarray], path: Path | None = None) -> None:
+    path = path or SNAPSHOT
+    masks = {f"mask_{digit}": hershey_mask(digit) for digit in DIGITS}
+    np.savez_compressed(path, **vectors, **masks)
+
+
 def _load(path: Path):
     with np.load(path) as blob:
         return (
@@ -61,17 +87,27 @@ def _load(path: Path):
         )
 
 
-def rows_match(path: Path | None = None) -> bool:
+def hershey_mismatch(path: Path | None = None) -> str | None:
+    """None when the pack's stand-in rows equal the committed snapshot."""
     labels, sources, vecs, _ot = _load(path or PACK)
-    fresh = hershey_vectors()
-    seen = set()
+    fresh = snapshot_vectors()
+    seen: dict[str, int] = {}
     for index, (label, source) in enumerate(zip(labels, sources)):
         if source != SOURCE:
             continue
-        seen.add(label)
-        if label not in fresh or not np.array_equal(vecs[index], fresh[label]):
-            return False
-    return seen == set(DIGITS)
+        seen[label] = seen.get(label, 0) + 1
+        if label not in fresh:
+            return f"unexpected hershey label {label!r}"
+        if not np.array_equal(vecs[index], fresh[label]):
+            delta = float(np.max(np.abs(vecs[index] - fresh[label])))
+            return f"hershey row {label!r} differs from the snapshot (max abs {delta})"
+    if seen != {digit: 1 for digit in DIGITS}:
+        return f"hershey rows are {seen}, expected one each of {DIGITS}"
+    return None
+
+
+def rows_match(path: Path | None = None) -> bool:
+    return hershey_mismatch(path) is None
 
 
 def write_rows(path: Path | None = None) -> None:
@@ -96,15 +132,17 @@ def write_rows(path: Path | None = None) -> None:
         source=np.array(sources),
         ot_vec=ot,
     )
+    write_snapshot(fresh)
 
 
 def main(argv: list[str] | None = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
     if args == ["--check"]:
-        if not rows_match():
-            print("hershey rows do not match the generator", file=sys.stderr)
+        mismatch = hershey_mismatch()
+        if mismatch:
+            print(mismatch, file=sys.stderr)
             return 1
-        print("hershey rows match")
+        print("hershey rows match the snapshot")
         return 0
     if args == ["--write"]:
         write_rows()
