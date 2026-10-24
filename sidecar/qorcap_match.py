@@ -498,7 +498,8 @@ def start_reader(api: Api, stop: threading.Event, state: dict, bundle: Path | No
     from qorcap_mnp import AutoProfileReader
     from qorcap_reader import collect_delta_corroboration, load_delta_corroboration_from_bundle
     from qorcap_playcall import PauseCapableGate, PlayCallDetector
-    core = ReaderCore(post, AutoProfileReader(standard_reader(), prep=prep), AgreementWindow(), PauseDetector(), detect_final,
+    from qorcap_score_grammar import lock_agreement_config
+    core = ReaderCore(post, AutoProfileReader(standard_reader(), prep=prep), AgreementWindow(lock_agreement_config()), PauseDetector(), detect_final,
                       final_screen_detector=madden_final_screen, end_menu_reader=EndMenuReader(),
                       playcall=PlayCallDetector(), gate=PauseCapableGate())
     if bundle is not None:
@@ -2067,7 +2068,8 @@ def default_core_factory(post):
     from qorcap_standard import standard_reader
 
     from qorcap_playcall import PauseCapableGate, PlayCallDetector
-    return ReaderCore(post, AutoProfileReader(standard_reader(), prep=prep), AgreementWindow(), PauseDetector(), detect_final,
+    from qorcap_score_grammar import lock_agreement_config
+    return ReaderCore(post, AutoProfileReader(standard_reader(), prep=prep), AgreementWindow(lock_agreement_config()), PauseDetector(), detect_final,
                       final_screen_detector=madden_final_screen, end_menu_reader=EndMenuReader(),
                       playcall=PlayCallDetector(), gate=PauseCapableGate())
 

@@ -492,8 +492,8 @@ class ScoreClockLock:
     def offer(self, read, *, clock_ns: int):
         from types import SimpleNamespace
         from qor_receipt._vendor.qoresence.sync.digit_integrity import implausible_transition_reason
-        from qor_receipt._vendor.qoresence.vision.local_scorebug.agreement import AgreementConfig
-        cfg = AgreementConfig()
+        from qorcap_score_grammar import lock_agreement_config
+        cfg = lock_agreement_config()
         pair = getattr(read, "pair", None)
         if pair is None:
             self.samples, self.key = [], None
@@ -1157,6 +1157,7 @@ class ReaderCore:
             print(f"scorebug reader error: {type(e).__name__}: {e}", file=sys.stderr)
             return
         self._note_reanchor(t_ms, fr)
+        fr = self._strip_inferred_quarter(fr)
         fr = self._hold_quarter(fr, t_ms)
         absent = (not fr.ok) and fr.reason in NOT_VISIBLE
         self._observe(t_ms, img, absent)
@@ -1430,23 +1431,46 @@ class ReaderCore:
         detail = getattr(fr, "detail", None) or {}
         grammar = detail.get("grammar_reanchor") is True
         clock = detail.get("clock_reanchor") is True
-        if not grammar and not clock:
+        rule = detail.get("clock_rule")
+        inferred = detail.get("quarter_inferred") is True
+        if not grammar and not clock and not rule and not inferred:
             return
         row = {
             "t_ms": int(t_ms),
             "away": getattr(fr, "left_score", None),
             "home": getattr(fr, "right_score", None),
         }
+        # An inferred quarter is not an observed quarter. It stays out of this key.
         quarter = getattr(fr, "quarter", None)
-        if quarter is not None:
+        if quarter is not None and not inferred:
             row["quarter"] = quarter
         if grammar:
             row["grammar_reanchor"] = True
         if clock:
             row["clock_reanchor"] = True
+            kind = detail.get("clock_reanchor_kind")
+            if kind:
+                row["clock_reanchor_kind"] = kind
+        if rule:
+            row["clock_rule"] = rule
+        if inferred:
+            row["quarter_inferred"] = True
+            row["inferred_quarter"] = detail.get("inferred_quarter")
         note = getattr(self, "reanchor_note", None)
         if note is not None:
             note(row)
+
+    def _strip_inferred_quarter(self, fr):
+        """A carried quarter must not enter the agreement window or a lock."""
+        detail = getattr(fr, "detail", None) or {}
+        if not detail.get("quarter_inferred") or getattr(fr, "quarter", None) is None:
+            return fr
+        try:
+            from dataclasses import replace
+            return replace(fr, quarter=None)
+        except TypeError:
+            fr.quarter = None
+            return fr
 
     def _post_agreed(self, t_ms: int, read, soft: bool, *, touchdown_hold: bool = False) -> None:
         from types import SimpleNamespace
@@ -1460,8 +1484,9 @@ class ReaderCore:
         elif not soft:
             self.score_lock.remember(getattr(res.read, "pair", None), t_ms * 1_000_000)
         self.stats["agreed"] += 1
+        from qorcap_clock import posted_quarter
         rd = {"t_ms": t_ms, "away": res.read.left_score, "home": res.read.right_score,  # Madden: AWAY on the LEFT
-              "quarter": res.read.quarter, "clock_s": res.read.clock_seconds,
+              "quarter": posted_quarter(res.read), "clock_s": res.read.clock_seconds,
               "clock_red": bool(getattr(res.read, "clock_red", False))}
         prev = next((r for r in reversed(self.timeline) if "obs" not in r), None)
         key = lambda r: (r["home"], r["away"], r["quarter"], r["clock_s"])  # noqa: E731
@@ -2209,7 +2234,8 @@ def main(argv=None) -> int:
     from qorcap_endmenu import EndMenuReader
     from qorcap_mnp import AutoProfileReader
     from qorcap_standard import standard_reader
-    core = ReaderCore(lambda b: http_post(a.qorcap, b), AutoProfileReader(standard_reader(), prep=prep), AgreementWindow(),
+    from qorcap_score_grammar import lock_agreement_config
+    core = ReaderCore(lambda b: http_post(a.qorcap, b), AutoProfileReader(standard_reader(), prep=prep), AgreementWindow(lock_agreement_config()),
                       PauseDetector(), detect_final,
                       final_screen_detector=madden_final_screen, end_menu_reader=EndMenuReader())
     last, period, t_print = None, 1.0 / a.hz, time.monotonic()
