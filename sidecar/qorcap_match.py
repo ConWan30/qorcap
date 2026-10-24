@@ -332,7 +332,7 @@ def build_receipt(draft: dict, cps: list[dict], device, referee, *, match_id: st
 
 
 # ------------------------------------------------------------------ scorebug sources
-def start_reader(api: Api, stop: threading.Event, state: dict, bundle: Path | None = None) -> threading.Thread:
+def start_reader(api: Api, stop: threading.Event, state: dict, bundle: Path | None = None, clock=None) -> threading.Thread:
     import hashlib
 
     import cv2
@@ -430,9 +430,14 @@ def start_reader(api: Api, stop: threading.Event, state: dict, bundle: Path | No
                 state["options_error"] = f"{type(e).__name__}: {e}"
         state["refresh_ms"] = (time.perf_counter() - t0) * 1000.0
 
+    # Private to this refresh thread. Cleanup must not set the match-wide stop: that is
+    # what ENTER/Q and the official live heartbeat wait on, including after the final.
+    refresh_stop = threading.Event()
+    wait = clock if clock is not None else (lambda ev, seconds: ev.wait(seconds))
+
     def refresh_worker():
         # The first refresh already ran on the starter thread. Later ones stay off the frame thread.
-        while not stop.wait(REFRESH_PERIOD_S):
+        while not wait(refresh_stop, REFRESH_PERIOD_S):
             refresh()
 
     def loop():
@@ -481,8 +486,9 @@ def start_reader(api: Api, stop: threading.Event, state: dict, bundle: Path | No
                     return
         finally:
             # tail_final_check reuses this process's bundle tail. Wait until the refresh
-            # thread has left it, but don't hang shutdown on a stuck read.
-            stop.set()
+            # thread has left it, but don't hang shutdown on a stuck read. refresh_stop
+            # is not the match stop, so a crash here leaves ENTER/Q and the heartbeat up.
+            refresh_stop.set()
             refresh_thread.join(timeout=5.0)
 
     refresh()

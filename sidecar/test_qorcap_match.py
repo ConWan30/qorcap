@@ -974,17 +974,80 @@ def test_tail_reparse_when_the_window_before_the_offset_changes(tmp_path):
     check()
 
 
+class _Clock:
+    """Stand-in for the refresh wait. ``advance`` moves its time; wall time does not."""
+
+    def __init__(self):
+        self._cv = threading.Condition()
+        self.t = 0.0
+        self.waiting = threading.Event()
+
+    def __call__(self, ev, seconds):
+        with self._cv:
+            deadline = self.t + float(seconds)
+            self.waiting.set()
+            while self.t < deadline and not ev.is_set():
+                self._cv.wait(timeout=1.0)
+            return bool(ev.is_set())
+
+    def advance(self, dt):
+        with self._cv:
+            self.t += float(dt)
+            self._cv.notify_all()
+
+
+class _Body:
+    def __init__(self, data):
+        self._d = data
+
+    def read(self):
+        return self._d
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+def _still_jpeg() -> bytes:
+    import cv2
+    import numpy as np
+
+    ok, buf = cv2.imencode(".jpg", np.zeros((8, 8, 3), np.uint8))
+    assert ok
+    return bytes(buf)
+
+
+def _arm_enter(monkeypatch):
+    """Make the next ENTER/Q visible to key_watcher, on Windows or POSIX."""
+    ready = threading.Event()
+    if qm.WIN:
+        import msvcrt
+        monkeypatch.setattr(msvcrt, "kbhit", lambda: ready.is_set())
+        monkeypatch.setattr(msvcrt, "getwch", lambda: "\r")
+    else:
+        import select
+        monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+        monkeypatch.setattr(sys.stdin, "readline", lambda: "\n")
+
+        def fake_select(rlist, wlist, xlist, timeout=None):
+            if ready.wait(0.2 if timeout is None else timeout):
+                return list(rlist)
+            return []
+
+        monkeypatch.setattr(select, "select", fake_select)
+    return ready
+
+
 def test_options_press_is_known_before_end_menu_can_lock(tmp_path, monkeypatch):
     """An OPTIONS press appended just after a refresh is visible before an end menu can lock.
 
     EndMenuAgreement commits on 3 frames. At 4 Hz a menu that appears just after a frame
     is locked by the third following frame, 3 periods later (0.75 s). A 2 s refresh
-    period misses that. 0.5 s does not.
+    period misses that. 0.5 s does not. The refresh wait uses an injected clock.
     """
     import urllib.request
-
-    import cv2
-    import numpy as np
 
     import qorcap_reader
     from qorcap_endmenu import EndMenuAgreement
@@ -995,24 +1058,8 @@ def test_options_press_is_known_before_end_menu_can_lock(tmp_path, monkeypatch):
     assert qm.REFRESH_PERIOD_S < lock_s, qm.REFRESH_PERIOD_S
 
     monkeypatch.setattr(qorcap_reader.ReaderCore, "on_frame", lambda *a, **k: None)
-    ok, buf = cv2.imencode(".jpg", np.zeros((8, 8, 3), np.uint8))
-    assert ok
-    jpeg = bytes(buf)
-
-    class _Resp:
-        def __init__(self, data):
-            self._d = data
-
-        def read(self):
-            return self._d
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *a):
-            return False
-
-    monkeypatch.setattr(urllib.request, "urlopen", lambda url, timeout=3: _Resp(jpeg))
+    jpeg = _still_jpeg()
+    monkeypatch.setattr(urllib.request, "urlopen", lambda url, timeout=3: _Body(jpeg))
     monkeypatch.setattr(qm.Api, "get", lambda self, path, timeout=3: {})
 
     bundle = tmp_path / "m"
@@ -1021,19 +1068,131 @@ def test_options_press_is_known_before_end_menu_can_lock(tmp_path, monkeypatch):
     inputs.write_text('{"type":"header","wall_anchor_ms":1000}\n', encoding="utf-8")
     stop = threading.Event()
     state = {}
-    thread = qm.start_reader(qm.Api(8792), stop, state, bundle=bundle)
+    clock = _Clock()
+    thread = qm.start_reader(qm.Api(8792), stop, state, bundle=bundle, clock=clock)
+    assert clock.waiting.wait(2)
     # The synchronous refresh has already consumed the header. The worker is in its wait.
     with open(inputs, "ab") as fh:
         fh.write(b'{"type":"in","b":512,"t_ms":2500}\n')
-    deadline = time.monotonic() + lock_s
+    clock.advance(lock_s)
+    deadline = time.monotonic() + 2
     seen = False
     while time.monotonic() < deadline:
         if 2500 in state["core"]._options_snapshot():
             seen = True
             break
-        time.sleep(0.02)
+        time.sleep(0.01)
     stop.set()
     thread.join(timeout=5)
     assert seen, qm.REFRESH_PERIOD_S
     alive = [th.name for th in threading.enumerate() if th.name == "qorcap-refresh" and th.is_alive()]
     assert alive == []
+
+
+@pytest.mark.filterwarnings("ignore::pytest.PytestUnhandledThreadExceptionWarning")
+def test_reader_crash_leaves_enter_and_the_heartbeat_running(monkeypatch):
+    """A raise in the frame loop must not set the match stop.
+
+    ENTER still records user_stop, and the official live heartbeat keeps stepping.
+    """
+    import urllib.request
+
+    import cv2
+
+    import qorcap_reader
+    from qorcap_submit import start_official_live
+
+    monkeypatch.setattr(qorcap_reader.ReaderCore, "on_frame", lambda *a, **k: None)
+    jpeg = _still_jpeg()
+    monkeypatch.setattr(urllib.request, "urlopen", lambda url, timeout=3: _Body(jpeg))
+    monkeypatch.setattr(qm.Api, "get", lambda self, path, timeout=3: {})
+
+    def _boom(*_a, **_k):
+        raise RuntimeError("forced")
+
+    monkeypatch.setattr(cv2, "imdecode", _boom)
+    ready = _arm_enter(monkeypatch)
+
+    class _Live:
+        def __init__(self):
+            self.failures = 0
+            self.steps = 0
+
+        def step(self):
+            self.steps += 1
+
+    stop = threading.Event()
+    state = {}
+    live = _Live()
+    thread = qm.start_reader(qm.Api(8793), stop, state, bundle=None)
+    qm.key_watcher(stop, state)
+    live_thread = start_official_live(live, stop, interval=0.05)
+    thread.join(timeout=3)
+    assert not thread.is_alive()
+    assert not stop.is_set()
+    base = live.steps
+    grew = time.monotonic() + 1
+    while time.monotonic() < grew and live.steps <= base:
+        time.sleep(0.02)
+    assert live.steps > base
+    ready.set()
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline and not state.get("user_stop"):
+        time.sleep(0.02)
+    assert state.get("user_stop") is True
+    assert not stop.is_set()
+    base = live.steps
+    grew = time.monotonic() + 1
+    while time.monotonic() < grew and live.steps <= base:
+        time.sleep(0.02)
+    assert live.steps > base
+    stop.set()
+    live_thread.join(timeout=2)
+    assert not live_thread.is_alive()
+
+
+def test_refresh_thread_is_joined_before_the_reader_returns(monkeypatch):
+    """Shutdown waits on the refresh thread. Dropping the join lets the reader return early.
+
+    A bare 'not alive after stop' check misses that: the refresh wait wakes on its own
+    stop and the daemon exits. This holds the second refresh and requires the reader
+    to still be in join.
+    """
+    import urllib.request
+
+    import qorcap_reader
+
+    monkeypatch.setattr(qorcap_reader.ReaderCore, "on_frame", lambda *a, **k: None)
+    jpeg = _still_jpeg()
+    monkeypatch.setattr(urllib.request, "urlopen", lambda url, timeout=3: _Body(jpeg))
+    entered = threading.Event()
+    hold = threading.Event()
+    calls = {"n": 0}
+
+    def get(self, path, timeout=3):
+        calls["n"] += 1
+        if calls["n"] >= 2:
+            entered.set()
+            hold.wait()
+        return {}
+
+    monkeypatch.setattr(qm.Api, "get", get)
+    stop = threading.Event()
+    state = {}
+    thread = qm.start_reader(qm.Api(8794), stop, state, bundle=None)
+    try:
+        assert entered.wait(2.0), calls["n"]
+        stop.set()
+        time.sleep(0.6)
+        assert thread.is_alive()
+        assert any(th.name == "qorcap-refresh" and th.is_alive() for th in threading.enumerate())
+    finally:
+        hold.set()
+    thread.join(timeout=2)
+    assert not thread.is_alive()
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline and any(
+        th.name == "qorcap-refresh" and th.is_alive() for th in threading.enumerate()
+    ):
+        time.sleep(0.02)
+    assert not any(th.name == "qorcap-refresh" and th.is_alive() for th in threading.enumerate())

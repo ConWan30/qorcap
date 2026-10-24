@@ -71,7 +71,15 @@ UNAGREED_MS = 10_000
 # end-menu lock uses, and it is still well under a second at 4 Hz.
 HEALTH_CLEAR_FRAMES = 3
 # One console warning per open span, and never again inside this window of frame time.
+# A closed span is held and merged with the next span of the same kind that starts
+# inside this window, so reader_health.jsonl gets at most one row per kind per 30 s.
 HEALTH_WARN_MS = 30_000
+
+
+def _seconds_text(ms: float) -> str:
+    """Frame gap as seconds. 2001 ms is '2.001'; 2100 ms is '2.1'."""
+    text = f"{float(ms) / 1000.0:.3f}"
+    return text.rstrip("0").rstrip(".") if "." in text else text
 
 
 class PeriodTrack:
@@ -512,31 +520,46 @@ def prep(img):
     return cv2.resize(img, READER_SIZE, interpolation=cv2.INTER_AREA)
 
 
+_fold_skip_logged = False
+
+
+def _skip_fold_row(exc: BaseException) -> None:
+    """One line for a bad inputs row. The rest of the batch is still folded."""
+    global _fold_skip_logged
+    if _fold_skip_logged:
+        return
+    _fold_skip_logged = True
+    print(f"inputs fold skipped a row: {type(exc).__name__}: {exc}", file=sys.stderr)
+
+
 def _fold_options(records, presses: list[int], prev: bool, anchor):
     """Fold ``records`` into an OPTIONS rising-edge list. ``presses`` is updated in place."""
     for r in records:
-        if not isinstance(r, dict):
-            continue
-        if r.get("type") == "header":
-            w = r.get("wall_anchor_ms")
-            if anchor is None and isinstance(w, int) and not isinstance(w, bool):
-                anchor = w
-            continue
-        if r.get("type") != "in":
-            continue
-        b = r.get("b")
-        if isinstance(b, bool) or not isinstance(b, int):
-            prev = False
-            continue
-        down = bool(b & OPTIONS_BIT)
-        if down and not prev:
-            t_ms = r.get("t_ms")
-            t_us = r.get("t_us")
-            if isinstance(t_ms, int) and not isinstance(t_ms, bool):
-                presses.append(t_ms)
-            elif anchor is not None and isinstance(t_us, int) and not isinstance(t_us, bool):
-                presses.append(int(anchor + t_us // 1000))
-        prev = down
+        try:
+            if not isinstance(r, dict):
+                continue
+            if r.get("type") == "header":
+                w = r.get("wall_anchor_ms")
+                if anchor is None and isinstance(w, int) and not isinstance(w, bool):
+                    anchor = w
+                continue
+            if r.get("type") != "in":
+                continue
+            b = r.get("b")
+            if isinstance(b, bool) or not isinstance(b, int):
+                prev = False
+                continue
+            down = bool(b & OPTIONS_BIT)
+            if down and not prev:
+                t_ms = r.get("t_ms")
+                t_us = r.get("t_us")
+                if isinstance(t_ms, int) and not isinstance(t_ms, bool):
+                    presses.append(t_ms)
+                elif anchor is not None and isinstance(t_us, int) and not isinstance(t_us, bool):
+                    presses.append(int(anchor + t_us // 1000))
+            prev = down
+        except Exception as e:
+            _skip_fold_row(e)
     return presses, prev, anchor
 
 
@@ -544,19 +567,22 @@ def _fold_activity(records) -> list[dict]:
     """Input rows that ``collect_delta_corroboration`` would emit, in the same order."""
     out: list[dict] = []
     for r in records or []:
-        if not isinstance(r, dict) or r.get("type") not in ("in", "press", "buttons"):
-            continue
-        t_ms = r.get("t_ms")
-        if t_ms is None and r.get("t_us") is not None:
-            t_ms = int(r["t_us"]) // 1000
-        if t_ms is None:
-            continue
-        buttons = r.get("buttons") if r.get("buttons") is not None else r.get("b")
-        if buttons is None:
-            buttons = r.get("pressed") or r.get("pad")
-        if buttons in (None, 0, [], {}, ""):
-            continue
-        out.append({"kind": "input_activity", "t_ms": int(t_ms)})
+        try:
+            if not isinstance(r, dict) or r.get("type") not in ("in", "press", "buttons"):
+                continue
+            t_ms = r.get("t_ms")
+            if t_ms is None and r.get("t_us") is not None:
+                t_ms = int(r["t_us"]) // 1000
+            if t_ms is None:
+                continue
+            buttons = r.get("buttons") if r.get("buttons") is not None else r.get("b")
+            if buttons is None:
+                buttons = r.get("pressed") or r.get("pad")
+            if buttons in (None, 0, [], {}, ""):
+                continue
+            out.append({"kind": "input_activity", "t_ms": int(t_ms)})
+        except Exception as e:
+            _skip_fold_row(e)
     return out
 
 
@@ -894,6 +920,8 @@ class ReaderCore:
         self._warn_ms: dict[str, int] = {}
         self.health: list[dict] = []
         self.health_write = None
+        # Closed spans waiting out the 30 s row window. Not yet in ``health``.
+        self._health_pending: dict[str, dict] = {}
 
     def note_options(self, presses_ms) -> None:
         """Remember OPTIONS press times (wall ms). Repeating a time is a no-op."""
@@ -1069,6 +1097,7 @@ class ReaderCore:
 
     def _note_frame_time(self, t_ms: int) -> None:
         """Open a reader_lag span when this frame is too far from the previous one to agree."""
+        self._flush_due_health(t_ms)
         prev = self._last_frame_ms
         self._last_frame_ms = t_ms
         if prev is None:
@@ -1080,7 +1109,10 @@ class ReaderCore:
             opening = self._lag is None
             self._lag = self._health_span(self._lag, "reader_lag", True, t_ms, max_gap_ms=gap)
             if opening:
-                self._warn_health("reader_lag", t_ms, f"Score reader behind: frames {gap / 1000:.1f} s apart; scores held")
+                self._warn_health(
+                    "reader_lag", t_ms,
+                    f"Score reader behind: frames {_seconds_text(gap)} s apart; scores held",
+                )
             return
         if self._lag is None:
             return
@@ -1120,8 +1152,11 @@ class ReaderCore:
         if self._unagreed is not None:
             self._unagreed["reasons"] = dict(self._unagreed_reasons)
         if opening:
-            held = (t_ms - self._unagreed_since) / 1000.0
-            self._warn_health("score_unagreed", t_ms, f"Score visible but not agreed for {held:.1f} s; scores held")
+            held_ms = t_ms - self._unagreed_since
+            self._warn_health(
+                "score_unagreed", t_ms,
+                f"Score visible but not agreed for {_seconds_text(held_ms)} s; scores held",
+            )
 
     def _health_span(self, cur, name, on, t_ms, max_gap_ms=None):
         """Same shape as a timeline span. Closed spans are diagnostics, not /events posts."""
@@ -1138,9 +1173,39 @@ class ReaderCore:
         return cur
 
     def _commit_health(self, span: dict) -> None:
+        """Hold a closed span. The next one of the same kind inside 30 s merges into it."""
         row = dict(span)
         if "reasons" in span:
             row["reasons"] = dict(span["reasons"])
+        row["count"] = 1
+        kind = str(row.get("obs") or "")
+        pending = self._health_pending.get(kind)
+        if pending is not None and int(row.get("t_ms") or 0) <= int(pending.get("until_ms") or 0) + HEALTH_WARN_MS:
+            pending["count"] = int(pending.get("count") or 1) + 1
+            pending["n"] = int(pending.get("n") or 0) + int(row.get("n") or 0)
+            pending["until_ms"] = max(int(pending.get("until_ms") or 0), int(row.get("until_ms") or 0))
+            if "max_gap_ms" in row:
+                pending["max_gap_ms"] = max(int(pending.get("max_gap_ms") or 0), int(row["max_gap_ms"]))
+            if row.get("reasons"):
+                reasons = dict(pending.get("reasons") or {})
+                for key, n in row["reasons"].items():
+                    reasons[key] = int(reasons.get(key) or 0) + int(n)
+                pending["reasons"] = reasons
+            return
+        if pending is not None:
+            self._emit_health(kind)
+        self._health_pending[kind] = row
+
+    def _flush_due_health(self, t_ms: int) -> None:
+        """Write a held row once frame time is 30 s past the span it covers."""
+        for kind, row in list(self._health_pending.items()):
+            if t_ms >= int(row.get("until_ms") or 0) + HEALTH_WARN_MS:
+                self._emit_health(kind)
+
+    def _emit_health(self, kind: str) -> None:
+        row = self._health_pending.pop(kind, None)
+        if row is None:
+            return
         self.health.append(row)
         write = self.health_write
         if write is None:
@@ -1151,19 +1216,16 @@ class ReaderCore:
             print(f"reader health write failed: {type(e).__name__}: {e}", file=sys.stderr)
 
     def health_observations(self) -> list[dict]:
-        """Closed diagnostics plus a span that is still open. Never a score."""
+        """Written rows, a span held for the 30 s window, and a span still open. Never a score."""
         out = []
-        for row in self.health:
+        seen = list(self.health) + list(self._health_pending.values())
+        for span in (self._lag, self._unagreed):
+            if span is not None:
+                seen.append(span)
+        for row in seen:
             item = dict(row)
             if "reasons" in row:
                 item["reasons"] = dict(row["reasons"])
-            out.append(item)
-        for span in (self._lag, self._unagreed):
-            if span is None:
-                continue
-            item = dict(span)
-            if "reasons" in span:
-                item["reasons"] = dict(span["reasons"])
             out.append(item)
         return out
 
