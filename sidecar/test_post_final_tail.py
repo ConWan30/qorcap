@@ -776,6 +776,72 @@ def test_live_call_passes_the_earliest_end_screen_match(monkeypatch):
     assert core.final["final_confirmed"] is False
 
 
+class _Agree:
+    def offer(self, fr, **_):
+        return _Fin(agreed=bool(getattr(fr, "ok", False)), read=fr if getattr(fr, "ok", False) else None)
+
+
+class _Scorebug:
+    """One agreed scorebug read. ``left`` is away, ``right`` is home."""
+
+    def __init__(self, away, home, quarter, clock_s, clock_red=False):
+        self.away, self.home, self.quarter = away, home, quarter
+        self.clock_s, self.clock_red = clock_s, clock_red
+
+    def read(self, _img):
+        return _Fin(ok=True, reason="ok", left_score=self.away, right_score=self.home,
+                    quarter=self.quarter, clock_seconds=self.clock_s, clock_red=self.clock_red,
+                    pair=(self.away, self.home))
+
+
+def _feed_flash_then_scorebug_then_menu(input_t):
+    """Pause-like end-screen flash, then real scorebug reads, then the real end menu."""
+    menu_reader = _LateDigits(10, 16, ready_at=20_000)
+    posts = []
+    core = ReaderCore(posts.append, _Scorebug(10, 10, 4, 0, True), _Agree(), None, _detect_final,
+                      final_screen_detector=madden_final_screen, end_menu_reader=menu_reader,
+                      end_menu_agree=EndMenuAgreement())
+    core.timeline = [{"t_ms": 1_000, "home": 10, "away": 10, "quarter": 4, "clock_s": 30, "clock_red": False}]
+    core.delta_corroboration = [{"kind": "input_activity", "t_ms": input_t}]
+    menu, blank = _menu(), _blank()
+    for t in (2_000, 2_500, 3_000):
+        menu_reader.t = t
+        core.on_frame(t, menu)
+    assert core._end_screen_earliest == 2_000
+    assert not any(isinstance(r, dict) and r.get("obs") == "final_screen" for r in core.timeline)
+    for t in (8_000, 9_000, 10_000):
+        menu_reader.t = t
+        core.on_frame(t, blank)
+    scores = [p for p in posts if p.get("type") == "score"]
+    assert scores and scores[-1]["clock_s"] == 0 and (scores[-1]["away"], scores[-1]["home"]) == (10, 10)
+    assert core._end_screen_earliest is None
+    for t, img in _menu_frames(20_000, 22_000):
+        menu_reader.t = t
+        core.on_frame(t, img)
+    return core
+
+
+def test_scorebug_return_clears_the_earliest_end_screen_match():
+    """A pause-like flash does not keep the cutoff once a real scorebug read comes back.
+
+    Input at 12 s, after that flash and before the real menu, still confirms the one-step
+    walk-off. Input after the real end screen does not. Deleting the clear in
+    ``_post_agreed`` leaves the flash time in place, so the 12 s input no longer confirms.
+    """
+    back = _feed_flash_then_scorebug_then_menu(12_000)
+    assert back.final["basis"] == "end_menu"
+    assert (back.final["away"], back.final["home"]) == (10, 16)
+    assert back.final["final_confirmed"] is True
+    assert back.final["delta_corroboration"]["kind"] == "input_activity"
+    assert back.final["delta_corroboration"]["t_ms"] == 12_000
+
+    after = _feed_flash_then_scorebug_then_menu(21_000)
+    assert after.final["basis"] == "end_menu"
+    assert (after.final["away"], after.final["home"]) == (10, 16)
+    assert after.final["final_confirmed"] is False
+    assert after.final.get("delta_corroboration") is None
+
+
 def test_offline_finalize_does_not_upgrade_a_disputed_end_menu():
     """The first end-menu event is confirmed. The dispute post is later. Finalize signs the dispute.
 
