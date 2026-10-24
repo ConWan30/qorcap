@@ -163,3 +163,16 @@ def harvested_vectors(role: str, *, profile: str | None = None, path: Path | Non
 
 def has_role(role: str, *, profile: str | None = None) -> bool:
     return bool(harvested_vectors(role, profile=profile))
+
+
+_DIGITS = frozenset("0123456789")
+
+
+def digits_complete(role: str, *, profile: str | None = None, path: Path | None = None) -> bool:
+    """True when this role has a template for every digit 0-9.
+
+    A partial pack can match the nearest harvested glyph and report a wrong
+    score. The standard reader abstains until the score set is complete, and
+    it does not install a partial clock set.
+    """
+    return _DIGITS <= set(harvested_vectors(role, profile=profile, path=path))

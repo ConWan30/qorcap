@@ -1,18 +1,25 @@
 """CI source check for glyph templates.
 
-Fails when a template file has no provenance row, a sha256 does not match, a
-source match is held out or not allowlisted, a row fails the JSON Schema
-(absolute path, unknown role, extra field), or a held-out id is stored in
-template-pack metadata. ``held_out_sha256.json`` is a blocklist of public
-clips, not a template pack, so it is not scanned for those ids.
+Fails when a tracked template file has no provenance row, a sha256 does not
+match, a source match is held out or not allowlisted, a row fails the JSON
+Schema (absolute path, unknown role, extra field), a provenance label does
+not match its file name, or a held-out id is stored in template-pack metadata.
+``held_out_sha256.json`` is a blocklist of public clips, not a template pack,
+so it is not scanned for those ids.
 
-``.npz`` and ``.npy`` anywhere under ``sidecar/`` (including ``glimpse``) and
-image or array files under ``templates/`` need a provenance row. Fixture
-images and docs screenshots are not templates.
+The scan is ``git ls-files`` (tracked paths only). CI checks QorTime out into
+an untracked ``qortime/`` inside the workspace; that tree is not a QorCap
+template. A tracked path under ``qortime/`` or ``qortime-main/`` fails on its
+own. A tracked symlink under ``templates/`` or ``sidecar/`` fails.
+
+``.npz`` and ``.npy`` anywhere tracked under ``sidecar/`` (including
+``glimpse``) and image or array files under ``templates/`` need a provenance
+row. Fixture images and docs screenshots are not templates.
 """
 from __future__ import annotations
 
 import json
+import subprocess
 import sys
 from pathlib import Path
 
@@ -21,7 +28,9 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "sidecar"))
+sys.path.insert(0, str(ROOT / "tools"))
 
+from harvest_templates import glyph_name_matches  # noqa: E402
 from qorcap_template_guard import sha256_file  # noqa: E402
 
 PROV = ROOT / "templates" / "provenance.json"
@@ -37,10 +46,6 @@ SKIP_PREFIXES = (
     ("docs", "assets"),
     ("docs", "qa"),
 )
-# CI clones the QorTime pin into the workspace as qortime/. Its stock
-# madden27_standard_v1.npz is not a QorCap template. qortime-main is the
-# unpinned contracts checkout. Neither tree is part of this repo.
-SKIP_TOP = {"qortime", "qortime-main", ".git"}
 ARRAY_EXTS = {".npz", ".npy"}
 IMAGE_EXTS = {".png", ".jpg", ".jpeg"}
 SKIP_JSON = {"held_out_sha256.json"}
@@ -51,14 +56,14 @@ def _ids(path: Path) -> set[str]:
 
 
 def is_scanned_template(rel: Path) -> bool:
-    """True when a repo-relative path must have a provenance row.
+    """True when a tracked repo-relative path must have a provenance row.
 
-    The CI job checks the QorTime pin out into ``qortime/`` (and qortime main
-    into ``qortime-main/``). Those trees are not this repo. A ``.jpg`` under
-    ``templates/`` and an ``.npz`` or ``.npy`` anywhere under ``sidecar/``
-    (including ``glimpse``) still count.
+    A ``.jpg`` under ``templates/`` and an ``.npz`` or ``.npy`` anywhere
+    (including ``sidecar/glimpse`` and a ``qortime/evil.npz`` that someone
+    committed) count. Fixture images and docs screenshots do not. The caller
+    passes tracked paths only, so an untracked CI checkout is not in the list.
     """
-    if not rel.parts or rel.parts[0] in SKIP_TOP:
+    if not rel.parts:
         return False
     suffix = rel.suffix.lower()
     if suffix not in ARRAY_EXTS | IMAGE_EXTS:
@@ -70,13 +75,38 @@ def is_scanned_template(rel: Path) -> bool:
     return rel.parts[:1] == ("templates",) or rel.parts[:2] == ("sidecar", "packs")
 
 
+def tracked_index() -> list[tuple[str, str]]:
+    """``(mode, path)`` from ``git ls-files -z -s``. Untracked files are absent."""
+    proc = subprocess.run(
+        ["git", "ls-files", "-z", "-s"],
+        cwd=ROOT, check=True, capture_output=True,
+    )
+    rows = []
+    for rec in proc.stdout.split(b"\0"):
+        if not rec:
+            continue
+        meta, path = rec.split(b"\t", 1)
+        mode = meta.split(b" ", 1)[0].decode("ascii")
+        rows.append((mode, path.decode("utf-8")))
+    return rows
+
+
+def index_violations(rows: list[tuple[str, str]]) -> list[str]:
+    """Tracked qortime trees, and tracked symlinks under templates/ or sidecar/."""
+    bad = []
+    for mode, path in rows:
+        if path.startswith("qortime/") or path.startswith("qortime-main/"):
+            bad.append(path)
+        if mode == "120000" and (path.startswith("templates/") or path.startswith("sidecar/")):
+            bad.append(f"symlink:{path}")
+    return bad
+
+
 def _template_files() -> list[Path]:
     found = []
-    for path in ROOT.rglob("*"):
-        if not path.is_file():
-            continue
-        rel = path.relative_to(ROOT)
-        if is_scanned_template(rel):
+    for _mode, rel in tracked_index():
+        path = ROOT / rel
+        if is_scanned_template(Path(rel)):
             found.append(path)
     return sorted(found)
 
@@ -132,15 +162,12 @@ def test_allowlist_and_heldout_files_are_exact():
         assert digest == "" or len(digest) == 64 and all(ch in "0123456789abcdef" for ch in digest)
 
 
-def test_scan_ignores_the_ci_qortime_checkout_and_still_flags_sidecar_arrays():
-    stock = Path(
-        "qortime/qor_receipt/_vendor/qoresence/vision/local_scorebug/packs/madden27_standard_v1.npz"
-    )
-    assert not is_scanned_template(stock)
-    assert not is_scanned_template(Path("qortime-main/packs/madden27_standard_v1.npz"))
+def test_scan_flags_sidecar_arrays_and_a_committed_qortime_pack():
     assert is_scanned_template(Path("sidecar/glimpse/leak.npz"))
     assert is_scanned_template(Path("sidecar/glimpse/leak.npy"))
     assert is_scanned_template(Path("sidecar/packs/old.npz"))
+    assert is_scanned_template(Path("qortime/evil.npz"))
+    assert is_scanned_template(Path("qortime-main/evil.npy"))
     assert is_scanned_template(Path("templates/glyph.jpg"))
     assert is_scanned_template(Path("templates/score/1.npy"))
     assert is_scanned_template(Path("sidecar/packs/banner.png"))
@@ -148,6 +175,40 @@ def test_scan_ignores_the_ci_qortime_checkout_and_still_flags_sidecar_arrays():
     assert not is_scanned_template(Path("docs/qa/shot.jpg"))
     assert not is_scanned_template(Path("docs/assets/shot.png"))
     assert not is_scanned_template(Path("README.png"))
+
+
+def test_index_rejects_a_tracked_qortime_tree_and_template_symlinks():
+    assert index_violations(tracked_index()) == []
+    planted = [
+        ("100644", "sidecar/glimpse/leak.npz"),
+        ("100644", "qortime/evil.npz"),
+        ("120000", "templates/score/link.npy"),
+        ("120000", "sidecar/packs/link.npz"),
+        ("120000", "docs/assets/shot.png"),
+    ]
+    assert index_violations(planted) == [
+        "qortime/evil.npz",
+        "symlink:templates/score/link.npy",
+        "symlink:sidecar/packs/link.npz",
+    ]
+    text = (ROOT / ".gitignore").read_text(encoding="utf-8")
+    assert "/qortime/" in text and "/qortime-main/" in text
+
+
+def test_untracked_qortime_pack_is_not_scanned():
+    """CI's ``git init qortime`` checkout is untracked. It must not need a row."""
+    path = ROOT / "qortime" / "evil.npz"
+    path.parent.mkdir(exist_ok=True)
+    np.savez(path, a=np.zeros(1, np.float32))
+    try:
+        rels = {item.relative_to(ROOT).as_posix() for item in _template_files()}
+        assert "qortime/evil.npz" not in rels
+    finally:
+        path.unlink()
+        try:
+            path.parent.rmdir()
+        except OSError:
+            pass
 
 
 def test_every_template_file_is_allowlisted_and_hashed():
@@ -170,6 +231,7 @@ def test_every_template_file_is_allowlisted_and_hashed():
         assert entry["video_sha256"] == src["video_sha256"]
         assert entry["source_match_folder"] == src["folder"]
         assert src["video_sha256"], mid
+        assert glyph_name_matches(entry), entry
         by_file[found.resolve()] = entry
     for path in _template_files():
         assert path.resolve() in by_file, f"no provenance entry for {path.relative_to(ROOT)}"
@@ -177,7 +239,7 @@ def test_every_template_file_is_allowlisted_and_hashed():
 
 def _valid_row() -> dict:
     return {
-        "path": "score/1__score_left__f000000__g0.npy",
+        "path": "score/102332__1__score_left__f000000__g0.npy",
         "sha256": "a" * 64,
         "role": "score",
         "label": "1",
@@ -189,8 +251,9 @@ def _valid_row() -> dict:
         "t_ms": 0,
         "start_frame_index": 0,
         "end_frame_index": 0,
-        "harvest_version": "2",
+        "harvest_version": "3",
         "harvest_date": "2026-10-24T17:31:00Z",
+        "qortime_commit": "0204e6d8082f8c40ea1fe5e09bf16402aaee3ff2",
     }
 
 
@@ -218,6 +281,13 @@ def test_schema_rejects_a_bad_role_an_absolute_path_and_an_extra_field():
     dated = _valid_row()
     dated["harvest_date"] = "2026-10-24"
     reject(dated)
+    assert glyph_name_matches(_valid_row())
+    relabelled = _valid_row()
+    relabelled["label"] = "7"
+    assert not glyph_name_matches(relabelled)
+    wrong_role = _valid_row()
+    wrong_role["role"] = "clock"
+    assert not glyph_name_matches(wrong_role)
 
 
 def test_held_out_ids_are_not_in_template_pack_metadata():

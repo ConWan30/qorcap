@@ -1,6 +1,12 @@
-"""Readers abstain when no allowlisted template is on disk. They do not guess a score."""
+"""Readers abstain when no allowlisted template is on disk. They do not guess a score.
+
+These tests point at an empty provenance file. A later harvest committed into
+``templates/provenance.json`` must not turn a blank frame into ``layout_unknown``.
+"""
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import sys
 from pathlib import Path
@@ -24,7 +30,23 @@ OLD_MODEL = "local_scorebug_v1:madden27-standard-v1:ac836591d618adb8"
 BLANK = np.zeros((360, 640, 3), np.uint8)
 
 
-def test_standard_reader_abstains_and_the_model_id_changed():
+def _empty_provenance(monkeypatch, tmp_path):
+    """The committed file may later hold a harvest. These tests stay on an empty one."""
+    import qorcap_template_guard as guard
+
+    prov = tmp_path / "provenance.json"
+    prov.write_text(json.dumps({
+        "schema": "qorcap-template-provenance/v0",
+        "harvest_script": "tools/harvest_templates.py",
+        "harvest_version": "3",
+        "templates": [],
+    }), encoding="utf-8")
+    monkeypatch.setattr(guard, "PROVENANCE_PATH", prov)
+    return guard
+
+
+def test_standard_reader_abstains_and_the_model_id_changed(monkeypatch, tmp_path):
+    _empty_provenance(monkeypatch, tmp_path)
     reader = standard_reader()
     # Computed from the reader, not a literal, so a rebase onto #81 does not rot the pin.
     expected = reader_model_id(reader.inner, reader.grammar, reader.clocks)
@@ -49,7 +71,8 @@ def test_primetime_and_end_menu_abstain_on_a_synthetic_frame():
     assert end.away is None and end.home is None
 
 
-def test_auto_profile_posts_no_score_when_templates_are_missing():
+def test_auto_profile_posts_no_score_when_templates_are_missing(monkeypatch, tmp_path):
+    _empty_provenance(monkeypatch, tmp_path)
     auto = AutoProfileReader(standard_reader())
     fr = auto.read(np.zeros((720, 1280, 3), np.uint8))
     assert fr.reason == TEMPLATES_MISSING
@@ -83,3 +106,53 @@ def test_reader_core_logs_the_reason_and_posts_no_score(capsys):
                for row in core.timeline)
     assert "home" not in posts[0] and "away" not in posts[0]
     assert TEMPLATES_MISSING_REASON in capsys.readouterr().err
+
+
+def test_relabeling_a_template_changes_the_model_id(monkeypatch, tmp_path):
+    """Same bytes, different role, label, or profile. The id is not a byte hash alone."""
+    import qorcap_template_guard as guard
+
+    npy = tmp_path / "score" / "102332__1__score_left__f000000__g0.npy"
+    npy.parent.mkdir()
+    vec = np.zeros(4, np.float32)
+    vec[0] = 1.0
+    np.save(npy, vec)
+    digest = hashlib.sha256(npy.read_bytes()).hexdigest()
+    sources = tmp_path / "sources.json"
+    sources.write_text(json.dumps({
+        "match_ids": ["102332"],
+        "sources": [{
+            "match_id": "102332",
+            "folder": "match-20261024-102332",
+            "video_sha256": "ab" * 32,
+        }],
+    }), encoding="utf-8")
+    monkeypatch.setattr(guard, "SOURCES_PATH", sources)
+    monkeypatch.setattr(guard, "HELDOUT_PATH", HERE.parent / "templates" / "heldout.json")
+
+    def write(label: str, role: str = "score", profile: str = "standard") -> None:
+        row = {
+            "path": "score/102332__1__score_left__f000000__g0.npy",
+            "sha256": digest,
+            "role": role,
+            "label": label,
+            "profile": profile,
+            "source_match_id": "102332",
+            "source_match_folder": "match-20261024-102332",
+            "video_sha256": "ab" * 32,
+        }
+        path = tmp_path / "provenance.json"
+        path.write_text(json.dumps({"templates": [row]}), encoding="utf-8")
+        monkeypatch.setattr(guard, "PROVENANCE_PATH", path)
+
+    reader = standard_reader()
+    write("1")
+    base = reader_model_id(reader.inner, reader.grammar, reader.clocks)
+    write("7")
+    assert reader_model_id(reader.inner, reader.grammar, reader.clocks) != base
+    write("1", role="clock")
+    assert reader_model_id(reader.inner, reader.grammar, reader.clocks) != base
+    write("1", profile="end_menu")
+    assert reader_model_id(reader.inner, reader.grammar, reader.clocks) != base
+    write("1")
+    assert reader_model_id(reader.inner, reader.grammar, reader.clocks) == base

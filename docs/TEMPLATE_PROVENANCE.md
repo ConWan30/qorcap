@@ -18,8 +18,11 @@ change ships the harvest script, the manifest, and the CI check. It does not
 ship harvested pixels. Until those pixels are committed, the readers abstain.
 They do not guess a score.
 
-`model_id` for the standard reader is a hash of the allowlisted template bytes
-(or an explicit missing marker) and the grammar and clock parameters.
+`model_id` for the standard reader is a hash of each allowlisted template's
+role, label, profile, and bytes (or an explicit missing marker) and the grammar
+and clock parameters. Relabelling a glyph changes the id even when the bytes
+do not. The reader abstains unless score digits 0-9 are all present. A partial
+clock set is not installed, and the stock clock font is not used in its place.
 
 | | id |
 | --- | --- |
@@ -73,7 +76,7 @@ Method is how the vectors were built. Frame index is what the pack still recorde
 
 Fixture images under `sidecar/fixtures/` are not templates. The reader does not load them as glyph packs. They were not deleted. Tests must not harvest templates from held-out matches (`170123`, `021003`, `125430`, `084523`, `193534`) or from the template-source games (`102332`, `111640`). Tests may grade the reader on held-out matches. That is what those matches are for. The evaluation modules skip with `templates_missing` until an allowlisted harvest is installed, and those skip names are listed in `tools/assert_pytest_skips.py` so the skip stays visible. They run again once score templates load.
 
-`sidecar/packs/held_out_sha256.json` is a blocklist of public clip and frame hashes for `170123`, `021003`, and `125430`. It is not a template pack. The harvest script refuses a video whose sha256 is in that table. `084523` and `193534` have no source video in this repo; those ids are refused by path.
+`sidecar/packs/held_out_sha256.json` is a blocklist of public **frame and clip** hashes for `170123`, `021003`, and `125430` (paths under `site/matches/.../events/` and `site/matches/.../clips/`). It does not contain the sha256 of a full match `video.mp4`. A renamed held-out match is refused because the allowlist pins the folder name and the sha256 of that allowlisted match's own `video.mp4`, not because this table knows the held-out match video. The harvest script still refuses a file whose sha256 is in the table. `084523` and `193534` have no source video in this repo; those ids are refused by path.
 
 The Windows zip copies `templates/` next to `sidecar/`. The three JSON files are required install files because the readers open them. With `templates` an empty list, the installed reader abstains the same way the repo does.
 
@@ -89,34 +92,13 @@ That observation is not a score event. It has no `home` or `away`.
 
 ## Harvest the replacements
 
-On the operator PC, from a git checkout of this repo, see `docs/HARVEST_TEMPLATES_WINDOWS.md`. The script is `tools/harvest_templates.py` version `2`. It calls the reader's own glyph segmentation and saves one binarised vector per glyph.
+On the operator PC, from a git checkout of this repo, follow `docs/HARVEST_RUNBOOK.md`. The script is `tools/harvest_templates.py` version `3`. It calls the reader's own glyph segmentation and saves one binarised vector per glyph. The file name carries the match id, the glyph, and the frame (`score/102332__1__score_left__f000012__g0.npy`). QorTime is resolved the same way Start Match resolves it (`--qortime`, `$QORTIME`, then the installed `qortime-<pin>`), and that commit is stored on every provenance row, before the video is hashed.
 
 Sunday, Monday, Thursday, and PSN readers have no harvest regions. After this harvest only the standard bar and the end menu can come back.
 
-1. Pin `video.mp4` before harvesting. An empty `video_sha256` refuses the run, so a renamed held-out folder cannot pass.
+The operator commands, including the pin, the preview, the dry-run, and the merge, are the two PowerShell blocks in `docs/HARVEST_RUNBOOK.md`. A skeleton labels file is `docs/templates/labels.example.json`.
 
-```powershell
-cd "$env:USERPROFILE\src\qorcap"
-$docs = [Environment]::GetFolderPath("MyDocuments")
-Get-FileHash -Algorithm SHA256 "$docs\QorCap Matches\match-20261024-102332\video.mp4"
-```
-
-Put that hash on the `102332` entry in `templates\template_sources.json`. Do the same for `111640`.
-
-2. Game 1, PowerShell. Start Match's venv has numpy and opencv. `--dry-run` lists the crops and writes nothing.
-
-```powershell
-$py = "$env:LOCALAPPDATA\QorCap\venv\Scripts\python.exe"
-New-Item -ItemType Directory -Force "$docs\QorCap Templates" | Out-Null
-& $py tools\harvest_templates.py --match-dir "$docs\QorCap Matches\match-20261024-102332" --labels "$docs\QorCap Templates\labels-102332.json" --out "$docs\QorCap Templates\out-102332"
-```
-
-3. Game 2: the same line with `102332` replaced by `111640` in the match folder, the labels file, and the output folder.
-4. Copy the `.npy` and `.png` files into `templates/`, keeping the relative paths.
-5. Merge each output `provenance.json` `templates` array into `templates/provenance.json`.
-6. Commit those files on this branch. Do not commit the match video. Do not tag or release from this work. Do not merge while `templates` is empty.
-
-A labels item is `role`, `label`, `roi`, `frame_index`, and a range (`start_frame_index`/`end_frame_index`, or `start_t_ms`/`end_t_ms`). `label` is the slot text. A score label `14` is kept only when the reader segments two glyphs, and the saved labels are `1` and `4`. Clock labels are digits, with an optional colon. Quarter labels are `1st`, `2nd`, `3rd`, `4th`, or `ot`. The person running the script chooses the label. The script does not invent one. `harvest_date` is the UTC time of the run. The script refuses a match id outside the allowlist, any held-out id, a video whose sha256 is missing from the allowlist or is in the blocklist, a label the reader would not segment, and an `--out` path inside the match folder. It does not write into the match folder.
+A labels item is `role`, `label`, `roi`, `frame_index`, and a range (`start_frame_index`/`end_frame_index`, or `start_t_ms`/`end_t_ms`). `label` is the slot text. A score label `14` is kept only when the reader segments two glyphs, and the saved labels are `1` and `4`. Two different labels for the same slot and frame are refused. Clock labels are digits, with an optional colon. Quarter labels are `1st`, `2nd`, `3rd`, `4th`, or `ot`. The person running the script chooses the label. The script does not invent one. `harvest_date` is the UTC time of the run. The script refuses a match id outside the allowlist, any held-out id, a video whose sha256 is missing from the allowlist or is in the blocklist, a label the reader would not segment, a non-empty `--out`, and an `--out` path inside the match folder. It does not write into the match folder. Commit the merged templates on this branch. Do not commit the match video. Do not tag or release from this work. Do not merge while `templates` is empty.
 
 ## Tracked debt: numbers fitted on held-out matches
 

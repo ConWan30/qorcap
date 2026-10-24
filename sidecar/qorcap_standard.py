@@ -163,7 +163,9 @@ def reader_model_id(inner, grammar, clocks) -> str:
 
     The vendored stock pack is not this id. Removed packs are not this id. An empty
     provenance file hashes as ``templates:missing``, which is not the previous id.
-    This id is what a receipt should name. It is not a checkpoint-hash input.
+    Each loaded row contributes its role, label, and profile as well as its bytes,
+    so relabelling a file changes the id. This id is what a receipt should name.
+    It is not a checkpoint-hash input.
     """
     from qor_receipt._vendor.qoresence.vision.local_scorebug.reader import READER_ID
     from qorcap_template_guard import authorized_entries
@@ -175,7 +177,14 @@ def reader_model_id(inner, grammar, clocks) -> str:
         h.update(b"templates:missing")
     else:
         for entry, found in rows:
+            h.update(str(entry.get("role") or "").encode())
+            h.update(b"\0")
+            h.update(str(entry.get("label") or "").encode())
+            h.update(b"\0")
+            h.update(str(entry.get("profile") or "").encode())
+            h.update(b"\0")
             h.update(str(entry.get("path")).encode())
+            h.update(b"\0")
             h.update(found.read_bytes())
     gate = inner.profile.clock_gate
     params = {
@@ -227,11 +236,12 @@ class StandardBarReader:
         from qorcap_template_guard import (
             TEMPLATES_MISSING,
             TEMPLATES_MISSING_REASON,
-            has_role,
+            digits_complete,
             log_templates_missing,
         )
 
-        if not has_role("score", profile="standard"):
+        # A partial digit set matches the nearest template and can misread.
+        if not digits_complete("score", profile="standard"):
             log_templates_missing()
             return FrameRead(
                 ok=False,
@@ -326,15 +336,25 @@ class StandardBarReader:
 
 
 def _install_authorized(reader) -> None:
-    """Replace stock digits with harvested per-glyph rows. Retired npz paths are not loaded."""
-    from qorcap_template_guard import harvested_vectors, has_role
+    """Replace stock digits with harvested per-glyph rows. Retired npz paths are not loaded.
 
-    if has_role("score", profile="standard"):
-        reader.pack.groups["score"] = harvested_vectors("score", profile="standard")
-        for role in ("clock", "quarter"):
-            got = harvested_vectors(role, profile="standard")
-            if got:
-                reader.pack.groups[role] = got
+    Score rows are installed only when digits 0-9 are all present; otherwise
+    ``read`` abstains and the stock score pack stays unused. A partial clock
+    set is not installed, and the stock clock font is cleared so it cannot
+    fill the gap. Quarter words are not a ten-digit set.
+    """
+    from qorcap_template_guard import digits_complete, harvested_vectors
+
+    if not digits_complete("score", profile="standard"):
+        return
+    reader.pack.groups["score"] = harvested_vectors("score", profile="standard")
+    if digits_complete("clock", profile="standard"):
+        reader.pack.groups["clock"] = harvested_vectors("clock", profile="standard")
+    else:
+        reader.pack.groups["clock"] = {}
+    quarter = harvested_vectors("quarter", profile="standard")
+    if quarter:
+        reader.pack.groups["quarter"] = quarter
 
 
 def standard_reader():

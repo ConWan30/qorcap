@@ -10,6 +10,7 @@
     "schema": {"const": "qorcap-template-provenance/v0"},
     "harvest_script": {"const": "tools/harvest_templates.py"},
     "harvest_version": {"type": "string", "pattern": "^[0-9]+$"},
+    "qortime_commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
     "templates": {
       "type": "array",
       "items": {"$ref": "#/$defs/template"}
@@ -22,7 +23,7 @@
       "required": [
         "path", "sha256", "role", "label", "profile", "source_match_id",
         "source_match_folder", "video_sha256",
-        "frame_index", "t_ms", "harvest_version", "harvest_date"
+        "frame_index", "t_ms", "harvest_version", "harvest_date", "qortime_commit"
       ],
       "properties": {
         "path": {
@@ -50,7 +51,8 @@
         "harvest_date": {
           "type": "string",
           "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
-        }
+        },
+        "qortime_commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"}
       },
       "anyOf": [
         {"required": ["start_frame_index", "end_frame_index"]},

@@ -14,17 +14,11 @@ under its own digit.
 This is a QorCap-internal tool. It does not write a receipt and it does not
 touch a vendored QorTime contract.
 
-PowerShell (from a git checkout; Start Match's venv has numpy and opencv).
-Game 2 is the same line with ``102332`` replaced by ``111640``::
-
-    cd "$env:USERPROFILE\\src\\qorcap"
-    $docs = [Environment]::GetFolderPath("MyDocuments")
-    $py   = "$env:LOCALAPPDATA\\QorCap\\venv\\Scripts\\python.exe"
-    New-Item -ItemType Directory -Force "$docs\\QorCap Templates" | Out-Null
-    & $py tools\\harvest_templates.py --match-dir "$docs\\QorCap Matches\\match-20261024-102332" --labels "$docs\\QorCap Templates\\labels-102332.json" --out "$docs\\QorCap Templates\\out-102332"
-
-``--dry-run`` lists the frames and crops and writes nothing. ``--windows-doc``
-prints the one-liner and writes nothing.
+PowerShell, one self-contained block per game, is in ``docs/HARVEST_RUNBOOK.md``.
+It defines ``$docs``, ``$py``, and ``QORTIME``, pins the video, and dry-runs
+before it writes. ``--dry-run`` lists the frames and crops and writes nothing.
+``--windows-doc`` prints the game-1 block and writes nothing. A non-empty
+``--out`` is refused.
 """
 from __future__ import annotations
 
@@ -39,7 +33,7 @@ import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
-HARVEST_VERSION = "2"
+HARVEST_VERSION = "3"
 HARVEST_SCRIPT = "tools/harvest_templates.py"
 # Which reader role a ROI belongs to. Banner fragments are not a per-glyph npy:
 # qorcap_banner matches GOA/TOUC masks and does not call harvested_vectors.
@@ -58,12 +52,23 @@ PROFILE_OF = {
     "quarter": "standard",
     "end_menu": "end_menu",
 }
+# Same pin as sidecar/qorcap_match.py QORTIME_PIN. The runbook sets QORTIME to the
+# tree Start Match already installed, so a fresh window does not decode before failing.
+QORTIME_PIN = "0204e6d8082f8c40ea1fe5e09bf16402aaee3ff2"
 POWERSHELL_ONELINER = (
     'cd "$env:USERPROFILE\\src\\qorcap"\n'
     '$docs = [Environment]::GetFolderPath("MyDocuments")\n'
     '$py   = "$env:LOCALAPPDATA\\QorCap\\venv\\Scripts\\python.exe"\n'
+    f'$env:QORTIME = "$env:LOCALAPPDATA\\QorCap\\qortime-{QORTIME_PIN}"\n'
     'New-Item -ItemType Directory -Force "$docs\\QorCap Templates" | Out-Null\n'
-    '& $py tools\\harvest_templates.py --match-dir "$docs\\QorCap Matches\\match-20261024-102332" '
+    '& $py tools\\pin_template_source.py --match-id 102332 '
+    '--video "$docs\\QorCap Matches\\match-20261024-102332\\video.mp4"\n'
+    '& $py tools\\harvest_templates.py --dry-run '
+    '--match-dir "$docs\\QorCap Matches\\match-20261024-102332" '
+    '--labels "$docs\\QorCap Templates\\labels-102332.json" '
+    '--out "$docs\\QorCap Templates\\out-102332"\n'
+    '& $py tools\\harvest_templates.py '
+    '--match-dir "$docs\\QorCap Matches\\match-20261024-102332" '
     '--labels "$docs\\QorCap Templates\\labels-102332.json" '
     '--out "$docs\\QorCap Templates\\out-102332"'
 )
@@ -81,14 +86,15 @@ the match. Game 1 is match-20261024-102332. Game 2 is match-20261024-111640
 templates\\template_sources.json. templates\\heldout.json is refused even if an
 allowlist names one of those ids.
 
-Before the first harvest, pin the video. A folder renamed to an allowlisted
-name is refused unless ``video.mp4`` matches that entry's ``video_sha256``.
-An empty pin refuses the harvest.
+Before the first harvest, pin the video with tools\\pin_template_source.py.
+Get-FileHash prints uppercase hex. The pin tool stores lowercase sha256 and
+refuses an id that is not allowlisted. Do not paste the hash by hand. An empty
+pin refuses the harvest. A folder renamed to an allowlisted name is refused
+unless ``video.mp4`` matches that entry. Set QORTIME (or pass --qortime)
+before the run. The script checks QorTime before it hashes or decodes the video.
 
-    Get-FileHash -Algorithm SHA256 "$docs\\QorCap Matches\\match-20261024-102332\\video.mp4"
-
-Put the hash in templates\\template_sources.json under that match's
-``video_sha256``, then:
+``sidecar\\packs\\held_out_sha256.json`` lists public frame and clip hashes,
+not full match-video hashes. The folder name plus this pin is the guard.
 
 One-liner:
 
@@ -155,7 +161,7 @@ def _load_sources(path: Path) -> list[dict]:
             raise Refuse("refusing: an allowlist source is not an object. no templates written.")
         mid = str(row.get("match_id") or "")
         folder = str(row.get("folder") or "")
-        digest = str(row.get("video_sha256") or "")
+        digest = str(row.get("video_sha256") or "").strip().lower()
         if not re.fullmatch(r"\d{6}", mid) or not _FOLDER.fullmatch(folder):
             raise Refuse(
                 f"refusing allowlist entry match_id={mid!r} folder={folder!r}. no templates written."
@@ -279,14 +285,18 @@ def _slot_text(role: str, label: str) -> str:
 
 def _load_labels(path: Path) -> list[dict]:
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        # utf-8-sig accepts a BOM from Windows Notepad and a plain UTF-8 file.
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
     except (OSError, ValueError) as exc:
-        raise Refuse(f"refusing unreadable labels ({exc}). no templates written.") from exc
+        raise Refuse(
+            f"refusing unreadable labels ({exc}). save labels as UTF-8 JSON. no templates written."
+        ) from exc
     items = data.get("items") if isinstance(data, dict) else None
     if not isinstance(items, list) or not items:
         raise Refuse("refusing: labels file needs a non-empty items list. no templates written.")
     out = []
     seen: set[tuple] = set()
+    slots: dict[tuple, str] = {}
     for raw in items:
         if not isinstance(raw, dict):
             raise Refuse("refusing: a label item is not an object. no templates written.")
@@ -312,6 +322,13 @@ def _load_labels(path: Path) -> list[dict]:
         if key in seen:
             raise Refuse(f"refusing duplicate label {key}. no templates written.")
         seen.add(key)
+        slot = (roi, frame_index)
+        if slot in slots and slots[slot] != label:
+            raise Refuse(
+                f"refusing: {roi} frame {frame_index} is labelled {slots[slot]!r} and {label!r}. "
+                "one label per slot per frame. no templates written."
+            )
+        slots[slot] = label
         out.append({
             "role": role,
             "label": label,
@@ -327,31 +344,61 @@ def _load_labels(path: Path) -> list[dict]:
     return out
 
 
-def _read_frames(video: Path, indices: set[int]) -> dict[int, tuple]:
-    """One sequential decode. ``index -> (640x360 frame, container t_ms)``."""
+def _open_video(video: Path):
+    """One capture. Callers decode with ``read`` in order and never seek."""
     import cv2
 
     cap = cv2.VideoCapture(str(video))
     if not cap.isOpened():
         raise Refuse(f"refusing: cannot read {video.name}. no templates written.")
-    needed = sorted(indices)
-    found: dict[int, tuple] = {}
+    fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+    count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    return cap, fps, count
+
+
+def _measured_msec(cap) -> int:
+    import cv2
+
+    msec = float(cap.get(cv2.CAP_PROP_POS_MSEC))
+    if msec != msec or msec < 0:
+        msec = 0.0
+    return int(round(msec))
+
+
+def iter_decoded(video: Path):
+    """Sequential frames in the harvester's decode order.
+
+    Yields ``(index, 640x360 frame, t_ms, fps, frame_count)``. Preview and
+    harvest both use this so a printed ``frame_index`` is the index harvest cuts.
+    """
+    cap, fps, count = _open_video(video)
     try:
         cursor = 0
-        want = 0
-        while want < len(needed):
+        while True:
             ok, frame = cap.read()
             if not ok or frame is None:
-                raise Refuse(f"refusing: video has no frame {needed[want]}. no templates written.")
-            if cursor == needed[want]:
-                msec = float(cap.get(cv2.CAP_PROP_POS_MSEC))
-                if msec != msec or msec < 0:
-                    msec = 0.0
-                found[cursor] = (_prepare_frame(frame), int(round(msec)))
-                want += 1
+                break
+            yield cursor, _prepare_frame(frame), _measured_msec(cap), fps, count
             cursor += 1
     finally:
         cap.release()
+
+
+def _read_frames(video: Path, indices: set[int]) -> dict[int, tuple]:
+    """One sequential decode. ``index -> (640x360 frame, container t_ms)``."""
+    needed = sorted(indices)
+    found: dict[int, tuple] = {}
+    want = 0
+    for cursor, frame, msec, _fps, _count in iter_decoded(video):
+        if want >= len(needed):
+            break
+        if cursor == needed[want]:
+            found[cursor] = (frame, msec)
+            want += 1
+        elif cursor > needed[want]:
+            break
+    if want < len(needed):
+        raise Refuse(f"refusing: video has no frame {needed[want]}. no templates written.")
     return found
 
 
@@ -363,11 +410,54 @@ def _prepare_frame(frame):
     return frame
 
 
-def _reader_stack():
+def _resolve_qortime(arg: str | None) -> tuple[Path, str]:
+    """The sidecar search, before any video byte is hashed or decoded.
+
+    ``--qortime``, then ``$QORTIME``, then ``<repo>/qortime``, then the tree
+    Start Match installed under ``$QORCAP_HOME`` or ``%LOCALAPPDATA%\\QorCap``
+    (``qortime-<pin>``). This does not download.
+    """
+    root = _repo_root()
+    side = str(root / "sidecar")
+    if side not in sys.path:
+        sys.path.insert(0, side)
+    from qorcap_match import find_qortime
+
+    try:
+        found = find_qortime(arg, download=False)
+    except SystemExit as exc:
+        detail = exc.code if isinstance(exc.code, str) else exc
+        raise Refuse(
+            f"refusing: QorTime was not found ({detail}). "
+            "Pass --qortime, set QORTIME, or install the pinned tree under "
+            "QORCAP_HOME or %LOCALAPPDATA%\\QorCap. no templates written."
+        ) from exc
+    return found, _qortime_commit(found)
+
+
+def _qortime_commit(path: Path) -> str:
+    import subprocess
+
+    if (path / ".git").exists():
+        proc = subprocess.run(
+            ["git", "-C", str(path), "rev-parse", "HEAD"],
+            check=False, capture_output=True, text=True,
+        )
+        rev = (proc.stdout or "").strip().lower()
+        if proc.returncode == 0 and re.fullmatch(r"[0-9a-f]{40}", rev):
+            return rev
+    pinned = path.name[len("qortime-"):] if path.name.startswith("qortime-") else ""
+    if re.fullmatch(r"[0-9a-f]{40}", pinned):
+        return pinned
+    raise Refuse(
+        f"refusing: {path} has no QorTime commit. no templates written."
+    )
+
+
+def _reader_stack(qortime: Path):
     """The reader's own segmenters. Nothing here reimplements ink or components."""
     root = _repo_root()
-    qortime = os.environ.get("QORTIME", "/tmp/qortime")
-    for entry in (str(root / "sidecar"), qortime):
+    for entry in (str(root / "sidecar"), str(qortime)):
         if entry not in sys.path:
             sys.path.insert(0, entry)
     from dataclasses import replace
@@ -528,8 +618,36 @@ def _segment(reader, shift, glyph_size, side_glyphs, norm_vec, hole_signature, h
     return [(text, vec)]
 
 
+_GLYPH_NAME = re.compile(
+    r"^(?P<role>score|clock|quarter|end_menu)/"
+    r"(?P<match>[0-9]{6})__(?P<label>[0-9]|1st|2nd|3rd|4th|ot)__"
+    r"(?P<roi>[a-z0-9_]+)__f(?P<frame>[0-9]{6})__g(?P<index>[0-9]+)\.(?P<ext>npy|png)$"
+)
+
+
+def glyph_name_matches(row: dict) -> bool:
+    """The file name is the role, the match id, the glyph label, and the frame."""
+    match = _GLYPH_NAME.fullmatch(str(row.get("path") or "").replace("\\", "/"))
+    if match is None:
+        return False
+    return (
+        match.group("role") == str(row.get("role") or "")
+        and match.group("label") == str(row.get("label") or "")
+        and match.group("match") == str(row.get("source_match_id") or "")
+        and int(match.group("frame")) == row.get("frame_index")
+    )
+
+
+def _out_occupied(out_dir: Path) -> bool:
+    if not out_dir.exists():
+        return False
+    if not out_dir.is_dir():
+        return True
+    return any(out_dir.iterdir())
+
+
 def _row(name: str, payload: bytes, item: dict, glyph: str, short: str, folder: str,
-         video_hash: str, measured_t_ms: int, harvest_date: str) -> dict:
+         video_hash: str, measured_t_ms: int, harvest_date: str, qortime_commit: str) -> dict:
     row = {
         "path": name.replace("\\", "/"),
         "sha256": hashlib.sha256(payload).hexdigest(),
@@ -543,6 +661,7 @@ def _row(name: str, payload: bytes, item: dict, glyph: str, short: str, folder: 
         "t_ms": measured_t_ms,
         "harvest_version": HARVEST_VERSION,
         "harvest_date": harvest_date,
+        "qortime_commit": qortime_commit,
     }
     if item["start_frame_index"] is not None:
         row["start_frame_index"] = item["start_frame_index"]
@@ -565,8 +684,12 @@ def _preview_wh(reader, glyph_size, end_glyph, role: str) -> tuple[int, int]:
 
 
 def harvest(match_dir: Path, out_dir: Path, labels_path: Path, allow_path: Path, held_path: Path,
-            hash_path: Path, *, dry_run: bool = False, now=None) -> dict:
-    """Segment glyphs and, unless ``dry_run``, write them under ``out_dir`` only."""
+            hash_path: Path, *, dry_run: bool = False, now=None, qortime: str | None = None) -> dict:
+    """Segment glyphs and, unless ``dry_run``, write them under ``out_dir`` only.
+
+    QorTime is resolved before the match video is hashed or decoded.
+    """
+    qortime_path, qortime_commit = _resolve_qortime(qortime)
     match_dir = match_dir.resolve()
     out_dir = out_dir.resolve()
     if not match_dir.is_dir():
@@ -593,6 +716,8 @@ def harvest(match_dir: Path, out_dir: Path, labels_path: Path, allow_path: Path,
         )
     if _inside(out_dir, match_dir) or _inside(match_dir, out_dir):
         raise Refuse("refusing: --out must be outside the match folder. no templates written.")
+    if _out_occupied(out_dir):
+        raise Refuse("refusing: --out is not empty. no templates written.")
     video = match_dir / "video.mp4"
     if not video.is_file():
         raise Refuse("refusing: match folder has no video.mp4. no templates written.")
@@ -626,7 +751,7 @@ def harvest(match_dir: Path, out_dir: Path, labels_path: Path, allow_path: Path,
     frames = _read_frames(video, {item["frame_index"] for item in labels})
     for item in labels:
         _check_range(item, frames[item["frame_index"]][1])
-    stack = _reader_stack()
+    stack = _reader_stack(qortime_path)
     reader, shift, glyph_size, side_glyphs, norm_vec, hole_signature, holes, no_hole, end_glyph = stack
     harvest_date = _harvest_date(now)
     built: list[tuple[str, bytes, dict]] = []
@@ -639,7 +764,7 @@ def harvest(match_dir: Path, out_dir: Path, labels_path: Path, allow_path: Path,
         width, height = _preview_wh(reader, glyph_size, end_glyph, item["role"])
         for index, (glyph, vec) in enumerate(glyphs):
             stem = (
-                f"{item['role']}/{glyph}__{item['roi']}__f{item['frame_index']:06d}__g{index}"
+                f"{item['role']}/{short}__{glyph}__{item['roi']}__f{item['frame_index']:06d}__g{index}"
             )
             npy_name = stem + ".npy"
             png_name = stem + ".png"
@@ -648,6 +773,7 @@ def harvest(match_dir: Path, out_dir: Path, labels_path: Path, allow_path: Path,
             for name, payload in ((npy_name, npy_bytes), (png_name, png_bytes)):
                 built.append((name, payload, _row(
                     name, payload, item, glyph, short, match_dir.name, video_hash, measured, harvest_date,
+                    qortime_commit,
                 )))
     if _snapshot(match_dir) != before:
         raise Refuse("refusing: match folder changed while reading. no templates written.")
@@ -655,6 +781,7 @@ def harvest(match_dir: Path, out_dir: Path, labels_path: Path, allow_path: Path,
         "schema": "qorcap-template-provenance/v0",
         "harvest_script": HARVEST_SCRIPT,
         "harvest_version": HARVEST_VERSION,
+        "qortime_commit": qortime_commit,
         "templates": [row for _name, _payload, row in built],
     }
     if dry_run:
@@ -707,6 +834,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--heldout-sha256", type=Path, default=root / "sidecar" / "packs" / "held_out_sha256.json")
     ap.add_argument("--windows-doc", action="store_true", help="print the PowerShell one-liner and write nothing")
     ap.add_argument("--dry-run", action="store_true", help="list the frames and crops and write nothing")
+    ap.add_argument("--qortime", default=None, help="QorTime checkout (else $QORTIME, then the installed pin)")
     args = ap.parse_args(argv)
     if args.windows_doc:
         print(POWERSHELL_ONELINER)
@@ -718,7 +846,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         doc = harvest(
             args.match_dir, args.out, args.labels, args.allowlist, args.heldout, args.heldout_sha256,
-            dry_run=args.dry_run,
+            dry_run=args.dry_run, qortime=args.qortime,
         )
     except Refuse as exc:
         print(str(exc), file=sys.stderr)

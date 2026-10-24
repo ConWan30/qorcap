@@ -1,0 +1,36 @@
+{
+  "items": [
+    {
+      "role": "score",
+      "label": "0",
+      "roi": "score_left",
+      "frame_index": 1200,
+      "start_frame_index": 1180,
+      "end_frame_index": 1260
+    },
+    {
+      "role": "score",
+      "label": "14",
+      "roi": "score_right",
+      "frame_index": 1200,
+      "start_frame_index": 1180,
+      "end_frame_index": 1260
+    },
+    {
+      "role": "clock",
+      "label": "5:23",
+      "roi": "clock",
+      "frame_index": 1200,
+      "start_t_ms": 40000,
+      "end_t_ms": 42000
+    },
+    {
+      "role": "quarter",
+      "label": "1st",
+      "roi": "quarter",
+      "frame_index": 1200,
+      "start_frame_index": 1180,
+      "end_frame_index": 1260
+    }
+  ]
+}

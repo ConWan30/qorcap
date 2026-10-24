@@ -95,7 +95,21 @@ def test_standard_bar_reads_15_00_and_keeps_the_score_when_the_quarter_fails():
     assert (fr.left_score, fr.right_score, fr.clock_seconds) == (6, 21, 900)
 
 
-def test_standard_bar_reads_23_and_30_and_refuses_the_downs_banner():
+def _empty_provenance(monkeypatch, tmp_path):
+    import json
+    import qorcap_template_guard as guard
+
+    prov = tmp_path / "provenance.json"
+    prov.write_text(json.dumps({
+        "schema": "qorcap-template-provenance/v0",
+        "harvest_script": "tools/harvest_templates.py",
+        "harvest_version": "3",
+        "templates": [],
+    }), encoding="utf-8")
+    monkeypatch.setattr(guard, "PROVENANCE_PATH", prov)
+
+
+def test_standard_bar_reads_23_and_30_and_refuses_the_downs_banner(monkeypatch, tmp_path):
     """110028 "2"/"3" templates were removed: they are not an allowlisted template source.
 
     The reader abstains. It does not report 23-0 or 30-6 from the old pack or from the stock pack.
@@ -103,6 +117,7 @@ def test_standard_bar_reads_23_and_30_and_refuses_the_downs_banner():
     import numpy as np
     from qorcap_template_guard import TEMPLATES_MISSING
 
+    _empty_provenance(monkeypatch, tmp_path)
     aug = standard_reader()
     for frame in (np.zeros((360, 640, 3), np.uint8),):
         hit = aug.read(frame)
@@ -165,12 +180,13 @@ def test_model_id_covers_the_stacked_templates_and_the_grammar_and_clock():
     assert "6" in aug.inner.pack.groups["clock"]
 
 
-def test_downs_banner_is_not_a_field_goal_and_mints_no_score():
+def test_downs_banner_is_not_a_field_goal_and_mints_no_score(monkeypatch, tmp_path):
     """No banner fragment pack is shipped. A blank frame mints no score."""
     import numpy as np
     from qorcap_banner import detect_banner
     from qorcap_template_guard import TEMPLATES_MISSING
 
+    _empty_provenance(monkeypatch, tmp_path)
     r = standard_reader()
     banner = r.read(np.zeros((360, 640, 3), np.uint8))
     assert banner.reason == TEMPLATES_MISSING

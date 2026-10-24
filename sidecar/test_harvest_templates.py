@@ -15,9 +15,10 @@ import numpy as np
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
+os.environ.setdefault("QORTIME", "/tmp/qortime")
 sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT / "sidecar"))
-sys.path.insert(0, os.environ.get("QORTIME", "/tmp/qortime"))
+sys.path.insert(0, os.environ["QORTIME"])
 import harvest_templates as H  # noqa: E402
 from qor_receipt._vendor.qoresence.vision.local_scorebug.reader import ScorebugReader  # noqa: E402
 
@@ -44,7 +45,39 @@ def _bar(logo) -> np.ndarray:
     return frame
 
 
-def _match(tmp: Path, short: str, *, video: bool = True, day: str = "20261024") -> Path:
+def _paint(logo, left: str, right: str, clock: str, *, quarter: str = "1", left_kind: str = "font") -> np.ndarray:
+    """Font digits at the real ROIs. ``ring`` and ``spur`` are hole-safe stand-ins for 0 and 8."""
+    frame = np.zeros((360, 640, 3), np.uint8)
+    frame[341:357, 200:300] = (255, 255, 255)
+    frame[341:356, 428:484] = (12, 12, 12)
+    frame[340:358, 8:80] = cv2.cvtColor(logo, cv2.COLOR_GRAY2BGR)
+    if left_kind == "ring":
+        frame[346:355, 223:232] = (0, 0, 0)
+        frame[348:353, 225:230] = (255, 255, 255)
+    elif left_kind == "spur":
+        frame[346:355, 224:227] = (0, 0, 0)
+        frame[346:348, 227:231] = (0, 0, 0)
+        frame[352:355, 227:231] = (0, 0, 0)
+    else:
+        cv2.putText(frame, left, (224, 355), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 0), 1, cv2.LINE_8)
+    cv2.putText(frame, right, (262, 355), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 0), 1, cv2.LINE_8)
+    cv2.putText(frame, clock, (447, 352), cv2.FONT_HERSHEY_SIMPLEX, 0.3, (240, 240, 240), 1, cv2.LINE_8)
+    cv2.putText(frame, quarter, (430, 353), cv2.FONT_HERSHEY_SIMPLEX, 0.28, (230, 230, 230), 1, cv2.LINE_8)
+    return frame
+
+
+def _digit_frames(logo) -> list[np.ndarray]:
+    """Five bars whose glyphs cover score 0-9 and clock 0-9. Frame 0 is 1 / 7 / 5:23."""
+    return [
+        _paint(logo, "1", "7", "5:23"),
+        _paint(logo, "0", "2", "0:14", left_kind="ring"),
+        _paint(logo, "3", "4", "6:23"),
+        _paint(logo, "5", "6", "8:19"),
+        _paint(logo, "8", "9", "7:23", left_kind="spur"),
+    ]
+
+
+def _match(tmp: Path, short: str, *, video: bool = True, day: str = "20261024", frames=None) -> Path:
     folder = tmp / f"match-{day}-{short}"
     folder.mkdir()
     if video:
@@ -52,8 +85,9 @@ def _match(tmp: Path, short: str, *, video: bool = True, day: str = "20261024") 
             str(folder / "video.mp4"), cv2.VideoWriter_fourcc(*"mp4v"), 30, (640, 360),
         )
         assert writer.isOpened()
-        frame = _bar(_logo())
-        for _ in range(4):
+        if frames is None:
+            frames = [_bar(_logo())] * 4
+        for frame in frames:
             writer.write(frame)
         writer.release()
     (folder / "timeline.jsonl").write_text('{"t_ms": 0}\n', encoding="utf-8")
@@ -266,6 +300,10 @@ def test_allowlisted_synthetic_match_writes_per_glyph_files_outside_and_is_deter
     assert {row["harvest_date"] for row in doc["templates"]} == {"2026-10-24T17:31:00Z"}
     npy_rows = [row for row in doc["templates"] if row["path"].endswith(".npy")]
     assert npy_rows and all("__g0" in row["path"] for row in npy_rows)
+    assert all(row["path"].startswith("score/555001__1__") for row in npy_rows)
+    assert all(H.glyph_name_matches(row) for row in doc["templates"])
+    assert {row["qortime_commit"] for row in doc["templates"]} == {doc["qortime_commit"]}
+    assert len(doc["qortime_commit"]) == 40
     for row in doc["templates"]:
         blob = (first / row["path"]).read_bytes()
         assert H.hashlib.sha256(blob).hexdigest() == row["sha256"]
@@ -277,6 +315,9 @@ def test_allowlisted_synthetic_match_writes_per_glyph_files_outside_and_is_deter
     assert "102332" in H.POWERSHELL_ONELINER and "\\" in H.POWERSHELL_ONELINER
     assert "GetFolderPath" in H.POWERSHELL_ONELINER
     assert "QorCap\\venv" in H.POWERSHELL_ONELINER
+    assert "QORTIME" in H.POWERSHELL_ONELINER and "--dry-run" in H.POWERSHELL_ONELINER
+    from qorcap_match import QORTIME_PIN
+    assert QORTIME_PIN == H.QORTIME_PIN
 
 
 def io_bytes(blob: bytes):
@@ -289,44 +330,253 @@ def test_windows_doc_flag_writes_nothing(tmp_path, capsys):
     assert "102332" in capsys.readouterr().out
 
 
-def test_harvested_templates_round_trip_through_the_reader(tmp_path, monkeypatch):
-    """Synthesize a bar, harvest it, install it, and read the same frame back.
+def _full_labels() -> list[dict]:
+    span = {"start_frame_index": 0, "end_frame_index": 4}
+    return [
+        {"role": "score", "label": "1", "roi": "score_left", "frame_index": 0, **span},
+        {"role": "score", "label": "7", "roi": "score_right", "frame_index": 0, **span},
+        {"role": "clock", "label": "5:23", "roi": "clock", "frame_index": 0, **span},
+        {"role": "quarter", "label": "1st", "roi": "quarter", "frame_index": 0, **span},
+        {"role": "score", "label": "0", "roi": "score_left", "frame_index": 1, **span},
+        {"role": "score", "label": "2", "roi": "score_right", "frame_index": 1, **span},
+        {"role": "clock", "label": "0:14", "roi": "clock", "frame_index": 1, **span},
+        {"role": "score", "label": "3", "roi": "score_left", "frame_index": 2, **span},
+        {"role": "score", "label": "4", "roi": "score_right", "frame_index": 2, **span},
+        {"role": "clock", "label": "6:23", "roi": "clock", "frame_index": 2, **span},
+        {"role": "score", "label": "5", "roi": "score_left", "frame_index": 3, **span},
+        {"role": "score", "label": "6", "roi": "score_right", "frame_index": 3, **span},
+        {"role": "clock", "label": "8:19", "roi": "clock", "frame_index": 3, **span},
+        {"role": "score", "label": "8", "roi": "score_left", "frame_index": 4, **span},
+        {"role": "score", "label": "9", "roi": "score_right", "frame_index": 4, **span},
+        {"role": "clock", "label": "7:23", "roi": "clock", "frame_index": 4, **span},
+    ]
 
-    CI fails when the harvester's vectors are not what the reader matches.
-    """
+
+def _install(monkeypatch, out: Path, allow: Path):
+    import qorcap_template_guard as guard
+    monkeypatch.setattr(guard, "PROVENANCE_PATH", out / "provenance.json")
+    monkeypatch.setattr(guard, "SOURCES_PATH", allow)
+    from qorcap_standard import standard_reader
+    return standard_reader()
+
+
+def test_two_labels_for_one_slot_are_refused(tmp_path):
     folder = _match(tmp_path, "555001")
+    before = _snap(folder)
+    allow = tmp_path / "allow.json"
+    _allow(allow, folder)
     labels = tmp_path / "labels.json"
     _labels(labels, [
-        {"role": "score", "label": "1", "roi": "score_left", "frame_index": 0,
-         "start_frame_index": 0, "end_frame_index": 3},
-        {"role": "score", "label": "7", "roi": "score_right", "frame_index": 0,
-         "start_frame_index": 0, "end_frame_index": 3},
-        {"role": "clock", "label": "5:23", "roi": "clock", "frame_index": 0,
-         "start_frame_index": 0, "end_frame_index": 3},
-        {"role": "quarter", "label": "1st", "roi": "quarter", "frame_index": 0,
-         "start_frame_index": 0, "end_frame_index": 3},
+        {"role": "score", "label": "6", "roi": "score_left", "frame_index": 0,
+         "start_frame_index": 0, "end_frame_index": 0},
+        {"role": "score", "label": "8", "roi": "score_left", "frame_index": 0,
+         "start_frame_index": 0, "end_frame_index": 0},
     ])
+    try:
+        H.harvest(folder, tmp_path / "out", labels, allow, HELD, HASHES, now=NOW)
+    except H.Refuse as exc:
+        assert "6" in str(exc) and "8" in str(exc)
+    else:
+        raise AssertionError("two labels for one slot were harvested")
+    assert not (tmp_path / "out").exists()
+    assert _snap(folder) == before
+
+
+def test_a_nonempty_out_is_refused(tmp_path):
+    folder = _match(tmp_path, "555001")
+    allow = tmp_path / "allow.json"
+    _allow(allow, folder)
+    labels = tmp_path / "labels.json"
+    _labels(labels)
+    out = tmp_path / "out"
+    H.harvest(folder, out, labels, allow, HELD, HASHES, now=NOW)
+    before = _snap(out)
+    try:
+        H.harvest(folder, out, labels, allow, HELD, HASHES, now=NOW)
+    except H.Refuse as exc:
+        assert "not empty" in str(exc)
+    else:
+        raise AssertionError("a second harvest wrote into a nonempty out")
+    assert _snap(out) == before
+
+
+def test_labels_with_a_utf8_bom_are_read(tmp_path):
+    folder = _match(tmp_path, "555001")
+    allow = tmp_path / "allow.json"
+    _allow(allow, folder)
+    labels = tmp_path / "labels.json"
+    body = json.dumps({"items": [{
+        "role": "score", "label": "1", "roi": "score_left", "frame_index": 0,
+        "start_frame_index": 0, "end_frame_index": 0,
+    }]})
+    labels.write_bytes(b"\xef\xbb\xbf" + body.encode("utf-8"))
+    doc = H.harvest(folder, tmp_path / "out", labels, allow, HELD, HASHES, now=NOW)
+    assert {row["label"] for row in doc["templates"]} == {"1"}
+
+
+def test_missing_qortime_refuses_before_the_video_is_hashed(tmp_path, monkeypatch):
+    monkeypatch.delenv("QORTIME", raising=False)
+    monkeypatch.setenv("QORCAP_HOME", str(tmp_path / "no-qortime"))
+    folder = _match(tmp_path, "555001")
+    allow = tmp_path / "allow.json"
+    _allow(allow, folder)
+    labels = tmp_path / "labels.json"
+    _labels(labels)
+
+    def boom(*_a, **_k):
+        raise AssertionError("hashed or decoded the video before QorTime was resolved")
+
+    monkeypatch.setattr(H, "_sha256", boom)
+    monkeypatch.setattr(H, "iter_decoded", boom)
+    try:
+        H.harvest(folder, tmp_path / "out", labels, allow, HELD, HASHES, now=NOW, qortime=None)
+    except H.Refuse as exc:
+        assert "QorTime" in str(exc)
+    else:
+        raise AssertionError("missing QorTime was harvested")
+    assert not (tmp_path / "out").exists()
+
+
+def test_uppercase_allowlist_pin_matches(tmp_path):
+    folder = _match(tmp_path, "555001")
+    digest = H._sha256(folder / "video.mp4").upper()
+    allow = tmp_path / "allow.json"
+    allow.write_text(json.dumps({"sources": [{
+        "match_id": "555001", "folder": folder.name, "video_sha256": digest,
+    }]}), encoding="utf-8")
+    labels = tmp_path / "labels.json"
+    _labels(labels)
+    doc = H.harvest(folder, tmp_path / "out", labels, allow, HELD, HASHES, now=NOW)
+    assert doc["templates"][0]["video_sha256"] == digest.lower()
+
+
+def test_a_partial_score_pack_abstains(tmp_path, monkeypatch):
+    folder = _match(tmp_path, "555001")
+    allow = tmp_path / "allow.json"
+    _allow(allow, folder)
+    labels = tmp_path / "labels.json"
+    _labels(labels)
+    out = tmp_path / "out"
+    H.harvest(folder, out, labels, allow, HELD, HASHES, now=NOW)
+    cap = cv2.VideoCapture(str(folder / "video.mp4"))
+    ok, frame = cap.read()
+    cap.release()
+    assert ok
+    from qorcap_template_guard import TEMPLATES_MISSING
+    reader = _install(monkeypatch, out, allow)
+    fr = reader.read(frame)
+    assert fr.reason == TEMPLATES_MISSING
+    assert fr.left_score is None and fr.right_score is None
+
+
+def test_harvested_templates_round_trip_through_the_reader(tmp_path, monkeypatch):
+    """Synthesize a bar, harvest every digit, install it, and read frame 0 back.
+
+    CI fails when the harvester's vectors are not what the reader matches.
+    Dropping one score digit or one clock digit must not leave a partial pack
+    that can misread.
+    """
+    logo = _logo()
+    folder = _match(tmp_path, "555001", frames=_digit_frames(logo))
+    labels = tmp_path / "labels.json"
+    _labels(labels, _full_labels())
     allow = tmp_path / "allow.json"
     _allow(allow, folder)
     out = tmp_path / "out"
     doc = H.harvest(folder, out, labels, allow, HELD, HASHES, now=NOW)
     _validate(doc)
-    glyph_labels = {row["label"] for row in doc["templates"] if row["path"].endswith(".npy")}
-    assert glyph_labels == {"1", "7", "5", "2", "3", "1st"}
-    assert all(len(row["label"]) == 1 or row["role"] == "quarter" for row in doc["templates"])
+    npy_rows = [row for row in doc["templates"] if row["path"].endswith(".npy")]
+    by_role = {}
+    for row in npy_rows:
+        by_role.setdefault(row["role"], set()).add(row["label"])
+        assert row["path"].startswith(f"{row['role']}/555001__{row['label']}__")
+        assert H.glyph_name_matches(row)
+    assert by_role["score"] == set("0123456789")
+    assert by_role["clock"] == set("0123456789")
+    assert by_role["quarter"] == {"1st"}
     cap = cv2.VideoCapture(str(folder / "video.mp4"))
     ok, frame = cap.read()
     cap.release()
     assert ok and frame is not None
 
-    import qorcap_template_guard as guard
-    monkeypatch.setattr(guard, "PROVENANCE_PATH", out / "provenance.json")
-    monkeypatch.setattr(guard, "SOURCES_PATH", allow)
-    from qorcap_standard import standard_reader
+    from qorcap_template_guard import TEMPLATES_MISSING
 
-    reader = standard_reader()
+    reader = _install(monkeypatch, out, allow)
     fr = reader.read(frame)
     assert (fr.left_score, fr.right_score) == (1, 7), (fr.reason, fr.detail)
     assert fr.quarter == 1, (fr.reason, fr.quarter)
     assert fr.clock_text == "5:23" and fr.clock_seconds == 323, (fr.reason, fr.clock_text)
     assert fr.ok is True and fr.reason == "ok"
+
+    dropped = json.loads((out / "provenance.json").read_text(encoding="utf-8"))
+    dropped["templates"] = [
+        row for row in dropped["templates"]
+        if not (row["role"] == "score" and row["label"] == "4")
+    ]
+    (out / "provenance.json").write_text(json.dumps(dropped), encoding="utf-8")
+    short = _install(monkeypatch, out, allow)
+    missed = short.read(frame)
+    assert missed.reason == TEMPLATES_MISSING
+    assert missed.left_score is None
+
+    clockless = json.loads((out / "provenance.json").read_text(encoding="utf-8"))
+    # Restore the score digit, then drop one clock digit. Scores may still read.
+    full = json.loads(json.dumps(doc))
+    clockless["templates"] = [
+        row for row in full["templates"]
+        if not (row["role"] == "clock" and row["label"] == "9")
+    ]
+    (out / "provenance.json").write_text(json.dumps(clockless), encoding="utf-8")
+    no_clock = _install(monkeypatch, out, allow)
+    held = no_clock.read(frame)
+    assert (held.left_score, held.right_score) == (1, 7), (held.reason, held.detail)
+    assert held.clock_seconds is None
+    assert "9" not in no_clock.inner.pack.groups.get("clock", {})
+
+
+def test_pin_preview_and_merge(tmp_path, capsys):
+    import merge_template_provenance as merge
+    import pin_template_source as pin
+    import preview_frame as preview
+
+    folder = _match(tmp_path, "555001")
+    video = folder / "video.mp4"
+    sources = tmp_path / "sources.json"
+    sources.write_text((ROOT / "templates" / "template_sources.json").read_text(encoding="utf-8"), encoding="utf-8")
+    before = sources.read_text(encoding="utf-8")
+    try:
+        pin.pin("999999", video, sources)
+    except SystemExit as exc:
+        assert "999999" in str(exc.code)
+    else:
+        raise AssertionError("an unknown match id was pinned")
+    assert sources.read_text(encoding="utf-8") == before
+    digest = pin.pin("102332", video, sources)
+    assert digest == digest.lower() and len(digest) == 64
+    saved = json.loads(sources.read_text(encoding="utf-8"))
+    row = next(item for item in saved["sources"] if item["match_id"] == "102332")
+    assert row["video_sha256"] == digest
+    assert saved["sources"][1]["video_sha256"] == ""
+
+    png = tmp_path / "preview.png"
+    index, measured, fps, count = preview.preview(video, png, frame=0, t_ms=None)
+    assert index == 0 and png.is_file() and count >= 1 and fps > 0
+    assert preview.main(["--video", str(video), "--frame", "0", "--out", str(tmp_path / "b.png")]) == 0
+    assert "frame_index=0" in capsys.readouterr().out
+
+    allow = tmp_path / "allow.json"
+    _allow(allow, folder)
+    labels = tmp_path / "labels.json"
+    _labels(labels)
+    out = tmp_path / "out"
+    H.harvest(folder, out, labels, allow, HELD, HASHES, now=NOW)
+    dest = tmp_path / "templates"
+    assert merge.merge(dest, [out]) > 0
+    snap = _snap(dest)
+    try:
+        merge.merge(dest, [out])
+    except SystemExit as exc:
+        assert "duplicate" in str(exc.code)
+    else:
+        raise AssertionError("a duplicate path was merged")
+    assert _snap(dest) == snap
