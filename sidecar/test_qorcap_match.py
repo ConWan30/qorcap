@@ -1070,21 +1070,24 @@ def test_options_press_is_known_before_end_menu_can_lock(tmp_path, monkeypatch):
     state = {}
     clock = _Clock()
     thread = qm.start_reader(qm.Api(8792), stop, state, bundle=bundle, clock=clock)
-    assert clock.waiting.wait(2)
-    # The synchronous refresh has already consumed the header. The worker is in its wait.
-    with open(inputs, "ab") as fh:
-        fh.write(b'{"type":"in","b":512,"t_ms":2500}\n')
-    clock.advance(lock_s)
-    deadline = time.monotonic() + 2
     seen = False
-    while time.monotonic() < deadline:
-        if 2500 in state["core"]._options_snapshot():
-            seen = True
-            break
-        time.sleep(0.01)
-    stop.set()
-    thread.join(timeout=5)
+    try:
+        assert clock.waiting.wait(2)
+        # The synchronous refresh has already consumed the header. The worker is in its wait.
+        with open(inputs, "ab") as fh:
+            fh.write(b'{"type":"in","b":512,"t_ms":2500}\n')
+        clock.advance(lock_s)
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            if 2500 in state["core"]._options_snapshot():
+                seen = True
+                break
+            time.sleep(0.01)
+    finally:
+        stop.set()
+        thread.join(timeout=5)
     assert seen, qm.REFRESH_PERIOD_S
+    assert not thread.is_alive()
     alive = [th.name for th in threading.enumerate() if th.name == "qorcap-refresh" and th.is_alive()]
     assert alive == []
 
@@ -1254,3 +1257,72 @@ def test_closed_health_span_is_written_when_the_reader_stops(tmp_path, monkeypat
     rows = [json.loads(line) for line in health.read_text(encoding="utf-8").splitlines() if line.strip()]
     lags = [row for row in rows if row.get("obs") == "reader_lag"]
     assert len(lags) == 1 and lags[0]["t_ms"] == 2100 and lags[0]["n"] == 1
+    assert "open_at_exit" not in lags[0]
+
+
+@pytest.mark.filterwarnings("ignore::pytest.PytestUnhandledThreadExceptionWarning")
+def test_closed_health_span_is_written_when_the_reader_crashes(tmp_path, monkeypatch):
+    """A crash after a closed span still writes the row, and does not set the match stop.
+
+    Flushing only when stop is already set leaves this row off disk.
+    """
+    import json
+    import urllib.request
+
+    import cv2
+    import numpy as np
+
+    import qorcap_reader
+
+    bundle = tmp_path / "m"
+    bundle.mkdir()
+    health = bundle / "reader_health.jsonl"
+    script = [0, 2100, 2500, 2900, 3300]
+    step = {"i": 0}
+    closed = threading.Event()
+    decoded = {"n": 0}
+
+    def on_frame(self, _t, _img):
+        i = step["i"]
+        if i >= len(script):
+            closed.set()
+            return
+        step["i"] = i + 1
+        self._note_frame_time(script[i])
+
+    def imdecode(*_a, **_k):
+        decoded["n"] += 1
+        # Five script frames, then the frame that notices the script is done, then raise.
+        if decoded["n"] > len(script) + 1:
+            raise RuntimeError("forced")
+        return np.zeros((8, 8, 3), np.uint8)
+
+    monkeypatch.setattr(qorcap_reader.ReaderCore, "on_frame", on_frame)
+    monkeypatch.setattr(cv2, "imdecode", imdecode)
+    frames = []
+    for i in range(16):
+        img = np.zeros((8, 8, 3), np.uint8)
+        img[:, :, 0] = i + 1
+        ok, buf = cv2.imencode(".png", img)
+        assert ok
+        frames.append(bytes(buf))
+    seq = {"i": 0}
+
+    def urlopen(url, timeout=3):
+        data = frames[seq["i"] % len(frames)]
+        seq["i"] += 1
+        return _Body(data)
+
+    monkeypatch.setattr(urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(qm.Api, "get", lambda self, path, timeout=3: {})
+    stop = threading.Event()
+    state = {}
+    thread = qm.start_reader(qm.Api(8796), stop, state, bundle=bundle)
+    assert closed.wait(3), step["i"]
+    thread.join(timeout=5)
+    assert not thread.is_alive()
+    assert not stop.is_set()
+    rows = [json.loads(line) for line in health.read_text(encoding="utf-8").splitlines() if line.strip()]
+    lags = [row for row in rows if row.get("obs") == "reader_lag"]
+    assert len(lags) == 1 and lags[0]["t_ms"] == 2100 and lags[0]["n"] == 1
+    assert "open_at_exit" not in lags[0]

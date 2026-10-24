@@ -571,4 +571,40 @@ def test_flush_health_writes_a_span_that_is_still_open():
     assert written == [] and core._lag is not None
     core.flush_health()
     assert len(written) == 1 and written[0]["obs"] == "reader_lag" and written[0]["n"] >= 1
+    assert written[0]["open_at_exit"] is True
     assert core._lag is None and core._health_pending == {}
+
+
+def test_exit_flush_marks_only_a_span_that_is_still_open():
+    """open_at_exit is for a span the reader was still in. A closed span has no such field."""
+    from qorcap_reader import HEALTH_CLEAR_FRAMES, ReaderCore
+
+    unread = NS(ok=False, reason="layout_unknown", left_score=None, right_score=None, quarter=None,
+                clock_seconds=None, clock_red=False, pair=None)
+
+    def closed_core():
+        posts = []
+        core = ReaderCore(posts.append, _StubReader(unread), Agree(), None, detect_final)
+        written = []
+        core.health_write = written.append
+        t = 0
+        core.on_frame(t, None)
+        t += 2100
+        core.on_frame(t, None)
+        for _ in range(HEALTH_CLEAR_FRAMES):
+            t += 400
+            core.on_frame(t, None)
+        return core, written
+
+    core, written = closed_core()
+    assert written == [] and core._lag is None
+    core.flush_health()
+    assert len(written) == 1 and "open_at_exit" not in written[0]
+
+    core, written = closed_core()
+    # The close left the clock at 3300. One more late frame is still open.
+    core.on_frame(5400, None)
+    assert core._lag is not None and written == []
+    core.flush_health()
+    assert len(written) == 1
+    assert written[0]["open_at_exit"] is True and written[0]["count"] == 2

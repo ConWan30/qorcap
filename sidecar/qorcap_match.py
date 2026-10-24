@@ -490,6 +490,9 @@ def start_reader(api: Api, stop: threading.Event, state: dict, bundle: Path | No
             # is not the match stop, so a crash here leaves ENTER/Q and the heartbeat up.
             # Held and still-open health rows are written here. A stall that ends with
             # the match would otherwise stay in memory.
+            # The flush must stay BEFORE the refresh join. The join gives up after 5 s,
+            # and a stuck refresh must not keep these rows off disk. This runs on the
+            # crash path too: an exception still reaches this finally, and stop is not set.
             try:
                 core.flush_health()
             except Exception as e:

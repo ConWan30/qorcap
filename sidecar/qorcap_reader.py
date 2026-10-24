@@ -1200,6 +1200,8 @@ class ReaderCore:
             pending["until_ms"] = max(int(pending.get("until_ms") or 0), int(row.get("until_ms") or 0))
             if "max_gap_ms" in row:
                 pending["max_gap_ms"] = max(int(pending.get("max_gap_ms") or 0), int(row["max_gap_ms"]))
+            if row.get("open_at_exit"):
+                pending["open_at_exit"] = True
             if row.get("reasons"):
                 reasons = dict(pending.get("reasons") or {})
                 for key, n in row["reasons"].items():
@@ -1220,9 +1222,14 @@ class ReaderCore:
         """Write held rows and any span still open. Runs when the reader thread exits."""
         for attr in ("_lag", "_unagreed"):
             span = getattr(self, attr, None)
-            if span is not None:
-                self._commit_health(span)
-                setattr(self, attr, None)
+            if span is None:
+                continue
+            open_row = dict(span)
+            if "reasons" in span:
+                open_row["reasons"] = dict(span["reasons"])
+            open_row["open_at_exit"] = True
+            self._commit_health(open_row)
+            setattr(self, attr, None)
         self._lag_clear = 0
         self._unagreed_clear = 0
         for kind in list(self._health_pending):
