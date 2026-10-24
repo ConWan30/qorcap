@@ -37,8 +37,11 @@ The vote uses the agreement window's numbers: ``vote_reads`` 3, ``vote_interval_
 evidence and is not a reset. One illegal frame blanks that frame and does not flip
 ``allows_final_fallback``. The same illegal run, persisted across the vote, does. A gap longer
 than ``vote_gap_ms`` starts the count over and does not clear a disagreement that already
-persisted. Clearing takes the same persistence: 3 reads of the locked score, spanning the vote,
-inside the gap. One read that matches the stale lock does not clear it. ``suspicious_reads`` 9
+persisted. A read of the locked score does not reset that count when a pending read is a new
+score (not a decrease). Three consecutive reads of the locked score, with the same interval,
+span, and gap, clear a disagreement that has persisted. One does not. An older lower score
+between reads of the lock is dismissed by those reads, so a forged decrease interleaved with
+the true lock does not abstain it. ``suspicious_reads`` 9
 over ``suspicious_span_ms``
 2_000 is the agreement window's bar for an implausible jump, so a short forged decrease still
 cannot confirm a re-anchor. See ``docs/SCOREBUG_CLOCK_VOTE.md``.
@@ -174,6 +177,7 @@ class ScoreGrammar:
         self._vote_n = 0
         self._vote_t0: int | None = None
         self._vote_last: int | None = None
+        self._vote_pairs: list[tuple[int, int]] = []
         self._clear_n = 0
         self._clear_t0: int | None = None
         self._clear_last: int | None = None
@@ -234,24 +238,50 @@ class ScoreGrammar:
         self._vote_n = 0
         self._vote_t0 = None
         self._vote_last = None
+        self._vote_pairs = []
 
-    def _note_disagreement(self, t_ms: int) -> None:
-        """Count an illegal gated score. One frame does not set ``disagreeing``."""
+    def _reset_clear(self) -> None:
+        self._clear_pair = None
+        self._clear_n = 0
+        self._clear_t0 = None
+        self._clear_last = None
+
+    def _pending_disagreement_is_a_decrease(self) -> bool:
+        """True when every in-progress disagreeing read is lower than the lock.
+
+        A re-show of the lock may dismiss that count: it is an older score sitting
+        between reads of the current one. A read that is not a decrease is a new
+        score, and a stale re-show must leave its count alone.
+        """
+        if self.locked is None or not self._vote_pairs:
+            return True
+        la, lh = int(self.locked[0]), int(self.locked[1])
+        return all(int(a) < la or int(h) < lh for a, h in self._vote_pairs)
+
+    def _note_disagreement(self, t_ms: int, pair: tuple[int, int]) -> bool:
+        """Count an illegal gated score. One frame does not set ``disagreeing``.
+
+        Returns True when this sample is new evidence. A sample closer than the
+        interval is not, and it is not a reset.
+        """
         t_ms = int(t_ms)
         last = self._vote_last
         if last is None or t_ms < last or t_ms - last > int(self.vote_gap_ms):
             self._vote_n = 1
             self._vote_t0 = t_ms
             self._vote_last = t_ms
+            self._vote_pairs = [pair]
             # A gap starts a new count. It does not erase a disagreement that already persisted.
-            return
+            return True
         if t_ms - last < int(self.vote_interval_ms):
-            return
+            return False
         self._vote_n += 1
         self._vote_last = t_ms
+        self._vote_pairs.append(pair)
         span = t_ms - (t_ms if self._vote_t0 is None else int(self._vote_t0))
         if self._vote_n >= int(self.vote_reads) and span >= int(self.vote_span_ms):
             self.disagreeing = True
+        return True
 
     def _note_clear(self, t_ms: int, pair: tuple[int, int]) -> None:
         """A read of the locked score. One does not clear ``disagreeing``."""
@@ -270,7 +300,18 @@ class ScoreGrammar:
         self._clear_last = t_ms
         span = t_ms - (t_ms if self._clear_t0 is None else int(self._clear_t0))
         if self._clear_n >= int(self.vote_reads) and span >= int(self.vote_span_ms):
-            self.disagreeing = False
+            # Three re-shows of the lock do not restore it while the disagreeing
+            # reads are still inside the vote gap. That is a stale lock sitting
+            # on top of a new score. Once those reads have left the gap, the
+            # same three reads clear it.
+            if not self._disagreement_still_pending(t_ms):
+                self.disagreeing = False
+
+    def _disagreement_still_pending(self, t_ms: int) -> bool:
+        last = self._vote_last
+        if last is None or self._vote_n < int(self.vote_reads):
+            return False
+        return int(t_ms) - int(last) <= int(self.vote_gap_ms)
 
     def _reanchor(self, pair: tuple[int, int], t_ms: int) -> bool:
         """True when this gated pair has agreed for K reads spanning T milliseconds."""
@@ -309,19 +350,23 @@ class ScoreGrammar:
         decision = judge(self.locked, pair, self.active_banner(t_ms), phase, side)
         if decision != "abstain":
             self._clear_cand()
-            self._clear_vote()
-            # Matching the lock can clear a disagreement, but only after the same vote
-            # that sets one. One stale re-show does not. A different legal score does not
-            # either: that would publish the stale lock through the fallback.
+            # A matching read must not wipe a pending new score: that is how a stale
+            # re-show used to keep the disagreement from ever forming. Three consecutive
+            # matches, and only those, clear a disagreement that has already persisted.
+            # A pending decrease is the old lower score (F3). The lock re-show dismisses
+            # that count so the true lock stays.
             if self.locked is not None and pair == self.locked:
+                if self._pending_disagreement_is_a_decrease():
+                    self._clear_vote()
                 self._note_clear(int(t_ms), pair)
             else:
-                self._clear_pair = None
-                self._clear_n = 0
-                self._clear_t0 = None
-                self._clear_last = None
+                self._clear_vote()
+                self._reset_clear()
             return fr
-        self._note_disagreement(int(t_ms))
+        if self._note_disagreement(int(t_ms), pair):
+            # A new disagreeing read breaks a clear streak. It does not, by itself,
+            # unset a disagreement that already persisted.
+            self._reset_clear()
         if not self._reanchor(pair, t_ms):
             return replace(
                 fr,

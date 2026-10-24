@@ -87,14 +87,26 @@ def test_clock_increase_inside_a_quarter_blanks_and_is_noted():
     assert h.reanchored is False
 
 
-def test_a_held_increase_does_not_reanchor():
-    """The stoppage gate used to accept a higher second that sat still. It must not."""
+def test_a_held_increase_voids_on_the_stoppage_bar_and_does_not_adopt_that_frame():
+    """One higher second does not move the baseline. Held for the stoppage bar, it blanks both.
+
+    The frame that completes the bar is not a re-anchor. A fresh stoppage after the blank may
+    adopt the held second.
+    """
     h = ClockHistory()
     assert h.filter(60, 1, 0) == 60
-    for t in (100, 800, 1_500, 2_100, 3_000):
-        assert h.filter(61, 1, t) is None
-        assert h.rule_note == "clock_increase"
-    assert h.last_s == 60 and h.reanchor_kind is None
+    assert h.filter(61, 1, 100) is None
+    assert h.filter(61, 1, 800) is None
+    assert h.filter(61, 1, 1_500) is None
+    assert h.last_s == 60 and h.rule_note == "clock_increase" and h.suspended is False
+    assert h.filter(61, 1, 2_100) is None
+    assert h.rule_note == "clock_disagree" and h.suspended and h.last_s is None
+    assert h.reanchor_kind is None
+    assert h.filter(61, 1, 2_200) is None
+    assert h.filter(61, 1, 2_900) is None
+    assert h.filter(61, 1, 3_600) is None
+    assert h.filter(61, 1, 4_200) == 61
+    assert h.reanchor_kind == "stop" and h.last_s == 61
 
 
 def test_clock_resets_at_a_higher_quarter_and_rejects_above_the_cap():
@@ -280,6 +292,86 @@ def test_stoppage_reanchor_still_accepts_a_held_lower_clock():
     assert h.last_s == 60
 
 
+def _mixq_after_detect(off):
+    """r2_trace pattern: offset while 3 s <= t < 9 s, quarter missing every fourth read."""
+    h = ClockHistory()
+    det = None
+    wrong_after = []
+    for i, t in enumerate(range(0, 18_000, 100)):
+        truth = 90 - t // 1000
+        read = truth + off if 3_000 <= t < 9_000 else truth
+        q = None if i % 4 == 3 else 1
+        out = h.filter(read, q, t)
+        if h.rule_note == "clock_disagree" and det is None:
+            det = t
+        if det is not None and t > det and out is not None and out != truth:
+            wrong_after.append((t, out, truth, q))
+    return det, wrong_after
+
+
+def test_mixq_five_high_and_ten_low_emit_nothing_wrong_after_detection():
+    """Quarterless reads used to leave the filter while the clock was suspended."""
+    for off in (5, -10):
+        det, wrong = _mixq_after_detect(off)
+        assert det is not None, off
+        assert wrong == [], (off, wrong)
+
+
+def test_held_true_clock_voids_a_ten_second_low_stoppage_and_reanchors():
+    """A 10 s-low misread can stick on a stoppage. The true second, held, must blank it
+    and then come back through the stoppage gate. Nothing wrong is emitted after the blank."""
+    h = ClockHistory()
+    assert h.filter(90, 1, 0) == 90
+    assert h.filter(80, 1, 100) is None
+    assert h.filter(80, 1, 800) is None
+    assert h.filter(80, 1, 1_500) is None
+    assert h.filter(80, 1, 2_100) == 80
+    assert h.reanchor_kind == "stop"
+    wrong = []
+    detected = None
+    recovered = None
+    t = 2_200
+    for _ in range(16):
+        got = h.filter(90, 1, t)
+        if h.rule_note == "clock_disagree" and detected is None:
+            detected = t
+            assert got is None and h.last_s is None and h.suspended
+        if detected is not None and got is not None and got != 90:
+            wrong.append((t, got))
+        if got == 90:
+            recovered = t
+            break
+        t += 700
+    assert detected is not None and recovered is not None and wrong == []
+    assert h.reanchor_kind == "stop" and h.last_s == 90
+
+
+def test_fuzz_suspended_emits_only_through_a_reanchor():
+    """While suspended, the only emitted read is the one that completes a fresh re-anchor."""
+    for seed in range(400):
+        rng = random.Random(seed)
+        h = ClockHistory()
+        true = rng.randint(40, 110)
+        off = rng.choice((5, -10, 8, -4))
+        t = 0
+        h.filter(true, 1, t)
+        for i in range(160):
+            t += rng.choice((100, 100, 200, 500))
+            if rng.randrange(3) == 0:
+                true = max(0, true - 1)
+            read = true + off if 30 <= i < 110 else true
+            if read < 0:
+                read = 0
+            q = None if rng.randrange(4) == 0 else 1
+            was = h.suspended
+            out = h.filter(read, q, t)
+            if not was or out is None:
+                continue
+            assert h.reanchored, (seed, t, out, read)
+            assert out == read
+            assert h.reanchor_kind in ("stop", "run")
+
+
 # --- vote ---
 
 def test_lock_vote_matches_the_agreement_window():
@@ -345,10 +437,17 @@ def test_a_legal_read_clears_a_disagreement_and_a_close_burst_is_one_sample():
     assert g.allows_final_fallback() is False
     assert g.filter(_fr(7, 14), 1_800, None).pair == (7, 14)
     assert g.locked == (7, 14) and g.allows_final_fallback() is False
-    # The same vote that sets a disagreement: 3 reads, 200 ms apart, spanning 400 ms.
+    # Three re-shows while the new score is still inside the 2 s gap do not
+    # restore the lock. The same three, once that gap has passed, do.
     assert g.filter(_fr(7, 14), 2_000, None).pair == (7, 14)
     assert g.allows_final_fallback() is False
     assert g.filter(_fr(7, 14), 2_200, None).pair == (7, 14)
+    assert g.allows_final_fallback() is False
+    assert g.filter(_fr(7, 14), 4_500, None).pair == (7, 14)
+    assert g.allows_final_fallback() is False
+    assert g.filter(_fr(7, 14), 4_700, None).pair == (7, 14)
+    assert g.allows_final_fallback() is False
+    assert g.filter(_fr(7, 14), 4_900, None).pair == (7, 14)
     assert g.allows_final_fallback() is True
 
 
@@ -438,6 +537,143 @@ def test_mirror_f3_true_final_interleaved_with_stale_reshows_does_not_publish_th
     assert published in (None, (7, 14))
     assert (final["away_score"], final["home_score"]) != (7, 7)
     assert final["winner"] == "unknown" or (final["away_score"], final["home_score"]) == (7, 14)
+
+
+def _offer_pair(grammar, agree, pair, t):
+    fr = grammar.filter(_fr(*pair), t, None)
+    res = agree.offer(fr, clock_ns=t * 1_000_000, crop_hash="crop", session_id="s")
+    published = None
+    if res.agreed and fr.pair is not None:
+        grammar.note_lock(t, fr.pair[0], fr.pair[1])
+        published = fr.pair
+    return published
+
+
+def test_clear_vote_gap_does_not_let_earlier_matching_reads_count():
+    """The clear vote has the same 2 s gap as the disagreement vote.
+
+    Two matching reads, then one more after the gap, must not clear. Dropping the gap
+    check would let those three reads add up.
+    """
+    g = _locked(7, 14)
+    g.filter(_fr(11, 14), 1_000, None)
+    g.filter(_fr(12, 14), 1_200, None)
+    g.filter(_fr(16, 14), 1_400, None)
+    assert g.allows_final_fallback() is False
+    assert g.filter(_fr(7, 14), 2_000, None).pair == (7, 14)
+    assert g.filter(_fr(7, 14), 2_200, None).pair == (7, 14)
+    assert g.allows_final_fallback() is False
+    # 2.1 s after the previous matching read. The count restarts at 1.
+    assert g.filter(_fr(7, 14), 4_300, None).pair == (7, 14)
+    assert g.allows_final_fallback() is False
+    assert g._clear_n == 1
+    assert g.filter(_fr(7, 14), 4_500, None).pair == (7, 14)
+    assert g.allows_final_fallback() is False
+    assert g.filter(_fr(7, 14), 4_700, None).pair == (7, 14)
+    assert g.allows_final_fallback() is True
+
+
+def test_matching_read_does_not_reset_a_pending_new_score():
+    """r3_trace: true 7-24 on even frames, stale 7-14 between. The count must not bounce."""
+    g = _locked(7, 14)
+    saw = []
+    for i in range(12):
+        t = 2_000 + 200 * i
+        pair = (7, 24) if i % 2 == 0 else (7, 14)
+        g.filter(_fr(*pair), t, None)
+        saw.append(g._vote_n)
+        if pair == (7, 14):
+            assert g._vote_n == saw[-2] if saw else g._vote_n
+    assert saw[0] == 1
+    assert 0 not in saw[1:]  # a stale re-show used to zero this
+    assert g.disagreeing is True
+    assert g.allows_final_fallback() is False
+    final = _final_from(g, {"home": 14, "away": 7, "quarter": 4, "t_ms": 4_200})
+    assert (final["away_score"], final["home_score"], final["winner"]) == (None, None, "unknown")
+
+
+def test_interleaved_from_the_start_true_final_does_not_publish_the_stale_lock():
+    """Stale 7-14 re-shows from the first frame, not after a disagreement was already set.
+
+    The result is an abstain or the true final. It is never the stale lock. Covers the
+    mirror-F3 patterns: 1 true per 2, 3, or 4 frames, and a true read every 700 ms.
+    """
+    stale = {"home": 14, "away": 7, "quarter": 4, "t_ms": 0}
+
+    def finish(g, true):
+        if g.allows_final_fallback():
+            assert g.locked == true
+            final = _final_from(g, {"home": true[1], "away": true[0], "quarter": 4, "t_ms": 0})
+            assert (final["away_score"], final["home_score"]) == true
+        else:
+            final = _final_from(g, stale)
+            assert (final["away_score"], final["home_score"], final["winner"]) == (None, None, "unknown")
+        assert (final["away_score"], final["home_score"]) != (7, 14)
+
+    for true in ((7, 24), (7, 21)):
+        for k in (2, 3, 4):
+            g = ScoreGrammar()
+            agree = AgreementWindow(lock_agreement_config())
+            end = _seed(g, agree, 7, 14, 4, t0=0)
+            t = end + 1_000
+            limit = t + 6_000
+            while t < limit:
+                _offer_pair(g, agree, true, t)
+                t += 200
+                for _ in range(k - 1):
+                    if t >= limit:
+                        break
+                    _offer_pair(g, agree, (7, 14), t)
+                    t += 200
+            _offer_pair(g, agree, true, t)  # last read is the true final
+            finish(g, true)
+            # The same pattern ending on the stale re-shows must not publish them either.
+            g = ScoreGrammar()
+            agree = AgreementWindow(lock_agreement_config())
+            end = _seed(g, agree, 7, 14, 4, t0=0)
+            t = end + 1_000
+            limit = t + 6_000
+            while t < limit:
+                _offer_pair(g, agree, true, t)
+                t += 200
+                for _ in range(k - 1):
+                    if t >= limit:
+                        break
+                    _offer_pair(g, agree, (7, 14), t)
+                    t += 200
+            finish(g, true)
+
+        g = ScoreGrammar()
+        agree = AgreementWindow(lock_agreement_config())
+        end = _seed(g, agree, 7, 14, 4, t0=0)
+        for i, dt in enumerate(range(0, 6_000, 100)):
+            t = end + 1_000 + dt
+            if dt % 700 == 0:
+                _offer_pair(g, agree, true, t)
+            else:
+                g.filter(_blank(), t, None)
+        finish(g, true)
+
+        g = ScoreGrammar()
+        agree = AgreementWindow(lock_agreement_config())
+        end = _seed(g, agree, 7, 14, 4, t0=0)
+        for i, dt in enumerate((0, 200, 400)):
+            _offer_pair(g, agree, true, end + 1_000 + dt)
+        finish(g, true)
+
+
+def test_f5_forged_seven_seven_for_one_and_a_half_seconds_does_not_name_it():
+    g = ScoreGrammar()
+    agree = AgreementWindow(lock_agreement_config())
+    end = _seed(g, agree, 7, 14, 4, t0=0)
+    published = None
+    for i in range(16):
+        t = end + 1_000 + i * 100
+        published = _offer_pair(g, agree, (7, 7), t) or published
+    assert published != (7, 7)
+    assert g.locked == (7, 14) and g.allows_final_fallback() is False
+    blocked = _final_from(g, {"home": 14, "away": 7, "quarter": 4, "t_ms": end})
+    assert (blocked["away_score"], blocked["home_score"], blocked["winner"]) == (None, None, "unknown")
 
 
 def test_interleaved_true_frames_do_not_lock_the_forgery():

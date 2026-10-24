@@ -10,9 +10,10 @@ A clock is kept when it holds or counts down inside its quarter. A higher quarte
 clock, up to 15:00 (the regulation cap; the configured quarter length is not known, so a reset
 is not guessed). A quarter that goes backwards is a cut: the baseline starts over, it is not
 a reject. A read with no quarter does not become the baseline, so it cannot blank the quarter
-that follows. An upward step inside a quarter is impossible: it is blanked, noted as
-``clock_increase``, and it cannot re-anchor. A drop bigger than the time since the last
-accepted clock is not accepted on that frame.
+that follows. An upward step inside a quarter is impossible: it is blanked and noted as
+``clock_increase``. One frame cannot re-anchor. The same higher second, held for the
+stoppage bar, blanks both clocks; a fresh stoppage after that blank may adopt it. A drop
+bigger than the time since the last accepted clock is not accepted on that frame.
 
 Two ways back in, both stricter than one frame:
 
@@ -30,7 +31,10 @@ Two ways back in, both stricter than one frame:
   may be kept. The kept value is the read itself. See ``docs/SCOREBUG_CLOCK_VOTE.md``.
 
 A second sustained line that disagrees with the accepted clock, higher or lower, blanks both.
-The contradicted line stays blocked. A different run, or a stoppage, may re-anchor. A lone
+So does one higher second held for the stoppage bar: the returning clock cannot show three
+distinct seconds while it is stopped. The contradicted line stays blocked. A different run,
+or a stoppage, may re-anchor. While that blank holds, nothing is emitted except the read
+that completes the re-anchor. A quarterless read is not emitted and does not join it. A lone
 runoff has no second line, so the running-clock gate still adopts it (FU1).
 
 Stoppage is a hold. With no ``t_ms`` the digits are read and the history is left alone.
@@ -148,6 +152,10 @@ class ClockHistory:
         self.suspended = False
         # (t_ms, seconds) of a line that disagreed and must not be adopted again.
         self._blocked_line: tuple[int, int] | None = None
+        # A higher second held against the accepted clock. The stoppage bar voids both.
+        self._held: int | None = None
+        self._held_n = 0
+        self._held_t0: int | None = None
 
     def _clear_cand(self) -> None:
         self._cand = None
@@ -170,6 +178,7 @@ class ClockHistory:
             # A new anchor replaces the dispute. The blocked line stays blocked.
             self._dispute = []
             self.suspended = False
+        self._clear_held()
         self.accepted_now = True
         # Same quarter as the one already observed. A reset or a cut is not a continuation.
         self.continuation = prev_q is not None and self.last_q == prev_q
@@ -215,6 +224,27 @@ class ClockHistory:
         self.reanchored = False
         self.reanchor_kind = None
         self.rule_note = "clock_disagree"
+        self._clear_held()
+
+    def _clear_held(self) -> None:
+        self._held = None
+        self._held_n = 0
+        self._held_t0 = None
+
+    def _held_disagreement(self, secs: int, t_ms: int) -> bool:
+        """The same higher second, held for the stoppage bar.
+
+        A stopped true clock cannot show the three distinct seconds a running dispute
+        needs. Completion blanks both. It does not adopt this read.
+        """
+        if secs != self._held:
+            self._held = int(secs)
+            self._held_n = 1
+            self._held_t0 = int(t_ms)
+            return False
+        self._held_n += 1
+        span = int(t_ms) - (int(t_ms) if self._held_t0 is None else int(self._held_t0))
+        return self._held_n >= self.reanchor_reads and span >= self.reanchor_span_ms
 
     def _reanchor(self, secs: int, t_ms: int) -> bool:
         """Stoppage: the same lower second, held. An increase never reaches this."""
@@ -272,6 +302,7 @@ class ClockHistory:
             self.rule_note = "clock_above_max"
             self._clear_run()
             self._clear_cand()
+            self._clear_held()
             return True
         return False
 
@@ -280,7 +311,7 @@ class ClockHistory:
 
         An impossible step returns None and sets ``rule_note``. A running-clock re-anchor may
         return ``secs`` after a drop the one-frame rule blanked. It never returns a different
-        number, and it never returns a clock that increased inside the quarter.
+        number than the read.
         """
         self.rule_note = None
         self.accepted_now = False
@@ -296,6 +327,7 @@ class ClockHistory:
             self.rule_note = "clock_negative"
             self._clear_run()
             self._clear_cand()
+            self._clear_held()
             return None
         q = _quarter(quarter)
         if self.last_t is not None and t_ms < self.last_t:
@@ -307,20 +339,31 @@ class ClockHistory:
             self.reanchor_kind = None
             self.last_run = None
         self.last_t = t_ms
-        if self.last_s is None:
-            # A quarter-less read must not freeze the baseline for the quarter that follows.
-            if q is None:
-                return secs
-            if self._too_high(secs):
-                return None
+        if self.suspended:
+            # Check this before the quarterless early return. A read with no quarter used
+            # to be emitted unfiltered while the baseline was blank.
             quarter_break = q is not None and self.last_q is not None and q != self.last_q
-            if self.suspended and not quarter_break:
-                # Blank until a different run, or a stoppage, re-anchors.
+            if quarter_break:
+                self._blocked_line = None
+                self.suspended = False
+                self._clear_held()
+            else:
+                self._clear_held()
+                if q is None:
+                    return None
+                if self._too_high(secs):
+                    return None
                 if self._reanchor(secs, t_ms) or self._offer_run(secs, t_ms):
                     self.suspended = False
                     return self._accept(secs, q, t_ms)
                 return None
-            self.suspended = False
+        if self.last_s is None:
+            # A quarter-less read must not freeze the baseline for the quarter that follows.
+            self._clear_held()
+            if q is None:
+                return secs
+            if self._too_high(secs):
+                return None
             self._blocked_line = None
             return self._accept(secs, q, t_ms)
         if q is not None and self.last_q is not None and q < self.last_q:
@@ -341,16 +384,18 @@ class ClockHistory:
             return None
         if secs > self.last_s:
             # Higher than the accepted clock. One frame is an increase. A sustained 1:1
-            # line (or a lower one, below) contradicts it: blank both, adopt neither.
+            # line, or the same second held for the stoppage bar, contradicts it: blank
+            # both, adopt neither.
             self.rule_note = "clock_increase"
             self._clear_run()
             self._clear_cand()
-            if self._offer_dispute(secs, t_ms):
+            if self._held_disagreement(secs, t_ms) or self._offer_dispute(secs, t_ms):
                 block = None
                 if self.last_accept_t is not None and self.last_s is not None:
                     block = (int(self.last_accept_t), int(self.last_s))
                 self._void(block)
             return None
+        self._clear_held()
         elapsed_s = 0 if self.last_accept_t is None else max(0.0, (t_ms - self.last_accept_t) / 1000.0)
         if self.last_s - secs <= int(elapsed_s) + 1:
             return self._accept(secs, q, t_ms)
