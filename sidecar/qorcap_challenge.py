@@ -48,6 +48,9 @@ v2 (``bundle.json`` ``challenge_rule`` = 2): pause 0..2500 ms, and the successfu
 ±300 ms of their median. A bundle with no ``challenge_rule`` stays on rule v1 (``segment_ranges``,
 0..600 ms). Nothing here is submitted to the referee. An ok result is ``reverified_by: recorder``
 and carries no ``rule`` field, so a local receipt keeps the v1 evidence check.
+A wrong pattern (``ok`` false, ``reason`` ``pattern_mismatch``) is stored the same way.
+The pinned verifier then reports ``challenge_failed``. Any other miss stays null
+(``challenge_unanswered``).
 """
 from __future__ import annotations
 
@@ -172,6 +175,23 @@ def capture_clock(segments: list[dict[str, Any]]) -> tuple[float, float]:
     return 0.0, _NOMINAL_MS
 
 
+def receipt_result(res: dict[str, Any] | None) -> dict[str, Any] | None:
+    """What ``challenges[].result`` stores for one recheck.
+
+    ``receipt.v0`` allows null, or an object with boolean ``ok`` and string ``reason``.
+    The pinned verifier maps null to ``challenge_unanswered`` and ``ok`` false to
+    ``challenge_failed``. A pass and a wrong pattern are stored. A miss stays null
+    so a challenge nobody answered does not FAIL the player's own receipt.
+    """
+    if not isinstance(res, dict):
+        return None
+    if res.get("ok") is True:
+        return res
+    if res.get("ok") is False and res.get("reason") == "pattern_mismatch":
+        return res
+    return None
+
+
 def frame_mono_ms(clock: tuple[float, float], pts0_ms: float, n: int, hz: float) -> int:
     """Capture mono time of decoded frame ``n`` in a run whose first sample PTS is ``pts0_ms``."""
     intercept, slope = clock
@@ -240,6 +260,6 @@ def challenge_results(d: str | Path, challenges: list[dict[str, Any]], *, decode
                      capture_pause_max_ms=CAPTURE_PAUSE_MAX_LATENCY_MS)
         if note:
             local["note"] = note
-        return {"result": res if res["ok"] else None, "local": local}
+        return {"result": receipt_result(res), "local": local}
 
     return [rerun(c) for c in challenges]

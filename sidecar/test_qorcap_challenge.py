@@ -140,4 +140,127 @@ def test_fill_challenge_results_uses_the_recorder_recheck():
     body = chal.split("def challenge_results", 1)[1]
     assert 'res["rule"]' not in body and "res['rule']" not in body
     assert "capture_pause_max_ms=CAPTURE_PAUSE_MAX_LATENCY_MS" in chal
-    assert 'return {"result": res if res["ok"] else None, "local": local}' in chal
+    assert "def receipt_result(" in chal
+    assert 'return {"result": receipt_result(res), "local": local}' in chal
+    assert 'return {"result": res if res["ok"] else None, "local": local}' not in chal
+
+
+def _challenge(nonce: str, phase: str, issued: int) -> dict:
+    from qor_receipt.challenge import pattern_for
+
+    return {"id": nonce[:8], "role": "home", "phase": phase, "nonce": nonce,
+            "pattern": pattern_for(nonce), "issued_ms": issued, "deadline_ms": issued + 90_000, "result": None}
+
+
+def _mismatch_bundle(bundle: Path) -> dict:
+    """Kickoff presses OPTIONS then a button that is not the prompt. Halftime and end have no presses."""
+    from qor_receipt.review.bundle import BUTTON_BITS
+
+    import qorcap_match as qm
+
+    bits = {name: bit for name, bit in BUTTON_BITS}
+    kick = _challenge("00112233445566778899aabbccddeeff", "kickoff", 1_000_000)
+    wrong = next(b for b in ("CROSS", "CIRCLE", "SQUARE", "TRIANGLE", "UP", "DOWN", "LEFT", "RIGHT")
+                 if b != kick["pattern"][1])
+    t0 = kick["issued_ms"] + 1_000
+    rows = [
+        {"type": "header", "schema": "qorcap-inputs/v0", "t_us": 0, "seg": 0, "wall_anchor_ms": 0},
+        {"type": "in", "t_us": t0 * 1000, "b": 1 << bits["OPTIONS"], "seg": 0},
+        {"type": "in", "t_us": (t0 + 400) * 1000, "b": 1 << bits[wrong], "seg": 0},
+    ]
+    bundle.mkdir(parents=True)
+    (bundle / "inputs.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+    for name in ("bundle.json", "receipt.json"):
+        (bundle / name).write_text("{}\n", encoding="utf-8")
+    for name in ("manifest.jsonl", "checkpoints.jsonl"):
+        (bundle / name).write_text("", encoding="utf-8")
+    chs = [
+        kick,
+        _challenge("ffeeddccbbaa99887766554433221100", "halftime", 2_000_000),
+        _challenge("0123456789abcdef0123456789abcdef", "end", 3_000_000),
+    ]
+    # decode=False: a mismatch still names pattern_mismatch. The pause search is not what failed.
+    return qm.fill_challenge_results(bundle, {"challenges": chs}, decode=False)
+
+
+def _signed_from_challenges(tmp: Path, challenges: list[dict]):
+    from qor_receipt.checkpoints import Chain
+    from qor_receipt.receipt import verify_receipt
+
+    import qorcap_match as qm
+
+    dev, ref = qm.load_keys(tmp / "keys")
+    t = [1000]
+    cs = qm.Countersigner(ref, "local-mismatch", "home", clock=lambda: t[0] + 50)
+    chain = Chain()
+    for _ in range(3):
+        cp = chain.next(t[0], "a" * 64, "b" * 64)
+        assert cs.offer(cp)
+        t[0] += 2000
+    draft = {
+        "match": {"match_id": "local-mismatch", "game": "madden27", "platform": "ps5",
+                  "scorebug_profile": "madden27_standard", "mode": "single", "started_ms": 900, "ended_ms": 0},
+        "result": {"home_score": 14, "away_score": 10, "quarter": 4, "final_t_ms": 5000, "winner": "home",
+                   "method": "agreed_scorebug_final", "final_basis": "clock_zero"},
+        "players": [{"role": "home", "player_id": "psn:me", "pubkey": "0" * 64, "key_kind": "software"}],
+        "challenges": challenges,
+        "agreement": {"timelines_agree": None, "mismatches": []},
+        "signals": {"motion_permille": {"home": None}},
+    }
+    rec = qm.build_receipt(draft, cs.signed, dev, ref, match_id="local-mismatch", role="home", started_ms=900)
+    return rec, verify_receipt(rec, referee_pub=ref.pubkey_hex)
+
+
+def test_pattern_mismatch_verifies_as_challenge_failed(tmp_path, capsys):
+    """match-20261024-135645: a wrong pattern is challenge_failed, never challenge_unanswered."""
+    import qorcap_challenge as C
+
+    filled = _mismatch_bundle(tmp_path / "bundle")
+    by_phase = {c["phase"]: c for c in filled["challenges"]}
+    kick = by_phase["kickoff"]["result"]
+    assert kick["ok"] is False and kick["reason"] == "pattern_mismatch"
+    assert kick["reverified_by"] == "recorder" and "rule" not in kick
+    assert isinstance(kick["hid_sha256"], str) and len(kick["hid_sha256"]) == 64
+    assert kick["done_ms"] is None and kick["latency_ms"] is None
+    assert isinstance(kick["pause_press_ms"], int)
+    assert by_phase["halftime"]["result"] is None and by_phase["end"]["result"] is None
+    lines = [json.loads(x) for x in (tmp_path / "bundle" / "challenge_results.jsonl").read_text().splitlines()]
+    assert lines[0]["reason"] == "pattern_mismatch" and lines[0]["ok"] is False
+    out = capsys.readouterr().out
+    assert "FAILED (pattern_mismatch)" in out and "PASSED" not in out
+
+    schema = json.loads((HERE.parent / "contracts" / "receipt.v0.json").read_text())
+    result_schema = schema["properties"]["challenges"]["items"]["properties"]["result"]["oneOf"]
+    assert result_schema[0] == {"type": "null"}
+    props = result_schema[1]["properties"]
+    assert props["ok"]["type"] == "boolean" and props["reason"]["type"] == "string"
+    assert "enum" not in props["reason"] and "enum" not in props["ok"]
+    assert set(kick) <= set(props) | {"reverified_by"}
+
+    _rec, v = _signed_from_challenges(tmp_path / "sign", filled["challenges"])
+    assert v["status"] == "FAIL"
+    assert "home:kickoff:challenge_failed:pattern_mismatch" in v["errors"]
+    assert "home:challenge_unanswered:kickoff" not in v["partial"]
+    assert "home:challenge_unanswered:halftime" in v["partial"]
+    assert "home:challenge_unanswered:end" in v["partial"]
+    assert C.receipt_result({"ok": False, "reason": "no_pause_press"}) is None
+    assert C.receipt_result({"ok": False, "reason": "pause_not_seen_on_video"}) is None
+    assert C.receipt_result({"ok": True, "reason": "ok"}) == {"ok": True, "reason": "ok"}
+
+
+def test_null_result_mutation_hides_the_mismatch(tmp_path, monkeypatch):
+    """The pre-fix drop (`ok` else null) must fail the mismatch check, not pass it."""
+    import qorcap_challenge as C
+
+    real, v_real = _signed_from_challenges(tmp_path / "real-sign", _mismatch_bundle(tmp_path / "real")["challenges"])
+    assert real["challenges"][0]["result"]["reason"] == "pattern_mismatch"
+    assert "home:kickoff:challenge_failed:pattern_mismatch" in v_real["errors"]
+    assert "home:challenge_unanswered:kickoff" not in v_real["partial"]
+
+    monkeypatch.setattr(C, "receipt_result", lambda res: res if isinstance(res, dict) and res.get("ok") else None)
+    mutated = _mismatch_bundle(tmp_path / "mutated")
+    assert mutated["challenges"][0]["result"] is None
+    _rec, v_bad = _signed_from_challenges(tmp_path / "mut-sign", mutated["challenges"])
+    assert "home:challenge_unanswered:kickoff" in v_bad["partial"]
+    assert "home:kickoff:challenge_failed:pattern_mismatch" not in v_bad["errors"]
+    assert v_bad["status"] == "SELF_ATTESTED"

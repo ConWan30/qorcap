@@ -279,8 +279,10 @@ From v0.3.11:
   still exactly 3 challenges (Q1–Q2, Q3, Q4/OT), one window open at a time. If no play-call screen is detected, the
   window opens 45 s after the clock starts running in that quarter. Every opening is logged in `challenge_gates.jsonl`.
 - **Receipt fix:** at the end QorCap re-runs each challenge on its own video and controller log (QorTime's rules).
-  Answered challenges are written into the receipt as passed. Up to v0.3.10 they always stayed empty
-  (`challenge_unanswered`). Misses stay empty and the reason is in `challenge_results.jsonl`.
+  A passed challenge is written into the receipt. A wrong pattern is written too, with `ok` false and
+  `reason` `pattern_mismatch`, so verify reports `challenge_failed`. Up to v0.3.10 every challenge stayed
+  empty (`challenge_unanswered`). A challenge nobody answered still stays empty, and the reason is in
+  `challenge_results.jsonl`.
 
 ### Signed submissions (v0.3.10)
 

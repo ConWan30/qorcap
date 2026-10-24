@@ -1726,7 +1726,9 @@ def fill_challenge_results(bundle: Path, draft: dict, *, ffmpeg: str | None = No
 
     QorCap <= 0.3.10 always signed ``result: null``, so a correctly answered challenge still verified as
     ``challenge_unanswered`` (match 2026-10-17 #4, 44b8d01f). An ok result goes into the receipt
-    (``reverified_by: recorder``); a miss stays null and its reason is written to challenge_results.jsonl and shown."""
+    (``reverified_by: recorder``). A wrong pattern (``ok`` false, ``reason`` ``pattern_mismatch``)
+    goes in too, so verify reports ``challenge_failed`` (match-20261024-135645). Any other miss stays
+    null; its reason is written to challenge_results.jsonl and shown."""
     chs = list(draft.get("challenges") or [])
     if not chs:
         return draft
@@ -1750,9 +1752,15 @@ def fill_challenge_results(bundle: Path, draft: dict, *, ffmpeg: str | None = No
     with open(bundle / "challenge_results.jsonl", "w", encoding="utf-8") as f:
         for c, o in zip(chs, outs):
             f.write(json.dumps(o["local"]) + "\n")
-            new.append(dict(c, result=o["result"]) if o["result"] is not None else c)
+            res = o["result"]
+            new.append(dict(c, result=res) if res is not None else c)
             loc = o["local"]
-            tag = "PASSED" if o["result"] is not None else f"not passed ({loc.get('reason')})"
+            if res is not None and res.get("ok") is True:
+                tag = "PASSED"
+            elif res is not None:
+                tag = f"FAILED ({res.get('reason')})"
+            else:
+                tag = f"not passed ({loc.get('reason')})"
             lat = f", pause on video {loc['latency_ms']} ms after OPTIONS" if loc.get("latency_ms") is not None else ""
             say(f"  Challenge {c.get('phase')} {str(c.get('id'))[:8]}: {tag}{lat}" + (f"  [{loc['note']}]" if loc.get("note") else ""))
     return dict(draft, challenges=new)
