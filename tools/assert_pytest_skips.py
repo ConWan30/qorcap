@@ -95,6 +95,7 @@ LINUX_FILES = (
     "sidecar/test_qorcap_match.py::test_reader_timing_log_names_the_three_clocks",
     "sidecar/test_qorcap_standard.py",
     "sidecar/test_qorcap_score_grammar.py",
+    "sidecar/test_qorcap_clock_vote.py",
     "sidecar/test_qorcap_hl170123.py",
     "sidecar/test_qorcap_seq125430.py",
     "sidecar/test_qorcap_tnp.py",
@@ -147,6 +148,7 @@ WINDOWS_FILES = (
     "sidecar/test_qorcap_match.py::test_reader_timing_log_names_the_three_clocks",
     "sidecar/test_qorcap_standard.py",
     "sidecar/test_qorcap_score_grammar.py",
+    "sidecar/test_qorcap_clock_vote.py",
     "sidecar/test_qorcap_tnp.py",
     "sidecar/test_qorcap_snp.py",
     "sidecar/test_qorcap_mnp.py",
@@ -168,11 +170,12 @@ WINDOWS_FILES = (
 # The floor is a minimum. A PR that adds tests, and any merge resolution, must
 # re-collect and set both floors to those exact counts. Leaving the old floor
 # keeps a dropped test green.
-# Collect-only of these lists on main 59009ad plus the guard tests in
-# tools/test_assert_pytest_skips.py. #96's suite, before those guard tests,
-# collected 580 linux / 562 windows. Re-collect after any list or test change.
-LINUX_MIN_COLLECTED = 596
-WINDOWS_MIN_COLLECTED = 578
+# pytest --collect-only -q of each --list with QORTIME importable, after adding
+# sidecar/test_qorcap_clock_vote.py on top of main e00d374 (596 linux / 578 windows).
+# Pin the same numbers in tools/test_assert_pytest_skips.py. Re-collect after any
+# list or test change.
+LINUX_MIN_COLLECTED = 675
+WINDOWS_MIN_COLLECTED = 657
 
 # Absent from both sidecar suites. A reason is required; whitespace does not count.
 EXCLUDED_TEST_FILES = {
