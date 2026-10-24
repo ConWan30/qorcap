@@ -628,6 +628,7 @@ def test_scorebug_between_menus_keeps_the_first_score_unconfirmed():
     assert "amends" not in core.final
     note = " ".join(n for n in core.final.get("notes") or [] if isinstance(n, str))
     assert "disagreed with the posted" in note and "not replaced" in note
+    assert "scorebug read came back between the two menus" in note
     finals = [p for p in posts if p.get("type") == "final"]
     # One confirmed post, then the dispute. A scorebug read must not post the menu again.
     assert len(finals) == 2
@@ -822,11 +823,11 @@ def test_live_call_passes_the_earliest_end_screen_match(monkeypatch):
     seen = {}
     real = qr.end_menu_delta_corroborated
 
-    def wrap(st, last, timeline, external, pixel_match_ms=missing):
+    def wrap(st, last, timeline, external, pixel_match_ms=missing, **rest):
         seen["pixel_match_ms"] = pixel_match_ms
         if pixel_match_ms is missing:
-            return real(st, last, timeline, external)
-        return real(st, last, timeline, external, pixel_match_ms=pixel_match_ms)
+            return real(st, last, timeline, external, **rest)
+        return real(st, last, timeline, external, pixel_match_ms=pixel_match_ms, **rest)
 
     monkeypatch.setattr(qr, "end_menu_delta_corroborated", wrap)
     core, _posts = _feed_end_screen_gap(5_200)
@@ -900,7 +901,7 @@ def test_scorebug_return_clears_the_earliest_end_screen_match():
     assert after.final.get("delta_corroboration") is None
 
 
-def _feed_labelled_screen_then_scorebug_then_menu(input_t):
+def _feed_labelled_screen_then_scorebug_then_menu(input_t, corr=None):
     """A committed end screen, then the scorebug comes back, then the real walk-off menu."""
     menu_reader = _LateDigits(10, 16, ready_at=20_000)
     posts = []
@@ -908,7 +909,7 @@ def _feed_labelled_screen_then_scorebug_then_menu(input_t):
                       final_screen_detector=madden_final_screen, end_menu_reader=menu_reader,
                       end_menu_agree=EndMenuAgreement())
     core.timeline = [{"t_ms": 1_000, "home": 10, "away": 10, "quarter": 4, "clock_s": 0, "clock_red": True}]
-    core.delta_corroboration = [{"kind": "input_activity", "t_ms": input_t}]
+    core.delta_corroboration = list(corr) if corr is not None else [{"kind": "input_activity", "t_ms": input_t}]
     menu = _menu()
     for t in (2_000, 3_200, 4_400, 5_600, 6_800):
         menu_reader.t = t
@@ -1014,6 +1015,260 @@ def test_note_only_end_menu_dispute_is_not_confirmed_offline():
     assert forced["away_score"] is None and forced["home_score"] is None
     assert forced["method"] == "last_scorebug_read_unconfirmed"
     assert any("abstains" in n for n in forced.get("notes") or [])
+
+
+def test_cutoff_counts_a_scorebug_that_shares_the_screen_time():
+    """A scorebug read at the screen's millisecond is still the cutoff. It is not discarded.
+
+    Excluding that time leaves no candidate. The fallback is the earliest screen, and it is
+    not None. This is the case a held touchdown posts on the menu frame.
+    """
+    tl = [{"t_ms": 1_000, "home": 10, "away": 10, "quarter": 4, "clock_s": 0},
+          {"t_ms": 5_000, "home": 10, "away": 16, "quarter": 4, "clock_s": 0}]
+    assert end_screen_evidence_cutoff_ms(tl, menu_t_ms=4_500, pixel_match_ms=5_000) == 5_000
+    # Every candidate is earlier than the scorebug read, including a timestamp that went backwards.
+    back = [{"t_ms": 9_000, "home": 10, "away": 10, "quarter": 4, "clock_s": 0}]
+    assert end_screen_evidence_cutoff_ms(back, menu_t_ms=2_000, pixel_match_ms=3_000) == 2_000
+
+
+class _Bar:
+    """One scorebug read. ``accepts_time`` so a stop-time re-read sees the frame clock."""
+
+    accepts_time = True
+
+    def __init__(self, script):
+        self.script = script
+
+    def read(self, _img, t_ms=0):
+        from qor_receipt._vendor.qoresence.vision.local_scorebug.reader import FrameRead
+        spec = self.script(t_ms)
+        if spec is None:
+            return FrameRead(ok=False, reason="layout_unknown", profile_id="qorcap-test")
+        away, home, quarter, clock = spec
+        return FrameRead(ok=True, reason="ok", profile_id="qorcap-test", left_score=away, right_score=home,
+                         quarter=quarter, clock_seconds=clock, clock_red=clock == 0, score_margin=0.4,
+                         score_conf=0.9, quarter_conf=0.9)
+
+
+class _AgreePair:
+    def __init__(self, pair):
+        self.pair = pair
+
+    def offer(self, fr, **_):
+        if getattr(fr, "ok", False) and getattr(fr, "pair", None) == self.pair:
+            return _Fin(agreed=True, read=fr)
+        return _Fin(agreed=False, read=None)
+
+
+class _QueuedMenu:
+    def __init__(self, reads):
+        self.reads = list(reads)
+        self.i = 0
+
+    def read(self, _img):
+        if self.i >= len(self.reads):
+            return self.reads[-1]
+        rd = self.reads[self.i]
+        self.i += 1
+        return rd
+
+
+def _td_flush_frames():
+    """10-10, a confusable 16-10 hold, two unreadable menu frames, then a readable 17-10 menu.
+
+    10 to 16 is a look-alike, so the hold is two seconds and wants two more bar frames.
+    Those land before the menu. The hold then ends on the first readable menu frame, and
+    the posted scorebug shares that frame's timestamp.
+    """
+    blank, menu = _blank(), _menu()
+    return ([(1_000, blank),
+             (2_000, blank), (2_300, blank), (2_600, blank), (2_900, blank),
+             (3_200, blank), (3_500, blank),
+             (4_200, menu), (4_500, menu),
+             (5_000, menu), (5_500, menu), (6_000, menu), (6_500, menu), (7_000, menu)])
+
+
+def _td_script(t_ms):
+    if t_ms < 1_500:
+        return (10, 10, 4, 0)
+    if t_ms < 4_000:
+        return (16, 10, 4, 0)
+    return None
+
+
+def _drive_td_flush(corr):
+    menu = _QueuedMenu([_Unread(), _Unread()] + [_MenuRead(17, 10)] * 8)
+    posts = []
+    core = ReaderCore(posts.append, _Bar(_td_script), _AgreePair((10, 10)), None, _detect_final,
+                      final_screen_detector=madden_final_screen, end_menu_reader=menu,
+                      end_menu_agree=EndMenuAgreement())
+    core.delta_corroboration = list(corr)
+    for t, img in _td_flush_frames():
+        core.on_frame(t, img)
+    return core, posts
+
+
+def test_touchdown_flush_on_the_menu_frame_does_not_confirm_later_input(tmp_path):
+    """A held touchdown posts on the menu frame. Input after that screen does not confirm.
+
+    Live input is 30 s later. The stop-time re-read loads input 8 s later and flushes the
+    same hold again. Dropping the shared timestamp makes the cutoff vanish and both confirm.
+    """
+    live, posts = _drive_td_flush([{"kind": "input_activity", "t_ms": 35_000}])
+    assert live.stats.get("touchdown_jump") == 1
+    scores = [p for p in posts if p.get("type") == "score"]
+    assert scores[-1]["t_ms"] == 5_000
+    assert (scores[-1]["away"], scores[-1]["home"]) == (16, 10)
+    assert live.final["basis"] == "end_menu"
+    assert (live.final["away"], live.final["home"]) == (17, 10)
+    assert live.final["final_confirmed"] is False
+    assert live.final.get("delta_corroboration") is None
+
+    bundle = tmp_path / "match-td-flush"
+    bundle.mkdir()
+    # The re-read replays the hold. The timeline it is seeded with is the score from before it.
+    (bundle / "timeline.jsonl").write_text(
+        json.dumps({"t_ms": 1_000, "home": 10, "away": 10, "quarter": 4, "clock_s": 0, "clock_red": True}) + "\n",
+        encoding="utf-8")
+    (bundle / "video.mp4").write_bytes(b"not-a-real-video")
+    (bundle / "manifest.jsonl").write_text(json.dumps({
+        "type": "segment", "seq": 0, "file": "video.mp4", "wall_ms": 7_000,
+    }) + "\n", encoding="utf-8")
+    (bundle / "inputs.jsonl").write_text(
+        json.dumps({"type": "in", "t_ms": 13_000, "b": 32}) + "\n", encoding="utf-8")
+    draft = {"result": {"home_score": 10, "away_score": 10, "quarter": 4, "winner": "tie",
+                        "method": "last_scorebug_read_unconfirmed", "final_confirmed": False}}
+
+    def factory(_post):
+        menu = _QueuedMenu([_Unread(), _Unread()] + [_MenuRead(17, 10)] * 8)
+        return ReaderCore(_post, _Bar(_td_script), _AgreePair((10, 10)), None, _detect_final,
+                          final_screen_detector=madden_final_screen, end_menu_reader=menu,
+                          end_menu_agree=EndMenuAgreement())
+
+    out = qm.tail_final_check(
+        bundle, draft, ffmpeg="ffmpeg", core_factory=factory, frames=_td_flush_frames(),
+        live_final=live.final)
+    res = out["result"]
+    assert res["method"] == "end_menu_read"
+    assert (res["away_score"], res["home_score"]) == (17, 10)
+    assert res["final_confirmed"] is False
+
+
+def test_evidence_on_the_earlier_end_screen_does_not_confirm():
+    """Input, haptic, and a clip from the first end screen through the scorebug return do not count.
+
+    Input after that return and before the new menu still does. That is the F1 case.
+    """
+    sha = "ab" * 32
+    for corr in (
+        [{"kind": "input_activity", "t_ms": 6_000}],
+        [{"kind": "haptic", "t_ms": 8_000}],
+        [{"kind": "score_change_clip", "t_ms": 7_000, "sha256": sha}],
+    ):
+        core = _feed_labelled_screen_then_scorebug_then_menu(6_000, corr=corr)
+        assert core.final["basis"] == "end_menu"
+        assert (core.final["away"], core.final["home"]) == (10, 16)
+        assert core.final["final_confirmed"] is False
+        assert core.final.get("delta_corroboration") is None
+
+
+def _forge_script(t_ms):
+    if t_ms < 2_000:
+        return (7, 10, 4, 30)
+    if t_ms == 8_000:
+        return (7, 10, 4, 0)
+    return None
+
+
+def test_forged_scorebug_after_a_rejected_menu_does_not_confirm_navigation():
+    """A menu rejected for a running clock, one forged 0:00 frame, then the menu again.
+
+    Navigation input at 5 s is on the first screen. It does not confirm the walk-off.
+    One unreadable frame after the forged read does not reuse the rejected agreement.
+    """
+    blank, menu = _blank(), _menu()
+    one = _QueuedMenu([_MenuRead(14, 10)] * 8 + [_Unread()])
+    posts = []
+    core = ReaderCore(posts.append, _Bar(_forge_script), _Agree(), None, _detect_final,
+                      final_screen_detector=madden_final_screen, end_menu_reader=one,
+                      end_menu_agree=EndMenuAgreement())
+    core.delta_corroboration = [{"kind": "input_activity", "t_ms": 5_000}]
+    for t, img in ((1_000, blank), (4_000, menu), (4_500, menu), (5_000, menu), (5_500, menu),
+                   (6_000, menu), (6_500, menu), (7_000, menu), (7_200, menu), (8_000, blank),
+                   (8_500, menu)):
+        core.on_frame(t, img)
+    assert core.end_menu_rejected and "clock not 0:00" in core.end_menu_rejected.get("why", "")
+    assert core.end_menu_agree.stable is None
+    assert core.end_menu is None
+    assert core.final is None
+
+    again = _QueuedMenu([_MenuRead(14, 10)] * 16)
+    posts = []
+    core = ReaderCore(posts.append, _Bar(_forge_script), _Agree(), None, _detect_final,
+                      final_screen_detector=madden_final_screen, end_menu_reader=again,
+                      end_menu_agree=EndMenuAgreement())
+    core.delta_corroboration = [{"kind": "input_activity", "t_ms": 5_000}]
+    # 4.0 s through 7.2 s is long enough to keep the labelled screen after the forged read.
+    for t, img in ((1_000, blank), (4_000, menu), (4_500, menu), (5_000, menu), (5_500, menu),
+                   (6_000, menu), (6_500, menu), (7_000, menu), (7_200, menu), (8_000, blank),
+                   (8_500, menu), (9_000, menu), (9_500, menu), (10_000, menu)):
+        core.on_frame(t, img)
+    assert core.final["basis"] == "end_menu"
+    assert (core.final["away"], core.final["home"]) == (14, 10)
+    assert core.final["final_confirmed"] is False
+    assert not any(p.get("final_confirmed") is True for p in posts)
+
+
+def test_menu_frames_do_not_agree_across_a_scorebug_read():
+    """Two menu frames, a scorebug read, then one menu frame is not an agreement.
+
+    Keeping the streak would post 10-16 from a frame that started before the scorebug returned.
+    """
+    blank, menu = _blank(), _menu()
+    posts = []
+    core = ReaderCore(posts.append, _Scorebug(10, 10, 4, 0, True), _Agree(), None, _detect_final,
+                      final_screen_detector=madden_final_screen, end_menu_reader=_MenuReader(10, 16),
+                      end_menu_agree=EndMenuAgreement())
+    for t, img in ((1_000, blank), (4_000, menu), (4_250, menu), (4_500, blank), (4_750, menu)):
+        core.on_frame(t, img)
+    assert core.end_menu_agree.stable is None
+    # The single post-return frame is the whole streak. Frames from before the read are gone.
+    assert core.end_menu_agree.streak == [(4_750, 10, 16)]
+    assert core.end_menu is None
+    assert core.final is None
+    assert not any(p.get("type") == "final" for p in posts)
+
+
+def test_stale_replay_misread_is_not_confirmed():
+    """A 0-6 replay after a real 7-6, then a menu misread as 8-6, does not confirm.
+
+    The input is on the first end screen, before the replay. It is not evidence for 8-6.
+    """
+    def script(t_ms):
+        if t_ms < 3_000:
+            return (7, 6, 4, 0)
+        if 9_000 <= t_ms <= 12_000:
+            return (0, 6, 4, 0)
+        return None
+
+    blank, menu = _blank(), _menu()
+    menu_reader = _LateDigits(8, 6, ready_at=14_000)
+    posts = []
+    core = ReaderCore(posts.append, _Bar(script), _Agree(), None, _detect_final,
+                      final_screen_detector=madden_final_screen, end_menu_reader=menu_reader,
+                      end_menu_agree=EndMenuAgreement())
+    core.delta_corroboration = [{"kind": "input_activity", "t_ms": 5_000}]
+    for t, img in ((1_000, blank), (2_000, blank), (4_000, menu), (5_000, menu), (6_000, menu),
+                   (7_000, menu), (8_000, menu), (10_000, blank), (11_000, blank),
+                   (14_000, menu), (14_500, menu), (15_000, menu), (15_500, menu)):
+        if t >= 14_000:
+            menu_reader.t = t
+        core.on_frame(t, img)
+    assert core.final is not None
+    assert (core.final["away"], core.final["home"]) == (8, 6)
+    assert core.final["final_confirmed"] is False
+    assert not any(
+        p.get("away") == 8 and p.get("home") == 6 and p.get("final_confirmed") is True for p in posts)
 
 
 # ---------------------------------------------------------------- chain model (tests only)

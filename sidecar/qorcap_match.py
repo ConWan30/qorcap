@@ -2420,6 +2420,7 @@ def end_menu_was_disputed(fin) -> bool:
 
     Only an end-menu final counts. A scorebug final (``clock_zero``, ``final_screen``,
     ``scorebug_gone``) that carries the same flag or the same sentence is not a dispute.
+    That gate is defensive: the reader sets the flag only on an end-menu final.
 
     The flag is on the posted final. The note is the receipt-visible record: receipt
     schema drops unknown result fields, and this note is already one of them. Either
@@ -2463,7 +2464,8 @@ def _disputed_final_result(draft: dict, live_final: dict, *, grammar_unresolved:
 
     A final that is not an end menu is not rewritten here. ``grammar_unresolved`` still
     reaches ``apply_final``, so a scorebug final abstains instead of being forced into
-    the dispute shape.
+    the dispute shape. Both are defensive. Only an end-menu final is disputed, and
+    ``apply_final`` ignores the grammar flag for those.
     """
     result = apply_final(draft.get("result") or {}, live_final, grammar_unresolved=grammar_unresolved)
     if not is_end_menu_final(live_final):

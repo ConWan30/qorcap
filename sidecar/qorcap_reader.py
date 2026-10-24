@@ -920,6 +920,10 @@ class ReaderCore:
         # scorebug read, so a one-frame gap cannot move the input cutoff forward.
         self._pixel_match_since: int | None = None
         self._end_screen_earliest: int | None = None
+        # Earliest pixel match of this capture. A scorebug read clears ``_end_screen_earliest``
+        # so the next screen has its own cutoff, but evidence from this first match through
+        # that read is still not the scoring play.
+        self._end_screen_seen_ms: int | None = None
         self._options_presses_ms: list[int] = []
         self._options_lock = threading.Lock()
         # Frame cadence and a visible-but-unlocked bar. These spans are diagnostics.
@@ -1023,6 +1027,7 @@ class ReaderCore:
         # end-of-game context, and treat an OPTIONS press that hid the scorebug as a pause until
         # the picture has stayed up long enough that it cannot be the scripted pause menu.
         if self.final_screen_detector is not None and self.final_screen_detector(img):
+            self._note_end_screen_time(t_ms)
             if self._pixel_match_since is None:
                 self._pixel_match_since = t_ms
             if self._end_screen_earliest is None:
@@ -1343,6 +1348,12 @@ class ReaderCore:
         # The scorebug is back. A new end screen starts its own cutoff.
         # A posted end menu stays posted. A later menu with a different score does not
         # replace it and does not confirm it (see ``_note_end_menu_disagreement``).
+        # Frames from before this read are not the same showing. Drop the streak and any
+        # score it had already reached, including one the clock gate had rejected.
+        agree = self.end_menu_agree
+        if agree is not None:
+            agree.streak = []
+            agree.stable = None
         self._end_screen_earliest = None
         self._close_spans()  # a fresh score read ends any absence span
         self._check_final(t_ms)
@@ -1367,6 +1378,8 @@ class ReaderCore:
             raw = bool(absent and self.final_screen_detector and self.final_screen_detector(img))
             if raw and self._pixel_match_since is None:
                 self._pixel_match_since = t_ms
+            if raw:
+                self._note_end_screen_time(t_ms)
             if raw and self._end_screen_earliest is None:
                 self._end_screen_earliest = t_ms
             screen = bool(raw and self._accept_final_screen(t_ms))
@@ -1390,6 +1403,14 @@ class ReaderCore:
         self._commit_span(self._absent)
         self._commit_span(self._screen)
         self._absent = self._screen = None
+
+    def _note_end_screen_time(self, t_ms: int) -> None:
+        """Remember the earliest end-screen pixel match. A later scorebug read does not erase it."""
+        if isinstance(t_ms, bool) or not isinstance(t_ms, int):
+            return
+        seen = self._end_screen_seen_ms
+        if seen is None or t_ms < seen:
+            self._end_screen_seen_ms = t_ms
 
     def last_scorebug(self) -> dict | None:
         return next((r for r in reversed(self.timeline) if "obs" not in r and "home" in r), None)
@@ -1548,7 +1569,8 @@ class ReaderCore:
               "t_ms": last["t_ms"]}
         notes = list(notes_c)
         corr = end_menu_delta_corroborated(
-            st, last, self.timeline, self.delta_corroboration, pixel_match_ms=self._end_screen_earliest)
+            st, last, self.timeline, self.delta_corroboration, pixel_match_ms=self._end_screen_earliest,
+            first_screen_ms=self._end_screen_seen_ms)
         confirmed = corr is not None and corr.get("kind") != "no_scorebug"
         if (sb["away"], sb["home"]) != (st["away"], st["home"]):
             notes.append(f"final play score not shown on scorebug: last scorebug read AWAY {sb['away']} - HOME {sb['home']}"
@@ -1590,8 +1612,8 @@ class ReaderCore:
         notes = [n for n in (self.final.get("notes") or []) if isinstance(n, str)]
         notes.append(
             f"later end-of-game menu read AWAY {st['away']} - HOME {st['home']} disagreed with the posted "
-            f"final AWAY {self.final.get('away')} - HOME {self.final.get('home')}; score not replaced; "
-            "final_confirmed=false")
+            f"final AWAY {self.final.get('away')} - HOME {self.final.get('home')} after a scorebug read "
+            "came back between the two menus; score not replaced; final_confirmed=false")
         self.final = dict(self.final)
         self.final["final_confirmed"] = False
         self.final["end_menu_disputed"] = True
@@ -1665,7 +1687,8 @@ def end_menu_consistency(st: dict, last: dict | None) -> str | None:
 
 
 def end_menu_delta_corroborated(st: dict, last: dict | None, timeline: list[dict] | None,
-                                external: list[dict] | None, pixel_match_ms: int | None = None) -> dict | None:
+                                external: list[dict] | None, pixel_match_ms: int | None = None,
+                                first_screen_ms: int | None = None) -> dict | None:
     """For a one-legal-step end-menu delta, return a corroboration record or None.
 
     Acceptable evidence (any one):
@@ -1676,12 +1699,15 @@ def end_menu_delta_corroborated(st: dict, last: dict | None, timeline: list[dict
 
     Button and haptic evidence at or after the end screen does not count. That time is
     the first pixel match or the first agreeing menu frame, and also any ``final_screen``
-    row already on the timeline, but only when that time is after the latest scorebug
-    read. A screen from before the scorebug came back is not this end. A missing label
-    is not a missing screen: the menu frame and the pixel match are enough. Menu
-    navigation during the post-final tail must not flip ``final_confirmed``. A
-    score-change clip from that same moment onward is ignored for the same reason. A
-    scorebug read already on the timeline still counts: that is the score, not an input.
+    row already on the timeline. A time shared with the latest scorebug read still counts:
+    a held touchdown can post on the menu frame. Evidence from the first end screen
+    through that scorebug read does not count either. The scorebug that came back still
+    showed the old score, so that input is not the scoring play. Only evidence after the
+    latest scorebug read, and before the next screen, counts. A missing label is not a
+    missing screen: the menu frame and the pixel match are enough. Menu navigation during
+    the post-final tail must not flip ``final_confirmed``. A score-change clip from that
+    same moment onward is ignored for the same reason. A scorebug read already on the
+    timeline still counts: that is the score, not an input.
     """
     if last is None:
         return {"kind": "no_scorebug"}
@@ -1699,6 +1725,11 @@ def end_menu_delta_corroborated(st: dict, last: dict | None, timeline: list[dict
     hi = int(st.get("t_ms") or last.get("t_ms") or 0) + 120_000
     menu_t = st.get("t_ms") if isinstance(st, dict) else None
     cutoff = end_screen_evidence_cutoff_ms(timeline, menu_t_ms=menu_t, pixel_match_ms=pixel_match_ms)
+    first = _earliest_end_screen_ms(timeline, menu_t_ms=menu_t, pixel_match_ms=pixel_match_ms)
+    remembered = _as_ms(first_screen_ms)
+    if remembered is not None:
+        first = remembered if first is None else min(first, remembered)
+    scorebug_t = _latest_scorebug_ms(timeline)
     for ev in external or []:
         kind = ev.get("kind") or ""
         t = ev.get("t_ms")
@@ -1708,11 +1739,56 @@ def end_menu_delta_corroborated(st: dict, last: dict | None, timeline: list[dict
             if kind == "score_change_clip" and not ev.get("sha256"):
                 continue
             # Tail input is not evidence of the scoring play. Clips cut off at the same instant.
-            if cutoff is not None and kind in ("input_activity", "haptic", "score_change_clip"):
-                if t is None or int(t) >= cutoff:
+            # Evidence on an earlier screen, up through the scorebug that came back, is not either.
+            if kind in ("input_activity", "haptic", "score_change_clip"):
+                if (first is not None and scorebug_t is not None and t is not None
+                        and not isinstance(t, bool) and first <= int(t) <= scorebug_t):
+                    continue
+                if cutoff is not None and (t is None or int(t) >= cutoff):
                     continue
             return {"kind": kind, **{k: ev[k] for k in ev if k != "kind"}}
     return None
+
+
+def _as_ms(t):
+    if isinstance(t, bool) or not isinstance(t, int):
+        return None
+    return t
+
+
+def _latest_scorebug_ms(timeline: list[dict] | None) -> int | None:
+    """Latest scorebug row. Observation rows are not reads."""
+    latest = None
+    for r in timeline or []:
+        if not isinstance(r, dict) or "obs" in r or "home" not in r:
+            continue
+        t = _as_ms(r.get("t_ms"))
+        if t is None:
+            continue
+        if latest is None or t > latest:
+            latest = t
+    return latest
+
+
+def _end_screen_candidates_ms(timeline: list[dict] | None, *, menu_t_ms=None,
+                              pixel_match_ms=None) -> list[int]:
+    times = []
+    for t in (menu_t_ms, pixel_match_ms):
+        ms = _as_ms(t)
+        if ms is not None:
+            times.append(ms)
+    for r in timeline or []:
+        if isinstance(r, dict) and r.get("obs") == "final_screen":
+            ms = _as_ms(r.get("t_ms"))
+            if ms is not None:
+                times.append(ms)
+    return times
+
+
+def _earliest_end_screen_ms(timeline: list[dict] | None, *, menu_t_ms=None,
+                            pixel_match_ms=None) -> int | None:
+    times = _end_screen_candidates_ms(timeline, menu_t_ms=menu_t_ms, pixel_match_ms=pixel_match_ms)
+    return min(times) if times else None
 
 
 def end_screen_evidence_cutoff_ms(timeline: list[dict] | None, *, menu_t_ms=None,
@@ -1721,39 +1797,22 @@ def end_screen_evidence_cutoff_ms(timeline: list[dict] | None, *, menu_t_ms=None
 
     The screen is the first pixel match or the first agreeing menu frame. A ``final_screen``
     timeline row is the same picture when the classifier labelled it. The cutoff is the
-    earliest of those. Dropped flashes are not on the timeline, and a tie that was labelled
-    is not required: the menu frame or the pixel match is enough on its own.
+    earliest of those that is at or after the latest scorebug read. A shared millisecond
+    counts: a held touchdown posts on the menu frame, and duplicate timestamps do too.
 
-    Only times strictly after the latest scorebug read count. A labelled screen from
-    before that read is an earlier picture: the scorebug came back, so it is not the end.
-    With no scorebug read on the timeline, every one of those times still counts.
+    A labelled screen from before that read is an earlier picture. If every candidate is
+    earlier, including when a frame timestamp went backwards, the cutoff is the earliest
+    candidate. It does not disappear. With no scorebug read, every candidate still counts.
+    With no candidate, there is no screen and the result is None.
     """
-    scorebug_t = None
-    for r in timeline or []:
-        if not isinstance(r, dict) or "obs" in r or "home" not in r:
-            continue
-        t = r.get("t_ms")
-        if isinstance(t, bool) or not isinstance(t, int):
-            continue
-        if scorebug_t is None or t > scorebug_t:
-            scorebug_t = t
-    cut = None
-
-    def consider(t):
-        nonlocal cut
-        if isinstance(t, bool) or not isinstance(t, int):
-            return
-        if scorebug_t is not None and t <= scorebug_t:
-            return
-        if cut is None or t < cut:
-            cut = t
-
-    consider(menu_t_ms)
-    consider(pixel_match_ms)
-    for r in timeline or []:
-        if isinstance(r, dict) and r.get("obs") == "final_screen":
-            consider(r.get("t_ms"))
-    return cut
+    times = _end_screen_candidates_ms(timeline, menu_t_ms=menu_t_ms, pixel_match_ms=pixel_match_ms)
+    if not times:
+        return None
+    scorebug_t = _latest_scorebug_ms(timeline)
+    if scorebug_t is None:
+        return min(times)
+    later = [t for t in times if t >= scorebug_t]
+    return min(later) if later else min(times)
 
 
 
