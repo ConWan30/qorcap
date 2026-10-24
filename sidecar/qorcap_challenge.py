@@ -46,15 +46,34 @@ live frame clock passed to ``ReaderCore.on_frame`` (wall time while recording). 
 only writes the close stamp. The official referee uses this same PTS clock only for challenge rule
 v2 (``bundle.json`` ``challenge_rule`` = 2): pause 0..2500 ms, and the successful latencies within
 ±300 ms of their median. A bundle with no ``challenge_rule`` stays on rule v1 (``segment_ranges``,
-0..600 ms). Nothing here is submitted to the referee. An ok result is ``reverified_by: recorder``
-and carries no ``rule`` field, so a local receipt keeps the v1 evidence check.
+0..600 ms). Nothing here is submitted to the referee. A pass is ``reverified_by: recorder``
+and carries no ``rule`` field, so that pass stays on the v1 evidence check.
+A ``pattern_mismatch`` is stored only when ``inputs.jsonl`` can support it: every
+non-empty line parses as a JSON object, there is one header row, chunk rows cover
+the window with no gap over 3000 ms, and the pad stayed ``connected`` from
+``issued_ms`` through ``deadline_ms + 2500``. The extra 2500 ms is the stall-detection
+lag. The verifier then reports ``challenge_failed`` and does not run the evidence check.
+OPTIONS alone, and OPTIONS before the deadline with the rest of the pattern after it,
+are that failure when the log passes. A stall, including one written just after the
+deadline, an unplug, a reconnect gap, a torn line anywhere in the file, or a log that
+ends inside the window leaves ``result`` null. ``video_before_input``,
+``video_latency_too_high``, ``pause_not_seen_on_video``, and ``no_pause_press`` stay
+null as well.
 """
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
 CAPTURE_PAUSE_MAX_LATENCY_MS = 2_500
+# inputs.rs writes "stalled" only after 2 s with no HID reports, on the next 100 ms read timeout.
+STALL_LAG_MS = 2_500
+# One inputs chunk per fMP4 segment. frag_mp4_args uses min_frag_duration 2 s, and the encoder
+# GOP is one second, so a chunk is about 2 s apart and at most 3 s.
+CHUNK_INTERVAL_MS = 2_000
+CHUNK_GAP_SLACK_MS = 1_000
+CHUNK_GAP_MAX_MS = CHUNK_INTERVAL_MS + CHUNK_GAP_SLACK_MS
 # Measured pause menus: kickoff full 16.2–16.6, end full 21.1 / lower 13.3. Gameplay on the same
 # capture is luma 60–110. 26 / 16 sits between those and still requires the white-text fraction.
 CAPTURE_PAUSE_MAX_LUMA = 26.0
@@ -172,6 +191,132 @@ def capture_clock(segments: list[dict[str, Any]]) -> tuple[float, float]:
     return 0.0, _NOMINAL_MS
 
 
+def receipt_result(res: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Object to store for one recheck, before the controller-log gate.
+
+    ``receipt.v0`` allows null, or boolean ``ok`` plus string ``reason``. A pass is
+    returned. ``pattern_mismatch`` is returned so the caller can still withhold it when
+    the log is not trustworthy. ``video_before_input`` and ``video_latency_too_high``
+    are not returned. A null result verifies as ``challenge_unanswered``.
+    """
+    if not isinstance(res, dict):
+        return None
+    if res.get("ok") is True:
+        return res
+    if res.get("ok") is False and res.get("reason") == "pattern_mismatch":
+        return res
+    return None
+
+
+def inputs_log_intact(path: str | Path) -> bool:
+    """False when ``inputs.jsonl`` is missing or any line is not one JSON object.
+
+    The recheck's JSONL reader skips a corrupt line and drops a value that is not an
+    object, so the presses that remain can look like a short pattern. A torn line, a
+    bare ``42`` or ``[]``, or a second ``header`` row is not a player failure.
+    """
+    try:
+        raw = Path(path).read_bytes()
+    except OSError:
+        return False
+    if not raw:
+        return True
+    headers = 0
+    for line in raw.decode("utf-8", "replace").splitlines():
+        if not line.strip():
+            continue
+        try:
+            val = json.loads(line)
+        except json.JSONDecodeError:
+            return False
+        if not isinstance(val, dict):
+            return False
+        if val.get("type") == "header":
+            headers += 1
+            if headers > 1:
+                return False
+    return True
+
+
+def pad_connected_through(records: list, *, issued_ms: int, deadline_ms: int, anchor_ms: int) -> bool:
+    """True when status records show ``connected`` from issue through the stall lag.
+
+    Every status row at the latest wall time at or before ``issued_ms`` must be
+    ``connected``. A non-connected row at that same millisecond withholds, whichever
+    row would sort last. Any later status other than ``connected`` through
+    ``deadline_ms + STALL_LAG_MS`` fails too, including an unplug that reconnects
+    before the deadline. A ``stalled`` row is written only after 2 s with no reports,
+    so the check runs 2.5 s past the deadline. A status row whose ``t_us`` is not an
+    integer, or whose ``state`` is not a string, fails closed even outside that span.
+    Times are the same wall clock as ``press_events`` (header ``wall_anchor_ms`` plus
+    ``t_us``).
+    """
+    events: list[tuple[int, str]] = []
+    for r in records:
+        if not isinstance(r, dict) or r.get("type") != "status":
+            continue
+        t_us, state = r.get("t_us"), r.get("state")
+        if isinstance(t_us, bool) or not isinstance(t_us, int) or not isinstance(state, str):
+            return False
+        events.append((anchor_ms + t_us // 1000, state))
+    events.sort()
+    last_open: int | None = None
+    for t, _state in events:
+        if t <= issued_ms:
+            last_open = t
+        else:
+            break
+    if last_open is None or any(state != "connected" for t, state in events if t == last_open):
+        return False
+    end = deadline_ms + STALL_LAG_MS
+    return all(state == "connected" for t, state in events if last_open < t <= end)
+
+
+def chunks_cover(records: list, *, issued_ms: int, deadline_ms: int, anchor_ms: int) -> bool:
+    """Chunk rows cover the window. Only ``type`` ``chunk`` rows with an integer ``t_us`` count.
+
+    Coverage opens at the latest chunk at or before ``issued_ms``. A chunk after ``issued_ms``
+    does not open it. Each next chunk is at most ``CHUNK_GAP_MAX_MS`` after the previous one,
+    through a chunk at or after ``deadline_ms``. A last chunk before the deadline does not
+    cover, even when the deadline is within that bound. The step from the opening chunk
+    already requires ``issued_ms - prev`` to be inside the bound, so that gap is not checked
+    on its own. Times are header ``wall_anchor_ms`` plus ``t_us``.
+    """
+    times = sorted({
+        anchor_ms + r["t_us"] // 1000
+        for r in records
+        if isinstance(r, dict) and r.get("type") == "chunk"
+        and isinstance(r.get("t_us"), int) and not isinstance(r.get("t_us"), bool)
+    })
+    if not times:
+        return False
+    prev: int | None = None
+    i = 0
+    while i < len(times) and times[i] <= issued_ms:
+        prev = times[i]
+        i += 1
+    if prev is None:
+        return False
+    if prev >= deadline_ms:
+        return True
+    while i < len(times):
+        if times[i] - prev > CHUNK_GAP_MAX_MS:
+            return False
+        prev = times[i]
+        i += 1
+        if prev >= deadline_ms:
+            return True
+    return False
+
+
+def mismatch_log_trustworthy(bundle: str | Path, records: list, *, issued_ms: int, deadline_ms: int,
+                             anchor_ms: int) -> bool:
+    """A pattern mismatch may be signed only when the controller log can support it."""
+    return inputs_log_intact(Path(bundle) / "inputs.jsonl") and pad_connected_through(
+        records, issued_ms=issued_ms, deadline_ms=deadline_ms, anchor_ms=anchor_ms) and chunks_cover(
+        records, issued_ms=issued_ms, deadline_ms=deadline_ms, anchor_ms=anchor_ms)
+
+
 def frame_mono_ms(clock: tuple[float, float], pts0_ms: float, n: int, hz: float) -> int:
     """Capture mono time of decoded frame ``n`` in a run whose first sample PTS is ``pts0_ms``."""
     intercept, slope = clock
@@ -240,6 +385,13 @@ def challenge_results(d: str | Path, challenges: list[dict[str, Any]], *, decode
                      capture_pause_max_ms=CAPTURE_PAUSE_MAX_LATENCY_MS)
         if note:
             local["note"] = note
-        return {"result": res if res["ok"] else None, "local": local}
+        stored = receipt_result(res)
+        if stored is not None and res.get("reason") == "pattern_mismatch":
+            anchor = B.wall_anchor(b) or 0
+            if not mismatch_log_trustworthy(
+                    d, b.inputs + b.input_chunks, issued_ms=issued, deadline_ms=deadline, anchor_ms=anchor):
+                stored = None
+                local["withheld"] = "controller_log"
+        return {"result": stored, "local": local}
 
     return [rerun(c) for c in challenges]

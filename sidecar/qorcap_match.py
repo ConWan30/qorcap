@@ -1726,7 +1726,18 @@ def fill_challenge_results(bundle: Path, draft: dict, *, ffmpeg: str | None = No
 
     QorCap <= 0.3.10 always signed ``result: null``, so a correctly answered challenge still verified as
     ``challenge_unanswered`` (match 2026-10-17 #4, 44b8d01f). An ok result goes into the receipt
-    (``reverified_by: recorder``); a miss stays null and its reason is written to challenge_results.jsonl and shown."""
+    (``reverified_by: recorder``). A ``pattern_mismatch`` is written when every line of
+    ``inputs.jsonl`` is one JSON object, there is a single header, chunk rows cover the window
+    with no gap over 3 s, and the pad stayed connected from issue through 2.5 s after the
+    deadline. From 0.3.34 a chunk row, including an empty one, is written every segment while
+    the HID reader is alive (it has returned from a read since the previous seal). A hung read
+    writes none, so a hang that spans a whole segment leaves a gap and withholds. OPTIONS alone and a
+    pattern whose later buttons fall after the deadline count. Verify then reports
+    ``challenge_failed``, and Start Match exits 2 without the submit prompt. Submit for
+    Verification still works later. A stall, including one recorded just after the deadline, an
+    unplug, a reconnect gap, a torn line, or a log that ends inside the window stays null.
+    ``video_before_input`` and ``video_latency_too_high`` stay null. The jsonl line always keeps
+    the recheck. A withheld mismatch adds ``withheld: controller_log``. That file is not a contract."""
     chs = list(draft.get("challenges") or [])
     if not chs:
         return draft
@@ -1750,9 +1761,15 @@ def fill_challenge_results(bundle: Path, draft: dict, *, ffmpeg: str | None = No
     with open(bundle / "challenge_results.jsonl", "w", encoding="utf-8") as f:
         for c, o in zip(chs, outs):
             f.write(json.dumps(o["local"]) + "\n")
-            new.append(dict(c, result=o["result"]) if o["result"] is not None else c)
+            res = o["result"]
+            new.append(dict(c, result=res) if res is not None else c)
             loc = o["local"]
-            tag = "PASSED" if o["result"] is not None else f"not passed ({loc.get('reason')})"
+            if res is not None and res.get("ok") is True:
+                tag = "PASSED"
+            elif res is not None:
+                tag = f"FAILED ({res.get('reason')})"
+            else:
+                tag = f"not passed ({loc.get('reason')})"
             lat = f", pause on video {loc['latency_ms']} ms after OPTIONS" if loc.get("latency_ms") is not None else ""
             say(f"  Challenge {c.get('phase')} {str(c.get('id'))[:8]}: {tag}{lat}" + (f"  [{loc['note']}]" if loc.get("note") else ""))
     return dict(draft, challenges=new)

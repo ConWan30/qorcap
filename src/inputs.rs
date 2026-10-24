@@ -10,8 +10,11 @@
 //! * chunk hashes are chained `head_n = SHA-256(JCS({prev, seq, sha256}))` (same rule as the video chain) and a
 //!   `{"type":"chunk",...}` line is written after the records.
 //!
-//! A chunk with no records hashes to SHA-256(JCS([])), exactly what QorCap <= 0.2.2 wrote, so bundles without a
-//! controller stay byte-compatible. Controller presence changes (`connected` / `missing` / `unplugged` /
+//! A chunk with no records hashes to SHA-256(JCS([])), exactly what QorCap <= 0.2.2 wrote. From 0.3.34 that
+//! empty chunk is still written, one per segment, when the HID logger thread has returned from a read since
+//! the previous seal. The fMP4 reader thread is the one that appends the line (`Engine::on_segment` calls
+//! `seal`). A hung `dev.read` never returns, so the beat does not move and that seal writes no row. The
+//! challenge gate then sees a gap and does not sign the mismatch. Controller presence changes (`connected` / `missing` / `unplugged` /
 //! `stalled`) are themselves records, so absence is committed rather than hidden. Each `connected` record
 //! on a new log carries `pad_id` (USB serial, or a device instance id / hidraw id). The reader never writes
 //! an output report or a feature report.
@@ -139,6 +142,10 @@ pub struct InputLog {
     haptic_path: Option<PathBuf>,
     wall_anchor_ms: u64,
     imu_committed: Option<(bool, u32)>,
+    /// Times the HID logger thread has returned from `dev.read`.
+    hid_beats: u64,
+    /// `hid_beats` already consumed by a seal. Equal means the reader has not returned since.
+    sealed_beats: u64,
 }
 
 impl InputLog {
@@ -146,7 +153,8 @@ impl InputLog {
         let haptic_path = path.as_ref().map(|p| p.with_file_name(haptics_file_name(p)));
         let mut l = InputLog { path, pending: vec![], head: GENESIS.into(), chunks: 0, total_records: 0, last_logged: None,
             live: Live { enabled, state: if enabled { "searching".into() } else { "off".into() }, ..Default::default() },
-            detector: Detector::new(wall_anchor_ms), haptic_path, wall_anchor_ms, imu_committed: None };
+            detector: Detector::new(wall_anchor_ms), haptic_path, wall_anchor_ms, imu_committed: None,
+            hid_beats: 0, sealed_beats: 0 };
         if enabled {
             l.pending.push(json!({"type": "header", "schema": SCHEMA, "t_us": 0,
                 "clock": "qorcap-mono-us (same Instant as manifest/checkpoint mono_ms)", "wall_anchor_ms": wall_anchor_ms,
@@ -247,7 +255,15 @@ impl InputLog {
     /// Records not yet sealed (used by `input-test`, which never seals).
     pub fn pending(&self) -> &[Value] { &self.pending }
 
+    /// The HID logger thread calls this on every `dev.read` return. A hung read never does.
+    pub fn note_hid_alive(&mut self) { self.hid_beats = self.hid_beats.saturating_add(1); }
+
     /// Seal everything pending into chunk `seg`. Returns (chunk_sha256, chain_head, n_records).
+    ///
+    /// Called on the fMP4 reader thread from `Engine::on_segment`. An empty segment (`n == 0`)
+    /// still appends a chunk row when `note_hid_alive` has run since the previous seal. If the
+    /// HID logger thread is blocked inside `dev.read`, the beat is unchanged and this returns
+    /// without a row, so the challenge gate withholds.
     pub fn seal(&mut self, seg: u64, t_us: u64) -> (String, String, usize) {
         if self.live.reports > 0 {
             let now = (self.detector.live.imu_present, self.detector.live.imu_rate_hz);
@@ -267,7 +283,12 @@ impl InputLog {
         }
         let sha = ev::jcs_sha(&Value::Array(recs.clone()));
         let n = recs.len();
-        if n == 0 { return (sha, self.head.clone(), 0); }
+        // Spend the beat before the append. A failed write must not leave it for a later empty
+        // seal: that seal did not see a new `dev.read` return.
+        let beats = self.hid_beats;
+        let reader_alive = beats != self.sealed_beats;
+        if n == 0 && !reader_alive { return (sha, self.head.clone(), 0); }
+        if reader_alive { self.sealed_beats = beats; }
         let prev = self.head.clone();
         let head = ev::link(&prev, self.chunks, &sha);
         let chunk = json!({"type": "chunk", "seq": self.chunks, "seg": seg, "n": n, "sha256": sha, "prev": prev, "head": head, "t_us": t_us});
@@ -278,6 +299,7 @@ impl InputLog {
             if let Err(e) = append_bytes(p, body.as_bytes()) {
                 // The chunk is not on disk, so the chain must not move. The records stay pending and
                 // the next segment seals them. A checkpoint for this segment then commits the empty hash.
+                // The beat stays spent.
                 warn!("cannot write {}: {e}; input chunk not sealed (chain unchanged)", p.display());
                 self.pending = recs;
                 return (empty_hash(), self.head.clone(), 0);
@@ -340,22 +362,28 @@ where F: Fn() -> Result<Box<dyn ReportSource>, String> + Send + 'static {
                         match dev.read(&mut buf, 100) {
                             Ok(Some(n)) => {
                                 let t = us();
+                                let mut l = log.lock().unwrap_or_else(|e| e.into_inner());
+                                // Back from read: this thread is not hung. The fMP4 reader may seal an empty chunk.
+                                l.note_hid_alive();
                                 if let Some(p) = hid::parse(&buf[..n]) {
-                                    let mut l = log.lock().unwrap_or_else(|e| e.into_inner());
                                     if l.live.state != "connected" { l.on_status_with_id(t, "connected", &detail, Some(&pad_id)); }
                                     l.on_report(t, &p);
                                     last_rx = Instant::now();
                                 }
                             }
                             Ok(None) => {
-                                if last_rx.elapsed() > Duration::from_secs(2) {
-                                    let mut l = log.lock().unwrap_or_else(|e| e.into_inner());
-                                    if l.live.state == "connected" { warn!("CONTROLLER: no HID reports for 2 s"); l.on_status(us(), "stalled", "no reports for 2 s"); }
+                                let mut l = log.lock().unwrap_or_else(|e| e.into_inner());
+                                l.note_hid_alive();
+                                if last_rx.elapsed() > Duration::from_secs(2) && l.live.state == "connected" {
+                                    warn!("CONTROLLER: no HID reports for 2 s");
+                                    l.on_status(us(), "stalled", "no reports for 2 s");
                                 }
                             }
                             Err(e) => {
                                 warn!("CONTROLLER: USB HID read failed ({e}); retrying");
-                                log.lock().unwrap_or_else(|e| e.into_inner()).on_status(us(), "unplugged", &e);
+                                let mut l = log.lock().unwrap_or_else(|e| e.into_inner());
+                                l.note_hid_alive();
+                                l.on_status(us(), "unplugged", &e);
                                 break;
                             }
                         }
@@ -426,7 +454,7 @@ mod tests {
         assert_eq!(n0, 6); // header, status, 3 records, imu presence
         assert_ne!(sha0, empty_hash());
         let (sha1, head1, n1) = l.seal(2, 11_000);
-        assert_eq!((sha1.as_str(), head1.as_str(), n1), (empty_hash().as_str(), head0.as_str(), 0), "empty chunk = legacy hash, chain unchanged");
+        assert_eq!((sha1.as_str(), head1.as_str(), n1), (empty_hash().as_str(), head0.as_str(), 0), "hung reader: empty seal writes no row");
         let (recs, chunks) = read_file(&p).unwrap();
         assert_eq!((recs.len(), chunks.len()), (6, 1));
         assert_eq!((recs[5]["type"].as_str(), recs[5]["present"].as_bool()), (Some("imu"), Some(false)));
@@ -436,6 +464,37 @@ mod tests {
         // tamper: change one button value
         let mut bad = recs.clone(); bad[3]["b"] = json!(0);
         assert!(!verify_chunks(&bad, &chunks).2.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn empty_segment_writes_a_chunk_row_when_the_hid_reader_is_alive() {
+        let dir = std::env::temp_dir().join(format!("qorcap-inputs-empty-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let p = dir.join("inputs.jsonl");
+        let mut l = InputLog::new(Some(p.clone()), true, 0);
+        let (sha0, head0, n0) = l.seal(0, 1_000);
+        assert!(n0 >= 1 && sha0 != empty_hash() && head0 != GENESIS, "header seals");
+        // No beat: the logger thread has not returned from read. Same as a hung dev.read.
+        let (sha_hung, head_hung, n_hung) = l.seal(1, 2_000_000);
+        assert_eq!((sha_hung.as_str(), head_hung.as_str(), n_hung, l.chunks), (empty_hash().as_str(), head0.as_str(), 0, 1));
+        l.note_hid_alive();
+        let (sha1, head1, n1) = l.seal(1, 2_000_000);
+        assert_eq!(n1, 0);
+        assert_eq!(sha1, empty_hash());
+        assert_ne!(head1, head0);
+        let (recs, chunks) = read_file(&p).unwrap();
+        assert_eq!(chunks.len(), 2, "empty segment still gets a chunk row");
+        assert_eq!(chunks[1]["n"].as_u64(), Some(0));
+        assert_eq!(chunks[1]["t_us"].as_u64(), Some(2_000_000));
+        assert_eq!(chunks[1]["type"].as_str(), Some("chunk"));
+        let (_m, head, errs) = verify_chunks(&recs, &chunks);
+        assert!(errs.is_empty(), "{errs:?}");
+        assert_eq!(head, head1);
+        // The beat was consumed. Another empty seal with no new read is a hang: no row.
+        let (sha2, head2, n2) = l.seal(2, 4_000_000);
+        assert_eq!((sha2.as_str(), head2.as_str(), n2, l.chunks), (empty_hash().as_str(), head1.as_str(), 0, 2));
+        assert_eq!(read_file(&p).unwrap().1.len(), 2);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -517,5 +576,219 @@ mod tests {
         assert_eq!(connected["pad_id"], "serial:FAKE0001");
         assert!(connected["detail"].as_str().unwrap().contains("serial=FAKE0001"), "{}", connected["detail"]);
         assert!(l.pending.iter().any(|r| r["type"] == "header" && r["pad_identity"] == "required"));
+    }
+
+    fn wait_for(log: &Mutex<InputLog>, mut pred: impl FnMut(&InputLog) -> bool) {
+        let end = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < end {
+            if pred(&log.lock().unwrap_or_else(|e| e.into_inner())) { return; }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        panic!("timed out waiting for the HID logger");
+    }
+
+    /// `read` returns `Ok(None)` and never a report. Dropping `note_hid_alive` on that arm
+    /// leaves both empty seals unwritten.
+    struct TimeoutForever;
+    impl ReportSource for TimeoutForever {
+        fn read(&mut self, _buf: &mut [u8], _t: i32) -> Result<Option<usize>, String> { Ok(None) }
+        fn name(&self) -> String { "Timeout DualSense".into() }
+        fn pad_id(&self) -> String { "serial:TIMEOUT".into() }
+    }
+
+    /// `read` does not return until `release` is set.
+    struct HangRead { release: Arc<AtomicBool> }
+    impl ReportSource for HangRead {
+        fn read(&mut self, _buf: &mut [u8], _t: i32) -> Result<Option<usize>, String> {
+            while !self.release.load(Ordering::SeqCst) { std::thread::sleep(Duration::from_millis(10)); }
+            Err("stopped".into())
+        }
+        fn name(&self) -> String { "Hung DualSense".into() }
+        fn pad_id(&self) -> String { "serial:HUNG".into() }
+    }
+
+    /// One real report, then further `Ok(Some)` returns that do not parse. The empty seals
+    /// after the first have no new records, so a row exists only because the report arm
+    /// called `note_hid_alive`.
+    struct ReportThenBytes { sent: bool }
+    impl ReportSource for ReportThenBytes {
+        fn read(&mut self, buf: &mut [u8], _t: i32) -> Result<Option<usize>, String> {
+            if !self.sent {
+                self.sent = true;
+                let r = hid::pack_usb(&pad(0, 0));
+                buf[..r.len()].copy_from_slice(&r);
+                return Ok(Some(r.len()));
+            }
+            buf[0] = 0;
+            Ok(Some(1))
+        }
+        fn name(&self) -> String { "Report DualSense".into() }
+        fn pad_id(&self) -> String { "serial:REPORT".into() }
+    }
+
+    /// First `read` is `Err`. Later `open` calls block so they add no further status row.
+    struct ErrOnce;
+    impl ReportSource for ErrOnce {
+        fn read(&mut self, _buf: &mut [u8], _t: i32) -> Result<Option<usize>, String> { Err("gone".into()) }
+        fn name(&self) -> String { "Err DualSense".into() }
+        fn pad_id(&self) -> String { "serial:ERR".into() }
+    }
+
+    fn flush_open(log: &Arc<Mutex<InputLog>>) -> u64 {
+        wait_for(log, |l| l.pending.iter().any(|r| r["state"] == "connected"));
+        let mut l = log.lock().unwrap_or_else(|e| e.into_inner());
+        let (_, _, n) = l.seal(0, 1_000);
+        assert!(n >= 1, "header and connected status seal");
+        l.chunks
+    }
+
+    #[test]
+    fn timeout_reads_write_two_empty_chunks() {
+        let dir = std::env::temp_dir().join(format!("qorcap-inputs-timeout-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let p = dir.join("inputs.jsonl");
+        let log = Arc::new(Mutex::new(InputLog::new(Some(p.clone()), true, 0)));
+        let stop = Arc::new(AtomicBool::new(false));
+        let h = spawn_logger_with(log.clone(), Instant::now(), stop.clone(), || Ok(Box::new(TimeoutForever) as Box<dyn ReportSource>));
+        let base = flush_open(&log);
+        for seg in 1..=2 {
+            std::thread::sleep(Duration::from_millis(40));
+            let mut l = log.lock().unwrap_or_else(|e| e.into_inner());
+            assert!(l.pending.is_empty(), "timeout must not add a record before the stall lag: {:?}", l.pending);
+            let (_, _, n) = l.seal(seg, seg * 2_000_000);
+            assert_eq!(n, 0);
+            assert_eq!(l.chunks, base + seg, "each timeout between seals writes an empty chunk");
+        }
+        let chunks = read_file(&p).unwrap().1;
+        assert_eq!(chunks.len() as u64, base + 2);
+        assert_eq!(chunks[chunks.len() - 1]["n"].as_u64(), Some(0));
+        assert_eq!(chunks[chunks.len() - 2]["n"].as_u64(), Some(0));
+        stop.store(true, Ordering::SeqCst);
+        h.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn hung_read_writes_no_empty_chunk() {
+        let dir = std::env::temp_dir().join(format!("qorcap-inputs-hang-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let p = dir.join("inputs.jsonl");
+        let log = Arc::new(Mutex::new(InputLog::new(Some(p.clone()), true, 0)));
+        let stop = Arc::new(AtomicBool::new(false));
+        let release = Arc::new(AtomicBool::new(false));
+        let rel = release.clone();
+        let h = spawn_logger_with(log.clone(), Instant::now(), stop.clone(), move || {
+            Ok(Box::new(HangRead { release: rel.clone() }) as Box<dyn ReportSource>)
+        });
+        let base = flush_open(&log);
+        std::thread::sleep(Duration::from_millis(50));
+        {
+            let mut l = log.lock().unwrap_or_else(|e| e.into_inner());
+            assert_eq!(l.hid_beats, 0, "a blocked read has not returned");
+            let (_, _, n1) = l.seal(1, 2_000_000);
+            let (_, _, n2) = l.seal(2, 4_000_000);
+            assert_eq!((n1, n2, l.chunks), (0, 0, base));
+        }
+        assert_eq!(read_file(&p).unwrap().1.len() as u64, base);
+        release.store(true, Ordering::SeqCst);
+        stop.store(true, Ordering::SeqCst);
+        h.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn report_reads_write_empty_chunks_after_the_records_are_sealed() {
+        let dir = std::env::temp_dir().join(format!("qorcap-inputs-report-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let p = dir.join("inputs.jsonl");
+        let log = Arc::new(Mutex::new(InputLog::new(Some(p.clone()), true, 0)));
+        let stop = Arc::new(AtomicBool::new(false));
+        let h = spawn_logger_with(log.clone(), Instant::now(), stop.clone(), || Ok(Box::new(ReportThenBytes { sent: false }) as Box<dyn ReportSource>));
+        wait_for(&log, |l| l.live.reports >= 1);
+        let base = {
+            let mut l = log.lock().unwrap_or_else(|e| e.into_inner());
+            let (_, _, n) = l.seal(0, 1_000);
+            assert!(n >= 1 && l.live.reports >= 1);
+            l.chunks
+        };
+        for seg in 1..=2 {
+            std::thread::sleep(Duration::from_millis(40));
+            let mut l = log.lock().unwrap_or_else(|e| e.into_inner());
+            assert!(l.pending.is_empty(), "later report returns must not add records: {:?}", l.pending);
+            let (_, _, n) = l.seal(seg, seg * 2_000_000);
+            assert_eq!(n, 0);
+            assert_eq!(l.chunks, base + seg);
+        }
+        let chunks = read_file(&p).unwrap().1;
+        assert!(chunks.len() as u64 >= base + 2);
+        assert_eq!(chunks.last().unwrap()["n"].as_u64(), Some(0));
+        stop.store(true, Ordering::SeqCst);
+        h.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn error_read_counts_as_alive_for_one_empty_seal() {
+        let dir = std::env::temp_dir().join(format!("qorcap-inputs-err-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let p = dir.join("inputs.jsonl");
+        let log = Arc::new(Mutex::new(InputLog::new(Some(p.clone()), true, 0)));
+        let stop = Arc::new(AtomicBool::new(false));
+        let release = Arc::new(AtomicBool::new(false));
+        let opened = Arc::new(AtomicBool::new(false));
+        let (rel, once) = (release.clone(), opened.clone());
+        let h = spawn_logger_with(log.clone(), Instant::now(), stop.clone(), move || {
+            if once.swap(true, Ordering::SeqCst) {
+                while !rel.load(Ordering::SeqCst) { std::thread::sleep(Duration::from_millis(10)); }
+                return Err("stopped".into());
+            }
+            Ok(Box::new(ErrOnce) as Box<dyn ReportSource>)
+        });
+        wait_for(&log, |l| l.live.state == "unplugged" && l.hid_beats >= 1);
+        {
+            let mut l = log.lock().unwrap_or_else(|e| e.into_inner());
+            assert!(l.hid_beats >= 1, "Err from dev.read is a live read");
+            // Drop the unplugged status so this seal is empty. The beat is the only reason it writes.
+            l.pending.clear();
+            let (_, _, n) = l.seal(1, 2_000_000);
+            assert_eq!(n, 0);
+            assert_eq!(l.chunks, 1, "the error return must write the empty chunk");
+            let (_, _, n2) = l.seal(2, 4_000_000);
+            assert_eq!((n2, l.chunks), (0, 1), "one error covers one empty seal");
+        }
+        assert_eq!(read_file(&p).unwrap().1.len(), 1);
+        assert_eq!(read_file(&p).unwrap().1[0]["n"].as_u64(), Some(0));
+        release.store(true, Ordering::SeqCst);
+        stop.store(true, Ordering::SeqCst);
+        h.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn failed_write_spends_the_hid_beat() {
+        let dir = std::env::temp_dir().join(format!("qorcap-inputs-spend-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("inputs.jsonl");
+        let mut l = InputLog::new(Some(p), true, 0);
+        let (_, head0, n0) = l.seal(0, 1_000);
+        assert!(n0 >= 1 && l.chunks == 1);
+        l.note_hid_alive();
+        let bad = dir.join("not-a-file");
+        std::fs::create_dir(&bad).unwrap();
+        l.path = Some(bad);
+        let (_, head_fail, n_fail) = l.seal(1, 2_000_000);
+        assert_eq!((n_fail, l.chunks, head_fail.as_str()), (0, 1, head0.as_str()));
+        let again = dir.join("again.jsonl");
+        l.path = Some(again.clone());
+        let (_, head2, n2) = l.seal(2, 4_000_000);
+        assert_eq!((n2, l.chunks, head2.as_str()), (0, 1, head0.as_str()), "a failed append must spend the beat");
+        assert!(read_file(&again).is_err());
+        l.note_hid_alive();
+        let (_, head3, n3) = l.seal(2, 6_000_000);
+        assert_eq!(n3, 0);
+        assert_eq!(l.chunks, 2);
+        assert_ne!(head3, head0);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

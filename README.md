@@ -243,6 +243,8 @@ summary into `input_proof.json` `haptics`. Input Test shows `HAPTIC peak=.. dur=
 A bundle signed only by your laptop is **SELF_ATTESTED**. To get **VERIFIED**, submit it to the QorTime official
 referee (`https://qortime-referee-production.up.railway.app`): double-click **Submit for Verification**, answer `y` at
 the end of Start Match, or run `qorcap submit "<bundle dir>"` (`--full` uploads every segment; `--yes` skips the prompt).
+A stored challenge mismatch makes Start Match exit 2 and skip that prompt. The same bundle can still be submitted
+later with **Submit for Verification** or `qorcap submit`.
 
 1. QorCap uploads the small metadata (manifest, checkpoints, inputs, receipts, no video).
 2. The referee re-checks every chain and signature on its own, *then* picks which video segments it wants:
@@ -279,8 +281,19 @@ From v0.3.11:
   still exactly 3 challenges (Q1–Q2, Q3, Q4/OT), one window open at a time. If no play-call screen is detected, the
   window opens 45 s after the clock starts running in that quarter. Every opening is logged in `challenge_gates.jsonl`.
 - **Receipt fix:** at the end QorCap re-runs each challenge on its own video and controller log (QorTime's rules).
-  Answered challenges are written into the receipt as passed. Up to v0.3.10 they always stayed empty
-  (`challenge_unanswered`). Misses stay empty and the reason is in `challenge_results.jsonl`.
+  A passed challenge is written into the receipt. A wrong pattern is written too, with `ok` false and
+  `reason` `pattern_mismatch`, only when every `inputs.jsonl` line is one JSON object, there is a single
+  header, chunk rows cover the window with no gap over 3 s, and the pad stayed connected from the window
+  open through 2.5 s after the deadline. Verify then reports `challenge_failed`.
+  Start Match exits 2 and does not ask to submit.
+  Submit for Verification still works later: double-click it, or run `qorcap submit`. OPTIONS alone, and a
+  pattern that finishes after the deadline, count as that failure when the log passes. A stall, including
+  one recorded just after the deadline, an unplug, a reconnect, a torn line, or a log that ends inside the
+  window stays empty. Up to v0.3.10 every challenge stayed empty (`challenge_unanswered`). A challenge with
+  no OPTIONS press still stays empty, and the reason is in `challenge_results.jsonl`. A withheld mismatch
+  adds `withheld: controller_log` on that line. That file is not a contract file.
+  From 0.3.34 a chunk row, including an empty one, is written every segment while the HID reader is alive.
+  A hung read writes none, so a hang that spans a whole segment leaves a gap and withholds.
 
 ### Signed submissions (v0.3.10)
 
