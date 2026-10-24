@@ -1597,12 +1597,35 @@ class ReaderCore:
               + (f"  [{notes[0]}]" if notes else ""), file=sys.stderr)
         self.post(jcs_safe(self.final))
 
+    def _scorebug_between_menus(self, later_t) -> bool:
+        """True only when a scorebug row is strictly after the posted menu ended and before the later menu.
+
+        The posted menu's ``until_ms`` and the later menu's ``t_ms`` are the bounds. A row
+        at either bound is not between them. A missing bound is not a scorebug read.
+        """
+        menu = self.end_menu if isinstance(self.end_menu, dict) else {}
+        start = _as_ms(menu.get("until_ms"))
+        later = _as_ms(later_t)
+        if start is None or later is None or later <= start:
+            return False
+        for r in self.timeline or []:
+            if not isinstance(r, dict) or "obs" in r or "home" not in r:
+                continue
+            t = _as_ms(r.get("t_ms"))
+            if t is not None and start < t < later:
+                return True
+        return False
+
     def _note_end_menu_disagreement(self, st: dict) -> None:
         """Keep the first posted score and leave it unconfirmed. Do not adopt the new score.
 
         A scorebug read between two end menus does not reopen the final. The first
         score stays. The later score is not the result. Confirmation stays false.
         A contradicting later menu must never become a confirmed final.
+
+        The signed note names that scorebug only when a scorebug row lies strictly
+        between the posted menu's ``until_ms`` and the later menu's ``t_ms``. Otherwise
+        the note is the previous sentence, with no claim that a scorebug returned.
         """
         if getattr(self, "_end_menu_disputed", False):
             return
@@ -1610,10 +1633,13 @@ class ReaderCore:
         if not isinstance(self.final, dict):
             return
         notes = [n for n in (self.final.get("notes") or []) if isinstance(n, str)]
+        between = ""
+        if self._scorebug_between_menus(st.get("t_ms") if isinstance(st, dict) else None):
+            between = " after a scorebug read came back between the two menus"
         notes.append(
             f"later end-of-game menu read AWAY {st['away']} - HOME {st['home']} disagreed with the posted "
-            f"final AWAY {self.final.get('away')} - HOME {self.final.get('home')} after a scorebug read "
-            "came back between the two menus; score not replaced; final_confirmed=false")
+            f"final AWAY {self.final.get('away')} - HOME {self.final.get('home')}{between}; score not replaced; "
+            "final_confirmed=false")
         self.final = dict(self.final)
         self.final["final_confirmed"] = False
         self.final["end_menu_disputed"] = True

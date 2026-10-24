@@ -573,15 +573,33 @@ def test_tail_button_and_haptic_do_not_confirm():
     assert late_core.final["final_confirmed"] is False
 
 
+# The sentence main signs when the later menu disagrees and no scorebug read sits between the two menus.
+_NO_SCOREBUG_DISPUTE_NOTE = (
+    "later end-of-game menu read AWAY 10 - HOME 0 disagreed with the posted "
+    "final AWAY 7 - HOME 0; score not replaced; final_confirmed=false")
+_SCOREBUG_DISPUTE_NOTE = (
+    "later end-of-game menu read AWAY 10 - HOME 0 disagreed with the posted "
+    "final AWAY 7 - HOME 0 after a scorebug read came back between the two menus; "
+    "score not replaced; final_confirmed=false")
+
+
 def test_later_end_menu_score_does_not_replace_a_posted_final():
-    """A different end-menu score during the tail keeps the posted score and drops confirmation."""
+    """A different end-menu score during the tail keeps the posted score and drops confirmation.
+
+    No scorebug read lies between the two menus. The signed note is the previous sentence.
+    It does not claim a scorebug came back.
+    """
     score = {"t_ms": 1_000, "home": 0, "away": 7, "quarter": 4, "clock_s": 0, "clock_red": True}
     reader = _SwitchScore((7, 0), (10, 0), at=9_000)
     core, posts = _core(score, reader=reader, corr=[{"kind": "haptic", "t_ms": 1_500}])
     _drive(core, _menu_frames(5_000, 12_000), 10, reader)
     assert (core.final["away"], core.final["home"]) == (7, 0)
     assert core.final["final_confirmed"] is False
-    assert any("not replaced" in n for n in core.final.get("notes") or [])
+    assert core.final["notes"][0] == _NO_SCOREBUG_DISPUTE_NOTE
+    assert "scorebug read came back" not in core.final["notes"][0]
+    scores = [r for r in core.timeline if isinstance(r, dict) and "home" in r and "obs" not in r]
+    start, later = core.end_menu["until_ms"], 9_000
+    assert not any(start < int(r["t_ms"]) < later for r in scores)
     assert not any(p.get("home") == 0 and p.get("away") == 10 and p.get("final_confirmed") is True for p in posts)
 
 
@@ -626,9 +644,19 @@ def test_scorebug_between_menus_keeps_the_first_score_unconfirmed():
     assert core.final["final_confirmed"] is False
     assert core.final.get("end_menu_disputed") is True
     assert "amends" not in core.final
-    note = " ".join(n for n in core.final.get("notes") or [] if isinstance(n, str))
-    assert "disagreed with the posted" in note and "not replaced" in note
-    assert "scorebug read came back between the two menus" in note
+    assert core.final["notes"][0] == _SCOREBUG_DISPUTE_NOTE
+    start = core.end_menu["until_ms"]
+    scores = [r for r in core.timeline if isinstance(r, dict) and "home" in r and "obs" not in r]
+    assert any(start < int(r["t_ms"]) < 25_000 for r in scores)
+    # A scorebug row on either bound is not between the menus. The note must not claim one.
+    bare = ReaderCore.__new__(ReaderCore)
+    bare.end_menu = {"until_ms": start}
+    bare.timeline = [{"t_ms": start, "home": 0, "away": 7}]
+    assert bare._scorebug_between_menus(25_000) is False
+    bare.timeline = [{"t_ms": 25_000, "home": 0, "away": 7}]
+    assert bare._scorebug_between_menus(25_000) is False
+    bare.timeline = [{"t_ms": start + 1, "home": 0, "away": 7}]
+    assert bare._scorebug_between_menus(25_000) is True
     finals = [p for p in posts if p.get("type") == "final"]
     # One confirmed post, then the dispute. A scorebug read must not post the menu again.
     assert len(finals) == 2
@@ -959,6 +987,34 @@ def test_cutoff_ignores_end_screens_from_before_the_scorebug_returned():
     assert after.final.get("delta_corroboration") is None
 
 
+def test_evidence_at_the_window_edges_does_not_count():
+    """Evidence at the first end-screen time, or at the latest scorebug read, does not count.
+
+    The closed window is ``first <= t <= scorebug_t``. An input one millisecond after that
+    scorebug read, and before the next screen, still counts. Opening either edge would
+    confirm the walk-off from the input that shares that millisecond.
+    """
+    first, scorebug_t, menu_t = 5_000, 10_000, 20_000
+    timeline = [
+        {"t_ms": first, "until_ms": 6_800, "obs": "final_screen", "n": 5},
+        {"t_ms": scorebug_t, "home": 10, "away": 10, "quarter": 4, "clock_s": 0},
+    ]
+    st = {"away": 10, "home": 16, "t_ms": menu_t}
+    last = {"away": 10, "home": 10, "t_ms": scorebug_t}
+    assert end_screen_evidence_cutoff_ms(timeline, menu_t_ms=menu_t) == menu_t
+
+    def at(t, kind="input_activity", **extra):
+        return end_menu_delta_corroborated(
+            st, last, timeline, [{"kind": kind, "t_ms": t, **extra}])
+
+    assert at(first) is None
+    assert at(scorebug_t) is None
+    assert at(first, "haptic") is None
+    assert at(scorebug_t, "score_change_clip", sha256="a" * 64) is None
+    got = at(scorebug_t + 1)
+    assert got and got["kind"] == "input_activity" and got["t_ms"] == scorebug_t + 1
+
+
 def test_offline_finalize_does_not_upgrade_a_disputed_end_menu():
     """The first end-menu event is confirmed. The dispute post is later. Finalize signs the dispute.
 
@@ -979,8 +1035,9 @@ def test_offline_finalize_does_not_upgrade_a_disputed_end_menu():
     assert fin is not None and fin.get("end_menu_disputed") is True
     assert res["final_confirmed"] is False
     assert (res["away_score"], res["home_score"]) == (7, 0)
-    kept = " ".join(n for n in res.get("notes") or [] if isinstance(n, str))
-    assert "disagreed with the posted" in kept and "not replaced" in kept
+    # Same no-scorebug drive as the live test. Finalize copies this note into the receipt.
+    assert res["notes"][0] == _NO_SCOREBUG_DISPUTE_NOTE
+    assert fin["notes"][0] == _NO_SCOREBUG_DISPUTE_NOTE
 
 
 def test_note_only_end_menu_dispute_is_not_confirmed_offline():
