@@ -12,6 +12,20 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      # .gitattributes pins contracts/ to LF. Fail if a checkout or a commit still has CR.
+      - name: Contract files have no carriage returns
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          root = Path("contracts")
+          files = [p for p in root.rglob("*") if p.is_file()]
+          bad = sorted(str(p) for p in files if b"\r" in p.read_bytes())
+          if not files:
+              raise SystemExit("contracts/ has no files")
+          if bad:
+              raise SystemExit("carriage return in:\n" + "\n".join(bad))
+          PY
       # ffmpeg and the pinned QorTime verifier run inside `cargo test` (clip credentials).
       # The receipt check is the real `python -m qor_receipt.cli verify`, not a stub.
       - run: sudo apt-get update && sudo apt-get install -y ffmpeg
@@ -83,6 +97,19 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - name: Contract files have no carriage returns
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          root = Path("contracts")
+          files = [p for p in root.rglob("*") if p.is_file()]
+          bad = sorted(str(p) for p in files if b"\r" in p.read_bytes())
+          if not files:
+              raise SystemExit("contracts/ has no files")
+          if bad:
+              raise SystemExit("carriage return in:\n" + "\n".join(bad))
+          PY
       - run: pip install pytest
       - name: QorTime main (unpinned)
         run: |
@@ -105,6 +132,20 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      # .gitattributes pins contracts/ to LF. This job's schema pin hashes raw checkout bytes.
+      - name: Contract files have no carriage returns
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          root = Path("contracts")
+          files = [p for p in root.rglob("*") if p.is_file()]
+          bad = sorted(str(p) for p in files if b"\r" in p.read_bytes())
+          if not files:
+              raise SystemExit("contracts/ has no files")
+          if bad:
+              raise SystemExit("carriage return in:\n" + "\n".join(bad))
+          PY
       - name: QorTime pin
         shell: bash
         run: |

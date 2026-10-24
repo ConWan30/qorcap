@@ -1,2 +1,7 @@
 *.cmd text eol=crlf
 *.ps1 text eol=crlf
+# Vendored QorTime contracts are byte-pinned (contracts/SHA256SUMS, raw SHA-256).
+# Windows runners set core.autocrlf=true; eol=lf keeps the checkout equal to the git blob.
+# contracts/* covers files directly in contracts/; contracts/** covers nested paths.
+contracts/* text eol=lf
+contracts/** text eol=lf
