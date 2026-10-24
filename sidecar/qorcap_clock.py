@@ -30,7 +30,10 @@ Two ways back in, both stricter than one frame:
   stoppage path; three displayed seconds is what a 1:1 clock shows and a frozen one does not),
   ``run_tol_s`` 1 (a displayed second is a one-second bin, so a perfect 1:1 line stays within
   1 s at every sample; the check is per sample, not just the endpoints). Over that window a
-  rate of about 0.7x–1.3x still fits; 2x does not. This is the one place a clock #76 blanked
+  rate of about 0.7x–1.3x still fits; 2x does not. A downward jump is kept only when the
+  drop from the last accepted clock agrees with the wall time since that read, inside
+  that same slope band. A steady lower misread that does not (the minute digit read one
+  low while counting down from 2:30) stays blank. This is the one place a clock #76 blanked
   may be kept. The kept value is the read itself. See ``docs/SCOREBUG_CLOCK_VOTE.md``.
 
 A second sustained line that disagrees with the accepted clock, higher or lower, blanks both.
@@ -51,8 +54,9 @@ not bring the accepted clock back. A higher clock that is neither
 blocked line returns through the running-clock gate or a quarter change, which clears
 both lines. While that blank holds,
 nothing is emitted except the read that completes the re-anchor. A quarterless read is not
-emitted and does not join it. A lone runoff has no second line, so the running-clock gate
-still adopts it (FU1).
+emitted and does not join it. A lone runoff is adopted only when its drop from the last
+accepted clock agrees with the elapsed time, inside the running gate's slope band. A
+countdown that is only internally consistent, and far below that clock, is not.
 
 Stoppage is a hold. With no ``t_ms`` the digits are read and the history is left alone.
 """
@@ -178,10 +182,6 @@ class ClockHistory:
         # Last clock published in the current quarter. A void does not clear it.
         # While suspended, the stoppage gate cannot adopt a second above this.
         self._published_s: int | None = None
-        # How the current baseline was confirmed: "run" (running gate), "stop"
-        # (stoppage gate), or "frame" (one frame, including the first accept and
-        # a quarter change). A one-frame continuation keeps only "stop".
-        self._baseline_kind = "frame"
 
     def _clear_cand(self) -> None:
         self._cand = None
@@ -213,17 +213,6 @@ class ClockHistory:
         self.accepted_now = True
         # Same quarter as the one already observed. A reset or a cut is not a continuation.
         self.continuation = prev_q is not None and self.last_q == prev_q
-        if self.reanchored and self.reanchor_kind == "run":
-            self._baseline_kind = "run"
-        elif self.reanchored and self.reanchor_kind == "stop":
-            self._baseline_kind = "stop"
-        elif self.continuation and self._baseline_kind == "stop":
-            # A one-frame tick keeps a stoppage adoption a stoppage.
-            pass
-        else:
-            # A one-frame accept never inherits a running-gate confirmation,
-            # including a 1:1 tick of the clock that gate just accepted.
-            self._baseline_kind = "frame"
         return int(secs)
 
     def _extend(self, series, secs: int, t_ms: int):
@@ -448,6 +437,25 @@ class ClockHistory:
         self._clear_run()
         return True
 
+    def _jump_tracks_elapsed(self, secs: int, t_ms: int) -> bool:
+        """True when this drop agrees with the wall time since the last accepted read.
+
+        The running gate's slope band is the tolerance, about 0.7x–1.3x plus one
+        displayed second. A minute-digit miss is a 60 s drop. That drop does not
+        enter the band during the minute it is on screen. Stoppage does not use
+        this check: a held lower clock is a different gate.
+        """
+        if self.last_accept_t is None or self.last_s is None:
+            return True
+        dt = (int(t_ms) - int(self.last_accept_t)) / 1000.0
+        if dt < 0:
+            return False
+        lo, hi = self._accepted_rate_band()
+        drop = int(self.last_s) - int(secs)
+        if drop < 0:
+            return False
+        return lo * dt - self.run_tol_s <= drop <= hi * dt + self.run_tol_s
+
     def _offer_dispute(self, secs: int, t_ms: int) -> bool:
         """A second 1:1 line that disagrees with the accepted clock. Completion voids both."""
         self._dispute = self._extend(self._dispute, secs, t_ms)
@@ -561,7 +569,7 @@ class ClockHistory:
             if held_done or dispute_done:
                 block = None
                 if self.last_accept_t is not None and self.last_s is not None:
-                    block = (int(self.last_accept_t), int(self.last_s), self._baseline_kind)
+                    block = (int(self.last_accept_t), int(self.last_s), "run")
                 other = None
                 if dispute_done and self._dispute:
                     other = (int(self._dispute[0][0]), int(self._dispute[0][1]), "run")
@@ -576,17 +584,29 @@ class ClockHistory:
         if self._reanchor(secs, t_ms):
             return self._accept(secs, q, t_ms)
         if self._offer_run(secs, t_ms):
-            return self._accept(secs, q, t_ms)
-        # Lower twin of the increase path. A lone runoff is accepted above and never gets
-        # here on its completing frame. A lower line that has outlasted the accepted clock
-        # (the accepted ticks cleared ``_run`` and left ``_dispute`` running) blanks both.
+            # Internally consistent, and still far below the last published clock.
+            # Adopting it would publish 0:00 while the truth is 1:00. Do not void
+            # either: the true second returns when its own drop matches elapsed time.
+            if self._jump_tracks_elapsed(secs, t_ms):
+                return self._accept(secs, q, t_ms)
+            # The same samples are also the dispute list. Leaving them there voids
+            # the true clock on the next frame. This runoff is not a second line.
+            self.reanchored = False
+            self.reanchor_kind = None
+            self.last_run = None
+            self._dispute = []
+            return None
+        # Lower twin of the increase path. A lone runoff that matches elapsed time is
+        # accepted above and never gets here on its completing frame. A lower line that
+        # has outlasted the accepted clock (the accepted ticks cleared ``_run`` and left
+        # ``_dispute`` running) blanks both.
         if self._offer_dispute(secs, t_ms):
             origin = None
             if self._dispute:
                 origin = (int(self._dispute[0][0]), int(self._dispute[0][1]), "run")
             old = None
             if self.last_accept_t is not None and self.last_s is not None:
-                old = (int(self.last_accept_t), int(self.last_s), self._baseline_kind)
+                old = (int(self.last_accept_t), int(self.last_s), "run")
             self._void(origin, old)
         return None
 
