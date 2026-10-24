@@ -1,6 +1,4 @@
 """A Windows-only submit skip must fail the job when it is recorded on Linux."""
-import os
-import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -230,23 +228,16 @@ def test_explicit_xfail_strict_false_fails(tmp_path, monkeypatch, capsys):
     assert needle in capsys.readouterr().err
 
 
-def _bash_python() -> str:
-    """PATH name bash can exec. CI runs ``python``.
-
-    ``sys.executable`` on Windows is a backslash path. Inside ``$(...)``, Git bash
-    does not run that path, the substitution fails, and the empty-list guard
-    never prints its message.
-    """
-    name = "python" if os.name == "nt" or not shutil.which("python3") else "python3"
-    if any(ch in name for ch in "\\/ \t"):
-        raise RuntimeError(name)
-    return name
-
-
 def test_list_failure_and_an_empty_list_do_not_run_pytest():
-    py = _bash_python()
+    """A failing ``$(...)`` trips errexit, and an empty array does not run pytest.
+
+    Builtins, not ``python``. On the Windows runner a nested bash resolves
+    ``python`` to the Store alias, which writes a UTF-16 "to install" line to
+    stdout and exits before the empty-list guard. The workflow's own ``python``
+    is the interpreter setup-python put on PATH.
+    """
     crash = subprocess.run(
-        ["bash", "-c", f"set -e\nSIDECAR_TESTS=($({py} -c 'import sys; sys.exit(3)'))\necho ran\n"],
+        ["bash", "-c", "set -e\nSIDECAR_TESTS=($(false))\necho ran\n"],
         capture_output=True,
         text=True,
     )
@@ -257,7 +248,7 @@ def test_list_failure_and_an_empty_list_do_not_run_pytest():
             "bash",
             "-c",
             "set -e\n"
-            f"SIDECAR_TESTS=($({py} -c 'import sys'))\n"
+            "SIDECAR_TESTS=($(:))\n"
             'if [[ ${#SIDECAR_TESTS[@]} -eq 0 ]]; then\n'
             '  echo "sidecar linux suite list is empty" >&2\n'
             "  exit 1\n"
@@ -268,7 +259,7 @@ def test_list_failure_and_an_empty_list_do_not_run_pytest():
         text=True,
     )
     assert empty.returncode == 1, (empty.returncode, empty.stdout, empty.stderr)
-    assert "empty" in empty.stderr
+    assert "empty" in empty.stderr, (empty.returncode, empty.stdout, empty.stderr)
     assert "ran" not in empty.stdout
 
 
