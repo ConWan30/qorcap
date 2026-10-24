@@ -49,10 +49,10 @@ v2 (``bundle.json`` ``challenge_rule`` = 2): pause 0..2500 ms, and the successfu
 0..600 ms). Nothing here is submitted to the referee. A pass is ``reverified_by: recorder``
 and carries no ``rule`` field, so that pass stays on the v1 evidence check.
 A ``pattern_mismatch`` is stored only when ``inputs.jsonl`` can support it: every
-non-empty line parses, some committed record (including a per-segment chunk row) is
-stamped at or after the deadline, and the pad stayed ``connected`` from ``issued_ms``
-through ``deadline_ms + 2500``. The extra 2500 ms is the stall-detection lag. The
-verifier then reports ``challenge_failed`` and does not run the evidence check.
+non-empty line parses as a JSON object, there is one header row, chunk rows cover
+the window with no gap over 3000 ms, and the pad stayed ``connected`` from
+``issued_ms`` through ``deadline_ms + 2500``. The extra 2500 ms is the stall-detection
+lag. The verifier then reports ``challenge_failed`` and does not run the evidence check.
 OPTIONS alone, and OPTIONS before the deadline with the rest of the pattern after it,
 are that failure when the log passes. A stall, including one written just after the
 deadline, an unplug, a reconnect gap, a torn line anywhere in the file, or a log that
@@ -69,6 +69,11 @@ from typing import Any
 CAPTURE_PAUSE_MAX_LATENCY_MS = 2_500
 # inputs.rs writes "stalled" only after 2 s with no HID reports, on the next 100 ms read timeout.
 STALL_LAG_MS = 2_500
+# One inputs chunk per fMP4 segment. frag_mp4_args uses min_frag_duration 2 s, and the encoder
+# GOP is one second, so a chunk is about 2 s apart and at most 3 s.
+CHUNK_INTERVAL_MS = 2_000
+CHUNK_GAP_SLACK_MS = 1_000
+CHUNK_GAP_MAX_MS = CHUNK_INTERVAL_MS + CHUNK_GAP_SLACK_MS
 # Measured pause menus: kickoff full 16.2–16.6, end full 21.1 / lower 13.3. Gameplay on the same
 # capture is luma 60–110. 26 / 16 sits between those and still requires the white-text fraction.
 CAPTURE_PAUSE_MAX_LUMA = 26.0
@@ -204,11 +209,11 @@ def receipt_result(res: dict[str, Any] | None) -> dict[str, Any] | None:
 
 
 def inputs_log_intact(path: str | Path) -> bool:
-    """False when ``inputs.jsonl`` is missing or any non-empty line does not parse.
+    """False when ``inputs.jsonl`` is missing or any line is not one JSON object.
 
-    The recheck's JSONL reader skips a corrupt line, so the presses that remain can
-    look like a short pattern. A torn line in the middle of the file does that too,
-    not only a partial last line. That is not a player failure.
+    The recheck's JSONL reader skips a corrupt line and drops a value that is not an
+    object, so the presses that remain can look like a short pattern. A torn line, a
+    bare ``42`` or ``[]``, or a second ``header`` row is not a player failure.
     """
     try:
         raw = Path(path).read_bytes()
@@ -216,13 +221,20 @@ def inputs_log_intact(path: str | Path) -> bool:
         return False
     if not raw:
         return True
+    headers = 0
     for line in raw.decode("utf-8", "replace").splitlines():
         if not line.strip():
             continue
         try:
-            json.loads(line)
+            val = json.loads(line)
         except json.JSONDecodeError:
             return False
+        if not isinstance(val, dict):
+            return False
+        if val.get("type") == "header":
+            headers += 1
+            if headers > 1:
+                return False
     return True
 
 
@@ -260,24 +272,46 @@ def pad_connected_through(records: list, *, issued_ms: int, deadline_ms: int, an
     return True
 
 
-def log_covers(records: list, *, deadline_ms: int, anchor_ms: int) -> bool:
-    """Some committed record is stamped at or after the deadline.
+def chunks_cover(records: list, *, issued_ms: int, deadline_ms: int, anchor_ms: int) -> bool:
+    """Chunk rows cover ``[issued_ms, deadline_ms]`` with no gap over ``CHUNK_GAP_MAX_MS``.
 
-    Chunk, press, status, and imu rows all count. A crash or an early stop drops the
-    pending batch and can leave a file that ends on a complete line inside the window.
-    A normal recording seals a chunk row every segment, so it reaches the deadline.
+    A normal recording seals one chunk per 2 s fMP4 segment. A single chunk after the
+    deadline does not cover the window. A crash that drops a stretch, then writes rows
+    after the deadline, does not either. Times are header ``wall_anchor_ms`` plus ``t_us``.
     """
-    ts = [anchor_ms + r["t_us"] // 1000 for r in records
-          if isinstance(r, dict) and isinstance(r.get("t_us"), int) and not isinstance(r.get("t_us"), bool)]
-    return bool(ts) and max(ts) >= deadline_ms
+    times = sorted({
+        anchor_ms + r["t_us"] // 1000
+        for r in records
+        if isinstance(r, dict) and r.get("type") == "chunk"
+        and isinstance(r.get("t_us"), int) and not isinstance(r.get("t_us"), bool)
+    })
+    if not times:
+        return False
+    prev: int | None = None
+    i = 0
+    while i < len(times) and times[i] <= issued_ms:
+        prev = times[i]
+        i += 1
+    if prev is None or issued_ms - prev > CHUNK_GAP_MAX_MS:
+        return False
+    if prev >= deadline_ms:
+        return True
+    while i < len(times):
+        if times[i] - prev > CHUNK_GAP_MAX_MS:
+            return False
+        prev = times[i]
+        i += 1
+        if prev >= deadline_ms:
+            return True
+    return False
 
 
 def mismatch_log_trustworthy(bundle: str | Path, records: list, *, issued_ms: int, deadline_ms: int,
                              anchor_ms: int) -> bool:
     """A pattern mismatch may be signed only when the controller log can support it."""
     return inputs_log_intact(Path(bundle) / "inputs.jsonl") and pad_connected_through(
-        records, issued_ms=issued_ms, deadline_ms=deadline_ms, anchor_ms=anchor_ms) and log_covers(
-        records, deadline_ms=deadline_ms, anchor_ms=anchor_ms)
+        records, issued_ms=issued_ms, deadline_ms=deadline_ms, anchor_ms=anchor_ms) and chunks_cover(
+        records, issued_ms=issued_ms, deadline_ms=deadline_ms, anchor_ms=anchor_ms)
 
 
 def frame_mono_ms(clock: tuple[float, float], pts0_ms: float, n: int, hz: float) -> int:

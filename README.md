@@ -282,9 +282,10 @@ From v0.3.11:
   window opens 45 s after the clock starts running in that quarter. Every opening is logged in `challenge_gates.jsonl`.
 - **Receipt fix:** at the end QorCap re-runs each challenge on its own video and controller log (QorTime's rules).
   A passed challenge is written into the receipt. A wrong pattern is written too, with `ok` false and
-  `reason` `pattern_mismatch`, only when every line of `inputs.jsonl` parses, the log (including its chunk
-  rows) reaches the deadline, and the pad stayed connected from the window open through 2.5 s after the
-  deadline. Verify then reports `challenge_failed`. Start Match exits 2 and does not ask to submit.
+  `reason` `pattern_mismatch`, only when every `inputs.jsonl` line is one JSON object, there is a single
+  header, chunk rows cover the window with no gap over 3 s, and the pad stayed connected from the window
+  open through 2.5 s after the deadline. Verify then reports `challenge_failed`.
+  Start Match exits 2 and does not ask to submit.
   Submit for Verification still works later: double-click it, or run `qorcap submit`. OPTIONS alone, and a
   pattern that finishes after the deadline, count as that failure when the log passes. A stall, including
   one recorded just after the deadline, an unplug, a reconnect, a torn line, or a log that ends inside the
