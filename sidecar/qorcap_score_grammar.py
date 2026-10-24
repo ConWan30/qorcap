@@ -37,7 +37,8 @@ The vote uses the agreement window's numbers: ``vote_reads`` 3, ``vote_interval_
 ``vote_span_ms`` 400, ``vote_gap_ms`` 2_000. A sample closer than the interval is not new
 evidence and is not a reset. One illegal frame blanks that frame and does not set
 ``disagreeing``. A pending new score inside the 2 s gap withholds the fallback even when
-that vote has not yet persisted; a pending decrease does not. The same illegal run, persisted
+that vote has not yet persisted; a pending decrease does not. Blank frames do not age
+that pending read out. The same illegal run, persisted
 across the vote, does abstain. A gap longer than ``vote_gap_ms`` starts the count over and
 does not clear a disagreement that already persisted. A read of the locked score does not
 reset that count when a pending read is a new score (not a decrease). Three consecutive
@@ -185,6 +186,8 @@ class ScoreGrammar:
         self._clear_t0: int | None = None
         self._clear_last: int | None = None
         self._clear_pair: tuple[int, int] | None = None
+        # Last frame that carried a score. Blanks move last_t and must not age a pending read.
+        self._score_t: int | None = None
 
     def _cut(self) -> None:
         """Drop the anchor. Keep an open try so the same score can be re-locked legally."""
@@ -329,15 +332,18 @@ class ScoreGrammar:
         return self._cand_n >= int(self.reanchor_reads) and span >= int(self.reanchor_span_ms)
 
     def _pending_new_score_inside_gap(self) -> bool:
-        """A new score still inside the vote gap withholds the fallback.
+        """A new score still unresolved withholds the fallback.
 
         Two frames do not meet the 3-read vote, and they must still keep a stale
-        lock off the final. A window of only decreases does not: that is FU2.
-        Compared with ``last_t``, which a blank frame moves forward.
+        lock off the final. Blank frames do not age this out. A later non-blank
+        read can: once that read is more than the vote gap after the pending
+        score, the pending flag drops. A window of only decreases does not
+        withhold the fallback: that is FU2.
         """
-        if self.locked is None or not self._vote_pairs or self._vote_last is None or self.last_t is None:
+        if self.locked is None or not self._vote_pairs or self._vote_last is None:
             return False
-        if int(self.last_t) - int(self._vote_last) > int(self.vote_gap_ms):
+        stamp = self._score_t if self._score_t is not None else int(self._vote_last)
+        if int(stamp) - int(self._vote_last) > int(self.vote_gap_ms):
             return False
         la, lh = int(self.locked[0]), int(self.locked[1])
         return any(int(a) >= la and int(h) >= lh for a, h in self._vote_pairs)
@@ -364,6 +370,7 @@ class ScoreGrammar:
         self.note_banner(t_ms, banner)
         if getattr(fr, "left_score", None) is None or getattr(fr, "right_score", None) is None:
             return fr
+        self._score_t = int(t_ms)
         pair = (int(fr.left_score), int(fr.right_score))
         phase, side = self._phase_at(t_ms)
         decision = judge(self.locked, pair, self.active_banner(t_ms), phase, side)

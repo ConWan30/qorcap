@@ -377,6 +377,43 @@ def test_held_five_high_stoppage_emits_nothing_wrong_after_detection():
     assert h.last_s == 60  # the same second may return; the higher one does not
 
 
+def test_a_steady_five_high_line_publishes_nothing_wrong_after_detection():
+    """+5 s on every frame for 17 s. After the two lines contradict, neither is published."""
+    h = ClockHistory()
+    det = None
+    wrong_after = []
+    for t in range(0, 17_000 + 1, 100):
+        truth = 90 - t // 1000
+        read = truth if t == 0 else truth + 5
+        out = h.filter(read, 1, t)
+        if h.rule_note == "clock_disagree" and det is None:
+            det = t
+        if det is not None and t > det and out is not None and out != truth:
+            wrong_after.append((t, out, truth))
+    assert det is not None and wrong_after == []
+
+
+def test_a_third_line_can_reanchor_after_both_contradicted_lines_are_blocked():
+    """A countdown on neither contradicted line may still complete the running gate."""
+    h = ClockHistory()
+    assert h.filter(90, 1, 0) == 90
+    for t in range(100, 4_000, 100):
+        h.filter((90 - t // 1000) + 5, 1, t)
+    assert h.suspended and h._blocked_line is not None and h._blocked_other is not None
+    accepted = []
+    kind = None
+    for i in range(40):
+        t = 8_000 + i * 100
+        secs = 40 - i // 10
+        got = h.filter(secs, 1, t)
+        if got is not None:
+            if kind is None:
+                kind = h.reanchor_kind
+            accepted.append(got)
+    assert accepted and kind == "run"
+    assert accepted[0] <= 40
+
+
 def test_a_higher_countdown_returns_only_through_the_running_gate():
     h = ClockHistory()
     assert h.filter(60, 1, 0) == 60
@@ -758,6 +795,31 @@ def test_two_new_score_frames_at_the_end_do_not_publish_the_stale_lock():
     assert down.disagreeing is False and down.allows_final_fallback() is True
     kept = _final_from(down, {"home": 14, "away": 7, "quarter": 4, "t_ms": 2_200})
     assert (kept["away_score"], kept["home_score"]) == (7, 14)
+
+
+def test_two_new_score_frames_then_blanks_do_not_publish_the_stale_lock():
+    """Blank frames must not age a pending new score out of the fallback."""
+    g = _locked(7, 14)
+    assert g.filter(_fr(7, 24), 0, None).left_score is None
+    assert g.filter(_fr(7, 24), 200, None).left_score is None
+    for i in range(30):
+        g.filter(_blank(), 400 + 100 * i, None)
+    assert g.disagreeing is False and g.allows_final_fallback() is False
+    published = _final_from(g, {"home": 14, "away": 7, "quarter": 4, "t_ms": 3_400})
+    assert (published["home_score"], published["away_score"], published["winner"]) == (None, None, "unknown")
+    # A later non-blank run of the lock can resolve it. A decrease still publishes.
+    shown = _locked(7, 14)
+    shown.filter(_fr(7, 24), 0, None)
+    shown.filter(_fr(7, 24), 200, None)
+    for i in range(30):
+        shown.filter(_fr(7, 14), 400 + 100 * i, None)
+    assert shown.allows_final_fallback() is True
+    down = _locked(7, 14)
+    down.filter(_fr(7, 7), 0, None)
+    down.filter(_fr(7, 7), 200, None)
+    for i in range(30):
+        down.filter(_blank(), 400 + 100 * i, None)
+    assert down.disagreeing is False and down.allows_final_fallback() is True
 
 
 def test_a_new_disagreeing_read_resets_the_clear_streak():

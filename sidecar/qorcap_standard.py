@@ -41,7 +41,7 @@ ANCHOR_SEARCH_PX = 8
 # Bumped when clock, vote, or inferred-quarter behaviour changes. Hashed into model_id.
 # Issue #78 also wants this id emitted for a referee. That upload is issue #80; this file
 # only moves the id. The banner pack is hashed so a future pack cannot keep this id.
-READER_LOGIC_REV = "2026-10-24-clock-vote-infer-r4"
+READER_LOGIC_REV = "2026-10-24-clock-vote-infer-r5"
 
 
 QUARTER_FAIL = {"quarter_unsure", "quarter_missing", "quarter_unknown", "quarter_no_templates"}
