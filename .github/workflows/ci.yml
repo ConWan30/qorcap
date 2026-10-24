@@ -68,6 +68,7 @@ jobs:
           # LINUX_MIN_COLLECTED and WINDOWS_MIN_COLLECTED to the new collect-only
           # counts, and a merge resolution must re-collect. Leaving the old floor
           # keeps a dropped test green.
+          # sidecar/test_presign_followups.py is on this job via --list linux.
           # xfail_strict fails an unexpected pass. junit_family=xunit1 keeps the file
           # attribute so the skip guard can match the full node id.
           # _suite_list=$(...) so a failing --list trips errexit. Each id is quoted,
@@ -188,6 +189,7 @@ jobs:
           # LINUX_MIN_COLLECTED and WINDOWS_MIN_COLLECTED to the new collect-only
           # counts, and a merge resolution must re-collect. Leaving the old floor
           # keeps a dropped test green.
+          # sidecar/test_presign_followups.py is on this job via --list windows.
           # Same gate as the Linux job. --suite windows checks this runner, the
           # exact skip reasons, the full node ids, and the collected-count floor.
           _suite_list=$(python tools/assert_pytest_skips.py --list windows)
