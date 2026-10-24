@@ -343,6 +343,8 @@ fn main() {
         Cmd::VerifyBundle { dir } => match qorcap::bundle::verify(std::path::Path::new(&dir)) {
             Ok(r) => {
                 println!("segments={} bytes={} checkpoints={} chain_head={}", r.segments, r.bytes, r.checkpoints, r.chain_head);
+                println!("frame_status={} reader_status={} frame_chain_head={} coverage_timed={} coverage_samples={} coverage_gaps={} au={} tail={}",
+                    r.frame_status, r.reader_status, r.frame_chain_head, r.frame_timed, r.frame_samples, r.frame_gaps, r.frame_au, r.frame_tail);
                 if let Some(h) = &r.input_head { println!("controller input chunks={} inputs_chain_head={h}", r.input_chunks); }
                 for e in &r.errors { println!("FAIL: {e}"); }
                 println!("{}", if r.errors.is_empty() { "OK: video bytes match the hash chain; checkpoints link. (Integrity + timing only; does not prove who played.)" } else { "FAILED" });
@@ -549,6 +551,7 @@ fn main() {
                 }
             }
             let e = Engine::new(a.clone(), ff);
+            if e.frame_bind.enabled() { e.seal_opening(); }
             if a.no_controller { info!("controller input logging disabled (--no-controller)"); } else { let _ = e.start_input_logger(); }
             let srv = match api::serve(e.clone(), cli.port) { Ok(h) => h, Err(m) => { error!("{m}"); std::process::exit(2); } };
             { let e = e.clone(); let _ = ctrlc::set_handler(move || { info!("Ctrl+C: stopping"); e.request_stop("ctrl_c"); }); }

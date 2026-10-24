@@ -42,11 +42,16 @@ META_FILES = ("bundle.json", "manifest.jsonl", "checkpoints.jsonl", "countersign
               "haptics.jsonl", "input_proof.json", "receipt.json", "receipt.draft.json", "timeline.jsonl",
               "challenges.jsonl", "official_challenges.jsonl", "anchors.jsonl", "referee.pub",
               "challenge_gates.jsonl", "challenge_results.jsonl", "pairing.json", "device_attest.v0.json",
-              "score_timeline.json")
+              "score_timeline.json", "frames.jsonl", "readers.json")
 
 
 def upload_names() -> tuple[str, ...]:
-    """Files meta_zip sends when they exist. Same order as contracts/compat.json bundle_files.meta."""
+    """Files meta_zip sends when they exist.
+
+    The prefix matches contracts/compat.json bundle_files.meta. ``frames.jsonl`` and ``readers.json``
+    are appended so a referee can fetch them. They are not in compat.json until QorTime adds them
+    and this repo re-copies the contract. Do not treat the suffix as a published schema.
+    """
     return META_FILES
 HERE = Path(__file__).resolve().parent
 CLIENT_VERSION = "0.3.32"

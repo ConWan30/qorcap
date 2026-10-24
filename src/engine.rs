@@ -213,6 +213,18 @@ impl Engine {
         let frame_clock = Arc::new(crate::frameclock::FrameClock::open(frame_on, args.bundle.as_deref().map(Path::new)));
         let bind_on = crate::framebind::flag_enabled(args.frame_bind, std::env::var(crate::framebind::ENV).ok().as_deref());
         let frame_bind = crate::framebind::FrameBind::open(bind_on, args.bundle.as_deref().map(Path::new), args.fps);
+        if bind_on {
+            if let Some(path) = &args.readers_manifest {
+                match std::fs::read(path).and_then(|b| serde_json::from_slice::<Value>(&b).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))) {
+                    Ok(v) => {
+                        if let Err(e) = frame_bind.install_readers(&v) {
+                            log::error!("readers manifest was not sealed ({e}); checkpoint 0 has no reader claim");
+                        }
+                    }
+                    Err(e) => log::error!("readers manifest was not read ({e}); checkpoint 0 has no reader claim"),
+                }
+            }
+        }
         let st = Status { state: "starting".into(), device: args.device.clone(), res: format!("{}x{}", args.res.0, args.res.1), fps_target: args.fps, replay_window: args.replay.unwrap_or(0), role: args.role.clone(), side_source: args.side_source.clone(), ..Default::default() };
         Arc::new(Self { ffmpeg, ring: Mutex::new(ReplayRing::new(window, cap)), rec: Mutex::new(None), status: Mutex::new(st), shutdown: AtomicBool::new(false),
             ev: Mutex::new(MatchState { started_wall_ms: wall_ms(), score: Value::Null, ..Default::default() }), subs: Mutex::new(vec![]),
@@ -260,23 +272,9 @@ impl Engine {
         let p = r.path.clone();
         *g = Some(r);
         drop(g);
-        // Genesis checkpoint right away: the first segment checkpoint can be 5-10 s away (device open,
-        // audio fallback retry, encoder warm-up) and the referee must see the chain start promptly.
-        // With --frame-bind the opening checkpoint waits (bounded) so readers.json can be sealed into
-        // seq 0. Flag off does not wait and does not add fields.
-        if self.frame_bind.enabled() {
-            let me = self.clone();
-            std::thread::spawn(move || {
-                let deadline = Instant::now() + crate::framebind::READERS_WAIT;
-                while Instant::now() < deadline {
-                    if me.shutdown.load(Ordering::SeqCst) || me.frame_bind.readers_ready() { break; }
-                    std::thread::sleep(Duration::from_millis(50));
-                }
-                me.emit_opening();
-            });
-        } else {
-            self.emit_opening();
-        }
+        // Genesis checkpoint right away. `--frame-bind` does not wait: the reader manifest is loaded
+        // before this, or checkpoint 0 records readers as unbound. The 4 s heartbeat is not suppressed.
+        self.emit_opening();
         // Until the first video segment exists (device open, audio fallbacks, encoder warm-up), keep the
         // referee fed every 4 s. Stops for good at the first segment, so mid-match gaps are still gaps.
         { let me = self.clone(); std::thread::spawn(move || {
@@ -284,7 +282,6 @@ impl Engine {
             while t0.elapsed() < Duration::from_secs(120) {
                 std::thread::sleep(Duration::from_millis(4000));
                 if me.shutdown.load(Ordering::SeqCst) || me.ev.lock().unwrap_or_else(|e| e.into_inner()).seg.seq > 0 || me.rec.lock().unwrap_or_else(|e| e.into_inner()).is_none() { break; }
-                if me.frame_bind.enabled() && !me.frame_bind.opening_claimed() { continue; }
                 me.checkpoint("startup", json!({}));
             }
         }); }
@@ -594,6 +591,11 @@ impl Engine {
     /// referee reports it countersigned through that seq. No referee attached -> no wait.
     pub fn seal_and_wait_countersign(&self, wait: Duration) -> Option<u64> {
         if self.sealed.load(Ordering::SeqCst) { return None; }
+        if self.frame_bind.enabled() {
+            if let Err(e) = self.frame_bind.seal() {
+                log::error!("frame seal was not written ({e}); no frame claim");
+            }
+        }
         let cp = self.checkpoint("stop", json!({}));
         self.sealed.store(true, Ordering::SeqCst);
         let last = cp["seq"].as_u64()?;
@@ -1199,13 +1201,19 @@ mod tests {
         assert!(e.frame_bind.enabled());
         let manifest = serde_json::json!({
             "schema": "qorcap-readers/v0",
+            "qorcap_version": "0.3.32",
+            "python": "3.12.0",
+            "numpy": null,
+            "opencv": null,
+            "ffmpeg": {"state": "unbound"},
+            "glimpse": {"state": "unbound"},
             "readers": [{"id": "scorebug", "version": "0.3.32", "files": [
                 {"kind": "code", "path": "sidecar/qorcap_standard.py", "sha256": "ab".repeat(32)}
             ]}]
         });
         e.bind_readers(&manifest).unwrap();
-        e.frame_bind.append_frame(1, 0, 0, b"au-0").unwrap();
-        e.frame_bind.append_frame(1, 30, 1120, b"au-30").unwrap();
+        e.frame_bind.append_frame(0, 0, 0, 0, b"au-0").unwrap();
+        e.frame_bind.append_frame(0, 30, 1120, 90_000, b"au-30").unwrap();
         let video = dir.join("video.mp4");
         std::fs::write(&video, b"hashed-segment").unwrap();
         e.on_segment(video.to_str().unwrap(), 0, b"hashed-segment");
@@ -1219,7 +1227,9 @@ mod tests {
         let ok = crate::bundle::verify(&dir).unwrap();
         assert!(ok.errors.is_empty(), "{:?}", ok.errors);
         let report = crate::framebind::check_dir(&dir, &cps);
-        assert!(report.frame_claim && report.reader_claim, "{:?}", report.errors);
+        assert_eq!(report.frame_status, "verified", "{:?}", report.errors);
+        assert!(report.reader_claim, "{:?}", report.errors);
+        assert_eq!(report.tail, "open", "this test does not write the stop seal");
         assert!(report.skew.iter().any(|s| s.frame == 30 && s.skew_ms == 120), "{:?}", report.skew);
         let mut raw = std::fs::read(dir.join("frames.jsonl")).unwrap();
         raw[40] ^= 0x01;
@@ -1266,12 +1276,15 @@ impl Engine {
         self.broadcast("segment", &m);
         // Frame lines for this fragment are on disk before the checkpoint that commits their running hash.
         self.frame_bind.on_segment(seq, kind, bytes);
-        if self.frame_bind.enabled() { self.emit_opening(); }
         // Seal controller inputs received up to now into this segment's chunk (same clock, same checkpoint).
         let (ih, ihead, n) = self.input.lock().unwrap_or_else(|e| e.into_inner()).seal(seq, self.started.elapsed().as_micros() as u64);
         if self.args.no_controller { self.checkpoint("segment", json!({})); }
         else { self.checkpoint_with("segment", json!({"input_seg": seq, "input_n": n, "input_head": ihead}), Some(ih)); }
     }
+
+    /// Checkpoint seq 0. Once per recording. Call this before the API accepts events when
+    /// `--frame-bind` is on, so a challenge cannot take seq 0. Flag off: the same start checkpoint.
+    pub fn seal_opening(&self) { self.emit_opening(); }
 
     /// Checkpoint seq 0. Once per recording. Flag off: the same start checkpoint as before.
     /// Flag on: includes whatever readers hash was frozen by `claim_opening` (or unbound).
@@ -1348,8 +1361,7 @@ impl Engine {
     pub fn event(self: &Arc<Self>, b: &Value) -> Result<Value, String> {
         let ty = b["type"].as_str().ok_or("missing type")?;
         if ty == "readers" {
-            let manifest = b.get("manifest").ok_or("missing manifest")?;
-            return self.bind_readers(manifest);
+            return Err("readers manifest is read from --readers-manifest before recording starts; a local post cannot change it".into());
         }
         let t_ms = b["t_ms"].as_u64().unwrap_or_else(wall_ms);
         let int = |k: &str| b[k].as_i64().ok_or(format!("{k} must be an integer"));

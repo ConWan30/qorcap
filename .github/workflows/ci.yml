@@ -82,7 +82,8 @@ jobs:
             sidecar/test_qorcap_sidepick.py \
             sidecar/test_score_timeline.py \
             sidecar/test_qorcap_glimpse_watch.py \
-            sidecar/test_qorcap_glimpse_witness.py
+            sidecar/test_qorcap_glimpse_witness.py \
+            sidecar/test_qorcap_readers.py
           python tools/assert_pytest_skips.py "$RUNNER_TEMP/sidecar-pytest.xml"
   # Contract bytes are compared to qortime main, not to QORTIME_PIN. The linux and windows
   # jobs keep fetching 0204e6d so `cargo test` and the bundled verifier stay reproducible.
@@ -197,7 +198,8 @@ jobs:
             sidecar/test_qorcap_sidepick.py \
             sidecar/test_score_timeline.py \
             sidecar/test_qorcap_glimpse_watch.py \
-            sidecar/test_qorcap_glimpse_witness.py
+            sidecar/test_qorcap_glimpse_witness.py \
+            sidecar/test_qorcap_readers.py
           python tools/assert_pytest_skips.py "$RUNNER_TEMP/sidecar-pytest.xml"
       # No controller is the expected result: input-test returns 1.
       # pwsh forwards that native code as the step result unless the script exits 0 itself.

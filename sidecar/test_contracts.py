@@ -117,7 +117,9 @@ def test_recorder_pause_caps_match_vendored_rule_v2():
 def test_sidecar_constants_match_registry():
     import qorcap_submit as qs
     assert qs.OFFICIAL_PUB == COMPAT["official_referee"]["pubkey"]
-    assert list(qs.META_FILES) == COMPAT["bundle_files"]["meta"]
+    pinned = tuple(COMPAT["bundle_files"]["meta"])
+    # frames.jsonl and readers.json are uploaded ahead of the QorTime compat re-copy.
+    assert tuple(qs.META_FILES) == pinned + ("frames.jsonl", "readers.json")
     src = (HERE / "qorcap_match.py").read_text(encoding="utf-8")
     for f in ("qorcap_mnp.py", "qorcap_snp.py", "qorcap_tnp.py"):
         src += (HERE / f).read_text(encoding="utf-8")

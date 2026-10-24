@@ -310,12 +310,6 @@ def start_reader(api: Api, stop: threading.Event, state: dict, bundle: Path | No
                       playcall=PlayCallDetector(), gate=PauseCapableGate())
     state["core"] = core
     state["gate"] = core.gate
-    if os.environ.get("QORCAP_FRAME_BIND", "").strip().lower() in ("1", "true", "yes", "on"):
-        try:
-            from qorcap_readers import publish
-            publish(api)
-        except Exception as e:  # a missed post seals checkpoint 0 as unbound; recording still runs
-            print(f"reader binding was not sealed: {type(e).__name__}: {e}", file=sys.stderr)
     try:  # Glimpse second opinion on held touchdown jumps: shadow log only unless QORCAP_GLIMPSE_TD_VETO=1
         from qorcap_reader import wire_touchdown_glimpse
         mode = wire_touchdown_glimpse(core, bundle.name if bundle is not None else None)
@@ -1030,6 +1024,13 @@ def main(argv=None) -> int:
                     say(line)
     if os.environ.get("QORCAP_FRAME_BIND", "").strip().lower() in ("1", "true", "yes", "on"):
         cmd.append("--frame-bind")
+        try:
+            from qorcap_readers import write_prerecord_manifest
+            manifest_path = bundle / "readers.input.json"
+            write_prerecord_manifest(manifest_path, ffmpeg=a.ffmpeg)
+            cmd += ["--readers-manifest", str(manifest_path)]
+        except Exception as e:
+            print(f"reader manifest was not sealed ({type(e).__name__}); checkpoint 0 has no reader claim", file=sys.stderr)
     log = open(bundle / "console.log", "w", encoding="utf-8")
     started_ms = int(time.time() * 1000)
     # Detach from this console and, when the job allows it, from the launcher job. Closing the

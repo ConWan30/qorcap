@@ -370,11 +370,15 @@ pub struct RecordArgs {
     #[arg(long)]
     pub frame_clock: bool,
     /// Draft: seal a per-frame sidecar and a scorebug-reader manifest into checkpoints.
-    /// Off unless this flag or `QORCAP_FRAME_BIND=1`. Writes `frames.jsonl` and, when the
-    /// sidecar posts it, `readers.json`. Does not add receipt fields and does not change
-    /// `frames_hash`'s formula. See docs/design/frame-and-reader-binding.md.
+    /// Off unless this flag or `QORCAP_FRAME_BIND=1`. Writes `frames.jsonl` and, when
+    /// `--readers-manifest` is set, `readers.json`. Does not add receipt fields and does not
+    /// change `frames_hash`'s formula. See docs/design/frame-and-reader-binding.md.
     #[arg(long)]
     pub frame_bind: bool,
+    /// Reader/pack manifest built before `record` starts. Sealed into checkpoint 0 with no wait.
+    /// A missing or rejected file seals `readers.state: unbound` (no reader claim).
+    #[arg(long)]
+    pub readers_manifest: Option<String>,
 }
 
 impl RecordArgs {
@@ -440,7 +444,8 @@ mod tests {
         assert!(matches!(Cli::try_parse_from(["qorcap", "input-proof", "b", "--frames", "10"]).unwrap().cmd, Cmd::InputProof { frames: 10, .. }));
         if let Cmd::Record(r) = Cli::try_parse_from(["qorcap", "record", "--no-controller"]).unwrap().cmd { assert!(r.no_controller); assert!(!r.frame_clock); assert!(!r.frame_bind); } else { panic!() }
         if let Cmd::Record(r) = Cli::try_parse_from(["qorcap", "record", "--frame-clock"]).unwrap().cmd { assert!(r.frame_clock); assert!(!r.frame_bind); } else { panic!() }
-        if let Cmd::Record(r) = Cli::try_parse_from(["qorcap", "record", "--frame-bind"]).unwrap().cmd { assert!(r.frame_bind); assert!(!r.frame_clock); } else { panic!() }
+        if let Cmd::Record(r) = Cli::try_parse_from(["qorcap", "record", "--frame-bind"]).unwrap().cmd { assert!(r.frame_bind); assert!(!r.frame_clock); assert!(r.readers_manifest.is_none()); } else { panic!() }
+        if let Cmd::Record(r) = Cli::try_parse_from(["qorcap", "record", "--frame-bind", "--readers-manifest", "readers.input.json"]).unwrap().cmd { assert_eq!(r.readers_manifest.as_deref(), Some("readers.input.json")); } else { panic!() }
         assert!(matches!(Cli::try_parse_from(["qorcap", "align-ab", "b", "--no-video"]).unwrap().cmd, Cmd::AlignAb { no_video: true, frames: 15, .. }));
     }
     #[test]

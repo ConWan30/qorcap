@@ -1,26 +1,25 @@
 //! Draft per-frame and scorebug-reader binding. Off unless `--frame-bind` or `QORCAP_FRAME_BIND`.
 //!
-//! This does not redefine `frames_hash`. That field stays `SHA-256(JCS(qorcap))`, which is a
-//! segment-level evidence object, not the per-frame hash QorTime's spec describes. See
+//! This does not redefine `frames_hash`. That field stays `SHA-256(JCS(qorcap))`, a segment-level
+//! evidence object, not the per-frame hash QorTime's spec describes. See
 //! `docs/design/frame-and-reader-binding.md`. When the flag is on, each checkpoint's `qorcap`
-//! object gains `frame_bind` (the sidecar's running hash). The first checkpoint also gains
-//! `readers` (the hash of `readers.json`, or `state: unbound`). Those keys sit inside the object
-//! `frames_hash` already covers. They are not receipt fields. `body_of` in QorTime drops `qorcap`
-//! before a checkpoint is copied into a receipt.
+//! object gains `frame_bind`. Checkpoint 0 also gains `readers`. Those keys sit inside the object
+//! `frames_hash` already covers. They are not receipt fields.
 //!
-//! `frames.jsonl` hashes encoded video access units (the sample bytes inside the sealed fMP4
-//! fragment). A referee recomputes that from the fragment the segment hash already commits to,
-//! with no decoder. Decoded pixels are not bit-stable across ffmpeg builds, so they are not the
-//! commitment.
+//! `frames.jsonl` hashes encoded video access units and pairs each sample to a capture arrival by
+//! exact 90 kHz PTS. `mono_ms` is the process clock when this process read the encoder's MPEG-TS,
+//! after encode and pipe delay. It is not glass time. A gap withholds times for that stretch and
+//! does not fail the match. A mismatched committed hash does.
 //!
-//! Absence of `frame_bind` is not a frame-level pass. A missing sidecar on a bundle that did
-//! commit `frame_bind` is a failed check, and the frame claim stays false.
+//! Absence, `unbound`, a gap, a write failure, or an unverified chain is not a frame-time claim
+//! and not a reader claim. The wire format is a draft until QorTime publishes the optional
+//! schemas. This module does not add a contract file.
 
 use crate::evidence::{self as ev, GENESIS};
 use crate::frameclock::video_pes_pts;
 use serde_json::{json, Value};
 use std::fs::OpenOptions;
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -30,15 +29,15 @@ pub const HASH_OF: &str = "encoded-video-sample";
 pub const FRAMES_FILE: &str = "frames.jsonl";
 pub const READERS_FILE: &str = "readers.json";
 pub const ENV: &str = "QORCAP_FRAME_BIND";
-/// How long `record` waits for the sidecar to post `readers` before sealing checkpoint 0 as unbound.
-pub const READERS_WAIT: std::time::Duration = std::time::Duration::from_secs(8);
+pub const PTS_TIMESCALE: u64 = 90_000;
+const MONO_STEP_MAX_MS: u64 = 600_000;
+const MONO_ABS_MAX_MS: u64 = 48 * 60 * 60 * 1000;
 
 pub fn flag_enabled(cli: bool, env_val: Option<&str>) -> bool {
     cli || matches!(env_val.map(str::trim), Some("1" | "true" | "yes" | "on"))
 }
 
 /// Running hash of exact sidecar line bytes (no newline). `head_0` is 64 zero bytes.
-/// `head_n = SHA-256(JCS({prev, sha256}))` where `sha256` is SHA-256 of line n's bytes.
 pub fn chain_head(lines: &[&[u8]]) -> String {
     let mut head = GENESIS.to_string();
     for line in lines {
@@ -52,6 +51,8 @@ pub struct FrameRow {
     pub seg: u64,
     pub frame: i64,
     pub mono_ms: u64,
+    /// 90 kHz PTS of the encoded sample. Clip time for skew is derived from this, not from `--fps`.
+    pub pts: u64,
     pub au_sha256: String,
 }
 
@@ -59,28 +60,24 @@ pub struct FrameRow {
 pub struct SkewSample {
     pub frame: i64,
     pub mono_ms: u64,
-    /// CFR time of this frame relative to the first sealed frame, in milliseconds.
-    /// `clip_ms = (frame - frame_0) * 1000 * fps_den / fps_num`.
+    /// Media time of this PTS relative to the first sealed frame, in milliseconds.
     pub clip_ms: i64,
-    /// Capture clock relative to the first sealed frame: `mono_ms - mono_ms_0`.
     pub capture_ms: i64,
-    /// `capture_ms - clip_ms`. Positive means the capture clock ran long relative to clip time.
+    /// `capture_ms - clip_ms`. This is arrival-time minus PTS time, after a constant offset drops out.
     pub skew_ms: i64,
 }
 
-/// Skew between nominal clip time (frame index / fps) and the sidecar's capture `mono_ms`.
-/// Both clocks are anchored at the first frame row, so a constant offset drops out and what
-/// remains is the drift highlight cuts were seeing (clip time vs capture clock).
-pub fn measure_skew(rows: &[FrameRow], fps_num: u64, fps_den: u64) -> Vec<SkewSample> {
-    if rows.is_empty() || fps_num == 0 || fps_den == 0 {
+/// Skew between PTS media time and sidecar `mono_ms`, anchored at the first frame row.
+/// The frame rate is the PTS spacing (90 kHz), not the nominal `--fps` flag.
+pub fn measure_skew(rows: &[FrameRow]) -> Vec<SkewSample> {
+    if rows.is_empty() {
         return vec![];
     }
-    let origin_frame = rows[0].frame;
+    let origin_pts = rows[0].pts as i128;
     let origin_mono = rows[0].mono_ms as i64;
     rows.iter()
         .map(|r| {
-            let frames = (r.frame - origin_frame) as i128;
-            let clip_ms = frames * 1000 * fps_den as i128 / fps_num as i128;
+            let clip_ms = ((r.pts as i128 - origin_pts) * 1000) / PTS_TIMESCALE as i128;
             let capture_ms = r.mono_ms as i64 - origin_mono;
             SkewSample {
                 frame: r.frame,
@@ -94,12 +91,8 @@ pub fn measure_skew(rows: &[FrameRow], fps_num: u64, fps_den: u64) -> Vec<SkewSa
 }
 
 /// Skew of sidecar `mono_ms` against a fragment-close clip clock.
-/// `points` are `(frame_index, mono_ms)` in frame order, the same pairs `manifest.jsonl` stores
-/// and the highlight cutter interpolates. `skew_ms = mono_ms - interpolated_clip_mono_ms`.
-pub fn measure_skew_against_clip_clock(
-    rows: &[FrameRow],
-    points: &[(i64, u64)],
-) -> Vec<SkewSample> {
+/// `points` are `(frame_index, mono_ms)` in frame order, the same pairs `manifest.jsonl` stores.
+pub fn measure_skew_against_clip_clock(rows: &[FrameRow], points: &[(i64, u64)]) -> Vec<SkewSample> {
     rows.iter()
         .map(|r| {
             let clip = clip_mono_at(points, r.frame);
@@ -146,10 +139,11 @@ pub fn frame_rows_from_lines(lines: &[&[u8]]) -> Vec<FrameRow> {
         if v["type"] != "frame" {
             continue;
         }
-        let (Some(seg), Some(frame), Some(mono), Some(hash)) = (
+        let (Some(seg), Some(frame), Some(mono), Some(pts), Some(hash)) = (
             v["seg"].as_u64(),
             v["frame"].as_i64(),
             v["mono_ms"].as_u64(),
+            v["pts"].as_u64(),
             v["au_sha256"].as_str(),
         ) else {
             continue;
@@ -158,6 +152,7 @@ pub fn frame_rows_from_lines(lines: &[&[u8]]) -> Vec<FrameRow> {
             seg,
             frame,
             mono_ms: mono,
+            pts,
             au_sha256: hash.to_string(),
         });
     }
@@ -165,16 +160,78 @@ pub fn frame_rows_from_lines(lines: &[&[u8]]) -> Vec<FrameRow> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Coverage {
+    pub timed_frames: u64,
+    pub gap_samples: u64,
+    pub samples: u64,
+    /// `checked`, `unavailable`, or `mismatch`.
+    pub au: String,
+}
+
+impl Default for Coverage {
+    fn default() -> Self {
+        Self {
+            timed_frames: 0,
+            gap_samples: 0,
+            samples: 0,
+            au: "unavailable".into(),
+        }
+    }
+}
+
+/// Machine-readable result for a QorTime gate.
+///
+/// `frame_status` and `reader_status` are each `verified`, `missing`, `stripped`, or `broken`.
+/// `tail` is `sealed` (the last checkpoint commits a seal line), `open` (a consistent prefix with
+/// no seal; dropping the last checkpoint and its lines looks like this), or `checkpoints_missing`.
+/// `frame_claim` is true only for a sealed, gap-free, verified chain with at least one timed frame.
+/// Anything else is no frame-time claim. `reader_claim` is true only when `readers.json` matches
+/// checkpoint 0. `unbound` is `missing`, not a claim.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BindReport {
-    /// True only when every checkpoint committed `frame_bind` and the sidecar matched.
+    pub frame_status: String,
+    pub reader_status: String,
+    pub frame_chain_head: String,
+    pub coverage: Coverage,
+    pub tail: String,
     pub frame_claim: bool,
     pub frame_reason: String,
-    /// True only when checkpoint 0 committed a `readers.json` hash and the file matched.
     pub reader_claim: bool,
     pub reader_reason: String,
     pub errors: Vec<String>,
-    /// Filled only when `frame_claim` is true. A failed or absent sidecar does not report skew.
     pub skew: Vec<SkewSample>,
+}
+
+impl BindReport {
+    fn absent() -> Self {
+        Self {
+            frame_status: "missing".into(),
+            reader_status: "missing".into(),
+            frame_chain_head: String::new(),
+            coverage: Coverage::default(),
+            tail: "open".into(),
+            frame_claim: false,
+            frame_reason: "no frame_bind on any checkpoint".into(),
+            reader_claim: false,
+            reader_reason: "no readers commitment on the first checkpoint".into(),
+            errors: Vec::new(),
+            skew: Vec::new(),
+        }
+    }
+
+    fn finish(&mut self) {
+        self.frame_claim = self.frame_status == "verified"
+            && self.tail == "sealed"
+            && self.coverage.gap_samples == 0
+            && self.coverage.timed_frames > 0
+            && self.errors.is_empty();
+    }
+}
+
+struct Arrival {
+    pts: u64,
+    mono_ms: u64,
+    gen: u64,
 }
 
 struct Inner {
@@ -183,12 +240,14 @@ struct Inner {
     head: String,
     n: u64,
     video_track: Option<u32>,
+    timescale: Option<u32>,
     next_frame: i64,
-    arrivals: Vec<u64>,
+    arrivals: Vec<Arrival>,
     last_pts: Option<u64>,
-    clock_lost: bool,
+    generation: u64,
+    failed: bool,
+    sealed: bool,
     readers_sha: Option<String>,
-    /// Snapshot taken when the opening checkpoint is claimed, so a late post cannot change it.
     sealed_readers: Option<String>,
     opening_claimed: bool,
 }
@@ -225,11 +284,13 @@ impl FrameBind {
                     "schema": SCHEMA,
                     "hash_of": HASH_OF,
                     "clock": "qorcap-mono-ms",
-                    "fps_num": fps_num,
-                    "fps_den": 1,
+                    "pts_timescale": PTS_TIMESCALE,
+                    "nominal_fps_num": fps_num,
+                    "nominal_fps_den": 1,
                 });
                 if let Err(e) = inner.push_line(&header) {
                     log::error!("frame bind: header was not written ({e}); no frame claim");
+                    let _ = std::fs::remove_file(&path);
                     return Self {
                         enabled: false,
                         inner: Mutex::new(Inner::empty(Some(dir.to_path_buf()))),
@@ -261,14 +322,6 @@ impl FrameBind {
             .opening_claimed
     }
 
-    pub fn readers_ready(&self) -> bool {
-        self.inner
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .readers_sha
-            .is_some()
-    }
-
     /// First caller emits the opening checkpoint. The readers hash is frozen here.
     pub fn claim_opening(&self) -> bool {
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -280,8 +333,9 @@ impl FrameBind {
         true
     }
 
-    /// Fields merged into `qorcap` before `frames_hash` is computed. `None` when the flag is off,
-    /// so a flag-off checkpoint is byte-for-byte the pre-binding shape.
+    /// Fields merged into `qorcap`. `None` when the flag is off.
+    /// A write failure commits `state: failed` and the last line that actually landed.
+    /// That is not a frame claim.
     pub fn commitment(&self, first: bool) -> Option<Value> {
         if !self.enabled {
             return None;
@@ -292,9 +346,15 @@ impl FrameBind {
         } else {
             g.readers_sha.clone()
         };
-        let mut v = json!({
-            "frame_bind": {"schema": SCHEMA, "n": g.n, "head": g.head},
+        let mut frame_bind = json!({
+            "schema": SCHEMA,
+            "n": g.n,
+            "head": g.head,
         });
+        if g.failed {
+            frame_bind["state"] = json!("failed");
+        }
+        let mut v = json!({ "frame_bind": frame_bind });
         if first {
             v["readers"] = match readers_sha {
                 Some(sha) => json!({"schema": READERS_SCHEMA, "sha256": sha}),
@@ -304,12 +364,15 @@ impl FrameBind {
         Some(v)
     }
 
-    /// `mono_ms` is the QorCap monotonic clock at the read that contained this TS packet.
+    /// `mono_ms` is the process clock when this TS packet was read from the encoder pipe.
     pub fn observe_ts(&self, data: &[u8], mono_ms: u64) {
         if !self.enabled {
             return;
         }
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if g.failed {
+            return;
+        }
         for pkt in data.chunks_exact(crate::ring::TS) {
             let Some(pts) = video_pes_pts(pkt) else {
                 continue;
@@ -318,75 +381,70 @@ impl FrameBind {
                 continue;
             }
             if let Some(prev) = g.last_pts {
-                if pts + 90_000 < prev {
-                    g.clock_lost = true;
+                if pts + PTS_TIMESCALE < prev {
+                    g.generation = g.generation.saturating_add(1);
                 }
             }
             g.last_pts = Some(pts);
-            g.arrivals.push(mono_ms);
+            let gen = g.generation;
+            g.arrivals.push(Arrival { pts, mono_ms, gen });
         }
     }
 
-    /// Seal one fMP4 segment. Init segments teach the video track id. Media segments append one
-    /// sidecar line per video sample, or one `align_gap` line when the capture clock cannot be
-    /// paired with those samples. A gap is not a per-frame time claim.
+    /// Seal one fMP4 segment. Samples are paired to arrivals by exact 90 kHz PTS.
+    /// A miss writes `align_gap` for that stretch only. The next segment pairs on its own.
+    /// A gap does not fail the match. A write error sticks `state: failed` and stops the claim.
     pub fn on_segment(&self, seq: u64, kind: &str, bytes: &[u8]) {
         if !self.enabled {
             return;
         }
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if g.failed {
+            return;
+        }
         if kind != "media" {
             if g.video_track.is_none() {
-                g.video_track = video_track_id(bytes);
+                if let Some((id, ts)) = video_timing(bytes) {
+                    g.video_track = Some(id);
+                    g.timescale = Some(ts);
+                }
             }
             return;
         }
-        let read = match g.video_track {
-            Some(id) => video_sample_hashes(bytes, id),
-            None => SampleRead::Unreadable("video track id was not in the init segment".into()),
+        let read = match (g.video_track, g.timescale) {
+            (Some(id), ts) => video_samples(bytes, id, ts),
+            _ => SampleRead::Unreadable("video track id or timescale was not in the init segment".into()),
         };
         match read {
             SampleRead::NoVideo => {}
             SampleRead::Unreadable(reason) => {
                 let from = g.next_frame;
-                g.clock_lost = true;
-                let _ = g.push_line(&json!({
-                    "type": "align_gap", "seg": seq, "from_frame": from, "reason": reason,
-                }));
+                if let Err(e) = g.push_line(&json!({
+                    "type": "align_gap",
+                    "seg": seq,
+                    "from_frame": from,
+                    "samples": 0,
+                    "pts": 0,
+                    "reason": reason,
+                })) {
+                    log::error!("frame bind: {e}");
+                }
             }
-            SampleRead::Frames(hashes) => {
-                let n = hashes.len() as i64;
-                let from = g.next_frame;
-                let have = g.arrivals.len() as i64 - from;
-                if g.clock_lost || have < n {
-                    g.clock_lost = true;
-                    g.next_frame += n;
-                    let _ = g.push_line(&json!({
-                        "type": "align_gap", "seg": seq, "from_frame": from,
-                        "samples": n, "arrivals": have.max(0),
-                        "reason": "capture clock does not line up with encoded samples",
-                    }));
-                } else {
-                    for (i, hash) in hashes.iter().enumerate() {
-                        let frame = from + i as i64;
-                        let mono = g.arrivals[frame as usize];
-                        let _ = g.push_line(&json!({
-                            "type": "frame", "seg": seq, "frame": frame,
-                            "mono_ms": mono, "au_sha256": hash,
-                        }));
-                    }
-                    g.next_frame += n;
+            SampleRead::Frames(samples) => {
+                if let Err(e) = pair_samples(&mut g, seq, &samples) {
+                    log::error!("frame bind: {e}");
                 }
             }
         }
     }
 
-    /// Test and tooling helper: append one already-identified frame. The live path uses `on_segment`.
+    /// Append one already-identified frame. The live path uses `on_segment`.
     pub fn append_frame(
         &self,
         seg: u64,
         frame: i64,
         mono_ms: u64,
+        pts: u64,
         au: &[u8],
     ) -> Result<(), String> {
         if !self.enabled {
@@ -394,13 +452,38 @@ impl FrameBind {
         }
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         g.push_line(&json!({
-            "type": "frame", "seg": seg, "frame": frame,
-            "mono_ms": mono_ms, "au_sha256": ev::sha256_hex(au),
+            "type": "frame",
+            "seg": seg,
+            "frame": frame,
+            "mono_ms": mono_ms,
+            "pts": pts,
+            "au_sha256": ev::sha256_hex(au),
         }))
     }
 
-    /// Write `readers.json` as JCS plus a newline and remember its SHA-256.
-    /// Refused after the opening checkpoint has been claimed: a late manifest is not a claim.
+    /// Last line of a finished recording. The stop checkpoint must commit it.
+    /// Dropping that checkpoint and this line leaves a consistent prefix with `tail: open`.
+    pub fn seal(&self) -> Result<(), String> {
+        if !self.enabled {
+            return Ok(());
+        }
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if g.sealed {
+            return Ok(());
+        }
+        g.push_line(&json!({"type": "seal"}))?;
+        g.sealed = true;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn retarget_writes_for_test(&self, path: &Path) {
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        g.file = Some(OpenOptions::new().write(true).open(path).unwrap());
+    }
+
+    /// Write `readers.json` as JCS plus a newline. Refused after the opening checkpoint is claimed.
+    /// A write error leaves no hash and no file claim.
     pub fn install_readers(&self, manifest: &Value) -> Result<String, String> {
         if !self.enabled {
             return Err("frame bind is off".into());
@@ -419,11 +502,83 @@ impl FrameBind {
             return Err("frame bind has no bundle directory".into());
         };
         let path = dir.join(READERS_FILE);
-        std::fs::write(&path, &bytes)
-            .map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+        let tmp = dir.join(".readers.json.tmp");
+        if let Err(e) = std::fs::write(&tmp, &bytes) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(format!("cannot write {}: {e}", path.display()));
+        }
+        if let Err(e) = std::fs::rename(&tmp, &path) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(format!("cannot write {}: {e}", path.display()));
+        }
         g.readers_sha = Some(sha.clone());
         Ok(sha)
     }
+}
+
+fn pair_samples(g: &mut Inner, seq: u64, samples: &[VideoSample]) -> Result<(), String> {
+    let gen = g.generation;
+    let mut used = vec![false; g.arrivals.len()];
+    let mut gap_from: Option<i64> = None;
+    let mut gap_n: i64 = 0;
+    let mut gap_pts: u64 = 0;
+    let flush_gap = |g: &mut Inner, gap_from: &mut Option<i64>, gap_n: &mut i64, gap_pts: &mut u64| -> Result<(), String> {
+        if *gap_n <= 0 {
+            return Ok(());
+        }
+        g.push_line(&json!({
+            "type": "align_gap",
+            "seg": seq,
+            "from_frame": gap_from.unwrap_or(g.next_frame),
+            "samples": *gap_n,
+            "pts": *gap_pts,
+            "reason": "no arrival with this sample PTS",
+        }))?;
+        *gap_from = None;
+        *gap_n = 0;
+        *gap_pts = 0;
+        Ok(())
+    };
+    for sample in samples {
+        if g.failed {
+            return Err("frame sidecar write already failed; no further claim".into());
+        }
+        let frame = g.next_frame;
+        let hit = sample.pts90.and_then(|pts| {
+            g.arrivals.iter().enumerate().find_map(|(i, a)| {
+                if !used[i] && a.gen == gen && a.pts == pts {
+                    Some((i, a.mono_ms, pts))
+                } else {
+                    None
+                }
+            })
+        });
+        match hit {
+            Some((i, mono, pts)) => {
+                flush_gap(g, &mut gap_from, &mut gap_n, &mut gap_pts)?;
+                g.push_line(&json!({
+                    "type": "frame",
+                    "seg": seq,
+                    "frame": frame,
+                    "mono_ms": mono,
+                    "pts": pts,
+                    "au_sha256": sample.hash,
+                }))?;
+                used[i] = true;
+                g.next_frame += 1;
+            }
+            None => {
+                if gap_from.is_none() {
+                    gap_from = Some(frame);
+                    gap_pts = sample.pts90.unwrap_or(0);
+                }
+                gap_n += 1;
+                g.next_frame += 1;
+            }
+        }
+    }
+    flush_gap(g, &mut gap_from, &mut gap_n, &mut gap_pts)?;
+    Ok(())
 }
 
 impl Inner {
@@ -434,37 +589,53 @@ impl Inner {
             head: GENESIS.into(),
             n: 0,
             video_track: None,
+            timescale: None,
             next_frame: 0,
             arrivals: Vec::new(),
             last_pts: None,
-            clock_lost: false,
+            generation: 0,
+            failed: false,
+            sealed: false,
             readers_sha: None,
             sealed_readers: None,
             opening_claimed: false,
         }
     }
 
+    /// Write the line, then advance the running hash. A write error does not move `head`.
     fn push_line(&mut self, v: &Value) -> Result<(), String> {
+        if self.failed {
+            return Err("frame sidecar write already failed; no further claim".into());
+        }
         let line = ev::jcs(v)?;
         let sha = ev::sha256_hex(line.as_bytes());
-        self.head = ev::jcs_sha(&json!({"prev": self.head, "sha256": sha}));
-        self.n += 1;
-        if let Some(file) = self.file.as_mut() {
-            writeln!(file, "{line}").map_err(|e| format!("frame sidecar write failed: {e}"))?;
-            file.flush()
-                .map_err(|e| format!("frame sidecar flush failed: {e}"))?;
+        let next = ev::jcs_sha(&json!({"prev": &self.head, "sha256": sha}));
+        let Some(file) = self.file.as_mut() else {
+            self.failed = true;
+            return Err("frame sidecar has no file; no frame claim".into());
+        };
+        if let Err(e) = writeln!(file, "{line}").and_then(|_| file.flush()) {
+            self.failed = true;
+            return Err(format!("frame sidecar write failed: {e}; no frame claim"));
         }
+        self.head = next;
+        self.n += 1;
         Ok(())
     }
 }
 
+struct VideoSample {
+    hash: String,
+    pts90: Option<u64>,
+}
+
 enum SampleRead {
-    Frames(Vec<String>),
+    Frames(Vec<VideoSample>),
     NoVideo,
     Unreadable(String),
 }
 
-fn video_sample_hashes(data: &[u8], track: u32) -> SampleRead {
+fn video_samples(data: &[u8], track: u32, timescale: Option<u32>) -> SampleRead {
     let moof = match find_box(data, b"moof") {
         Ok(Some(b)) => b,
         Ok(None) => return SampleRead::Unreadable("fragment has no moof".into()),
@@ -475,7 +646,7 @@ fn video_sample_hashes(data: &[u8], track: u32) -> SampleRead {
         Ok(v) => v,
         Err(e) => return SampleRead::Unreadable(e),
     };
-    let mut hashes = Vec::new();
+    let mut out = Vec::new();
     for traf in trafs.into_iter().filter(|b| &b.ty == b"traf") {
         let traf_bytes = &moof_payload[traf.payload..traf.end];
         let tfhd = match find_payload(traf_bytes, b"tfhd") {
@@ -483,20 +654,28 @@ fn video_sample_hashes(data: &[u8], track: u32) -> SampleRead {
             Ok(None) => continue,
             Err(e) => return SampleRead::Unreadable(e),
         };
-        let (tid, default_size) = match parse_tfhd(tfhd) {
+        let parsed = match parse_tfhd(tfhd) {
             Ok(v) => v,
             Err(e) => return SampleRead::Unreadable(e),
         };
-        if tid != track {
+        if parsed.track != track {
             continue;
         }
+        let base = match find_payload(traf_bytes, b"tfdt") {
+            Ok(Some(p)) => parse_tfdt(p).ok(),
+            _ => None,
+        };
         let truns = match iter_boxes(traf_bytes) {
             Ok(v) => v,
             Err(e) => return SampleRead::Unreadable(e),
         };
         for trun in truns.into_iter().filter(|b| &b.ty == b"trun") {
-            let parsed = parse_trun(&traf_bytes[trun.payload..trun.end], default_size);
-            let (offset, sizes) = match parsed {
+            let parsed_trun = parse_trun(
+                &traf_bytes[trun.payload..trun.end],
+                parsed.default_size,
+                parsed.default_duration,
+            );
+            let (offset, samples) = match parsed_trun {
                 Ok(v) => v,
                 Err(e) => return SampleRead::Unreadable(e),
             };
@@ -508,23 +687,52 @@ fn video_sample_hashes(data: &[u8], track: u32) -> SampleRead {
                 _ => return SampleRead::Unreadable("data_offset is outside the fragment".into()),
             };
             let mut at = start;
-            for size in sizes {
-                let Some(end) = at.checked_add(size as usize) else {
+            let mut cursor = base.unwrap_or(0);
+            let mut pts_ok = base.is_some();
+            for sample in samples {
+                let Some(end) = at.checked_add(sample.size as usize) else {
                     return SampleRead::Unreadable("sample size overflow".into());
                 };
                 if end > data.len() {
                     return SampleRead::Unreadable("sample extends past the fragment".into());
                 }
-                hashes.push(ev::sha256_hex(&data[at..end]));
+                let pts90 = if pts_ok {
+                    timescale.and_then(|ts| to_90k(cursor, ts))
+                } else {
+                    None
+                };
+                if pts90.is_none() {
+                    pts_ok = false;
+                }
+                out.push(VideoSample {
+                    hash: ev::sha256_hex(&data[at..end]),
+                    pts90,
+                });
                 at = end;
+                match sample.duration {
+                    Some(d) if pts_ok => cursor = cursor.saturating_add(d as u64),
+                    _ => pts_ok = false,
+                }
             }
         }
     }
-    if hashes.is_empty() {
+    if out.is_empty() {
         SampleRead::NoVideo
     } else {
-        SampleRead::Frames(hashes)
+        SampleRead::Frames(out)
     }
+}
+
+fn to_90k(pts: u64, timescale: u32) -> Option<u64> {
+    let ts = timescale as u64;
+    if ts == 0 {
+        return None;
+    }
+    let ticks = pts.checked_mul(PTS_TIMESCALE)?;
+    if ticks % ts != 0 {
+        return None;
+    }
+    Some(ticks / ts)
 }
 
 struct BoxRef {
@@ -579,29 +787,58 @@ fn find_payload<'a>(data: &'a [u8], ty: &[u8; 4]) -> Result<Option<&'a [u8]>, St
     Ok(find_box(data, ty)?.map(|b| &data[b.payload..b.end]))
 }
 
-fn video_track_id(init: &[u8]) -> Option<u32> {
+fn video_timing(init: &[u8]) -> Option<(u32, u32)> {
     let moov = find_payload(init, b"moov").ok().flatten()?;
     let traks = iter_boxes(moov).ok()?;
     for trak in traks.into_iter().filter(|b| &b.ty == b"trak") {
         let body = &moov[trak.payload..trak.end];
-        let tkhd = match find_payload(body, b"tkhd") {
-            Ok(Some(p)) => p,
-            _ => continue,
-        };
+        let tkhd = find_payload(body, b"tkhd").ok().flatten()?;
         let id = track_id_of(tkhd)?;
-        let mdia = match find_payload(body, b"mdia") {
-            Ok(Some(p)) => p,
-            _ => continue,
-        };
-        let hdlr = match find_payload(mdia, b"hdlr") {
-            Ok(Some(p)) => p,
-            _ => continue,
-        };
-        if hdlr.len() >= 12 && &hdlr[8..12] == b"vide" {
-            return Some(id);
+        let mdia = find_payload(body, b"mdia").ok().flatten()?;
+        let hdlr = find_payload(mdia, b"hdlr").ok().flatten()?;
+        if hdlr.len() < 12 || &hdlr[8..12] != b"vide" {
+            continue;
         }
+        let mdhd = find_payload(mdia, b"mdhd").ok().flatten()?;
+        let ts = media_timescale(mdhd)?;
+        return Some((id, ts));
     }
     None
+}
+
+#[cfg(test)]
+fn video_track_id(init: &[u8]) -> Option<u32> {
+    video_timing(init).map(|(id, _)| id).or_else(|| {
+        let moov = find_payload(init, b"moov").ok().flatten()?;
+        let traks = iter_boxes(moov).ok()?;
+        for trak in traks.into_iter().filter(|b| &b.ty == b"trak") {
+            let body = &moov[trak.payload..trak.end];
+            let tkhd = find_payload(body, b"tkhd").ok().flatten()?;
+            let id = track_id_of(tkhd)?;
+            let mdia = find_payload(body, b"mdia").ok().flatten()?;
+            let hdlr = find_payload(mdia, b"hdlr").ok().flatten()?;
+            if hdlr.len() >= 12 && &hdlr[8..12] == b"vide" {
+                return Some(id);
+            }
+        }
+        None
+    })
+}
+
+fn media_timescale(mdhd: &[u8]) -> Option<u32> {
+    if mdhd.is_empty() {
+        return None;
+    }
+    let off = if mdhd[0] == 1 { 20 } else { 12 };
+    if mdhd.len() < off + 4 {
+        return None;
+    }
+    let ts = u32::from_be_bytes(mdhd[off..off + 4].try_into().ok()?);
+    if ts == 0 {
+        None
+    } else {
+        Some(ts)
+    }
 }
 
 fn track_id_of(tkhd: &[u8]) -> Option<u32> {
@@ -615,20 +852,19 @@ fn track_id_of(tkhd: &[u8]) -> Option<u32> {
     Some(u32::from_be_bytes(tkhd[off..off + 4].try_into().ok()?))
 }
 
-fn parse_tfhd(p: &[u8]) -> Result<(u32, Option<u32>), String> {
+struct Tfhd {
+    track: u32,
+    default_size: Option<u32>,
+    default_duration: Option<u32>,
+}
+
+fn parse_tfhd(p: &[u8]) -> Result<Tfhd, String> {
     if p.len() < 8 {
         return Err("tfhd is short".into());
     }
     let flags = u32::from_be_bytes(p[0..4].try_into().unwrap()) & 0x00ff_ffff;
     let track = u32::from_be_bytes(p[4..8].try_into().unwrap());
     let mut i = 8usize;
-    let take = |i: &mut usize, n: usize| -> Result<(), String> {
-        if p.len().saturating_sub(*i) < n {
-            return Err("tfhd is short".into());
-        }
-        *i += n;
-        Ok(())
-    };
     if flags & 0x020000 == 0 {
         return Err("tfhd is not default-base-is-moof".into());
     }
@@ -636,24 +872,64 @@ fn parse_tfhd(p: &[u8]) -> Result<(u32, Option<u32>), String> {
         return Err("tfhd base-data-offset is not used".into());
     }
     if flags & 0x000002 != 0 {
-        take(&mut i, 4)?;
+        if p.len().saturating_sub(i) < 4 {
+            return Err("tfhd is short".into());
+        }
+        i += 4;
     }
-    if flags & 0x000008 != 0 {
-        take(&mut i, 4)?;
-    }
+    let default_duration = if flags & 0x000008 != 0 {
+        if p.len().saturating_sub(i) < 4 {
+            return Err("tfhd is short".into());
+        }
+        let d = u32::from_be_bytes(p[i..i + 4].try_into().unwrap());
+        i += 4;
+        Some(d)
+    } else {
+        None
+    };
     let default_size = if flags & 0x000010 != 0 {
         if p.len().saturating_sub(i) < 4 {
             return Err("tfhd is short".into());
         }
-        let s = u32::from_be_bytes(p[i..i + 4].try_into().unwrap());
-        Some(s)
+        Some(u32::from_be_bytes(p[i..i + 4].try_into().unwrap()))
     } else {
         None
     };
-    Ok((track, default_size))
+    Ok(Tfhd {
+        track,
+        default_size,
+        default_duration,
+    })
 }
 
-fn parse_trun(p: &[u8], default_size: Option<u32>) -> Result<(Option<i32>, Vec<u32>), String> {
+fn parse_tfdt(p: &[u8]) -> Result<u64, String> {
+    if p.is_empty() {
+        return Err("tfdt is short".into());
+    }
+    if p[0] == 1 {
+        if p.len() < 12 {
+            return Err("tfdt is short".into());
+        }
+        Ok(u64::from_be_bytes(p[4..12].try_into().unwrap()))
+    } else {
+        if p.len() < 8 {
+            return Err("tfdt is short".into());
+        }
+        Ok(u32::from_be_bytes(p[4..8].try_into().unwrap()) as u64)
+    }
+}
+
+#[derive(Debug)]
+struct TrunSample {
+    size: u32,
+    duration: Option<u32>,
+}
+
+fn parse_trun(
+    p: &[u8],
+    default_size: Option<u32>,
+    default_duration: Option<u32>,
+) -> Result<(Option<i32>, Vec<TrunSample>), String> {
     if p.len() < 8 {
         return Err("trun is short".into());
     }
@@ -686,12 +962,16 @@ fn parse_trun(p: &[u8], default_size: Option<u32>) -> Result<(Option<i32>, Vec<u
     if !has_size && default_size.is_none() {
         return Err("trun has no sample size".into());
     }
-    let mut sizes = Vec::with_capacity(count as usize);
+    let mut samples = Vec::with_capacity(count as usize);
     for _ in 0..count {
-        if has_dur {
+        let duration = if has_dur {
             need(i, 4)?;
+            let d = u32::from_be_bytes(p[i..i + 4].try_into().unwrap());
             i += 4;
-        }
+            Some(d)
+        } else {
+            default_duration
+        };
         let size = if has_size {
             need(i, 4)?;
             let s = u32::from_be_bytes(p[i..i + 4].try_into().unwrap());
@@ -714,68 +994,181 @@ fn parse_trun(p: &[u8], default_size: Option<u32>) -> Result<(Option<i32>, Vec<u
                 );
             }
         }
-        sizes.push(size);
+        samples.push(TrunSample { size, duration });
     }
-    Ok((data_offset, sizes))
+    Ok((data_offset, samples))
 }
 
 fn validate_readers(v: &Value) -> Result<(), String> {
     ev::jcs(v)?;
+    reject_unknown(
+        v,
+        &[
+            "schema",
+            "qorcap_version",
+            "python",
+            "numpy",
+            "opencv",
+            "ffmpeg",
+            "glimpse",
+            "readers",
+        ],
+        "readers manifest",
+    )?;
     if v["schema"] != READERS_SCHEMA {
         return Err(format!("readers manifest schema must be {READERS_SCHEMA}"));
     }
+    let ver = req_str(v, "qorcap_version", "readers manifest")?;
+    if ver.is_empty() || ver.len() > 80 {
+        return Err("qorcap_version is empty or too long".into());
+    }
+    let py = req_str(v, "python", "readers manifest")?;
+    if py.is_empty() || py.len() > 80 {
+        return Err("python version is empty or too long".into());
+    }
+    check_opt_version(&v["numpy"], "numpy")?;
+    check_opencv(&v["opencv"])?;
+    check_ffmpeg(&v["ffmpeg"])?;
+    check_glimpse(&v["glimpse"])?;
     let readers = v["readers"]
         .as_array()
         .ok_or("readers manifest needs a readers array")?;
-    if readers.is_empty() {
-        return Err("readers manifest has no readers".into());
+    if readers.is_empty() || readers.len() > 32 {
+        return Err("readers manifest has no readers or too many".into());
     }
     for (i, r) in readers.iter().enumerate() {
-        let id = r["id"]
-            .as_str()
-            .ok_or(format!("readers[{i}].id must be a string"))?;
+        reject_unknown(r, &["id", "version", "files"], &format!("readers[{i}]"))?;
+        let id = req_str(r, "id", &format!("readers[{i}]"))?;
         if id.is_empty() || id.len() > 80 {
             return Err(format!("readers[{i}].id is empty or too long"));
         }
-        let ver = r["version"]
-            .as_str()
-            .ok_or(format!("readers[{i}].version must be a string"))?;
+        let ver = req_str(r, "version", &format!("readers[{i}]"))?;
         if ver.is_empty() || ver.len() > 80 {
             return Err(format!("readers[{i}].version is empty or too long"));
         }
         let files = r["files"]
             .as_array()
             .ok_or(format!("readers[{i}].files must be an array"))?;
-        if files.is_empty() {
-            return Err(format!("readers[{i}] lists no files"));
+        if files.is_empty() || files.len() > 64 {
+            return Err(format!("readers[{i}] lists no files or too many"));
         }
         for (j, f) in files.iter().enumerate() {
-            let kind = f["kind"]
-                .as_str()
-                .ok_or(format!("readers[{i}].files[{j}].kind must be a string"))?;
+            reject_unknown(
+                f,
+                &["kind", "path", "sha256"],
+                &format!("readers[{i}].files[{j}]"),
+            )?;
+            let kind = req_str(f, "kind", &format!("readers[{i}].files[{j}]"))?;
             if kind != "code" && kind != "pack" {
                 return Err(format!("readers[{i}].files[{j}].kind must be code or pack"));
             }
-            let path = f["path"]
-                .as_str()
-                .ok_or(format!("readers[{i}].files[{j}].path must be a string"))?;
+            let path = req_str(f, "path", &format!("readers[{i}].files[{j}]"))?;
             if !safe_rel_path(path) {
                 return Err(format!(
                     "readers[{i}].files[{j}].path is not a relative code or pack path"
                 ));
             }
-            let sha = f["sha256"]
-                .as_str()
-                .ok_or(format!("readers[{i}].files[{j}].sha256 must be a string"))?;
-            if sha.len() != 64
-                || !sha
-                    .bytes()
-                    .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
-            {
-                return Err(format!(
-                    "readers[{i}].files[{j}].sha256 must be 64 lowercase hex chars"
-                ));
-            }
+            let sha = req_str(f, "sha256", &format!("readers[{i}].files[{j}]"))?;
+            check_hex(sha, &format!("readers[{i}].files[{j}].sha256"))?;
+        }
+    }
+    Ok(())
+}
+
+fn req_str<'a>(v: &'a Value, key: &str, what: &str) -> Result<&'a str, String> {
+    v[key]
+        .as_str()
+        .ok_or_else(|| format!("{what}.{key} must be a string"))
+}
+
+fn check_hex(sha: &str, what: &str) -> Result<(), String> {
+    if sha.len() == 64
+        && sha
+            .bytes()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+    {
+        Ok(())
+    } else {
+        Err(format!("{what} must be 64 lowercase hex chars"))
+    }
+}
+
+fn check_opt_version(v: &Value, what: &str) -> Result<(), String> {
+    if v.is_null() {
+        return Ok(());
+    }
+    let s = v
+        .as_str()
+        .ok_or_else(|| format!("{what} must be a string or null"))?;
+    if s.is_empty() || s.len() > 80 {
+        return Err(format!("{what} is empty or too long"));
+    }
+    Ok(())
+}
+
+fn check_opencv(v: &Value) -> Result<(), String> {
+    if v.is_null() {
+        return Ok(());
+    }
+    reject_unknown(v, &["version", "build_sha256"], "opencv")?;
+    let ver = req_str(v, "version", "opencv")?;
+    if ver.is_empty() || ver.len() > 80 {
+        return Err("opencv.version is empty or too long".into());
+    }
+    check_hex(req_str(v, "build_sha256", "opencv")?, "opencv.build_sha256")
+}
+
+fn check_ffmpeg(v: &Value) -> Result<(), String> {
+    if v.get("state").is_some() {
+        reject_unknown(v, &["state"], "ffmpeg")?;
+        if v["state"] != "unbound" {
+            return Err("ffmpeg.state must be unbound".into());
+        }
+        return Ok(());
+    }
+    reject_unknown(v, &["version", "sha256"], "ffmpeg")?;
+    let ver = req_str(v, "version", "ffmpeg")?;
+    if ver.is_empty() || ver.len() > 240 {
+        return Err("ffmpeg.version is empty or too long".into());
+    }
+    check_hex(req_str(v, "sha256", "ffmpeg")?, "ffmpeg.sha256")
+}
+
+fn check_glimpse(v: &Value) -> Result<(), String> {
+    if v.get("state").is_some() {
+        reject_unknown(v, &["state"], "glimpse")?;
+        if v["state"] != "unbound" {
+            return Err("glimpse.state must be unbound".into());
+        }
+        return Ok(());
+    }
+    reject_unknown(
+        v,
+        &["model", "version", "prompt_sha256", "veto_ran"],
+        "glimpse",
+    )?;
+    let model = req_str(v, "model", "glimpse")?;
+    let ver = req_str(v, "version", "glimpse")?;
+    if model.is_empty() || model.len() > 120 || ver.is_empty() || ver.len() > 80 {
+        return Err("glimpse model or version is empty or too long".into());
+    }
+    check_hex(
+        req_str(v, "prompt_sha256", "glimpse")?,
+        "glimpse.prompt_sha256",
+    )?;
+    if !v["veto_ran"].is_boolean() {
+        return Err("glimpse.veto_ran must be a boolean".into());
+    }
+    Ok(())
+}
+
+fn reject_unknown(v: &Value, allowed: &[&str], what: &str) -> Result<(), String> {
+    let Some(map) = v.as_object() else {
+        return Err(format!("{what} must be an object"));
+    };
+    for k in map.keys() {
+        if !allowed.contains(&k.as_str()) {
+            return Err(format!("{what} has unknown key {k}"));
         }
     }
     Ok(())
@@ -812,58 +1205,52 @@ fn sidecar_lines(bytes: &[u8]) -> Vec<&[u8]> {
     lines
 }
 
-fn header_fps(lines: &[&[u8]]) -> Option<(u64, u64)> {
-    let first = lines.first()?;
-    let v: Value = serde_json::from_slice(first).ok()?;
-    if v["type"] != "header" {
-        return None;
-    }
-    let num = v["fps_num"].as_u64()?;
-    let den = v["fps_den"].as_u64()?;
-    if num == 0 || den == 0 {
-        None
-    } else {
-        Some((num, den))
-    }
-}
-
 /// Check `frames.jsonl` and `readers.json` against the checkpoints in a bundle.
-///
-/// No `frame_bind` on any checkpoint: `frame_claim` is false and there is no error, whether or
-/// not a stray sidecar file is sitting in the directory. A committed `frame_bind` whose file is
-/// missing, short, long, or altered is an error, and `frame_claim` stays false.
 pub fn check_dir(dir: &Path, checkpoints: &[Value]) -> BindReport {
-    let mut report = BindReport {
-        frame_claim: false,
-        frame_reason: "no frame_bind on any checkpoint".into(),
-        reader_claim: false,
-        reader_reason: "no readers commitment on the first checkpoint".into(),
-        errors: Vec::new(),
-        skew: Vec::new(),
-    };
+    let mut report = BindReport::absent();
+    let sidecars = dir.join(FRAMES_FILE).exists() || dir.join(READERS_FILE).exists();
     if checkpoints.is_empty() {
+        if sidecars {
+            report.frame_status = "broken".into();
+            report.reader_status = "broken".into();
+            report.tail = "checkpoints_missing".into();
+            report.frame_reason = "checkpoints.jsonl is missing; sidecars are not a claim".into();
+            report.errors.push(report.frame_reason.clone());
+        }
+        report.finish();
         return report;
     }
-    check_readers(dir, checkpoints, &mut report);
     let flags: Vec<bool> = checkpoints
         .iter()
         .map(|c| c["qorcap"].get("frame_bind").is_some())
         .collect();
     let any = flags.iter().any(|b| *b);
     if !any {
+        if sidecars {
+            report.frame_status = "stripped".into();
+            report.reader_status = "stripped".into();
+            report.frame_reason =
+                "sidecar files are present but no checkpoint commits frame_bind".into();
+            report.reader_reason = report.frame_reason.clone();
+        }
+        report.finish();
         return report;
     }
+    check_readers(dir, checkpoints, true, &mut report);
     if flags.iter().any(|b| !*b) {
+        report.frame_status = "broken".into();
         report.frame_reason = "frame_bind is missing from a checkpoint".into();
         report.errors.push(report.frame_reason.clone());
+        report.finish();
         return report;
     }
-    let path = dir.join(FRAMES_FILE);
-    let bytes = match std::fs::read(&path) {
+    let bytes = match std::fs::read(dir.join(FRAMES_FILE)) {
         Ok(b) => b,
         Err(_) => {
+            report.frame_status = "broken".into();
             report.frame_reason = "frame_bind is committed but frames.jsonl is missing".into();
             report.errors.push(report.frame_reason.clone());
+            report.finish();
             return report;
         }
     };
@@ -871,36 +1258,64 @@ pub fn check_dir(dir: &Path, checkpoints: &[Value]) -> BindReport {
     let mut head = GENESIS.to_string();
     let mut idx = 0u64;
     let mut prev_n = 0u64;
+    let mut failed_state = false;
     for (ci, cp) in checkpoints.iter().enumerate() {
         let fb = &cp["qorcap"]["frame_bind"];
-        if fb["schema"] != SCHEMA {
-            report.frame_reason = format!("checkpoint {ci}: frame_bind schema is not {SCHEMA}");
+        if let Err(e) = reject_unknown(fb, &["schema", "n", "head", "state"], "frame_bind") {
+            report.frame_status = "broken".into();
+            report.frame_reason = format!("checkpoint {ci}: {e}");
             report.errors.push(report.frame_reason.clone());
+            report.finish();
             return report;
         }
+        if fb["schema"] != SCHEMA {
+            report.frame_status = "broken".into();
+            report.frame_reason = format!("checkpoint {ci}: frame_bind schema is not {SCHEMA}");
+            report.errors.push(report.frame_reason.clone());
+            report.finish();
+            return report;
+        }
+        if let Some(state) = fb.get("state") {
+            if state != "failed" {
+                report.frame_status = "broken".into();
+                report.frame_reason = format!("checkpoint {ci}: frame_bind.state is not failed");
+                report.errors.push(report.frame_reason.clone());
+                report.finish();
+                return report;
+            }
+            failed_state = true;
+        }
         let Some(n) = fb["n"].as_u64() else {
+            report.frame_status = "broken".into();
             report.frame_reason = format!("checkpoint {ci}: frame_bind.n is not an integer");
             report.errors.push(report.frame_reason.clone());
+            report.finish();
             return report;
         };
         let Some(want) = fb["head"].as_str() else {
+            report.frame_status = "broken".into();
             report.frame_reason = format!("checkpoint {ci}: frame_bind.head is missing");
             report.errors.push(report.frame_reason.clone());
+            report.finish();
             return report;
         };
         if n < prev_n {
+            report.frame_status = "broken".into();
             report
                 .errors
                 .push(format!("checkpoint {ci}: frame_bind.n went backwards"));
             report.frame_reason = "frame sidecar commitment is not a growing prefix".into();
+            report.finish();
             return report;
         }
         if n as usize > lines.len() {
+            report.frame_status = "broken".into();
             report.errors.push(format!(
                 "checkpoint {ci}: frame_bind commits {n} lines but frames.jsonl has {}",
                 lines.len()
             ));
             report.frame_reason = "frames.jsonl is shorter than a checkpoint commitment".into();
+            report.finish();
             return report;
         }
         while idx < n {
@@ -908,80 +1323,149 @@ pub fn check_dir(dir: &Path, checkpoints: &[Value]) -> BindReport {
             head = match ev::try_jcs_sha(&json!({"prev": head, "sha256": sha})) {
                 Ok(h) => h,
                 Err(e) => {
+                    report.frame_status = "broken".into();
                     report.errors.push(format!(
                         "checkpoint {ci}: sidecar hash is not JCS-safe ({e})"
                     ));
                     report.frame_reason = "sidecar hash failed".into();
+                    report.finish();
                     return report;
                 }
             };
             idx += 1;
         }
         if want != head {
+            report.frame_status = "broken".into();
             report.errors.push(format!(
                 "checkpoint {ci}: frame_bind.head does not match frames.jsonl"
             ));
             report.frame_reason = "a frames.jsonl line does not match the checkpoint".into();
+            report.finish();
             return report;
         }
         prev_n = n;
     }
+    report.frame_chain_head = head;
     if idx as usize != lines.len() {
+        report.frame_status = "broken".into();
         report.errors.push(format!(
             "frames.jsonl has {} lines but the last checkpoint commits {idx} (frames added or left unsealed)",
             lines.len()
         ));
         report.frame_reason = "frames were added or left unsealed after the last checkpoint".into();
+        report.finish();
         return report;
     }
-    report.frame_claim = true;
-    report.frame_reason = format!("frames.jsonl matches {idx} committed lines");
-    if let Some((num, den)) = header_fps(&lines) {
-        report.skew = measure_skew(&frame_rows_from_lines(&lines), num, den);
+    if let Err(e) = validate_rows(dir, checkpoints, &lines) {
+        report.frame_status = "broken".into();
+        report.frame_reason = e.clone();
+        report.errors.push(e);
+        report.finish();
+        return report;
     }
+    report.coverage = coverage_of(&lines);
+    match au_check(dir, &lines) {
+        AuCheck::Unavailable => report.coverage.au = "unavailable".into(),
+        AuCheck::Checked => report.coverage.au = "checked".into(),
+        AuCheck::Mismatch(e) => {
+            report.coverage.au = "mismatch".into();
+            report.frame_status = "broken".into();
+            report.frame_reason = e.clone();
+            report.errors.push(e);
+            report.finish();
+            return report;
+        }
+    }
+    report.tail = if lines.last().is_some_and(|l| {
+        serde_json::from_slice::<Value>(l)
+            .ok()
+            .is_some_and(|v| v["type"] == "seal")
+    }) {
+        "sealed".into()
+    } else {
+        "open".into()
+    };
+    if failed_state {
+        report.frame_status = "broken".into();
+        report.frame_reason = "a frames.jsonl write failed; no frame claim".into();
+        report.finish();
+        return report;
+    }
+    if report.frame_status == "broken" || !report.errors.is_empty() {
+        report.finish();
+        return report;
+    }
+    report.frame_status = "verified".into();
+    report.frame_reason = format!(
+        "frames.jsonl matches {} committed lines; tail {}",
+        idx, report.tail
+    );
+    if report.coverage.timed_frames > 0 && report.coverage.gap_samples == 0 {
+        report.skew = measure_skew(&frame_rows_from_lines(&lines));
+    }
+    report.finish();
     report
 }
 
-fn check_readers(dir: &Path, checkpoints: &[Value], report: &mut BindReport) {
+fn check_readers(dir: &Path, checkpoints: &[Value], frame_bind: bool, report: &mut BindReport) {
     let first = checkpoints
         .iter()
         .find(|c| c["seq"].as_u64() == Some(0))
         .unwrap_or(&checkpoints[0]);
     let readers = &first["qorcap"]["readers"];
     if readers.is_null() || !readers.is_object() {
+        if frame_bind {
+            report.reader_status = "broken".into();
+            report.frame_status = "broken".into();
+            report.reader_reason =
+                "frame_bind is present but readers is absent on checkpoint 0".into();
+            report.errors.push(report.reader_reason.clone());
+        }
+        return;
+    }
+    if let Err(e) = reject_unknown(readers, &["schema", "sha256", "state"], "readers commitment") {
+        report.reader_status = "broken".into();
+        report.reader_reason = e.clone();
+        report.errors.push(e);
         return;
     }
     if readers["schema"] != READERS_SCHEMA {
+        report.reader_status = "broken".into();
         report.reader_reason = "readers commitment schema is not qorcap-readers/v0".into();
         report.errors.push(report.reader_reason.clone());
         return;
     }
     if readers["state"] == "unbound" {
         if readers.get("sha256").is_some() {
+            report.reader_status = "broken".into();
             report.reader_reason = "readers commitment is both unbound and hashed".into();
             report.errors.push(report.reader_reason.clone());
             return;
         }
+        report.reader_status = "missing".into();
         report.reader_reason = "readers were not bound before the first checkpoint".into();
         return;
     }
     let Some(want) = readers["sha256"].as_str() else {
+        report.reader_status = "broken".into();
         report.reader_reason = "readers commitment has no sha256".into();
         report.errors.push(report.reader_reason.clone());
         return;
     };
-    let path = dir.join(READERS_FILE);
-    match std::fs::read(&path) {
+    match std::fs::read(dir.join(READERS_FILE)) {
         Err(_) => {
+            report.reader_status = "broken".into();
             report.reader_reason = "readers.json is committed but missing".into();
             report.errors.push(report.reader_reason.clone());
         }
         Ok(bytes) => {
             let got = ev::sha256_hex(&bytes);
             if got != want {
+                report.reader_status = "broken".into();
                 report.reader_reason = "readers.json does not match the first checkpoint".into();
                 report.errors.push(report.reader_reason.clone());
             } else {
+                report.reader_status = "verified".into();
                 report.reader_claim = true;
                 report.reader_reason = "readers.json matches the first checkpoint".into();
             }
@@ -989,6 +1473,332 @@ fn check_readers(dir: &Path, checkpoints: &[Value], report: &mut BindReport) {
     }
 }
 
+fn coverage_of(lines: &[&[u8]]) -> Coverage {
+    let mut c = Coverage::default();
+    for line in lines {
+        let Ok(v) = serde_json::from_slice::<Value>(line) else {
+            continue;
+        };
+        if v["type"] == "frame" {
+            c.timed_frames += 1;
+            c.samples += 1;
+        } else if v["type"] == "align_gap" {
+            let n = v["samples"].as_u64().unwrap_or(0);
+            c.gap_samples += n;
+            c.samples += n;
+        }
+    }
+    c
+}
+
+fn validate_rows(dir: &Path, checkpoints: &[Value], lines: &[&[u8]]) -> Result<(), String> {
+    if lines.is_empty() {
+        return Err("frames.jsonl has no header".into());
+    }
+    let header: Value =
+        serde_json::from_slice(lines[0]).map_err(|_| "frames.jsonl header is not JSON".to_string())?;
+    reject_unknown(
+        &header,
+        &[
+            "type",
+            "schema",
+            "hash_of",
+            "clock",
+            "pts_timescale",
+            "nominal_fps_num",
+            "nominal_fps_den",
+        ],
+        "frames.jsonl header",
+    )?;
+    if header["type"] != "header"
+        || header["schema"] != SCHEMA
+        || header["hash_of"] != HASH_OF
+        || header["clock"] != "qorcap-mono-ms"
+        || header["pts_timescale"] != PTS_TIMESCALE
+    {
+        return Err("frames.jsonl header is not qorcap-frame-bind/v0".into());
+    }
+    let mut prev_n = 0usize;
+    let mut prev_frame: Option<i64> = None;
+    let mut prev_mono: Option<u64> = None;
+    let mut prev_pts_in_seg: Option<(u64, u64)> = None;
+    let mut saw_seal = false;
+    for (ci, cp) in checkpoints.iter().enumerate() {
+        let n = cp["qorcap"]["frame_bind"]["n"].as_u64().unwrap_or(0) as usize;
+        let expected = expected_seg(dir, cp);
+        for line in lines.iter().take(n).skip(prev_n) {
+            let v: Value = serde_json::from_slice(line)
+                .map_err(|_| format!("checkpoint {ci}: a frames.jsonl line is not JSON"))?;
+            let ty = v["type"].as_str().unwrap_or("");
+            if saw_seal {
+                return Err("a line follows the seal".into());
+            }
+            match ty {
+                "header" => {
+                    if prev_n != 0 || line.as_ptr() != lines[0].as_ptr() {
+                        return Err("header is not the first frames.jsonl line".into());
+                    }
+                }
+                "seal" => {
+                    reject_unknown(&v, &["type"], "seal line")?;
+                    saw_seal = true;
+                }
+                "frame" => {
+                    reject_unknown(
+                        &v,
+                        &["type", "seg", "frame", "mono_ms", "pts", "au_sha256"],
+                        "frame line",
+                    )?;
+                    let seg = v["seg"].as_u64().ok_or("frame line seg is not an integer")?;
+                    let frame = v["frame"].as_i64().ok_or("frame line frame is not an integer")?;
+                    let mono = v["mono_ms"]
+                        .as_u64()
+                        .ok_or("frame line mono_ms is not an integer")?;
+                    let pts = v["pts"].as_u64().ok_or("frame line pts is not an integer")?;
+                    let hash = v["au_sha256"]
+                        .as_str()
+                        .ok_or("frame line au_sha256 is missing")?;
+                    check_hex(hash, "au_sha256")?;
+                    let want = expected.ok_or("frame line has no checkpoint segment to match")?;
+                    if seg != want {
+                        return Err(format!(
+                            "frame {frame} seg {seg} does not match checkpoint segment {want}"
+                        ));
+                    }
+                    if frame < 0 || prev_frame.is_some_and(|p| frame <= p) {
+                        return Err(format!("frame numbers are not strictly increasing at {frame}"));
+                    }
+                    if mono > MONO_ABS_MAX_MS {
+                        return Err(format!("mono_ms {mono} is not a sane capture read time"));
+                    }
+                    if let Some(prev) = prev_mono {
+                        if mono < prev || mono - prev > MONO_STEP_MAX_MS {
+                            return Err(format!("mono_ms {mono} is not sane after {prev}"));
+                        }
+                    }
+                    if let Some((pseg, ppts)) = prev_pts_in_seg {
+                        if pseg == seg && pts <= ppts {
+                            return Err(format!("pts went backwards inside segment {seg}"));
+                        }
+                    }
+                    if pts > (1u64 << 33) - 1 {
+                        return Err("pts is outside the 33-bit MPEG range".into());
+                    }
+                    prev_frame = Some(frame);
+                    prev_mono = Some(mono);
+                    prev_pts_in_seg = Some((seg, pts));
+                }
+                "align_gap" => {
+                    reject_unknown(
+                        &v,
+                        &["type", "seg", "from_frame", "samples", "pts", "reason"],
+                        "align_gap",
+                    )?;
+                    let seg = v["seg"].as_u64().ok_or("align_gap seg is not an integer")?;
+                    let want = expected.ok_or("align_gap has no checkpoint segment to match")?;
+                    if seg != want {
+                        return Err(format!(
+                            "align_gap seg {seg} does not match checkpoint segment {want}"
+                        ));
+                    }
+                    if v["from_frame"].as_i64().is_none_or(|n| n < 0) {
+                        return Err("align_gap from_frame is not a sane index".into());
+                    }
+                    if v["samples"].as_u64().is_none() {
+                        return Err("align_gap samples is not an integer".into());
+                    }
+                    if v["pts"].as_u64().is_none() {
+                        return Err("align_gap pts is not an integer".into());
+                    }
+                    let reason = v["reason"].as_str().unwrap_or("");
+                    if reason.is_empty() || reason.len() > 200 {
+                        return Err("align_gap reason is empty or too long".into());
+                    }
+                }
+                _ => return Err(format!("unknown frames.jsonl line type {ty}")),
+            }
+        }
+        prev_n = n;
+    }
+    Ok(())
+}
+
+fn expected_seg(dir: &Path, cp: &Value) -> Option<u64> {
+    if let Some(hash) = cp["qorcap"]["segment_hash"].as_str() {
+        if let Some(seq) = manifest_seq_for_hash(dir, hash) {
+            return Some(seq);
+        }
+    }
+    cp["qorcap"]["segment_seq"].as_u64()
+}
+
+fn manifest_seq_for_hash(dir: &Path, hash: &str) -> Option<u64> {
+    let text = std::fs::read_to_string(dir.join("manifest.jsonl")).ok()?;
+    for line in text.lines() {
+        let Ok(v) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if v["type"] == "segment" && v["sha256"].as_str() == Some(hash) {
+            return v["seq"].as_u64();
+        }
+    }
+    None
+}
+
+enum AuCheck {
+    Unavailable,
+    Checked,
+    Mismatch(String),
+}
+
+fn au_check(dir: &Path, lines: &[&[u8]]) -> AuCheck {
+    let Some(text) = std::fs::read_to_string(dir.join("manifest.jsonl")).ok() else {
+        return AuCheck::Unavailable;
+    };
+    let mut segs: Vec<(u64, Vec<u8>)> = Vec::new();
+    for line in text.lines() {
+        let Ok(v) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if v["type"] != "segment" {
+            continue;
+        }
+        let (Some(seq), Some(file), Some(off), Some(len)) = (
+            v["seq"].as_u64(),
+            v["file"].as_str(),
+            v["offset"].as_u64(),
+            v["bytes"].as_u64(),
+        ) else {
+            continue;
+        };
+        let Some(bytes) = read_contained(dir, file, off, len) else {
+            return AuCheck::Unavailable;
+        };
+        segs.push((seq, bytes));
+    }
+    if segs.is_empty() {
+        return AuCheck::Unavailable;
+    }
+    let Some((track, timescale)) = segs.iter().find_map(|(_, b)| video_timing(b)) else {
+        return AuCheck::Unavailable;
+    };
+    let mut checked = false;
+    for (seq, bytes) in &segs {
+        let framed = frame_hashes_for_seg(lines, *seq);
+        if framed.is_empty() && !gap_for_seg(lines, *seq) {
+            continue;
+        }
+        if find_box(bytes, b"moof").ok().flatten().is_none() {
+            if framed.is_empty() {
+                continue;
+            }
+            return AuCheck::Unavailable;
+        }
+        let parsed = video_samples(bytes, track, Some(timescale));
+        let SampleRead::Frames(samples) = parsed else {
+            if framed.is_empty() {
+                continue;
+            }
+            return AuCheck::Unavailable;
+        };
+        if framed.is_empty() {
+            continue;
+        }
+        checked = true;
+        if samples.len() < framed.len() {
+            return AuCheck::Mismatch(format!(
+                "segment {seq} has {} samples but frames.jsonl names {}",
+                samples.len(),
+                framed.len()
+            ));
+        }
+        for (idx, hash) in framed {
+            let Some(sample) = samples.get(idx) else {
+                return AuCheck::Mismatch(format!(
+                    "segment {seq} has no sample at index {idx}"
+                ));
+            };
+            if sample.hash != hash {
+                return AuCheck::Mismatch(format!(
+                    "segment {seq} sample {idx} hash does not match frames.jsonl"
+                ));
+            }
+        }
+    }
+    if checked {
+        AuCheck::Checked
+    } else {
+        AuCheck::Unavailable
+    }
+}
+
+fn frame_hashes_for_seg(lines: &[&[u8]], seg: u64) -> Vec<(usize, String)> {
+    let mut base: Option<i64> = None;
+    let mut out = Vec::new();
+    for line in lines {
+        let Ok(v) = serde_json::from_slice::<Value>(line) else {
+            continue;
+        };
+        if v["seg"].as_u64() != Some(seg) {
+            continue;
+        }
+        if v["type"] == "align_gap" {
+            if let Some(from) = v["from_frame"].as_i64() {
+                base = Some(base.map(|b| b.min(from)).unwrap_or(from));
+            }
+        }
+        if v["type"] != "frame" {
+            continue;
+        }
+        let Some(frame) = v["frame"].as_i64() else {
+            continue;
+        };
+        base = Some(base.map(|b| b.min(frame)).unwrap_or(frame));
+        if let Some(hash) = v["au_sha256"].as_str() {
+            out.push((frame, hash.to_string()));
+        }
+    }
+    let Some(base) = base else {
+        return vec![];
+    };
+    out.into_iter()
+        .filter_map(|(frame, hash)| {
+            let idx = frame - base;
+            if idx < 0 {
+                None
+            } else {
+                Some((idx as usize, hash))
+            }
+        })
+        .collect()
+}
+
+fn gap_for_seg(lines: &[&[u8]], seg: u64) -> bool {
+    lines.iter().any(|l| {
+        serde_json::from_slice::<Value>(l)
+            .ok()
+            .is_some_and(|v| v["type"] == "align_gap" && v["seg"].as_u64() == Some(seg))
+    })
+}
+
+fn read_contained(dir: &Path, file: &str, off: u64, len: u64) -> Option<Vec<u8>> {
+    if file.is_empty()
+        || file.contains("..")
+        || file.starts_with('/')
+        || file.starts_with('\\')
+        || file.contains(':')
+        || len > 64 * 1024 * 1024
+    {
+        return None;
+    }
+    let mut f = std::fs::File::open(dir.join(file)).ok()?;
+    f.seek(SeekFrom::Start(off)).ok()?;
+    let mut buf = vec![0u8; len as usize];
+    f.read_exact(&mut buf).ok()?;
+    Some(buf)
+}
+
+#[cfg(test)]
 fn box_of(ty: &[u8; 4], payload: &[u8]) -> Vec<u8> {
     let mut v = ((8 + payload.len()) as u32).to_be_bytes().to_vec();
     v.extend_from_slice(ty);
@@ -997,387 +1807,5 @@ fn box_of(ty: &[u8; 4], payload: &[u8]) -> Vec<u8> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::evidence::CheckpointChain;
-
-    fn temp_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("qorcap-bind-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
-    }
-
-    fn manifest() -> Value {
-        json!({
-            "schema": READERS_SCHEMA,
-            "readers": [{
-                "id": "scorebug",
-                "version": "0.3.32",
-                "files": [{
-                    "kind": "code",
-                    "path": "sidecar/qorcap_standard.py",
-                    "sha256": "ab".repeat(32),
-                }, {
-                    "kind": "pack",
-                    "path": "sidecar/packs/madden27_standard_score_110028.npz",
-                    "sha256": "cd".repeat(32),
-                }]
-            }]
-        })
-    }
-
-    fn seal_two(dir: &Path) -> (FrameBind, Vec<Value>) {
-        let b = FrameBind::open(true, Some(dir), 30);
-        b.append_frame(1, 0, 0, b"au-0").unwrap();
-        b.append_frame(1, 30, 1120, b"au-30").unwrap();
-        let mut ext0 = json!({"trigger": "start"});
-        merge(&mut ext0, b.commitment(true).unwrap());
-        let mut chain = CheckpointChain::default();
-        let cp0 = chain.next(10, ext0).unwrap();
-        b.append_frame(2, 90, 3719, b"au-90").unwrap();
-        let mut ext1 = json!({"trigger": "segment"});
-        merge(&mut ext1, b.commitment(false).unwrap());
-        let cp1 = chain.next(20, ext1).unwrap();
-        (b, vec![cp0, cp1])
-    }
-
-    fn merge(dst: &mut Value, src: Value) {
-        if let (Some(d), Some(s)) = (dst.as_object_mut(), src.as_object()) {
-            for (k, v) in s {
-                d.insert(k.clone(), v.clone());
-            }
-        }
-    }
-
-    #[test]
-    fn flag_defaults_off() {
-        assert!(!flag_enabled(false, None));
-        assert!(!flag_enabled(false, Some("0")));
-        assert!(flag_enabled(false, Some("1")));
-        assert!(flag_enabled(true, None));
-        let dir = temp_dir("off");
-        let b = FrameBind::open(false, Some(&dir), 30);
-        assert!(!b.enabled());
-        assert!(b.commitment(true).is_none());
-        assert!(!dir.join(FRAMES_FILE).exists());
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn tampering_any_sidecar_line_breaks_checkpoint_verification() {
-        let dir = temp_dir("tamper");
-        let (_b, cps) = seal_two(&dir);
-        let ok = check_dir(&dir, &cps);
-        assert!(ok.errors.is_empty(), "{:?}", ok.errors);
-        assert!(ok.frame_claim);
-        let original = std::fs::read(dir.join(FRAMES_FILE)).unwrap();
-        let lines = sidecar_lines(&original);
-        assert!(lines.len() >= 4, "header plus three frames");
-        for i in 0..lines.len() {
-            let mut broken = original.clone();
-            let start = lines[i].as_ptr() as usize - original.as_ptr() as usize;
-            let at = start + lines[i].len() / 2;
-            broken[at] ^= 0x01;
-            std::fs::write(dir.join(FRAMES_FILE), &broken).unwrap();
-            let report = check_dir(&dir, &cps);
-            assert!(!report.frame_claim, "line {i} still claimed");
-            assert!(
-                !report.errors.is_empty(),
-                "line {i} did not fail verification"
-            );
-        }
-        std::fs::write(dir.join(FRAMES_FILE), &original).unwrap();
-        // Retime one frame: same keys, different mono_ms. The line bytes change, so the head breaks.
-        let mut text = String::from_utf8(original.clone()).unwrap();
-        assert!(text.contains("\"mono_ms\":1120"));
-        text = text.replacen("\"mono_ms\":1120", "\"mono_ms\":1121", 1);
-        std::fs::write(dir.join(FRAMES_FILE), text.as_bytes()).unwrap();
-        let retimed = check_dir(&dir, &cps);
-        assert!(!retimed.frame_claim);
-        assert!(retimed.errors.iter().any(|e| e.contains("does not match")));
-        // A line appended after the last checkpoint is not a claim and does not verify.
-        std::fs::write(dir.join(FRAMES_FILE), &original).unwrap();
-        let mut extra = original.clone();
-        extra.extend_from_slice(b"{\"type\":\"frame\"}\n");
-        std::fs::write(dir.join(FRAMES_FILE), &extra).unwrap();
-        let added = check_dir(&dir, &cps);
-        assert!(!added.frame_claim);
-        assert!(added
-            .errors
-            .iter()
-            .any(|e| e.contains("added") || e.contains("unsealed")));
-        // Dropping a line fails the same way.
-        let dropped = original[..original.len().saturating_sub(2)].to_vec();
-        std::fs::write(dir.join(FRAMES_FILE), &dropped).unwrap();
-        let short = check_dir(&dir, &cps);
-        assert!(!short.frame_claim && !short.errors.is_empty());
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn missing_sidecar_degrades_to_no_frame_claim() {
-        let dir = temp_dir("missing");
-        let mut chain = CheckpointChain::default();
-        let old = vec![chain.next(5, json!({"trigger": "segment"})).unwrap()];
-        let absent = check_dir(&dir, &old);
-        assert!(absent.errors.is_empty(), "{:?}", absent.errors);
-        assert!(!absent.frame_claim);
-        assert!(!absent.reader_claim);
-        assert!(absent.skew.is_empty());
-        std::fs::write(
-            dir.join(FRAMES_FILE),
-            "{\"type\":\"frame\",\"frame\":0,\"mono_ms\":1}\n",
-        )
-        .unwrap();
-        let stray = check_dir(&dir, &old);
-        assert!(
-            stray.errors.is_empty(),
-            "an uncommitted sidecar must not become a claim or a failure"
-        );
-        assert!(!stray.frame_claim);
-        assert!(stray.skew.is_empty());
-
-        // The stray file is not a commitment. Remove it before sealing a real sidecar:
-        // open() refuses to append a second header onto an existing frames.jsonl.
-        std::fs::remove_file(dir.join(FRAMES_FILE)).unwrap();
-        let (_b, cps) = seal_two(&dir);
-        std::fs::remove_file(dir.join(FRAMES_FILE)).unwrap();
-        let gone = check_dir(&dir, &cps);
-        assert!(
-            !gone.frame_claim,
-            "a missing committed sidecar must not pass a frame claim"
-        );
-        assert!(gone.errors.iter().any(|e| e.contains("missing")));
-        assert!(gone.skew.is_empty());
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn timing_skew_between_clip_time_and_mono_ms_is_measurable_from_the_sidecar() {
-        let rows = vec![
-            FrameRow {
-                seg: 1,
-                frame: 0,
-                mono_ms: 5_000,
-                au_sha256: "a".repeat(64),
-            },
-            FrameRow {
-                seg: 1,
-                frame: 30,
-                mono_ms: 6_120,
-                au_sha256: "b".repeat(64),
-            },
-            FrameRow {
-                seg: 2,
-                frame: 90,
-                mono_ms: 8_719,
-                au_sha256: "c".repeat(64),
-            },
-        ];
-        let skew = measure_skew(&rows, 30, 1);
-        assert_eq!(skew[0].skew_ms, 0);
-        assert_eq!(skew[1].clip_ms, 1_000);
-        assert_eq!(skew[1].skew_ms, 120);
-        assert_eq!(skew[2].clip_ms, 3_000);
-        assert_eq!(skew[2].skew_ms, 719);
-
-        // Fragment-close clip clock: 300 frames span 10_000 ms of manifest mono, starting at 5_000.
-        // The sidecar's own mono_ms sits 120 ms and 719 ms off that interpolation.
-        let points = [(0i64, 5_000u64), (300, 15_000u64)];
-        let against = measure_skew_against_clip_clock(&rows, &points);
-        assert_eq!(against[1].clip_ms, 6_000);
-        assert_eq!(against[1].skew_ms, 120);
-        assert_eq!(against[2].clip_ms, 8_000);
-        assert_eq!(against[2].skew_ms, 719);
-
-        let dir = temp_dir("skew");
-        let (_b, cps) = seal_two(&dir);
-        let report = check_dir(&dir, &cps);
-        assert!(report.frame_claim, "{:?}", report.errors);
-        let by_frame: Vec<(i64, i64)> = report.skew.iter().map(|s| (s.frame, s.skew_ms)).collect();
-        assert!(by_frame.contains(&(30, 120)), "{by_frame:?}");
-        assert!(by_frame.contains(&(90, 719)), "{by_frame:?}");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn readers_hash_is_committed_only_by_the_first_checkpoint() {
-        let dir = temp_dir("readers");
-        let b = FrameBind::open(true, Some(&dir), 30);
-        let sha = b.install_readers(&manifest()).unwrap();
-        let file = std::fs::read(dir.join(READERS_FILE)).unwrap();
-        assert_eq!(ev::sha256_hex(&file), sha);
-        assert!(b.claim_opening());
-        let mut ext = json!({"trigger": "start"});
-        merge(&mut ext, b.commitment(true).unwrap());
-        assert_eq!(ext["readers"]["sha256"], sha);
-        let mut chain = CheckpointChain::default();
-        let cp0 = chain.next(1, ext).unwrap();
-        let mut later = json!({"trigger": "segment"});
-        merge(&mut later, b.commitment(false).unwrap());
-        assert!(later.get("readers").is_none());
-        let cp1 = chain.next(2, later).unwrap();
-        let ok = check_dir(&dir, &[cp0.clone(), cp1]);
-        assert!(ok.reader_claim, "{:?}", ok.errors);
-        assert!(ok.frame_claim, "{:?}", ok.errors);
-
-        let mut flipped = file.clone();
-        let last = flipped.len() - 2;
-        flipped[last] ^= 0x01;
-        std::fs::write(dir.join(READERS_FILE), &flipped).unwrap();
-        let bad = check_dir(&dir, &[cp0.clone()]);
-        assert!(!bad.reader_claim);
-        assert!(bad.errors.iter().any(|e| e.contains("readers.json")));
-
-        std::fs::remove_file(dir.join(READERS_FILE)).unwrap();
-        let missing = check_dir(&dir, &[cp0]);
-        assert!(!missing.reader_claim);
-        assert!(missing.errors.iter().any(|e| e.contains("missing")));
-
-        let unbound_dir = temp_dir("readers-unbound");
-        let u = FrameBind::open(true, Some(&unbound_dir), 30);
-        let mut ext = json!({"trigger": "start"});
-        merge(&mut ext, u.commitment(true).unwrap());
-        assert_eq!(ext["readers"]["state"], "unbound");
-        let cp = CheckpointChain::default().next(1, ext).unwrap();
-        let report = check_dir(&unbound_dir, &[cp]);
-        assert!(!report.reader_claim);
-        assert!(report.errors.is_empty(), "{:?}", report.errors);
-        assert!(report.frame_claim);
-        let _ = std::fs::remove_dir_all(&dir);
-        let _ = std::fs::remove_dir_all(&unbound_dir);
-    }
-
-    #[test]
-    fn readers_manifest_rejects_key_paths_and_late_binding() {
-        let mut bad = manifest();
-        bad["readers"][0]["files"][0]["path"] = json!("keys/referee.key");
-        assert!(validate_readers(&bad).is_err());
-        bad["readers"][0]["files"][0]["path"] = json!("../sidecar/qorcap_standard.py");
-        assert!(validate_readers(&bad).is_err());
-        let dir = temp_dir("late");
-        let b = FrameBind::open(true, Some(&dir), 30);
-        assert!(b.claim_opening());
-        let err = b.install_readers(&manifest()).unwrap_err();
-        assert!(err.contains("after the first checkpoint"));
-        assert!(!dir.join(READERS_FILE).exists());
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn encoded_video_samples_are_hashed_and_audio_is_not() {
-        let init = {
-            let moov = box_of(b"moov", &[trak(1, b"vide"), trak(2, b"soun")].concat());
-            [box_of(b"ftyp", b"iso5"), moov].concat()
-        };
-        assert_eq!(video_track_id(&init), Some(1));
-        let v0 = b"FRAME0";
-        let v1 = b"FRAME1!!";
-        let audio = b"AUD";
-        let tfhd_v = tfhd(1);
-        let tfhd_a = tfhd(2);
-        let trun_v = trun(&[v0.len() as u32, v1.len() as u32], 0);
-        let trun_a = trun(&[audio.len() as u32], 0);
-        let traf_v = box_of(b"traf", &[tfhd_v, trun_v].concat());
-        let traf_a = box_of(b"traf", &[tfhd_a, trun_a].concat());
-        let moof_len = 8 + traf_v.len() + traf_a.len();
-        let video_off = moof_len as i32 + 8;
-        let audio_off = video_off + (v0.len() + v1.len()) as i32;
-        let trun_v = trun(&[v0.len() as u32, v1.len() as u32], video_off);
-        let trun_a = trun(&[audio.len() as u32], audio_off);
-        let traf_v = box_of(b"traf", &[tfhd(1), trun_v].concat());
-        let traf_a = box_of(b"traf", &[tfhd(2), trun_a].concat());
-        let moof = box_of(b"moof", &[traf_v, traf_a].concat());
-        assert_eq!(moof.len(), moof_len);
-        let mdat = box_of(
-            b"mdat",
-            &[v0.as_slice(), v1.as_slice(), audio.as_slice()].concat(),
-        );
-        let seg = [moof, mdat].concat();
-        match video_sample_hashes(&seg, 1) {
-            SampleRead::Frames(h) => {
-                assert_eq!(h, vec![ev::sha256_hex(v0), ev::sha256_hex(v1)]);
-            }
-            SampleRead::NoVideo => panic!("no video"),
-            SampleRead::Unreadable(e) => panic!("{e}"),
-        }
-        let bad = trun_with_cto();
-        let err = parse_trun(&bad, None).unwrap_err();
-        assert!(err.contains("composition offset"));
-    }
-
-    #[test]
-    fn receipt_schema_does_not_gain_sidecar_fields() {
-        let schema: Value =
-            serde_json::from_str(include_str!("../contracts/receipt.v0.json")).unwrap();
-        assert_eq!(schema["additionalProperties"], false);
-        let top: Vec<&str> = schema["properties"]
-            .as_object()
-            .unwrap()
-            .keys()
-            .map(|s| s.as_str())
-            .collect();
-        for forbidden in ["frame_bind", "readers", "frames_hash_v2", "qorcap"] {
-            assert!(!top.contains(&forbidden), "{forbidden} is a receipt field");
-        }
-        let cp = &schema["$defs"]["checkpoint"]["properties"];
-        assert!(cp.get("frame_bind").is_none());
-        assert!(cp.get("readers").is_none());
-        assert!(cp.get("qorcap").is_none());
-        assert_eq!(schema["$defs"]["checkpoint"]["additionalProperties"], false);
-        let draft = ev::draft_receipt(
-            "m",
-            "home",
-            "p",
-            1,
-            2,
-            &json!({"home": 1, "away": 0, "quarter": 4, "t_ms": 2, "basis": "clock_zero"}),
-            &[],
-        );
-        let allowed: std::collections::BTreeSet<&String> =
-            schema["properties"].as_object().unwrap().keys().collect();
-        for k in draft.as_object().unwrap().keys() {
-            assert!(allowed.contains(k), "draft receipt gained {k}");
-        }
-        assert!(draft["checkpoints"].as_object().unwrap().is_empty());
-    }
-
-    fn trak(id: u32, kind: &[u8; 4]) -> Vec<u8> {
-        let mut tkhd_p = vec![0u8; 16];
-        tkhd_p[12..16].copy_from_slice(&id.to_be_bytes());
-        let mut hdlr_p = vec![0u8; 12];
-        hdlr_p[8..12].copy_from_slice(kind);
-        let mdia = box_of(b"mdia", &box_of(b"hdlr", &hdlr_p));
-        box_of(b"trak", &[box_of(b"tkhd", &tkhd_p), mdia].concat())
-    }
-
-    fn tfhd(track: u32) -> Vec<u8> {
-        let mut p = vec![0u8; 8];
-        p[0..4].copy_from_slice(&0x020000u32.to_be_bytes());
-        p[4..8].copy_from_slice(&track.to_be_bytes());
-        box_of(b"tfhd", &p)
-    }
-
-    fn trun(sizes: &[u32], data_offset: i32) -> Vec<u8> {
-        let mut p = Vec::new();
-        p.extend_from_slice(&0x201u32.to_be_bytes());
-        p.extend_from_slice(&(sizes.len() as u32).to_be_bytes());
-        p.extend_from_slice(&data_offset.to_be_bytes());
-        for s in sizes {
-            p.extend_from_slice(&s.to_be_bytes());
-        }
-        box_of(b"trun", &p)
-    }
-
-    fn trun_with_cto() -> Vec<u8> {
-        // data-offset | sample-size | sample-composition-time-offset = 0x1 | 0x200 | 0x800
-        let mut p = Vec::new();
-        p.extend_from_slice(&0xA01u32.to_be_bytes());
-        p.extend_from_slice(&1u32.to_be_bytes());
-        p.extend_from_slice(&0i32.to_be_bytes());
-        p.extend_from_slice(&4u32.to_be_bytes());
-        p.extend_from_slice(&1i32.to_be_bytes());
-        p
-    }
-}
+#[path = "framebind_tests.rs"]
+mod tests;
