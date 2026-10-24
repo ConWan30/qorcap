@@ -8,6 +8,10 @@ Windows-only submit skips are not in that set. They are accepted only when this
 process is told ``--platform windows`` and the junit skip message contains the
 reason recorded below. A Linux skip of the same test fails the job, even when
 the message text matches.
+
+``--platform`` has to name this machine. ``sys.platform == "linux"`` accepts
+only ``linux``; ``sys.platform == "win32"`` accepts only ``windows``. Omitting
+the flag means linux, so a Windows job that forgets it fails closed.
 """
 import sys
 import xml.etree.ElementTree as ET
@@ -38,6 +42,15 @@ WINDOWS_SKIP_REASONS = {
     "test_live_signed_bundle_still_passes": _FFMPEG,
     "test_submit_prompt_times_out_to_no": _PIPE,
 }
+
+
+def host_platform() -> str:
+    """The ``--platform`` name for this process, or ``sys.platform`` when it is neither."""
+    if sys.platform == "win32":
+        return "windows"
+    if sys.platform == "linux":
+        return "linux"
+    return sys.platform
 
 
 def unexpected_skips(path: str, *, platform: str = "linux") -> list[str]:
@@ -73,8 +86,19 @@ def main(argv: list[str]) -> int:
     else:
         print("usage: assert_pytest_skips.py [--platform linux|windows] JUNIT.xml", file=sys.stderr)
         return 2
+    plat = platform.strip().lower()
+    if plat not in {"linux", "windows"}:
+        print(f"platform must be linux or windows, not {platform!r}", file=sys.stderr)
+        return 2
+    host = host_platform()
+    if host != plat:
+        print(
+            f"--platform {plat} does not match this OS (sys.platform={sys.platform})",
+            file=sys.stderr,
+        )
+        return 2
     try:
-        bad = unexpected_skips(path, platform=platform)
+        bad = unexpected_skips(path, platform=plat)
     except ValueError as exc:
         print(str(exc), file=sys.stderr)
         return 2

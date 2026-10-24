@@ -671,6 +671,12 @@ def test_negative_volume_warns_and_plays_at_full_scale(monkeypatch, caplog):
     assert any("-1" in rec.getMessage() and "full scale" in rec.getMessage() for rec in caplog.records)
     half = _cfg("-0.5")
     assert half.beep_volume == 1.0 and half.beep and half.toast and half.flash
+    alert._WARNED.discard("beep_volume")
+    caplog.clear()
+    signed_zero = _cfg("-0")
+    assert signed_zero.beep_volume == 1.0 and signed_zero.beep and signed_zero.toast and signed_zero.flash
+    assert _cfg("-0.0").beep_volume == 1.0 and _cfg("-0.0").beep is True
+    assert any("volume '-0'" in rec.getMessage() and "full scale" in rec.getMessage() for rec in caplog.records)
 
 
 def _players():
@@ -765,6 +771,54 @@ def test_twenty_five_hangs_leave_one_player_thread(monkeypatch, caplog):
         messages = [rec.getMessage() for rec in caplog.records if rec.name == "qorcap.challenge_alert"]
         assert sum("timed out" in msg for msg in messages) == 1
         assert sum("still running" in msg for msg in messages) == 24
+    finally:
+        release.set()
+        deadline = time.monotonic() + 1.0
+        while _players() and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+
+def test_beep_resumes_after_the_stuck_player_ends(monkeypatch):
+    monkeypatch.setattr(alert, "_BEEP_TIMEOUT_S", 0.05)
+    order = []
+    release = threading.Event()
+
+    def beep(prompt, cfg):
+        del prompt, cfg
+        order.append("beep-start")
+        release.wait(30)
+
+    def mark(kind):
+        def fn(prompt, cfg):
+            del prompt, cfg
+            order.append(kind)
+        return fn
+
+    monkeypatch.setattr(
+        alert, "default_backends",
+        lambda: alert.AlertBackends(beep=beep, toast=mark("toast"), flash=mark("flash")),
+    )
+    deadline = time.monotonic() + 1.0
+    while _players() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert _players() == []
+    try:
+        alert.notify_challenge("stuck", env=_ON)
+        assert alert.drain(2)
+        assert order.count("beep-start") == 1
+        alert.notify_challenge("while-stuck", env=_ON)
+        assert alert.drain(2)
+        assert order.count("beep-start") == 1
+        assert order.count("toast") == 2 and order.count("flash") == 2
+        release.set()
+        deadline = time.monotonic() + 1.0
+        while _players() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert _players() == []
+        alert.notify_challenge("after", env=_ON)
+        assert alert.drain(2)
+        assert order.count("beep-start") == 2
+        assert order.count("toast") == 3 and order.count("flash") == 3
     finally:
         release.set()
         deadline = time.monotonic() + 1.0

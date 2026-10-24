@@ -42,9 +42,37 @@ def test_psn_skip_stays_allowed_on_linux(tmp_path):
     assert skips.unexpected_skips(path, platform="windows") == []
 
 
-def test_main_reports_a_linux_skip_as_a_failed_job(tmp_path, capsys):
+def test_main_reports_a_linux_skip_as_a_failed_job(tmp_path, capsys, monkeypatch):
     name = "test_live_signed_bundle_still_passes"
     path = _xml(tmp_path, name, skips.WINDOWS_SKIP_REASONS[name])
+    monkeypatch.setattr(skips.sys, "platform", "linux")
     assert skips.main(["assert_pytest_skips.py", "--platform", "linux", path]) == 1
     assert name in capsys.readouterr().err
+    monkeypatch.setattr(skips.sys, "platform", "win32")
     assert skips.main(["assert_pytest_skips.py", "--platform", "windows", path]) == 0
+
+
+def test_missing_platform_flag_means_linux(tmp_path, capsys, monkeypatch):
+    """A default of windows would accept this skip and the job would stay green."""
+    name = "test_submit_prompt_times_out_to_no"
+    path = _xml(tmp_path, name, skips.WINDOWS_SKIP_REASONS[name])
+    monkeypatch.setattr(skips.sys, "platform", "linux")
+    assert skips.main(["assert_pytest_skips.py", path]) == 1
+    assert name in capsys.readouterr().err
+
+
+def test_platform_flag_must_match_sys_platform(tmp_path, capsys, monkeypatch):
+    path = _xml(tmp_path, "test_local_021003_both_players", "opponent frames are not committed")
+    monkeypatch.setattr(skips.sys, "platform", "linux")
+    assert skips.main(["assert_pytest_skips.py", "--platform", "windows", path]) == 2
+    err = capsys.readouterr().err
+    assert "sys.platform=linux" in err and "windows" in err
+
+    monkeypatch.setattr(skips.sys, "platform", "win32")
+    assert skips.main(["assert_pytest_skips.py", "--platform", "linux", path]) == 2
+    err = capsys.readouterr().err
+    assert "sys.platform=win32" in err
+
+    assert skips.main(["assert_pytest_skips.py", "--platform", "windows", path]) == 0
+    monkeypatch.setattr(skips.sys, "platform", "linux")
+    assert skips.main(["assert_pytest_skips.py", path]) == 0

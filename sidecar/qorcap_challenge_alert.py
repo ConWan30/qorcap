@@ -8,14 +8,15 @@ Nothing here is recorded. A miss stays unanswered. ``notify_challenge`` only
 enqueues work and returns. One daemon worker runs each alert: the toast, then
 the flash, then the beep. The queue holds two jobs; a third is dropped. Toast
 and flash do not wait on the sound player. If playback is still going after
-``_BEEP_TIMEOUT_S`` that player is left running and the timeout is logged.
-While it is alive, later alerts still toast and flash, and their beep is
-skipped and logged. The worker is not replaced. On any other platform the
-Windows calls are skipped and this module does not raise.
+``_BEEP_TIMEOUT_S`` that player is left running and the timeout is logged
+every time it happens. While it is alive, later alerts still toast and flash,
+and their beep is skipped and logged every time. The worker is not replaced.
+On any other platform the Windows calls are skipped and this module does not raise.
 
 A failed backend logs one warning per process on the ``qorcap.challenge_alert``
-logger (stderr when nothing else is configured). It never writes a bundle file,
-a checkpoint, or a receipt field.
+logger (stderr when nothing else is configured). A beep timeout and a beep
+skipped because the previous player is still running are not that path: each
+one is logged. Nothing here writes a bundle file, a checkpoint, or a receipt field.
 
 Environment (unset means on):
 
@@ -32,7 +33,8 @@ Environment (unset means on):
   is 100% (full scale), not one percent. ``50`` is half. ``100`` is full scale.
   A decimal strictly between 0 and 1 is a fraction (``0.5`` is half). ``1.0``
   is full scale, the same loudness as bare ``1`` and ``100``.
-  Anything else (``1.5``, ``loud``, ``inf``) logs one warning and stays at full scale.
+  Anything else (``1.5``, ``loud``, ``inf``, ``-1``, ``-0``) logs one warning and stays at full scale.
+  ``-0`` is a negative, not a mute: mute is ``0``, ``0.0``, and ``0%`` with no sign.
 * ``QORCAP_CHALLENGE_TOAST=0`` skips the toast.
 * ``QORCAP_CHALLENGE_FLASH=0`` skips flashing the console window and its taskbar button.
 
@@ -69,7 +71,7 @@ _HZ_MIN = 200
 _HZ_MAX = 8000
 _QUEUE_MAX = 2
 # A normal three-beep is under a second. A PlaySound that is still blocked after
-# this is treated as hung: the player thread is abandoned and the worker replaced.
+# this is left running. The next beep is skipped until that thread has finished.
 _BEEP_TIMEOUT_S = 5.0
 
 _WARNED: set[str] = set()
@@ -183,6 +185,7 @@ def _volume(raw: str | None) -> float:
     * ``80%`` or an integer 0..100 is a percent. Bare ``1`` is full scale.
     * A float strictly between 0 and 1 is a fraction (``0.5`` is half).
     * ``0.0`` is silence and ``1.0`` is full scale, the same loudness as ``0`` and bare ``1``.
+    * A leading minus, including ``-0`` and ``-0.0``, is a negative: one warning and full scale.
     * Anything else logs one warning and uses full scale.
 
     This never raises. Volume does not turn the toast or the flash off.
@@ -193,6 +196,10 @@ def _volume(raw: str | None) -> float:
     low = text.lower()
     if low in _MUTE_VOLUME:
         return 0.0
+    # "-0" and "-0.0" compare equal to zero, but they are signed. Mute is an
+    # unsigned 0 / 0.0 / 0%. A leading minus warns and plays at full scale.
+    if text.startswith("-"):
+        return _warn_volume(text)
     try:
         if low.endswith("%"):
             return _as_percent(text[:-1].strip(), text)

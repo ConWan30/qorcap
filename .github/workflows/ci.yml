@@ -51,6 +51,7 @@ jobs:
       # sidecar/test_qorcap_submit.py is in this step. fastapi and httpx are installed above
       # for the in-process referee. ffmpeg is installed, so those tests run. A skip of one
       # of them fails this job: the Windows reasons are not accepted with --platform linux.
+      # The flag is checked against sys.platform. Omitting it means linux.
       # ffmpeg is installed above, so the highlights clip test and
       # test_close_stamp_lag_does_not_move_the_pause run here. They are not skipped.
       - name: Sidecar tests
@@ -180,8 +181,9 @@ jobs:
       # run on Linux, where ffmpeg is installed, so those tests are required there.
       # --platform windows accepts the submit skips whose junit message matches the
       # recorded reason: no ffmpeg for the referee bundle, and select() cannot wait on a
-      # pipe (readline would block). Any other skip reason still fails. The submit tests
-      # that do not need ffmpeg still run. fastapi and httpx are installed above.
+      # pipe (readline would block). Any other skip reason still fails. --platform must
+      # be windows here: it is checked against sys.platform, and an omitted flag means linux.
+      # The submit tests that do not need ffmpeg still run. fastapi and httpx are installed above.
       - name: Sidecar tests
         shell: bash
         env:
