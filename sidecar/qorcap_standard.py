@@ -14,18 +14,13 @@ from __future__ import annotations
 
 import hashlib
 import json
-from pathlib import Path
 
 import numpy as np
 
-# Retired packs. 110028 is a known match and is not held out, but it is not an
-# allowlisted template source. 084523 is held out. Neither file ships. A reader
-# loads one only when templates/provenance.json authorizes that exact file.
-PACK = Path(__file__).resolve().parent / "packs" / "madden27_standard_score_110028.npz"
-PACK_FOUR = Path(__file__).resolve().parent / "packs" / "madden27_standard_score_084523.npz"
 # Logo search wider than the profile's ±3. The 0.90 NCC floor is unchanged. 11 px blur still misses it.
 # ±8 px and the full-resolution clock were tuned on the 170123 highlight kit. That match is held out.
-# No template was cut from it.
+# No template was cut from it. The constant is tracked debt in docs/TEMPLATE_PROVENANCE.md.
+# Do not change it in a provenance-only patch.
 ANCHOR_SEARCH_PX = 8
 
 
@@ -331,18 +326,9 @@ class StandardBarReader:
 
 
 def _install_authorized(reader) -> None:
-    """Stack a pack only when provenance names that file. Harvested score rows replace stock digits."""
-    from qorcap_template_guard import file_authorized, harvested_vectors, has_role
+    """Replace stock digits with harvested per-glyph rows. Retired npz paths are not loaded."""
+    from qorcap_template_guard import harvested_vectors, has_role
 
-    if file_authorized(PACK):
-        z = np.load(PACK)
-        score = reader.pack.groups["score"]
-        score["2"] = np.vstack([score["2"], np.atleast_2d(z["two"].astype(np.float32))])
-        score["3"] = np.vstack([score["3"], np.atleast_2d(z["three"].astype(np.float32))])
-    if file_authorized(PACK_FOUR):
-        z = np.load(PACK_FOUR)
-        score = reader.pack.groups["score"]
-        score["4"] = np.vstack([score["4"], np.atleast_2d(z["four"].astype(np.float32))])
     if has_role("score", profile="standard"):
         reader.pack.groups["score"] = harvested_vectors("score", profile="standard")
         for role in ("clock", "quarter"):

@@ -111,23 +111,40 @@ def test_standard_bar_reads_23_and_30_and_refuses_the_downs_banner():
 
 
 def test_standard_bar_reads_the_red_14_of_084523():
-    """The 084523 "4" pack was held-out-derived and is removed.
+    """match-20261018-084523 (CHI–ATL) is held-out evaluation, not a harvest source.
 
-    This test does not open that match's frames. The reader abstains instead of
-    reporting 0-14 or 6-14.
+    The real-glyph "4" pack was removed. This grades the reader once allowlisted
+    templates are loaded, and skips while they are missing.
     """
-    import numpy as np
-    from qorcap_template_guard import TEMPLATES_MISSING
+    import pytest
+    from qorcap_reader import prep
+    from qorcap_template_guard import has_role
 
-    assert not (HERE / "packs" / "madden27_standard_score_084523.npz").is_file()
-    fr = standard_reader().read(np.zeros((360, 640, 3), np.uint8))
-    assert fr.reason == TEMPLATES_MISSING
-    assert fr.left_score is None and fr.right_score is None
+    if not has_role("score", profile="standard"):
+        pytest.skip("templates_missing: held-out 084523 evaluation waits for allowlisted score templates")
+    r = standard_reader()
+    for name, pair, q in (("m27_std_084523_q2_0_13.jpg", (0, 13), 2), ("m27_std_084523_q2_0_14.jpg", (0, 14), 2),
+                          ("m27_std_084523_q4_6_14.jpg", (6, 14), 4)):
+        fr = r.read(prep(img(name)))
+        assert fr.ok, (name, fr.reason)
+        assert tuple(fr.pair) == pair and fr.quarter == q, (name, fr.pair, fr.quarter)
+        assert fr.score_margin >= 0.15
+    clocks = {
+        "m27_std_084523_q2_0_13.jpg": 36,   # 2nd, 0:36
+        "m27_std_084523_q2_0_14.jpg": 32,   # 2nd, 0:32
+        "m27_std_084523_q4_6_14.jpg": 80,   # 4th, 1:20
+    }
+    for name, secs in clocks.items():
+        got = r.read(prep(img(name))).clock_seconds
+        assert got in (None, secs), (name, got)
 
 
 def test_without_the_four_variant_084523_stays_unread():
-    """The held-out "4" file is gone. Scoring that match's frames here would be an evaluation."""
+    """The stock pack, with no harvested "4", does not read this held-out frame."""
+    from qorcap_reader import prep
     assert not (HERE / "packs" / "madden27_standard_score_084523.npz").is_file()
+    fr = ScorebugReader().read(prep(img("m27_std_084523_q4_6_14.jpg")))
+    assert not fr.ok and fr.reason == "score_unsure"
 
 
 def test_model_id_covers_the_stacked_templates_and_the_grammar_and_clock():

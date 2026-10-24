@@ -1,18 +1,30 @@
-"""Cut scorebug and end-menu glyph templates from an allowlisted match folder.
+"""Cut per-glyph scorebug and end-menu templates from an allowlisted match folder.
 
 The match folder is read only. Templates and ``provenance.json`` are written to
 ``--out``, which must sit outside that folder. A match id that is not in
 ``templates/template_sources.json``, or any id in ``templates/heldout.json``,
-is refused before a template is written.
+is refused before a template is written. The allowlist entry must pin the
+sha256 of ``video.mp4``. An empty pin refuses the harvest.
+
+Each saved vector is one glyph, segmented and normalised by the same functions
+the reader uses at read time. A label such as ``14`` is the slot text: it is
+kept only when the reader segments that many glyphs, and each glyph is stored
+under its own digit.
 
 This is a QorCap-internal tool. It does not write a receipt and it does not
 touch a vendored QorTime contract.
 
-PowerShell (from the repo, game 1; swap the id for game 2 ``111640``)::
+PowerShell (from a git checkout; Start Match's venv has numpy and opencv).
+Game 2 is the same line with ``102332`` replaced by ``111640``::
 
-    python tools\\harvest_templates.py --match-dir "$env:USERPROFILE\\Documents\\QorCap Matches\\match-20261024-102332" --labels "$env:USERPROFILE\\Documents\\QorCap Templates\\labels-102332.json" --out "$env:USERPROFILE\\Documents\\QorCap Templates\\out-102332"
+    cd "$env:USERPROFILE\\src\\qorcap"
+    $docs = [Environment]::GetFolderPath("MyDocuments")
+    $py   = "$env:LOCALAPPDATA\\QorCap\\venv\\Scripts\\python.exe"
+    New-Item -ItemType Directory -Force "$docs\\QorCap Templates" | Out-Null
+    & $py tools\\harvest_templates.py --match-dir "$docs\\QorCap Matches\\match-20261024-102332" --labels "$docs\\QorCap Templates\\labels-102332.json" --out "$docs\\QorCap Templates\\out-102332"
 
-``--windows-doc`` prints that one-liner and writes nothing.
+``--dry-run`` lists the frames and crops and writes nothing. ``--windows-doc``
+prints the one-liner and writes nothing.
 """
 from __future__ import annotations
 
@@ -20,78 +32,105 @@ import argparse
 import hashlib
 import io
 import json
+import os
 import re
 import sys
 import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
 
-HARVEST_VERSION = "1"
+HARVEST_VERSION = "2"
 HARVEST_SCRIPT = "tools/harvest_templates.py"
-# Boxes are x1, x2, y1, y2 on a 640x360 frame. Standard boxes are the vendored
-# madden27-standard-v1 profile. End-menu boxes are qorcap_endmenu.SIDES / BAND_Y.
-# Banner rows are the standard reference band (y 330) plus qorcap_banner._ROI.
-ROIS: dict[str, tuple[int, int, int, int]] = {
-    "score_left": (220, 246, 342, 357),
-    "score_right": (257, 284, 342, 357),
-    "clock": (447, 480, 344, 353),
-    "quarter": (430, 447, 344, 353),
-    "banner": (160, 450, 338, 358),
-    "end_menu_away": (280, 368, 28, 66),
-    "end_menu_home": (384, 462, 28, 66),
+# Which reader role a ROI belongs to. Banner fragments are not a per-glyph npy:
+# qorcap_banner matches GOA/TOUC masks and does not call harvested_vectors.
+ROI_ROLE = {
+    "score_left": "score",
+    "score_right": "score",
+    "clock": "clock",
+    "quarter": "quarter",
+    "end_menu_away": "end_menu",
+    "end_menu_home": "end_menu",
 }
-NORM_SIZE = {
-    "score": (10, 14),
-    "clock": (6, 9),
-    "quarter": (17, 9),
-    "banner": (64, 20),
-    "end_menu": (12, 18),
-}
+QUARTER_LABELS = {"1st", "2nd", "3rd", "4th", "ot"}
 PROFILE_OF = {
     "score": "standard",
     "clock": "standard",
     "quarter": "standard",
-    "banner": "standard",
     "end_menu": "end_menu",
 }
-ROLES = tuple(NORM_SIZE)
 POWERSHELL_ONELINER = (
-    'python tools\\harvest_templates.py --match-dir '
-    '"$env:USERPROFILE\\Documents\\QorCap Matches\\match-20261024-102332" '
-    '--labels "$env:USERPROFILE\\Documents\\QorCap Templates\\labels-102332.json" '
-    '--out "$env:USERPROFILE\\Documents\\QorCap Templates\\out-102332"'
+    'cd "$env:USERPROFILE\\src\\qorcap"\n'
+    '$docs = [Environment]::GetFolderPath("MyDocuments")\n'
+    '$py   = "$env:LOCALAPPDATA\\QorCap\\venv\\Scripts\\python.exe"\n'
+    'New-Item -ItemType Directory -Force "$docs\\QorCap Templates" | Out-Null\n'
+    '& $py tools\\harvest_templates.py --match-dir "$docs\\QorCap Matches\\match-20261024-102332" '
+    '--labels "$docs\\QorCap Templates\\labels-102332.json" '
+    '--out "$docs\\QorCap Templates\\out-102332"'
 )
 WINDOWS_DOC = f"""Harvest scorebug templates on Windows
 =====================================
 
-Run this from the qorcap repo in PowerShell. The match folder is only read.
-``--out`` must be a different folder, not inside the match. Game 1 is
-match-20261024-102332. Game 2 is match-20261024-111640 (change the three
-paths). Both ids are the only entries in templates\\template_sources.json.
-templates\\heldout.json is refused even if an allowlist names one of those ids.
+Run this from a git checkout of qorcap. ``tools\\`` is not in the release zip.
+Start Match's venv has numpy and opencv; bare ``python`` may not.
+``Documents`` may be redirected to OneDrive. ``GetFolderPath("MyDocuments")``
+is the same resolution Start Match uses.
+
+The match folder is only read. ``--out`` must be a different folder, not inside
+the match. Game 1 is match-20261024-102332. Game 2 is match-20261024-111640
+(change the id in the three paths). Both ids are the only entries in
+templates\\template_sources.json. templates\\heldout.json is refused even if an
+allowlist names one of those ids.
+
+Before the first harvest, pin the video. A folder renamed to an allowlisted
+name is refused unless ``video.mp4`` matches that entry's ``video_sha256``.
+An empty pin refuses the harvest.
+
+    Get-FileHash -Algorithm SHA256 "$docs\\QorCap Matches\\match-20261024-102332\\video.mp4"
+
+Put the hash in templates\\template_sources.json under that match's
+``video_sha256``, then:
 
 One-liner:
 
 {POWERSHELL_ONELINER}
 
-Labels file (human picks every glyph; the script does not guess a digit):
+Dry-run (same arguments plus ``--dry-run``) lists the frames and per-glyph
+crops and writes nothing.
+
+Labels file (a person names every slot; the script does not guess a digit).
+``label`` is the slot text. Its length, after a clock colon is removed, must
+equal the number of glyphs the reader segments. Each glyph is saved on its own.
 
 {{
   "items": [
-    {{"role": "score", "label": "0", "roi": "score_left", "frame_index": 12, "t_ms": 400}}
+    {{"role": "score", "label": "14", "roi": "score_left", "frame_index": 1200, "start_frame_index": 1200, "end_frame_index": 1260}}
   ]
 }}
 
-Roles: score, clock, quarter, banner, end_menu.
-ROIs: score_left, score_right, clock, quarter, banner, end_menu_away, end_menu_home.
+Roles: score, clock, quarter, end_menu.
+ROIs: score_left, score_right, clock, quarter, end_menu_away, end_menu_home.
+Score, clock, and end-menu labels are digits 0-9, one per segmented glyph.
+A clock label may contain a colon (``5:23`` is three digits). Quarter labels
+are 1st, 2nd, 3rd, 4th, or ot. Banner is not harvested: no reader loads a
+harvested banner vector.
+
+Each item needs ``frame_index`` and a range that contains that frame:
+``start_frame_index`` and ``end_frame_index``, or ``start_t_ms`` and
+``end_t_ms``, or both. The script checks the range against the decoded frame.
+``harvest_date`` is the UTC time of the harvest, not the match-folder date.
+
+Sunday, Monday, Thursday, and PSN readers have no harvest regions. A standard
+harvest does not bring those readers back.
 
 After both games, copy the written files into the repo templates\\ directory
 (keep paths relative to the provenance file) and commit templates\\provenance.json
 with them. Do not commit the match video. CI rejects a template with no
-provenance row, a bad sha256, or a source_match_id other than 102332 or 111640.
+provenance row, a bad sha256, a source match other than 102332 or 111640, or a
+row that does not match the provenance schema.
 """
 
-_FOLDER = re.compile(r"^match-(\d{4})(\d{2})(\d{2})-(\d{6})$")
-_LABEL = re.compile(r"^[A-Za-z0-9]{1,16}$")
+_FOLDER = re.compile(r"^match-(\d{8})-(\d{6})$")
+_SHA = re.compile(r"^[0-9a-f]{64}$")
 
 
 class Refuse(Exception):
@@ -100,6 +139,33 @@ class Refuse(Exception):
 
 def _repo_root() -> Path:
     return Path(__file__).resolve().parents[1]
+
+
+def _load_sources(path: Path) -> list[dict]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise Refuse(f"refusing unreadable allowlist ({exc}). no templates written.") from exc
+    rows = data.get("sources") if isinstance(data, dict) else None
+    if not isinstance(rows, list) or not rows:
+        raise Refuse("refusing: allowlist needs a sources list with video_sha256. no templates written.")
+    out = []
+    for row in rows:
+        if not isinstance(row, dict):
+            raise Refuse("refusing: an allowlist source is not an object. no templates written.")
+        mid = str(row.get("match_id") or "")
+        folder = str(row.get("folder") or "")
+        digest = str(row.get("video_sha256") or "")
+        if not re.fullmatch(r"\d{6}", mid) or not _FOLDER.fullmatch(folder):
+            raise Refuse(
+                f"refusing allowlist entry match_id={mid!r} folder={folder!r}. no templates written."
+            )
+        if folder[-6:] != mid:
+            raise Refuse(
+                f"refusing: allowlist folder {folder} does not end in match id {mid}. no templates written."
+            )
+        out.append({"match_id": mid, "folder": folder, "video_sha256": digest})
+    return out
 
 
 def _load_ids(path: Path) -> set[str]:
@@ -115,14 +181,14 @@ def _inside(child: Path, parent: Path) -> bool:
     return True
 
 
-def _parse_folder(match_dir: Path) -> tuple[str, str]:
+def _parse_folder(match_dir: Path) -> str:
     match = _FOLDER.fullmatch(match_dir.name)
     if match is None:
         raise Refuse(
             f"refusing {match_dir.name}: match folder must be named match-YYYYMMDD-HHMMSS. "
             "no templates written."
         )
-    year, month, day, short = match.groups()
+    short = match.group(2)
     meta = match_dir / "match.json"
     if meta.is_file():
         try:
@@ -131,7 +197,7 @@ def _parse_folder(match_dir: Path) -> tuple[str, str]:
             raise Refuse(f"refusing unreadable match.json ({exc}). no templates written.") from exc
         if stated and short not in stated and stated != short:
             raise Refuse("refusing: match.json match_id does not match the folder. no templates written.")
-    return short, f"{year}-{month}-{day}"
+    return short
 
 
 def _held_hit(text: str, held: set[str]) -> str | None:
@@ -154,50 +220,61 @@ def _held_out_hashes(path: Path) -> dict[str, str]:
     return {str(k): str(v) for k, v in data.get("sha256", {}).items()}
 
 
-def _norm(patch, size: tuple[int, int]):
-    import cv2
-    import numpy as np
+def _snapshot(root: Path) -> dict[str, tuple[int, int]]:
+    """Size and mtime only. The video hash is taken once, separately."""
+    found = {}
+    if not root.exists():
+        return found
+    for path in sorted(p for p in root.rglob("*") if p.is_file()):
+        st = path.stat()
+        found[str(path.relative_to(root))] = (st.st_size, st.st_mtime_ns)
+    return found
 
-    arr = np.asarray(patch)
-    if arr.ndim == 3:
-        arr = cv2.cvtColor(arr, cv2.COLOR_BGR2GRAY)
-    arr = arr.astype(np.float32)
-    if arr.size == 0:
+
+def _harvest_date(now) -> str:
+    when = now if now is not None else datetime.now(timezone.utc)
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    when = when.astimezone(timezone.utc).replace(microsecond=0)
+    return when.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _opt_int(raw: dict, key: str):
+    if key not in raw or raw[key] is None:
         return None
-    if float(arr.max()) > 1.0:
-        arr = arr / 255.0
-    vec = cv2.resize(arr, size, interpolation=cv2.INTER_AREA).ravel().astype(np.float32)
-    vec = vec - float(vec.mean())
-    norm = float(np.linalg.norm(vec))
-    if norm < 1e-6:
-        return None
-    return vec / norm
+    val = raw[key]
+    if isinstance(val, bool) or not isinstance(val, int) or val < 0:
+        raise Refuse(f"refusing: {key} must be an integer >= 0. no templates written.")
+    return val
 
 
-def _read_frame(video: Path, index: int):
-    """Decode frames 0..index in order. Seeking by timestamp is not used."""
-    import cv2
-
-    cap = cv2.VideoCapture(str(video))
-    if not cap.isOpened():
-        raise Refuse(f"refusing: cannot read {video.name}. no templates written.")
-    frame = None
-    try:
-        for _ in range(index + 1):
-            ok, frame = cap.read()
-            if not ok or frame is None:
-                raise Refuse(f"refusing: video has no frame {index}. no templates written.")
-    finally:
-        cap.release()
-    return frame
+def _pair(raw: dict, start: str, end: str):
+    lo, hi = _opt_int(raw, start), _opt_int(raw, end)
+    if (lo is None) != (hi is None):
+        raise Refuse(f"refusing: {start} and {end} are both required. no templates written.")
+    if lo is not None and lo > hi:
+        raise Refuse(f"refusing: {start} is after {end}. no templates written.")
+    return lo, hi
 
 
-def _prepare_frame(frame):
-    import cv2
-
-    if frame.shape[1] != 640 or frame.shape[0] != 360:
-        frame = cv2.resize(frame, (640, 360), interpolation=cv2.INTER_AREA)
-    return frame
+def _slot_text(role: str, label: str) -> str:
+    if role == "banner":
+        raise Refuse(
+            "refusing role=banner: no reader loads a harvested banner vector. no templates written."
+        )
+    if role == "quarter":
+        word = label.lower()
+        if word not in QUARTER_LABELS:
+            raise Refuse(
+                f"refusing quarter label {label!r}. use 1st, 2nd, 3rd, 4th, or ot. no templates written."
+            )
+        return word
+    text = label.replace(":", "") if role == "clock" else label
+    if not text or any(ch not in "0123456789" for ch in text):
+        raise Refuse(
+            f"refusing {role} label {label!r}: digits 0-9 only, one per glyph. no templates written."
+        )
+    return text
 
 
 def _load_labels(path: Path) -> list[dict]:
@@ -216,59 +293,304 @@ def _load_labels(path: Path) -> list[dict]:
         role = str(raw.get("role") or "")
         label = str(raw.get("label") or "")
         roi = str(raw.get("roi") or "")
-        if role not in ROLES or roi not in ROIS or _LABEL.fullmatch(label) is None:
+        if roi not in ROI_ROLE or ROI_ROLE[roi] != role:
             raise Refuse(
                 f"refusing label role={role!r} roi={roi!r} label={label!r}. no templates written."
             )
+        text = _slot_text(role, label)
         frame_index = raw.get("frame_index")
-        t_ms = raw.get("t_ms")
         if isinstance(frame_index, bool) or not isinstance(frame_index, int) or frame_index < 0:
             raise Refuse("refusing: each label needs an integer frame_index >= 0. no templates written.")
-        if t_ms is not None and (isinstance(t_ms, bool) or not isinstance(t_ms, int) or t_ms < 0):
-            raise Refuse("refusing: t_ms must be an integer >= 0 or omitted. no templates written.")
-        key = (role, label, roi, frame_index)
+        start_f, end_f = _pair(raw, "start_frame_index", "end_frame_index")
+        start_t, end_t = _pair(raw, "start_t_ms", "end_t_ms")
+        if start_f is None and start_t is None:
+            raise Refuse(
+                "refusing: each label needs a frame range (start_frame_index, end_frame_index) "
+                "or a time range (start_t_ms, end_t_ms). no templates written."
+            )
+        key = (role, label, roi, frame_index, start_f, end_f, start_t, end_t)
         if key in seen:
             raise Refuse(f"refusing duplicate label {key}. no templates written.")
         seen.add(key)
         out.append({
             "role": role,
             "label": label,
+            "text": text,
             "roi": roi,
             "frame_index": frame_index,
-            "t_ms": t_ms,
+            "start_frame_index": start_f,
+            "end_frame_index": end_f,
+            "start_t_ms": start_t,
+            "end_t_ms": end_t,
         })
     out.sort(key=lambda item: (item["role"], item["label"], item["roi"], item["frame_index"]))
     return out
 
 
-def _snapshot(root: Path) -> dict[str, str]:
-    found = {}
-    if not root.exists():
-        return found
-    for path in sorted(p for p in root.rglob("*") if p.is_file()):
-        found[str(path.relative_to(root))] = _sha256(path)
+def _read_frames(video: Path, indices: set[int]) -> dict[int, tuple]:
+    """One sequential decode. ``index -> (640x360 frame, container t_ms)``."""
+    import cv2
+
+    cap = cv2.VideoCapture(str(video))
+    if not cap.isOpened():
+        raise Refuse(f"refusing: cannot read {video.name}. no templates written.")
+    needed = sorted(indices)
+    found: dict[int, tuple] = {}
+    try:
+        cursor = 0
+        want = 0
+        while want < len(needed):
+            ok, frame = cap.read()
+            if not ok or frame is None:
+                raise Refuse(f"refusing: video has no frame {needed[want]}. no templates written.")
+            if cursor == needed[want]:
+                msec = float(cap.get(cv2.CAP_PROP_POS_MSEC))
+                if msec != msec or msec < 0:
+                    msec = 0.0
+                found[cursor] = (_prepare_frame(frame), int(round(msec)))
+                want += 1
+            cursor += 1
+    finally:
+        cap.release()
     return found
 
 
+def _prepare_frame(frame):
+    import cv2
+
+    if frame.shape[1] != 640 or frame.shape[0] != 360:
+        frame = cv2.resize(frame, (640, 360), interpolation=cv2.INTER_AREA)
+    return frame
+
+
+def _reader_stack():
+    """The reader's own segmenters. Nothing here reimplements ink or components."""
+    root = _repo_root()
+    qortime = os.environ.get("QORTIME", "/tmp/qortime")
+    for entry in (str(root / "sidecar"), qortime):
+        if entry not in sys.path:
+            sys.path.insert(0, entry)
+    from dataclasses import replace
+
+    from qor_receipt._vendor.qoresence.vision.local_scorebug.glyphs import GLYPH_SIZE
+    from qor_receipt._vendor.qoresence.vision.local_scorebug.reader import ScorebugReader, _shift
+    from qorcap_endmenu import GLYPH, HOLES, NO_HOLE, hole_signature, norm_vec, side_glyphs
+    from qorcap_standard import ANCHOR_SEARCH_PX
+
+    reader = ScorebugReader()
+    reader.profile = replace(reader.profile, anchor_search_px=ANCHOR_SEARCH_PX)
+    return reader, _shift, GLYPH_SIZE, side_glyphs, norm_vec, hole_signature, HOLES, NO_HOLE, GLYPH
+
+
+def _check_range(item: dict, measured_t_ms: int) -> None:
+    frame_index = item["frame_index"]
+    if item["start_frame_index"] is not None:
+        if not item["start_frame_index"] <= frame_index <= item["end_frame_index"]:
+            raise Refuse(
+                f"refusing: frame {frame_index} is outside the labelled frame range "
+                f"{item['start_frame_index']}-{item['end_frame_index']}. no templates written."
+            )
+    if item["start_t_ms"] is not None:
+        if not item["start_t_ms"] <= measured_t_ms <= item["end_t_ms"]:
+            raise Refuse(
+                f"refusing: measured t_ms {measured_t_ms} for frame {frame_index} is outside "
+                f"the labelled range {item['start_t_ms']}-{item['end_t_ms']}. no templates written."
+            )
+
+
+def _preview(vec, width: int, height: int):
+    import cv2
+    import numpy as np
+
+    img = np.asarray(vec, dtype=np.float32).reshape(height, width)
+    img = img - float(img.min())
+    peak = float(img.max())
+    if peak > 0:
+        img = img / peak
+    shown = (img * 255.0).astype(np.uint8)
+    ok, buf = cv2.imencode(".png", shown, [cv2.IMWRITE_PNG_COMPRESSION, 3])
+    if not ok:
+        raise Refuse("refusing: png encode failed. no templates written.")
+    return buf.tobytes()
+
+
+def _npy(vec) -> bytes:
+    import numpy as np
+
+    buf = io.BytesIO()
+    np.save(buf, np.ascontiguousarray(vec, dtype=np.float32))
+    return buf.getvalue()
+
+
+def _segment(reader, shift, glyph_size, side_glyphs, norm_vec, hole_signature, holes, no_hole, end_glyph,
+             frame, item) -> list[tuple[str, object]]:
+    """One ``(label, vector)`` per glyph, from the reader's segmenter."""
+    role = item["role"]
+    text = item["text"]
+    if role == "end_menu":
+        side = "away" if item["roi"] == "end_menu_away" else "home"
+        masks = side_glyphs(frame, side)
+        if not masks or any(mask is None for mask in masks):
+            raise Refuse(
+                f"refusing: end-menu segmentation failed for {item['roi']} "
+                f"frame {item['frame_index']}. no templates written."
+            )
+        if len(masks) != len(text):
+            raise Refuse(
+                f"refusing: label {item['label']!r} has {len(text)} glyphs but the reader "
+                f"segmented {len(masks)} on frame {item['frame_index']}. no templates written."
+            )
+        out = []
+        for ch, mask in zip(text, masks):
+            vec = norm_vec(mask)
+            if vec is None:
+                raise Refuse(
+                    f"refusing flat end-menu glyph {ch!r} frame {item['frame_index']}. "
+                    "no templates written."
+                )
+            signature = hole_signature(mask)
+            if (ch in holes and signature not in holes[ch]) or (ch in no_hole and signature != "0"):
+                raise Refuse(
+                    f"refusing: end-menu glyph {ch!r} holes {signature} would be blanked at read time. "
+                    "no templates written."
+                )
+            if int(vec.size) != end_glyph[0] * end_glyph[1]:
+                raise Refuse("refusing: end-menu vector is not the reader's glyph size. no templates written.")
+            out.append((ch, vec))
+        return out
+
+    band, why = reader.reference_band(frame)
+    if band is None:
+        raise Refuse(
+            f"refusing: frame {item['frame_index']} has no scorebug band ({why}). no templates written."
+        )
+    layout, (dx, dy), _info = reader.check_layout(band)
+    if layout != "ok":
+        raise Refuse(
+            f"refusing: frame {item['frame_index']} is not a standard bar the reader would score "
+            f"({layout}). no templates written."
+        )
+    if role == "score":
+        box = reader.profile.left_score if item["roi"] == "score_left" else reader.profile.right_score
+        slot = reader._crop(band, shift(box, dx, dy))
+        glyphs, gwhy, _boxes = reader.score_glyphs(slot)
+        if glyphs is None:
+            raise Refuse(
+                f"refusing: score segmentation failed ({gwhy}) role={role} label={item['label']!r} "
+                f"frame={item['frame_index']}. no templates written."
+            )
+        if len(glyphs) != len(text):
+            raise Refuse(
+                f"refusing: label {item['label']!r} has {len(text)} glyphs but the reader segmented "
+                f"{len(glyphs)} on frame {item['frame_index']}. no templates written."
+            )
+        rules = dict(reader.profile.score_hole_rules)
+        out = []
+        width, height = glyph_size
+        for ch, (vec, signature) in zip(text, glyphs):
+            if signature == "2+" or (ch in rules and signature not in rules[ch]):
+                raise Refuse(
+                    f"refusing: score glyph {ch!r} holes {signature} would be blanked at read time. "
+                    "no templates written."
+                )
+            if int(vec.size) != width * height:
+                raise Refuse("refusing: score vector is not the reader's glyph size. no templates written.")
+            out.append((ch, vec))
+        return out
+    if role == "clock":
+        vecs, cwhy = reader.clock_glyphs(band, dx, dy)
+        if vecs is None:
+            raise Refuse(
+                f"refusing: clock segmentation failed ({cwhy}) label={item['label']!r} "
+                f"frame={item['frame_index']}. no templates written."
+            )
+        if len(vecs) != len(text):
+            raise Refuse(
+                f"refusing: label {item['label']!r} has {len(text)} glyphs but the reader segmented "
+                f"{len(vecs)} on frame {item['frame_index']}. no templates written."
+            )
+        width, height = reader.profile.clock_glyph_size
+        out = []
+        for ch, vec in zip(text, vecs):
+            if int(vec.size) != width * height:
+                raise Refuse("refusing: clock vector is not the reader's glyph size. no templates written.")
+            out.append((ch, vec))
+        return out
+    vec = reader.quarter_vector(band, dx, dy)
+    if vec is None:
+        raise Refuse(
+            f"refusing: quarter segmentation failed label={item['label']!r} "
+            f"frame={item['frame_index']}. no templates written."
+        )
+    x1, x2, y1, y2 = reader.profile.quarter
+    if int(vec.size) != (x2 - x1) * (y2 - y1):
+        raise Refuse("refusing: quarter vector is not the reader's quarter box. no templates written.")
+    return [(text, vec)]
+
+
+def _row(name: str, payload: bytes, item: dict, glyph: str, short: str, folder: str,
+         video_hash: str, measured_t_ms: int, harvest_date: str) -> dict:
+    row = {
+        "path": name.replace("\\", "/"),
+        "sha256": hashlib.sha256(payload).hexdigest(),
+        "role": item["role"],
+        "label": glyph,
+        "profile": PROFILE_OF[item["role"]],
+        "source_match_id": short,
+        "source_match_folder": folder,
+        "video_sha256": video_hash,
+        "frame_index": item["frame_index"],
+        "t_ms": measured_t_ms,
+        "harvest_version": HARVEST_VERSION,
+        "harvest_date": harvest_date,
+    }
+    if item["start_frame_index"] is not None:
+        row["start_frame_index"] = item["start_frame_index"]
+        row["end_frame_index"] = item["end_frame_index"]
+    if item["start_t_ms"] is not None:
+        row["start_t_ms"] = item["start_t_ms"]
+        row["end_t_ms"] = item["end_t_ms"]
+    return row
+
+
+def _preview_wh(reader, glyph_size, end_glyph, role: str) -> tuple[int, int]:
+    if role == "score":
+        return glyph_size
+    if role == "clock":
+        return tuple(reader.profile.clock_glyph_size)
+    if role == "quarter":
+        x1, x2, y1, y2 = reader.profile.quarter
+        return (x2 - x1, y2 - y1)
+    return end_glyph
+
+
 def harvest(match_dir: Path, out_dir: Path, labels_path: Path, allow_path: Path, held_path: Path,
-            hash_path: Path) -> dict:
-    """Build the output document and file bytes. Writes only under ``out_dir`` after every check."""
+            hash_path: Path, *, dry_run: bool = False, now=None) -> dict:
+    """Segment glyphs and, unless ``dry_run``, write them under ``out_dir`` only."""
     match_dir = match_dir.resolve()
     out_dir = out_dir.resolve()
     if not match_dir.is_dir():
         raise Refuse(f"refusing: {match_dir} is not a match folder. no templates written.")
     before = _snapshot(match_dir)
-    short, harvest_date = _parse_folder(match_dir)
+    short = _parse_folder(match_dir)
     try:
-        allowed = _load_ids(allow_path)
+        sources = _load_sources(allow_path)
         held = _load_ids(held_path)
+    except Refuse:
+        raise
     except (OSError, ValueError, KeyError) as exc:
         raise Refuse(f"refusing unreadable allowlist or held-out list ({exc}). no templates written.") from exc
     hit = _held_hit(match_dir.name, held) or (short if short in held else None)
     if hit:
         raise Refuse(f"refusing held-out match {hit}. no templates written.")
-    if short not in allowed:
+    entry = next((row for row in sources if row["match_id"] == short), None)
+    if entry is None:
         raise Refuse(f"refusing match {short}: not in the template-source allowlist. no templates written.")
+    if entry["folder"] != match_dir.name:
+        raise Refuse(
+            f"refusing: folder {match_dir.name} does not match the allowlist folder "
+            f"{entry['folder']}. no templates written."
+        )
     if _inside(out_dir, match_dir) or _inside(match_dir, out_dir):
         raise Refuse("refusing: --out must be outside the match folder. no templates written.")
     video = match_dir / "video.mp4"
@@ -289,48 +611,44 @@ def harvest(match_dir: Path, out_dir: Path, labels_path: Path, allow_path: Path,
         raise Refuse(
             f"refusing held-out footage (sha256 matches {table[video_hash]}). no templates written."
         )
+    pinned = entry["video_sha256"]
+    if not _SHA.fullmatch(pinned):
+        raise Refuse(
+            f"refusing: allowlist has no video_sha256 for {match_dir.name}. "
+            "pin the sha256 of video.mp4 before harvesting. no templates written."
+        )
+    if pinned != video_hash:
+        raise Refuse(
+            f"refusing: video.mp4 sha256 does not match the allowlist entry for {match_dir.name}. "
+            "no templates written."
+        )
     labels = _load_labels(labels_path)
-    # Decode each requested frame once, in index order.
-    frames = {}
-    for index in sorted({item["frame_index"] for item in labels}):
-        frames[index] = _prepare_frame(_read_frame(video, index))
+    frames = _read_frames(video, {item["frame_index"] for item in labels})
+    for item in labels:
+        _check_range(item, frames[item["frame_index"]][1])
+    stack = _reader_stack()
+    reader, shift, glyph_size, side_glyphs, norm_vec, hole_signature, holes, no_hole, end_glyph = stack
+    harvest_date = _harvest_date(now)
     built: list[tuple[str, bytes, dict]] = []
     for item in labels:
-        frame = frames[item["frame_index"]]
-        x1, x2, y1, y2 = ROIS[item["roi"]]
-        crop = frame[y1:y2, x1:x2]
-        vec = _norm(crop, NORM_SIZE[item["role"]])
-        if vec is None:
-            raise Refuse(
-                f"refusing flat crop role={item['role']} label={item['label']} "
-                f"frame={item['frame_index']}. no templates written."
+        frame, measured = frames[item["frame_index"]]
+        glyphs = _segment(
+            reader, shift, glyph_size, side_glyphs, norm_vec, hole_signature, holes, no_hole, end_glyph,
+            frame, item,
+        )
+        width, height = _preview_wh(reader, glyph_size, end_glyph, item["role"])
+        for index, (glyph, vec) in enumerate(glyphs):
+            stem = (
+                f"{item['role']}/{glyph}__{item['roi']}__f{item['frame_index']:06d}__g{index}"
             )
-        stem = f"{item['role']}/{item['label']}__{item['roi']}__f{item['frame_index']:06d}"
-        npy_name = stem + ".npy"
-        png_name = stem + ".png"
-        import cv2
-        import numpy as np
-
-        buf = io.BytesIO()
-        np.save(buf, np.ascontiguousarray(vec, dtype=np.float32))
-        npy_bytes = buf.getvalue()
-        ok, png_buf = cv2.imencode(".png", crop, [cv2.IMWRITE_PNG_COMPRESSION, 3])
-        if not ok:
-            raise Refuse("refusing: png encode failed. no templates written.")
-        png_bytes = png_buf.tobytes()
-        for name, payload in ((npy_name, npy_bytes), (png_name, png_bytes)):
-            built.append((name, payload, {
-                "path": name.replace("\\", "/"),
-                "sha256": hashlib.sha256(payload).hexdigest(),
-                "role": item["role"],
-                "label": item["label"],
-                "profile": PROFILE_OF[item["role"]],
-                "source_match_id": short,
-                "t_ms": item["t_ms"],
-                "frame_index": item["frame_index"],
-                "harvest_version": HARVEST_VERSION,
-                "harvest_date": harvest_date,
-            }))
+            npy_name = stem + ".npy"
+            png_name = stem + ".png"
+            npy_bytes = _npy(vec)
+            png_bytes = _preview(vec, width, height)
+            for name, payload in ((npy_name, npy_bytes), (png_name, png_bytes)):
+                built.append((name, payload, _row(
+                    name, payload, item, glyph, short, match_dir.name, video_hash, measured, harvest_date,
+                )))
     if _snapshot(match_dir) != before:
         raise Refuse("refusing: match folder changed while reading. no templates written.")
     doc = {
@@ -339,12 +657,13 @@ def harvest(match_dir: Path, out_dir: Path, labels_path: Path, allow_path: Path,
         "harvest_version": HARVEST_VERSION,
         "templates": [row for _name, _payload, row in built],
     }
+    if dry_run:
+        return doc
     body = (json.dumps(doc, indent=2, sort_keys=True) + "\n").encode("utf-8")
-    # Write only after every crop succeeded, and only outside the match folder.
     out_dir.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="qorcap-harvest-", dir=str(out_dir.parent)) as tmp_name:
         tmp = Path(tmp_name)
-        for name, payload, _row in built:
+        for name, payload, _row_doc in built:
             dest = tmp / name
             dest.parent.mkdir(parents=True, exist_ok=True)
             dest.write_bytes(payload)
@@ -363,8 +682,22 @@ def harvest(match_dir: Path, out_dir: Path, labels_path: Path, allow_path: Path,
     return doc
 
 
+def _print_plan(doc: dict, out_dir: Path) -> None:
+    print(f"dry-run: {len(doc['templates'])} files would be written to {out_dir}; writing nothing")
+    for row in doc["templates"]:
+        span = []
+        if "start_frame_index" in row:
+            span.append(f"frames {row['start_frame_index']}-{row['end_frame_index']}")
+        if "start_t_ms" in row:
+            span.append(f"t_ms {row['start_t_ms']}-{row['end_t_ms']}")
+        print(
+            f"{row['path']} label={row['label']} role={row['role']} "
+            f"frame={row['frame_index']} t_ms={row['t_ms']} {' '.join(span)}"
+        )
+
+
 def main(argv: list[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(description="Harvest allowlisted scorebug templates outside the match folder")
+    ap = argparse.ArgumentParser(description="Harvest allowlisted per-glyph scorebug templates")
     ap.add_argument("--match-dir", type=Path)
     ap.add_argument("--out", type=Path)
     ap.add_argument("--labels", type=Path)
@@ -373,6 +706,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--heldout", type=Path, default=root / "templates" / "heldout.json")
     ap.add_argument("--heldout-sha256", type=Path, default=root / "sidecar" / "packs" / "held_out_sha256.json")
     ap.add_argument("--windows-doc", action="store_true", help="print the PowerShell one-liner and write nothing")
+    ap.add_argument("--dry-run", action="store_true", help="list the frames and crops and write nothing")
     args = ap.parse_args(argv)
     if args.windows_doc:
         print(POWERSHELL_ONELINER)
@@ -382,10 +716,16 @@ def main(argv: list[str] | None = None) -> int:
         print(POWERSHELL_ONELINER, file=sys.stderr)
         return 2
     try:
-        doc = harvest(args.match_dir, args.out, args.labels, args.allowlist, args.heldout, args.heldout_sha256)
+        doc = harvest(
+            args.match_dir, args.out, args.labels, args.allowlist, args.heldout, args.heldout_sha256,
+            dry_run=args.dry_run,
+        )
     except Refuse as exc:
         print(str(exc), file=sys.stderr)
         return 2
+    if args.dry_run:
+        _print_plan(doc, args.out)
+        return 0
     print(f"wrote {len(doc['templates'])} template files to {args.out}")
     return 0
 

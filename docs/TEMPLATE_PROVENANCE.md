@@ -33,8 +33,8 @@ enter the hash.
 
 | file | role |
 | --- | --- |
-| `templates/provenance.json` | sha256, source match, `t_ms`, frame index, harvest script version, harvest date. Empty until a harvest is committed. |
-| `templates/template_sources.json` | allowlist. Exactly `102332` and `111640`. |
+| `templates/provenance.json` | one row per glyph. sha256, source match id and full folder, video sha256, measured `t_ms`, frame index, the labelled time or frame range, harvest script version, harvest time (UTC). Empty until a harvest is committed. |
+| `templates/template_sources.json` | allowlist. Exactly `102332` and `111640`, each with the full folder name and the sha256 of `video.mp4`. An empty hash refuses the harvest. |
 | `templates/heldout.json` | held-out ids. The harvest script refuses them. |
 | `schema/template_provenance.v0.json` | JSON Schema for the provenance file. |
 
@@ -71,7 +71,7 @@ Method is how the vectors were built. Frame index is what the pack still recorde
 | `sidecar/packs/madden27_banner_fragments.npz` | `170123` (hl00 frame 175 white GOA, hl01 frame 174 dark TOUC) | fragment cut. Already absent on main. | held-out-derived, removed |
 | QorTime `qor_receipt/_vendor/qoresence/vision/local_scorebug/packs/madden27_standard_v1.npz` | September 2026 HDMI clips `hdmi_clip_20260906_111605` through `hdmi_clip_20260912_015442`, plus `hdmi_live_bottom` and `live_frame_receipt5` (244 frames, built 2026-10-08). Not one of the five held-out matches. | one mean vector per label. Frame index not kept in the npz. | not in this repo. Vendored with QorTime. Not deleted here. The QorCap standard reader does not emit a score from it while allowlisted templates are missing. |
 
-Fixture images under `sidecar/fixtures/` are not templates. The reader does not load them as glyph packs. They were not deleted. Tests must not grade the reader against held-out matches (`170123`, `021003`, `125430`, `084523`, `193534`) or against the template-source games (`102332`, `111640`).
+Fixture images under `sidecar/fixtures/` are not templates. The reader does not load them as glyph packs. They were not deleted. Tests must not harvest templates from held-out matches (`170123`, `021003`, `125430`, `084523`, `193534`) or from the template-source games (`102332`, `111640`). Tests may grade the reader on held-out matches. That is what those matches are for. The evaluation modules skip with `templates_missing` until an allowlisted harvest is installed, and those skip names are listed in `tools/assert_pytest_skips.py` so the skip stays visible. They run again once score templates load.
 
 `sidecar/packs/held_out_sha256.json` is a blocklist of public clip and frame hashes for `170123`, `021003`, and `125430`. It is not a template pack. The harvest script refuses a video whose sha256 is in that table. `084523` and `193534` have no source video in this repo; those ids are refused by path.
 
@@ -89,17 +89,41 @@ That observation is not a score event. It has no `home` or `away`.
 
 ## Harvest the replacements
 
-On the operator PC, from this repo, see `docs/HARVEST_TEMPLATES_WINDOWS.md`. The script is `tools/harvest_templates.py` version `1`.
+On the operator PC, from a git checkout of this repo, see `docs/HARVEST_TEMPLATES_WINDOWS.md`. The script is `tools/harvest_templates.py` version `2`. It calls the reader's own glyph segmentation and saves one binarised vector per glyph.
 
-1. Game 1, PowerShell:
+Sunday, Monday, Thursday, and PSN readers have no harvest regions. After this harvest only the standard bar and the end menu can come back.
+
+1. Pin `video.mp4` before harvesting. An empty `video_sha256` refuses the run, so a renamed held-out folder cannot pass.
 
 ```powershell
-python tools\harvest_templates.py --match-dir "$env:USERPROFILE\Documents\QorCap Matches\match-20261024-102332" --labels "$env:USERPROFILE\Documents\QorCap Templates\labels-102332.json" --out "$env:USERPROFILE\Documents\QorCap Templates\out-102332"
+cd "$env:USERPROFILE\src\qorcap"
+$docs = [Environment]::GetFolderPath("MyDocuments")
+Get-FileHash -Algorithm SHA256 "$docs\QorCap Matches\match-20261024-102332\video.mp4"
 ```
 
-2. Game 2: the same line with `102332` replaced by `111640` in the match folder, the labels file, and the output folder.
-3. Copy the `.npy` and `.png` files into `templates/`, keeping the relative paths.
-4. Merge each output `provenance.json` `templates` array into `templates/provenance.json`.
-5. Commit those files. Do not commit the match video. Do not tag or release from this work.
+Put that hash on the `102332` entry in `templates\template_sources.json`. Do the same for `111640`.
 
-A labels item is `role`, `label`, `roi`, `frame_index`, and optional `t_ms`. The person running the script chooses the label. The script does not invent one. It refuses a match id outside the allowlist, any held-out id, a video whose sha256 is in the blocklist, and an `--out` path inside the match folder. It does not write into the match folder.
+2. Game 1, PowerShell. Start Match's venv has numpy and opencv. `--dry-run` lists the crops and writes nothing.
+
+```powershell
+$py = "$env:LOCALAPPDATA\QorCap\venv\Scripts\python.exe"
+New-Item -ItemType Directory -Force "$docs\QorCap Templates" | Out-Null
+& $py tools\harvest_templates.py --match-dir "$docs\QorCap Matches\match-20261024-102332" --labels "$docs\QorCap Templates\labels-102332.json" --out "$docs\QorCap Templates\out-102332"
+```
+
+3. Game 2: the same line with `102332` replaced by `111640` in the match folder, the labels file, and the output folder.
+4. Copy the `.npy` and `.png` files into `templates/`, keeping the relative paths.
+5. Merge each output `provenance.json` `templates` array into `templates/provenance.json`.
+6. Commit those files on this branch. Do not commit the match video. Do not tag or release from this work. Do not merge while `templates` is empty.
+
+A labels item is `role`, `label`, `roi`, `frame_index`, and a range (`start_frame_index`/`end_frame_index`, or `start_t_ms`/`end_t_ms`). `label` is the slot text. A score label `14` is kept only when the reader segments two glyphs, and the saved labels are `1` and `4`. Clock labels are digits, with an optional colon. Quarter labels are `1st`, `2nd`, `3rd`, `4th`, or `ot`. The person running the script chooses the label. The script does not invent one. `harvest_date` is the UTC time of the run. The script refuses a match id outside the allowlist, any held-out id, a video whose sha256 is missing from the allowlist or is in the blocklist, a label the reader would not segment, and an `--out` path inside the match folder. It does not write into the match folder.
+
+## Tracked debt: numbers fitted on held-out matches
+
+These are not templates. This change does not edit them.
+
+| constant | where | fitted on |
+| --- | --- | --- |
+| `ANCHOR_SEARCH_PX = 8` and the full-resolution clock | `sidecar/qorcap_standard.py` | the 170123 highlight kit |
+| `GOA_MIN = 0.66`, `TOUC_MIN = 0.72` | `sidecar/qorcap_banner.py` | the same clips |
+| the 021003 touchdown look-alike safeguard (`TD_MIN_MARGIN` and the 0/8, 0/6, 0/9, 3/9 rules) | `sidecar/qorcap_reader.py` | match 021003 |

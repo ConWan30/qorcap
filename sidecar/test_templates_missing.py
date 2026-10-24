@@ -15,19 +15,21 @@ from qorcap_endmenu import EndMenuReader  # noqa: E402
 from qorcap_mnp import AutoProfileReader, MondayNightReader  # noqa: E402
 from qorcap_reader import ReaderCore  # noqa: E402
 from qorcap_snp import SundayNightReader  # noqa: E402
-from qorcap_standard import standard_reader  # noqa: E402
+from qorcap_standard import reader_model_id, standard_reader  # noqa: E402
 from qorcap_template_guard import TEMPLATES_MISSING, TEMPLATES_MISSING_REASON  # noqa: E402
 from qorcap_tnp import ThursdayNightReader  # noqa: E402
 from qor_receipt._vendor.qoresence.vision.local_scorebug.reader import ScorebugReader  # noqa: E402
 
 OLD_MODEL = "local_scorebug_v1:madden27-standard-v1:ac836591d618adb8"
-NEW_MODEL = "local_scorebug_v1:madden27-standard-v1:322a3c85a62409de"
 BLANK = np.zeros((360, 640, 3), np.uint8)
 
 
 def test_standard_reader_abstains_and_the_model_id_changed():
     reader = standard_reader()
-    assert reader.model_id == NEW_MODEL
+    # Computed from the reader, not a literal, so a rebase onto #81 does not rot the pin.
+    expected = reader_model_id(reader.inner, reader.grammar, reader.clocks)
+    assert reader.model_id == expected
+    assert reader.model_id.startswith("local_scorebug_v1:madden27-standard-v1:")
     assert reader.model_id != OLD_MODEL
     assert reader.model_id != ScorebugReader().model_id
     fr = reader.read(BLANK)

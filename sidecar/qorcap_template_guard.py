@@ -42,8 +42,18 @@ def _load_json(path: Path) -> dict:
 
 
 def match_ids(path: Path) -> set[str]:
+    """Ids from ``match_ids`` and from ``sources[].match_id``.
+
+    The harvest script also requires each source's ``video_sha256``. The reader
+    does not have the video, so it checks the id. CI checks the pin against the
+    provenance rows once templates exist.
+    """
     data = _load_json(path)
-    return {str(x) for x in data.get("match_ids", [])}
+    ids = {str(x) for x in data.get("match_ids", [])}
+    for row in data.get("sources") or []:
+        if isinstance(row, dict) and row.get("match_id"):
+            ids.add(str(row["match_id"]))
+    return ids
 
 
 def provenance_entries(path: Path | None = None) -> list[dict]:

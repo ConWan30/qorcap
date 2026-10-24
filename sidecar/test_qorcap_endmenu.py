@@ -1,8 +1,8 @@
 """End-of-game menu policy.
 
-Digit packs that included match 125430 are removed. This file does not open that frame.
-m27_end_menu_restart.jpg is match-20261016-143212 and is used only so the final-screen
-detector fires. Scores in the policy tests come from ScriptedEndMenu, not from glyphs.
+Digit packs that included match 125430 are removed. Policy tests use ScriptedEndMenu.
+The 125430 FINISH GAME frame is held-out evaluation: the score read skips until
+end-menu templates load. Harvesting from 125430 stays refused.
 """
 
 import json
@@ -37,6 +37,22 @@ class ScriptedEndMenu:
 
     def period(self, _img):
         return self._period
+
+
+def test_held_out_125430_finish_menu_reads_7_14():
+    """Grade the 125430 finish menu once end-menu glyphs are allowlisted."""
+    import pytest
+    from qorcap_template_guard import has_role
+
+    if not has_role("end_menu"):
+        pytest.skip("templates_missing: held-out 125430 end-menu evaluation waits for allowlisted end-menu templates")
+    fin = cv2.imread(str(HERE / "fixtures" / "m27_end_menu_finish.jpg"))
+    assert fin is not None
+    reader = EndMenuReader()
+    away_left = reader.read(RST)
+    finish = reader.read(fin)
+    assert away_left.ok and (away_left.away, away_left.home) == (0, 20), away_left
+    assert finish.ok and (finish.away, finish.home) == (7, 14), finish
 
 
 def test_reads_both_matches_away_left_home_right():
