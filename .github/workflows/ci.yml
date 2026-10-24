@@ -72,6 +72,9 @@ jobs:
             sidecar/test_qorcap_release.py \
             tools/test_frame_clock_ab.py \
             sidecar/test_qorcap_reader.py \
+            sidecar/test_qorcap_match.py::test_refresh_off_the_frame_thread_keeps_four_hertz \
+            sidecar/test_qorcap_match.py::test_incremental_tail_matches_full_parse \
+            sidecar/test_qorcap_match.py::test_reader_timing_log_names_the_three_clocks \
             sidecar/test_qorcap_standard.py \
             sidecar/test_qorcap_score_grammar.py \
             sidecar/test_qorcap_hl170123.py \
@@ -196,6 +199,9 @@ jobs:
             sidecar/test_qorcap_release.py \
             tools/test_frame_clock_ab.py \
             sidecar/test_qorcap_reader.py \
+            sidecar/test_qorcap_match.py::test_refresh_off_the_frame_thread_keeps_four_hertz \
+            sidecar/test_qorcap_match.py::test_incremental_tail_matches_full_parse \
+            sidecar/test_qorcap_match.py::test_reader_timing_log_names_the_three_clocks \
             sidecar/test_qorcap_standard.py \
             sidecar/test_qorcap_score_grammar.py \
             sidecar/test_qorcap_tnp.py \

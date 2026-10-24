@@ -4,6 +4,8 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -739,3 +741,173 @@ def test_finalize_role_correction_resigns_for_the_corrected_side(tmp_path, capsy
     assert meta3["role"] == "home" and "role_correction" not in meta3
     assert meta3.get("submittable") is not False and "submittable" not in meta3
     assert json.loads((b / "receipt.json").read_text())["referee"]["key_kind"] == qm.REFEREE_KIND
+
+
+def test_reader_timing_log_names_the_three_clocks(tmp_path):
+    row = qm.reader_timing_row(1_000, [250, 300, 280], 12.4, [8, 9], [20, 22],
+                               {"reader_lag": {"obs": "reader_lag", "n": 1, "max_gap_ms": 2100}})
+    assert row["kind"] == "timing"
+    assert row["frame_period_ms"]["n"] == 3 and row["frame_period_ms"]["max_ms"] == 300
+    assert row["refresh_ms"] == 12
+    assert row["on_frame_ms"]["mean_ms"] == 8 or row["on_frame_ms"]["mean_ms"] == 9
+    text = qm.format_reader_timing(row)
+    assert "frame_period_ms" in text and "refresh_ms" in text and "on_frame_ms" in text
+    path = tmp_path / "reader_health.jsonl"
+    qm.append_reader_health(path, row)
+    got = json.loads(path.read_text(encoding="utf-8").strip())
+    assert got["on_frame_ms"]["max_ms"] == 9
+    assert "home" not in got and "away" not in got
+
+
+def test_refresh_off_the_frame_thread_keeps_four_hertz(monkeypatch):
+    """A 1.5 s refresh must not run on the frame thread. 6 s still yields at least 16 frames."""
+    import urllib.request
+
+    import cv2
+    import numpy as np
+
+    import qorcap_reader
+
+    counts = []
+
+    def fast(self, t, img):
+        counts.append(t)
+
+    monkeypatch.setattr(qorcap_reader.ReaderCore, "on_frame", fast)
+    frames = []
+    for i in range(40):
+        img = np.zeros((8, 8, 3), np.uint8)
+        img[0, 0, 0] = i * 6
+        ok, buf = cv2.imencode(".jpg", img)
+        assert ok
+        frames.append(bytes(buf))
+    seq = {"i": 0}
+
+    class _Resp:
+        def __init__(self, data):
+            self._d = data
+
+        def read(self):
+            return self._d
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def urlopen(url, timeout=3):
+        data = frames[seq["i"] % len(frames)]
+        seq["i"] += 1
+        return _Resp(data)
+
+    monkeypatch.setattr(urllib.request, "urlopen", urlopen)
+
+    def slow_get(self, path, timeout=3):
+        time.sleep(1.5)
+        return {}
+
+    monkeypatch.setattr(qm.Api, "get", slow_get)
+    stop = threading.Event()
+    state = {}
+    thread = qm.start_reader(qm.Api(8791), stop, state, bundle=None)
+    time.sleep(0.3)
+    n0 = len(counts)
+    time.sleep(6.0)
+    n1 = len(counts)
+    stop.set()
+    thread.join(timeout=3)
+    assert n1 - n0 >= 16, n1 - n0
+
+
+def _full_jsonl(path: Path) -> list:
+    if not path.is_file():
+        return []
+    rows = []
+    for line in path.read_bytes().decode("utf-8", "replace").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rows.append(json.loads(line))
+        except Exception:
+            continue
+    return rows
+
+
+def _full_corr(bundle: Path) -> list:
+    from qorcap_reader import collect_delta_corroboration
+
+    clips = []
+    meta = bundle / "bundle.json"
+    if meta.is_file():
+        clips.extend(json.loads(meta.read_text(encoding="utf-8")).get("clips") or [])
+    for row in _full_jsonl(bundle / "manifest.jsonl"):
+        if isinstance(row, dict) and row.get("type") == "clip":
+            clips.append(row)
+    return collect_delta_corroboration(
+        clips=clips,
+        haptic_records=[r for r in _full_jsonl(bundle / "haptics.jsonl") if isinstance(r, dict)],
+        input_records=[r for r in _full_jsonl(bundle / "inputs.jsonl") if isinstance(r, dict)],
+    )
+
+
+def test_incremental_tail_matches_full_parse(tmp_path):
+    """A generated inputs file, appended in chunks with a partial last line, matches a full parse."""
+    from qorcap_reader import load_delta_corroboration_from_bundle, note_options_from_inputs, options_presses_ms
+
+    bundle = tmp_path / "match"
+    bundle.mkdir()
+    (bundle / "bundle.json").write_text(json.dumps({"schema": "qorcap-bundle/v0", "clips": []}) + "\n", encoding="utf-8")
+    (bundle / "manifest.jsonl").write_text(
+        json.dumps({"type": "clip", "name": "score-a0-h3", "sha256": "ab" * 32, "t_ms": 5_000}) + "\n",
+        encoding="utf-8")
+    (bundle / "haptics.jsonl").write_text(json.dumps({"type": "haptic", "t_ms": 5_100}) + "\n", encoding="utf-8")
+    inputs = bundle / "inputs.jsonl"
+    parts = []
+    size = 0
+    i = 0
+    while size < 15_000_000:
+        button = 512 if i % 10 == 0 else 0
+        line = f'{{"type":"in","b":{button},"t_us":{i * 1000}}}\n'.encode()
+        parts.append(line)
+        size += len(line)
+        i += 1
+    blob = b"".join(parts)
+
+    class _Opt:
+        def __init__(self):
+            self._inputs_tail = None
+            self.presses = []
+
+        def set_options(self, presses):
+            self.presses = list(presses)
+
+    opt = _Opt()
+
+    def check():
+        note_options_from_inputs(opt, inputs)
+        assert opt.presses == options_presses_ms(_full_jsonl(inputs))
+        assert load_delta_corroboration_from_bundle(bundle) == _full_corr(bundle)
+
+    for off in range(0, len(blob), 3_000_000):
+        with open(inputs, "ab") as fh:
+            fh.write(blob[off:off + 3_000_000])
+        check()
+    with open(inputs, "ab") as fh:
+        fh.write(b'{"type":"in","b":512,"t_us":')  # partial trailing line, not valid JSON yet
+    check()
+    with open(inputs, "ab") as fh:
+        fh.write(b"999}\n")
+    check()
+    with open(bundle / "haptics.jsonl", "ab") as fh:
+        fh.write(json.dumps({"type": "haptic", "t_ms": 9_000}).encode() + b"\n")
+    with open(bundle / "manifest.jsonl", "ab") as fh:
+        fh.write(json.dumps({"type": "clip", "name": "score-a3-h3", "sha256": "cd" * 32, "t_ms": 9_100}).encode() + b"\n")
+    check()
+    rotated = bundle / "inputs-next.jsonl"
+    rotated.write_bytes(b'{"type":"in","b":0,"t_ms":1}\n{"type":"in","b":512,"t_ms":2}\n')
+    os.replace(rotated, inputs)
+    check()
+    inputs.write_bytes(b'{"type":"in","b":512,"t_us":4000}\n{"type":"in","b":')  # truncated, partial again
+    check()

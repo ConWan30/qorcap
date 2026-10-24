@@ -870,6 +870,34 @@ mod tests {
     }
 
     #[test]
+    fn reader_lag_is_not_a_timeline_observation() {
+        // QorTime's reader documents timeline obs as scorebug_absent|final_screen. A stall
+        // signal stays out of timeline.jsonl, so it cannot open a session break or a score.
+        use clap::Parser;
+        let dir = std::env::temp_dir().join(format!("qorcap-lag-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let d = dir.to_string_lossy().into_owned();
+        let crate::cli::Cmd::Record(r) = crate::cli::Cli::try_parse_from(["q", "record", "--device", "testpattern", "--bundle", &d]).unwrap().cmd else { panic!() };
+        let e = Engine::new(r, "ffmpeg-x".into());
+        e.event(&serde_json::json!({"type":"score","home":0,"away":3,"quarter":1,"clock_s":100})).unwrap();
+        let lag = e.event(&serde_json::json!({"type":"obs","obs":"reader_lag","t_ms":1000,"until_ms":30000,"n":4,"max_gap_ms":2100}));
+        assert!(lag.unwrap_err().contains("scorebug_absent|final_screen"));
+        let unagreed = e.event(&serde_json::json!({"type":"obs","obs":"score_unagreed","t_ms":1000,"until_ms":12000,"n":8}));
+        assert!(unagreed.unwrap_err().contains("scorebug_absent|final_screen"));
+        {
+            let st = e.ev.lock().unwrap_or_else(|err| err.into_inner());
+            assert!(!st.scorebug_break);
+            assert_eq!(st.timeline.len(), 1);
+        }
+        let text = std::fs::read_to_string(dir.join("timeline.jsonl")).unwrap_or_default();
+        assert!(!text.contains("reader_lag") && !text.contains("score_unagreed"));
+        let next = e.event(&serde_json::json!({"type":"score","home":0,"away":0,"quarter":1,"clock_s":90})).unwrap();
+        assert!(next.get("new_session").is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn null_quarter_keeps_last_reliable_and_does_not_go_backwards() {
         use clap::Parser;
         let dir = std::env::temp_dir().join(format!("qorcap-qkeep-{}", std::process::id()));

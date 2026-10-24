@@ -27,6 +27,22 @@ def _rows():
     ]
 
 
+def test_health_observations_do_not_change_the_score_chain():
+    """reader_lag and score_unagreed are not score rows. The signed chain is the scores alone."""
+    scores = [
+        {"t_ms": 1000, "home": 0, "away": 0, "quarter": 1},
+        {"t_ms": 5000, "home": 3, "away": 0, "quarter": 1},
+    ]
+    base, head = st.chain_events(st.events_from_timeline(scores))
+    mixed = scores + [
+        {"t_ms": 2000, "until_ms": 4000, "obs": "reader_lag", "n": 1, "max_gap_ms": 2100},
+        {"t_ms": 6000, "until_ms": 16000, "obs": "score_unagreed", "n": 4, "reasons": {"agreeing": 4}},
+    ]
+    again, head2 = st.chain_events(st.events_from_timeline(mixed))
+    assert again == base and head2 == head
+    assert st.events_from_timeline(mixed) == st.events_from_timeline(scores)
+
+
 def test_collapse_keeps_the_first_timestamp_of_each_score():
     events = st.events_from_timeline(_rows())
     assert events == [
