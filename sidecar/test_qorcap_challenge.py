@@ -181,22 +181,30 @@ def _status(t_ms: int, state: str) -> dict:
     return {"type": "status", "t_us": t_ms * 1000, "state": state, "detail": state, "seg": 0}
 
 
-def _chunk(t_ms: int, seq: int = 1) -> dict:
-    """A per-segment chunk row. Real recordings seal one of these after the records."""
-    return {"type": "chunk", "seq": seq, "seg": seq, "n": 1, "sha256": "ab" * 32,
+def _chunk(t_ms: int, seq: int = 1, n: int = 1) -> dict:
+    """A per-segment chunk row. An idle pad from 0.3.34 still writes one with ``n`` 0."""
+    return {"type": "chunk", "seq": seq, "seg": seq, "n": n, "sha256": "ab" * 32,
             "prev": "cd" * 32, "head": "ef" * 32, "t_us": t_ms * 1000}
 
 
-def _chunk_span(issued_ms: int, deadline_ms: int, step: int = 2_000) -> list[dict]:
-    """Chunk rows from one step before the window through the deadline."""
+def _chunk_span(issued_ms: int, deadline_ms: int, step: int = 2_000, *, n: int = 1,
+                start: int | None = None, until: int | None = None) -> list[dict]:
+    """Chunk rows from one step before the window through the deadline.
+
+    ``start`` is the first stamp (default one step before ``issued_ms``). ``until`` is the
+    last stamp (default ``deadline_ms``). ``n`` is written on every row.
+    """
     rows = []
-    t = issued_ms - step
+    t = issued_ms - step if start is None else start
+    end = deadline_ms if until is None else until
     seq = 0
-    while t < deadline_ms:
-        rows.append(_chunk(t, seq))
+    if t > end:
+        return rows
+    while t < end:
+        rows.append(_chunk(t, seq, n))
         seq += 1
         t += step
-    rows.append(_chunk(deadline_ms, seq))
+    rows.append(_chunk(end, seq, n))
     return rows
 
 
@@ -698,3 +706,108 @@ def test_chunk_coverage_must_be_continuous(tmp_path):
     stored, local = _boundary(
         tmp_path, "over-bound", [*head, *_chunk_span(issued, deadline, step=C.CHUNK_GAP_MAX_MS + 1)])
     assert stored is None and local["withheld"] == "controller_log"
+
+
+def _mismatch_head(kick: dict) -> list[dict]:
+    t0 = kick["issued_ms"] + 1_000
+    return [_header(), _status(0, "connected"), _press(t0, "OPTIONS"),
+            _press(t0 + 400, _wrong_button(kick["pattern"]))]
+
+
+def test_idle_pad_empty_chunks_store_pattern_mismatch(tmp_path):
+    """An idle pad seals a chunk every 2 s with n 0. That window stores the mismatch.
+
+    seal() used to return before writing when n was 0, so a real idle stretch left gaps
+    over 3 s and the gate withheld the window.
+    """
+    kick = _kickoff()
+    rows = [*_mismatch_head(kick), *_chunk_span(kick["issued_ms"], kick["deadline_ms"], n=0)]
+    assert [r["n"] for r in rows if r["type"] == "chunk"]
+    assert all(r["n"] == 0 for r in rows if r["type"] == "chunk")
+    stored, local = _boundary(tmp_path, "idle", rows)
+    assert stored["reason"] == "pattern_mismatch" and "withheld" not in local
+
+
+def test_chunk_after_issue_does_not_open_coverage(tmp_path):
+    """The first chunk is 1 ms after issue and nothing is at or before it. That withholds.
+
+    A gate that let a chunk after issued_ms open coverage would store this.
+    """
+    kick = _kickoff()
+    issued, deadline = kick["issued_ms"], kick["deadline_ms"]
+    rows = [*_mismatch_head(kick), *_chunk_span(issued, deadline, start=issued + 1)]
+    assert all(r["t_us"] // 1000 > issued for r in rows if r["type"] == "chunk")
+    stored, local = _boundary(tmp_path, "after-issue", rows)
+    assert stored is None and local["reason"] == "pattern_mismatch" and local["withheld"] == "controller_log"
+
+
+def test_last_chunk_before_deadline_withholds(tmp_path):
+    """The last chunk is 1 ms before the deadline and nothing is at or after it. That withholds.
+
+    Steps stay inside 3000 ms, and the deadline is 1 ms after the last chunk. A gate that
+    stops once the steps fit, or that treats the end as covered when deadline - last <= 3000,
+    would store this.
+    """
+    kick = _kickoff()
+    issued, deadline = kick["issued_ms"], kick["deadline_ms"]
+    rows = [*_mismatch_head(kick), *_chunk_span(issued, deadline, start=issued, until=deadline - 1)]
+    times = sorted(r["t_us"] // 1000 for r in rows if r["type"] == "chunk")
+    assert times[0] == issued and times[-1] == deadline - 1
+    assert all(times[i] - times[i - 1] <= 3_000 for i in range(1, len(times)))
+    assert all(t < deadline for t in times)
+    stored, local = _boundary(tmp_path, "before-deadline", rows)
+    assert stored is None and local["reason"] == "pattern_mismatch" and local["withheld"] == "controller_log"
+
+
+def test_chunk_exactly_at_issue_opens_coverage(tmp_path):
+    """A chunk stamped exactly at issued_ms opens coverage when nothing is earlier.
+
+    Changing the opening comparison from <= issued_ms to < issued_ms would withhold this.
+    """
+    kick = _kickoff()
+    issued, deadline = kick["issued_ms"], kick["deadline_ms"]
+    rows = [*_mismatch_head(kick), *_chunk_span(issued, deadline, start=issued)]
+    times = sorted(r["t_us"] // 1000 for r in rows if r["type"] == "chunk")
+    assert times[0] == issued and all(t >= issued for t in times) and times[-1] >= deadline
+    stored, local = _boundary(tmp_path, "at-issue", rows)
+    assert stored["reason"] == "pattern_mismatch" and "withheld" not in local
+
+
+def test_status_rows_are_not_chunk_coverage(tmp_path):
+    """Status rows across the window are not chunk rows. Dropping the type filter would store this."""
+    kick = _kickoff()
+    issued, deadline = kick["issued_ms"], kick["deadline_ms"]
+    rows = _mismatch_head(kick)
+    t = 0
+    while t <= deadline:
+        rows.append(_status(t, "connected"))
+        t += 2_000
+    assert not any(r["type"] == "chunk" for r in rows)
+    stored, local = _boundary(tmp_path, "status-only", rows)
+    assert stored is None and local["reason"] == "pattern_mismatch" and local["withheld"] == "controller_log"
+
+
+def test_issued_equal_deadline_with_a_chunk_at_that_instant_stores(tmp_path):
+    """issued_ms == deadline_ms and one chunk at that instant covers.
+
+    The early ``prev >= deadline_ms`` return is what accepts this. Flipping it to false
+    withholds only this shape. The press on that instant is inside the window.
+    """
+    import qorcap_challenge as C
+
+    kick = _kickoff()
+    issued = kick["issued_ms"]
+    kick = dict(kick, deadline_ms=issued)
+    wrong = _wrong_button(kick["pattern"])
+    rows = [
+        _header(),
+        _status(0, "connected"),
+        _press(issued, "OPTIONS"),
+        _press(issued, wrong),
+        _chunk(issued, 0),
+    ]
+    assert C.chunks_cover(rows, issued_ms=issued, deadline_ms=issued, anchor_ms=0) is True
+    filled = _fill(tmp_path / "equal", rows, [kick])
+    assert filled["challenges"][0]["result"]["reason"] == "pattern_mismatch"
+    line = json.loads((tmp_path / "equal" / "challenge_results.jsonl").read_text(encoding="utf-8").splitlines()[0])
+    assert line["reason"] == "pattern_mismatch" and "withheld" not in line

@@ -1729,7 +1729,8 @@ def fill_challenge_results(bundle: Path, draft: dict, *, ffmpeg: str | None = No
     (``reverified_by: recorder``). A ``pattern_mismatch`` is written when every line of
     ``inputs.jsonl`` is one JSON object, there is a single header, chunk rows cover the window
     with no gap over 3 s, and the pad stayed connected from issue through 2.5 s after the
-    deadline. OPTIONS alone and a
+    deadline. From 0.3.34 an idle segment still writes a chunk row (``n`` 0) when the HID
+    reader has returned from a read; a hung read writes none, so the gap withholds. OPTIONS alone and a
     pattern whose later buttons fall after the deadline count. Verify then reports
     ``challenge_failed``, and Start Match exits 2 without the submit prompt. Submit for
     Verification still works later. A stall, including one recorded just after the deadline, an

@@ -10,8 +10,11 @@
 //! * chunk hashes are chained `head_n = SHA-256(JCS({prev, seq, sha256}))` (same rule as the video chain) and a
 //!   `{"type":"chunk",...}` line is written after the records.
 //!
-//! A chunk with no records hashes to SHA-256(JCS([])), exactly what QorCap <= 0.2.2 wrote, so bundles without a
-//! controller stay byte-compatible. Controller presence changes (`connected` / `missing` / `unplugged` /
+//! A chunk with no records hashes to SHA-256(JCS([])), exactly what QorCap <= 0.2.2 wrote. From 0.3.34 that
+//! empty chunk is still written, one per segment, when the HID logger thread has returned from a read since
+//! the previous seal. The fMP4 reader thread is the one that appends the line (`Engine::on_segment` calls
+//! `seal`). A hung `dev.read` never returns, so the beat does not move and that seal writes no row. The
+//! challenge gate then sees a gap and does not sign the mismatch. Controller presence changes (`connected` / `missing` / `unplugged` /
 //! `stalled`) are themselves records, so absence is committed rather than hidden. Each `connected` record
 //! on a new log carries `pad_id` (USB serial, or a device instance id / hidraw id). The reader never writes
 //! an output report or a feature report.
@@ -139,6 +142,10 @@ pub struct InputLog {
     haptic_path: Option<PathBuf>,
     wall_anchor_ms: u64,
     imu_committed: Option<(bool, u32)>,
+    /// Times the HID logger thread has returned from `dev.read`.
+    hid_beats: u64,
+    /// `hid_beats` already consumed by a seal. Equal means the reader has not returned since.
+    sealed_beats: u64,
 }
 
 impl InputLog {
@@ -146,7 +153,8 @@ impl InputLog {
         let haptic_path = path.as_ref().map(|p| p.with_file_name(haptics_file_name(p)));
         let mut l = InputLog { path, pending: vec![], head: GENESIS.into(), chunks: 0, total_records: 0, last_logged: None,
             live: Live { enabled, state: if enabled { "searching".into() } else { "off".into() }, ..Default::default() },
-            detector: Detector::new(wall_anchor_ms), haptic_path, wall_anchor_ms, imu_committed: None };
+            detector: Detector::new(wall_anchor_ms), haptic_path, wall_anchor_ms, imu_committed: None,
+            hid_beats: 0, sealed_beats: 0 };
         if enabled {
             l.pending.push(json!({"type": "header", "schema": SCHEMA, "t_us": 0,
                 "clock": "qorcap-mono-us (same Instant as manifest/checkpoint mono_ms)", "wall_anchor_ms": wall_anchor_ms,
@@ -247,7 +255,15 @@ impl InputLog {
     /// Records not yet sealed (used by `input-test`, which never seals).
     pub fn pending(&self) -> &[Value] { &self.pending }
 
+    /// The HID logger thread calls this on every `dev.read` return. A hung read never does.
+    pub fn note_hid_alive(&mut self) { self.hid_beats = self.hid_beats.saturating_add(1); }
+
     /// Seal everything pending into chunk `seg`. Returns (chunk_sha256, chain_head, n_records).
+    ///
+    /// Called on the fMP4 reader thread from `Engine::on_segment`. An empty segment (`n == 0`)
+    /// still appends a chunk row when `note_hid_alive` has run since the previous seal. If the
+    /// HID logger thread is blocked inside `dev.read`, the beat is unchanged and this returns
+    /// without a row, so the challenge gate withholds.
     pub fn seal(&mut self, seg: u64, t_us: u64) -> (String, String, usize) {
         if self.live.reports > 0 {
             let now = (self.detector.live.imu_present, self.detector.live.imu_rate_hz);
@@ -267,7 +283,8 @@ impl InputLog {
         }
         let sha = ev::jcs_sha(&Value::Array(recs.clone()));
         let n = recs.len();
-        if n == 0 { return (sha, self.head.clone(), 0); }
+        let reader_alive = self.hid_beats != self.sealed_beats;
+        if n == 0 && !reader_alive { return (sha, self.head.clone(), 0); }
         let prev = self.head.clone();
         let head = ev::link(&prev, self.chunks, &sha);
         let chunk = json!({"type": "chunk", "seq": self.chunks, "seg": seg, "n": n, "sha256": sha, "prev": prev, "head": head, "t_us": t_us});
@@ -283,6 +300,7 @@ impl InputLog {
                 return (empty_hash(), self.head.clone(), 0);
             }
         }
+        if reader_alive { self.sealed_beats = self.hid_beats; }
         if let Some(hp) = &self.haptic_path {
             let hs: String = recs.iter().filter(|r| r["type"] == "haptic").map(|r| format!("{r}\n")).collect();
             if !hs.is_empty() {
@@ -340,22 +358,28 @@ where F: Fn() -> Result<Box<dyn ReportSource>, String> + Send + 'static {
                         match dev.read(&mut buf, 100) {
                             Ok(Some(n)) => {
                                 let t = us();
+                                let mut l = log.lock().unwrap_or_else(|e| e.into_inner());
+                                // Back from read: this thread is not hung. The fMP4 reader may seal an empty chunk.
+                                l.note_hid_alive();
                                 if let Some(p) = hid::parse(&buf[..n]) {
-                                    let mut l = log.lock().unwrap_or_else(|e| e.into_inner());
                                     if l.live.state != "connected" { l.on_status_with_id(t, "connected", &detail, Some(&pad_id)); }
                                     l.on_report(t, &p);
                                     last_rx = Instant::now();
                                 }
                             }
                             Ok(None) => {
-                                if last_rx.elapsed() > Duration::from_secs(2) {
-                                    let mut l = log.lock().unwrap_or_else(|e| e.into_inner());
-                                    if l.live.state == "connected" { warn!("CONTROLLER: no HID reports for 2 s"); l.on_status(us(), "stalled", "no reports for 2 s"); }
+                                let mut l = log.lock().unwrap_or_else(|e| e.into_inner());
+                                l.note_hid_alive();
+                                if last_rx.elapsed() > Duration::from_secs(2) && l.live.state == "connected" {
+                                    warn!("CONTROLLER: no HID reports for 2 s");
+                                    l.on_status(us(), "stalled", "no reports for 2 s");
                                 }
                             }
                             Err(e) => {
                                 warn!("CONTROLLER: USB HID read failed ({e}); retrying");
-                                log.lock().unwrap_or_else(|e| e.into_inner()).on_status(us(), "unplugged", &e);
+                                let mut l = log.lock().unwrap_or_else(|e| e.into_inner());
+                                l.note_hid_alive();
+                                l.on_status(us(), "unplugged", &e);
                                 break;
                             }
                         }
@@ -426,7 +450,7 @@ mod tests {
         assert_eq!(n0, 6); // header, status, 3 records, imu presence
         assert_ne!(sha0, empty_hash());
         let (sha1, head1, n1) = l.seal(2, 11_000);
-        assert_eq!((sha1.as_str(), head1.as_str(), n1), (empty_hash().as_str(), head0.as_str(), 0), "empty chunk = legacy hash, chain unchanged");
+        assert_eq!((sha1.as_str(), head1.as_str(), n1), (empty_hash().as_str(), head0.as_str(), 0), "hung reader: empty seal writes no row");
         let (recs, chunks) = read_file(&p).unwrap();
         assert_eq!((recs.len(), chunks.len()), (6, 1));
         assert_eq!((recs[5]["type"].as_str(), recs[5]["present"].as_bool()), (Some("imu"), Some(false)));
@@ -436,6 +460,37 @@ mod tests {
         // tamper: change one button value
         let mut bad = recs.clone(); bad[3]["b"] = json!(0);
         assert!(!verify_chunks(&bad, &chunks).2.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn empty_segment_writes_a_chunk_row_when_the_hid_reader_is_alive() {
+        let dir = std::env::temp_dir().join(format!("qorcap-inputs-empty-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let p = dir.join("inputs.jsonl");
+        let mut l = InputLog::new(Some(p.clone()), true, 0);
+        let (sha0, head0, n0) = l.seal(0, 1_000);
+        assert!(n0 >= 1 && sha0 != empty_hash() && head0 != GENESIS, "header seals");
+        // No beat: the logger thread has not returned from read. Same as a hung dev.read.
+        let (sha_hung, head_hung, n_hung) = l.seal(1, 2_000_000);
+        assert_eq!((sha_hung.as_str(), head_hung.as_str(), n_hung, l.chunks), (empty_hash().as_str(), head0.as_str(), 0, 1));
+        l.note_hid_alive();
+        let (sha1, head1, n1) = l.seal(1, 2_000_000);
+        assert_eq!(n1, 0);
+        assert_eq!(sha1, empty_hash());
+        assert_ne!(head1, head0);
+        let (recs, chunks) = read_file(&p).unwrap();
+        assert_eq!(chunks.len(), 2, "empty segment still gets a chunk row");
+        assert_eq!(chunks[1]["n"].as_u64(), Some(0));
+        assert_eq!(chunks[1]["t_us"].as_u64(), Some(2_000_000));
+        assert_eq!(chunks[1]["type"].as_str(), Some("chunk"));
+        let (_m, head, errs) = verify_chunks(&recs, &chunks);
+        assert!(errs.is_empty(), "{errs:?}");
+        assert_eq!(head, head1);
+        // The beat was consumed. Another empty seal with no new read is a hang: no row.
+        let (sha2, head2, n2) = l.seal(2, 4_000_000);
+        assert_eq!((sha2.as_str(), head2.as_str(), n2, l.chunks), (empty_hash().as_str(), head1.as_str(), 0, 2));
+        assert_eq!(read_file(&p).unwrap().1.len(), 2);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

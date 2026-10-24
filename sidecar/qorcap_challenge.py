@@ -273,11 +273,14 @@ def pad_connected_through(records: list, *, issued_ms: int, deadline_ms: int, an
 
 
 def chunks_cover(records: list, *, issued_ms: int, deadline_ms: int, anchor_ms: int) -> bool:
-    """Chunk rows cover ``[issued_ms, deadline_ms]`` with no gap over ``CHUNK_GAP_MAX_MS``.
+    """Chunk rows cover the window. Only ``type`` ``chunk`` rows with an integer ``t_us`` count.
 
-    A normal recording seals one chunk per 2 s fMP4 segment. A single chunk after the
-    deadline does not cover the window. A crash that drops a stretch, then writes rows
-    after the deadline, does not either. Times are header ``wall_anchor_ms`` plus ``t_us``.
+    Coverage opens at the latest chunk at or before ``issued_ms``. A chunk after ``issued_ms``
+    does not open it. Each next chunk is at most ``CHUNK_GAP_MAX_MS`` after the previous one,
+    through a chunk at or after ``deadline_ms``. A last chunk before the deadline does not
+    cover, even when the deadline is within that bound. The step from the opening chunk
+    already requires ``issued_ms - prev`` to be inside the bound, so that gap is not checked
+    on its own. Times are header ``wall_anchor_ms`` plus ``t_us``.
     """
     times = sorted({
         anchor_ms + r["t_us"] // 1000
@@ -292,7 +295,7 @@ def chunks_cover(records: list, *, issued_ms: int, deadline_ms: int, anchor_ms: 
     while i < len(times) and times[i] <= issued_ms:
         prev = times[i]
         i += 1
-    if prev is None or issued_ms - prev > CHUNK_GAP_MAX_MS:
+    if prev is None:
         return False
     if prev >= deadline_ms:
         return True
