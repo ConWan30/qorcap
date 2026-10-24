@@ -148,12 +148,26 @@ def test_model_id_covers_the_stacked_templates_and_the_grammar_and_clock():
     raw, aug = ScorebugReader(), standard_reader()
     assert aug.model_id != raw.model_id
     assert "3abf7beda13325e0" not in aug.model_id
+    # #76 id. The clock-vote logic has to move it.
+    assert "ac836591d618adb8" not in aug.model_id
     assert aug.model_id == standard_reader().model_id
     other = standard_reader()
     other.grammar.reanchor_reads = aug.grammar.reanchor_reads + 1
     assert other.model_id != aug.model_id
     other.grammar.reanchor_reads = aug.grammar.reanchor_reads
     other.clocks.reanchor_span_ms = aug.clocks.reanchor_span_ms + 1
+    assert other.model_id != aug.model_id
+    other.clocks.reanchor_span_ms = aug.clocks.reanchor_span_ms
+    other.clocks.run_span_ms = aug.clocks.run_span_ms + 1
+    assert other.model_id != aug.model_id
+    other.clocks.run_span_ms = aug.clocks.run_span_ms
+    other.clocks.run_tol_s = aug.clocks.run_tol_s + 1
+    assert other.model_id != aug.model_id
+    other.clocks.run_tol_s = aug.clocks.run_tol_s
+    other.grammar.vote_reads = aug.grammar.vote_reads + 1
+    assert other.model_id != aug.model_id
+    other.grammar.vote_reads = aug.grammar.vote_reads
+    other.grammar.vote_span_ms = aug.grammar.vote_span_ms + 1
     assert other.model_id != aug.model_id
     assert aug.inner.profile.anchor_search_px == 8
     assert aug.inner.profile.min_logo_ncc == raw.profile.min_logo_ncc == 0.90

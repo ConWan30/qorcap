@@ -15,7 +15,8 @@ sys.path.insert(0, os.environ.get("QORTIME", "/workspace/qortime-src"))
 from qor_receipt._vendor.qoresence.vision.local_scorebug.reader import FrameRead  # noqa: E402
 from qorcap_clock import ClockHistory  # noqa: E402
 from qorcap_score_grammar import (  # noqa: E402
-    BANNER_WINDOW_MS, REANCHOR_READS, REANCHOR_SPAN_MS, TRY_WINDOW_MS, ScoreGrammar, judge,
+    BANNER_WINDOW_MS, REANCHOR_READS, REANCHOR_SPAN_MS, TRY_WINDOW_MS, VOTE_READS, VOTE_SPAN_MS,
+    ScoreGrammar, judge,
 )
 
 
@@ -39,6 +40,8 @@ def test_windows_are_the_documented_defaults():
     assert g.try_window_ms == TRY_WINDOW_MS == 45_000
     assert g.reanchor_reads == REANCHOR_READS == 4
     assert g.reanchor_span_ms == REANCHOR_SPAN_MS == 2_000
+    assert g.vote_reads == VOTE_READS == 3
+    assert g.vote_span_ms == VOTE_SPAN_MS == 400
     g.note_lock(0, 0, 0)
     g.note_banner(0, "fg")
     assert g.active_banner(12_000) == "fg"
@@ -175,10 +178,16 @@ def test_a_stable_illegal_score_reanchors_without_raising_confidence():
     assert g.allows_final_fallback() is True
 
 
-def test_an_unconfirmed_reanchor_or_a_disagreement_blocks_the_final():
+def test_an_unconfirmed_reanchor_or_a_persistent_disagreement_blocks_the_final():
     from qorcap_match import apply_final
     stuck = _locked(0, 6)
     assert stuck.filter(_fr(0, 7), 1_000, None).left_score is None
+    assert stuck.locked == (0, 6)
+    # One illegal frame blanks that frame. It does not abstain the final (FU2).
+    assert stuck.allows_final_fallback() is True
+    assert stuck.filter(_fr(0, 7), 1_200, None).left_score is None
+    assert stuck.allows_final_fallback() is True
+    assert stuck.filter(_fr(0, 7), 1_400, None).left_score is None
     assert stuck.allows_final_fallback() is False
     base = {"home_score": 6, "away_score": 0, "quarter": 1, "final_t_ms": 5, "winner": "home",
             "method": "last_scorebug_read_unconfirmed"}

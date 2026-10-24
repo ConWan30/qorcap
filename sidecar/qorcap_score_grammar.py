@@ -28,9 +28,18 @@ Re-anchor (constructor arguments; these constants are the default):
   score that keeps agreeing takes over.
 
 A re-anchor stays unconfirmed until ``note_lock`` records that same pair (the agreement window
-locked it). While the grammar is abstaining, or the last re-anchor is still unconfirmed,
-``allows_final_fallback`` is false. The match final must abstain instead of publishing the frozen
-anchor.
+locked it). While a disagreement has persisted across the vote, or the last re-anchor is still
+unconfirmed, ``allows_final_fallback`` is false. The match final must abstain instead of
+publishing the frozen anchor.
+
+The vote uses the agreement window's numbers: ``vote_reads`` 3, ``vote_interval_ms`` 200,
+``vote_span_ms`` 400, ``vote_gap_ms`` 2_000. A sample closer than the interval is not new
+evidence and is not a reset. One illegal frame blanks that frame and does not flip
+``allows_final_fallback``. The same illegal run, persisted across the vote, does. A gap longer
+than ``vote_gap_ms`` starts the count over and does not clear a disagreement that already
+persisted. ``suspicious_reads`` 9 over ``suspicious_span_ms``
+2_000 is the agreement window's bar for an implausible jump, so a short forged decrease still
+cannot confirm a re-anchor. See ``docs/SCOREBUG_CLOCK_VOTE.md``.
 
 A backward timestamp is a cut. The old anchor is dropped and the next gated score is a fresh
 entry. An open try is kept only when that next lock is the same score that had the try open, so
@@ -74,6 +83,14 @@ TRY_WINDOW_MS = 45_000
 # Four gated reads spanning two seconds. Stricter than one agreement window (3 x 400 ms).
 REANCHOR_READS = 4
 REANCHOR_SPAN_MS = 2_000
+# Same numbers as QorTime AgreementConfig. A disagreement has to clear the lock's own vote.
+VOTE_READS = 3
+VOTE_INTERVAL_MS = 200
+VOTE_SPAN_MS = 400
+VOTE_GAP_MS = 2_000
+SUSPICIOUS_READS = 9
+SUSPICIOUS_SPAN_MS = 2_000
+JUMP_MEMORY_MS = 30_000
 
 _TD_COMBINED = (6, 7, 8)
 _TRY_STEPS = (1, 2)
@@ -124,6 +141,13 @@ class ScoreGrammar:
     try_window_ms: int = TRY_WINDOW_MS
     reanchor_reads: int = REANCHOR_READS
     reanchor_span_ms: int = REANCHOR_SPAN_MS
+    vote_reads: int = VOTE_READS
+    vote_interval_ms: int = VOTE_INTERVAL_MS
+    vote_span_ms: int = VOTE_SPAN_MS
+    vote_gap_ms: int = VOTE_GAP_MS
+    suspicious_reads: int = SUSPICIOUS_READS
+    suspicious_span_ms: int = SUSPICIOUS_SPAN_MS
+    jump_memory_ms: int = JUMP_MEMORY_MS
 
     def __post_init__(self) -> None:
         self.reset()
@@ -145,6 +169,9 @@ class ScoreGrammar:
         self.disagreeing = False
         self.reanchor_pair: tuple[int, int] | None = None
         self.reanchor_confirmed = True
+        self._vote_n = 0
+        self._vote_t0: int | None = None
+        self._vote_last: int | None = None
 
     def _cut(self) -> None:
         """Drop the anchor. Keep an open try so the same score can be re-locked legally."""
@@ -197,6 +224,29 @@ class ScoreGrammar:
         self._cand_n = 0
         self._cand_t0 = None
 
+    def _clear_vote(self) -> None:
+        self._vote_n = 0
+        self._vote_t0 = None
+        self._vote_last = None
+
+    def _note_disagreement(self, t_ms: int) -> None:
+        """Count an illegal gated score. One frame does not set ``disagreeing``."""
+        t_ms = int(t_ms)
+        last = self._vote_last
+        if last is None or t_ms < last or t_ms - last > int(self.vote_gap_ms):
+            self._vote_n = 1
+            self._vote_t0 = t_ms
+            self._vote_last = t_ms
+            # A gap starts a new count. It does not erase a disagreement that already persisted.
+            return
+        if t_ms - last < int(self.vote_interval_ms):
+            return
+        self._vote_n += 1
+        self._vote_last = t_ms
+        span = t_ms - (t_ms if self._vote_t0 is None else int(self._vote_t0))
+        if self._vote_n >= int(self.vote_reads) and span >= int(self.vote_span_ms):
+            self.disagreeing = True
+
     def _reanchor(self, pair: tuple[int, int], t_ms: int) -> bool:
         """True when this gated pair has agreed for K reads spanning T milliseconds."""
         t_ms = int(t_ms)
@@ -234,12 +284,10 @@ class ScoreGrammar:
         decision = judge(self.locked, pair, self.active_banner(t_ms), phase, side)
         if decision != "abstain":
             self._clear_cand()
-            if self.locked is not None and pair == tuple(self.locked):
-                self.disagreeing = False
-            elif decision in ("accept", "defer"):
-                self.disagreeing = False
+            self._clear_vote()
+            self.disagreeing = False
             return fr
-        self.disagreeing = True
+        self._note_disagreement(int(t_ms))
         if not self._reanchor(pair, t_ms):
             return replace(
                 fr,
@@ -258,6 +306,7 @@ class ScoreGrammar:
         self.reanchor_confirmed = False
         self.disagreeing = False
         self._clear_cand()
+        self._clear_vote()
         detail = dict(getattr(fr, "detail", None) or {})
         detail["grammar_reanchor"] = True
         return replace(fr, detail=detail)
@@ -293,3 +342,24 @@ class ScoreGrammar:
         self.phase = None
         self.td_side = None
         self.try_until = None
+
+
+def lock_agreement_config(grammar: ScoreGrammar | None = None):
+    """The agreement window, with N and the span written down.
+
+    The numbers are QorTime's ``AgreementConfig`` defaults. Passing them explicitly keeps a
+    lock and the disagreement vote on the same bar. ``need_suspicious`` stays 9 over 2 s, so a
+    forged decrease cannot confirm on a short run.
+    """
+    from qor_receipt._vendor.qoresence.vision.local_scorebug.agreement import AgreementConfig
+
+    g = grammar if grammar is not None else ScoreGrammar()
+    return AgreementConfig(
+        need=int(g.vote_reads),
+        min_interval_ns=int(g.vote_interval_ms) * 1_000_000,
+        min_span_ns=int(g.vote_span_ms) * 1_000_000,
+        max_gap_ns=int(g.vote_gap_ms) * 1_000_000,
+        need_suspicious=int(g.suspicious_reads),
+        min_span_suspicious_ns=int(g.suspicious_span_ms) * 1_000_000,
+        jump_memory_ns=int(g.jump_memory_ms) * 1_000_000,
+    )

@@ -8,11 +8,14 @@ are the mean of the real glyphs from that window (148 twos, 132 threes), added a
 A "1ST DOWNS" banner still fails ``score_panel_covered`` / ``score_slot_ink`` before any digit match.
 
 The clock is read from the source frame with the stock glyphs, and kept only when it holds,
-counts down, or re-anchors. A FIELD GOAL or TOUCHDOWN banner blanks the scores and still
-returns quarter and clock. No banner fragment is shipped: the only ones cut for this reader
-came from held-out 170123 frames. The score grammar can abstain or re-anchor; it cannot raise
-a read. See ``qorcap_score_grammar`` for the windows. ``model_id`` hashes every stacked template
-plus the grammar and clock parameters.
+counts down, or re-anchors. A running clock may re-anchor after a consistent 1:1 countdown.
+An increase inside a quarter is blanked. A FIELD GOAL or TOUCHDOWN banner blanks the scores
+and still returns quarter and clock. No banner fragment is shipped: the only ones cut for this
+reader came from held-out 170123 frames. The score grammar can abstain or re-anchor; it cannot
+raise a read. A disagreement abstains the final only after it persists across the vote. An
+unreadable quarter may be carried in ``detail`` as inferred; the quarter field stays empty.
+See ``qorcap_score_grammar`` and ``docs/SCOREBUG_CLOCK_VOTE.md``. ``model_id`` hashes every
+stacked template plus the grammar, vote, and clock parameters.
 """
 from __future__ import annotations
 
@@ -33,6 +36,10 @@ PACK_FOUR = Path(__file__).resolve().parent / "packs" / "madden27_standard_score
 # ±8 px and the full-resolution clock were tuned on the 170123 highlight kit. That match is held out.
 # No template was cut from it.
 ANCHOR_SEARCH_PX = 8
+# Bumped when clock, vote, or inferred-quarter behaviour changes. Hashed into model_id.
+# Issue #78 also wants this id emitted for a referee. That upload is issue #80; this file
+# only moves the id. The banner pack is hashed so a future pack cannot keep this id.
+READER_LOGIC_REV = "2026-10-24-clock-vote-infer"
 
 
 QUARTER_FAIL = {"quarter_unsure", "quarter_missing", "quarter_unknown", "quarter_no_templates"}
@@ -169,12 +176,22 @@ def _clock_box_dark(reader, band, dx: int, dy: int) -> bool:
     return border <= p.max_clock_box_border_v
 
 
+def _banner_pack_id() -> str:
+    """``none`` until a banner pack exists. A shipped pack moves ``model_id`` (issue #78)."""
+    from qorcap_banner import PACK
+
+    if not PACK.is_file():
+        return "none"
+    return hashlib.sha256(PACK.read_bytes()).hexdigest()[:16]
+
+
 def reader_model_id(inner, grammar, clocks) -> str:
-    """Hash every template row plus the grammar and clock parameters.
+    """Hash every template row plus the grammar, vote, and clock parameters.
 
     ``TemplatePack.sha16`` is the stock pack only. The 110028 and 084523 score rows are stacked
     after that, and the anchor search, full-resolution clock, and grammar windows are not in it.
-    This id is what a receipt should name. It is not a checkpoint-hash input.
+    This id is what a receipt should name. It is not a checkpoint-hash input and it is not
+    written into receipt.v0.
     """
     from qor_receipt._vendor.qoresence.vision.local_scorebug.reader import READER_ID
 
@@ -194,10 +211,23 @@ def reader_model_id(inner, grammar, clocks) -> str:
         "clock_gate_min_margin": float(gate.min_margin),
         "clock_reanchor_reads": int(clocks.reanchor_reads),
         "clock_reanchor_span_ms": int(clocks.reanchor_span_ms),
+        "clock_run_reads": int(clocks.run_reads),
+        "clock_run_span_ms": int(clocks.run_span_ms),
+        "clock_run_min_distinct": int(clocks.run_min_distinct),
+        "clock_run_tol_s": int(clocks.run_tol_s),
         "banner_window_ms": int(grammar.banner_window_ms),
         "try_window_ms": int(grammar.try_window_ms),
         "reanchor_reads": int(grammar.reanchor_reads),
         "reanchor_span_ms": int(grammar.reanchor_span_ms),
+        "vote_reads": int(grammar.vote_reads),
+        "vote_interval_ms": int(grammar.vote_interval_ms),
+        "vote_span_ms": int(grammar.vote_span_ms),
+        "vote_gap_ms": int(grammar.vote_gap_ms),
+        "suspicious_reads": int(grammar.suspicious_reads),
+        "suspicious_span_ms": int(grammar.suspicious_span_ms),
+        "jump_memory_ms": int(grammar.jump_memory_ms),
+        "reader_logic_rev": READER_LOGIC_REV,
+        "banner_pack": _banner_pack_id(),
     }
     h.update(json.dumps(params, sort_keys=True, separators=(",", ":")).encode())
     return f"{READER_ID}:{inner.profile.layout_version}:{h.hexdigest()[:16]}"
@@ -242,9 +272,13 @@ class StandardBarReader:
             fr = self._apply_clock(frame, fr, t_ms)
             if t_ms is not None:
                 banner = detect_banner(self.inner, small)
+        else:
+            self.clocks.accepted_now = False
+            self.clocks.continuation = False
         if t_ms is not None:
             fr = self.grammar.filter(fr, t_ms, banner)
-        return fr
+        from qorcap_clock import apply_inferred_quarter
+        return apply_inferred_quarter(fr, self.clocks)
 
     def _recover_quarter(self, small, fr):
         """Quarter only. Scores stay blank: a banner is not a digit source."""
@@ -270,6 +304,8 @@ class StandardBarReader:
         from qorcap_clock import read_clock_box
 
         if fr.reason == "clock_box_missing":
+            self.clocks.accepted_now = False
+            self.clocks.continuation = False
             return fr
         dx, dy = fr.offset if getattr(fr, "offset", None) else (0, 0)
         full = read_clock_box(self.inner, frame, dx, dy)
@@ -282,18 +318,28 @@ class StandardBarReader:
             source = "inner"
         kept = self.clocks.filter(secs, fr.quarter, t_ms)
         reanchored = bool(self.clocks.reanchored)
+        kind = self.clocks.reanchor_kind
+        note = self.clocks.rule_note
         self.clocks.reanchored = False
         if kept is None:
-            if secs is None and source == "inner":
+            if secs is None and source == "inner" and not note:
                 return fr
+            detail = dict(getattr(fr, "detail", None) or {})
+            if note:
+                detail["clock_rule"] = note
             return replace(
                 fr, clock_seconds=None, clock_text=None, clock_conf=None, clock_margin=None, clock_red=False,
+                detail=detail,
             )
-        if source == "inner" and kept == fr.clock_seconds and not reanchored:
+        if source == "inner" and kept == fr.clock_seconds and not reanchored and not note:
             return fr
         detail = dict(getattr(fr, "detail", None) or {})
         if reanchored:
             detail["clock_reanchor"] = True
+            if kind:
+                detail["clock_reanchor_kind"] = kind
+        if note:
+            detail["clock_rule"] = note
         return replace(
             fr,
             clock_seconds=int(kept),
