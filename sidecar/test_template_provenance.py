@@ -37,6 +37,10 @@ SKIP_PREFIXES = (
     ("docs", "assets"),
     ("docs", "qa"),
 )
+# CI clones the QorTime pin into the workspace as qortime/. Its stock
+# madden27_standard_v1.npz is not a QorCap template. qortime-main is the
+# unpinned contracts checkout. Neither tree is part of this repo.
+SKIP_TOP = {"qortime", "qortime-main", ".git"}
 ARRAY_EXTS = {".npz", ".npy"}
 IMAGE_EXTS = {".png", ".jpg", ".jpeg"}
 SKIP_JSON = {"held_out_sha256.json"}
@@ -46,22 +50,33 @@ def _ids(path: Path) -> set[str]:
     return {str(x) for x in json.loads(path.read_text(encoding="utf-8"))["match_ids"]}
 
 
+def is_scanned_template(rel: Path) -> bool:
+    """True when a repo-relative path must have a provenance row.
+
+    The CI job checks the QorTime pin out into ``qortime/`` (and qortime main
+    into ``qortime-main/``). Those trees are not this repo. A ``.jpg`` under
+    ``templates/`` and an ``.npz`` or ``.npy`` anywhere under ``sidecar/``
+    (including ``glimpse``) still count.
+    """
+    if not rel.parts or rel.parts[0] in SKIP_TOP:
+        return False
+    suffix = rel.suffix.lower()
+    if suffix not in ARRAY_EXTS | IMAGE_EXTS:
+        return False
+    if any(rel.parts[: len(prefix)] == prefix for prefix in SKIP_PREFIXES):
+        return False
+    if suffix in ARRAY_EXTS:
+        return True
+    return rel.parts[:1] == ("templates",) or rel.parts[:2] == ("sidecar", "packs")
+
+
 def _template_files() -> list[Path]:
     found = []
     for path in ROOT.rglob("*"):
         if not path.is_file():
             continue
-        suffix = path.suffix.lower()
-        if suffix not in ARRAY_EXTS | IMAGE_EXTS:
-            continue
         rel = path.relative_to(ROOT)
-        if any(rel.parts[:len(prefix)] == prefix for prefix in SKIP_PREFIXES):
-            continue
-        if suffix in ARRAY_EXTS:
-            found.append(path)
-            continue
-        # A jpg or png under templates/, or an image sitting in sidecar/packs.
-        if rel.parts[:1] == ("templates",) or rel.parts[:2] == ("sidecar", "packs"):
+        if is_scanned_template(rel):
             found.append(path)
     return sorted(found)
 
@@ -115,6 +130,24 @@ def test_allowlist_and_heldout_files_are_exact():
     for row in rows:
         digest = str(row["video_sha256"])
         assert digest == "" or len(digest) == 64 and all(ch in "0123456789abcdef" for ch in digest)
+
+
+def test_scan_ignores_the_ci_qortime_checkout_and_still_flags_sidecar_arrays():
+    stock = Path(
+        "qortime/qor_receipt/_vendor/qoresence/vision/local_scorebug/packs/madden27_standard_v1.npz"
+    )
+    assert not is_scanned_template(stock)
+    assert not is_scanned_template(Path("qortime-main/packs/madden27_standard_v1.npz"))
+    assert is_scanned_template(Path("sidecar/glimpse/leak.npz"))
+    assert is_scanned_template(Path("sidecar/glimpse/leak.npy"))
+    assert is_scanned_template(Path("sidecar/packs/old.npz"))
+    assert is_scanned_template(Path("templates/glyph.jpg"))
+    assert is_scanned_template(Path("templates/score/1.npy"))
+    assert is_scanned_template(Path("sidecar/packs/banner.png"))
+    assert not is_scanned_template(Path("sidecar/fixtures/m27.jpg"))
+    assert not is_scanned_template(Path("docs/qa/shot.jpg"))
+    assert not is_scanned_template(Path("docs/assets/shot.png"))
+    assert not is_scanned_template(Path("README.png"))
 
 
 def test_every_template_file_is_allowlisted_and_hashed():
