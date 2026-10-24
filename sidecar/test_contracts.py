@@ -1,11 +1,13 @@
 """QorCap <-> QorTime contract tests (vendored registry: contracts/, pinned in contracts/CONTRACTS_PIN).
 
-Unit part (always runs): vendored files are intact; sidecar constants match the registry.
-E2E part (needs ffmpeg + a qortime checkout, ~1-2 min): runs the REAL Start Match (--test-pattern) -> QorCap
-writer -> local countersign -> receipt, then asserts both verifiers (qortime verify + qorcap verify-bundle, plus
-QorTime's official-review structural checks) agree on the good bundle and on tampered / foreign-key /
-missing-checkpoint variants, and that the sealed stop checkpoint meets QorTime's gap/skew rule.
-QorCap's GitHub CI has no workflow token yet: run locally with  python -m pytest -q sidecar/test_contracts.py
+Unit part (CI job ``contracts``, no capture card): vendored files match SHA256SUMS; sidecar constants
+match the registry; the recorder's pause caps match rule v2; the copies match the qortime checkout in
+``$QORTIME`` (CI checks out qortime main, not the runtime verifier pin).
+E2E part (needs ffmpeg + a built qorcap + a qortime checkout, ~1-2 min): runs the REAL Start Match
+(--test-pattern) -> QorCap writer -> local countersign -> receipt, then asserts both verifiers
+(qortime verify + qorcap verify-bundle, plus QorTime's official-review structural checks) agree on the
+good bundle and on tampered / foreign-key / missing-checkpoint variants, and that the sealed stop
+checkpoint meets QorTime's gap/skew rule. CI sets QORCAP_E2E=0. Run the E2E locally.
 """
 import hashlib
 import json
@@ -28,10 +30,42 @@ QT = next((Path(p) for p in [os.getenv("QORTIME", ""), ROOT / "qortime", ROOT.pa
 sys.path.insert(0, str(HERE))
 
 
+# Written by QorCap. QorTime checks the same objects in code and does not ship these schemas.
+QORCAP_ONLY_SCHEMAS = ("device_attest.v0.json", "score_timeline.v0.json")
+
+
 def test_vendored_contracts_intact():
     for line in (C / "SHA256SUMS").read_text().splitlines():
+        if not line.strip():
+            continue
         h, name = line.split()
         assert hashlib.sha256((C / name).read_bytes()).hexdigest() == h, f"{name} edited locally: change it in qortime and re-vendor"
+
+
+def test_qorcap_only_schemas_are_checksummed():
+    """device_attest and score_timeline stay in this repo until ownership is decided.
+
+    They are in SHA256SUMS so a local edit cannot pass silently. They are not part of the
+    qortime byte-compare. If qortime gains a copy, this fails so the two trees are not
+    treated as the same file without a decision.
+    """
+    names = [line.split()[1] for line in (C / "SHA256SUMS").read_text().splitlines() if line.strip()]
+    for name in QORCAP_ONLY_SCHEMAS:
+        assert name in names
+        assert (C / name).is_file()
+    if QT is not None and (QT / "schema" / "contracts").exists():
+        for name in QORCAP_ONLY_SCHEMAS:
+            assert not (QT / "schema" / "contracts" / name).exists(), (
+                f"qortime now has schema/contracts/{name}; decide which tree owns it before re-vendoring"
+            )
+
+
+def test_qortime_checkout_present_when_required():
+    """CI sets this. A missing checkout must fail the job, not skip the drift compare."""
+    if os.getenv("QORCAP_CONTRACTS_REQUIRED") != "1":
+        pytest.skip("set QORCAP_CONTRACTS_REQUIRED=1 to refuse a missing qortime checkout")
+    assert QT is not None and (QT / "schema" / "contracts").is_dir(), "QORTIME checkout with schema/contracts is required"
+    assert (QT / "schema" / "receipt.v0.json").is_file()
 
 
 @pytest.mark.skipif(QT is None or not (QT / "schema" / "contracts").exists(), reason="no qortime checkout with schema/contracts")
@@ -39,6 +73,45 @@ def test_vendored_contracts_equal_qortime_checkout():
     for p in (QT / "schema" / "contracts").glob("*.json"):
         assert (C / p.name).read_bytes() == p.read_bytes(), f"contracts/{p.name} drifted from qortime"
     assert (C / "receipt.v0.json").read_bytes() == (QT / "schema" / "receipt.v0.json").read_bytes()
+
+
+def test_recorder_pause_caps_match_vendored_rule_v2():
+    """Rule v2 caps are the ones the recorder recheck already uses. Nothing here widens them.
+
+    motion_rules is referee scoring (PARTIAL below the floor, never FAIL). QorCap does not
+    compute it. The floor, the sample size, and the bright-text window are locked so a
+    re-vendor cannot loosen them without editing this test.
+    """
+    import qorcap_challenge as ch
+
+    versions = COMPAT["challenge_rules"]["rule_versions"]
+    v1, v2 = versions["1"], versions["2"]
+    assert ch.CAPTURE_PAUSE_MAX_LUMA == v2["dark_menu_max_luma"] == 26
+    assert ch.CAPTURE_PAUSE_MAX_LOWER == v2["dark_menu_max_lower"] == 16
+    assert v2["pause_latency_ms"] == [0, ch.CAPTURE_PAUSE_MAX_LATENCY_MS] == [0, 2500]
+    assert v2["consistency_ms"] == 300
+    assert v1["pause_latency_ms"] == [0, 600]
+    assert v1["dark_menu_max_luma"] == 16 and v1["dark_menu_max_lower"] == 8
+    assert v1["dark_menu_max_luma"] < v2["dark_menu_max_luma"]
+    assert v1["dark_menu_max_lower"] < v2["dark_menu_max_lower"]
+    assert v1["dark_menu_bright_frac"] == v2["dark_menu_bright_frac"] == [0.005, 0.05]
+    assert "dark_menu_bright" not in (HERE / "qorcap_challenge.py").read_text(encoding="utf-8")
+    bundle = json.loads((C / "qorcap-bundle.v0.json").read_text(encoding="utf-8"))
+    assert bundle["properties"]["challenge_rule"]["enum"] == [1, 2]
+    assert set(versions) == {"1", "2"}
+    motion = COMPAT["motion_rules"]
+    assert motion["current"] == 3
+    assert motion["floor_permille"] == 300
+    assert motion["min_bins"] == 20
+    assert motion["max_lag_bins"] == 3
+    assert motion["sample_max_segments"] == 24
+    assert motion["sample_hz"] == 10
+    assert motion["sample_size"] == [640, 360]
+    assert set(motion["rule_versions"]) == {"3"}
+    assert COMPAT["checkpoint_timing"]["max_gap_ms"] == 10000
+    assert COMPAT["checkpoint_timing"]["max_skew_ms"] == 3000
+    leave = COMPAT["challenge_rules"]["menu_leave_buttons"]
+    assert leave == ["CROSS", "CIRCLE"]
 
 
 def test_sidecar_constants_match_registry():
