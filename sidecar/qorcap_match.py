@@ -267,6 +267,7 @@ def seal_reader(stop: threading.Event, state: dict, timeout: float | None = READ
     stop.set()
     thread = state.get("reader_thread")
     if thread is None:
+        _freeze_reader(state, joined=True)
         return True
     if timeout is None:
         thread.join()
@@ -290,7 +291,44 @@ def seal_reader(stop: threading.Event, state: dict, timeout: float | None = READ
             sweep()
         except Exception:
             pass
-    return not thread.is_alive()
+    joined = not thread.is_alive()
+    # The thread may still be in on_frame. Freeze the final and reanchor notes
+    # before the caller reads them for the receipt.
+    _freeze_reader(state, joined=joined)
+    return joined
+
+
+def _freeze_reader(state: dict, *, joined: bool) -> None:
+    """Stop a late frame from replacing the final or appending a reanchor note.
+
+    A join that times out also leaves one ``reader_join_timeout`` health row.
+    That row is a notice. It is not a timeline observation and not a receipt field.
+    """
+    state["reader_frozen"] = True
+    core = state.get("core")
+    freeze = getattr(core, "freeze", None)
+    if freeze is not None:
+        freeze()
+    if joined:
+        return
+    write = getattr(core, "health_write", None) if core is not None else None
+    if write is None:
+        return
+    try:
+        write({
+            "kind": "reader_join_timeout",
+            "t_ms": int(time.time() * 1000),
+            "notice": "reader still running after the join cap",
+        })
+    except Exception as e:
+        print(f"reader health write failed: {type(e).__name__}: {e}", file=sys.stderr)
+
+
+def note_reader_final(state: dict, body: dict) -> bool:
+    """False when the seal has frozen finals. The caller must not publish ``body``."""
+    if state.get("reader_frozen") and isinstance(body, dict) and body.get("type") == "final":
+        return False
+    return True
 
 
 def mark_health_sealed(state: dict) -> None:
@@ -487,6 +525,9 @@ def start_reader(api: Api, stop: threading.Event, state: dict, bundle: Path | No
     from qorcap_standard import standard_reader
 
     def post(b):
+        # seal_reader set this. A late final must not be published or replace the receipt final.
+        if b.get("type") == "final" and not note_reader_final(state, b):
+            return {}
         try:
             r = api.post("/events", b)
         except Exception:
@@ -503,7 +544,13 @@ def start_reader(api: Api, stop: threading.Event, state: dict, bundle: Path | No
                       playcall=PlayCallDetector(), gate=PauseCapableGate())
     if bundle is not None:
         from qorcap_reanchor_notes import append_note
-        core.reanchor_note = lambda row, bundle=bundle: append_note(bundle, row)
+
+        def _reanchor(row, bundle=bundle):
+            if state.get("reader_frozen"):
+                return
+            append_note(bundle, row)
+
+        core.reanchor_note = _reanchor
     state["core"] = core
     state["gate"] = core.gate
     try:  # Glimpse second opinion on held touchdown jumps: shadow log only unless QORCAP_GLIMPSE_TD_VETO=1
@@ -2715,6 +2762,8 @@ def tail_final_check(bundle: Path, draft: dict, *, ffmpeg: str, secs: int = TAIL
     if busy is not None:
         kind, notice, msg = busy
         note_bundle_unavailable(bundle, kind, notice)
+        from qorcap_reanchor_notes import record_pre_sign_fail_closed
+        record_pre_sign_fail_closed(bundle, kind, notice)
         say(msg)
         result = dict(draft.get("result") or {})
         result["final_confirmed"] = False

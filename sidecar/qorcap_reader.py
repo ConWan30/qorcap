@@ -91,6 +91,10 @@ INPUTS_LOCK_TIMEOUT_S = 2.0
 # A pause counts as progress for at most this long. After that, a detector
 # stuck on paused is a silent reader again.
 PAUSE_PROGRESS_CAP_MS = 300_000
+# One frame of "not paused" does not clear that clock. A blip every minute
+# would otherwise restart the cap forever. Continuous play this long does
+# clear it, and so does a scorebug read or a new timeline row on that frame.
+PAUSE_PLAY_RESET_MS = 5_000
 
 
 def _seconds_text(ms: float) -> str:
@@ -1009,6 +1013,9 @@ class ReaderCore:
         self._last_progress_ms: int | None = None
         self._stall_open = False
         self._pause_since: int | None = None
+        self._play_since: int | None = None
+        # Set by seal_reader. A late frame must not replace the final or append a note.
+        self._frozen = False
 
     def note_options(self, presses_ms) -> None:
         """Remember OPTIONS press times (wall ms). Repeating a time is a no-op."""
@@ -1131,8 +1138,14 @@ class ReaderCore:
                     self._pause_since = t_ms
                 if t_ms - self._pause_since < PAUSE_PROGRESS_CAP_MS:
                     self.note_progress(t_ms)
+                self._play_since = None
                 return
-        self._pause_since = None
+        # A non-paused frame. One blip does not clear the pause cap.
+        play_token = (self.stats.get("agreed", 0), len(self.timeline))
+        if self._pause_since is None:
+            self._play_since = None
+        elif self._play_since is None:
+            self._play_since = t_ms
         if self.gate is not None:
             pc = False
             if self.playcall is not None:
@@ -1155,6 +1168,7 @@ class ReaderCore:
         except Exception as e:  # never silent
             self.stats["errors"] += 1
             print(f"scorebug reader error: {type(e).__name__}: {e}", file=sys.stderr)
+            self._end_play_frame(t_ms, play_token)
             return
         self._note_reanchor(t_ms, fr)
         fr = self._hold_quarter(fr, t_ms)
@@ -1172,6 +1186,7 @@ class ReaderCore:
         except Exception as e:  # never silent
             self.stats["errors"] += 1
             print(f"score agreement error: {type(e).__name__}: {e}", file=sys.stderr)
+            self._end_play_frame(t_ms, play_token)
             return
         self._note_agreement(t_ms, fr, absent, res)
         if res.agreed and res.read is not None:
@@ -1179,10 +1194,35 @@ class ReaderCore:
                 self.touchdown.reset()
         elif self.touchdown is not None:
             self.touchdown.offer(fr, t_ms, self.last_scorebug(), self._max_quarter)
+            self._end_play_frame(t_ms, play_token)
             return
         else:
+            self._end_play_frame(t_ms, play_token)
             return
         self._post_agreed(t_ms, res.read, soft)
+        self._end_play_frame(t_ms, play_token)
+
+    def freeze(self) -> None:
+        """After the seal. Later frames must not replace the final or append a reanchor note."""
+        self._frozen = True
+
+    def _end_play_frame(self, t_ms: int, token: tuple) -> None:
+        """Clear the pause cap only for real play, not a one-frame blip.
+
+        A scorebug read or a new timeline row on this non-paused frame clears it
+        immediately. Otherwise it clears once play has been continuous for
+        PAUSE_PLAY_RESET_MS. A scorebug-basis final does not clear it by itself.
+        """
+        if self._pause_since is None:
+            self._play_since = None
+            return
+        agreed0, rows0 = token
+        progressed = self.stats.get("agreed", 0) != agreed0 or len(self.timeline) != rows0
+        if progressed or (
+            self._play_since is not None and int(t_ms) - int(self._play_since) >= PAUSE_PLAY_RESET_MS
+        ):
+            self._pause_since = None
+            self._play_since = None
 
     def note_progress(self, t_ms: int) -> None:
         """A timeline row or a reader_lag / score_unagreed row was written.
@@ -1427,6 +1467,8 @@ class ReaderCore:
         ``score_timeline.v0`` has no field for these flags, and the checkpoint evidence
         is the existing score object. The note stays out of both.
         """
+        if self._frozen:
+            return
         detail = getattr(fr, "detail", None) or {}
         grammar = detail.get("grammar_reanchor") is True
         clock = detail.get("clock_reanchor") is True
@@ -1646,6 +1688,8 @@ class ReaderCore:
 
     def _end_menu(self, t_ms: int, img) -> None:
         """Read the end-menu score panel; once stable over consecutive frames, post it as the final."""
+        if self._frozen:
+            return
         if self.end_menu_reader is None:
             return
         try:
@@ -1771,7 +1815,7 @@ class ReaderCore:
         count. Otherwise the note is the previous sentence, with no claim that a
         scorebug returned.
         """
-        if getattr(self, "_end_menu_disputed", False):
+        if self._frozen or getattr(self, "_end_menu_disputed", False):
             return
         self._end_menu_disputed = True
         if not isinstance(self.final, dict):
@@ -1813,7 +1857,7 @@ class ReaderCore:
                            [dict(side=k, source="corroborated", xcheck="n/a", **v) for k, v in c["sides"].items()])
 
     def _check_final(self, t_ms: int) -> None:
-        if self.final is not None:
+        if self._frozen or self.final is not None:
             return
         last = self.last_scorebug()
         if last is not None and last.get("quarter") is None:
