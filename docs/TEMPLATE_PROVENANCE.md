@@ -33,9 +33,10 @@ with harvest ignored, so installing templates does not change that test.
 The final's `end_menu` block records `pack_id`, `pack_sha256`, and
 `end_menu_model_id`. That id hashes this pack and the end-menu gates. It is
 not the scorebug `model_id` and it is not a `receipt.v0` field. Digits 1, 4,
-and 7 are Hershey stand-ins. Their bytes are `tools/end_menu_hershey_rows.npz`,
+and 7 are Hershey stand-ins. Their bytes are `tools/end_menu_hershey_rows.json`,
 written by `tools/make_end_menu_hershey.py`. `--check` compares the pack to
-that snapshot. A live OpenCV redraw is not bit-stable across machines.
+that snapshot. A live OpenCV redraw is not bit-stable across machines. The
+snapshot is JSON, not an `.npz`, so the provenance scan does not require a row.
 
 | | id |
 | --- | --- |

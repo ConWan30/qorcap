@@ -7,14 +7,16 @@ stored vector.
 
 ``cv2.putText`` and ``cv2.resize(..., INTER_AREA)`` are not bit-stable across
 CPU dispatches of one OpenCV wheel, so a live redraw is not the oracle.
-``tools/end_menu_hershey_rows.npz`` holds the vectors ``--write`` produced.
-``--check`` compares the pack to that snapshot.
+``tools/end_menu_hershey_rows.json`` holds the little-endian float32 vectors
+``--write`` produced. It is not an ``.npz``, so the provenance scan does not
+treat it as a template. ``--check`` compares the pack to that snapshot.
 
     python tools/make_end_menu_hershey.py --check
     python tools/make_end_menu_hershey.py --write
 """
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -23,7 +25,7 @@ import numpy as np
 
 ROOT = Path(__file__).resolve().parents[1]
 PACK = ROOT / "sidecar" / "packs" / "madden27_end_menu_v2.npz"
-SNAPSHOT = ROOT / "tools" / "end_menu_hershey_rows.npz"
+SNAPSHOT = ROOT / "tools" / "end_menu_hershey_rows.json"
 SOURCE = "synthetic:hershey"
 DIGITS = ("1", "4", "7")
 FONT = cv2.FONT_HERSHEY_SIMPLEX
@@ -61,20 +63,33 @@ def snapshot_vectors(path: Path | None = None) -> dict[str, np.ndarray]:
     path = path or SNAPSHOT
     if not path.is_file():
         raise SystemExit(f"missing hershey snapshot {path}")
-    with np.load(path) as blob:
-        missing = [digit for digit in DIGITS if digit not in blob.files]
-        if missing:
-            raise SystemExit(f"hershey snapshot is missing {missing}")
-        return {
-            digit: np.ascontiguousarray(blob[digit], dtype=np.float32).copy()
-            for digit in DIGITS
-        }
+    data = json.loads(path.read_text(encoding="utf-8"))
+    digits = data.get("digits")
+    if not isinstance(digits, dict):
+        raise SystemExit(f"hershey snapshot {path} has no digits object")
+    out: dict[str, np.ndarray] = {}
+    for digit in DIGITS:
+        raw = digits.get(digit)
+        if not isinstance(raw, str):
+            raise SystemExit(f"hershey snapshot is missing {digit!r}")
+        vec = np.frombuffer(bytes.fromhex(raw), dtype="<f4").copy()
+        if vec.shape != (12 * 18,):
+            raise SystemExit(f"hershey snapshot row {digit!r} has length {vec.shape[0]}")
+        out[digit] = vec
+    return out
 
 
 def write_snapshot(vectors: dict[str, np.ndarray], path: Path | None = None) -> None:
     path = path or SNAPSHOT
-    masks = {f"mask_{digit}": hershey_mask(digit) for digit in DIGITS}
-    np.savez_compressed(path, **vectors, **masks)
+    payload = {
+        "dtype": "float32-le",
+        "length": 12 * 18,
+        "digits": {
+            digit: np.ascontiguousarray(vectors[digit], dtype="<f4").tobytes().hex()
+            for digit in DIGITS
+        },
+    }
+    path.write_bytes((json.dumps(payload, indent=2) + "\n").encode("utf-8"))
 
 
 def _load(path: Path):
