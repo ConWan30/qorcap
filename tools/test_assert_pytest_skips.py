@@ -380,12 +380,13 @@ def test_sidecar_ci_sets_xfail_strict_and_the_suite_gate():
         assert files[pause + 1] == "sidecar/test_post_final_tail.py"
         reader = files.index("sidecar/test_qorcap_reader.py")
         assert files[reader + 1] == "sidecar/test_c11_snapshot_inputs_timeout.py"
+        assert files[reader + 2] == "sidecar/test_presign_followups.py"
         timing = files.index(
             "sidecar/test_qorcap_match.py::test_reader_timing_log_names_the_three_clocks"
         )
         assert files[timing - len(stall_ids):timing] == stall_ids
-    assert skips.LINUX_MIN_COLLECTED == 596
-    assert skips.WINDOWS_MIN_COLLECTED == 578
+    assert skips.LINUX_MIN_COLLECTED == 603
+    assert skips.WINDOWS_MIN_COLLECTED == 585
 
 
 def test_xfail_strict_rejects_an_unexpected_pass(tmp_path):

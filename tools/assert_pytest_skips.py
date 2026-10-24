@@ -75,6 +75,7 @@ LINUX_FILES = (
     "tools/test_assert_pytest_skips.py",
     "sidecar/test_qorcap_reader.py",
     "sidecar/test_c11_snapshot_inputs_timeout.py",
+    "sidecar/test_presign_followups.py",
     "sidecar/test_qorcap_match.py::test_refresh_off_the_frame_thread_keeps_four_hertz",
     "sidecar/test_qorcap_match.py::test_incremental_tail_matches_full_parse",
     "sidecar/test_qorcap_match.py::test_tail_reparse_when_the_window_before_the_offset_changes",
@@ -127,6 +128,7 @@ WINDOWS_FILES = (
     "tools/test_assert_pytest_skips.py",
     "sidecar/test_qorcap_reader.py",
     "sidecar/test_c11_snapshot_inputs_timeout.py",
+    "sidecar/test_presign_followups.py",
     "sidecar/test_qorcap_match.py::test_refresh_off_the_frame_thread_keeps_four_hertz",
     "sidecar/test_qorcap_match.py::test_incremental_tail_matches_full_parse",
     "sidecar/test_qorcap_match.py::test_tail_reparse_when_the_window_before_the_offset_changes",
@@ -168,11 +170,10 @@ WINDOWS_FILES = (
 # The floor is a minimum. A PR that adds tests, and any merge resolution, must
 # re-collect and set both floors to those exact counts. Leaving the old floor
 # keeps a dropped test green.
-# Collect-only of these lists on main 59009ad plus the guard tests in
-# tools/test_assert_pytest_skips.py. #96's suite, before those guard tests,
-# collected 580 linux / 562 windows. Re-collect after any list or test change.
-LINUX_MIN_COLLECTED = 596
-WINDOWS_MIN_COLLECTED = 578
+# Collect-only of these lists on main e00d374 (596 linux / 578 windows)
+# plus the pre-sign follow-up tests. Re-collect after any list or test change.
+LINUX_MIN_COLLECTED = 603
+WINDOWS_MIN_COLLECTED = 585
 
 # Absent from both sidecar suites. A reason is required; whitespace does not count.
 EXCLUDED_TEST_FILES = {

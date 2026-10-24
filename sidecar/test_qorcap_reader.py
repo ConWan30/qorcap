@@ -769,11 +769,12 @@ def test_long_pause_is_not_a_reader_stall():
     assert posts == []
 
 
-def _drive_stuck_pause(seconds: int, lookalike_every_s: int | None = None):
+def _drive_stuck_pause(seconds: int, lookalike_every_s: int | None = None, unpaused_every_s: int | None = None):
     """Every frame is paused. One second apart, under the agreement gap.
 
     ``lookalike_every_s`` turns the end-menu detector on for that one frame.
-    Those frames are not an accepted end menu.
+    Those frames are not an accepted end menu. ``unpaused_every_s`` is one
+    frame where the pause detector says not paused.
     """
     from qorcap_reader import ReaderCore
 
@@ -790,14 +791,17 @@ def _drive_stuck_pause(seconds: int, lookalike_every_s: int | None = None):
             return self.on
 
     posts = []
+    pause = Pause()
     screen = Screen() if lookalike_every_s else None
-    core = ReaderCore(posts.append, None, None, Pause(), _no_final, final_screen_detector=screen)
+    core = ReaderCore(posts.append, None, None, pause, _no_final, final_screen_detector=screen)
     written = []
     core.health_write = written.append
     step = None if lookalike_every_s is None else lookalike_every_s * 1000
+    blip = None if unpaused_every_s is None else unpaused_every_s * 1000
     for t in range(0, seconds * 1000 + 1, 1000):
         if screen is not None:
             screen.on = step is not None and t > 0 and t % step == 0
+        pause.paused = not (blip is not None and t > 0 and t % blip == 0)
         core.on_frame(t, None)
         core.consider_stall(t)
     return core, written, posts
@@ -930,12 +934,14 @@ def test_end_menu_lookalike_does_not_hide_a_stuck_pause():
 
 
 def test_play_between_pauses_restarts_the_pause_cap():
-    """A normal frame clears the pause clock.
+    """Continuous play clears the pause clock. One non-paused frame does not.
 
-    Without that reset the second pause keeps the first clock and writes
-    reader_stalled inside a pause that is still under the cap.
+    Clearing on every non-paused frame is the blip mutant: the 15-minute cadence
+    test then writes no notice.
     """
-    from qorcap_reader import ReaderCore
+    from qorcap_reader import PAUSE_PLAY_RESET_MS, ReaderCore
+
+    assert PAUSE_PLAY_RESET_MS == 5_000
 
     class Pause:
         paused = True
@@ -948,20 +954,96 @@ def test_play_between_pauses_restarts_the_pause_cap():
     core = ReaderCore(posts.append, None, None, pause, _no_final)
     written = []
     core.health_write = written.append
-    for t in range(0, 240_000 + 1, 1000):
+    for t in range(0, 10_000 + 1, 1000):
         core.on_frame(t, None)
         core.consider_stall(t)
     assert core._pause_since == 0
-    assert _stalls(written) == []
     pause.paused = False
-    core.on_frame(241_000, None)
-    core.consider_stall(241_000)
-    assert core._pause_since is None
-    pause.paused = True
-    core.on_frame(242_000, None)
-    assert core._pause_since == 242_000
-    for t in range(243_000, 242_000 + 240_000 + 1, 1000):
+    core.on_frame(11_000, None)
+    assert core._pause_since == 0
+    for t in range(12_000, 11_000 + PAUSE_PLAY_RESET_MS + 1, 1000):
         core.on_frame(t, None)
         core.consider_stall(t)
+    assert core._pause_since is None
+    pause.paused = True
+    core.on_frame(11_000 + PAUSE_PLAY_RESET_MS + 1_000, None)
+    assert core._pause_since == 11_000 + PAUSE_PLAY_RESET_MS + 1_000
     assert _stalls(written) == []
     assert posts == []
+
+
+def test_pause_blip_does_not_hide_a_stuck_pause():
+    """A detector that says not-paused for one frame every 60 s or 240 s still stalls.
+
+    Clearing the pause clock on that frame restarts the cap and the notices drop to 0.
+    """
+    _core, plain_written, plain_posts = _drive_stuck_pause(15 * 60)
+    plain = _stalls(plain_written)
+    _core, every_60, posts_60 = _drive_stuck_pause(15 * 60, unpaused_every_s=60)
+    _core, every_240, posts_240 = _drive_stuck_pause(15 * 60, unpaused_every_s=240)
+    assert len(plain) == 1 and plain[0]["paused_s"] >= 300
+    assert len(_stalls(every_60)) == len(plain)
+    assert len(_stalls(every_240)) == len(plain)
+    assert [p for p in plain_posts + posts_60 + posts_240 if p.get("type") in ("score", "final")] == []
+
+
+def test_scorebug_read_clears_the_pause_clock():
+    """A non-paused frame that reads the scorebug clears the cap without waiting out play."""
+    from qor_receipt._vendor.qoresence.vision.local_scorebug.agreement import AgreementWindow
+
+    from qorcap_reader import ReaderCore
+
+    class Pause:
+        paused = True
+
+        def update(self, _t, _img):
+            return None
+
+    posts = []
+    pause = Pause()
+    core = ReaderCore(posts.append, _StubReader(_Syn()), AgreementWindow(), pause, _no_final)
+    core.on_frame(0, None)
+    assert core._pause_since == 0
+    pause.paused = False
+    core.on_frame(1000, None)
+    assert [p for p in posts if p.get("type") == "score"] == []
+    assert core._pause_since == 0
+    for t in (1200, 1400, 1600):
+        core.on_frame(t, None)
+    assert [p for p in posts if p.get("type") == "score"]
+    assert core._pause_since is None
+
+
+def test_scorebug_final_does_not_clear_the_pause_clock():
+    """A scorebug-basis final is provisional. It must not clear the pause cap.
+
+    Clearing on every basis makes this fail. An accepted end menu still clears it.
+    """
+    from qor_receipt.final_detect import detect_final
+
+    from qorcap_reader import ReaderCore
+
+    posts = []
+    core = ReaderCore(posts.append, None, None, None, detect_final)
+    core._pause_since = 50_000
+    core.timeline = [
+        {"t_ms": 1000 + i * 1000, "home": 14, "away": 7, "quarter": 4, "clock_s": 0, "clock_red": True}
+        for i in range(5)
+    ]
+    core._check_final(20_000)
+    assert core.final["basis"] == "clock_zero"
+    assert (core.final["home"], core.final["away"]) == (14, 7)
+    assert core._pause_since == 50_000
+    assert posts and posts[0]["basis"] == "clock_zero" and "paused_s" not in posts[0]
+
+    posts2 = []
+    core2 = ReaderCore(posts2.append, None, None, None, detect_final)
+    core2._pause_since = 50_000
+    core2.timeline = [
+        {"t_ms": 1000 + i * 500, "home": 14, "away": 7, "quarter": 4, "clock_s": 3, "clock_red": True}
+        for i in range(4)
+    ]
+    core2.timeline.append({"t_ms": 4000, "until_ms": 34_000, "obs": "scorebug_absent", "n": 10})
+    core2._check_final(40_000)
+    assert core2.final["basis"] == "scorebug_gone"
+    assert core2._pause_since == 50_000
