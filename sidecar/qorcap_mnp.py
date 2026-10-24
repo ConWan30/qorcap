@@ -248,6 +248,14 @@ class MondayNightReader:
     wants_full_res = True
 
     def __init__(self, pack: str | Path = PACK) -> None:
+        from qorcap_template_guard import file_authorized
+
+        self.source = {}
+        self.groups = {}
+        self.ids = {}
+        self._missing = not file_authorized(Path(pack))
+        if self._missing:
+            return
         d = np.load(str(pack))
         self.groups: dict[str, tuple[list[str], np.ndarray]] = {}
         for g in ("score", "clock", "quarter"):
@@ -314,6 +322,10 @@ class MondayNightReader:
         The live path leaves it unset. Tests pass a video-minute prefix so a template cut from that
         minute is not scored against the frames it was cut from. Offline labels never enter this method.
         """
+        if self._missing:
+            from qorcap_template_guard import TEMPLATES_MISSING, TEMPLATES_MISSING_REASON, log_templates_missing
+            log_templates_missing()
+            return _fr(ok=False, reason=TEMPLATES_MISSING, detail={"templates_missing": TEMPLATES_MISSING_REASON})
         hsv = bar_hsv(frame)
         if hsv is None:
             return _fr(ok=False, reason="frame_invalid")
@@ -441,7 +453,7 @@ class AutoProfileReader:
             fr = self._read_one(r, img, t_ms)
             if first is None:
                 first = (i, fr)
-            if fr.ok or fr.reason not in NOT_VISIBLE:
+            if fr.ok or fr.reason not in (NOT_VISIBLE | {"templates_missing"}):
                 pid = self._pid(r)
                 # A primetime frame whose digits cleared the per-digit gates is that presentation, even when the
                 # quarter glyph did not. Counting only fr.ok left match-20261017-091651 as madden27_standard.

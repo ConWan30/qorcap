@@ -20,6 +20,8 @@ A read only counts once ``EndMenuAgreement`` sees the same score on N consecutiv
 """
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -28,6 +30,21 @@ import numpy as np
 
 GLYPH = (12, 18)  # (w, h) normalised end-menu glyph
 PACK = Path(__file__).resolve().parent / "packs" / "madden27_end_menu_v2.npz"
+# v2 with the 125430 rows (source ``real:95``) removed. ``real:600`` is match
+# 143212's zero, two glyphs on each of 300 frames, and ``real:300`` is that
+# match's two. Digits 1, 4, and 7 were only in the removed rows; Hershey
+# stand-ins keep the set complete so a missing digit is not the nearest match.
+# sha256 of sidecar/packs/madden27_end_menu_v2.npz.
+LEGACY_END_MENU_SHA256 = "82eefd6f5e36223de370304519ad29643ba761d6f80d4434ac5e9a80aa8ec3b7"
+LEGACY_PACK_ID = "madden27_end_menu_v2"
+_LEGACY_HELD_OUT = ("170123", "021003", "125430", "084523", "193534")
+# sha256 of each ``real:95`` vector from the pack before those rows were removed
+# (digits 1, 4, and 7). Relabelling the source to ``synthetic`` does not hide them.
+_HELD_OUT_GLYPH_SHA256 = frozenset({
+    "0542479ccb5e17ec9e3476c9e5eaaaa94cccccf6b9732b4db275c2b27a2969ac",
+    "4b0bf1393685df0c33a43fda2a40cc2f459ba859e8c2c808179441a37100bbdb",
+    "84744bfaa6535b0e643f09f913e53a103187e721775cec5730de8129e7cceaf7",
+})
 BAND_Y = (28, 66)                      # score digits sit at y ~38-56
 SIDES = {"away": (280, 368), "home": (384, 462)}  # logos at x<276 and x>465 stay outside
 GLYPH_H = (15, 22)
@@ -126,24 +143,158 @@ class EndMenuRead:
     conf: float = 0.0
     margin: float = 0.0
     digits: list[dict[str, Any]] = field(default_factory=list)
+    pack_id: str | None = None
+    pack_sha256: str | None = None
+    end_menu_model_id: str | None = None
+
+
+def provenance_tokens(sources) -> list[str]:
+    """Every colon-separated piece of a glyph source, including ``hershey``."""
+    out: set[str] = set()
+    for src in sources:
+        for part in str(src).split(":"):
+            if part:
+                out.add(part)
+    return sorted(out)
+
+
+def _glyph_sha(vec: np.ndarray) -> str:
+    return hashlib.sha256(np.ascontiguousarray(vec, dtype=np.float32).tobytes()).hexdigest()
+
+
+def end_menu_model_id(pack_id: str, payload: bytes) -> str:
+    """Identity of the end-menu pack. Separate from the scorebug ``model_id``.
+
+    The scorebug id stays the provenance hash. This one moves when the pack
+    bytes or the end-menu gates move, so a later decision to drop the pinned
+    pack is a change of this id only. It is not a receipt field.
+    """
+    h = hashlib.sha256()
+    h.update(b"qorcap-end-menu/v1")
+    h.update(pack_id.encode())
+    h.update(b"\0")
+    h.update(payload)
+    params = {
+        "glyph_h": GLYPH[1],
+        "glyph_w": GLYPH[0],
+        "ink": INK,
+        "min_margin": MIN_MARGIN,
+        "min_score": MIN_SCORE,
+        "xcheck_min": XCHECK_MIN,
+    }
+    h.update(json.dumps(params, sort_keys=True, separators=(",", ":")).encode())
+    return f"end_menu:{pack_id}:{h.hexdigest()[:16]}"
+
+
+def _load_npz(pack: Path) -> tuple[list[str], np.ndarray, list[str], np.ndarray | None]:
+    d = np.load(str(pack))
+    labels = [str(x) for x in d["labels"]]
+    vecs = d["vecs"].astype(np.float32)
+    sources = [str(x) for x in d["source"]]
+    ot = d["ot_vec"].astype(np.float32).ravel() if "ot_vec" in d.files else None
+    return labels, vecs, sources, ot
+
+
+def _legacy_end_menu(pack: str | Path | None) -> bool:
+    """The committed 143212 pack, and only while provenance is that committed file.
+
+    A substituted provenance file is a full replacement: an empty one abstains,
+    and a partial end-menu harvest does not fall back to this pack. The 125430
+    rows are not in it.
+    """
+    from qorcap_template_guard import PROVENANCE_PATH, sha256_file
+
+    if pack is None:
+        return False
+    path = Path(pack)
+    try:
+        if not path.is_file() or path.resolve() != PACK.resolve():
+            return False
+        committed = Path(__file__).resolve().parents[1] / "templates" / "provenance.json"
+        if PROVENANCE_PATH.resolve() != committed.resolve():
+            return False
+        if sha256_file(path) != LEGACY_END_MENU_SHA256:
+            return False
+        _labels, _vecs, sources, _ot = _load_npz(path)
+    except (OSError, ValueError, KeyError):
+        return False
+    if not set("0123456789") <= set(_labels):
+        return False
+    for src in sources:
+        if src == "real:95" or any(item in src for item in _LEGACY_HELD_OUT):
+            return False
+    for vec in _vecs:
+        if _glyph_sha(vec) in _HELD_OUT_GLYPH_SHA256:
+            return False
+    return True
 
 
 class EndMenuReader:
     def corroborate(self, img, expected: dict) -> dict:
         return corroborate(img, expected, self)
 
-    def __init__(self, pack: str | Path | None = PACK, scorebug_pack=None) -> None:
-        d = np.load(str(pack))
-        self.labels = [str(x) for x in d["labels"]]
-        self.vecs = d["vecs"].astype(np.float32)
-        self.sources = [str(x) for x in d["source"]]
+    def stamp(self, rd: EndMenuRead) -> EndMenuRead:
+        rd.pack_id = self.pack_id
+        rd.pack_sha256 = self.pack_sha256
+        rd.end_menu_model_id = self.end_menu_model_id
+        return rd
+
+    def _identify(self, pack_id: str, payload: bytes) -> None:
+        self.pack_id = pack_id
+        self.pack_sha256 = hashlib.sha256(payload).hexdigest()
+        self.end_menu_model_id = end_menu_model_id(pack_id, payload)
+
+    def __init__(self, pack: str | Path | None = PACK, scorebug_pack=None, *, use_harvest: bool = True) -> None:
+        from qorcap_template_guard import digits_complete, file_authorized, harvested_vectors
+
+        self._missing = False
+        self.pack_id = "missing"
+        self.pack_sha256 = ""
+        self.end_menu_model_id = end_menu_model_id("missing", b"")
+        # A partial digit set matches the nearest glyph. Abstain until 0-9 are all present.
+        # Any harvested end-menu row blocks the legacy pack, so a partial harvest cannot
+        # fill the gap from it. use_harvest=False is the recorded-frame check: it keeps
+        # reading the pinned pack when a harvest is installed.
+        harvested = harvested_vectors("end_menu") if use_harvest else {}
+        if digits_complete("end_menu") and harvested:
+            labels, rows, sources = [], [], []
+            for lab, vecs in harvested.items():
+                for row in vecs:
+                    labels.append(lab)
+                    rows.append(row)
+                    sources.append("allowlisted")
+            self.labels = labels
+            self.vecs = np.stack(rows, axis=0).astype(np.float32)
+            self.sources = sources
+            self.ot_vec = None
+            payload = np.ascontiguousarray(self.vecs, dtype=np.float32).tobytes()
+            self._identify("harvested-end-menu", payload)
+        elif harvested:
+            self._missing = True
+            self.labels = []
+            self.vecs = np.zeros((0, GLYPH[0] * GLYPH[1]), np.float32)
+            self.sources = []
+            self.ot_vec = None
+        elif _legacy_end_menu(pack) or (pack is not None and file_authorized(Path(pack))):
+            path = Path(pack)
+            self.labels, self.vecs, self.sources, self.ot_vec = _load_npz(path)
+            pack_id = LEGACY_PACK_ID if path.resolve() == PACK.resolve() else path.name
+            self._identify(pack_id, path.read_bytes())
+        else:
+            self._missing = True
+            self.labels = []
+            self.vecs = np.zeros((0, GLYPH[0] * GLYPH[1]), np.float32)
+            self.sources = []
+            self.ot_vec = None
         self.source = {}
         for lab, src in zip(self.labels, self.sources):
             self.source[lab] = src  # last vector wins; digit info below uses the vector that actually matched
-        self.ot_vec = d["ot_vec"].astype(np.float32).ravel() if "ot_vec" in d.files else None
-        if scorebug_pack is None:
-            scorebug_pack = load_scorebug_pack()
-        self.xpack = scorebug_pack  # QorTime TemplatePack (or None: cross-check skipped and reported)
+        if self._missing:
+            self.xpack = None
+        else:
+            if scorebug_pack is None:
+                scorebug_pack = load_scorebug_pack()
+            self.xpack = scorebug_pack  # QorTime TemplatePack (or None: cross-check skipped and reported)
 
     def _digit(self, g) -> tuple[str | None, dict]:
         v = norm_vec(g)
@@ -162,7 +313,7 @@ class EndMenuReader:
         second = ranked[1][1][0] if len(ranked) > 1 else -1.0
         holes = hole_signature(g)
         info = {"label": lab, "best": round(best, 3), "margin": round(best - second, 3), "holes": holes,
-                "source": self.sources[idx].split(":")[0]}
+                "source": self.sources[idx]}
         if best < MIN_SCORE or best - second < MIN_MARGIN:
             return None, dict(info, why="unsure")
         if (lab in HOLES and holes not in HOLES[lab]) or (lab in NO_HOLE and holes != "0"):
@@ -183,6 +334,10 @@ class EndMenuReader:
         return lab, info
 
     def read(self, img) -> EndMenuRead:
+        if self._missing:
+            from qorcap_template_guard import TEMPLATES_MISSING, TEMPLATES_MISSING_REASON, log_templates_missing
+            log_templates_missing()
+            return EndMenuRead(False, reason=TEMPLATES_MISSING, digits=[{"templates_missing": TEMPLATES_MISSING_REASON}])
         if img is None:
             return EndMenuRead(False, reason="no_frame")
         img = _prep(img)
@@ -202,7 +357,7 @@ class EndMenuReader:
             if len(txt) == 2 and txt[0] == "0":
                 return EndMenuRead(False, reason=f"{side}_leading_zero", digits=digits)
             vals[side] = int(txt)
-        return EndMenuRead(True, vals["away"], vals["home"], "ok", conf, margin, digits)
+        return self.stamp(EndMenuRead(True, vals["away"], vals["home"], "ok", conf, margin, digits))
 
     def period(self, img) -> str | None:
         """``OT`` when the end screen draws that ordinal under the score panel. Other screens score <= ~0.31."""
@@ -250,12 +405,17 @@ class EndMenuAgreement:
         self.streak.append((t_ms, rd.away, rd.home))
         if len(self.streak) >= self.n and self.streak[-1][0] - self.streak[0][0] >= self.min_span_ms:
             if self.stable is None or (self.stable["away"], self.stable["home"]) != (rd.away, rd.home):
-                srcs = sorted({d["source"] for d in rd.digits})
+                srcs = provenance_tokens(d.get("source", "") for d in rd.digits)
                 self.stable = {"away": rd.away, "home": rd.home, "t_ms": self.streak[0][0], "until_ms": t_ms,
                                "frames": len(self.streak), "conf": round(rd.conf, 3), "margin": round(rd.margin, 3),
                                "template_sources": srcs,
                                "xcheck": ("skipped" if any(d.get("xcheck") == "skipped" for d in rd.digits) else
                                          "n/a (corroboration)" if rd.reason == "corroborated" else "qortime_scorebug_pack")}
+                pack_id = getattr(rd, "pack_id", None)
+                if pack_id:
+                    self.stable["pack_id"] = pack_id
+                    self.stable["pack_sha256"] = getattr(rd, "pack_sha256", None)
+                    self.stable["end_menu_model_id"] = getattr(rd, "end_menu_model_id", None)
             else:
                 self.stable.update(until_ms=t_ms, frames=len(self.streak))
         return self.stable

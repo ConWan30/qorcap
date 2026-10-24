@@ -37,7 +37,10 @@ _LOADED: tuple | None = None
 def _load():
     global _LOADED
     if _LOADED is None:
-        if not PACK.is_file():
+        from qorcap_template_guard import file_authorized
+
+        # A file sitting on disk is not a template. Provenance has to name it.
+        if not PACK.is_file() or not file_authorized(PACK):
             _LOADED = (None, None)
         else:
             z = np.load(PACK)

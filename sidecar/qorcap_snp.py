@@ -231,6 +231,13 @@ class SundayNightReader:
     wants_full_res = True
 
     def __init__(self, pack: str | Path = PACK) -> None:
+        from qorcap_template_guard import file_authorized
+
+        self.source = {}
+        self.groups = {}
+        self._missing = not file_authorized(Path(pack))
+        if self._missing:
+            return
         d = np.load(str(pack))
         self.groups: dict[str, tuple[list[str], np.ndarray]] = {}
         for g in ("score", "clock", "quarter"):
@@ -264,6 +271,10 @@ class SundayNightReader:
         return hsv is not None and is_present(hsv)
 
     def read(self, frame) -> Any:
+        if self._missing:
+            from qorcap_template_guard import TEMPLATES_MISSING, TEMPLATES_MISSING_REASON, log_templates_missing
+            log_templates_missing()
+            return _fr(ok=False, reason=TEMPLATES_MISSING, detail={"templates_missing": TEMPLATES_MISSING_REASON})
         hsv = hsv_of(frame)
         if hsv is None:
             return _fr(ok=False, reason="frame_invalid")

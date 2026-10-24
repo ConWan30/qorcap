@@ -1,0 +1,83 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://conwan30.github.io/qorcap/schema/template_provenance.v0.json",
+  "title": "QorCap template provenance v0",
+  "description": "Internal record of which match a glyph template was cut from. Not a receipt.v0 field and not a qorcap-bundle field. One row is one glyph the reader matches, not a whole score slot.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "harvest_script", "harvest_version", "templates"],
+  "properties": {
+    "schema": {"const": "qorcap-template-provenance/v0"},
+    "harvest_script": {"const": "tools/harvest_templates.py"},
+    "harvest_version": {"type": "string", "pattern": "^[0-9]+$"},
+    "qortime_commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "templates": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/template"}
+    }
+  },
+  "$defs": {
+    "template": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path", "sha256", "role", "label", "profile", "source_match_id",
+        "source_match_folder", "video_sha256",
+        "frame_index", "t_ms", "harvest_version", "harvest_date", "qortime_commit"
+      ],
+      "properties": {
+        "path": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 240,
+          "pattern": "^(?!/)(?!.*\\.\\.)[A-Za-z0-9_./+-]+$"
+        },
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "role": {"enum": ["score", "clock", "quarter", "banner", "end_menu"]},
+        "label": {"type": "string", "minLength": 1, "maxLength": 16},
+        "profile": {
+          "enum": ["standard", "end_menu", "monday_night", "sunday_night", "thursday_night", "psn"]
+        },
+        "source_match_id": {"type": "string", "pattern": "^[0-9]{6}$"},
+        "source_match_folder": {"type": "string", "pattern": "^match-[0-9]{8}-[0-9]{6}$"},
+        "video_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "frame_index": {"type": "integer", "minimum": 0, "maximum": 9007199254740991},
+        "t_ms": {"type": "integer", "minimum": 0, "maximum": 9007199254740991},
+        "start_frame_index": {"type": "integer", "minimum": 0, "maximum": 9007199254740991},
+        "end_frame_index": {"type": "integer", "minimum": 0, "maximum": 9007199254740991},
+        "start_t_ms": {"type": "integer", "minimum": 0, "maximum": 9007199254740991},
+        "end_t_ms": {"type": "integer", "minimum": 0, "maximum": 9007199254740991},
+        "harvest_version": {"type": "string", "pattern": "^[0-9]+$"},
+        "harvest_date": {
+          "type": "string",
+          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+        },
+        "qortime_commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"}
+      },
+      "anyOf": [
+        {"required": ["start_frame_index", "end_frame_index"]},
+        {"required": ["start_t_ms", "end_t_ms"]}
+      ],
+      "allOf": [
+        {
+          "if": {
+            "properties": {"role": {"const": "quarter"}},
+            "required": ["role"]
+          },
+          "then": {
+            "properties": {"label": {"enum": ["1st", "2nd", "3rd", "4th", "ot"]}}
+          }
+        },
+        {
+          "if": {
+            "properties": {"role": {"enum": ["score", "clock", "end_menu"]}},
+            "required": ["role"]
+          },
+          "then": {
+            "properties": {"label": {"pattern": "^[0-9]$"}}
+          }
+        }
+      ]
+    }
+  }
+}

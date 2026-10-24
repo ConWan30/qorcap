@@ -1,37 +1,26 @@
-"""Standard Madden scorebug with real digits from match-20261017-110028 (QorCap 0.3.14).
+"""Standard Madden scorebug.
 
-QorTime's ``madden27_standard`` pack has a "2" and a "3", but on the London HOU–JAX bar the leading
-"2" matched that template at about 0.59 and the "3" at about 0.67, both under the 0.70 gate. Every
-other check on those frames was fine (logo, white panel, quarter), so the timeline went blank from
-11:12:59 to 11:19:52 while the score sat on 22, 23, and 29. The gate stays 0.70. These two vectors
-are the mean of the real glyphs from that window (148 twos, 132 threes), added as extra variants.
-A "1ST DOWNS" banner still fails ``score_panel_covered`` / ``score_slot_ink`` before any digit match.
+Score digits are read only from allowlisted templates in ``templates/provenance.json``
+(matches 102332 and 111640). Those files are not in the repo yet. Until they are,
+``read`` abstains with ``templates_missing`` and does not guess a score from the
+vendored stock pack or from a pack cut from a held-out match.
 
-The clock is read from the source frame with the stock glyphs, and kept only when it holds,
-counts down, or re-anchors. A FIELD GOAL or TOUCHDOWN banner blanks the scores and still
-returns quarter and clock. No banner fragment is shipped: the only ones cut for this reader
-came from held-out 170123 frames. The score grammar can abstain or re-anchor; it cannot raise
-a read. See ``qorcap_score_grammar`` for the windows. ``model_id`` hashes every stacked template
-plus the grammar and clock parameters.
+The 110028 "2"/"3" and the 084523 "4" used to be stacked on the stock pack. 084523
+is held out. 110028 is not an allowlisted template-source match. Both packs are
+removed. ``model_id`` hashes the allowlisted template bytes (or an explicit
+missing marker) plus the grammar and clock parameters.
 """
 from __future__ import annotations
 
 import hashlib
 import json
-from pathlib import Path
 
 import numpy as np
 
-PACK = Path(__file__).resolve().parent / "packs" / "madden27_standard_score_110028.npz"
-# QorCap 0.3.23: on match-20261018-084523 (CHI–ATL) the red home "14" scored 0.57-0.64 against the QorTime
-# "4" template, so every read from 0-14 on was score_unsure and the draft stopped at 0-13 Q2 (real final 6-14).
-# This pack holds the mean of 111 real "4" glyphs from that match (tools/add_standard_four_084523.py).
-# 084523 is one of Con's labelled games (sidecar/eval/human_labels.jsonl). It is held out of new
-# training. The row is the one already on main; this change does not rebuild it and does not remove it.
-PACK_FOUR = Path(__file__).resolve().parent / "packs" / "madden27_standard_score_084523.npz"
 # Logo search wider than the profile's ±3. The 0.90 NCC floor is unchanged. 11 px blur still misses it.
 # ±8 px and the full-resolution clock were tuned on the 170123 highlight kit. That match is held out.
-# No template was cut from it.
+# No template was cut from it. The constant is tracked debt in docs/TEMPLATE_PROVENANCE.md.
+# Do not change it in a provenance-only patch.
 ANCHOR_SEARCH_PX = 8
 
 
@@ -170,21 +159,33 @@ def _clock_box_dark(reader, band, dx: int, dy: int) -> bool:
 
 
 def reader_model_id(inner, grammar, clocks) -> str:
-    """Hash every template row plus the grammar and clock parameters.
+    """Hash allowlisted template bytes plus the grammar and clock parameters.
 
-    ``TemplatePack.sha16`` is the stock pack only. The 110028 and 084523 score rows are stacked
-    after that, and the anchor search, full-resolution clock, and grammar windows are not in it.
-    This id is what a receipt should name. It is not a checkpoint-hash input.
+    The vendored stock pack is not this id. Removed packs are not this id. An empty
+    provenance file hashes as ``templates:missing``, which is not the previous id.
+    Each loaded row contributes its role, label, and profile as well as its bytes,
+    so relabelling a file changes the id. This id is what a receipt should name.
+    It is not a checkpoint-hash input.
     """
     from qor_receipt._vendor.qoresence.vision.local_scorebug.reader import READER_ID
+    from qorcap_template_guard import authorized_entries
 
     h = hashlib.sha256()
-    pack = inner.pack
-    h.update(np.ascontiguousarray(pack.logo, dtype=np.float32).tobytes())
-    for group in sorted(pack.groups):
-        for label in sorted(pack.groups[group]):
-            h.update(f"{group}/{label}".encode())
-            h.update(np.ascontiguousarray(pack.groups[group][label], dtype=np.float32).tobytes())
+    h.update(b"qorcap-template-provenance/v0")
+    rows = sorted(authorized_entries(), key=lambda item: str(item[0].get("path")))
+    if not rows:
+        h.update(b"templates:missing")
+    else:
+        for entry, found in rows:
+            h.update(str(entry.get("role") or "").encode())
+            h.update(b"\0")
+            h.update(str(entry.get("label") or "").encode())
+            h.update(b"\0")
+            h.update(str(entry.get("profile") or "").encode())
+            h.update(b"\0")
+            h.update(str(entry.get("path")).encode())
+            h.update(b"\0")
+            h.update(found.read_bytes())
     gate = inner.profile.clock_gate
     params = {
         "anchor_search_px": int(inner.profile.anchor_search_px),
@@ -231,6 +232,23 @@ class StandardBarReader:
         return reader_model_id(self.inner, self.grammar, self.clocks)
 
     def read(self, frame, t_ms=None):
+        from qor_receipt._vendor.qoresence.vision.local_scorebug.reader import FrameRead
+        from qorcap_template_guard import (
+            TEMPLATES_MISSING,
+            TEMPLATES_MISSING_REASON,
+            digits_complete,
+            log_templates_missing,
+        )
+
+        # A partial digit set matches the nearest template and can misread.
+        if not digits_complete("score", profile="standard"):
+            log_templates_missing()
+            return FrameRead(
+                ok=False,
+                reason=TEMPLATES_MISSING,
+                profile_id=self.profile_id,
+                detail={"templates_missing": TEMPLATES_MISSING_REASON},
+            )
         from qorcap_banner import detect_banner
         from qorcap_reader import prep
 
@@ -317,21 +335,35 @@ class StandardBarReader:
         return getattr(self.inner, name)
 
 
+def _install_authorized(reader) -> None:
+    """Replace stock digits with harvested per-glyph rows. Retired npz paths are not loaded.
+
+    Score rows are installed only when digits 0-9 are all present; otherwise
+    ``read`` abstains and the stock score pack stays unused. A partial clock
+    set is not installed, and the stock clock font is cleared so it cannot
+    fill the gap. Quarter words are not a ten-digit set.
+    """
+    from qorcap_template_guard import digits_complete, harvested_vectors
+
+    if not digits_complete("score", profile="standard"):
+        return
+    reader.pack.groups["score"] = harvested_vectors("score", profile="standard")
+    if digits_complete("clock", profile="standard"):
+        reader.pack.groups["clock"] = harvested_vectors("clock", profile="standard")
+    else:
+        reader.pack.groups["clock"] = {}
+    quarter = harvested_vectors("quarter", profile="standard")
+    if quarter:
+        reader.pack.groups["quarter"] = quarter
+
+
 def standard_reader():
-    """QorTime's ScorebugReader plus the 110028 "2"/"3" and the 084523 "4". No held-out clock glyphs."""
+    """QorTime geometry plus allowlisted templates. No held-out glyph is loaded."""
     from dataclasses import replace
 
     from qor_receipt._vendor.qoresence.vision.local_scorebug.reader import ScorebugReader
 
     reader = ScorebugReader()
-    if PACK.is_file():
-        z = np.load(PACK)
-        score = reader.pack.groups["score"]
-        score["2"] = np.vstack([score["2"], np.atleast_2d(z["two"].astype(np.float32))])
-        score["3"] = np.vstack([score["3"], np.atleast_2d(z["three"].astype(np.float32))])
-    if PACK_FOUR.is_file():
-        z = np.load(PACK_FOUR)
-        score = reader.pack.groups["score"]
-        score["4"] = np.vstack([score["4"], np.atleast_2d(z["four"].astype(np.float32))])
+    _install_authorized(reader)
     reader.profile = replace(reader.profile, anchor_search_px=ANCHOR_SEARCH_PX)
     return StandardBarReader(reader)

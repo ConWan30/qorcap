@@ -1067,6 +1067,14 @@ class ReaderCore:
                 fr = self.reader.read(rimg, t_ms=t_ms)
             else:
                 fr = self.reader.read(rimg)
+        except Exception as e:  # never silent
+            self.stats["errors"] += 1
+            print(f"scorebug reader error: {type(e).__name__}: {e}", file=sys.stderr)
+            return
+        if getattr(fr, "reason", None) == "templates_missing":
+            self._note_templates_missing(t_ms)
+            return
+        try:
             band, _ = self.reader.reference_band(rimg) if hasattr(self.reader, "reference_band") else (None, None)
         except Exception as e:  # never silent
             self.stats["errors"] += 1
@@ -1285,6 +1293,18 @@ class ReaderCore:
         self.score_lock.remember(got.pair, t_ms * 1_000_000)
         self._post_agreed(t_ms, got, True)
 
+    def _note_templates_missing(self, t_ms: int) -> None:
+        """Abstain once. The timeline row is not a score. No home or away is posted."""
+        from qorcap_template_guard import TEMPLATES_MISSING_REASON, log_templates_missing
+
+        log_templates_missing()
+        if self.stats.get("templates_missing"):
+            return
+        self.stats["templates_missing"] = 1
+        row = {"t_ms": int(t_ms), "obs": "templates_missing", "reason": TEMPLATES_MISSING_REASON}
+        self.timeline.append(row)
+        self.post(jcs_safe({"type": "obs", **row}))
+
     def _note_reanchor(self, t_ms: int, fr) -> None:
         """Record a re-anchor on the sidecar callback. The score event itself is unchanged.
 
@@ -1494,6 +1514,10 @@ class ReaderCore:
             self.stats["errors"] += 1
             print(f"end-menu reader error: {type(e).__name__}: {e}", file=sys.stderr)
             return
+        if getattr(rd, "reason", None) == "templates_missing":
+            self._note_templates_missing(t_ms)
+            self.stats["end_menu_unreadable"] = self.stats.get("end_menu_unreadable", 0) + 1
+            return
         if not rd.ok and hasattr(self.end_menu_reader, "corroborate"):
             rd = self._corroborate(img, rd)
         k = "end_menu_reads" if rd.ok else "end_menu_unreadable"
@@ -1610,8 +1634,10 @@ class ReaderCore:
         from qorcap_endmenu import EndMenuRead
         sc = min(v["score"] for v in c["sides"].values())
         mg = min(v["score"] - v["alt_score"] for v in c["sides"].values())
-        return EndMenuRead(True, last["away"], last["home"], "corroborated", sc, mg,
-                           [dict(side=k, source="corroborated", xcheck="n/a", **v) for k, v in c["sides"].items()])
+        built = EndMenuRead(True, last["away"], last["home"], "corroborated", sc, mg,
+                            [dict(side=k, source="corroborated", xcheck="n/a", **v) for k, v in c["sides"].items()])
+        stamp = getattr(self.end_menu_reader, "stamp", None)
+        return stamp(built) if stamp else built
 
     def _check_final(self, t_ms: int) -> None:
         if self.final is not None:

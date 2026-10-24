@@ -1,10 +1,12 @@
 """Files the sidecar opens from the directory that contains ``sidecar/``.
 
 That directory is the repo when developing, and the unzipped Windows release when
-a player runs Start Match. ``release.yml`` copies ``sidecar/`` and ``contracts/``
-into that folder. This module is the check that the copy actually contains every
-file those modules read, and that the signing path can load ``receipt.v0.json``
-from it.
+a player runs Start Match. ``release.yml`` copies ``sidecar/``, ``contracts/``,
+and ``templates/`` into that folder. This module is the check that the copy
+actually contains every file those modules read, and that the signing path can
+load ``receipt.v0.json`` from it. ``templates/`` holds the allowlist, the
+held-out list, and the provenance manifest. An empty manifest is still a file
+the readers open; they abstain when it lists no templates.
 
 ``qorcap.exe``, ``ffmpeg.exe``, and the vendored ``qortime/`` tree are located at
 runtime and installed by their own release steps. They are not in this list.
@@ -28,7 +30,17 @@ _OPTIONAL_INSTALL = frozenset({"qorcap", "qorcap.exe", "ffmpeg", "ffmpeg.exe", "
 # The banner fragment pack is optional. qorcap_banner treats a missing file as no banner.
 # A release with no pack must still install and load the signing schema.
 _OPTIONAL_RUNTIME_FILES = frozenset({
+    # Not required for the install audit. The end-menu npz is present and
+    # hash-pinned; a missing file still abstains. The other packs are absent
+    # until an allowlisted harvest replaces them.
     "sidecar/packs/madden27_banner_fragments.npz",
+    "sidecar/packs/madden27_standard_score_110028.npz",
+    "sidecar/packs/madden27_standard_score_084523.npz",
+    "sidecar/packs/madden27_sunday_night_v1.npz",
+    "sidecar/packs/madden27_thursday_night_v1.npz",
+    "sidecar/packs/madden27_monday_night_v1.npz",
+    "sidecar/packs/madden27_end_menu_v2.npz",
+    "sidecar/packs/madden27_psn_banner_v1.npz",
 })
 _READ_TEXT = frozenset({"read_text", "read_bytes"})
 _FILE_SUFFIXES = (".json", ".md", ".npz", ".txt")
@@ -262,8 +274,9 @@ def required_runtime_files(sidecar_dir: Path) -> list[str]:
 def stage_runtime_layout(repo: Path, dest: Path) -> Path:
     """The slice of the Windows zip the sidecar reads.
 
-    Same two copies as ``.github/workflows/release.yml``: the ``sidecar/`` tree
-    and ``contracts/``. The exe, ffmpeg, and qortime checkout are separate steps.
+    Same copies as ``.github/workflows/release.yml``: the ``sidecar/`` tree,
+    ``contracts/``, and ``templates/`` (provenance, allowlist, held-out list).
+    The exe, ffmpeg, and qortime checkout are separate steps.
     """
     repo, dest = Path(repo), Path(dest)
     shutil.copytree(
@@ -271,6 +284,7 @@ def stage_runtime_layout(repo: Path, dest: Path) -> Path:
         ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
     )
     shutil.copytree(repo / "contracts", dest / "contracts")
+    shutil.copytree(repo / "templates", dest / "templates")
     return dest
 
 

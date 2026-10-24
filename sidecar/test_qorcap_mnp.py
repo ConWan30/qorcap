@@ -13,12 +13,36 @@ sys.path.insert(0, str(HERE))
 sys.path.insert(0, os.environ.get("QORTIME", "/workspace/qortime-src"))
 import qorcap_mnp as M  # noqa: E402
 from qorcap_reader import madden_final_screen, prep  # noqa: E402
+from qorcap_standard import standard_reader  # noqa: E402
+from qorcap_template_guard import TEMPLATES_MISSING  # noqa: E402
 
 FX = HERE / "fixtures"
 
 
 def img(name):
     return cv2.imread(str(FX / name))
+
+
+def abstain(fr):
+    assert fr.ok is False and fr.reason == TEMPLATES_MISSING, getattr(fr, "reason", fr)
+    assert fr.left_score is None and fr.right_score is None
+    assert fr.quarter is None and fr.clock_text is None
+
+
+@pytest.fixture(autouse=True)
+def _empty_provenance(monkeypatch, tmp_path):
+    """A committed harvest must not turn these abstentions into layout_unknown."""
+    import json
+    import qorcap_template_guard as guard
+
+    prov = tmp_path / "provenance.json"
+    prov.write_text(json.dumps({
+        "schema": "qorcap-template-provenance/v0",
+        "harvest_script": "tools/harvest_templates.py",
+        "harvest_version": "3",
+        "templates": [],
+    }), encoding="utf-8")
+    monkeypatch.setattr(guard, "PROVENANCE_PATH", prov)
 
 
 @pytest.fixture(scope="module")
@@ -32,10 +56,10 @@ def mnp():
     ("m27_mnp_q4_final.jpg", 34, 29, 4, "0:00", True),   # red final-minute clock, touching "00"
 ])
 def test_monday_night_reads(mnp, name, away, home, q, clock, red):
+    """170000 and 162055 are not allowlisted template matches. The old eye label is not emitted."""
     fr = mnp.read(img(name))
-    assert fr.ok, fr.reason
-    assert (fr.left_score, fr.right_score, fr.quarter, fr.clock_text, fr.clock_red) == (away, home, q, clock, red)
-    assert fr.profile_id == "madden27_monday_night"
+    abstain(fr)
+    assert (fr.left_score, fr.right_score, fr.quarter, fr.clock_text, fr.clock_red) != (away, home, q, clock, red)
 
 
 def test_half_resolution_frame_still_reads_scores(mnp):
@@ -43,22 +67,24 @@ def test_half_resolution_frame_still_reads_scores(mnp):
     assert fr.ok is False or (fr.left_score, fr.right_score) == (14, 13)  # never a wrong score
 
 
-@pytest.mark.parametrize("name", ["m27_end_menu_finish.jpg", "m27_pause_menu.jpg", "m27_mnp_end_menu_online.jpg"])
+@pytest.mark.parametrize("name", ["m27_pause_menu.jpg", "m27_mnp_end_menu_online.jpg"])
 def test_not_monday_night_is_layout_unknown(mnp, name):
-    assert mnp.read(img(name)).reason == "layout_unknown"
+    assert mnp.read(img(name)).reason == TEMPLATES_MISSING
 
 
 def test_broncos_orange_endzone_is_not_monday_night(mnp):
-    """match-20261017-091651 OT walk-off: the logo box is ~99% orange. A real Monday Night mark is ~0.06."""
-    assert mnp.read(img("m27_tnp_091651_ot_10_16.jpg")).reason == "layout_unknown"
+    """match-20261017-091651 OT walk-off: the logo box is ~99% orange. A real Monday Night mark is ~0.06.
+
+    The reader abstains before the orange gate, because the pack is not loaded. The orange measurement stays.
+    """
+    abstain(mnp.read(img("m27_tnp_091651_ot_10_16.jpg")))
     for name in ("m27_mnp_q1.jpg", "m27_mnp_q2.jpg", "m27_mnp_q4_final.jpg"):
         assert M.LOGO_MIN_ORANGE <= M.logo_orange(M.bar_hsv(img(name))) <= M.LOGO_MAX_ORANGE
 
 
 def test_pack_provenance(mnp):
-    assert mnp.source["score:5"].startswith("synthetic")
-    assert all(mnp.source[f"score:{d}"].startswith("real") for d in "012346789")
-    assert set(mnp.groups["quarter"][0]) == {"1ST", "2ND", "3RD", "4TH"}
+    assert mnp._missing and mnp.source == {} and mnp.groups == {} and mnp.ids == {}
+    assert not Path(M.PACK).is_file()
 
 
 class Fixed:
@@ -95,11 +121,10 @@ def test_auto_standard_misread_is_not_masked():
 
 
 def test_auto_with_real_readers():
-    from qor_receipt._vendor.qoresence.vision.local_scorebug.reader import ScorebugReader
-    a = M.AutoProfileReader(ScorebugReader(), prep=prep)
-    fr = a.read(img("m27_mnp_q2.jpg"))
-    assert fr.ok and (fr.left_score, fr.right_score) == (14, 13) and a.active_profile == "madden27_monday_night"
-    assert a.read(img("m27_end_menu_finish.jpg")).reason == "layout_unknown"
+    a = M.AutoProfileReader(standard_reader(), prep=prep)
+    abstain(a.read(img("m27_mnp_q2.jpg")))
+    abstain(a.read(img("m27_pause_menu.jpg")))
+    assert a.profile_counts == {}
 
 
 def test_online_end_menu_is_final_screen_and_fails_closed_on_occluded_away():
@@ -107,17 +132,17 @@ def test_online_end_menu_is_final_screen_and_fails_closed_on_occluded_away():
     im = img("m27_mnp_end_menu_online.jpg")
     assert madden_final_screen(prep(im))  # gamertag banners no longer hide the end menu
     rd = EndMenuReader().read(im)
-    assert not rd.ok and rd.reason.startswith("away_")  # name tags cover the away score: never guessed
+    assert not rd.ok and rd.reason == TEMPLATES_MISSING
+    assert rd.away is None and rd.home is None
 
 
 def test_end_menu_real_9_template_still_xchecked():
-    from qorcap_endmenu import EndMenuReader, side_glyphs
-    r, im = EndMenuReader(), prep(img("m27_mnp_end_menu_online.jpg"))
-    d2, d9 = (r._digit(g) for g in side_glyphs(im, "home"))
-    assert d2[0] == "2"
-    assert d9[1]["label"] == "9" and d9[1]["source"] == "real" and d9[1]["best"] > 0.9
-    # QorTime's scorebug pack calls this glyph "0": the cross-check still fails it closed (v0.3.4 rule kept)
-    assert d9[0] is None and d9[1]["why"] == "xcheck_disagrees"
+    """The end-menu pack that cross-checked the home 9 is removed. No digit is classified."""
+    from qorcap_endmenu import EndMenuReader
+    r = EndMenuReader()
+    assert r._missing and r.labels == [] and r.xpack is None
+    rd = r.read(prep(img("m27_mnp_end_menu_online.jpg")))
+    assert not rd.ok and rd.reason == TEMPLATES_MISSING and rd.away is None and rd.home is None
 
 
 # ---- v0.3.6: covered end-menu panel corroborates (never reads) the scorebug final
@@ -127,8 +152,11 @@ def test_end_menu_real_9_template_still_xchecked():
     ({"away": 40, "home": 29}, False), ({"away": 34, "home": 35}, False), ({"away": 27, "home": 29}, False),
 ])
 def test_corroborate_online_end_menu(exp, ok):
+    """No digit templates: neither the former confirming score nor an alternative is corroborated."""
     from qorcap_endmenu import EndMenuReader
-    assert EndMenuReader().corroborate(img("m27_mnp_end_menu_online.jpg"), exp)["ok"] is ok
+    got = EndMenuReader().corroborate(img("m27_mnp_end_menu_online.jpg"), exp)
+    assert got["ok"] is False
+    assert ok in (True, False)
 
 
 def _shift_quarter_word(im, dx):
@@ -151,35 +179,21 @@ def _shift_quarter_word(im, dx):
     return out
 
 
-def _old_box_label(mnp, im):
-    """The v0.3.17 crop: a fixed box ending at x=882, which clips a 2ND that has moved right."""
-    hsv = M.bar_hsv(im)
-    v = hsv[..., 2]
-    y0, y1 = M.QUARTER_Y[0] - M.BAR_Y[0], M.QUARTER_Y[1] - M.BAR_Y[0]
-    q = (v[y0:y1, M.QUARTER_X[0]:M.QUARTER_X[1]] > M.QUARTER_INK).astype(np.uint8)
-    ys, xs = np.nonzero(q)
-    if len(xs) < 20:
-        return None
-    lab, _, _ = mnp.classify("quarter", q[ys.min():ys.max() + 1, xs.min():xs.max() + 1], M.QUARTER_SIZE)
-    return lab
-
-
 @pytest.mark.parametrize("name,away,home,q,clock,red", [
     ("m27_mnp_q2.jpg", 14, 13, 2, "2:27", False),
     ("m27_mnp_q4_final.jpg", 34, 29, 4, "0:00", True),
 ])
 def test_quarter_word_shifted_toward_the_clock_still_reads(mnp, name, away, home, q, clock, red):
-    """2ND/4TH are wider than 1ST. Eight pixels toward the clock clips the old box and used to go quarter-null."""
+    """The shift still moves ink. With no quarter templates the frame abstains and does not emit the old label."""
     im = _shift_quarter_word(img(name), 8)
-    assert _old_box_label(mnp, im) is None
+    assert "quarter" not in mnp.groups
     fr = mnp.read(im)
-    assert fr.ok, fr.reason
-    assert (fr.left_score, fr.right_score, fr.quarter, fr.clock_text, fr.clock_red) == (away, home, q, clock, red)
+    abstain(fr)
+    assert (fr.left_score, fr.right_score, fr.quarter, fr.clock_text, fr.clock_red) != (away, home, q, clock, red)
 
 
 def test_q1_word_still_reads_after_the_same_shift(mnp):
-    fr = mnp.read(_shift_quarter_word(img("m27_mnp_q1.jpg"), 8))
-    assert fr.ok and (fr.quarter, fr.clock_text, fr.left_score, fr.right_score) == (1, "4:07", 0, 0)
+    abstain(mnp.read(_shift_quarter_word(img("m27_mnp_q1.jpg"), 8)))
 
 
 def test_clock_keeps_reading_when_the_quarter_word_is_gone(mnp):
@@ -192,9 +206,7 @@ def test_clock_keeps_reading_when_the_quarter_word_is_gone(mnp):
     bg = np.median(src[~ink], axis=0).astype(np.uint8)
     src[ink] = bg
     im[y0:y1, x0:x1] = src
-    fr = mnp.read(im)
-    assert fr.ok is False and fr.reason in ("quarter_missing", "quarter_unsure")
-    assert (fr.left_score, fr.right_score, fr.quarter, fr.clock_text) == (14, 13, None, "2:27")
+    abstain(mnp.read(im))
 
 
 def test_clock_from_digits_accepts_ten_through_fifteen_only():
@@ -208,37 +220,14 @@ def test_clock_from_digits_accepts_ten_through_fifteen_only():
 
 
 def test_four_digit_clock_reads_fifteen_minutes(mnp):
-    """Paint 1 5 0 0 from the clock templates into the clock band of a real Monday Night frame."""
-    import numpy as np
-    im = img("m27_mnp_q2.jpg").copy()
-    hsv = cv2.cvtColor(im, cv2.COLOR_BGR2HSV)
-    v = hsv[..., 2]
-    # Clear the existing 3-digit clock so only the painted 15:00 remains.
-    v[M.QUARTER_Y[0]:M.QUARTER_Y[1], 880:940] = 20
-    labels, vecs = mnp.groups["clock"]
-    glyphs = {}
-    for lab, vec in zip(labels, vecs):
-        if lab in glyphs:
-            continue
-        imgv = vec.reshape(M.CLOCK_SIZE[1], M.CLOCK_SIZE[0])
-        glyphs[lab] = (imgv > 0.02).astype(np.uint8)
-    x = 880  # inside the one-digit box, four digits: the old reader required exactly three
-    for lab in "1500":
-        g = glyphs[lab]
-        h, w = g.shape
-        y = 692
-        patch = v[y:y + h, x:x + w]
-        patch[g.astype(bool)] = 255
-        v[y:y + h, x:x + w] = patch
-        x += w + 3
-    hsv[..., 2] = v
-    painted = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
-    fr = mnp.read(painted)
-    assert fr.clock_text == "15:00" and fr.clock_seconds == 900, (fr.reason, fr.clock_text, fr.quarter)
-    assert fr.quarter == 2 and (fr.left_score, fr.right_score) == (14, 13)
+    """Clock templates are not loaded, so a Monday Night frame cannot be painted into 15:00."""
+    assert "clock" not in mnp.groups
+    abstain(mnp.read(img("m27_mnp_q2.jpg")))
+    assert M.clock_from_digits("1500") == (900, "15:00")
 
 
 def test_reader_core_confirms_covered_end_menu_only_with_q4_scorebug_final():
+    """The covered-panel corroboration needs end-menu templates. Without them the core posts no score."""
     from qorcap_endmenu import EndMenuReader
     from qorcap_reader import ReaderCore
 
@@ -250,8 +239,10 @@ def test_reader_core_confirms_covered_end_menu_only_with_q4_scorebug_final():
         def offer(self, fr, **_):
             return NS(agreed=False, read=None)
 
+    posts = []
+
     def core(final):
-        c = ReaderCore([].append, R(), A(), None, lambda tl: NS(final=False), final_screen_detector=madden_final_screen,
+        c = ReaderCore(posts.append, R(), A(), None, lambda tl: NS(final=False), final_screen_detector=madden_final_screen,
                        end_menu_reader=EndMenuReader())
         c.timeline = [{"t_ms": 0, "away": 34, "home": 29, "quarter": 4, "clock_s": 0}]
         c.final = final
@@ -259,9 +250,11 @@ def test_reader_core_confirms_covered_end_menu_only_with_q4_scorebug_final():
             c.on_frame(1000 + i * 500, img("m27_mnp_end_menu_online.jpg"))
         return c
     c = core({"type": "final", "basis": "clock_zero", "home": 29, "away": 34, "quarter": 4, "t_ms": 0})
-    assert c.final["method"] == "end_menu_read" and (c.final["away"], c.final["home"]) == (34, 29)
-    assert c.end_menu["template_sources"] == ["corroborated"] and "partly covered" in c.final["notes"][0]
-    assert core(None).end_menu is None  # no scorebug final yet: nothing to corroborate
+    assert c.end_menu is None
+    assert c.final["basis"] == "clock_zero"
+    assert not any(p.get("basis") == "end_menu" for p in posts)
+    assert any(row.get("obs") == TEMPLATES_MISSING for row in c.timeline)
+    assert core(None).end_menu is None
 
 
 # ---- v0.3.19: thick paint from match-20261017-162055
@@ -285,60 +278,13 @@ def _frame162(fp):
     return im
 
 
-def _got(fr, field, row):
-    if field == "score":
-        return None if fr.left_score is None else f"{fr.left_score}-{fr.right_score}"
-    if field == "quarter":
-        return None if fr.quarter is None else str(fr.quarter)
-    return fr.clock_text
-
-
-# Fields that stay unknown when every template from that video minute is removed.
-# Unknown is allowed. A different value is not. Minute 22 is the only 3RD sample.
-HOLDOUT_UNKNOWN = {
-    "8:50.000": {"quarter"},
-    "12:10.000": {"score", "clock", "quarter"},
-    "18:56.750": {"clock"},
-    "19:30.000": {"clock"},
-    "20:30.000": {"clock"},
-    "20:50.000": {"clock"},
-    "21:50.000": {"quarter"},
-    "22:10.000": {"quarter"},
-    "22:30.000": {"quarter"},
-    "22:33.500": {"quarter"},
-}
-
-
 def test_162055_pack_reads_the_labeled_frames_and_holds_out_by_minute(mnp):
-    meta, by = _labels162()
+    """The offline label table stays. The pack rows cut from those frames are gone, so nothing is scored."""
+    meta, _by = _labels162()
     assert len(meta) == 90
-    wrong = []
-    for fp, row in meta.items():
-        im = _frame162(fp)
-        minute = int(row["video_time"].split(":")[0])
-        full = mnp.read(im)
-        held = mnp.read(im, drop_src=f"162055:m{minute:02d}:")
-        unknown = HOLDOUT_UNKNOWN.get(row["video_time"], set())
-        for field, exp in (("score", f"{row['away']}-{row['home']}"),):
-            if _got(full, field, row) != exp:
-                wrong.append((row["video_time"], field, exp, _got(full, field, row), "full"))
-            h = _got(held, field, row)
-            if field in unknown:
-                assert h is None, (row["video_time"], field, h)
-            elif h != exp:
-                wrong.append((row["video_time"], field, exp, h, "holdout"))
-        for field in ("quarter", "clock"):
-            if field not in by[fp]:
-                continue
-            exp = by[fp][field]
-            if _got(full, field, row) != exp:
-                wrong.append((row["video_time"], field, exp, _got(full, field, row), "full"))
-            h = _got(held, field, row)
-            if field in unknown:
-                assert h is None, (row["video_time"], field, h)
-            elif h != exp:
-                wrong.append((row["video_time"], field, exp, h, "holdout"))
-    assert wrong == []
+    assert mnp.ids == {}
+    row = next(iter(meta.values()))
+    abstain(mnp.read(_frame162(row["frame_path"])))
 
 
 @pytest.mark.parametrize("video_time,away,home,q,clock,red", [
@@ -353,62 +299,40 @@ def test_162055_named_moments(mnp, video_time, away, home, q, clock, red):
     meta, _ = _labels162()
     row = next(r for r in meta.values() if r["video_time"] == video_time)
     fr = mnp.read(_frame162(row["frame_path"]))
-    assert fr.ok, fr.reason
-    assert (fr.left_score, fr.right_score, fr.quarter, fr.clock_text, fr.clock_red) == (away, home, q, clock, red)
+    abstain(fr)
+    assert (fr.left_score, fr.right_score, fr.quarter, fr.clock_text, fr.clock_red) != (away, home, q, clock, red)
 
 
 def test_162055_third_quarter_held_out_does_not_become_first_or_second(mnp):
     meta, by = _labels162()
+    saw = False
     for row in meta.values():
         if by[row["frame_path"]].get("quarter") != "3":
             continue
-        im = _frame162(row["frame_path"])
-        assert mnp.read(im).quarter == 3
-        held = mnp.read(im, drop_src=f"162055:m{int(row['video_time'].split(':')[0]):02d}:")
-        assert held.quarter is None
+        saw = True
+        fr = mnp.read(_frame162(row["frame_path"]))
+        abstain(fr)
+        assert fr.quarter is None
+    assert saw
 
 
 def test_162055_teal_six_the_thin_pack_called_eight_stays_six(mnp):
-    """13:10 and 19:50: the strip.mp4 templates rank the away 6 as 8, under the gate. A sibling 6 reads it."""
+    """13:10 and 19:50 used to need a sibling 6. With the pack gone they abstain, and they are not read as 8."""
     meta, _ = _labels162()
     for video_time in ("13:10.000", "19:50.000"):
         row = next(r for r in meta.values() if r["video_time"] == video_time)
         fr = mnp.read(_frame162(row["frame_path"]))
-        assert (fr.left_score, fr.right_score) == (6, int(row["home"]))
+        abstain(fr)
         assert fr.left_score != 8
 
 
 def test_162055_templates_are_the_crops_they_name(mnp):
-    """Each footage template equals the glyph of the frame named in its id, not a neighbour."""
-    labels_by = {g: mnp.groups[g][0] for g in ("score", "clock", "quarter")}
-    vecs = {g: mnp.groups[g][1] for g in ("score", "clock", "quarter")}
-    n = 0
-    for group, ids in mnp.ids.items():
-        for i, src in enumerate(ids):
-            if not src.startswith("162055:"):
-                continue
-            n += 1
-            parts = src.split(":")
-            # 162055:mMM:group:label:stem[:index]
-            assert parts[2] == group and parts[3] == labels_by[group][i]
-            im = _frame162(parts[4] + ".jpg")
-            v = M.bar_hsv(im)[..., 2]
-            if group == "quarter":
-                glyph = M.quarter_crop(v)
-            elif group == "score":
-                glyph = M.score_glyphs(v, "away")[int(parts[5])]
-            else:
-                gs = M.components(v, *M.CLOCK_X, M.CLOCK_H, thr=M.clock_thr(v), max_w=M.CLOCK_MAX_W)
-                glyph = gs[int(parts[5])]
-            size = {"score": M.SCORE_SIZE, "clock": M.CLOCK_SIZE, "quarter": M.QUARTER_SIZE}[group]
-            assert np.allclose(vecs[group][i], M.norm_vec(glyph, size), atol=1e-5)
-    assert n == 8 + 53 + 17
+    """The footage rows are not in the reader. The label file is an offline record, not a loaded template."""
+    assert mnp.groups == {} and mnp.ids == {}
+    meta, _ = _labels162()
+    assert len(meta) == 90
 
 
 def test_162055_templates_do_not_add_a_quarter_word(mnp):
-    assert set(mnp.groups["quarter"][0]) == {"1ST", "2ND", "3RD", "4TH"}
-    assert mnp.source["qtr:162055"].startswith("real")
-    assert mnp.source["clk:162055"].startswith("real")
-    assert mnp.source["scr:162055"].startswith("real")
-    assert mnp.source["score:5"].startswith("synthetic")
+    assert mnp.groups == {} and mnp.source == {}
     assert "labeled_candidates" not in Path(M.__file__).read_text()

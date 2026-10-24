@@ -53,6 +53,9 @@ jobs:
           # contracts/ sits next to sidecar/. Signing reads contracts\receipt.v0.json from there.
           # compat.json is the vendored registry and ships with it. A missing file fails this step.
           Copy-Item contracts (Join-Path $root "contracts") -Recurse
+          # templates/ is the provenance manifest, the allowlist, and the held-out list.
+          # An empty manifest still has to be in the zip: the readers open it and abstain.
+          Copy-Item templates (Join-Path $root "templates") -Recurse
           # Witness, burst, and attest ship as sidecar\qorcap_glimpse_watch.py, qorcap_glimpse_side.py,
           # qorcap_glimpse_attest.py, and sidecar\glimpse\ prompts. Python deps are not vendored:
           # start-match.ps1 installs numpy, opencv-python-headless, and cryptography (Ed25519 attest).
@@ -63,6 +66,9 @@ jobs:
             "docs\FRAME_CLOCK_AB.md",
             "contracts\receipt.v0.json",
             "contracts\compat.json",
+            "templates\provenance.json",
+            "templates\template_sources.json",
+            "templates\heldout.json",
             "sidecar\qorcap_match.py",
             "sidecar\qorcap_console.py",
             "sidecar\qorcap_ai_loop.py",

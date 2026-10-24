@@ -1,0 +1,6 @@
+{
+  "schema": "qorcap-template-provenance/v0",
+  "harvest_script": "tools/harvest_templates.py",
+  "harvest_version": "3",
+  "templates": []
+}

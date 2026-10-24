@@ -95,29 +95,48 @@ def test_standard_bar_reads_15_00_and_keeps_the_score_when_the_quarter_fails():
     assert (fr.left_score, fr.right_score, fr.clock_seconds) == (6, 21, 900)
 
 
-def test_standard_bar_reads_23_and_30_and_refuses_the_downs_banner():
-    raw, aug = ScorebugReader(), standard_reader()
-    q3 = img("m27_std_110028_q3_23_0.jpg")
-    miss = raw.read(q3)
-    assert not miss.ok  # the stall: stock templates do not clear 0.70 on this "2"/"3"
-    hit = aug.read(q3)
-    assert hit.ok and (hit.left_score, hit.right_score, hit.quarter) == (23, 0, 3), hit
-    # 0:26 needs a full-res glyph the stock pack does not clear. Abstain. Do not guess.
-    assert hit.clock_seconds in (None, 26)
-    q4 = aug.read(img("m27_std_110028_q4_30_6.jpg"))
-    assert q4.ok and (q4.left_score, q4.right_score, q4.quarter) == (30, 6, 4), q4
-    assert q4.clock_seconds in (None, 67)  # 4th, 1:07, or abstain
-    banner = aug.read(img("m27_std_110028_downs.jpg"))
-    assert not banner.ok
-    assert banner.reason in ("score_panel_covered", "score_slot_ink", "score_unsure", "layout_unknown")
-    assert (banner.left_score, banner.right_score) == (None, None)
-    assert (banner.quarter, banner.clock_seconds) == (4, 104)  # 4th, 1:44, scores stay blank
+def _empty_provenance(monkeypatch, tmp_path):
+    import json
+    import qorcap_template_guard as guard
+
+    prov = tmp_path / "provenance.json"
+    prov.write_text(json.dumps({
+        "schema": "qorcap-template-provenance/v0",
+        "harvest_script": "tools/harvest_templates.py",
+        "harvest_version": "3",
+        "templates": [],
+    }), encoding="utf-8")
+    monkeypatch.setattr(guard, "PROVENANCE_PATH", prov)
+
+
+def test_standard_bar_reads_23_and_30_and_refuses_the_downs_banner(monkeypatch, tmp_path):
+    """110028 "2"/"3" templates were removed: they are not an allowlisted template source.
+
+    The reader abstains. It does not report 23-0 or 30-6 from the old pack or from the stock pack.
+    """
+    import numpy as np
+    from qorcap_template_guard import TEMPLATES_MISSING
+
+    _empty_provenance(monkeypatch, tmp_path)
+    aug = standard_reader()
+    for frame in (np.zeros((360, 640, 3), np.uint8),):
+        hit = aug.read(frame)
+        assert hit.reason == TEMPLATES_MISSING
+        assert (hit.left_score, hit.right_score, hit.quarter, hit.clock_seconds) == (None, None, None, None)
 
 
 def test_standard_bar_reads_the_red_14_of_084523():
-    """match-20261018-084523 (CHI–ATL): the QorTime "4" scored 0.57-0.64 under the 0.70 gate, so 0-14 and 6-14
-    were score_unsure and the draft stopped at 0-13 Q2. The real-glyph "4" variant reads both; 0-13 is unchanged."""
+    """match-20261018-084523 (CHI–ATL) is held-out evaluation, not a harvest source.
+
+    The real-glyph "4" pack was removed. This grades the reader once allowlisted
+    templates are loaded, and skips while they are missing.
+    """
+    import pytest
     from qorcap_reader import prep
+    from qorcap_template_guard import has_role
+
+    if not has_role("score", profile="standard"):
+        pytest.skip("templates_missing: held-out 084523 evaluation waits for allowlisted score templates")
     r = standard_reader()
     for name, pair, q in (("m27_std_084523_q2_0_13.jpg", (0, 13), 2), ("m27_std_084523_q2_0_14.jpg", (0, 14), 2),
                           ("m27_std_084523_q4_6_14.jpg", (6, 14), 4)):
@@ -131,14 +150,14 @@ def test_standard_bar_reads_the_red_14_of_084523():
         "m27_std_084523_q4_6_14.jpg": 80,   # 4th, 1:20
     }
     for name, secs in clocks.items():
-        # These clocks were read only by the removed 170123 means. Stock glyphs abstain.
         got = r.read(prep(img(name))).clock_seconds
         assert got in (None, secs), (name, got)
 
 
 def test_without_the_four_variant_084523_stays_unread():
-    """Guard that the fixture really exercises the new template (plain QorTime pack fails closed)."""
+    """The stock pack, with no harvested "4", does not read this held-out frame."""
     from qorcap_reader import prep
+    assert not (HERE / "packs" / "madden27_standard_score_084523.npz").is_file()
     fr = ScorebugReader().read(prep(img("m27_std_084523_q4_6_14.jpg")))
     assert not fr.ok and fr.reason == "score_unsure"
 
@@ -161,14 +180,18 @@ def test_model_id_covers_the_stacked_templates_and_the_grammar_and_clock():
     assert "6" in aug.inner.pack.groups["clock"]
 
 
-def test_downs_banner_is_not_a_field_goal_and_mints_no_score():
+def test_downs_banner_is_not_a_field_goal_and_mints_no_score(monkeypatch, tmp_path):
+    """No banner fragment pack is shipped. A blank frame mints no score."""
+    import numpy as np
     from qorcap_banner import detect_banner
-    from qorcap_reader import prep
+    from qorcap_template_guard import TEMPLATES_MISSING
+
+    _empty_provenance(monkeypatch, tmp_path)
     r = standard_reader()
-    banner = r.read(img("m27_std_110028_downs.jpg"))
-    assert not banner.ok
+    banner = r.read(np.zeros((360, 640, 3), np.uint8))
+    assert banner.reason == TEMPLATES_MISSING
     assert (banner.left_score, banner.right_score) == (None, None)
-    assert detect_banner(r.inner, prep(img("m27_std_110028_downs.jpg"))) is None
+    assert detect_banner(r.inner, None) is None
 
 
 def test_human_label_for_084523_matches_the_q4_fixture():

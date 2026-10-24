@@ -1,0 +1,17 @@
+{
+  "schema": "qorcap-template-sources/v0",
+  "description": "Template-only matches. They are never test or evaluation data. The harvest script accepts these ids and no others. video_sha256 is the sha256 of that folder's video.mp4. An empty hash refuses the harvest, so a renamed held-out video cannot pass by folder name. Fill the hash on the operator PC before harvesting. This file is not a receipt field.",
+  "match_ids": ["102332", "111640"],
+  "sources": [
+    {
+      "match_id": "102332",
+      "folder": "match-20261024-102332",
+      "video_sha256": ""
+    },
+    {
+      "match_id": "111640",
+      "folder": "match-20261024-111640",
+      "video_sha256": ""
+    }
+  ]
+}

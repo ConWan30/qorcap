@@ -1,6 +1,10 @@
-"""End-of-game menu score reader (v0.3.4). Fixtures are real frames from Con's 2026-10-16 matches:
-m27_end_menu_finish.jpg = match-20261016-125430 (AWAY 7 Saints - HOME 14 Giants, cursor FINISH GAME),
-m27_end_menu_restart.jpg = match-20261016-143212 (AWAY 0 - HOME 20, cursor RESTART; scorebug last read 0-17)."""
+"""End-of-game menu policy.
+
+Digit packs that included match 125430 are removed. Policy tests use ScriptedEndMenu.
+The 125430 FINISH GAME frame is held-out evaluation: the score read skips until
+end-menu digits 0-9 are all present. A partial harvest stays skipped. Harvesting
+from 125430 stays refused.
+"""
 
 import json
 import os
@@ -9,6 +13,7 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+import pytest
 
 HERE = Path(__file__).parent
 sys.path.insert(0, str(HERE))
@@ -17,26 +22,320 @@ from qorcap_endmenu import EndMenuAgreement, EndMenuRead, EndMenuReader  # noqa:
 from qorcap_reader import ReaderCore, end_menu_consistency, madden_final_screen, prep  # noqa: E402
 from qor_receipt.final_detect import detect_final  # noqa: E402
 
-FIN = cv2.imread(str(HERE / "fixtures" / "m27_end_menu_finish.jpg"))
 RST = cv2.imread(str(HERE / "fixtures" / "m27_end_menu_restart.jpg"))
-R = EndMenuReader()
 
 
-def test_reads_both_matches_away_left_home_right():
-    a = R.read(RST)
-    assert a.ok and (a.away, a.home) == (0, 20), a
-    b = R.read(FIN)
-    assert b.ok and (b.away, b.home) == (7, 14), b      # match 1: away 7, home 14 (Con confirmed 14-7 home win)
-    assert R.read(cv2.resize(RST, (1280, 720))).away == 0  # card resolution is downscaled to 640x360 first
-    assert R.xpack is not None and all(d["xcheck"] == d["label"] for d in a.digits + b.digits)
+def _empty_provenance(monkeypatch, tmp_path):
+    import qorcap_template_guard as guard
+
+    prov = tmp_path / "provenance.json"
+    prov.write_text(json.dumps({
+        "schema": "qorcap-template-provenance/v0",
+        "harvest_script": "tools/harvest_templates.py",
+        "harvest_version": "3",
+        "templates": [],
+    }), encoding="utf-8")
+    monkeypatch.setattr(guard, "PROVENANCE_PATH", prov)
 
 
-def test_unreadable_fails_closed():
-    assert not R.read(np.zeros((360, 640, 3), np.uint8)).ok
+@pytest.fixture
+def menu(monkeypatch, tmp_path):
+    """Build the reader after the provenance patch. Import time is too early."""
+    _empty_provenance(monkeypatch, tmp_path)
+    return EndMenuReader()
+
+
+def _end_menu_provenance(tmp_path, labels: str):
+    """Synthetic end-menu rows for 102332. ``labels`` is a string of digit characters."""
+    import hashlib
+
+    root = tmp_path / "installed"
+    rows = []
+    commit = "0204e6d8082f8c40ea1fe5e09bf16402aaee3ff2"
+    video = "ab" * 32
+    for lab in labels:
+        rel = f"end_menu/102332__{lab}__menu_away__f000000__g0.npy"
+        dest = root / rel
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        arr = np.zeros((12 * 18,), np.float32)
+        arr[int(lab)] = 1.0
+        np.save(dest, arr)
+        digest = hashlib.sha256(dest.read_bytes()).hexdigest()
+        rows.append({
+            "path": rel,
+            "sha256": digest,
+            "role": "end_menu",
+            "label": lab,
+            "profile": "end_menu",
+            "source_match_id": "102332",
+            "source_match_folder": "match-20261024-102332",
+            "video_sha256": video,
+            "frame_index": 0,
+            "t_ms": 0,
+            "start_frame_index": 0,
+            "end_frame_index": 0,
+            "harvest_version": "3",
+            "harvest_date": "2026-10-24T17:31:00Z",
+            "qortime_commit": commit,
+        })
+    prov = root / "provenance.json"
+    prov.write_text(json.dumps({
+        "schema": "qorcap-template-provenance/v0",
+        "harvest_script": "tools/harvest_templates.py",
+        "harvest_version": "3",
+        "qortime_commit": commit,
+        "templates": rows,
+    }), encoding="utf-8")
+    return prov
+
+
+class ScriptedEndMenu:
+    """A stand-in read. The glyph pack is gone, and the policy tests still need a stable score."""
+
+    def __init__(self, away, home, conf=0.91, margin=0.42, period=None):
+        self.away, self.home = away, home
+        self.conf, self.margin, self._period = conf, margin, period
+
+    def read(self, _img):
+        return EndMenuRead(True, self.away, self.home, "ok", self.conf, self.margin,
+                           [{"source": "scripted", "xcheck": "skipped"}])
+
+    def period(self, _img):
+        return self._period
+
+
+def test_a_partial_end_menu_set_abstains(monkeypatch, tmp_path):
+    """Digits 0-8 are not a pack. The reader abstains instead of matching the nearest glyph."""
+    import qorcap_template_guard as guard
+    from qorcap_template_guard import TEMPLATES_MISSING
+
+    prov = _end_menu_provenance(tmp_path, "012345678")
+    monkeypatch.setattr(guard, "PROVENANCE_PATH", prov)
+    reader = EndMenuReader()
+    assert reader._missing and reader.xpack is None
+    rd = reader.read(np.zeros((360, 640, 3), np.uint8))
+    assert rd.ok is False and rd.reason == TEMPLATES_MISSING
+    assert rd.away is None and rd.home is None
+
+
+def test_a_complete_end_menu_set_loads(monkeypatch, tmp_path):
+    import qorcap_template_guard as guard
+
+    prov = _end_menu_provenance(tmp_path, "0123456789")
+    monkeypatch.setattr(guard, "PROVENANCE_PATH", prov)
+    reader = EndMenuReader()
+    assert reader._missing is False
+    assert set(reader.labels) >= set("0123456789")
+    assert reader.pack_id == "harvested-end-menu"
+    assert reader.end_menu_model_id.startswith("end_menu:harvested-end-menu:")
+
+
+def _committed_arrays():
+    import qorcap_endmenu as em
+
+    with np.load(em.PACK) as blob:
+        return (
+            [str(x) for x in blob["labels"]],
+            [str(x) for x in blob["source"]],
+            np.array(blob["vecs"], np.float32, copy=True),
+            np.array(blob["ot_vec"], np.float32, copy=True),
+        )
+
+
+def _save_pack(path: Path, labels, sources, vecs, ot) -> None:
+    np.savez_compressed(
+        path,
+        labels=np.array(labels),
+        vecs=np.asarray(vecs, np.float32),
+        source=np.array(sources),
+        ot_vec=np.asarray(ot, np.float32),
+    )
+
+
+def _accept_pack(monkeypatch, path: Path) -> None:
+    import hashlib
+
+    import qorcap_endmenu as em
+
+    monkeypatch.setattr(em, "PACK", path)
+    monkeypatch.setattr(em, "LEGACY_END_MENU_SHA256", hashlib.sha256(path.read_bytes()).hexdigest())
+
+
+def test_legacy_pack_rejects_a_sha_mismatch(monkeypatch, tmp_path):
+    import qorcap_endmenu as em
+
+    labels, sources, vecs, ot = _committed_arrays()
+    vecs = vecs.copy()
+    vecs[0, 0] = float(vecs[0, 0]) + 0.25
+    path = tmp_path / "pack.npz"
+    _save_pack(path, labels, sources, vecs, ot)
+    monkeypatch.setattr(em, "PACK", path)
+    assert em._legacy_end_menu(path) is False
+
+
+def test_legacy_pack_rejects_a_different_path(monkeypatch, tmp_path):
+    import hashlib
+
+    import qorcap_endmenu as em
+
+    labels, sources, vecs, ot = _committed_arrays()
+    path = tmp_path / "pack.npz"
+    _save_pack(path, labels, sources, vecs, ot)
+    monkeypatch.setattr(em, "LEGACY_END_MENU_SHA256", hashlib.sha256(path.read_bytes()).hexdigest())
+    assert path.resolve() != em.PACK.resolve()
+    assert em._legacy_end_menu(path) is False
+
+
+def test_legacy_pack_rejects_a_missing_digit(monkeypatch, tmp_path):
+    import qorcap_endmenu as em
+
+    labels, sources, vecs, ot = _committed_arrays()
+    keep = [i for i, lab in enumerate(labels) if lab != "9"]
+    path = tmp_path / "pack.npz"
+    _save_pack(path, [labels[i] for i in keep], [sources[i] for i in keep], vecs[keep], ot)
+    _accept_pack(monkeypatch, path)
+    assert em._legacy_end_menu(path) is False
+
+
+def test_legacy_pack_rejects_a_held_out_source_string(monkeypatch, tmp_path):
+    import qorcap_endmenu as em
+
+    labels, sources, vecs, ot = _committed_arrays()
+    sources = list(sources)
+    sources[0] = "real:95"
+    path = tmp_path / "pack.npz"
+    _save_pack(path, labels, sources, vecs, ot)
+    _accept_pack(monkeypatch, path)
+    assert em._legacy_end_menu(path) is False
+
+
+def test_125430_rows_relabelled_synthetic_are_rejected(monkeypatch, tmp_path):
+    """The source string no longer says 125430. The glyph bytes still do."""
+    import qorcap_endmenu as em
+
+    assert {
+        "0542479ccb5e17ec9e3476c9e5eaaaa94cccccf6b9732b4db275c2b27a2969ac",
+        "4b0bf1393685df0c33a43fda2a40cc2f459ba859e8c2c808179441a37100bbdb",
+        "84744bfaa6535b0e643f09f913e53a103187e721775cec5730de8129e7cceaf7",
+    } <= em._HELD_OUT_GLYPH_SHA256
+    labels, sources, vecs, ot = _committed_arrays()
+    row = np.zeros((1, vecs.shape[1]), np.float32)
+    row[0, 0] = 0.5
+    glyph = em._glyph_sha(row[0])
+    monkeypatch.setattr(em, "_HELD_OUT_GLYPH_SHA256", em._HELD_OUT_GLYPH_SHA256 | {glyph})
+    path = tmp_path / "pack.npz"
+    _save_pack(
+        path,
+        labels + ["1"],
+        sources + ["synthetic"],
+        np.vstack([vecs, row]),
+        ot,
+    )
+    _accept_pack(monkeypatch, path)
+    assert em._legacy_end_menu(path) is False
+
+
+def test_partial_harvest_does_not_fall_back_to_the_pinned_pack(monkeypatch):
+    import qorcap_template_guard as guard
+
+    def partial(role, profile=None, path=None):
+        if role == "end_menu":
+            return {"0": np.zeros((1, 12 * 18), np.float32)}
+        return {}
+
+    monkeypatch.setattr(guard, "harvested_vectors", partial)
+    reader = EndMenuReader()
+    assert reader._missing
+    assert reader.pack_id == "missing"
+
+
+def test_hershey_stays_in_the_provenance_list():
+    from qorcap_endmenu import provenance_tokens
+
+    assert "hershey" in provenance_tokens(["synthetic:hershey", "real:600"])
+    agreed = EndMenuAgreement(n=1, min_span_ms=0)
+    read = EndMenuRead(
+        True, 0, 20, "ok", 0.9, 0.4,
+        [{"source": "synthetic:hershey", "xcheck": "skipped"}],
+        pack_id="madden27_end_menu_v2",
+        pack_sha256="ab",
+        end_menu_model_id="end_menu:madden27_end_menu_v2:0123456789abcdef",
+    )
+    stable = agreed.offer(0, read)
+    assert stable is not None
+    assert "hershey" in stable["template_sources"]
+    assert "synthetic" in stable["template_sources"]
+    assert stable["pack_id"] == "madden27_end_menu_v2"
+    assert stable["pack_sha256"] == "ab"
+    assert stable["end_menu_model_id"].startswith("end_menu:")
+
+
+def test_hershey_rows_match_the_generator():
+    sys.path.insert(0, str(HERE.parent / "tools"))
+    from make_end_menu_hershey import hershey_mismatch
+
+    assert hershey_mismatch() is None
+
+
+def test_partial_end_menu_harvest_keeps_the_recorded_final_green(monkeypatch, tmp_path):
+    """A partial end-menu harvest abstains and does not turn the tail check red."""
+    import qorcap_template_guard as guard
+    from qorcap_template_guard import TEMPLATES_MISSING, digits_complete
+
+    real = guard.harvested_vectors
+
+    def partial(role, profile=None, path=None):
+        if role == "end_menu":
+            row = np.zeros((1, 12 * 18), np.float32)
+            return {digit: row for digit in "012345678"}
+        return real(role, profile=profile, path=path)
+
+    monkeypatch.setattr(guard, "harvested_vectors", partial)
+    assert digits_complete("end_menu") is False
+    ambient = EndMenuReader()
+    assert ambient._missing
+    assert ambient.read(np.zeros((360, 640, 3), np.uint8)).reason == TEMPLATES_MISSING
+    os.environ.setdefault("QORTIME", "/tmp/qortime")
+    from test_qorcap_match import test_tail_final_check_confirms_from_recorded_frames
+
+    test_tail_final_check_confirms_from_recorded_frames(tmp_path)
+
+
+def test_held_out_125430_finish_menu_reads_7_14():
+    """Grade the 125430 finish menu once end-menu glyphs are allowlisted."""
+    import pytest
+    from qorcap_template_guard import digits_complete
+
+    # A partial harvest still has the role. The grader runs only once 0-9 are all present.
+    if not digits_complete("end_menu"):
+        pytest.skip("templates_missing: held-out 125430 end-menu evaluation waits for end-menu digits 0-9")
+    fin = cv2.imread(str(HERE / "fixtures" / "m27_end_menu_finish.jpg"))
+    assert fin is not None
+    reader = EndMenuReader()
+    away_left = reader.read(RST)
+    finish = reader.read(fin)
+    assert away_left.ok and (away_left.away, away_left.home) == (0, 20), away_left
+    assert finish.ok and (finish.away, finish.home) == (7, 14), finish
+
+
+def test_reads_both_matches_away_left_home_right(menu):
+    """A substituted empty provenance abstains. The committed 143212 pack is not used."""
+    from qorcap_template_guard import TEMPLATES_MISSING
+    blank = np.zeros((360, 640, 3), np.uint8)
+    for frame in (blank, RST, cv2.resize(RST, (1280, 720))):
+        rd = menu.read(frame)
+        assert rd.ok is False and rd.reason == TEMPLATES_MISSING, rd
+        assert rd.away is None and rd.home is None
+    assert menu.xpack is None and menu._missing
+    assert not (HERE / "packs" / "madden27_end_menu_v1.npz").is_file()
+
+
+def test_unreadable_fails_closed(menu):
+    assert not menu.read(np.zeros((360, 640, 3), np.uint8)).ok
     smudge = RST.copy()
     cv2.rectangle(smudge, (395, 40), (412, 50), (255, 255, 255), -1)   # damage the "2"
-    assert not R.read(smudge).ok
-    assert not R.read(None).ok
+    assert not menu.read(smudge).ok
+    assert not menu.read(None).ok
 
 
 def test_agreement_needs_consecutive_frames():
@@ -79,17 +378,18 @@ class Paused:
         pass
 
 
-def _core(last):
+def _core(last, reader):
     posts = []
     core = ReaderCore(posts.append, None, None, Paused(), detect_final, final_screen_detector=madden_final_screen,
-                      end_menu_reader=R)
+                      end_menu_reader=reader)
     core.timeline = [dict(last)]
     return core, posts
 
 
 def test_core_end_menu_final_overrides_scorebug_and_notes():
     """Match 2 (0-20 end menu vs 0-17 scorebug): accepted as end_menu_read but NOT confirmed without corroboration."""
-    core, posts = _core({"t_ms": 0, "home": 17, "away": 0, "quarter": 4, "clock_s": 0, "clock_red": True})
+    core, posts = _core({"t_ms": 0, "home": 17, "away": 0, "quarter": 4, "clock_s": 0, "clock_red": True},
+                        ScriptedEndMenu(0, 20))
     for k in range(6):
         core.on_frame(10_000 + k * 500, RST)
     fins = [p for p in posts if p["type"] == "final"]
@@ -104,7 +404,8 @@ def test_core_end_menu_final_overrides_scorebug_and_notes():
 
 
 def test_core_end_menu_match2_confirms_with_haptic_corroboration():
-    core, posts = _core({"t_ms": 0, "home": 17, "away": 0, "quarter": 4, "clock_s": 0, "clock_red": True})
+    core, posts = _core({"t_ms": 0, "home": 17, "away": 0, "quarter": 4, "clock_s": 0, "clock_red": True},
+                        ScriptedEndMenu(0, 20))
     core.delta_corroboration = [{"kind": "haptic", "t_ms": 500}]
     for k in range(6):
         core.on_frame(10_000 + k * 500, RST)
@@ -113,20 +414,23 @@ def test_core_end_menu_match2_confirms_with_haptic_corroboration():
 
 
 def test_core_end_menu_match1_no_note():
-    core, posts = _core({"t_ms": 0, "home": 14, "away": 7, "quarter": 4, "clock_s": 0, "clock_red": True})
+    """Exact 7-14 confirms. The 125430 finish frame is held out and is not the image under test."""
+    core, posts = _core({"t_ms": 0, "home": 14, "away": 7, "quarter": 4, "clock_s": 0, "clock_red": True},
+                        ScriptedEndMenu(7, 14))
     for k in range(6):
-        core.on_frame(10_000 + k * 500, FIN)
+        core.on_frame(10_000 + k * 500, RST)
     f = [p for p in posts if p["type"] == "final" and p["basis"] == "end_menu"][0]
     assert (f["away"], f["home"]) == (7, 14) and f["notes"] == []
     assert f["final_confirmed"] is True and f["delta_corroboration"]["kind"] == "exact_match"
 
 
 def test_core_rejects_inconsistent_or_pre_q4():
-    core, posts = _core({"t_ms": 0, "home": 3, "away": 0, "quarter": 4, "clock_s": 0})
+    menu = ScriptedEndMenu(0, 20)
+    core, posts = _core({"t_ms": 0, "home": 3, "away": 0, "quarter": 4, "clock_s": 0}, menu)
     for k in range(6):
         core.on_frame(10_000 + k * 500, RST)        # 0-3 -> 0-20 is not one play: refuse, stay unconfirmed
     assert not any(p.get("basis") == "end_menu" for p in posts) and core.end_menu_rejected
-    core, posts = _core({"t_ms": 0, "home": 17, "away": 0, "quarter": 2, "clock_s": 0})
+    core, posts = _core({"t_ms": 0, "home": 17, "away": 0, "quarter": 2, "clock_s": 0}, menu)
     for k in range(6):
         core.on_frame(10_000 + k * 500, RST)
     assert not any(p.get("basis") == "end_menu" for p in posts)
@@ -149,27 +453,28 @@ def test_apply_final_fields():
     assert r["final_confirmed"] is False and r["method"] == "last_scorebug_read_unconfirmed" and "final_basis" not in r
 
 
-def test_tnp_ot_end_menu_reads_walkoff_and_sets_quarter():
+def test_tnp_ot_end_menu_reads_walkoff_and_sets_quarter(menu):
+    from qorcap_template_guard import TEMPLATES_MISSING
     ot = cv2.imread(str(HERE / "fixtures" / "m27_tnp_091651_end_menu.jpg"))
     assert madden_final_screen(prep(ot))
-    rd = R.read(ot)
-    assert rd.ok and (rd.away, rd.home) == (10, 16), rd
-    assert R.period(ot) == "OT"
-    assert all(d["source"] == "real" for d in rd.digits)
+    rd = menu.read(ot)
+    assert not rd.ok and rd.reason == TEMPLATES_MISSING and rd.away is None and rd.home is None
+    assert menu.period(ot) is None  # ot_vec lived in the removed pack
+    menu = ScriptedEndMenu(10, 16, period="OT")
     # Walk-off: last scorebug is OT 1:55, same score. Clock is not 0:00; the menu still confirms.
-    core, posts = _core({"t_ms": 0, "home": 16, "away": 10, "quarter": 5, "clock_s": 115, "clock_red": False})
+    core, posts = _core({"t_ms": 0, "home": 16, "away": 10, "quarter": 5, "clock_s": 115, "clock_red": False}, menu)
     for k in range(6):
         core.on_frame(10_000 + k * 500, ot)
     f = [p for p in posts if p.get("basis") == "end_menu"][0]
     assert (f["away"], f["home"], f["quarter"], f["final_confirmed"]) == (10, 16, 5, True)
     # Regulation ended 10-10; the menu is one touchdown later and says OT, so the final quarter is 5.
-    core, posts = _core({"t_ms": 0, "home": 10, "away": 10, "quarter": 4, "clock_s": 0})
+    core, posts = _core({"t_ms": 0, "home": 10, "away": 10, "quarter": 4, "clock_s": 0}, menu)
     for k in range(6):
         core.on_frame(10_000 + k * 500, ot)
     f = [p for p in posts if p.get("basis") == "end_menu"][0]
     assert f["quarter"] == 5 and f["final_confirmed"] is False
     # A Q4 menu with the clock still running does not end the match, OT paint or not.
-    core, posts = _core({"t_ms": 0, "home": 16, "away": 10, "quarter": 4, "clock_s": 30})
+    core, posts = _core({"t_ms": 0, "home": 16, "away": 10, "quarter": 4, "clock_s": 30}, menu)
     for k in range(6):
         core.on_frame(10_000 + k * 500, ot)
     assert not any(p.get("basis") == "end_menu" for p in posts)
@@ -177,8 +482,9 @@ def test_tnp_ot_end_menu_reads_walkoff_and_sets_quarter():
 
 
 def test_core_rejects_end_menu_before_clock_zero():
-    """Doctored end-menu frames matching a mid-Q4 score must not end the match early."""
-    core, posts = _core({"t_ms": 0, "home": 20, "away": 0, "quarter": 4, "clock_s": 30, "clock_red": False})
+    """A menu that matches the current score must not end the match while the clock is still running."""
+    core, posts = _core({"t_ms": 0, "home": 20, "away": 0, "quarter": 4, "clock_s": 30, "clock_red": False},
+                        ScriptedEndMenu(0, 20))
     for k in range(6):
         core.on_frame(10_000 + k * 500, RST)  # real end-menu fixture reading 0-20
     assert not any(p.get("basis") == "end_menu" for p in posts)
@@ -251,9 +557,10 @@ def test_tail_loads_bundle_haptics_when_core_has_no_corr(tmp_path):
             pass
 
     def fac(post):
-        # No pre-seeded delta_corroboration — must come from the bundle via load_delta_corroboration_from_bundle
+        # No pre-seeded delta_corroboration — must come from the bundle via load_delta_corroboration_from_bundle.
+        # The digit pack is gone; the haptic gate is what this test locks.
         return ReaderCore(post, None, None, Paused(), detect_final, final_screen_detector=madden_final_screen,
-                          end_menu_reader=R)
+                          end_menu_reader=ScriptedEndMenu(0, 20))
 
     out = qm.tail_final_check(b, draft, ffmpeg="ffmpeg-missing", core_factory=fac, frames=frames)
     r = out["result"]
@@ -323,7 +630,7 @@ def test_finalize_aggregates_091651_end_menu_to_confirmed_ot_final(capsys):
 
     def factory(post):
         core = ReaderCore(post, None, None, Paused(), detect_final, final_screen_detector=madden_final_screen,
-                          end_menu_reader=R)
+                          end_menu_reader=ScriptedEndMenu(10, 16, period="OT"))
         core.timeline = [
             {"t_ms": 1_000, "home": 16, "away": 10, "quarter": 5, "clock_s": 115, "clock_red": False},
             {"t_ms": 2_000, "home": 16, "away": 10, "quarter": None, "clock_s": 115, "clock_red": False},
@@ -349,14 +656,19 @@ def test_finalize_aggregates_091651_end_menu_to_confirmed_ot_final(capsys):
     assert "END MENU rejected" not in capsys.readouterr().err
 
 
-def test_standard_end_menu_reads_and_confirms_hou_30_jax_6():
-    """match-20261017-110028: standard end menu, last scorebug clock 0:03 red, exact 30-6."""
+def test_standard_end_menu_reads_and_confirms_hou_30_jax_6(menu):
+    """110028 is not an allowlisted template match, so the glyph reader abstains.
+
+    The exact-match gate and the red-clock gate still run on a scripted 30-6.
+    """
     import qorcap_match as qm
+    from qorcap_template_guard import TEMPLATES_MISSING
     im = cv2.imread(str(HERE / "fixtures" / "m27_std_110028_end_menu.jpg"))
     assert madden_final_screen(prep(im))
-    rd = R.read(im)
-    assert rd.ok and (rd.away, rd.home) == (30, 6), rd
-    core, posts = _core({"t_ms": 0, "home": 6, "away": 30, "quarter": 4, "clock_s": 3, "clock_red": True})
+    rd = menu.read(im)
+    assert not rd.ok and rd.reason == TEMPLATES_MISSING and rd.away is None and rd.home is None
+    scripted = ScriptedEndMenu(30, 6)
+    core, posts = _core({"t_ms": 0, "home": 6, "away": 30, "quarter": 4, "clock_s": 3, "clock_red": True}, scripted)
     for k in range(6):
         core.on_frame(10_000 + k * 500, im)
     f = [p for p in posts if p.get("basis") == "end_menu"][0]
@@ -365,7 +677,7 @@ def test_standard_end_menu_reads_and_confirms_hou_30_jax_6():
     res = qm.apply_final({"final_t_ms": 1}, f)
     assert (res["away_score"], res["home_score"], res["quarter"], res["winner"]) == (30, 6, 4, "away")
     # A red 0:14 is still a running quarter.
-    core, posts = _core({"t_ms": 0, "home": 6, "away": 30, "quarter": 4, "clock_s": 14, "clock_red": True})
+    core, posts = _core({"t_ms": 0, "home": 6, "away": 30, "quarter": 4, "clock_s": 14, "clock_red": True}, scripted)
     for k in range(6):
         core.on_frame(10_000 + k * 500, im)
     assert not any(p.get("basis") == "end_menu" for p in posts)
@@ -406,7 +718,7 @@ def test_end_menu_after_the_clock_dies_at_the_q1_q2_break():
     rd = Rdr()
     blank = np.zeros((360, 640, 3), np.uint8)
     core = ReaderCore(posts.append, rd, Agree(), None, detect_final, final_screen_detector=madden_final_screen,
-                      end_menu_reader=R)
+                      end_menu_reader=ScriptedEndMenu(30, 6))
     rd.next = FR(ok=True, reason="ok", left_score=30, right_score=6, quarter=1, clock_seconds=1, clock_red=False)
     core.on_frame(0, blank)
     rd.next = FR(ok=False, reason="quarter_unsure", left_score=30, right_score=6, quarter=None,
@@ -425,7 +737,8 @@ def test_end_menu_after_the_clock_dies_at_the_q1_q2_break():
 
 
 def test_end_menu_rejection_is_logged(capsys):
-    core, posts = _core({"t_ms": 0, "home": 20, "away": 0, "quarter": 4, "clock_s": 30, "clock_red": False})
+    core, posts = _core({"t_ms": 0, "home": 20, "away": 0, "quarter": 4, "clock_s": 30, "clock_red": False},
+                        ScriptedEndMenu(0, 20))
     for k in range(6):
         core.on_frame(10_000 + k * 500, RST)
     err = capsys.readouterr().err
@@ -444,13 +757,16 @@ def _floats(v, path=""):
 
 
 def test_posted_end_menu_final_is_jcs_safe_match_193534():
-    """v0.3.25 regression (match-20261018-193534): the live end-menu final carried end_menu.conf and
-    end_menu.margin as floats; qorcap.exe's JCS hash panicked with the match state locked and the recording
-    stopped. Every posted event must canonicalize under the QorTime JCS profile (no floats)."""
+    """v0.3.25 regression (match 193534): a posted end-menu final carried conf and margin as floats.
+
+    That match is held out, so this test does not open its footage. A scripted read still has those
+    floats in memory, and the event posted to qorcap.exe must canonicalize them.
+    """
     from qor_receipt.jcs import canonicalize
-    core, posts = _core({"t_ms": 0, "home": 14, "away": 7, "quarter": 4, "clock_s": 0, "clock_red": True})
+    core, posts = _core({"t_ms": 0, "home": 14, "away": 7, "quarter": 4, "clock_s": 0, "clock_red": True},
+                        ScriptedEndMenu(7, 14, conf=0.953, margin=0.421))
     for k in range(6):
-        core.on_frame(10_000 + k * 500, FIN)
+        core.on_frame(10_000 + k * 500, RST)
     f = next(p for p in posts if p["type"] == "final" and p["basis"] == "end_menu")
     # the reader's own state still holds the floats (the referee's end-menu fallback reads `conf`) ...
     assert isinstance(core.final["end_menu"]["conf"], float) and isinstance(core.final["end_menu"]["margin"], float)

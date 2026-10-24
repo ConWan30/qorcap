@@ -257,7 +257,10 @@ def _fixture(name):
 
 
 def test_end_menu_detector_is_cursor_independent_on_real_frames():
-    """match-20261016-143212: cursor on RESTART (missed live by v0.3.2); match 125430: cursor on FINISH GAME."""
+    """match-20261016-143212: cursor on RESTART (missed live by v0.3.2); match 125430: cursor on FINISH GAME.
+
+    The 125430 frame is held-out evaluation of the menu detector. It is not a harvest source.
+    """
     from qorcap_reader import madden_final_screen
     assert madden_final_screen(_fixture("m27_end_menu_restart.jpg"))
     assert madden_final_screen(_fixture("m27_end_menu_finish.jpg"))
