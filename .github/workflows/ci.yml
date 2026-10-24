@@ -72,6 +72,15 @@ jobs:
             sidecar/test_qorcap_release.py \
             tools/test_frame_clock_ab.py \
             sidecar/test_qorcap_reader.py \
+            sidecar/test_qorcap_match.py::test_refresh_off_the_frame_thread_keeps_four_hertz \
+            sidecar/test_qorcap_match.py::test_incremental_tail_matches_full_parse \
+            sidecar/test_qorcap_match.py::test_tail_reparse_when_the_window_before_the_offset_changes \
+            sidecar/test_qorcap_match.py::test_options_press_is_known_before_end_menu_can_lock \
+            sidecar/test_qorcap_match.py::test_reader_crash_leaves_enter_and_the_heartbeat_running \
+            sidecar/test_qorcap_match.py::test_refresh_thread_is_joined_before_the_reader_returns \
+            sidecar/test_qorcap_match.py::test_closed_health_span_is_written_when_the_reader_stops \
+            sidecar/test_qorcap_match.py::test_closed_health_span_is_written_when_the_reader_crashes \
+            sidecar/test_qorcap_match.py::test_reader_timing_log_names_the_three_clocks \
             sidecar/test_qorcap_standard.py \
             sidecar/test_qorcap_score_grammar.py \
             sidecar/test_qorcap_hl170123.py \
@@ -196,6 +205,15 @@ jobs:
             sidecar/test_qorcap_release.py \
             tools/test_frame_clock_ab.py \
             sidecar/test_qorcap_reader.py \
+            sidecar/test_qorcap_match.py::test_refresh_off_the_frame_thread_keeps_four_hertz \
+            sidecar/test_qorcap_match.py::test_incremental_tail_matches_full_parse \
+            sidecar/test_qorcap_match.py::test_tail_reparse_when_the_window_before_the_offset_changes \
+            sidecar/test_qorcap_match.py::test_options_press_is_known_before_end_menu_can_lock \
+            sidecar/test_qorcap_match.py::test_reader_crash_leaves_enter_and_the_heartbeat_running \
+            sidecar/test_qorcap_match.py::test_refresh_thread_is_joined_before_the_reader_returns \
+            sidecar/test_qorcap_match.py::test_closed_health_span_is_written_when_the_reader_stops \
+            sidecar/test_qorcap_match.py::test_closed_health_span_is_written_when_the_reader_crashes \
+            sidecar/test_qorcap_match.py::test_reader_timing_log_names_the_three_clocks \
             sidecar/test_qorcap_standard.py \
             sidecar/test_qorcap_score_grammar.py \
             sidecar/test_qorcap_tnp.py \

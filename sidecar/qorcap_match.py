@@ -164,7 +164,60 @@ class Countersigner:
 
 
 STATIC_FRAME_S = 1.0
+FRAME_PERIOD_S = 0.25  # the frame loop aims at 4 Hz, subtracting the work already done
+# OPTIONS presses ride this refresh. The end menu locks on 3 frames (~0.75 s at 4 Hz),
+# so a 2 s period can accept a pause menu before the press is known. 0.5 s stays inside
+# that window. A refresh with no new bytes is a short stat and read.
+REFRESH_PERIOD_S = 0.5
+READER_HEALTH_LOG_S = 30.0
 SHUTDOWN_TIMEOUT_S = 900  # input proof decodes the whole video once; never kill QorCap mid-bundle
+
+
+def _ms_stats(samples: list[float]) -> dict:
+    if not samples:
+        return {"n": 0, "mean_ms": None, "max_ms": None}
+    return {"n": len(samples), "mean_ms": int(round(sum(samples) / len(samples))), "max_ms": int(round(max(samples)))}
+
+
+def reader_timing_row(t_ms: int, frame_periods_ms, refresh_ms, on_frame_ms, fetch_ms, open_health=None) -> dict:
+    """One 30 s health line. Not a receipt field and not a timeline observation."""
+    row = {
+        "kind": "timing",
+        "t_ms": int(t_ms),
+        "frame_period_ms": _ms_stats(list(frame_periods_ms)),
+        "refresh_ms": None if refresh_ms is None else int(round(float(refresh_ms))),
+        "on_frame_ms": _ms_stats(list(on_frame_ms)),
+        "fetch_ms": _ms_stats(list(fetch_ms)),
+    }
+    if open_health:
+        row["open"] = open_health
+    return row
+
+
+def format_reader_timing(row: dict) -> str:
+    frame = row.get("frame_period_ms") or {}
+    work = row.get("on_frame_ms") or {}
+    return (f"reader health: frame_period_ms mean={frame.get('mean_ms')} max={frame.get('max_ms')} "
+            f"refresh_ms={row.get('refresh_ms')} on_frame_ms mean={work.get('mean_ms')} max={work.get('max_ms')}")
+
+
+def append_reader_health(path: Path, row: dict) -> None:
+    """Append one diagnostics line beside the bundle. Not a receipt field."""
+    with open(path, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(row, separators=(",", ":")) + "\n")
+
+
+def open_reader_health(core) -> dict:
+    """Spans that are still open, so a stall shows up before the span closes."""
+    out = {}
+    for name, span in (("reader_lag", getattr(core, "_lag", None)), ("score_unagreed", getattr(core, "_unagreed", None))):
+        if not span:
+            continue
+        item = {k: span[k] for k in ("t_ms", "until_ms", "obs", "n", "max_gap_ms") if k in span}
+        if span.get("reasons"):
+            item["reasons"] = dict(span["reasons"])
+        out[name] = item
+    return out
 
 
 def countersign_new_from_file(path: Path, cs: "Countersigner") -> int:
@@ -279,7 +332,7 @@ def build_receipt(draft: dict, cps: list[dict], device, referee, *, match_id: st
 
 
 # ------------------------------------------------------------------ scorebug sources
-def start_reader(api: Api, stop: threading.Event, state: dict, bundle: Path | None = None) -> threading.Thread:
+def start_reader(api: Api, stop: threading.Event, state: dict, bundle: Path | None = None, clock=None) -> threading.Thread:
     import hashlib
 
     import cv2
@@ -326,8 +379,20 @@ def start_reader(api: Api, stop: threading.Event, state: dict, bundle: Path | No
         except Exception:
             core.delta_corroboration = []
 
+    health_path = (bundle / "reader_health.jsonl") if bundle is not None else None
+
+    def _write_health(row):
+        if health_path is None:
+            return
+        try:
+            append_reader_health(health_path, row)
+        except Exception as e:
+            print(f"reader health write failed: {type(e).__name__}: {e}", file=sys.stderr)
+
+    core.health_write = _write_health
+
     def _refresh_corr():
-        """Pull score-change clip hashes from /timeline + re-read haptics/inputs from the live bundle."""
+        """Pull score-change clip hashes from /timeline + tail haptics/inputs from the live bundle."""
         clips = []
         try:
             tl = api.get("/timeline", timeout=1)
@@ -349,43 +414,98 @@ def start_reader(api: Api, stop: threading.Event, state: dict, bundle: Path | No
             if key not in seen:
                 merged.append(e)
                 seen.add(key)
+        # Publish a new list. The frame thread keeps whatever list it already loaded.
         core.delta_corroboration = merged
 
-    def loop():
-        last, last_t, last_corr = None, 0.0, 0.0
-        while not stop.is_set():
-            now = time.monotonic()
-            if now - last_corr >= 1.0:
-                last_corr = now
-                try:
-                    _refresh_corr()
-                except Exception as e:
-                    state["corr_error"] = f"{type(e).__name__}: {e}"
-                if bundle is not None:
-                    try:
-                        note_options_from_inputs(core, bundle / "inputs.jsonl")
-                    except Exception as e:
-                        state["options_error"] = f"{type(e).__name__}: {e}"
+    def refresh():
+        t0 = time.perf_counter()
+        try:
+            _refresh_corr()
+        except Exception as e:
+            state["corr_error"] = f"{type(e).__name__}: {e}"
+        if bundle is not None:
             try:
-                with urllib.request.urlopen(api.base + "/snapshot.jpg", timeout=3) as r:
-                    data = r.read()
-            except Exception:
-                time.sleep(0.5)
-                continue
-            h = hashlib.sha256(data).digest()
-            # A perfectly static screen (end-of-game menu) can produce byte-identical snapshots; still feed
-            # it about once a second so time-based spans (final_screen >= 3 s) can grow.
-            if h != last or time.monotonic() - last_t >= STATIC_FRAME_S:
-                last, last_t = h, time.monotonic()
-                img = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
-                if img is not None:
-                    try:
-                        core.on_frame(int(time.time() * 1000), img)
-                    except Exception as e:  # never let one bad frame kill the reader thread
-                        state["reader_error"] = f"{type(e).__name__}: {e}"
-            time.sleep(0.25)
+                note_options_from_inputs(core, bundle / "inputs.jsonl")
+            except Exception as e:
+                state["options_error"] = f"{type(e).__name__}: {e}"
+        state["refresh_ms"] = (time.perf_counter() - t0) * 1000.0
 
-    t = threading.Thread(target=loop, daemon=True)
+    # Private to this refresh thread. Cleanup must not set the match-wide stop: that is
+    # what ENTER/Q and the official live heartbeat wait on, including after the final.
+    refresh_stop = threading.Event()
+    wait = clock if clock is not None else (lambda ev, seconds: ev.wait(seconds))
+
+    def refresh_worker():
+        # The first refresh already ran on the starter thread. Later ones stay off the frame thread.
+        while not wait(refresh_stop, REFRESH_PERIOD_S):
+            refresh()
+
+    def loop():
+        last, last_t = None, 0.0
+        prev_tick = None
+        periods, ons, fetches = [], [], []
+        window_start = time.monotonic()
+        try:
+            while not stop.is_set():
+                tick = time.perf_counter()
+                if prev_tick is not None:
+                    periods.append((tick - prev_tick) * 1000.0)
+                prev_tick = tick
+                try:
+                    tf = time.perf_counter()
+                    with urllib.request.urlopen(api.base + "/snapshot.jpg", timeout=3) as r:
+                        data = r.read()
+                    fetches.append((time.perf_counter() - tf) * 1000.0)
+                except Exception:
+                    if stop.wait(0.5):
+                        return
+                    continue
+                h = hashlib.sha256(data).digest()
+                # A perfectly static screen (end-of-game menu) can produce byte-identical snapshots; still feed
+                # it about once a second so time-based spans (final_screen >= 3 s) can grow.
+                if h != last or time.monotonic() - last_t >= STATIC_FRAME_S:
+                    last, last_t = h, time.monotonic()
+                    img = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
+                    if img is not None:
+                        try:
+                            t_on = time.perf_counter()
+                            core.on_frame(int(time.time() * 1000), img)
+                            ons.append((time.perf_counter() - t_on) * 1000.0)
+                        except Exception as e:  # never let one bad frame kill the reader thread
+                            state["reader_error"] = f"{type(e).__name__}: {e}"
+                now = time.monotonic()
+                if now - window_start >= READER_HEALTH_LOG_S:
+                    row = reader_timing_row(int(time.time() * 1000), periods, state.get("refresh_ms"), ons, fetches,
+                                            open_reader_health(core))
+                    print(format_reader_timing(row), file=sys.stderr)
+                    _write_health(row)
+                    periods, ons, fetches = [], [], []
+                    window_start = now
+                remain = FRAME_PERIOD_S - (time.perf_counter() - tick)
+                if remain > 0 and stop.wait(remain):
+                    return
+        finally:
+            # tail_final_check reuses this process's bundle tail. Wait until the refresh
+            # thread has left it, but don't hang shutdown on a stuck read. refresh_stop
+            # is not the match stop, so a crash here leaves ENTER/Q and the heartbeat up.
+            # Held and still-open health rows are written here. A stall that ends with
+            # the match would otherwise stay in memory.
+            # The flush must stay BEFORE the refresh join. The join gives up after 5 s,
+            # and a stuck refresh must not keep these rows off disk. This runs on the
+            # crash path too: an exception still reaches this finally, and stop is not set.
+            try:
+                core.flush_health()
+            except Exception as e:
+                print(f"reader health flush failed: {type(e).__name__}: {e}", file=sys.stderr)
+            refresh_stop.set()
+            refresh_thread.join(timeout=5.0)
+
+    refresh()
+    refresh_thread = threading.Thread(target=refresh_worker, name="qorcap-refresh", daemon=True)
+    state["refresh_thread"] = refresh_thread
+    refresh_thread.start()
+    t = threading.Thread(target=loop, name="qorcap-reader", daemon=True)
+    state["reader_thread"] = t
     t.start()
     return t
 

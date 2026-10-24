@@ -4,6 +4,8 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -739,3 +741,588 @@ def test_finalize_role_correction_resigns_for_the_corrected_side(tmp_path, capsy
     assert meta3["role"] == "home" and "role_correction" not in meta3
     assert meta3.get("submittable") is not False and "submittable" not in meta3
     assert json.loads((b / "receipt.json").read_text())["referee"]["key_kind"] == qm.REFEREE_KIND
+
+
+def test_reader_timing_log_names_the_three_clocks(tmp_path):
+    row = qm.reader_timing_row(1_000, [250, 300, 280], 12.4, [8, 9], [20, 22],
+                               {"reader_lag": {"obs": "reader_lag", "n": 1, "max_gap_ms": 2100}})
+    assert row["kind"] == "timing"
+    assert row["frame_period_ms"]["n"] == 3 and row["frame_period_ms"]["max_ms"] == 300
+    assert row["refresh_ms"] == 12
+    assert row["on_frame_ms"]["mean_ms"] == 8 or row["on_frame_ms"]["mean_ms"] == 9
+    text = qm.format_reader_timing(row)
+    assert "frame_period_ms" in text and "refresh_ms" in text and "on_frame_ms" in text
+    path = tmp_path / "reader_health.jsonl"
+    qm.append_reader_health(path, row)
+    got = json.loads(path.read_text(encoding="utf-8").strip())
+    assert got["on_frame_ms"]["max_ms"] == 9
+    assert "home" not in got and "away" not in got
+
+
+def test_refresh_off_the_frame_thread_keeps_four_hertz(monkeypatch):
+    """A 1.5 s refresh must not run on the frame thread.
+
+    Sleep releases the GIL (at least 16 frames in 6 s). A CPU burn holds the GIL and
+    still has to stay at or above 3 Hz.
+    """
+    import urllib.request
+
+    import cv2
+    import numpy as np
+
+    import qorcap_reader
+
+    counts = []
+
+    def fast(self, t, img):
+        counts.append(t)
+
+    monkeypatch.setattr(qorcap_reader.ReaderCore, "on_frame", fast)
+    frames = []
+    for i in range(40):
+        # Lossless and unique. JPEG quantization collapsed some of these 8x8 frames
+        # onto the same bytes, and the loop then skipped them for up to a second.
+        img = np.zeros((8, 8, 3), np.uint8)
+        img[:, :, 0] = i
+        ok, buf = cv2.imencode(".png", img)
+        assert ok
+        frames.append(bytes(buf))
+    seq = {"i": 0}
+
+    class _Resp:
+        def __init__(self, data):
+            self._d = data
+
+        def read(self):
+            return self._d
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def urlopen(url, timeout=3):
+        data = frames[seq["i"] % len(frames)]
+        seq["i"] += 1
+        return _Resp(data)
+
+    monkeypatch.setattr(urllib.request, "urlopen", urlopen)
+
+    def drive(mode, floor):
+        def slow_get(self, path, timeout=3):
+            # Sleep releases the GIL. The CPU burn holds it for 1.5 s, which is what a
+            # refresh stuck back on the frame thread would do. Off-thread, the frame
+            # loop still has to clear 3 Hz.
+            if mode == "sleep":
+                time.sleep(1.5)
+            else:
+                deadline = time.perf_counter() + 1.5
+                x = 0
+                while time.perf_counter() < deadline:
+                    x = (x * 1103515245 + 12345) & 0x7FFFFFFF
+            return {}
+
+        monkeypatch.setattr(qm.Api, "get", slow_get)
+        stop = threading.Event()
+        state = {}
+        before = len(counts)
+        thread = qm.start_reader(qm.Api(8791), stop, state, bundle=None)
+        time.sleep(0.3)
+        n0 = len(counts)
+        time.sleep(6.0)
+        n1 = len(counts)
+        stop.set()
+        thread.join(timeout=5)
+        assert n1 - n0 >= floor, (mode, n1 - n0, n0 - before)
+
+    drive("sleep", 16)
+    drive("cpu", 18)  # 3 Hz over 6 s; the burn holds the GIL
+
+
+def _full_jsonl(path: Path) -> list:
+    if not path.is_file():
+        return []
+    rows = []
+    for line in path.read_bytes().decode("utf-8", "replace").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rows.append(json.loads(line))
+        except Exception:
+            continue
+    return rows
+
+
+def _full_corr(bundle: Path) -> list:
+    from qorcap_reader import collect_delta_corroboration
+
+    clips = []
+    meta = bundle / "bundle.json"
+    if meta.is_file():
+        clips.extend(json.loads(meta.read_text(encoding="utf-8")).get("clips") or [])
+    for row in _full_jsonl(bundle / "manifest.jsonl"):
+        if isinstance(row, dict) and row.get("type") == "clip":
+            clips.append(row)
+    return collect_delta_corroboration(
+        clips=clips,
+        haptic_records=[r for r in _full_jsonl(bundle / "haptics.jsonl") if isinstance(r, dict)],
+        input_records=[r for r in _full_jsonl(bundle / "inputs.jsonl") if isinstance(r, dict)],
+    )
+
+
+def test_incremental_tail_matches_full_parse(tmp_path):
+    """A generated inputs file, appended in chunks with a partial last line, matches a full parse."""
+    from qorcap_reader import load_delta_corroboration_from_bundle, note_options_from_inputs, options_presses_ms
+
+    bundle = tmp_path / "match"
+    bundle.mkdir()
+    (bundle / "bundle.json").write_text(json.dumps({"schema": "qorcap-bundle/v0", "clips": []}) + "\n", encoding="utf-8")
+    (bundle / "manifest.jsonl").write_text(
+        json.dumps({"type": "clip", "name": "score-a0-h3", "sha256": "ab" * 32, "t_ms": 5_000}) + "\n",
+        encoding="utf-8")
+    (bundle / "haptics.jsonl").write_text(json.dumps({"type": "haptic", "t_ms": 5_100}) + "\n", encoding="utf-8")
+    inputs = bundle / "inputs.jsonl"
+    parts = []
+    size = 0
+    i = 0
+    while size < 15_000_000:
+        button = 512 if i % 10 == 0 else 0
+        line = f'{{"type":"in","b":{button},"t_us":{i * 1000}}}\n'.encode()
+        parts.append(line)
+        size += len(line)
+        i += 1
+    blob = b"".join(parts)
+
+    class _Opt:
+        def __init__(self):
+            self._inputs_tail = None
+            self.presses = []
+
+        def set_options(self, presses):
+            self.presses = list(presses)
+
+    opt = _Opt()
+
+    def check():
+        note_options_from_inputs(opt, inputs)
+        assert opt.presses == options_presses_ms(_full_jsonl(inputs))
+        assert load_delta_corroboration_from_bundle(bundle) == _full_corr(bundle)
+
+    for off in range(0, len(blob), 3_000_000):
+        with open(inputs, "ab") as fh:
+            fh.write(blob[off:off + 3_000_000])
+        check()
+    with open(inputs, "ab") as fh:
+        fh.write(b'{"type":"in","b":512,"t_us":')  # partial trailing line, not valid JSON yet
+    check()
+    with open(inputs, "ab") as fh:
+        fh.write(b"999}\n")
+    check()
+    with open(bundle / "haptics.jsonl", "ab") as fh:
+        fh.write(json.dumps({"type": "haptic", "t_ms": 9_000}).encode() + b"\n")
+    with open(bundle / "manifest.jsonl", "ab") as fh:
+        fh.write(json.dumps({"type": "clip", "name": "score-a3-h3", "sha256": "cd" * 32, "t_ms": 9_100}).encode() + b"\n")
+    check()
+    rotated = bundle / "inputs-next.jsonl"
+    rotated.write_bytes(b'{"type":"in","b":0,"t_ms":1}\n{"type":"in","b":512,"t_ms":2}\n')
+    os.replace(rotated, inputs)
+    check()
+    inputs.write_bytes(b'{"type":"in","b":512,"t_us":4000}\n{"type":"in","b":')  # truncated, partial again
+    check()
+
+
+def test_tail_reparse_when_the_window_before_the_offset_changes(tmp_path):
+    """A rewrite that keeps the 64-byte prefix and grows past the old offset is parsed again.
+
+    The shrink is not observed: write_bytes replaces the bytes in place, and the next read
+    sees a larger file. The window just before the old offset is what shows the body changed.
+    """
+    from qorcap_reader import load_delta_corroboration_from_bundle, note_options_from_inputs, options_presses_ms
+
+    bundle = tmp_path / "m"
+    bundle.mkdir()
+    (bundle / "bundle.json").write_text("{}\n", encoding="utf-8")
+    (bundle / "manifest.jsonl").write_bytes(b"")
+    (bundle / "haptics.jsonl").write_bytes(b"")
+    inputs = bundle / "inputs.jsonl"
+    blob = b'{"type":"in","b":0,"t_us":1}\n' * 20
+    inputs.write_bytes(blob)
+
+    class _Opt:
+        presses: list = []
+
+        def set_options(self, presses):
+            self.presses = list(presses)
+
+    opt = _Opt()
+
+    def check():
+        note_options_from_inputs(opt, inputs)
+        assert opt.presses == options_presses_ms(_full_jsonl(inputs))
+        assert load_delta_corroboration_from_bundle(bundle) == _full_corr(bundle)
+
+    check()
+    new = blob[:64] + (b'{"type":"in","b":512,"t_ms":10}\n' * 40)
+    assert len(new) > len(blob) and new[:64] == blob[:64]
+    assert new[len(blob) - 64:len(blob)] != blob[-64:]
+    inputs.write_bytes(new)
+    check()
+    with open(inputs, "ab") as fh:
+        fh.write(b'{"type":"in","b":512,"t_ms":77}')  # valid JSON, no newline yet
+    check()
+
+
+class _Clock:
+    """Stand-in for the refresh wait. ``advance`` moves its time; wall time does not."""
+
+    def __init__(self):
+        self._cv = threading.Condition()
+        self.t = 0.0
+        self.waiting = threading.Event()
+
+    def __call__(self, ev, seconds):
+        with self._cv:
+            deadline = self.t + float(seconds)
+            self.waiting.set()
+            while self.t < deadline and not ev.is_set():
+                self._cv.wait(timeout=1.0)
+            return bool(ev.is_set())
+
+    def advance(self, dt):
+        with self._cv:
+            self.t += float(dt)
+            self._cv.notify_all()
+
+
+class _Body:
+    def __init__(self, data):
+        self._d = data
+
+    def read(self):
+        return self._d
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+def _still_jpeg() -> bytes:
+    import cv2
+    import numpy as np
+
+    ok, buf = cv2.imencode(".jpg", np.zeros((8, 8, 3), np.uint8))
+    assert ok
+    return bytes(buf)
+
+
+def _arm_enter(monkeypatch):
+    """Make the next ENTER/Q visible to key_watcher, on Windows or POSIX."""
+    ready = threading.Event()
+    if qm.WIN:
+        import msvcrt
+        monkeypatch.setattr(msvcrt, "kbhit", lambda: ready.is_set())
+        monkeypatch.setattr(msvcrt, "getwch", lambda: "\r")
+    else:
+        import select
+        monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+        monkeypatch.setattr(sys.stdin, "readline", lambda: "\n")
+
+        def fake_select(rlist, wlist, xlist, timeout=None):
+            if ready.wait(0.2 if timeout is None else timeout):
+                return list(rlist)
+            return []
+
+        monkeypatch.setattr(select, "select", fake_select)
+    return ready
+
+
+def test_options_press_is_known_before_end_menu_can_lock(tmp_path, monkeypatch):
+    """An OPTIONS press appended just after a refresh is visible before an end menu can lock.
+
+    EndMenuAgreement commits on 3 frames. At 4 Hz a menu that appears just after a frame
+    is locked by the third following frame, 3 periods later (0.75 s). A 2 s refresh
+    period misses that. 0.5 s does not. The refresh wait uses an injected clock.
+    """
+    import urllib.request
+
+    import qorcap_reader
+    from qorcap_endmenu import EndMenuAgreement
+
+    agree = EndMenuAgreement()
+    lock_s = agree.n * qm.FRAME_PERIOD_S
+    assert lock_s * 1000 >= agree.min_span_ms
+    assert qm.REFRESH_PERIOD_S < lock_s, qm.REFRESH_PERIOD_S
+
+    monkeypatch.setattr(qorcap_reader.ReaderCore, "on_frame", lambda *a, **k: None)
+    jpeg = _still_jpeg()
+    monkeypatch.setattr(urllib.request, "urlopen", lambda url, timeout=3: _Body(jpeg))
+    monkeypatch.setattr(qm.Api, "get", lambda self, path, timeout=3: {})
+
+    bundle = tmp_path / "m"
+    bundle.mkdir()
+    inputs = bundle / "inputs.jsonl"
+    inputs.write_text('{"type":"header","wall_anchor_ms":1000}\n', encoding="utf-8")
+    stop = threading.Event()
+    state = {}
+    clock = _Clock()
+    thread = qm.start_reader(qm.Api(8792), stop, state, bundle=bundle, clock=clock)
+    seen = False
+    try:
+        assert clock.waiting.wait(2)
+        # The synchronous refresh has already consumed the header. The worker is in its wait.
+        with open(inputs, "ab") as fh:
+            fh.write(b'{"type":"in","b":512,"t_ms":2500}\n')
+        clock.advance(lock_s)
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            if 2500 in state["core"]._options_snapshot():
+                seen = True
+                break
+            time.sleep(0.01)
+    finally:
+        stop.set()
+        thread.join(timeout=5)
+    assert seen, qm.REFRESH_PERIOD_S
+    assert not thread.is_alive()
+    alive = [th.name for th in threading.enumerate() if th.name == "qorcap-refresh" and th.is_alive()]
+    assert alive == []
+
+
+@pytest.mark.filterwarnings("ignore::pytest.PytestUnhandledThreadExceptionWarning")
+def test_reader_crash_leaves_enter_and_the_heartbeat_running(monkeypatch):
+    """A raise in the frame loop must not set the match stop.
+
+    ENTER still records user_stop, and the official live heartbeat keeps stepping.
+    """
+    import urllib.request
+
+    import cv2
+
+    import qorcap_reader
+    from qorcap_submit import start_official_live
+
+    monkeypatch.setattr(qorcap_reader.ReaderCore, "on_frame", lambda *a, **k: None)
+    jpeg = _still_jpeg()
+    monkeypatch.setattr(urllib.request, "urlopen", lambda url, timeout=3: _Body(jpeg))
+    monkeypatch.setattr(qm.Api, "get", lambda self, path, timeout=3: {})
+
+    def _boom(*_a, **_k):
+        raise RuntimeError("forced")
+
+    monkeypatch.setattr(cv2, "imdecode", _boom)
+    ready = _arm_enter(monkeypatch)
+
+    class _Live:
+        def __init__(self):
+            self.failures = 0
+            self.steps = 0
+
+        def step(self):
+            self.steps += 1
+
+    stop = threading.Event()
+    state = {}
+    live = _Live()
+    thread = qm.start_reader(qm.Api(8793), stop, state, bundle=None)
+    qm.key_watcher(stop, state)
+    live_thread = start_official_live(live, stop, interval=0.05)
+    thread.join(timeout=3)
+    assert not thread.is_alive()
+    assert not stop.is_set()
+    base = live.steps
+    grew = time.monotonic() + 1
+    while time.monotonic() < grew and live.steps <= base:
+        time.sleep(0.02)
+    assert live.steps > base
+    ready.set()
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline and not state.get("user_stop"):
+        time.sleep(0.02)
+    assert state.get("user_stop") is True
+    assert not stop.is_set()
+    base = live.steps
+    grew = time.monotonic() + 1
+    while time.monotonic() < grew and live.steps <= base:
+        time.sleep(0.02)
+    assert live.steps > base
+    stop.set()
+    live_thread.join(timeout=2)
+    assert not live_thread.is_alive()
+
+
+def test_refresh_thread_is_joined_before_the_reader_returns(monkeypatch):
+    """Shutdown waits on the refresh thread. Dropping the join lets the reader return early.
+
+    A bare 'not alive after stop' check misses that: the refresh wait wakes on its own
+    stop and the daemon exits. This holds the second refresh and requires the reader
+    to still be in join.
+    """
+    import urllib.request
+
+    import qorcap_reader
+
+    monkeypatch.setattr(qorcap_reader.ReaderCore, "on_frame", lambda *a, **k: None)
+    jpeg = _still_jpeg()
+    monkeypatch.setattr(urllib.request, "urlopen", lambda url, timeout=3: _Body(jpeg))
+    entered = threading.Event()
+    hold = threading.Event()
+    calls = {"n": 0}
+
+    def get(self, path, timeout=3):
+        calls["n"] += 1
+        if calls["n"] >= 2:
+            entered.set()
+            hold.wait()
+        return {}
+
+    monkeypatch.setattr(qm.Api, "get", get)
+    stop = threading.Event()
+    state = {}
+    thread = qm.start_reader(qm.Api(8794), stop, state, bundle=None)
+    refresh = state["refresh_thread"]
+    assert refresh is not thread
+    try:
+        assert entered.wait(2.0), calls["n"]
+        stop.set()
+        time.sleep(0.6)
+        assert thread.is_alive()
+        assert refresh.is_alive()
+    finally:
+        hold.set()
+    thread.join(timeout=2)
+    assert not thread.is_alive()
+    refresh.join(timeout=2)
+    assert not refresh.is_alive()
+
+
+def test_closed_health_span_is_written_when_the_reader_stops(tmp_path, monkeypatch):
+    """A span that closes just before stop is in reader_health.jsonl after the join.
+
+    The 30 s hold would otherwise drop it. The write is in the reader thread's cleanup.
+    """
+    import json
+    import urllib.request
+
+    import cv2
+    import numpy as np
+
+    import qorcap_reader
+
+    bundle = tmp_path / "m"
+    bundle.mkdir()
+    health = bundle / "reader_health.jsonl"
+    script = [0, 2100, 2500, 2900, 3300]
+    step = {"i": 0}
+    closed = threading.Event()
+
+    def on_frame(self, _t, _img):
+        i = step["i"]
+        if i >= len(script):
+            closed.set()
+            return
+        step["i"] = i + 1
+        self._note_frame_time(script[i])
+
+    monkeypatch.setattr(qorcap_reader.ReaderCore, "on_frame", on_frame)
+    # Unique frames. A repeated snapshot is skipped for up to a second, and this
+    # script needs a call per step.
+    frames = []
+    for i in range(16):
+        img = np.zeros((8, 8, 3), np.uint8)
+        img[:, :, 0] = i + 1
+        ok, buf = cv2.imencode(".png", img)
+        assert ok
+        frames.append(bytes(buf))
+    seq = {"i": 0}
+
+    def urlopen(url, timeout=3):
+        data = frames[seq["i"] % len(frames)]
+        seq["i"] += 1
+        return _Body(data)
+
+    monkeypatch.setattr(urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(qm.Api, "get", lambda self, path, timeout=3: {})
+    stop = threading.Event()
+    state = {}
+    thread = qm.start_reader(qm.Api(8795), stop, state, bundle=bundle)
+    assert closed.wait(3), step["i"]
+    assert not health.is_file() or "reader_lag" not in health.read_text(encoding="utf-8")
+    stop.set()
+    thread.join(timeout=5)
+    assert not thread.is_alive()
+    rows = [json.loads(line) for line in health.read_text(encoding="utf-8").splitlines() if line.strip()]
+    lags = [row for row in rows if row.get("obs") == "reader_lag"]
+    assert len(lags) == 1 and lags[0]["t_ms"] == 2100 and lags[0]["n"] == 1
+    assert "open_at_exit" not in lags[0]
+
+
+@pytest.mark.filterwarnings("ignore::pytest.PytestUnhandledThreadExceptionWarning")
+def test_closed_health_span_is_written_when_the_reader_crashes(tmp_path, monkeypatch):
+    """A crash after a closed span still writes the row, and does not set the match stop.
+
+    Flushing only when stop is already set leaves this row off disk.
+    """
+    import json
+    import urllib.request
+
+    import cv2
+    import numpy as np
+
+    import qorcap_reader
+
+    bundle = tmp_path / "m"
+    bundle.mkdir()
+    health = bundle / "reader_health.jsonl"
+    script = [0, 2100, 2500, 2900, 3300]
+    step = {"i": 0}
+    closed = threading.Event()
+    decoded = {"n": 0}
+
+    def on_frame(self, _t, _img):
+        i = step["i"]
+        if i >= len(script):
+            closed.set()
+            return
+        step["i"] = i + 1
+        self._note_frame_time(script[i])
+
+    def imdecode(*_a, **_k):
+        decoded["n"] += 1
+        # Five script frames, then the frame that notices the script is done, then raise.
+        if decoded["n"] > len(script) + 1:
+            raise RuntimeError("forced")
+        return np.zeros((8, 8, 3), np.uint8)
+
+    monkeypatch.setattr(qorcap_reader.ReaderCore, "on_frame", on_frame)
+    monkeypatch.setattr(cv2, "imdecode", imdecode)
+    frames = []
+    for i in range(16):
+        img = np.zeros((8, 8, 3), np.uint8)
+        img[:, :, 0] = i + 1
+        ok, buf = cv2.imencode(".png", img)
+        assert ok
+        frames.append(bytes(buf))
+    seq = {"i": 0}
+
+    def urlopen(url, timeout=3):
+        data = frames[seq["i"] % len(frames)]
+        seq["i"] += 1
+        return _Body(data)
+
+    monkeypatch.setattr(urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(qm.Api, "get", lambda self, path, timeout=3: {})
+    stop = threading.Event()
+    state = {}
+    thread = qm.start_reader(qm.Api(8796), stop, state, bundle=bundle)
+    assert closed.wait(3), step["i"]
+    thread.join(timeout=5)
+    assert not thread.is_alive()
+    assert not stop.is_set()
+    rows = [json.loads(line) for line in health.read_text(encoding="utf-8").splitlines() if line.strip()]
+    lags = [row for row in rows if row.get("obs") == "reader_lag"]
+    assert len(lags) == 1 and lags[0]["t_ms"] == 2100 and lags[0]["n"] == 1
+    assert "open_at_exit" not in lags[0]

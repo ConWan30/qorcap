@@ -296,3 +296,315 @@ def test_real_end_menu_confirms_final_through_pause_gate():
         core.on_frame(1792180070000 + k * 1000, end)  # static screen fed ~1/s
     fin = [p for p in posts if p.get("type") == "final"]
     assert fin and fin[0]["basis"] == "final_screen" and (fin[0]["away"], fin[0]["home"]) == (0, 17)
+
+
+class _Band:
+    def tobytes(self):
+        return b"synthetic-band"
+
+
+class _Syn:
+    """Always-ok scorebug read. The numbers are synthetic, not from a recorded match."""
+
+    ok = True
+    reason = "ok"
+    left_score = 0
+    right_score = 3
+    quarter = 1
+    clock_seconds = 100
+    clock_red = False
+
+    @property
+    def pair(self):
+        return (self.left_score, self.right_score)
+
+
+class _StubReader:
+    def __init__(self, fr):
+        self.fr = fr
+
+    def read(self, _img):
+        return self.fr
+
+    def reference_band(self, _img):
+        return _Band(), None
+
+
+def _lags(core):
+    return [h for h in core.health_observations() if h.get("obs") == "reader_lag"]
+
+
+def test_score_rows_inside_the_agreement_gap_and_reader_lag_outside(capsys):
+    """1.9 s still agrees. 2.1 s agrees nothing and logs one reader_lag. No score is guessed."""
+    from qor_receipt._vendor.qoresence.vision.local_scorebug.agreement import AgreementWindow
+
+    from qorcap_reader import ReaderCore
+
+    def drive(step, n):
+        posts = []
+        core = ReaderCore(posts.append, _StubReader(_Syn()), AgreementWindow(), None, detect_final)
+        written = []
+        core.health_write = written.append
+        for i in range(n):
+            core.on_frame(i * step, None)
+        return core, posts, written
+
+    core, posts, written = drive(1900, 4)
+    scores = [p for p in posts if p.get("type") == "score"]
+    assert scores and (scores[0]["away"], scores[0]["home"]) == (0, 3)
+    assert _lags(core) == []
+    assert not any(p.get("obs") == "reader_lag" for p in posts)
+    err = capsys.readouterr().err
+    assert "Score reader behind" not in err
+
+    core, posts, written = drive(2100, 4)
+    assert [p for p in posts if p.get("type") == "score"] == []
+    assert not any(p.get("type") == "score" or p.get("obs") in ("reader_lag", "score_unagreed") for p in posts)
+    open_lag = _lags(core)
+    assert len(open_lag) == 1 and "home" not in open_lag[0] and "away" not in open_lag[0]
+    assert open_lag[0]["n"] == 3 and open_lag[0]["max_gap_ms"] == 2100
+    assert written == []  # still open: the closed line is the one record
+    err = capsys.readouterr().err
+    assert err.count("Score reader behind") == 1
+    assert "Score reader behind: frames 2.1 s apart; scores held" in err
+    # One in-budget frame must not close the span (a flap would emit a row per pair).
+    # The recovery frames are not a readable bar, so they also do not mint a score.
+    from qorcap_reader import HEALTH_CLEAR_FRAMES, HEALTH_WARN_MS
+    core.reader.fr = NS(ok=False, reason="layout_unknown", left_score=None, right_score=None, quarter=None,
+                        clock_seconds=None, clock_red=False, pair=None)
+    for i in range(HEALTH_CLEAR_FRAMES - 1):
+        core.on_frame(3 * 2100 + (i + 1) * 400, None)
+    assert core._lag is not None and [h for h in core.health if h.get("obs") == "reader_lag"] == []
+    core.on_frame(3 * 2100 + HEALTH_CLEAR_FRAMES * 400, None)
+    held = _lags(core)
+    assert len(held) == 1 and core._lag is None
+    assert held[0]["until_ms"] == 3 * 2100 and held[0]["n"] == 3 and held[0]["count"] == 1
+    # Held for 30 s of frame time, so a flap does not append a reader_health.jsonl row yet.
+    assert [h for h in core.health if h.get("obs") == "reader_lag"] == []
+    assert written == []
+    core.on_frame(held[0]["until_ms"] + HEALTH_WARN_MS, None)
+    assert len(written) == 1
+    assert written[0]["until_ms"] == 3 * 2100 and written[0]["n"] == 3 and written[0]["count"] == 1
+    assert [h for h in core.health if h.get("obs") == "reader_lag"] == written
+    assert [p for p in posts if p.get("type") == "score"] == []
+
+
+def test_visible_bar_without_agreement_logs_score_unagreed():
+    """A readable bar that never locks for more than 10 s is one rate-limited span, not a score."""
+    from qorcap_reader import ReaderCore
+
+    class Never:
+        def __init__(self):
+            self.config = NS(max_gap_ns=2_000_000_000)
+
+        def offer(self, fr, **_):
+            return NS(agreed=False, read=None, reason="agreeing")
+
+    posts = []
+    core = ReaderCore(posts.append, _StubReader(_Syn()), Never(), None, detect_final)
+    for i in range(31):  # 0 .. 12_000 ms at 400 ms: under the 2 s gap, past 10 s unlocked
+        core.on_frame(i * 400, None)
+    spans = [h for h in core.health_observations() if h.get("obs") == "score_unagreed"]
+    assert len(spans) == 1
+    assert spans[0]["reasons"].get("agreeing", 0) > 1
+    assert "home" not in spans[0] and "away" not in spans[0]
+    assert _lags(core) == []
+    assert [p for p in posts if p.get("type") == "score"] == []
+    core.on_frame(12_400, None)  # still visible and still unlocked: the same span, not a second one
+    assert len([h for h in core.health_observations() if h.get("obs") == "score_unagreed"]) == 1
+    from qorcap_reader import HEALTH_CLEAR_FRAMES
+    core.reader.fr = NS(ok=False, reason="layout_unknown", left_score=None, right_score=None, quarter=None,
+                        clock_seconds=None, clock_red=False, pair=None)
+    for i in range(HEALTH_CLEAR_FRAMES):
+        core.on_frame(12_800 + i * 400, None)
+    posted = [h for h in core.health_observations() if h.get("obs") == "score_unagreed"]
+    assert len(posted) == 1 and posted[0]["count"] == 1 and core._unagreed is None
+    assert [h for h in core.health if h.get("obs") == "score_unagreed"] == []
+    assert [p for p in posts if p.get("type") == "score"] == []
+
+
+def test_lag_flap_is_one_open_span_and_one_warning(capsys):
+    """Gaps that alternate around 2 s stay one span. A second warning inside 30 s is dropped."""
+    from qor_receipt._vendor.qoresence.vision.local_scorebug.agreement import AgreementWindow
+
+    from qorcap_reader import HEALTH_CLEAR_FRAMES, ReaderCore
+
+    posts = []
+    core = ReaderCore(posts.append, _StubReader(_Syn()), AgreementWindow(), None, detect_final)
+    t = 0
+    core.on_frame(t, None)
+    for _ in range(8):  # stays inside the 30 s warning window
+        t += 2100
+        core.on_frame(t, None)
+        t += 400
+        core.on_frame(t, None)
+    err = capsys.readouterr().err
+    assert err.count("Score reader behind") == 1
+    assert [h for h in core.health if h.get("obs") == "reader_lag"] == []
+    assert len(_lags(core)) == 1
+    # Quiet frames are not a readable bar, so closing the span does not mint a score.
+    core.reader.fr = NS(ok=False, reason="layout_unknown", left_score=None, right_score=None, quarter=None,
+                        clock_seconds=None, clock_red=False, pair=None)
+    for _ in range(HEALTH_CLEAR_FRAMES):
+        t += 400
+        core.on_frame(t, None)
+    closed = _lags(core)
+    assert len(closed) == 1 and closed[0]["count"] == 1 and core._lag is None
+    assert [h for h in core.health if h.get("obs") == "reader_lag"] == []
+    t += 2100
+    core.on_frame(t, None)
+    assert capsys.readouterr().err.count("Score reader behind") == 0
+    assert len(_lags(core)) == 2  # the held row plus the new open span
+    assert [p for p in posts if p.get("type") == "score"] == []
+
+
+def test_health_rows_merge_inside_thirty_seconds_and_keep_milliseconds(capsys):
+    """Two closed lag spans inside 30 s are one row with a count. 2001 ms prints as 2.001 s."""
+    from qor_receipt._vendor.qoresence.vision.local_scorebug.agreement import AgreementWindow
+
+    from qorcap_reader import HEALTH_CLEAR_FRAMES, HEALTH_WARN_MS, ReaderCore
+
+    posts = []
+    core = ReaderCore(posts.append, _StubReader(_Syn()), AgreementWindow(), None, detect_final)
+    written = []
+    core.health_write = written.append
+    core.on_frame(0, None)
+    core.on_frame(2001, None)
+    err = capsys.readouterr().err
+    assert "Score reader behind: frames 2.001 s apart; scores held" in err
+    assert "2.0 s" not in err
+    core.reader.fr = NS(ok=False, reason="layout_unknown", left_score=None, right_score=None, quarter=None,
+                        clock_seconds=None, clock_red=False, pair=None)
+    t = 2001
+    for _ in range(HEALTH_CLEAR_FRAMES):
+        t += 400
+        core.on_frame(t, None)
+    t += 2100
+    core.on_frame(t, None)
+    for _ in range(HEALTH_CLEAR_FRAMES):
+        t += 400
+        core.on_frame(t, None)
+    assert written == []
+    held = _lags(core)
+    assert len(held) == 1 and held[0]["count"] == 2 and held[0]["n"] == 2
+    assert held[0]["max_gap_ms"] == 2100
+    core.on_frame(held[0]["until_ms"] + HEALTH_WARN_MS, None)
+    assert len(written) == 1 and written[0]["count"] == 2 and written[0]["max_gap_ms"] == 2100
+    assert [p for p in posts if p.get("type") == "score"] == []
+
+
+def test_fold_skips_one_bad_row_and_keeps_the_rest(tmp_path, capsys):
+    """A row that raises is logged once per inputs file. The rows around it still fold."""
+    from qorcap_reader import InputsShare, _fold_activity, _fold_options, options_presses_ms
+
+    class Boom(dict):
+        def get(self, *a, **k):
+            raise RuntimeError("bad row")
+
+    presses = options_presses_ms([
+        {"type": "in", "b": 512, "t_ms": 10},
+        Boom(),
+        {"type": "in", "b": 0, "t_ms": 15},
+        {"type": "in", "b": 512, "t_ms": 20},
+    ])
+    assert presses == [10, 20]
+    assert capsys.readouterr().err.count("inputs fold skipped a row") == 1
+    # A later fold is not silenced by an earlier one. The flag is not process-wide.
+    options_presses_ms([Boom()])
+    assert capsys.readouterr().err.count("inputs fold skipped a row") == 1
+
+    first = InputsShare(tmp_path / "match-a" / "inputs.jsonl")
+    second = InputsShare(tmp_path / "match-b" / "inputs.jsonl")
+    _fold_options([Boom()], [], False, None, first._fold_log)
+    kept = _fold_activity([
+        {"type": "in", "b": 1, "t_ms": 1},
+        Boom(),
+        {"type": "in", "b": 2, "t_ms": 2},
+    ], first._fold_log)
+    assert [row["t_ms"] for row in kept] == [1, 2]
+    assert capsys.readouterr().err.count("inputs fold skipped a row") == 1
+    _fold_options([Boom()], [], False, None, first._fold_log)
+    assert capsys.readouterr().err.count("inputs fold skipped a row") == 0
+    _fold_activity([Boom()], second._fold_log)
+    assert capsys.readouterr().err.count("inputs fold skipped a row") == 1
+
+
+def test_lag_flap_longer_than_a_minute_writes_at_least_two_rows():
+    """A flap past 60 s writes during the match. The window starts at the first t_ms.
+
+    Anchoring the wait on the span's growing end merges every new span and writes nothing.
+    """
+    from qorcap_reader import HEALTH_CLEAR_FRAMES, ReaderCore
+
+    posts = []
+    unread = NS(ok=False, reason="layout_unknown", left_score=None, right_score=None, quarter=None,
+                clock_seconds=None, clock_red=False, pair=None)
+    core = ReaderCore(posts.append, _StubReader(unread), Agree(), None, detect_final)
+    written = []
+    core.health_write = written.append
+    t = 0
+    core.on_frame(t, None)
+    while t <= 70_000:
+        t += 2100
+        core.on_frame(t, None)
+        for _ in range(HEALTH_CLEAR_FRAMES):
+            t += 400
+            core.on_frame(t, None)
+    lags = [row for row in written if row.get("obs") == "reader_lag"]
+    assert t > 60_000
+    assert len(lags) >= 2
+    assert [p for p in posts if p.get("type") == "score"] == []
+
+
+def test_flush_health_writes_a_span_that_is_still_open():
+    """Stopping mid-span still records it. An open stall is not dropped."""
+    from qorcap_reader import ReaderCore
+
+    posts = []
+    unread = NS(ok=False, reason="layout_unknown", left_score=None, right_score=None, quarter=None,
+                clock_seconds=None, clock_red=False, pair=None)
+    core = ReaderCore(posts.append, _StubReader(unread), Agree(), None, detect_final)
+    written = []
+    core.health_write = written.append
+    core.on_frame(0, None)
+    core.on_frame(2100, None)
+    assert written == [] and core._lag is not None
+    core.flush_health()
+    assert len(written) == 1 and written[0]["obs"] == "reader_lag" and written[0]["n"] >= 1
+    assert written[0]["open_at_exit"] is True
+    assert core._lag is None and core._health_pending == {}
+
+
+def test_exit_flush_marks_only_a_span_that_is_still_open():
+    """open_at_exit is for a span the reader was still in. A closed span has no such field."""
+    from qorcap_reader import HEALTH_CLEAR_FRAMES, ReaderCore
+
+    unread = NS(ok=False, reason="layout_unknown", left_score=None, right_score=None, quarter=None,
+                clock_seconds=None, clock_red=False, pair=None)
+
+    def closed_core():
+        posts = []
+        core = ReaderCore(posts.append, _StubReader(unread), Agree(), None, detect_final)
+        written = []
+        core.health_write = written.append
+        t = 0
+        core.on_frame(t, None)
+        t += 2100
+        core.on_frame(t, None)
+        for _ in range(HEALTH_CLEAR_FRAMES):
+            t += 400
+            core.on_frame(t, None)
+        return core, written
+
+    core, written = closed_core()
+    assert written == [] and core._lag is None
+    core.flush_health()
+    assert len(written) == 1 and "open_at_exit" not in written[0]
+
+    core, written = closed_core()
+    # The close left the clock at 3300. One more late frame is still open.
+    core.on_frame(5400, None)
+    assert core._lag is not None and written == []
+    core.flush_health()
+    assert len(written) == 1
+    assert written[0]["open_at_exit"] is True and written[0]["count"] == 2
