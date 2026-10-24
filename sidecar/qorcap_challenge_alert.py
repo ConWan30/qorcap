@@ -4,17 +4,23 @@ The operator often plays with the QorCap console off-screen, so a challenge card
 goes unseen. This module makes the same challenge audible and visible without
 moving the challenge, the response window, or anything written to the bundle.
 
-Nothing here is recorded. A miss stays unanswered. ``notify_challenge`` returns
-as soon as the work is queued. The beep, toast, and flash run on a daemon thread
-and each one swallows its own errors. On any other platform the Windows calls
-are skipped and this module does not raise.
+Nothing here is recorded. A miss stays unanswered. ``notify_challenge`` only
+enqueues work and returns. One daemon worker runs the beep, toast, and flash.
+The queue holds two jobs; a third is dropped. On any other platform the Windows
+calls are skipped and this module does not raise.
+
+A failed backend logs one warning per process on the ``qorcap.challenge_alert``
+logger (stderr when nothing else is configured). It never writes a bundle file,
+a checkpoint, or a receipt field.
 
 Environment (unset means on):
 
 * ``QORCAP_CHALLENGE_BEEP=0`` skips the three-beep. ``false`` / ``no`` / ``off`` too.
 * ``QORCAP_CHALLENGE_BEEP_HZ`` tone frequency, default 2400, kept inside 200..8000.
-* ``QORCAP_CHALLENGE_BEEP_VOLUME`` sample scale. ``1`` (default) is full int16
-  amplitude. ``0.5`` is half. A number above 1 is a percent (``50`` -> half).
+* ``QORCAP_CHALLENGE_BEEP_VOLUME`` amplitude. A value with a decimal point is a
+  fraction from 0 to 1 (``1.0`` full, ``0.5`` half). An integer is a percent
+  from 0 to 100 (``100`` full, ``50`` half, ``1`` is one percent). ``0`` and
+  ``0.0`` turn the beep off. Anything else, including ``1.5``, stays at full scale.
 * ``QORCAP_CHALLENGE_TOAST=0`` skips the toast.
 * ``QORCAP_CHALLENGE_FLASH=0`` skips flashing the console window and its taskbar button.
 
@@ -24,16 +30,18 @@ from __future__ import annotations
 
 import array
 import io
+import logging
 import math
 import os
+import queue
 import subprocess
 import sys
 import threading
-import time
 import wave
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 
+_LOG = logging.getLogger("qorcap.challenge_alert")
 _OFF = {"0", "false", "no", "off"}
 _RATE = 44100
 _BEEP_S = 0.16
@@ -44,14 +52,18 @@ DEFAULT_HZ = 2400
 DEFAULT_VOLUME = 1.0
 _HZ_MIN = 200
 _HZ_MAX = 8000
+_QUEUE_MAX = 2
 
-# PlaySound SND_MEMORY reads the buffer while the sound plays. Keep the last few
-# clips alive so a return from the alert thread cannot free them mid-beep.
-_HELD_WAVS: list[bytes] = []
+_WARNED: set[str] = set()
+_WARN_LOCK = threading.Lock()
+_WAV_CACHE: dict[tuple[int, float], bytes] = {}
+_JOBS: queue.Queue[Callable[[], None]] | None = None
+_WORKER_LOCK = threading.Lock()
 _TOAST_PROCS: list[subprocess.Popen] = []
 
-# PowerShell's own AUMID. An unpackaged console has no toast identity; this one
-# often works, and a failure is ignored.
+# PowerShell's own AUMID. An unpackaged console has none. Some Windows builds
+# still refuse this borrowed identity; the toast is best-effort and a failure
+# is logged once.
 _TOAST_SCRIPT = r"""
 $ErrorActionPreference = 'Stop'
 $text = [string]$env:QORCAP_TOAST_TEXT
@@ -83,6 +95,15 @@ class AlertBackends:
     flash: Callable[[str, AlertConfig], None]
 
 
+def warn_once(backend: str, detail: object) -> None:
+    """Log one warning for this backend. Stderr only; never a bundle file."""
+    with _WARN_LOCK:
+        if backend in _WARNED:
+            return
+        _WARNED.add(backend)
+    _LOG.warning("challenge alert %s failed: %s", backend, detail)
+
+
 def _enabled(env: Mapping[str, str], name: str) -> bool:
     raw = env.get(name)
     if raw is None:
@@ -103,34 +124,45 @@ def _hz(raw: str | None) -> int:
 
 
 def _volume(raw: str | None) -> float:
+    """Fraction ``0..1`` if the text has a decimal point, otherwise percent ``0..100``.
+
+    ``0`` and ``0.0`` are silence. ``1.5`` is neither a fraction nor a percent, so
+    the default full scale is kept. ``1`` is one percent; full scale is ``1.0`` or ``100``.
+    """
     if raw is None or not str(raw).strip():
         return DEFAULT_VOLUME
+    text = str(raw).strip()
     try:
-        vol = float(str(raw).strip())
+        if any(mark in text for mark in ".eE"):
+            vol = float(text)
+            if 0.0 <= vol <= 1.0:
+                return vol
+            return DEFAULT_VOLUME
+        percent = int(text, 10)
     except (TypeError, ValueError):
         return DEFAULT_VOLUME
-    if vol > 1.0:
-        vol = vol / 100.0
-    if vol < 0.0 or vol > 1.0:
+    if percent < 0 or percent > 100:
         return DEFAULT_VOLUME
-    return vol
+    return percent / 100.0
 
 
 def config_from_env(env: Mapping[str, str]) -> AlertConfig:
+    volume = _volume(env.get("QORCAP_CHALLENGE_BEEP_VOLUME"))
     return AlertConfig(
-        beep=_enabled(env, "QORCAP_CHALLENGE_BEEP"),
+        beep=_enabled(env, "QORCAP_CHALLENGE_BEEP") and volume > 0.0,
         toast=_enabled(env, "QORCAP_CHALLENGE_TOAST"),
         flash=_enabled(env, "QORCAP_CHALLENGE_FLASH"),
         beep_hz=_hz(env.get("QORCAP_CHALLENGE_BEEP_HZ")),
-        beep_volume=_volume(env.get("QORCAP_CHALLENGE_BEEP_VOLUME")),
+        beep_volume=volume,
     )
 
 
 def render_three_beep_wav(hz: int, volume: float) -> bytes:
     """Three high tones separated by silence. Peak sample is full int16 scale at volume 1.
 
-    A sine at ±32767 is the loudest tone this format can hold. ``winsound.Beep`` is a
-    fallback only: on some machines it is quiet or missing, and it does not take a volume.
+    A sine at ±32767 is the loudest tone this format can hold. Playback is synchronous
+    ``PlaySound`` on the alert worker: CPython rejects ``SND_ASYNC`` together with
+    ``SND_MEMORY`` (``Cannot play asynchronously from memory``).
     """
     amp = int(round(32767 * max(0.0, min(1.0, float(volume)))))
     tone_hz = int(hz) if int(hz) > 0 else DEFAULT_HZ
@@ -160,40 +192,36 @@ def render_three_beep_wav(hz: int, volume: float) -> bytes:
     return buf.getvalue()
 
 
-def _retain_wav(data: bytes) -> None:
-    _HELD_WAVS.append(data)
-    del _HELD_WAVS[:-4]
+def _cached_wav(hz: int, volume: float) -> bytes:
+    key = (int(hz), float(volume))
+    hit = _WAV_CACHE.get(key)
+    if hit is None:
+        hit = render_three_beep_wav(key[0], key[1])
+        _WAV_CACHE[key] = hit
+    return hit
 
 
-def _play_wav_async(data: bytes, hz: int) -> None:
-    """Play a WAV without waiting. No-op off Windows. Never raises.
+def _play_wav(data: bytes) -> None:
+    """Play a memory WAV on the alert worker. No-op off Windows. Logs once on failure.
 
-    ``SND_ASYNC | SND_MEMORY`` returns as soon as playback is queued. ``SND_NODEFAULT``
-    avoids substituting a quiet system sound when the clip cannot be played. If that
-    call fails, three ``Beep``s run on this same (already background) thread.
+    Flags are ``SND_MEMORY | SND_NODEFAULT`` and not ``SND_ASYNC``. CPython raises
+    ``RuntimeError: Cannot play asynchronously from memory`` for that pair, which
+    used to hide the clip and fall through to a quiet ``Beep``.
     """
     if os.name != "nt" or not data:
         return
     try:
         import winsound
-        winsound.PlaySound(data, winsound.SND_ASYNC | winsound.SND_MEMORY | winsound.SND_NODEFAULT)
-        return
-    except Exception:
-        pass
-    try:
-        import winsound
-        for _ in range(_BEEPS):
-            winsound.Beep(int(hz), 160)
-            time.sleep(0.08)
-    except Exception:
-        return
+        winsound.PlaySound(data, winsound.SND_MEMORY | winsound.SND_NODEFAULT)
+    except Exception as exc:
+        warn_once("beep", exc)
 
 
 def play_three_beep(prompt: str, cfg: AlertConfig) -> None:
     del prompt
-    data = render_three_beep_wav(cfg.beep_hz, cfg.beep_volume)
-    _retain_wav(data)
-    _play_wav_async(data, cfg.beep_hz)
+    if cfg.beep_volume <= 0.0:
+        return
+    _play_wav(_cached_wav(cfg.beep_hz, cfg.beep_volume))
 
 
 def _toast_text(prompt: str) -> str:
@@ -204,7 +232,11 @@ def _toast_text(prompt: str) -> str:
 
 
 def show_toast(prompt: str, cfg: AlertConfig) -> None:
-    """Toast via WinRT in a hidden PowerShell process. No-op off Windows. Never raises."""
+    """Toast via WinRT in a hidden PowerShell process. No-op off Windows.
+
+    The borrowed PowerShell AppUserModelID does not show a toast on every build.
+    A spawn or WinRT failure is logged once and ignored.
+    """
     del cfg
     if os.name != "nt":
         return
@@ -219,15 +251,15 @@ def show_toast(prompt: str, cfg: AlertConfig) -> None:
         if flags:
             kwargs["creationflags"] = flags
         proc = subprocess.Popen(
-            ["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", _TOAST_SCRIPT],
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", _TOAST_SCRIPT],
             **kwargs,
         )
         _TOAST_PROCS.append(proc)
-        del _TOAST_PROCS[:-4]
-        for old in _TOAST_PROCS:
+        for old in list(_TOAST_PROCS):
             old.poll()
-    except Exception:
-        return
+        del _TOAST_PROCS[:-4]
+    except Exception as exc:
+        warn_once("toast", exc)
 
 
 def flash_console(prompt: str, cfg: AlertConfig) -> None:
@@ -235,7 +267,7 @@ def flash_console(prompt: str, cfg: AlertConfig) -> None:
 
     ``FLASHW_ALL`` is the caption plus the taskbar button. ``FLASHW_TIMERNOFG`` keeps
     going until the operator focuses the console. No-op off Windows, or when this
-    process has no console. Never raises.
+    process has no console. A failure is logged once.
     """
     del prompt, cfg
     if os.name != "nt":
@@ -272,19 +304,57 @@ def flash_console(prompt: str, cfg: AlertConfig) -> None:
         user32.FlashWindowEx.argtypes = [ctypes.POINTER(FLASHWINFO)]
         user32.FlashWindowEx.restype = wintypes.BOOL
         user32.FlashWindowEx(ctypes.byref(info))
-    except Exception:
-        return
+    except Exception as exc:
+        warn_once("flash", exc)
 
 
 def default_backends() -> AlertBackends:
     return AlertBackends(beep=play_three_beep, toast=show_toast, flash=flash_console)
 
 
-def _safe(fn: Callable[[], None]) -> None:
+def _safe(backend: str, fn: Callable[[], None]) -> None:
     try:
         fn()
-    except Exception:
+    except Exception as exc:
+        warn_once(backend, exc)
+
+
+def _worker_loop() -> None:
+    jobs = _JOBS
+    if jobs is None:
         return
+    while True:
+        job = jobs.get()
+        try:
+            job()
+        except Exception as exc:
+            warn_once("worker", exc)
+        finally:
+            jobs.task_done()
+
+
+def _ensure_worker() -> queue.Queue[Callable[[], None]]:
+    global _JOBS
+    with _WORKER_LOCK:
+        if _JOBS is None:
+            _JOBS = queue.Queue(maxsize=_QUEUE_MAX)
+            threading.Thread(target=_worker_loop, name="qorcap-challenge-alert", daemon=True).start()
+        return _JOBS
+
+
+def drain(timeout: float = 5.0) -> bool:
+    """Wait until queued alert jobs finish. Used by tests so one sleep cannot block the next."""
+    jobs = _JOBS
+    if jobs is None:
+        return True
+    done = threading.Event()
+
+    def _join() -> None:
+        jobs.join()
+        done.set()
+
+    threading.Thread(target=_join, name="qorcap-challenge-alert-drain", daemon=True).start()
+    return done.wait(timeout)
 
 
 def _schedule(prompt: str, *, env: Mapping[str, str] | None, backends: AlertBackends | None) -> None:
@@ -295,19 +365,22 @@ def _schedule(prompt: str, *, env: Mapping[str, str] | None, backends: AlertBack
 
     def run() -> None:
         if cfg.beep:
-            _safe(lambda: backs.beep(prompt, cfg))
+            _safe("beep", lambda: backs.beep(prompt, cfg))
         if cfg.toast:
-            _safe(lambda: backs.toast(prompt, cfg))
+            _safe("toast", lambda: backs.toast(prompt, cfg))
         if cfg.flash:
-            _safe(lambda: backs.flash(prompt, cfg))
+            _safe("flash", lambda: backs.flash(prompt, cfg))
 
-    threading.Thread(target=run, name="qorcap-challenge-alert", daemon=True).start()
+    try:
+        _ensure_worker().put_nowait(run)
+    except queue.Full:
+        warn_once("queue", "dropped; alert worker is busy")
 
 
 def notify_challenge(prompt: str, *, env: Mapping[str, str] | None = None,
                      backends: AlertBackends | None = None) -> None:
-    """Queue the enabled alerts and return. A failure here cannot reach the caller."""
+    """Enqueue the enabled alerts and return. A failure here cannot reach the caller."""
     try:
         _schedule(prompt, env=env, backends=backends)
-    except Exception:
-        return
+    except Exception as exc:
+        warn_once("schedule", exc)

@@ -4,8 +4,10 @@ The three-beep, toast, and flash run after the challenge is posted. They do not
 move the window, the response log, the receipt, or the checkpoints. Off Windows
 the real backends do nothing and do not raise.
 """
+import hashlib
 import io
 import json
+import logging
 import os
 import sys
 import threading
@@ -19,6 +21,12 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import qorcap_challenge_alert as alert  # noqa: E402
 import qorcap_submit as qs  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _drain_alert_worker():
+    yield
+    alert.drain(5)
 
 WALL = 1_700_000_000_000
 TOKEN = {
@@ -39,7 +47,7 @@ _ON = {
     "QORCAP_CHALLENGE_TOAST": "1",
     "QORCAP_CHALLENGE_FLASH": "1",
     "QORCAP_CHALLENGE_BEEP_HZ": "2400",
-    "QORCAP_CHALLENGE_BEEP_VOLUME": "1",
+    "QORCAP_CHALLENGE_BEEP_VOLUME": "1.0",
 }
 _OFF_ALL = {
     "QORCAP_CHALLENGE_BEEP": "0",
@@ -208,6 +216,10 @@ def _names(calls):
     return [name for name, _prompt, _cfg in calls]
 
 
+def _digests(files: dict[str, bytes]) -> dict[str, str]:
+    return {name: hashlib.sha256(data).hexdigest() for name, data in files.items()}
+
+
 def test_three_beep_wav_is_full_scale_and_three_pulses():
     cfg = alert.config_from_env({})
     assert cfg.beep and cfg.toast and cfg.flash
@@ -218,29 +230,168 @@ def test_three_beep_wav_is_full_scale_and_three_pulses():
     assert alert.config_from_env({"QORCAP_CHALLENGE_BEEP_HZ": "50"}).beep_hz == 2400
     assert alert.config_from_env({"QORCAP_CHALLENGE_BEEP_VOLUME": "0.5"}).beep_volume == 0.5
     assert alert.config_from_env({"QORCAP_CHALLENGE_BEEP_VOLUME": "50"}).beep_volume == 0.5
+    assert alert.config_from_env({"QORCAP_CHALLENGE_BEEP_VOLUME": "1.0"}).beep_volume == 1.0
+    assert alert.config_from_env({"QORCAP_CHALLENGE_BEEP_VOLUME": "100"}).beep_volume == 1.0
+    assert alert.config_from_env({"QORCAP_CHALLENGE_BEEP_VOLUME": "1"}).beep_volume == 0.01
+    assert alert.config_from_env({"QORCAP_CHALLENGE_BEEP_VOLUME": "1.5"}).beep_volume == 1.0
+    silent = alert.config_from_env({"QORCAP_CHALLENGE_BEEP_VOLUME": "0"})
+    assert silent.beep_volume == 0.0 and silent.beep is False
+    assert alert.config_from_env({"QORCAP_CHALLENGE_BEEP_VOLUME": "0.0"}).beep is False
     loud = _pcm(alert.render_three_beep_wav(2400, 1.0))
     half = _pcm(alert.render_three_beep_wav(2400, 0.5))
     assert max(abs(sample) for sample in loud) >= 32000
     assert 16000 <= max(abs(sample) for sample in half) <= 17000
     assert _bursts(loud) == 3
     played = {}
+    renders = []
+    real_render = alert.render_three_beep_wav
+    original_play = alert._play_wav
+    alert._WAV_CACHE.clear()
 
-    def capture(data, hz):
+    def spy_render(hz, volume):
+        renders.append((hz, volume))
+        return real_render(hz, volume)
+
+    def capture(data):
         played["data"] = data
-        played["hz"] = hz
 
-    original = alert._play_wav_async
-    alert._play_wav_async = capture
+    alert.render_three_beep_wav = spy_render
+    alert._play_wav = capture
     try:
-        alert.play_three_beep("QORTIME CHALLENGE", alert.config_from_env({
+        cfg = alert.config_from_env({
             "QORCAP_CHALLENGE_BEEP_HZ": "1760",
-            "QORCAP_CHALLENGE_BEEP_VOLUME": "1",
-        }))
+            "QORCAP_CHALLENGE_BEEP_VOLUME": "1.0",
+        })
+        alert.play_three_beep("QORTIME CHALLENGE", cfg)
+        alert.play_three_beep("again", cfg)
     finally:
-        alert._play_wav_async = original
-    assert played["hz"] == 1760
+        alert.render_three_beep_wav = real_render
+        alert._play_wav = original_play
+    assert renders == [(1760, 1.0)]
     assert max(abs(sample) for sample in _pcm(played["data"])) >= 32000
     assert _bursts(_pcm(played["data"])) == 3
+
+
+class _CPythonWinsound:
+    """The PC/winsound.c check: SND_MEMORY cannot be combined with SND_ASYNC."""
+
+    SND_SYNC = 0
+    SND_ASYNC = 1
+    SND_NODEFAULT = 2
+    SND_MEMORY = 4
+
+    def __init__(self):
+        self.played = []
+        self.beeps = []
+
+    def PlaySound(self, sound, flags):
+        self.played.append((bytes(sound), flags))
+        if flags & self.SND_MEMORY and flags & self.SND_ASYNC:
+            raise RuntimeError("Cannot play asynchronously from memory")
+
+    def Beep(self, hz, ms):
+        self.beeps.append((hz, ms))
+
+
+def test_playsound_is_sync_memory_and_not_async(monkeypatch):
+    fake = _CPythonWinsound()
+    monkeypatch.setattr(os, "name", "nt")
+    monkeypatch.setitem(sys.modules, "winsound", fake)
+    alert._WARNED.discard("beep")
+    cfg = alert.config_from_env({
+        "QORCAP_CHALLENGE_BEEP_HZ": "2400",
+        "QORCAP_CHALLENGE_BEEP_VOLUME": "1.0",
+    })
+    alert.play_three_beep("QORTIME CHALLENGE", cfg)
+    assert len(fake.played) == 1
+    _clip, flags = fake.played[0]
+    assert flags == (fake.SND_MEMORY | fake.SND_NODEFAULT)
+    assert flags & fake.SND_ASYNC == 0
+    assert fake.beeps == []
+
+
+def test_each_backend_logs_once_and_writes_no_bundle_file(tmp_path, monkeypatch, caplog):
+    # Import ctypes before pretending to be Windows. ctypes reads os.name at import
+    # and would look for a Windows-only symbol.
+    import ctypes
+    caplog.set_level(logging.WARNING, logger="qorcap.challenge_alert")
+    alert._WARNED.clear()
+    monkeypatch.setattr(os, "name", "nt")
+    fake = _CPythonWinsound()
+
+    def no_device(sound, flags):
+        raise RuntimeError("no device")
+
+    fake.PlaySound = no_device
+    monkeypatch.setitem(sys.modules, "winsound", fake)
+    cfg = alert.config_from_env({"QORCAP_CHALLENGE_BEEP_VOLUME": "1.0"})
+    alert.play_three_beep("QORTIME CHALLENGE", cfg)
+    alert.play_three_beep("QORTIME CHALLENGE", cfg)
+
+    def no_powershell(*_args, **_kwargs):
+        raise OSError("powershell missing")
+
+    monkeypatch.setattr(alert.subprocess, "Popen", no_powershell)
+    alert.show_toast("QORTIME CHALLENGE", cfg)
+    alert.show_toast("QORTIME CHALLENGE", cfg)
+
+    def no_dll(*_args, **_kwargs):
+        raise OSError("no dll")
+
+    monkeypatch.setattr(ctypes, "WinDLL", no_dll, raising=False)
+    alert.flash_console("QORTIME CHALLENGE", cfg)
+    alert.flash_console("QORTIME CHALLENGE", cfg)
+
+    messages = [rec.getMessage() for rec in caplog.records if rec.name == "qorcap.challenge_alert"]
+    assert sum(msg.startswith("challenge alert beep failed") for msg in messages) == 1
+    assert sum(msg.startswith("challenge alert toast failed") for msg in messages) == 1
+    assert sum(msg.startswith("challenge alert flash failed") for msg in messages) == 1
+    assert "no device" in messages[0] or any("no device" in msg for msg in messages)
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_full_alert_queue_drops_without_blocking(monkeypatch, caplog):
+    caplog.set_level(logging.WARNING, logger="qorcap.challenge_alert")
+    alert._WARNED.discard("queue")
+    for key, value in _ON.items():
+        monkeypatch.setenv(key, value)
+    release = threading.Event()
+    started = threading.Event()
+
+    def block(prompt, cfg):
+        del prompt, cfg
+        started.set()
+        release.wait(3)
+
+    monkeypatch.setattr(
+        alert, "default_backends",
+        lambda: alert.AlertBackends(beep=block, toast=lambda *_a: None, flash=lambda *_a: None),
+    )
+    try:
+        alert.notify_challenge("one")
+        assert started.wait(1.0)
+        alert.notify_challenge("two")
+        alert.notify_challenge("three")
+        t0 = time.perf_counter()
+        alert.notify_challenge("four")
+        assert time.perf_counter() - t0 < 0.2
+        assert any(rec.getMessage().startswith("challenge alert queue failed") for rec in caplog.records)
+    finally:
+        release.set()
+
+
+def test_schedule_failure_is_logged_and_the_record_stands(tmp_path, monkeypatch, caplog):
+    caplog.set_level(logging.WARNING, logger="qorcap.challenge_alert")
+    alert._WARNED.discard("schedule")
+
+    def boom(_msg):
+        raise RuntimeError("schedule down")
+
+    monkeypatch.setattr(qs, "notify_challenge", boom)
+    _live, api, _marks = _fire(tmp_path, legacy=[])
+    assert any("schedule down" in rec.getMessage() for rec in caplog.records)
+    assert _digests(_snapshot(tmp_path)) == _digests(_expected_files())
+    assert api.posted == [("/challenge", _expected_post())]
 
 
 def test_platform_backends_do_not_raise():
@@ -364,8 +515,7 @@ def test_alert_exception_does_not_change_the_recording(tmp_path, monkeypatch, ca
     assert _names(calls) == ["beep", "toast", "flash"]
     assert errors == []
     assert "Exception in thread" not in err.err
-    assert "alert down" not in err.err
-    assert _snapshot(tmp_path) == _expected_files()
+    assert _digests(_snapshot(tmp_path)) == _digests(_expected_files())
     assert api.posted == [("/challenge", _expected_post())]
     assert (tmp_path / "inputs.jsonl").read_bytes() == SEEDS["inputs.jsonl"]
     assert (tmp_path / "checkpoints.jsonl").read_bytes() == SEEDS["checkpoints.jsonl"]
@@ -389,6 +539,7 @@ def test_recorded_bytes_match_with_alerts_on_and_off(tmp_path, monkeypatch):
     _live_off, api_off, _marks = _fire(off, legacy=[])
     time.sleep(0.05)
     assert _snapshot(on) == _snapshot(off) == _expected_files()
+    assert _digests(_snapshot(on)) == _digests(_snapshot(off)) == _digests(_expected_files())
     assert api_on.posted == api_off.posted == [("/challenge", _expected_post())]
     posted = json.dumps(api_on.posted[0][1], sort_keys=True).encode()
     assert posted == json.dumps(api_off.posted[0][1], sort_keys=True).encode()
