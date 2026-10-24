@@ -26,6 +26,33 @@ jobs:
         env:
           QORTIME: ${{ github.workspace }}/qortime
       - run: python -m pytest -q sidecar/test_pairing.py sidecar/test_qorcap_highlights.py sidecar/test_auto_highlights.py sidecar/test_final_screen_pause.py sidecar/test_start_match_glimpse.py sidecar/test_qorcap_ai_loop.py sidecar/test_qorcap_console.py sidecar/test_qorcap_release.py tools/test_frame_clock_ab.py
+  # Contract bytes are compared to qortime main, not to QORTIME_PIN. The linux and windows
+  # jobs keep fetching 0204e6d so `cargo test` and the bundled verifier stay reproducible.
+  # This job goes red when qortime main changes schema/contracts or schema/receipt.v0.json.
+  # QORCAP_E2E=0 skips the Start Match recording. That path needs a built qorcap and ffmpeg;
+  # it is not the drift check.
+  contracts:
+    name: contracts (qortime main)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install pytest
+      - name: QorTime main (unpinned)
+        run: |
+          git init qortime-main
+          git -C qortime-main remote add origin https://github.com/ConWan30/qortime.git
+          git -C qortime-main fetch --depth 1 origin refs/heads/main
+          git -C qortime-main checkout --detach FETCH_HEAD
+          git -C qortime-main rev-parse HEAD
+      - name: Contract unit tests
+        env:
+          QORTIME: ${{ github.workspace }}/qortime-main
+          QORCAP_E2E: "0"
+          QORCAP_CONTRACTS_REQUIRED: "1"
+        run: python -m pytest -q sidecar/test_contracts.py
   windows:
     runs-on: windows-latest
     steps:
