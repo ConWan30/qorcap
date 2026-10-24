@@ -364,11 +364,28 @@ def test_sidecar_ci_sets_xfail_strict_and_the_suite_gate():
     assert text.count("must re-collect") == 2
     assert "< <(" not in text
     assert "mapfile" not in text
+    stall_ids = (
+        "sidecar/test_qorcap_match.py::test_large_inputs_file_keeps_frames_bounded_and_reaches_final",
+        "sidecar/test_qorcap_match.py::test_reader_stalled_notice_when_frames_arrive_without_rows",
+        "sidecar/test_qorcap_match.py::test_hung_inputs_read_does_not_confirm_final",
+        "sidecar/test_qorcap_match.py::test_reader_joined_and_health_sealed_before_sign",
+        "sidecar/test_qorcap_match.py::test_stall_shapes_do_not_skew_the_verified_chain",
+        "sidecar/test_qorcap_match.py::test_hung_haptics_read_does_not_confirm_final",
+        "sidecar/test_qorcap_match.py::test_hung_manifest_read_does_not_confirm_final",
+        "sidecar/test_qorcap_match.py::test_hung_on_frame_is_noticed_from_the_status_loop",
+        "sidecar/test_qorcap_match.py::test_hung_refresh_shows_refresh_age_ms",
+    )
     for files in (skips.LINUX_FILES, skips.WINDOWS_FILES):
         pause = files.index("sidecar/test_final_screen_pause.py")
         assert files[pause + 1] == "sidecar/test_post_final_tail.py"
-    assert skips.LINUX_MIN_COLLECTED == 573
-    assert skips.WINDOWS_MIN_COLLECTED == 555
+        reader = files.index("sidecar/test_qorcap_reader.py")
+        assert files[reader + 1] == "sidecar/test_c11_snapshot_inputs_timeout.py"
+        timing = files.index(
+            "sidecar/test_qorcap_match.py::test_reader_timing_log_names_the_three_clocks"
+        )
+        assert files[timing - len(stall_ids):timing] == stall_ids
+    assert skips.LINUX_MIN_COLLECTED == 596
+    assert skips.WINDOWS_MIN_COLLECTED == 578
 
 
 def test_xfail_strict_rejects_an_unexpected_pass(tmp_path):

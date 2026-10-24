@@ -74,6 +74,7 @@ LINUX_FILES = (
     "tools/test_frame_clock_ab.py",
     "tools/test_assert_pytest_skips.py",
     "sidecar/test_qorcap_reader.py",
+    "sidecar/test_c11_snapshot_inputs_timeout.py",
     "sidecar/test_qorcap_match.py::test_refresh_off_the_frame_thread_keeps_four_hertz",
     "sidecar/test_qorcap_match.py::test_incremental_tail_matches_full_parse",
     "sidecar/test_qorcap_match.py::test_tail_reparse_when_the_window_before_the_offset_changes",
@@ -82,6 +83,15 @@ LINUX_FILES = (
     "sidecar/test_qorcap_match.py::test_refresh_thread_is_joined_before_the_reader_returns",
     "sidecar/test_qorcap_match.py::test_closed_health_span_is_written_when_the_reader_stops",
     "sidecar/test_qorcap_match.py::test_closed_health_span_is_written_when_the_reader_crashes",
+    "sidecar/test_qorcap_match.py::test_large_inputs_file_keeps_frames_bounded_and_reaches_final",
+    "sidecar/test_qorcap_match.py::test_reader_stalled_notice_when_frames_arrive_without_rows",
+    "sidecar/test_qorcap_match.py::test_hung_inputs_read_does_not_confirm_final",
+    "sidecar/test_qorcap_match.py::test_reader_joined_and_health_sealed_before_sign",
+    "sidecar/test_qorcap_match.py::test_stall_shapes_do_not_skew_the_verified_chain",
+    "sidecar/test_qorcap_match.py::test_hung_haptics_read_does_not_confirm_final",
+    "sidecar/test_qorcap_match.py::test_hung_manifest_read_does_not_confirm_final",
+    "sidecar/test_qorcap_match.py::test_hung_on_frame_is_noticed_from_the_status_loop",
+    "sidecar/test_qorcap_match.py::test_hung_refresh_shows_refresh_age_ms",
     "sidecar/test_qorcap_match.py::test_reader_timing_log_names_the_three_clocks",
     "sidecar/test_qorcap_standard.py",
     "sidecar/test_qorcap_score_grammar.py",
@@ -116,6 +126,7 @@ WINDOWS_FILES = (
     "tools/test_frame_clock_ab.py",
     "tools/test_assert_pytest_skips.py",
     "sidecar/test_qorcap_reader.py",
+    "sidecar/test_c11_snapshot_inputs_timeout.py",
     "sidecar/test_qorcap_match.py::test_refresh_off_the_frame_thread_keeps_four_hertz",
     "sidecar/test_qorcap_match.py::test_incremental_tail_matches_full_parse",
     "sidecar/test_qorcap_match.py::test_tail_reparse_when_the_window_before_the_offset_changes",
@@ -124,6 +135,15 @@ WINDOWS_FILES = (
     "sidecar/test_qorcap_match.py::test_refresh_thread_is_joined_before_the_reader_returns",
     "sidecar/test_qorcap_match.py::test_closed_health_span_is_written_when_the_reader_stops",
     "sidecar/test_qorcap_match.py::test_closed_health_span_is_written_when_the_reader_crashes",
+    "sidecar/test_qorcap_match.py::test_large_inputs_file_keeps_frames_bounded_and_reaches_final",
+    "sidecar/test_qorcap_match.py::test_reader_stalled_notice_when_frames_arrive_without_rows",
+    "sidecar/test_qorcap_match.py::test_hung_inputs_read_does_not_confirm_final",
+    "sidecar/test_qorcap_match.py::test_reader_joined_and_health_sealed_before_sign",
+    "sidecar/test_qorcap_match.py::test_stall_shapes_do_not_skew_the_verified_chain",
+    "sidecar/test_qorcap_match.py::test_hung_haptics_read_does_not_confirm_final",
+    "sidecar/test_qorcap_match.py::test_hung_manifest_read_does_not_confirm_final",
+    "sidecar/test_qorcap_match.py::test_hung_on_frame_is_noticed_from_the_status_loop",
+    "sidecar/test_qorcap_match.py::test_hung_refresh_shows_refresh_age_ms",
     "sidecar/test_qorcap_match.py::test_reader_timing_log_names_the_three_clocks",
     "sidecar/test_qorcap_standard.py",
     "sidecar/test_qorcap_score_grammar.py",
@@ -148,9 +168,11 @@ WINDOWS_FILES = (
 # The floor is a minimum. A PR that adds tests, and any merge resolution, must
 # re-collect and set both floors to those exact counts. Leaving the old floor
 # keeps a dropped test green.
-# 562/544 before #98's 10 post-final-tail tests and test_nested_test_module_is_unlisted.
-LINUX_MIN_COLLECTED = 573
-WINDOWS_MIN_COLLECTED = 555
+# Collect-only of these lists on main 59009ad plus the guard tests in
+# tools/test_assert_pytest_skips.py. #96's suite, before those guard tests,
+# collected 580 linux / 562 windows. Re-collect after any list or test change.
+LINUX_MIN_COLLECTED = 596
+WINDOWS_MIN_COLLECTED = 578
 
 # Absent from both sidecar suites. A reason is required; whitespace does not count.
 EXCLUDED_TEST_FILES = {
