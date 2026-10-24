@@ -1815,7 +1815,7 @@ class ReaderCore:
         count. Otherwise the note is the previous sentence, with no claim that a
         scorebug returned.
         """
-        if self._frozen or getattr(self, "_end_menu_disputed", False):
+        if getattr(self, "_frozen", False) or getattr(self, "_end_menu_disputed", False):
             return
         self._end_menu_disputed = True
         if not isinstance(self.final, dict):
