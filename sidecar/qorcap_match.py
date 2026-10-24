@@ -1726,9 +1726,12 @@ def fill_challenge_results(bundle: Path, draft: dict, *, ffmpeg: str | None = No
 
     QorCap <= 0.3.10 always signed ``result: null``, so a correctly answered challenge still verified as
     ``challenge_unanswered`` (match 2026-10-17 #4, 44b8d01f). An ok result goes into the receipt
-    (``reverified_by: recorder``). A wrong pattern (``ok`` false, ``reason`` ``pattern_mismatch``)
-    goes in too, so verify reports ``challenge_failed`` (match-20261024-135645). Any other miss stays
-    null; its reason is written to challenge_results.jsonl and shown."""
+    (``reverified_by: recorder``). A ``pattern_mismatch`` is written when the pad stayed connected
+    and un-stalled for the whole window and ``inputs.jsonl`` is intact, including OPTIONS alone and
+    a pattern whose later buttons fall after the deadline. Verify then reports ``challenge_failed``,
+    and Start Match exits 2 without the submit prompt. A stall, an unplug, a reconnect gap, or a
+    partial last line stays null. ``video_before_input`` and ``video_latency_too_high`` stay null.
+    The jsonl line always keeps the recheck."""
     chs = list(draft.get("challenges") or [])
     if not chs:
         return draft

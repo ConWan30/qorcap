@@ -141,8 +141,18 @@ def test_fill_challenge_results_uses_the_recorder_recheck():
     assert 'res["rule"]' not in body and "res['rule']" not in body
     assert "capture_pause_max_ms=CAPTURE_PAUSE_MAX_LATENCY_MS" in chal
     assert "def receipt_result(" in chal
-    assert 'return {"result": receipt_result(res), "local": local}' in chal
+    assert "mismatch_log_trustworthy(" in body
+    assert "receipt_result(res)" in body
     assert 'return {"result": res if res["ok"] else None, "local": local}' not in chal
+
+
+_NON_OK_REASONS = (
+    "no_pause_press",
+    "pattern_mismatch",
+    "pause_not_seen_on_video",
+    "video_before_input",
+    "video_latency_too_high",
+)
 
 
 def _challenge(nonce: str, phase: str, issued: int) -> dict:
@@ -152,35 +162,63 @@ def _challenge(nonce: str, phase: str, issued: int) -> dict:
             "pattern": pattern_for(nonce), "issued_ms": issued, "deadline_ms": issued + 90_000, "result": None}
 
 
-def _mismatch_bundle(bundle: Path) -> dict:
-    """Kickoff presses OPTIONS then a button that is not the prompt. Halftime and end have no presses."""
+def _bits():
     from qor_receipt.review.bundle import BUTTON_BITS
 
-    import qorcap_match as qm
+    return {name: bit for name, bit in BUTTON_BITS}
 
-    bits = {name: bit for name, bit in BUTTON_BITS}
-    kick = _challenge("00112233445566778899aabbccddeeff", "kickoff", 1_000_000)
-    wrong = next(b for b in ("CROSS", "CIRCLE", "SQUARE", "TRIANGLE", "UP", "DOWN", "LEFT", "RIGHT")
-                 if b != kick["pattern"][1])
-    t0 = kick["issued_ms"] + 1_000
-    rows = [
-        {"type": "header", "schema": "qorcap-inputs/v0", "t_us": 0, "seg": 0, "wall_anchor_ms": 0},
-        {"type": "in", "t_us": t0 * 1000, "b": 1 << bits["OPTIONS"], "seg": 0},
-        {"type": "in", "t_us": (t0 + 400) * 1000, "b": 1 << bits[wrong], "seg": 0},
-    ]
-    bundle.mkdir(parents=True)
-    (bundle / "inputs.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
-    for name in ("bundle.json", "receipt.json"):
-        (bundle / name).write_text("{}\n", encoding="utf-8")
-    for name in ("manifest.jsonl", "checkpoints.jsonl"):
-        (bundle / name).write_text("", encoding="utf-8")
-    chs = [
+
+def _press(t_ms: int, button: str) -> dict:
+    return {"type": "in", "t_us": t_ms * 1000, "b": 1 << _bits()[button], "seg": 0}
+
+
+def _status(t_ms: int, state: str) -> dict:
+    return {"type": "status", "t_us": t_ms * 1000, "state": state, "detail": state, "seg": 0}
+
+
+def _kickoff():
+    return _challenge("00112233445566778899aabbccddeeff", "kickoff", 1_000_000)
+
+
+def _phases(kick: dict) -> list[dict]:
+    return [
         kick,
         _challenge("ffeeddccbbaa99887766554433221100", "halftime", 2_000_000),
         _challenge("0123456789abcdef0123456789abcdef", "end", 3_000_000),
     ]
-    # decode=False: a mismatch still names pattern_mismatch. The pause search is not what failed.
-    return qm.fill_challenge_results(bundle, {"challenges": chs}, decode=False)
+
+
+def _wrong_button(pattern: list[str]) -> str:
+    return next(b for b in ("CROSS", "CIRCLE", "SQUARE", "TRIANGLE", "UP", "DOWN", "LEFT", "RIGHT") if b != pattern[1])
+
+
+def _fill(bundle: Path, rows: list[dict], challenges: list[dict], *, chop: int = 0) -> dict:
+    import qorcap_match as qm
+
+    bundle.mkdir(parents=True)
+    raw = ("".join(json.dumps(r) + "\n" for r in rows)).encode()
+    if chop:
+        raw = raw[:-chop]
+    (bundle / "inputs.jsonl").write_bytes(raw)
+    for name in ("bundle.json", "receipt.json"):
+        (bundle / name).write_text("{}\n", encoding="utf-8")
+    for name in ("manifest.jsonl", "checkpoints.jsonl"):
+        (bundle / name).write_text("", encoding="utf-8")
+    # decode=False: the pattern decision does not wait on a pause frame.
+    return qm.fill_challenge_results(bundle, {"challenges": challenges}, decode=False)
+
+
+def _mismatch_bundle(bundle: Path) -> dict:
+    """Kickoff presses OPTIONS then a button that is not the prompt. The pad stays connected."""
+    kick = _kickoff()
+    t0 = kick["issued_ms"] + 1_000
+    rows = [
+        {"type": "header", "schema": "qorcap-inputs/v0", "t_us": 0, "seg": 0, "wall_anchor_ms": 0},
+        _status(0, "connected"),
+        _press(t0, "OPTIONS"),
+        _press(t0 + 400, _wrong_button(kick["pattern"])),
+    ]
+    return _fill(bundle, rows, _phases(kick))
 
 
 def _signed_from_challenges(tmp: Path, challenges: list[dict]):
@@ -229,15 +267,11 @@ def test_pattern_mismatch_verifies_as_challenge_failed(tmp_path, capsys):
     out = capsys.readouterr().out
     assert "FAILED (pattern_mismatch)" in out and "PASSED" not in out
 
-    schema = json.loads((HERE.parent / "contracts" / "receipt.v0.json").read_text())
-    result_schema = schema["properties"]["challenges"]["items"]["properties"]["result"]["oneOf"]
-    assert result_schema[0] == {"type": "null"}
-    props = result_schema[1]["properties"]
-    assert props["ok"]["type"] == "boolean" and props["reason"]["type"] == "string"
-    assert "enum" not in props["reason"] and "enum" not in props["ok"]
-    assert set(kick) <= set(props) | {"reverified_by"}
+    import jsonschema
 
-    _rec, v = _signed_from_challenges(tmp_path / "sign", filled["challenges"])
+    schema = json.loads((HERE.parent / "contracts" / "receipt.v0.json").read_text())
+    rec, v = _signed_from_challenges(tmp_path / "sign", filled["challenges"])
+    jsonschema.validate(rec, schema)
     assert v["status"] == "FAIL"
     assert "home:kickoff:challenge_failed:pattern_mismatch" in v["errors"]
     assert "home:challenge_unanswered:kickoff" not in v["partial"]
@@ -264,3 +298,118 @@ def test_null_result_mutation_hides_the_mismatch(tmp_path, monkeypatch):
     assert "home:challenge_unanswered:kickoff" in v_bad["partial"]
     assert "home:kickoff:challenge_failed:pattern_mismatch" not in v_bad["errors"]
     assert v_bad["status"] == "SELF_ATTESTED"
+
+
+def test_only_pattern_mismatch_among_non_ok_reasons_is_stored():
+    """video_before_input and video_latency_too_high stay null. Widening the allowlist would store them."""
+    import qorcap_challenge as C
+
+    def widened(res):
+        if isinstance(res, dict) and res.get("ok") is True:
+            return res
+        if isinstance(res, dict) and res.get("reason") in {"pattern_mismatch", "video_before_input", "video_latency_too_high"}:
+            return res
+        return None
+
+    for reason in _NON_OK_REASONS:
+        body = {"ok": False, "reason": reason, "pause_press_ms": 1, "done_ms": None, "latency_ms": None}
+        got = C.receipt_result(body)
+        if reason == "pattern_mismatch":
+            assert got is not None and got["reason"] == "pattern_mismatch"
+        else:
+            assert got is None
+        if reason in {"video_before_input", "video_latency_too_high"}:
+            assert widened(body) is not None and got is None
+
+
+def test_options_alone_and_late_rest_stay_failed(tmp_path):
+    """QorArch: these two match the referee, so a trustworthy log stores pattern_mismatch."""
+    kick = _kickoff()
+    t0 = kick["issued_ms"] + 1_000
+    header = {"type": "header", "schema": "qorcap-inputs/v0", "t_us": 0, "seg": 0, "wall_anchor_ms": 0}
+    alone = _fill(tmp_path / "alone", [header, _status(0, "connected"), _press(t0, "OPTIONS")], _phases(kick))
+    assert alone["challenges"][0]["result"]["reason"] == "pattern_mismatch"
+    _rec, v_alone = _signed_from_challenges(tmp_path / "alone-sign", alone["challenges"])
+    assert "home:kickoff:challenge_failed:pattern_mismatch" in v_alone["errors"]
+    assert "home:challenge_unanswered:kickoff" not in v_alone["partial"]
+
+    late_rows = [header, _status(0, "connected"), _press(t0, "OPTIONS")]
+    for i, button in enumerate(kick["pattern"][1:]):
+        late_rows.append(_press(kick["deadline_ms"] + 1_000 + i * 400, button))
+    late = _fill(tmp_path / "late", late_rows, _phases(kick))
+    assert late["challenges"][0]["result"]["reason"] == "pattern_mismatch"
+    _rec, v_late = _signed_from_challenges(tmp_path / "late-sign", late["challenges"])
+    assert "home:kickoff:challenge_failed:pattern_mismatch" in v_late["errors"]
+    assert "home:challenge_unanswered:kickoff" not in v_late["partial"]
+
+
+def _glitch_rows(kind: str) -> tuple[list[dict], int]:
+    """Presses that verify_response calls pattern_mismatch, plus one controller glitch. chop is the tail to cut."""
+    kick = _kickoff()
+    t0 = kick["issued_ms"] + 1_000
+    header = {"type": "header", "schema": "qorcap-inputs/v0", "t_us": 0, "seg": 0, "wall_anchor_ms": 0}
+    connected = _status(0, "connected")
+    options = _press(t0, "OPTIONS")
+    if kind == "stall":
+        rows = [header, connected, options, _press(t0 + 400, kick["pattern"][1]), _status(t0 + 800, "stalled")]
+        return rows, 0
+    if kind == "unplug":
+        return [header, connected, options, _status(t0 + 200, "unplugged")], 0
+    if kind == "reconnect":
+        return [
+            header, connected, options,
+            _status(t0 + 200, "unplugged"),
+            _status(t0 + 800, "connected"),
+            _press(t0 + 1_200, _wrong_button(kick["pattern"])),
+        ], 0
+    if kind == "truncated":
+        rows = [header, connected, options, _press(t0 + 400, _wrong_button(kick["pattern"]))]
+        return rows, 12
+    raise AssertionError(kind)
+
+
+def _glitch_fill(bundle: Path, kind: str) -> dict:
+    rows, chop = _glitch_rows(kind)
+    return _fill(bundle, rows, _phases(_kickoff()), chop=chop)
+
+
+@pytest.mark.parametrize("kind", ["stall", "unplug", "reconnect", "truncated"])
+def test_controller_glitch_stays_unanswered(tmp_path, kind):
+    """A stall, unplug, reconnect gap, or partial last line is not a signed player failure."""
+    import qorcap_challenge as C
+
+    filled = _glitch_fill(tmp_path / "bundle", kind)
+    assert filled["challenges"][0]["result"] is None
+    line = json.loads((tmp_path / "bundle" / "challenge_results.jsonl").read_text().splitlines()[0])
+    assert line["reason"] == "pattern_mismatch" and line["ok"] is False
+    assert line["withheld"] == "controller_log"
+    if kind == "truncated":
+        assert C.inputs_log_intact(tmp_path / "bundle" / "inputs.jsonl") is False
+    _rec, v = _signed_from_challenges(tmp_path / "sign", filled["challenges"])
+    assert "home:challenge_unanswered:kickoff" in v["partial"]
+    assert "home:kickoff:challenge_failed:pattern_mismatch" not in v["errors"]
+    assert v["status"] == "SELF_ATTESTED"
+
+
+@pytest.mark.parametrize("kind", ["stall", "unplug", "reconnect", "truncated"])
+def test_ignoring_the_controller_log_signs_the_glitch_as_failed(tmp_path, monkeypatch, kind):
+    """Mutation: trusting every pattern_mismatch signs the glitch as challenge_failed."""
+    import qorcap_challenge as C
+
+    monkeypatch.setattr(C, "mismatch_log_trustworthy", lambda *a, **k: True)
+    filled = _glitch_fill(tmp_path / "bundle", kind)
+    assert filled["challenges"][0]["result"]["reason"] == "pattern_mismatch"
+    assert "withheld" not in json.loads((tmp_path / "bundle" / "challenge_results.jsonl").read_text().splitlines()[0])
+    _rec, v = _signed_from_challenges(tmp_path / "sign", filled["challenges"])
+    assert "home:kickoff:challenge_failed:pattern_mismatch" in v["errors"]
+    assert "home:challenge_unanswered:kickoff" not in v["partial"]
+    assert v["status"] == "FAIL"
+
+
+def test_fail_verdict_exits_2_and_skips_the_submit_prompt():
+    import qorcap_match as qm
+
+    assert qm.EXIT_CODES["FAIL"] == 2
+    assert qm.overall("FAIL", True) == "FAIL"
+    src = (HERE / "qorcap_match.py").read_text(encoding="utf-8")
+    assert "if code != 2 and (a.submit or not a.no_submit_prompt) and not a.test_pattern:" in src

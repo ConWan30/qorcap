@@ -28,7 +28,7 @@ return {"result": res if res["ok"] else None, "local": local}
 
 `fill_challenge_results` in `sidecar/qorcap_match.py` copies that object onto the challenge when it is not null, and otherwise leaves the draft's null in place. A pattern mismatch is `ok: false`, so the receipt kept null while the jsonl line kept `pattern_mismatch`. That is the whole bug. The console then said "not passed" for both a wrong pattern and a challenge nobody answered.
 
-The receipt value is now chosen by `receipt_result`: a pass, or `ok` false with `reason` `pattern_mismatch`. `fill_challenge_results` still copies a non-null result and still leaves null alone. A stored failure is printed as `FAILED`, not `PASSED`.
+`receipt_result` returns a pass, or `ok` false with `reason` `pattern_mismatch`. `challenge_results` then drops that mismatch unless `mismatch_log_trustworthy` says the controller log can support it. `fill_challenge_results` copies a non-null result and leaves null alone. A stored failure is printed as `FAILED`. A withheld one is printed as not passed, and the jsonl line carries `withheld: controller_log`.
 
 QorCap does not call QorTime `review.local.challenge_results` on this path. That function in the pin has the same drop (`result` only when `ok`). The live writer is `qorcap_challenge.challenge_results`.
 
@@ -112,11 +112,19 @@ else:
 
 Phase 2, in this change. The existing `result` object expresses the failure. No new contract field. No hashed sidecar.
 
-The emitter stores a recheck in the receipt in two cases:
+A stored mismatch is a player failure. A recorder or controller glitch is not.
 
-- `ok: true` — a pass, as before (`reverified_by: recorder`, no `rule` field).
-- `ok: false` and `reason == "pattern_mismatch"` — a wrong pattern. Verify reports `challenge_failed`.
+`receipt_result` returns a pass, and it returns `pattern_mismatch`. It does not return any other reason. `video_before_input` and `video_latency_too_high` stay null even though the verifier would put them in `errors` if they were stored. `no_pause_press`, `pause_not_seen_on_video`, and malformed timing stay null too.
 
-Every other recheck stays `result: null` (`no_pause_press`, `pause_not_seen_on_video`, `video_before_input`, `video_latency_too_high`, malformed timing). The verifier would score those as `challenge_failed` too if they were stored, because it only looks at `ok`. Leaving them null keeps a missed press as `challenge_unanswered`, which is the rule the pass tests already lock and the frozen `compat.json` sentence describes. The bug in #93 is the wrong answer, which was logged and then thrown away.
+`challenge_results` keeps a returned `pattern_mismatch` only when both of these hold for that challenge's `[issued_ms, deadline_ms]`:
 
-The jsonl line is still the full recheck for every challenge, pass or miss.
+- `inputs.jsonl` is intact. The last record parses as JSON. A partial last line is not intact. The JSONL reader skips that line, so the presses that remain can look like a short pattern.
+- The pad's status is `connected` at `issued_ms` and stays `connected` through `deadline_ms`. A `stalled`, `unplugged`, or `missing` record in the window withholds the failure. An unplug that reconnects before the deadline still withholds it. The clock is the header `wall_anchor_ms` plus `t_us`, the same clock as the button edges.
+
+QorArch, on this PR: OPTIONS alone stays a failure, and OPTIONS before the deadline with the rest of the pattern after the deadline stays a failure. Both are `pattern_mismatch` from `verify_response`, which is what the referee runs. The client and the referee agree on those two. They are stored when the log is trustworthy. They are not stored when the log is truncated or the pad dropped, because that is the glitch rule above, not a different pattern rule.
+
+A stored mismatch makes `qortime verify` status `FAIL`. `EXIT_CODES["FAIL"]` is 2, and `sign_and_report` returns that. Start Match offers the submit prompt only when `code != 2`, so a stored mismatch skips the prompt.
+
+`contracts/` is not re-vendored here. QorTime PR #80 will reword `compat.json` `recorder_result` and add `recorder_versions.challenge_mismatch_stored_from` `0.3.34`. After that merges, this PR picks up `compat.json`, `SHA256SUMS`, and `CONTRACTS_PIN`. Until then the frozen `recorder_result` sentence still says every non-ok result stays null.
+
+The jsonl line is still the full recheck for every challenge. A withheld mismatch keeps `reason: pattern_mismatch` there and adds `withheld: controller_log`. The receipt result is null.

@@ -30,7 +30,7 @@ jobs:
       # The receipt check is the real `python -m qor_receipt.cli verify`, not a stub.
       - run: sudo apt-get update && sudo apt-get install -y ffmpeg
       # opencv-python-headless: CPU scorebug reads. No GPU, no capture card, no HID.
-      - run: pip install cryptography pytest numpy opencv-python-headless fastapi httpx
+      - run: pip install cryptography pytest numpy opencv-python-headless fastapi httpx jsonschema
       - name: QorTime pin
         run: |
           git init qortime
@@ -158,7 +158,7 @@ jobs:
       # opencv-python-headless: CPU scorebug reads. No GPU, no capture card, no HID.
       # No ffmpeg on this job. Rust clip tests that cut with ffmpeg skip; sign/verify uses tests/fixtures/tiny_clip.mp4.
       # Pytest modules that need ffmpeg stay on the Linux job, where a missing ffmpeg fails the reader step.
-      - run: pip install cryptography pytest numpy opencv-python-headless fastapi httpx
+      - run: pip install cryptography pytest numpy opencv-python-headless fastapi httpx jsonschema
       # c2pa is built with rust_native_crypto (no OpenSSL, no HTTP). This job is the Windows compile check.
       - run: cargo test --locked
         env:

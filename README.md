@@ -280,8 +280,11 @@ From v0.3.11:
   window opens 45 s after the clock starts running in that quarter. Every opening is logged in `challenge_gates.jsonl`.
 - **Receipt fix:** at the end QorCap re-runs each challenge on its own video and controller log (QorTime's rules).
   A passed challenge is written into the receipt. A wrong pattern is written too, with `ok` false and
-  `reason` `pattern_mismatch`, so verify reports `challenge_failed`. Up to v0.3.10 every challenge stayed
-  empty (`challenge_unanswered`). A challenge nobody answered still stays empty, and the reason is in
+  `reason` `pattern_mismatch`, when the controller log is intact and the pad stayed connected for the
+  whole window. Verify then reports `challenge_failed`, and Start Match exits 2 without asking to submit.
+  OPTIONS alone, and a pattern that finishes after the deadline, count as that failure. A stall, an unplug,
+  or a cut-off `inputs.jsonl` stays empty. Up to v0.3.10 every challenge stayed empty
+  (`challenge_unanswered`). A challenge with no OPTIONS press still stays empty, and the reason is in
   `challenge_results.jsonl`.
 
 ### Signed submissions (v0.3.10)

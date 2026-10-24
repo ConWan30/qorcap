@@ -46,14 +46,20 @@ live frame clock passed to ``ReaderCore.on_frame`` (wall time while recording). 
 only writes the close stamp. The official referee uses this same PTS clock only for challenge rule
 v2 (``bundle.json`` ``challenge_rule`` = 2): pause 0..2500 ms, and the successful latencies within
 ±300 ms of their median. A bundle with no ``challenge_rule`` stays on rule v1 (``segment_ranges``,
-0..600 ms). Nothing here is submitted to the referee. An ok result is ``reverified_by: recorder``
-and carries no ``rule`` field, so a local receipt keeps the v1 evidence check.
-A wrong pattern (``ok`` false, ``reason`` ``pattern_mismatch``) is stored the same way.
-The pinned verifier then reports ``challenge_failed``. Any other miss stays null
-(``challenge_unanswered``).
+0..600 ms). Nothing here is submitted to the referee. A pass is ``reverified_by: recorder``
+and carries no ``rule`` field, so that pass stays on the v1 evidence check.
+A ``pattern_mismatch`` is stored only when ``inputs.jsonl`` is intact and the pad stayed
+``connected`` (not ``stalled``, not ``unplugged``, not ``missing``) for the whole window.
+The verifier then reports ``challenge_failed`` and does not run the evidence check.
+OPTIONS alone, and OPTIONS before the deadline with the rest of the pattern after it, are
+that failure when the log is trustworthy: the referee says ``pattern_mismatch`` too.
+A stall, an unplug, a reconnect gap, or a partial last line leaves ``result`` null.
+``video_before_input``, ``video_latency_too_high``, ``pause_not_seen_on_video``, and
+``no_pause_press`` stay null as well.
 """
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
@@ -176,12 +182,12 @@ def capture_clock(segments: list[dict[str, Any]]) -> tuple[float, float]:
 
 
 def receipt_result(res: dict[str, Any] | None) -> dict[str, Any] | None:
-    """What ``challenges[].result`` stores for one recheck.
+    """Object to store for one recheck, before the controller-log gate.
 
-    ``receipt.v0`` allows null, or an object with boolean ``ok`` and string ``reason``.
-    The pinned verifier maps null to ``challenge_unanswered`` and ``ok`` false to
-    ``challenge_failed``. A pass and a wrong pattern are stored. A miss stays null
-    so a challenge nobody answered does not FAIL the player's own receipt.
+    ``receipt.v0`` allows null, or boolean ``ok`` plus string ``reason``. A pass is
+    returned. ``pattern_mismatch`` is returned so the caller can still withhold it when
+    the log is not trustworthy. ``video_before_input`` and ``video_latency_too_high``
+    are not returned. A null result verifies as ``challenge_unanswered``.
     """
     if not isinstance(res, dict):
         return None
@@ -190,6 +196,69 @@ def receipt_result(res: dict[str, Any] | None) -> dict[str, Any] | None:
     if res.get("ok") is False and res.get("reason") == "pattern_mismatch":
         return res
     return None
+
+
+def inputs_log_intact(path: str | Path) -> bool:
+    """False when ``inputs.jsonl`` is missing or its last record is truncated.
+
+    A finished file ends on a complete JSON line. A partial last line does not parse.
+    The recheck's JSONL reader skips that line, so the presses that remain can look
+    like a short pattern. That is not a player failure.
+    """
+    try:
+        raw = Path(path).read_bytes()
+    except OSError:
+        return False
+    if not raw:
+        return True
+    last = ""
+    for line in raw.decode("utf-8", "replace").splitlines():
+        if line.strip():
+            last = line
+    if not last:
+        return True
+    try:
+        json.loads(last)
+    except json.JSONDecodeError:
+        return False
+    return True
+
+
+def pad_connected_through(records: list, *, issued_ms: int, deadline_ms: int, anchor_ms: int) -> bool:
+    """True when status records show ``connected`` across the whole challenge window.
+
+    ``stalled``, ``unplugged``, and ``missing`` anywhere in ``[issued_ms, deadline_ms]``
+    fail the check, including an unplug that reconnects before the deadline. Times are
+    the same wall clock as ``press_events`` (header ``wall_anchor_ms`` plus ``t_us``).
+    """
+    events: list[tuple[int, str]] = []
+    for r in records:
+        if not isinstance(r, dict) or r.get("type") != "status":
+            continue
+        t_us, state = r.get("t_us"), r.get("state")
+        if isinstance(t_us, bool) or not isinstance(t_us, int) or not isinstance(state, str):
+            continue
+        events.append((anchor_ms + t_us // 1000, state))
+    events.sort()
+    state: str | None = None
+    i = 0
+    while i < len(events) and events[i][0] <= issued_ms:
+        state = events[i][1]
+        i += 1
+    if state != "connected":
+        return False
+    while i < len(events) and events[i][0] <= deadline_ms:
+        if events[i][1] != "connected":
+            return False
+        i += 1
+    return True
+
+
+def mismatch_log_trustworthy(bundle: str | Path, records: list, *, issued_ms: int, deadline_ms: int,
+                             anchor_ms: int) -> bool:
+    """A pattern mismatch may be signed only when the controller log can support it."""
+    return inputs_log_intact(Path(bundle) / "inputs.jsonl") and pad_connected_through(
+        records, issued_ms=issued_ms, deadline_ms=deadline_ms, anchor_ms=anchor_ms)
 
 
 def frame_mono_ms(clock: tuple[float, float], pts0_ms: float, n: int, hz: float) -> int:
@@ -260,6 +329,12 @@ def challenge_results(d: str | Path, challenges: list[dict[str, Any]], *, decode
                      capture_pause_max_ms=CAPTURE_PAUSE_MAX_LATENCY_MS)
         if note:
             local["note"] = note
-        return {"result": receipt_result(res), "local": local}
+        stored = receipt_result(res)
+        if stored is not None and res.get("reason") == "pattern_mismatch":
+            anchor = B.wall_anchor(b) or 0
+            if not mismatch_log_trustworthy(d, b.inputs, issued_ms=issued, deadline_ms=deadline, anchor_ms=anchor):
+                stored = None
+                local["withheld"] = "controller_log"
+        return {"result": stored, "local": local}
 
     return [rerun(c) for c in challenges]
