@@ -2,7 +2,7 @@
 
 # QorCap
 
-**Website:** https://conwan30.github.io/qorcap/ · **Download:** [v0.3.32](https://github.com/ConWan30/qorcap/releases/tag/v0.3.32) ([latest release](https://github.com/ConWan30/qorcap/releases/latest))
+**Website:** https://conwan30.github.io/qorcap/ · **Download:** [v0.3.33](https://github.com/ConWan30/qorcap/releases/tag/v0.3.33) ([latest release](https://github.com/ConWan30/qorcap/releases/latest))
 
 A small Windows recorder for a USB HDMI capture card (built for a generic **"USB3.0 Video"** card carrying a PS5),
 made for **[QorTime](https://github.com/ConWan30/qortime)** match receipts. It does two jobs:
@@ -26,7 +26,7 @@ with a local control surface). QorCap copies only that design idea, no code. No 
 
 ## Quickstart: double-click Start Match
 
-1. Download `qorcap-v0.3.32-windows-x64.zip` from the [latest release](https://github.com/ConWan30/qorcap/releases/latest)
+1. Download `qorcap-v0.3.33-windows-x64.zip` from the [latest release](https://github.com/ConWan30/qorcap/releases/latest)
    and unzip it, for example to `C:\QorCap` (right-click the zip, *Extract All*).
 2. Connect PS5 HDMI out to the **USB3.0 Video** card, and the card to a blue USB 3 port. Close OBS or the Camera app.
 3. Double-click **`Start Match`**. On the first run it downloads ffmpeg, installs Python 3.12 through winget if it
@@ -386,7 +386,7 @@ Global: `--port 8788`, `--ffmpeg PATH`, `--log FILE` (default `qorcap.log`, or `
 ## Run on Windows by hand (PowerShell, advanced)
 
 ```powershell
-# 1. unzip qorcap-v0.3.32-windows-x64.zip to C:\QorCap, then:
+# 1. unzip qorcap-v0.3.33-windows-x64.zip to C:\QorCap, then:
 cd C:\QorCap
 Unblock-File .\qorcap.exe, .\get-ffmpeg.ps1
 powershell -ExecutionPolicy Bypass -File .\get-ffmpeg.ps1     # puts ffmpeg.exe next to qorcap.exe
@@ -423,6 +423,8 @@ continues), replay save, challenge stamp visible in the video, score/final event
 written, `verify-bundle` OK, and a single flipped byte reported as FAIL.
 
 **Tested on Windows (v0.2.0–v0.2.1 era, MyTurn, USB3.0 Video):** `--input-format mjpeg` 1280x720@30 with `h264_mf` at 29.7 fps. v0.2.1 fixed audio / auto-format / OBS.
+
+**v0.3.33:** when QorTime posts a liveness challenge, the console plays a loud three-beep clip, tries to show a Windows toast with the prompt (best-effort; some Windows builds refuse it), and flashes the console caption and taskbar button until the window is focused. These alerts are local to this PC and non-blocking: they run on a separate worker after the challenge is recorded and posted, they do not move the issued or deadline times, nothing about them is sent to QorTime or written to the bundle or receipt, and a missed challenge is still a miss. Set `QORCAP_CHALLENGE_BEEP=0` to skip the clip (`QORCAP_CHALLENGE_TOAST=0` and `QORCAP_CHALLENGE_FLASH=0` skip the others); the old `MessageBeep` still runs. Windows only. Covered by unit tests; not yet exercised on Windows hardware. The standard-bar scorebug reader re-anchors a stuck score or clock lock (4 gated reads across 2 s) and abstains on an illegal score step. On an unresolved disagreement it publishes null scores and winner `unknown`, unless a gated end-menu final is present. Re-anchor notes are written to `reanchor_notes.jsonl` in the match bundle, not to the receipt. No clock or banner template is cut from the held-out matches: the standard-bar clock uses the stock glyphs and no banner pack ships, so field-goal and touchdown banners are not detected. `contracts/compat.json` and `contracts/qorcap-bundle.v0.json` re-vendored from QorTime main (dd01b6c, then 61976ca), and a CI job compares the vendored contracts against QorTime main. Vendored contracts re-vendored from QorTime 585ccc4 (frame-bind and readers schemas). Submit uploads frames.jsonl and readers.json when present; this recorder does not write them yet. PR #87. CI also runs the sidecar scorebug reader tests on Linux and Windows. `receipt.v0.json` is unchanged. PRs #72, #73, #74, #76, #83.
 
 **v0.3.32:** the Windows zip includes `contracts/` next to `sidecar/`, and the release build fails if a file the sidecar reads is missing. Signing prints a clear message when `contracts/receipt.v0.json` is absent. The local finalize summary says the recorder already accepted the pause, the receipt check still uses the 600 ms ceiling, and the official referee decides with its own rule. The challenge card says `In the order shown. CIRCLE closes menu; stay until done.` when CIRCLE or CROSS is in the pattern and the row fits. On Windows, virtual-terminal mode is enabled on the Start Match window, so a redirected log does not turn the branded console off. `receipt.v0.json` is unchanged, and the recorder does not stamp a rule on its own result. PR #70.
 
