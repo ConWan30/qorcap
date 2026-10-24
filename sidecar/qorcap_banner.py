@@ -19,7 +19,8 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-# Intentionally absent. See the module docstring. A future pack must not be cut from a held-out match.
+# Optional. The release audit does not require this file. A missing pack means no banner.
+# A future pack must not be cut from a held-out match.
 PACK = Path(__file__).resolve().parent / "packs" / "madden27_banner_fragments.npz"
 
 # NCC floors. DOWNS at 0.57 must miss. The weakest full FIELD GOAL in the clips is 0.69.

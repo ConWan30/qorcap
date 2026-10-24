@@ -3,6 +3,7 @@
 Illegal jumps abstain and are not snapped to a nearby legal score. Legal football steps pass.
 The grammar never raises a confidence.
 """
+import json
 import os
 import sys
 from pathlib import Path
@@ -227,6 +228,103 @@ def test_harvest_refuses_held_out_footage(tmp_path):
     banned = tmp_path / "170123"
     banned.mkdir()
     assert main([str(banned)]) == 2
+    import hashlib
+    import harvest_standard_clock_banner as harvest
+    payload = b"renamed-held-out-clip"
+    digest = hashlib.sha256(payload).hexdigest()
+    commit, table = harvest.held_out_table()
+    assert commit == "585ccc4f2af3d67880d40e75553864df01b6e7b7"
+    assert harvest.clip_sha256("170123", "hl00-q3-a3-h0") == (
+        "46e732640b65a1cdbf8e4f593713cfecea9abb1e6910dad55f070045d19ec70b")
+    cloned = dict(table)
+    cloned[digest] = "site/matches/170123/clips/hl00-q3-a3-h0.mp4"
+    harvest._SHA256 = cloned
+    try:
+        folder = tmp_path / "clean-name"
+        folder.mkdir()
+        (folder / "frame.png").write_bytes(payload)
+        assert main([str(folder)]) == 2
+    finally:
+        harvest._SHA256 = table
+
+
+def test_reanchor_notes_stay_off_the_timeline_schema_and_the_checkpoint(tmp_path):
+    from qorcap_match import apply_stopped_match_final, score_evidence, tail_final_check
+    from qorcap_reader import ReaderCore
+    from qorcap_reanchor_notes import FILENAME, append_note, record_unresolved_final
+
+    schema = json.loads((HERE.parent / "contracts" / "score_timeline.v0.json").read_text(encoding="utf-8"))
+    props = schema["properties"]["signals"]["properties"]["score_timeline"]["properties"]["events"]["items"]["properties"]
+    assert "grammar_reanchor" not in props and "clock_reanchor" not in props
+    rows = []
+    core = ReaderCore(lambda b: None, None, None, None, None)
+    core.reanchor_note = rows.append
+    fr = type("F", (), {})()
+    fr.detail = {"grammar_reanchor": True, "clock_reanchor": True}
+    fr.left_score, fr.right_score, fr.quarter = 6, 7, 2
+    core._note_reanchor(1500, fr)
+    assert rows == [{
+        "t_ms": 1500, "away": 6, "home": 7, "quarter": 2,
+        "grammar_reanchor": True, "clock_reanchor": True,
+    }]
+    append_note(tmp_path, rows[0])
+    base = {"home_score": 6, "away_score": 0, "quarter": 1, "final_t_ms": 5, "winner": "home",
+            "method": "last_scorebug_read_unconfirmed"}
+    stopped = apply_stopped_match_final(
+        {"result": dict(base)},
+        {"basis": "clock_zero", "home": 6, "away": 0, "quarter": 1, "t_ms": 5},
+        grammar_unresolved=True,
+    )
+    assert stopped["result"]["winner"] == "unknown" and stopped["result"]["home_score"] is None
+    kept = apply_stopped_match_final(
+        {"result": dict(base)},
+        {"basis": "end_menu", "method": "end_menu_read", "home": 14, "away": 7, "quarter": 4,
+         "t_ms": 9, "final_confirmed": True},
+        grammar_unresolved=True,
+    )
+    assert kept["result"]["method"] == "end_menu_read" and kept["result"]["home_score"] == 14
+    record_unresolved_final(tmp_path, stopped["result"])
+    record_unresolved_final(tmp_path, kept["result"])
+    lines = [json.loads(line) for line in (tmp_path / FILENAME).read_text(encoding="utf-8").splitlines()]
+    assert lines[-1] == {"kind": "final", "grammar_unresolved": True}
+    assert sum(1 for row in lines if row.get("kind") == "final") == 1
+    event = {"type": "score", "t_ms": 1500, "home": 7, "away": 6, "quarter": 2, "clock_s": 10,
+             "clock_red": False, "video_ms": 1500, "grammar_reanchor": True, "clock_reanchor": True}
+    evidence = score_evidence(event)
+    assert set(evidence) == {"home", "away", "quarter", "clock_s", "clock_red"}
+    assert "grammar_reanchor" not in evidence and "clock_reanchor" not in evidence
+
+    class Tail:
+        def __init__(self, post):
+            self.post = post
+            self.stats = {"frames": 0}
+            self.final = None
+            self.end_menu = None
+            self.end_menu_rejected = None
+
+        def on_frame(self, t, img):
+            self.stats["frames"] += 1
+            self.final = {"basis": "clock_zero", "home": 6, "away": 0, "quarter": 4, "t_ms": t}
+
+    (tmp_path / "timeline.jsonl").write_text(
+        json.dumps({"t_ms": 1000, "home": 6, "away": 0, "quarter": 4}) + "\n", encoding="utf-8")
+    (tmp_path / "manifest.jsonl").write_text(
+        json.dumps({"type": "segment", "seq": 1, "file": "video.mp4", "wall_ms": 60_000}) + "\n", encoding="utf-8")
+    (tmp_path / "video.mp4").write_bytes(b"x")
+    draft = {"result": dict(base, quarter=4, final_t_ms=60_000)}
+    out = tail_final_check(tmp_path, draft, ffmpeg="missing", core_factory=Tail, frames=[(5_000, None)],
+                           grammar_unresolved=True)
+    assert out["result"]["winner"] == "unknown" and out["result"]["home_score"] is None
+
+    class Menu(Tail):
+        def on_frame(self, t, img):
+            self.final = {"basis": "end_menu", "method": "end_menu_read", "home": 14, "away": 7,
+                          "quarter": 4, "t_ms": t, "final_confirmed": True}
+
+    kept_tail = tail_final_check(tmp_path, draft, ffmpeg="missing", core_factory=Menu, frames=[(5_000, None)],
+                                 grammar_unresolved=True)
+    assert kept_tail["result"]["method"] == "end_menu_read"
+    assert (kept_tail["result"]["away_score"], kept_tail["result"]["home_score"]) == (7, 14)
 
 
 def test_clock_does_not_lock_a_low_misread_or_a_quarterless_start_or_a_quarter_regression():

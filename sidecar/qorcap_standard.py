@@ -30,6 +30,8 @@ PACK = Path(__file__).resolve().parent / "packs" / "madden27_standard_score_1100
 # training. The row is the one already on main; this change does not rebuild it and does not remove it.
 PACK_FOUR = Path(__file__).resolve().parent / "packs" / "madden27_standard_score_084523.npz"
 # Logo search wider than the profile's ±3. The 0.90 NCC floor is unchanged. 11 px blur still misses it.
+# ±8 px and the full-resolution clock were tuned on the 170123 highlight kit. That match is held out.
+# No template was cut from it.
 ANCHOR_SEARCH_PX = 8
 
 

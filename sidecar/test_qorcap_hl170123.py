@@ -33,7 +33,9 @@ from qorcap_standard import standard_reader  # noqa: E402
 FIXTURE = HERE / "eval" / "170123_hl"
 LABELS = json.loads((FIXTURE / "labels.json").read_text())
 TRAPS = json.loads((FIXTURE / "traps.json").read_text())
-CLIP_URL = "https://github.com/ConWan30/qortime/raw/main/site/matches/170123/clips/{name}.mp4"
+_HELD_OUT = json.loads((HERE / "packs" / "held_out_sha256.json").read_text(encoding="utf-8"))
+QORTIME_COMMIT = _HELD_OUT["qortime_commit"]
+CLIP_URL = "https://github.com/ConWan30/qortime/raw/" + QORTIME_COMMIT + "/site/matches/170123/clips/{name}.mp4"
 CLIPS = ("hl00-q3-a3-h0", "hl01-q4-a9-h0", "hl02-q4-a10-h0")
 START = {"hl00-q3-a3-h0": 7, "hl01-q4-a9-h0": 6, "hl02-q4-a10-h0": 6}
 # Real source times from site/matches/170123/clips/manifest.json. Start-to-start gaps are
@@ -52,12 +54,24 @@ def _cache() -> Path:
     return root
 
 
+def _clip_sha(name: str) -> str:
+    suffix = f"site/matches/170123/clips/{name}.mp4"
+    hits = [digest for digest, path in _HELD_OUT["sha256"].items() if path == suffix]
+    if len(hits) != 1:
+        raise KeyError(suffix)
+    return hits[0]
+
+
 def _clip(name: str) -> Path:
     path = _cache() / "clips" / f"{name}.mp4"
     path.parent.mkdir(parents=True, exist_ok=True)
-    if path.is_file() and path.stat().st_size > 100_000:
+    expect = _clip_sha(name)
+    if path.is_file() and hashlib.sha256(path.read_bytes()).hexdigest() == expect:
         return path
     urllib.request.urlretrieve(CLIP_URL.format(name=name), path)
+    got = hashlib.sha256(path.read_bytes()).hexdigest()
+    if got != expect:
+        raise RuntimeError(f"{name} sha256 {got} != {expect} at {QORTIME_COMMIT}")
     return path
 
 

@@ -7,7 +7,7 @@
     "084523",
     "193534"
   ],
-  "held_out_note": "170123, 021003 and 125430 are the public matches. 084523 and 193534 are the games Con labelled in sidecar/eval/human_labels.jsonl. Harvesting a glyph from any of them is training. New templates in this change were not cut from them.",
+  "held_out_note": "170123, 021003 and 125430 are the public matches. 084523 and 193534 are the games Con labelled in sidecar/eval/human_labels.jsonl. Harvesting a glyph from any of them is training. New templates in this change were not cut from them. sidecar/packs/held_out_sha256.json lists sha256 of the public clips and event frames of 170123, 021003, and 125430 at qortime 585ccc4f2af3d67880d40e75553864df01b6e7b7. 084523 and 193534 have no source video in either repo, so those are refused by path.",
   "new_templates": [],
   "new_templates_not_built": {
     "clock_glyphs": "Removed. The previous pack madden27_standard_clock_170123.npz was the mean of stock-pack argmax labels on all 90 clean 170123 kit frames (hl00 f007+12k, hl01/hl02 f006+12k). Counts were 0:87, 1:13, 2:3, 3:2, 4:47, 5:24, 7:42, 8:3, 9:22. There was no 6. That pack is deleted.",

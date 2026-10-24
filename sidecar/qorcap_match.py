@@ -308,6 +308,9 @@ def start_reader(api: Api, stop: threading.Event, state: dict, bundle: Path | No
     core = ReaderCore(post, AutoProfileReader(standard_reader(), prep=prep), AgreementWindow(), PauseDetector(), detect_final,
                       final_screen_detector=madden_final_screen, end_menu_reader=EndMenuReader(),
                       playcall=PlayCallDetector(), gate=PauseCapableGate())
+    if bundle is not None:
+        from qorcap_reanchor_notes import append_note
+        core.reanchor_note = lambda row, bundle=bundle: append_note(bundle, row)
     state["core"] = core
     state["gate"] = core.gate
     try:  # Glimpse second opinion on held touchdown jumps: shadow log only unless QORCAP_GLIMPSE_TD_VETO=1
@@ -1207,15 +1210,20 @@ def main(argv=None) -> int:
         say(f"FAIL: QorCap did not write the bundle. See {bundle / 'qorcap.log'}")
         return 2
     draft = json.loads(draft_p.read_text(encoding="utf-8"))
-    # Prefer the live ReaderCore final (includes final_confirmed + delta_corroboration) when present.
+    # Same abstain rule as offline finalize. An end-menu final is kept. The rule is on, not behind a flag.
     live_fin = state.get("final")
+    unresolved = _grammar_unresolved(state.get("core"))
     if live_fin and is_end_menu_final(live_fin):
-        draft = dict(draft, result=apply_final(draft["result"], live_fin))
+        draft = apply_stopped_match_final(draft, live_fin, grammar_unresolved=unresolved)
+    elif unresolved:
+        draft = apply_stopped_match_final(draft, None, grammar_unresolved=True)
     if not a.test_pattern and draft["result"].get("method") != "end_menu_read" and a.ffmpeg:
-        draft = tail_final_check(bundle, draft, ffmpeg=a.ffmpeg)
+        draft = tail_final_check(bundle, draft, ffmpeg=a.ffmpeg, grammar_unresolved=unresolved)
     elif not a.test_pattern and draft["result"].get("method") == "end_menu_read" and draft["result"].get("final_confirmed") is not True and a.ffmpeg:
         # Stop-time fallback: re-read with bundle haptics/clips so a live-uncorroborated delta can still confirm.
-        draft = tail_final_check(bundle, draft, ffmpeg=a.ffmpeg)
+        draft = tail_final_check(bundle, draft, ffmpeg=a.ffmpeg, grammar_unresolved=unresolved)
+    from qorcap_reanchor_notes import record_unresolved_final
+    record_unresolved_final(bundle, draft.get("result"))
     if not a.test_pattern and a.audio != "none":
         report_recording_audio(bundle, a.ffmpeg or next((str(c) for c in [HERE.parent / ("ffmpeg.exe" if WIN else "ffmpeg")]
                                                          if c.exists()), None) or shutil.which("ffmpeg"))
@@ -1643,6 +1651,15 @@ def segment_at(manifest: list[dict], wall_ms: int) -> dict | None:
     return best or (segs[0] if segs else None)
 
 
+# Keys copied into checkpoint evidence. A re-anchor flag is not one of them, so frames_hash stays put.
+_SCORE_EVIDENCE_KEYS = ("home", "away", "quarter", "clock_s", "clock_red")
+
+
+def score_evidence(event: dict) -> dict:
+    """The score object a checkpoint commits. Re-anchor flags are left out."""
+    return {k: event[k] for k in _SCORE_EVIDENCE_KEYS}
+
+
 def score_checkpoints(events: list[dict], manifest: list[dict], match_id: str, role: str) -> list[dict]:
     """QorTime-shaped chain over offline score changes + final, each bound to the video chain head."""
     from qor_receipt.checkpoints import make_checkpoint, GENESIS
@@ -1655,7 +1672,7 @@ def score_checkpoints(events: list[dict], manifest: list[dict], match_id: str, r
             if key == last:
                 continue
             trig, prev_score, last = "score_change", (dict(zip(("home", "away", "quarter"), last)) if last else None), key
-            extra = {"score": {k: e[k] for k in ("home", "away", "quarter", "clock_s", "clock_red")}, "prev_score": prev_score}
+            extra = {"score": score_evidence(e), "prev_score": prev_score}
         elif e["type"] == "final":
             trig, extra = "final", {"final": {k: e[k] for k in ("home", "away", "quarter", "t_ms", "basis") + (("method",) if "method" in e else ())}}
         else:
@@ -1850,6 +1867,18 @@ def _grammar_unresolved(core) -> bool:
     return any(not g.allows_final_fallback() for g in found)
 
 
+def apply_stopped_match_final(draft: dict, live_fin, *, grammar_unresolved: bool = False) -> dict:
+    """Live Start Match final. A disagreement or an unconfirmed re-anchor abstains.
+
+    A gated end-menu final is kept. This is the same rule as offline finalize, and it is on.
+    """
+    if grammar_unresolved and not is_end_menu_final(live_fin):
+        return dict(draft, result=apply_final(draft["result"], None, grammar_unresolved=True))
+    if live_fin and is_end_menu_final(live_fin):
+        return dict(draft, result=apply_final(draft["result"], live_fin, grammar_unresolved=grammar_unresolved))
+    return draft
+
+
 def apply_final(res: dict, fin: dict | None, *, fallback: dict | None = None, grammar_unresolved: bool = False) -> dict:
     """Result fields from a reader final. Only an end-of-game-menu final is ``final_confirmed``; a scorebug final
     (clock_zero / scorebug_gone / final_screen) keeps its basis but stays unconfirmed; no final -> last read.
@@ -1908,7 +1937,7 @@ TAIL_HZ = 2.0
 
 
 def tail_final_check(bundle: Path, draft: dict, *, ffmpeg: str, secs: int = TAIL_SECS, hz: float = TAIL_HZ,
-                     core_factory=None, frames=None) -> dict:
+                     core_factory=None, frames=None, grammar_unresolved: bool = False) -> dict:
     """Live final missed: read the last ``secs`` of the recorded video (end-of-game menu) with the same reader,
     seeded with the live timeline, and confirm the final from recorded frames. Saves clips/final-recorded.mp4
     and final.tail.json. Checkpoints are untouched (the chain is sealed at stop); only the draft result changes."""
@@ -1923,6 +1952,8 @@ def tail_final_check(bundle: Path, draft: dict, *, ffmpeg: str, secs: int = TAIL
     say(f"Final not seen live; checking the last {secs // 60} minutes of the recording for the end-of-game screen ...")
     events: list[dict] = []
     core = (core_factory or default_core_factory)(lambda b: events.append(b) or {})
+    from qorcap_reanchor_notes import append_note
+    core.reanchor_note = lambda row, bundle=bundle: append_note(bundle, row)
     core.timeline = [dict(r) for r in live]
     try:
         from qorcap_reader import note_options_from_inputs
@@ -1957,11 +1988,16 @@ def tail_final_check(bundle: Path, draft: dict, *, ffmpeg: str, secs: int = TAIL
     (bundle / "final.tail.json").write_text(json.dumps(out, indent=2), encoding="utf-8")
     if not fin:
         say("  no end-of-game screen in the recording's last minutes; final stays NOT confirmed.")
+        if grammar_unresolved and draft.get("result", {}).get("method") != "end_menu_read":
+            return dict(draft, result=apply_final(draft["result"], None, grammar_unresolved=True))
         return draft
+    still = bool(grammar_unresolved) or _grammar_unresolved(core)
     if is_end_menu_final(fin):
         say(f"  FINAL (end-of-game menu, from recorded frames): AWAY {fin['away']} - HOME {fin['home']}")
         for n in fin.get("notes") or []:
             say(f"  note: {n}")
+    elif still:
+        say("  score grammar is unresolved; the final score abstains.")
     else:
         say(f"  FINAL on the scorebug ({fin['basis']}, from recorded frames): AWAY {fin['away']} - HOME {fin['home']}; "
             "end-of-game menu score NOT read, so the final stays NOT confirmed.")
@@ -1974,7 +2010,9 @@ def tail_final_check(bundle: Path, draft: dict, *, ffmpeg: str, secs: int = TAIL
             say(f"  final clip saved: {clip}")
     except Exception as e:
         say(f"  (final clip not saved: {e})")
-    return dict(draft, result=apply_final(draft["result"], fin))
+    # The tail reader starts with a fresh grammar, so a live disagreement stays in force.
+    # An end-menu final is kept inside apply_final. A scorebug final does not clear it.
+    return dict(draft, result=apply_final(draft["result"], fin, grammar_unresolved=still))
 
 
 def decode_frames_tail(ffmpeg: str, video: Path, secs: int, hz: float, size=(1280, 720)):
@@ -2342,6 +2380,8 @@ def finalize(bundle: Path, *, qt: Path, qorcap: str, ffmpeg: str, key_dir: Path,
     def fac(post):  # one reader across parts so agreement/final state carries over
         if shared["core"] is None:
             shared["core"] = factory(post)
+            from qorcap_reanchor_notes import append_note
+            shared["core"].reanchor_note = lambda row, bundle=bundle: append_note(bundle, row)
             try:
                 from qorcap_reader import note_options_from_inputs
                 note_options_from_inputs(shared["core"], bundle / "inputs.jsonl")
@@ -2391,8 +2431,11 @@ def finalize(bundle: Path, *, qt: Path, qorcap: str, ffmpeg: str, key_dir: Path,
          "method": "offline: QorTime ScorebugReader + AgreementWindow + detect_final over recorded video",
          "finalized_ms": int(time.time() * 1000)}, indent=2), encoding="utf-8")
 
+    unresolved = _grammar_unresolved(shared["core"])
     res = apply_final(draft["result"], fin, fallback=game_segment_score(events),
-                      grammar_unresolved=_grammar_unresolved(shared["core"]))
+                      grammar_unresolved=unresolved)
+    from qorcap_reanchor_notes import record_unresolved_final
+    record_unresolved_final(bundle, res)
     res = keep_recovery_notes(res, draft)
     if role != rec_role:
         corr = meta.get("role_correction") if isinstance(meta.get("role_correction"), dict) else {}
