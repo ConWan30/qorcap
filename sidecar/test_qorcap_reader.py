@@ -715,14 +715,15 @@ def test_transient_stat_failure_keeps_presses(tmp_path, monkeypatch):
     from qorcap_reader import OPTIONS_BIT, ReaderCore, note_options_from_inputs, shared_inputs
 
     inputs = (tmp_path / "inputs.jsonl").resolve()
-    line = json.dumps({"type": "in", "b": OPTIONS_BIT, "t_ms": 1234}) + "\n"
-    inputs.write_text(line, encoding="utf-8")
+    # Binary, so Windows text mode does not turn the newline into CRLF and move the offset.
+    payload = (json.dumps({"type": "in", "b": OPTIONS_BIT, "t_ms": 1234}) + "\n").encode()
+    inputs.write_bytes(payload)
     core = ReaderCore(lambda body: None, None, None, None, _no_final)
     note_options_from_inputs(core, inputs)
     assert core._options_snapshot() == [1234]
     share = shared_inputs(inputs)
     off = share.tail.off
-    assert off == len(line.encode())
+    assert off == inputs.stat().st_size == len(payload)
     want = os.fspath(inputs)
     seen = {"n": 0}
     real = os.stat
