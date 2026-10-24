@@ -26,9 +26,11 @@ def _token(**over):
 
 def test_upload_names_match_the_vendored_registry():
     compat = json.loads((ROOT / "contracts" / "compat.json").read_text(encoding="utf-8"))
-    assert list(qs.META_FILES) == compat["bundle_files"]["meta"]
+    pinned = tuple(compat["bundle_files"]["meta"])
+    assert qs.META_FILES == pinned
     assert qs.upload_names() == qs.META_FILES
-    assert qs.META_FILES[-3:] == ("pairing.json", "device_attest.v0.json", "score_timeline.json")
+    assert pinned[-5:-2] == ("pairing.json", "device_attest.v0.json", "score_timeline.json")
+    assert pinned[-2:] == ("frames.jsonl", "readers.json")
     assert compat["pairing"]["type"] == "qortime-pairing/v1"
     assert compat["pairing"]["file"] == "pairing.json"
     assert compat["pairing"]["body"].startswith("ignored")
@@ -44,15 +46,18 @@ def test_meta_zip_includes_optional_sidecars_only_when_present(tmp_path):
     (bundle / "score_timeline.json").write_text('{"schema":"qorcap-score-timeline/v0"}\n', encoding="utf-8")
     (bundle / "device_attest.v0.json").write_text("{}\n", encoding="utf-8")
     (bundle / "pairing.json").write_text("{}\n", encoding="utf-8")
+    (bundle / "frames.jsonl").write_text('{"type":"header"}\n', encoding="utf-8")
+    (bundle / "readers.json").write_text("{}\n", encoding="utf-8")
     names = set(zipfile.ZipFile(io.BytesIO(qs.meta_zip(bundle))).namelist())
-    assert {"receipt.json", "score_timeline.json", "device_attest.v0.json", "pairing.json"} <= names
+    assert {"receipt.json", "score_timeline.json", "device_attest.v0.json", "pairing.json",
+            "frames.jsonl", "readers.json"} <= names
 
     bare = tmp_path / "bare"
     bare.mkdir()
     (bare / "receipt.json").write_text("{}", encoding="utf-8")
     bare_names = set(zipfile.ZipFile(io.BytesIO(qs.meta_zip(bare))).namelist())
     assert bare_names == {"receipt.json"}
-    for name in ("score_timeline.json", "device_attest.v0.json", "pairing.json"):
+    for name in ("score_timeline.json", "device_attest.v0.json", "pairing.json", "frames.jsonl", "readers.json"):
         assert name not in bare_names
 
 
