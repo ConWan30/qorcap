@@ -6,6 +6,11 @@ other check on those frames was fine (logo, white panel, quarter), so the timeli
 11:12:59 to 11:19:52 while the score sat on 22, 23, and 29. The gate stays 0.70. These two vectors
 are the mean of the real glyphs from that window (148 twos, 132 threes), added as extra variants.
 A "1ST DOWNS" banner still fails ``score_panel_covered`` / ``score_slot_ink`` before any digit match.
+
+The clock is read from the source frame, with mean glyphs from locked 170123 highlights, and kept
+only when it holds or counts down. A FIELD GOAL or TOUCHDOWN banner blanks the scores and still
+returns quarter and clock. The score grammar can abstain; it cannot raise a read. See
+``qorcap_score_grammar`` for the windows.
 """
 from __future__ import annotations
 
@@ -18,9 +23,16 @@ PACK = Path(__file__).resolve().parent / "packs" / "madden27_standard_score_1100
 # "4" template, so every read from 0-14 on was score_unsure and the draft stopped at 0-13 Q2 (real final 6-14).
 # This pack holds the mean of 111 real "4" glyphs from that match (tools/add_standard_four_084523.py).
 PACK_FOUR = Path(__file__).resolve().parent / "packs" / "madden27_standard_score_084523.npz"
+# Mean clock glyphs from locked 170123 highlight frames. Stacked after sha16, so model_id is unchanged.
+CLOCK_PACK = Path(__file__).resolve().parent / "packs" / "madden27_standard_clock_170123.npz"
+# Logo search wider than the profile's ±3. The 0.90 NCC floor is unchanged. 11 px blur still misses it.
+ANCHOR_SEARCH_PX = 8
 
 
 QUARTER_FAIL = {"quarter_unsure", "quarter_missing", "quarter_unknown", "quarter_no_templates"}
+_UNANCHORED = {"layout_unknown", "frame_invalid", "frame_too_small", "frame_aspect"}
+# The score cells are covered or broken. Quarter and clock sit outside them and can still be read.
+_RECOVER = {"score_panel_covered", "score_slot_ink", "score_shape", "score_glyph_count"}
 # A regulation quarter opens at 15:00 and is never above that. 10:00–15:00 is the two-digit minute.
 MMSS_MIN_S = 10 * 60
 MMSS_MAX_S = 15 * 60
@@ -138,28 +150,143 @@ def rescue_standard_read(reader, frame):
     return _fill_clock(reader, frame, fr)
 
 
+def _clock_box_dark(reader, band, dx: int, dy: int) -> bool:
+    """The clock box is still the dark well. A covered score panel does not light it up."""
+    import cv2
+
+    p = reader.profile
+    cb = reader._crop(band, _shift(p.clock_box, dx, dy))
+    if cb is None or cb.size == 0 or cb.shape[0] < 4:
+        return False
+    v = cv2.cvtColor(cb, cv2.COLOR_BGR2HSV)[..., 2].astype(np.float32)
+    border = float(np.concatenate([v[:2].ravel(), v[-2:].ravel()]).mean())
+    return border <= p.max_clock_box_border_v
+
+
+def _stack_clock_variants(reader) -> None:
+    """Extra clock glyphs. Groups are mutated in place; ``TemplatePack.sha16`` is left as built."""
+    if not CLOCK_PACK.is_file():
+        return
+    z = np.load(CLOCK_PACK)
+    clock = reader.pack.groups["clock"]
+    for key in z.files:
+        if len(key) < 2 or not key.startswith("d") or not key[1:].isdigit():
+            continue
+        label = key[1:]
+        if label not in clock:
+            continue
+        vec = np.atleast_2d(np.asarray(z[key], dtype=np.float32))
+        clock[label] = np.vstack([clock[label], vec])
+
+
 class StandardBarReader:
-    """``madden27_standard`` plus the 110028 digit variants, with scores kept when the quarter misses."""
+    """``madden27_standard`` plus real digit variants.
 
-    wants_full_res = False
+    Scores and the quarter word are read on the 640×360 prep, so a full-resolution frame does not
+    change them. The clock is read from the source frame. A banner that covers the scores blanks
+    the scores and still returns quarter and clock. The score grammar can abstain; it cannot raise
+    a read. ``t_ms`` None leaves the grammar and the clock history idle, so a one-shot fixture read
+    stays a one-shot.
+    """
 
-    def __init__(self, inner) -> None:
+    wants_full_res = True
+    accepts_time = True
+
+    def __init__(self, inner, grammar=None) -> None:
+        from qorcap_clock import ClockHistory
+        from qorcap_score_grammar import ScoreGrammar
+
         self.inner = inner
         self.profile = inner.profile
         self.profile_id = inner.profile.profile_id
+        self.grammar = grammar if grammar is not None else ScoreGrammar()
+        self.clocks = ClockHistory()
 
-    def read(self, frame):
-        return rescue_standard_read(self.inner, frame)
+    def read(self, frame, t_ms=None):
+        from qorcap_banner import detect_banner
+        from qorcap_reader import prep
+
+        small = prep(frame)
+        fr = rescue_standard_read(self.inner, small)
+        banner = None
+        if fr.reason not in _UNANCHORED:
+            fr = self._recover_quarter(small, fr)
+            fr = self._apply_clock(frame, fr, t_ms)
+            if t_ms is not None:
+                banner = detect_banner(self.inner, small)
+        if t_ms is not None:
+            fr = self.grammar.filter(fr, t_ms, banner)
+        return fr
+
+    def _recover_quarter(self, small, fr):
+        """Quarter only. Scores stay blank: a banner is not a digit source."""
+        if fr.quarter is not None or fr.left_score is not None or fr.right_score is not None:
+            return fr
+        if fr.reason not in _RECOVER:
+            return fr
+        band, why = self.inner.reference_band(small)
+        if band is None:
+            return fr
+        dx, dy = fr.offset if getattr(fr, "offset", None) else (0, 0)
+        if not _clock_box_dark(self.inner, band, dx, dy):
+            return fr
+        q, _why, qc = self.inner._read_quarter(band, dx, dy)
+        if q is None:
+            return fr
+        from dataclasses import replace
+        return replace(fr, quarter=q, quarter_conf=round(float(qc), 4))
+
+    def _apply_clock(self, frame, fr, t_ms):
+        from dataclasses import replace
+
+        from qorcap_clock import read_clock_box
+
+        if fr.reason == "clock_box_missing":
+            return fr
+        dx, dy = fr.offset if getattr(fr, "offset", None) else (0, 0)
+        full = read_clock_box(self.inner, frame, dx, dy)
+        if full is not None:
+            secs, text, conf, margin, red = full
+            source = "full"
+        else:
+            secs, text = fr.clock_seconds, fr.clock_text
+            conf, margin, red = fr.clock_conf, fr.clock_margin, fr.clock_red
+            source = "inner"
+        kept = self.clocks.filter(secs, fr.quarter, t_ms)
+        if kept is None:
+            if secs is None and source == "inner":
+                return fr
+            return replace(
+                fr, clock_seconds=None, clock_text=None, clock_conf=None, clock_margin=None, clock_red=False,
+            )
+        if source == "inner" and kept == fr.clock_seconds:
+            return fr
+        return replace(
+            fr,
+            clock_seconds=int(kept),
+            clock_text=text,
+            clock_conf=None if conf is None else round(float(conf), 4),
+            clock_margin=None if margin is None else round(float(margin), 4),
+            clock_red=bool(red),
+        )
+
+    def note_lock(self, t_ms: int, away: int, home: int) -> None:
+        """A score the agreement window locked. Not called from ``read``."""
+        self.grammar.note_lock(t_ms, away, home)
 
     def reference_band(self, frame):
-        return self.inner.reference_band(frame)
+        """The prep band, so a full-resolution caller hashes the same crop as the 640 path."""
+        from qorcap_reader import prep
+        return self.inner.reference_band(prep(frame))
 
     def __getattr__(self, name):
         return getattr(self.inner, name)
 
 
 def standard_reader():
-    """QorTime's ScorebugReader plus the 110028 "2"/"3" and 084523 "4" variants."""
+    """QorTime's ScorebugReader plus the 110028 "2"/"3", the 084523 "4", and the 170123 clock variants."""
+    from dataclasses import replace
+
     from qor_receipt._vendor.qoresence.vision.local_scorebug.reader import ScorebugReader
 
     reader = ScorebugReader()
@@ -172,4 +299,6 @@ def standard_reader():
         z = np.load(PACK_FOUR)
         score = reader.pack.groups["score"]
         score["4"] = np.vstack([score["4"], np.atleast_2d(z["four"].astype(np.float32))])
+    _stack_clock_variants(reader)
+    reader.profile = replace(reader.profile, anchor_search_px=ANCHOR_SEARCH_PX)
     return StandardBarReader(reader)

@@ -756,7 +756,10 @@ class ReaderCore:
                 self.stats["pause_capable"] = self.stats.get("pause_capable", 0) + 1
                 print(f"pause-capable moment ({ev.basis}): Q{ev.quarter} -> {ev.phase} challenge may open", file=sys.stderr)
         try:
-            fr = self.reader.read(rimg)
+            if getattr(self.reader, "accepts_time", False):
+                fr = self.reader.read(rimg, t_ms=t_ms)
+            else:
+                fr = self.reader.read(rimg)
             band, _ = self.reader.reference_band(rimg) if hasattr(self.reader, "reference_band") else (None, None)
         except Exception as e:  # never silent
             self.stats["errors"] += 1
@@ -802,6 +805,9 @@ class ReaderCore:
 
     def _post_agreed(self, t_ms: int, read, soft: bool) -> None:
         from types import SimpleNamespace
+        note = getattr(self.reader, "note_lock", None)
+        if note is not None and getattr(read, "left_score", None) is not None and getattr(read, "right_score", None) is not None:
+            note(t_ms, read.left_score, read.right_score)
         res = SimpleNamespace(read=read)
         if soft and hasattr(self.agree, "last_agreed"):
             self.agree.last_agreed = res.read.pair

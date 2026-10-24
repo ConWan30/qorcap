@@ -102,13 +102,15 @@ def test_standard_bar_reads_23_and_30_and_refuses_the_downs_banner():
     assert not miss.ok  # the stall: stock templates do not clear 0.70 on this "2"/"3"
     hit = aug.read(q3)
     assert hit.ok and (hit.left_score, hit.right_score, hit.quarter) == (23, 0, 3), hit
+    assert hit.clock_seconds == 26  # 3rd, 0:26
     q4 = aug.read(img("m27_std_110028_q4_30_6.jpg"))
     assert q4.ok and (q4.left_score, q4.right_score, q4.quarter) == (30, 6, 4), q4
+    assert q4.clock_seconds == 67  # 4th, 1:07
     banner = aug.read(img("m27_std_110028_downs.jpg"))
     assert not banner.ok
     assert banner.reason in ("score_panel_covered", "score_slot_ink", "score_unsure", "layout_unknown")
-    assert (banner.left_score, banner.right_score) != (6, 4)
-    assert (banner.left_score, banner.right_score) != (61, 4)
+    assert (banner.left_score, banner.right_score) == (None, None)
+    assert (banner.quarter, banner.clock_seconds) == (4, 104)  # 4th, 1:44, scores stay blank
 
 
 def test_standard_bar_reads_the_red_14_of_084523():
@@ -122,6 +124,13 @@ def test_standard_bar_reads_the_red_14_of_084523():
         assert fr.ok, (name, fr.reason)
         assert tuple(fr.pair) == pair and fr.quarter == q, (name, fr.pair, fr.quarter)
         assert fr.score_margin >= 0.15
+    clocks = {
+        "m27_std_084523_q2_0_13.jpg": 36,   # 2nd, 0:36
+        "m27_std_084523_q2_0_14.jpg": 32,   # 2nd, 0:32
+        "m27_std_084523_q4_6_14.jpg": 80,   # 4th, 1:20
+    }
+    for name, secs in clocks.items():
+        assert r.read(prep(img(name))).clock_seconds == secs, name
 
 
 def test_without_the_four_variant_084523_stays_unread():
@@ -129,6 +138,25 @@ def test_without_the_four_variant_084523_stays_unread():
     from qorcap_reader import prep
     fr = ScorebugReader().read(prep(img("m27_std_084523_q4_6_14.jpg")))
     assert not fr.ok and fr.reason == "score_unsure"
+
+
+def test_clock_variants_do_not_change_the_model_id_and_the_anchor_stays_strict():
+    """Harvested clock glyphs are extra variants. They must not change the pack hash the checkpoint names."""
+    raw, aug = ScorebugReader(), standard_reader()
+    assert aug.inner.model_id == raw.model_id
+    assert aug.inner.profile.anchor_search_px == 8
+    assert aug.inner.profile.min_logo_ncc == raw.profile.min_logo_ncc == 0.90
+    assert aug.wants_full_res is True
+
+
+def test_downs_banner_is_not_a_field_goal_and_mints_no_score():
+    from qorcap_banner import detect_banner
+    from qorcap_reader import prep
+    r = standard_reader()
+    banner = r.read(img("m27_std_110028_downs.jpg"))
+    assert not banner.ok
+    assert (banner.left_score, banner.right_score) == (None, None)
+    assert detect_banner(r.inner, prep(img("m27_std_110028_downs.jpg"))) is None
 
 
 def test_human_label_for_084523_matches_the_q4_fixture():
