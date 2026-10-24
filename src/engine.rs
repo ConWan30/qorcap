@@ -68,6 +68,8 @@ pub struct Engine {
     pub input: Arc<Mutex<crate::inputs::InputLog>>,
     /// Opt-in per-frame capture clock. Off unless `--frame-clock` or `QORCAP_FRAME_CLOCK`. No file when off.
     pub frame_clock: Arc<crate::frameclock::FrameClock>,
+    /// Opt-in sealed per-frame sidecar. Off unless `--frame-bind` or `QORCAP_FRAME_BIND`.
+    pub frame_bind: crate::framebind::FrameBind,
     /// The supervisor loop (`run`) is active; the API keeps serving until it has finished the bundle.
     pub running: AtomicBool,
     /// Set when `run` has returned (or /shutdown arrives while not running): the API thread exits.
@@ -209,11 +211,13 @@ impl Engine {
         // After the input logger's wall anchor, before `started`. Opening the file does not read the clock.
         let frame_on = crate::frameclock::flag_enabled(args.frame_clock, std::env::var(crate::frameclock::ENV).ok().as_deref());
         let frame_clock = Arc::new(crate::frameclock::FrameClock::open(frame_on, args.bundle.as_deref().map(Path::new)));
+        let bind_on = crate::framebind::flag_enabled(args.frame_bind, std::env::var(crate::framebind::ENV).ok().as_deref());
+        let frame_bind = crate::framebind::FrameBind::open(bind_on, args.bundle.as_deref().map(Path::new), args.fps);
         let st = Status { state: "starting".into(), device: args.device.clone(), res: format!("{}x{}", args.res.0, args.res.1), fps_target: args.fps, replay_window: args.replay.unwrap_or(0), role: args.role.clone(), side_source: args.side_source.clone(), ..Default::default() };
         Arc::new(Self { ffmpeg, ring: Mutex::new(ReplayRing::new(window, cap)), rec: Mutex::new(None), status: Mutex::new(st), shutdown: AtomicBool::new(false),
             ev: Mutex::new(MatchState { started_wall_ms: wall_ms(), score: Value::Null, ..Default::default() }), subs: Mutex::new(vec![]),
             stamp_file: dir.join("stamp.txt"),
-            snapshot: dir.join("snapshot.jpg"), tap: crate::glimpse::FrameTap::with_ring(args.glimpse_frame || crate::glimpse::env_enabled(), crate::glimpse::ring_enabled()), exit_when_recording_ends: AtomicBool::new(false), started: Instant::now(), last_data_ms: AtomicU64::new(0), input, frame_clock,
+            snapshot: dir.join("snapshot.jpg"), tap: crate::glimpse::FrameTap::with_ring(args.glimpse_frame || crate::glimpse::env_enabled(), crate::glimpse::ring_enabled()), exit_when_recording_ends: AtomicBool::new(false), started: Instant::now(), last_data_ms: AtomicU64::new(0), input, frame_clock, frame_bind,
             running: AtomicBool::new(false), api_closed: AtomicBool::new(false), sealed: AtomicBool::new(false),
             countersigned: std::sync::atomic::AtomicI64::new(-1),
             stop_reason: Mutex::new(None), bundle_write: Mutex::new(()), bundle_finalized: AtomicBool::new(false), args })
@@ -258,7 +262,21 @@ impl Engine {
         drop(g);
         // Genesis checkpoint right away: the first segment checkpoint can be 5-10 s away (device open,
         // audio fallback retry, encoder warm-up) and the referee must see the chain start promptly.
-        self.checkpoint("start", match &self.args.side_source { Some(src) => json!({"side_source": src}), None => json!({}) });
+        // With --frame-bind the opening checkpoint waits (bounded) so readers.json can be sealed into
+        // seq 0. Flag off does not wait and does not add fields.
+        if self.frame_bind.enabled() {
+            let me = self.clone();
+            std::thread::spawn(move || {
+                let deadline = Instant::now() + crate::framebind::READERS_WAIT;
+                while Instant::now() < deadline {
+                    if me.shutdown.load(Ordering::SeqCst) || me.frame_bind.readers_ready() { break; }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                me.emit_opening();
+            });
+        } else {
+            self.emit_opening();
+        }
         // Until the first video segment exists (device open, audio fallbacks, encoder warm-up), keep the
         // referee fed every 4 s. Stops for good at the first segment, so mid-match gaps are still gaps.
         { let me = self.clone(); std::thread::spawn(move || {
@@ -266,6 +284,7 @@ impl Engine {
             while t0.elapsed() < Duration::from_secs(120) {
                 std::thread::sleep(Duration::from_millis(4000));
                 if me.shutdown.load(Ordering::SeqCst) || me.ev.lock().unwrap_or_else(|e| e.into_inner()).seg.seq > 0 || me.rec.lock().unwrap_or_else(|e| e.into_inner()).is_none() { break; }
+                if me.frame_bind.enabled() && !me.frame_bind.opening_claimed() { continue; }
                 me.checkpoint("startup", json!({}));
             }
         }); }
@@ -390,6 +409,9 @@ impl Engine {
                 if written && frame_clock.enabled() {
                     let file = Path::new(&r.path).file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
                     frame_clock.observe(slice, t_us, &file);
+                }
+                if written {
+                    self.frame_bind.observe_ts(slice, t);
                 }
             }
             if r.deadline.map(|d| Instant::now() >= d).unwrap_or(false) {
@@ -1145,6 +1167,67 @@ mod tests {
         assert_eq!(stamps[0].file, "video.mp4");
         let _ = std::fs::remove_dir_all(&dir2);
     }
+
+    #[test]
+    fn frame_bind_off_adds_nothing_and_on_seals_the_sidecar_into_verify() {
+        use clap::Parser;
+        let dir = std::env::temp_dir().join(format!("qorcap-bind-eng-off-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let d = dir.to_string_lossy().into_owned();
+        let crate::cli::Cmd::Record(r) = crate::cli::Cli::try_parse_from(["q", "record", "--device", "testpattern", "--bundle", &d, "--no-controller"]).unwrap().cmd else { panic!() };
+        let e = Engine::new(r, "ffmpeg-x".into());
+        assert!(!e.frame_bind.enabled());
+        let video = dir.join("video.mp4");
+        std::fs::write(&video, b"hashed-segment").unwrap();
+        e.on_segment(video.to_str().unwrap(), 0, b"hashed-segment");
+        let cp: Value = serde_json::from_str(std::fs::read_to_string(dir.join("checkpoints.jsonl")).unwrap().lines().next().unwrap()).unwrap();
+        assert!(cp["qorcap"].get("frame_bind").is_none());
+        assert!(cp["qorcap"].get("readers").is_none());
+        assert!(!dir.join("frames.jsonl").exists());
+        assert!(!dir.join("readers.json").exists());
+        let off = crate::bundle::verify(&dir).unwrap();
+        assert!(off.errors.is_empty(), "{:?}", off.errors);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let dir = std::env::temp_dir().join(format!("qorcap-bind-eng-on-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let d = dir.to_string_lossy().into_owned();
+        let crate::cli::Cmd::Record(r) = crate::cli::Cli::try_parse_from(["q", "record", "--device", "testpattern", "--bundle", &d, "--no-controller", "--frame-bind"]).unwrap().cmd else { panic!() };
+        let e = Engine::new(r, "ffmpeg-x".into());
+        assert!(e.frame_bind.enabled());
+        let manifest = serde_json::json!({
+            "schema": "qorcap-readers/v0",
+            "readers": [{"id": "scorebug", "version": "0.3.32", "files": [
+                {"kind": "code", "path": "sidecar/qorcap_standard.py", "sha256": "ab".repeat(32)}
+            ]}]
+        });
+        e.bind_readers(&manifest).unwrap();
+        e.frame_bind.append_frame(1, 0, 0, b"au-0").unwrap();
+        e.frame_bind.append_frame(1, 30, 1120, b"au-30").unwrap();
+        let video = dir.join("video.mp4");
+        std::fs::write(&video, b"hashed-segment").unwrap();
+        e.on_segment(video.to_str().unwrap(), 0, b"hashed-segment");
+        let text = std::fs::read_to_string(dir.join("checkpoints.jsonl")).unwrap();
+        let cps: Vec<Value> = text.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+        assert!(cps.len() >= 2, "opening checkpoint plus the segment");
+        assert!(cps[0]["qorcap"]["readers"]["sha256"].is_string());
+        assert!(cps[0]["qorcap"].get("frame_bind").is_some());
+        assert!(cps.iter().all(|c| c["qorcap"].get("frame_bind").is_some()));
+        assert_eq!(cps[0]["frames_hash"], crate::evidence::try_jcs_sha(&cps[0]["qorcap"]).unwrap());
+        let ok = crate::bundle::verify(&dir).unwrap();
+        assert!(ok.errors.is_empty(), "{:?}", ok.errors);
+        let report = crate::framebind::check_dir(&dir, &cps);
+        assert!(report.frame_claim && report.reader_claim, "{:?}", report.errors);
+        assert!(report.skew.iter().any(|s| s.frame == 30 && s.skew_ms == 120), "{:?}", report.skew);
+        let mut raw = std::fs::read(dir.join("frames.jsonl")).unwrap();
+        raw[40] ^= 0x01;
+        std::fs::write(dir.join("frames.jsonl"), &raw).unwrap();
+        let bad = crate::bundle::verify(&dir).unwrap();
+        assert!(bad.errors.iter().any(|e| e.contains("frames.jsonl") || e.contains("frame_bind")), "{:?}", bad.errors);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 impl Engine {
@@ -1181,10 +1264,29 @@ impl Engine {
         append_jsonl(&self.ev_path("manifest.jsonl"), &m);
         crate::inputproof::touch_recording_marker(self.bundle_dir().as_deref());
         self.broadcast("segment", &m);
+        // Frame lines for this fragment are on disk before the checkpoint that commits their running hash.
+        self.frame_bind.on_segment(seq, kind, bytes);
+        if self.frame_bind.enabled() { self.emit_opening(); }
         // Seal controller inputs received up to now into this segment's chunk (same clock, same checkpoint).
         let (ih, ihead, n) = self.input.lock().unwrap_or_else(|e| e.into_inner()).seal(seq, self.started.elapsed().as_micros() as u64);
         if self.args.no_controller { self.checkpoint("segment", json!({})); }
         else { self.checkpoint_with("segment", json!({"input_seg": seq, "input_n": n, "input_head": ihead}), Some(ih)); }
+    }
+
+    /// Checkpoint seq 0. Once per recording. Flag off: the same start checkpoint as before.
+    /// Flag on: includes whatever readers hash was frozen by `claim_opening` (or unbound).
+    fn emit_opening(&self) {
+        if !self.frame_bind.claim_opening() { return; }
+        let extra = match &self.args.side_source { Some(src) => json!({"side_source": src}), None => json!({}) };
+        self.checkpoint("start", extra);
+    }
+
+    /// Scorebug sidecar posts the reader/pack manifest. Seals it into checkpoint 0 when that
+    /// checkpoint has not been written yet. A late post is refused and is not a reader claim.
+    pub fn bind_readers(&self, manifest: &Value) -> Result<Value, String> {
+        let sha = self.frame_bind.install_readers(manifest)?;
+        self.emit_opening();
+        Ok(json!({"ok": true, "sha256": sha}))
     }
 
     /// Append a QorTime-shaped checkpoint binding the current chain head + score/clock state.
@@ -1198,6 +1300,11 @@ impl Engine {
         let mut ext = json!({"trigger": trigger, "segment_seq": st.seg.seq, "segment_hash": st.last_seg_sha, "chain_head": st.seg.head,
             "score": st.score, "mono_ms": self.ms(), "match_id": self.args.match_id, "role": self.args.role});
         if let (Value::Object(e), Value::Object(x)) = (&mut ext, extra) { e.extend(x); }
+        // Binding fields win over anything the caller put in `extra`, and they are omitted entirely
+        // when the flag is off. They live inside `qorcap`, which `frames_hash` already covers.
+        if let Some(bind) = self.frame_bind.commitment(st.cps.seq == 0) {
+            if let (Value::Object(e), Value::Object(x)) = (&mut ext, bind) { e.extend(x); }
+        }
         let cp = match st.cps.next_with_input(wall_ms(), ext, input_hash) {
             Ok(cp) => cp,
             Err(e) => {
@@ -1240,6 +1347,10 @@ impl Engine {
     /// Scorebug reader events (from the sidecar): score | obs | final.
     pub fn event(self: &Arc<Self>, b: &Value) -> Result<Value, String> {
         let ty = b["type"].as_str().ok_or("missing type")?;
+        if ty == "readers" {
+            let manifest = b.get("manifest").ok_or("missing manifest")?;
+            return self.bind_readers(manifest);
+        }
         let t_ms = b["t_ms"].as_u64().unwrap_or_else(wall_ms);
         let int = |k: &str| b[k].as_i64().ok_or(format!("{k} must be an integer"));
         match ty {

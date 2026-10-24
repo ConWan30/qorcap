@@ -369,6 +369,12 @@ pub struct RecordArgs {
     /// (`qorcap align-ab`, docs/FRAME_CLOCK_AB.md).
     #[arg(long)]
     pub frame_clock: bool,
+    /// Draft: seal a per-frame sidecar and a scorebug-reader manifest into checkpoints.
+    /// Off unless this flag or `QORCAP_FRAME_BIND=1`. Writes `frames.jsonl` and, when the
+    /// sidecar posts it, `readers.json`. Does not add receipt fields and does not change
+    /// `frames_hash`'s formula. See docs/design/frame-and-reader-binding.md.
+    #[arg(long)]
+    pub frame_bind: bool,
 }
 
 impl RecordArgs {
@@ -432,8 +438,9 @@ mod tests {
         assert!(matches!(Cli::try_parse_from(["qorcap", "pair", "create", "--bundle", "b"]).unwrap().cmd, Cmd::Pair { action: PairCmd::Create, .. }));
         assert!(matches!(Cli::try_parse_from(["qorcap", "pair", "join", "qorpair1.abc", "--bundle", "b"]).unwrap().cmd, Cmd::Pair { action: PairCmd::Join { .. }, .. }));
         assert!(matches!(Cli::try_parse_from(["qorcap", "input-proof", "b", "--frames", "10"]).unwrap().cmd, Cmd::InputProof { frames: 10, .. }));
-        if let Cmd::Record(r) = Cli::try_parse_from(["qorcap", "record", "--no-controller"]).unwrap().cmd { assert!(r.no_controller); assert!(!r.frame_clock); } else { panic!() }
-        if let Cmd::Record(r) = Cli::try_parse_from(["qorcap", "record", "--frame-clock"]).unwrap().cmd { assert!(r.frame_clock); } else { panic!() }
+        if let Cmd::Record(r) = Cli::try_parse_from(["qorcap", "record", "--no-controller"]).unwrap().cmd { assert!(r.no_controller); assert!(!r.frame_clock); assert!(!r.frame_bind); } else { panic!() }
+        if let Cmd::Record(r) = Cli::try_parse_from(["qorcap", "record", "--frame-clock"]).unwrap().cmd { assert!(r.frame_clock); assert!(!r.frame_bind); } else { panic!() }
+        if let Cmd::Record(r) = Cli::try_parse_from(["qorcap", "record", "--frame-bind"]).unwrap().cmd { assert!(r.frame_bind); assert!(!r.frame_clock); } else { panic!() }
         assert!(matches!(Cli::try_parse_from(["qorcap", "align-ab", "b", "--no-video"]).unwrap().cmd, Cmd::AlignAb { no_video: true, frames: 15, .. }));
     }
     #[test]

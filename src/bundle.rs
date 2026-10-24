@@ -200,6 +200,8 @@ pub fn verify(dir: &Path) -> Result<Report, String> {
             }
             r.checkpoints += 1;
         }
+        let bind = crate::framebind::check_dir(dir, &cps);
+        r.errors.extend(bind.errors);
     }
     if let Some(m) = input_by_seg.as_ref() { if committed < m.len() { r.errors.push(format!("inputs: {} chunk(s) not committed by any checkpoint", m.len() - committed)); } }
     Ok(r)
