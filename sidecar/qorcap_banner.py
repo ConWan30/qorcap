@@ -1,13 +1,16 @@
 """FIELD GOAL / TOUCHDOWN fragments on the standard bar.
 
-The zero-shot reader saw ``GOA`` and ``TOUC`` when a banner covered the scores. This matches those
-fragments. It does not OCR the banner and it does not read a team. Both sides stay candidates.
+The matcher looks for a ``GOA`` fragment and a ``TOUC`` fragment. It does not OCR the banner and
+it does not read a team. Both sides stay candidates.
 
-Gates, measured on the 170123 public highlight frames: score-visible frames peak at 0.31 (GOA) and
-0.28 (TOUC). FIELD GOAL frames sit at 0.69–1.0. TOUCHDOWN frames that have finished drawing sit at
-0.83–1.0. The 1ST DOWNS fixture peaks at 0.57 GOA, under the field-goal gate, so it is not a
-field goal. A partial banner that misses the gate simply does not arm; a later clear frame inside
-the grammar window still does.
+No fragment pack is shipped. The only cuts in this repo were held-out 170123 frames (hl00 f175
+for FIELD GOAL, hl01 f174 for TOUCHDOWN). Those matches are evaluation only. The navy TOUCHDOWN
+on 125430 hl04 was missed by that held-out TOUC fragment (NCC about 0.31) and is still undetected:
+there is no non-held-out navy or gold TOUCHDOWN frame to cut a template from. Without a pack,
+``detect_banner`` returns None and the grammar does not arm. A +6 or +3 still takes the ordinary
+path. The 1ST DOWNS fixture is not a field goal.
+
+Gates, if a pack is supplied later: GOA 0.66 (1ST DOWNS peaked at 0.57) and TOUC 0.72.
 """
 from __future__ import annotations
 
@@ -16,7 +19,8 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-PACK = Path(__file__).resolve().parent / "packs" / "madden27_banner_fragments_170123.npz"
+# Intentionally absent. See the module docstring. A future pack must not be cut from a held-out match.
+PACK = Path(__file__).resolve().parent / "packs" / "madden27_banner_fragments.npz"
 
 # NCC floors. DOWNS at 0.57 must miss. The weakest full FIELD GOAL in the clips is 0.69.
 GOA_MIN = 0.66

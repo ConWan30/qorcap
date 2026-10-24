@@ -71,6 +71,7 @@ jobs:
             sidecar/test_qorcap_standard.py \
             sidecar/test_qorcap_score_grammar.py \
             sidecar/test_qorcap_hl170123.py \
+            sidecar/test_qorcap_seq125430.py \
             sidecar/test_qorcap_tnp.py \
             sidecar/test_qorcap_snp.py \
             sidecar/test_qorcap_mnp.py \

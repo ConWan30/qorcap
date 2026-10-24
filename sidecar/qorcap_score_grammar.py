@@ -13,10 +13,28 @@ path, which already rechecks a suspicious jump). +2 with no banner is a safety a
 Windows (constructor arguments; these constants are the default):
 
 * ``BANNER_WINDOW_MS`` = 12_000. One public highlight clip is about 12 s. The banner is on screen
-  for about two seconds and the score returns in the same clip, so 12 s still covers that return
-  and does not reach the next clip when clips are spaced 20 s apart in the harness.
-* ``TRY_WINDOW_MS`` = 45_000. A point-after can land in the following highlight (the 170123 clips
-  go 9-0 then 10-0 about 19 s later in that harness) and expires before an unrelated +1.
+  for about two seconds and the score returns in the same clip.
+* ``TRY_WINDOW_MS`` = 45_000. A point-after can land in the following highlight and expires before
+  an unrelated +1.
+
+Re-anchor (constructor arguments; these constants are the default):
+
+* ``REANCHOR_READS`` = 4 and ``REANCHOR_SPAN_MS`` = 2_000. The agreement window already demands 3
+  samples over 400 ms. A score that is not a legal step from the anchor is still abstained until
+  the same pair has passed the existing glyph gates on 4 reads whose first and last are at least
+  2 s apart. That read is kept, with ``detail["grammar_reanchor"]`` set, and becomes the anchor.
+  Its confidence is the confidence the gates already gave it. A one-frame glitch cannot move the
+  anchor. This is also how a wrong first lock recovers: the first lock is ordinary, and a later
+  score that keeps agreeing takes over.
+
+A re-anchor stays unconfirmed until ``note_lock`` records that same pair (the agreement window
+locked it). While the grammar is abstaining, or the last re-anchor is still unconfirmed,
+``allows_final_fallback`` is false. The match final must abstain instead of publishing the frozen
+anchor.
+
+A backward timestamp is a cut. The old anchor is dropped and the next gated score is a fresh
+entry. An open try is kept only when that next lock is the same score that had the try open, so
+the point-after is still legal. A quarter change does not reset the grammar: scores carry over.
 
 State lives on the reader. Nothing here is written into receipt.v0 or into a checkpoint hash.
 The grammar can only abstain. It does not raise a confidence and it does not fill a blank.
@@ -27,8 +45,8 @@ Legal transitions from a locked score, one side only unless noted:
 |---|---|---|---|---|
 | none yet | any | any | any read | defer (ordinary gates) |
 | same | any | any | same | accept |
-| either side down | any | any | decrease | abstain |
-| both sides move | any | not a try return | both | abstain |
+| either side down | any | any | decrease | abstain, unless it re-anchors |
+| both sides move | any | not a try return | both | abstain, unless it re-anchors |
 | +3 on one side | field goal | any | that side +3 | accept |
 | anything else | field goal | any | not +3 | abstain |
 | +6, +7, or +8 on one side | touchdown | any | that side | accept |
@@ -36,9 +54,10 @@ Legal transitions from a locked score, one side only unless noted:
 | +2 on the other side | none or touchdown | try | defensive return | accept |
 | +2 on one side | none | none | safety | accept |
 | +3 or +6 on one side | none | none | ordinary path | defer |
-| +1, +4, +5, +7, +8, other | none | none | illegal | abstain |
+| +1, +4, +5, +7, +8, other | none | none | illegal | abstain, unless it re-anchors |
 | +3 | touchdown only | none | not a field goal | abstain |
 | +6 | field goal only | none | not a touchdown | abstain |
+| same illegal pair, 4 reads over 2 s | any | any | that pair | re-anchor |
 
 The banner does not name a team. Both sides stay candidates. A banner that is still on screen
 after the transition locks is spent until its window ends, so the same pixels cannot authorise a
@@ -50,8 +69,11 @@ from dataclasses import dataclass, replace
 
 # One highlight clip is ~12 s. The score returns inside that clip after the banner.
 BANNER_WINDOW_MS = 12_000
-# A try can finish in the next highlight. 45 s covers that gap and not a later drive.
+# A try can finish in the next highlight. 45 s covers a short gap and not a later drive.
 TRY_WINDOW_MS = 45_000
+# Four gated reads spanning two seconds. Stricter than one agreement window (3 x 400 ms).
+REANCHOR_READS = 4
+REANCHOR_SPAN_MS = 2_000
 
 _TD_COMBINED = (6, 7, 8)
 _TRY_STEPS = (1, 2)
@@ -100,6 +122,8 @@ class ScoreGrammar:
 
     banner_window_ms: int = BANNER_WINDOW_MS
     try_window_ms: int = TRY_WINDOW_MS
+    reanchor_reads: int = REANCHOR_READS
+    reanchor_span_ms: int = REANCHOR_SPAN_MS
 
     def __post_init__(self) -> None:
         self.reset()
@@ -114,10 +138,25 @@ class ScoreGrammar:
         self.phase: str | None = None
         self.td_side: str | None = None
         self.try_until: int | None = None
+        self._cand: tuple[int, int] | None = None
+        self._cand_n = 0
+        self._cand_t0: int | None = None
+        self._try_carry: tuple[tuple[int, int], str] | None = None
+        self.disagreeing = False
+        self.reanchor_pair: tuple[int, int] | None = None
+        self.reanchor_confirmed = True
+
+    def _cut(self) -> None:
+        """Drop the anchor. Keep an open try so the same score can be re-locked legally."""
+        carry = None
+        if self.phase == "try" and self.locked is not None and self.td_side in ("away", "home"):
+            carry = (tuple(self.locked), self.td_side)
+        self.reset()
+        self._try_carry = carry
 
     def _rewind(self, t_ms: int) -> None:
         if self.last_t is not None and int(t_ms) < self.last_t:
-            self.reset()
+            self._cut()
 
     def active_banner(self, t_ms: int) -> str | None:
         if self.banner_kind and self.banner_until is not None and int(t_ms) <= self.banner_until:
@@ -153,39 +192,92 @@ class ScoreGrammar:
         self.td_side = side
         self.try_until = int(t_ms) + int(self.try_window_ms)
 
+    def _clear_cand(self) -> None:
+        self._cand = None
+        self._cand_n = 0
+        self._cand_t0 = None
+
+    def _reanchor(self, pair: tuple[int, int], t_ms: int) -> bool:
+        """True when this gated pair has agreed for K reads spanning T milliseconds."""
+        t_ms = int(t_ms)
+        if pair != self._cand:
+            self._cand = pair
+            self._cand_n = 1
+            self._cand_t0 = t_ms
+            return False
+        self._cand_n += 1
+        span = t_ms - (t_ms if self._cand_t0 is None else int(self._cand_t0))
+        return self._cand_n >= int(self.reanchor_reads) and span >= int(self.reanchor_span_ms)
+
+    def allows_final_fallback(self) -> bool:
+        """False when a frozen anchor must not be published as the match score."""
+        if self.disagreeing:
+            return False
+        if self.reanchor_pair is not None and not self.reanchor_confirmed:
+            return False
+        return True
+
     def filter(self, fr, t_ms: int | None, banner: str | None = None):
-        """Blank an illegal score. Quarter and clock stay. A missing score is not filled in."""
+        """Blank an illegal score. Quarter and clock stay. A missing score is not filled in.
+
+        A score that is not a legal step is kept, flagged ``grammar_reanchor``, once it has
+        passed the existing gates on ``reanchor_reads`` reads spanning ``reanchor_span_ms``.
+        That does not raise ``score_conf``.
+        """
         if t_ms is None:
             return fr
         self.note_banner(t_ms, banner)
         if getattr(fr, "left_score", None) is None or getattr(fr, "right_score", None) is None:
             return fr
+        pair = (int(fr.left_score), int(fr.right_score))
         phase, side = self._phase_at(t_ms)
-        decision = judge(
-            self.locked, (fr.left_score, fr.right_score), self.active_banner(t_ms), phase, side,
-        )
+        decision = judge(self.locked, pair, self.active_banner(t_ms), phase, side)
         if decision != "abstain":
+            self._clear_cand()
+            if self.locked is not None and pair == tuple(self.locked):
+                self.disagreeing = False
+            elif decision in ("accept", "defer"):
+                self.disagreeing = False
             return fr
-        return replace(
-            fr,
-            ok=False,
-            reason="score_transition",
-            left_score=None,
-            right_score=None,
-            score_conf=None,
-            score_margin=None,
-        )
+        self.disagreeing = True
+        if not self._reanchor(pair, t_ms):
+            return replace(
+                fr,
+                ok=False,
+                reason="score_transition",
+                left_score=None,
+                right_score=None,
+                score_conf=None,
+                score_margin=None,
+            )
+        self.locked = pair
+        self.phase = None
+        self.td_side = None
+        self.try_until = None
+        self.reanchor_pair = pair
+        self.reanchor_confirmed = False
+        self.disagreeing = False
+        self._clear_cand()
+        detail = dict(getattr(fr, "detail", None) or {})
+        detail["grammar_reanchor"] = True
+        return replace(fr, detail=detail)
 
     def note_lock(self, t_ms: int, away: int, home: int) -> None:
         """Remember a score the agreement window actually locked. Does not run during a bare read."""
         self._rewind(t_ms)
         self.last_t = int(t_ms)
         new = (int(away), int(home))
+        if self.reanchor_pair == new:
+            self.reanchor_confirmed = True
         prev = self.locked
         banner = self.active_banner(t_ms)
         phase, side = self._phase_at(t_ms)
+        carry = self._try_carry
         self.locked = new
+        self._try_carry = None
         if prev is None:
+            if carry is not None and new == carry[0]:
+                self._open_try(t_ms, carry[1])
             return
         da, dh = new[0] - prev[0], new[1] - prev[1]
         if da == 0 and dh == 0:

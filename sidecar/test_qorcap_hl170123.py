@@ -36,9 +36,13 @@ TRAPS = json.loads((FIXTURE / "traps.json").read_text())
 CLIP_URL = "https://github.com/ConWan30/qortime/raw/main/site/matches/170123/clips/{name}.mp4"
 CLIPS = ("hl00-q3-a3-h0", "hl01-q4-a9-h0", "hl02-q4-a10-h0")
 START = {"hl00-q3-a3-h0": 7, "hl01-q4-a9-h0": 6, "hl02-q4-a10-h0": 6}
-# Clips are separate highlights of one match. 20 s between them keeps the 12 s banner window from
-# crossing a clip and lets the 45 s try window reach the point after the touchdown.
-CLIP_GAP_MS = 20_000
+# Real source times from site/matches/170123/clips/manifest.json. Start-to-start gaps are
+# 301.289 s and 15.092 s. hl01 ends 3.092 s before hl02 starts, so the reel does not overlap.
+START_S = {
+    "hl00-q3-a3-h0": 587.359,
+    "hl01-q4-a9-h0": 888.648,
+    "hl02-q4-a10-h0": 903.740,
+}
 FIELDS = ("away", "home", "quarter", "clock")
 
 
@@ -164,8 +168,8 @@ def _wrong(claims, truth):
     return bad
 
 
-def _t_ms(clip_i: int, frame_n: int) -> int:
-    return clip_i * CLIP_GAP_MS + int(round(frame_n / 30 * 1000))
+def _t_ms(name: str, frame_n: int) -> int:
+    return int(round((START_S[name] + frame_n / 30.0) * 1000))
 
 
 def _read_image(reader, img, t_ms):
@@ -201,10 +205,10 @@ def test_highlights_lock_the_legal_scores_and_add_no_confident_wrong_read():
             else:
                 into[field]["wrong"] += 1
 
-    for clip_i, name in enumerate(CLIPS):
+    for name in CLIPS:
         for n in _indices(name):
             img = cv2.imread(str(_cache() / "frames" / name / f"f{n:03d}.png"))
-            t_ms = _t_ms(clip_i, n)
+            t_ms = _t_ms(name, n)
             fr, ms = _read_image(reader, img, t_ms)
             costs.append(ms)
             truth = LABELS[f"{name}/f{n:03d}.png"]

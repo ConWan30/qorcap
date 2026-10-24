@@ -7,13 +7,17 @@ other check on those frames was fine (logo, white panel, quarter), so the timeli
 are the mean of the real glyphs from that window (148 twos, 132 threes), added as extra variants.
 A "1ST DOWNS" banner still fails ``score_panel_covered`` / ``score_slot_ink`` before any digit match.
 
-The clock is read from the source frame, with mean glyphs from locked 170123 highlights, and kept
-only when it holds or counts down. A FIELD GOAL or TOUCHDOWN banner blanks the scores and still
-returns quarter and clock. The score grammar can abstain; it cannot raise a read. See
-``qorcap_score_grammar`` for the windows.
+The clock is read from the source frame with the stock glyphs, and kept only when it holds,
+counts down, or re-anchors. A FIELD GOAL or TOUCHDOWN banner blanks the scores and still
+returns quarter and clock. No banner fragment is shipped: the only ones cut for this reader
+came from held-out 170123 frames. The score grammar can abstain or re-anchor; it cannot raise
+a read. See ``qorcap_score_grammar`` for the windows. ``model_id`` hashes every stacked template
+plus the grammar and clock parameters.
 """
 from __future__ import annotations
 
+import hashlib
+import json
 from pathlib import Path
 
 import numpy as np
@@ -22,9 +26,9 @@ PACK = Path(__file__).resolve().parent / "packs" / "madden27_standard_score_1100
 # QorCap 0.3.23: on match-20261018-084523 (CHI–ATL) the red home "14" scored 0.57-0.64 against the QorTime
 # "4" template, so every read from 0-14 on was score_unsure and the draft stopped at 0-13 Q2 (real final 6-14).
 # This pack holds the mean of 111 real "4" glyphs from that match (tools/add_standard_four_084523.py).
+# 084523 is one of Con's labelled games (sidecar/eval/human_labels.jsonl). It is held out of new
+# training. The row is the one already on main; this change does not rebuild it and does not remove it.
 PACK_FOUR = Path(__file__).resolve().parent / "packs" / "madden27_standard_score_084523.npz"
-# Mean clock glyphs from locked 170123 highlight frames. Stacked after sha16, so model_id is unchanged.
-CLOCK_PACK = Path(__file__).resolve().parent / "packs" / "madden27_standard_clock_170123.npz"
 # Logo search wider than the profile's ±3. The 0.90 NCC floor is unchanged. 11 px blur still misses it.
 ANCHOR_SEARCH_PX = 8
 
@@ -163,30 +167,48 @@ def _clock_box_dark(reader, band, dx: int, dy: int) -> bool:
     return border <= p.max_clock_box_border_v
 
 
-def _stack_clock_variants(reader) -> None:
-    """Extra clock glyphs. Groups are mutated in place; ``TemplatePack.sha16`` is left as built."""
-    if not CLOCK_PACK.is_file():
-        return
-    z = np.load(CLOCK_PACK)
-    clock = reader.pack.groups["clock"]
-    for key in z.files:
-        if len(key) < 2 or not key.startswith("d") or not key[1:].isdigit():
-            continue
-        label = key[1:]
-        if label not in clock:
-            continue
-        vec = np.atleast_2d(np.asarray(z[key], dtype=np.float32))
-        clock[label] = np.vstack([clock[label], vec])
+def reader_model_id(inner, grammar, clocks) -> str:
+    """Hash every template row plus the grammar and clock parameters.
+
+    ``TemplatePack.sha16`` is the stock pack only. The 110028 and 084523 score rows are stacked
+    after that, and the anchor search, full-resolution clock, and grammar windows are not in it.
+    This id is what a receipt should name. It is not a checkpoint-hash input.
+    """
+    from qor_receipt._vendor.qoresence.vision.local_scorebug.reader import READER_ID
+
+    h = hashlib.sha256()
+    pack = inner.pack
+    h.update(np.ascontiguousarray(pack.logo, dtype=np.float32).tobytes())
+    for group in sorted(pack.groups):
+        for label in sorted(pack.groups[group]):
+            h.update(f"{group}/{label}".encode())
+            h.update(np.ascontiguousarray(pack.groups[group][label], dtype=np.float32).tobytes())
+    gate = inner.profile.clock_gate
+    params = {
+        "anchor_search_px": int(inner.profile.anchor_search_px),
+        "min_logo_ncc": float(inner.profile.min_logo_ncc),
+        "clock_full_res": True,
+        "clock_gate_min_score": float(gate.min_score),
+        "clock_gate_min_margin": float(gate.min_margin),
+        "clock_reanchor_reads": int(clocks.reanchor_reads),
+        "clock_reanchor_span_ms": int(clocks.reanchor_span_ms),
+        "banner_window_ms": int(grammar.banner_window_ms),
+        "try_window_ms": int(grammar.try_window_ms),
+        "reanchor_reads": int(grammar.reanchor_reads),
+        "reanchor_span_ms": int(grammar.reanchor_span_ms),
+    }
+    h.update(json.dumps(params, sort_keys=True, separators=(",", ":")).encode())
+    return f"{READER_ID}:{inner.profile.layout_version}:{h.hexdigest()[:16]}"
 
 
 class StandardBarReader:
     """``madden27_standard`` plus real digit variants.
 
     Scores and the quarter word are read on the 640×360 prep, so a full-resolution frame does not
-    change them. The clock is read from the source frame. A banner that covers the scores blanks
-    the scores and still returns quarter and clock. The score grammar can abstain; it cannot raise
-    a read. ``t_ms`` None leaves the grammar and the clock history idle, so a one-shot fixture read
-    stays a one-shot.
+    change them. The clock is read from the source frame with the stock glyphs. A banner that
+    covers the scores blanks the scores and still returns quarter and clock. The score grammar can
+    abstain or re-anchor; it cannot raise a read. ``t_ms`` None leaves the grammar and the clock
+    history idle, so a one-shot fixture read stays a one-shot.
     """
 
     wants_full_res = True
@@ -201,6 +223,10 @@ class StandardBarReader:
         self.profile_id = inner.profile.profile_id
         self.grammar = grammar if grammar is not None else ScoreGrammar()
         self.clocks = ClockHistory()
+
+    @property
+    def model_id(self) -> str:
+        return reader_model_id(self.inner, self.grammar, self.clocks)
 
     def read(self, frame, t_ms=None):
         from qorcap_banner import detect_banner
@@ -253,14 +279,19 @@ class StandardBarReader:
             conf, margin, red = fr.clock_conf, fr.clock_margin, fr.clock_red
             source = "inner"
         kept = self.clocks.filter(secs, fr.quarter, t_ms)
+        reanchored = bool(self.clocks.reanchored)
+        self.clocks.reanchored = False
         if kept is None:
             if secs is None and source == "inner":
                 return fr
             return replace(
                 fr, clock_seconds=None, clock_text=None, clock_conf=None, clock_margin=None, clock_red=False,
             )
-        if source == "inner" and kept == fr.clock_seconds:
+        if source == "inner" and kept == fr.clock_seconds and not reanchored:
             return fr
+        detail = dict(getattr(fr, "detail", None) or {})
+        if reanchored:
+            detail["clock_reanchor"] = True
         return replace(
             fr,
             clock_seconds=int(kept),
@@ -268,6 +299,7 @@ class StandardBarReader:
             clock_conf=None if conf is None else round(float(conf), 4),
             clock_margin=None if margin is None else round(float(margin), 4),
             clock_red=bool(red),
+            detail=detail,
         )
 
     def note_lock(self, t_ms: int, away: int, home: int) -> None:
@@ -284,7 +316,7 @@ class StandardBarReader:
 
 
 def standard_reader():
-    """QorTime's ScorebugReader plus the 110028 "2"/"3", the 084523 "4", and the 170123 clock variants."""
+    """QorTime's ScorebugReader plus the 110028 "2"/"3" and the 084523 "4". No held-out clock glyphs."""
     from dataclasses import replace
 
     from qor_receipt._vendor.qoresence.vision.local_scorebug.reader import ScorebugReader
@@ -299,6 +331,5 @@ def standard_reader():
         z = np.load(PACK_FOUR)
         score = reader.pack.groups["score"]
         score["4"] = np.vstack([score["4"], np.atleast_2d(z["four"].astype(np.float32))])
-    _stack_clock_variants(reader)
     reader.profile = replace(reader.profile, anchor_search_px=ANCHOR_SEARCH_PX)
     return StandardBarReader(reader)

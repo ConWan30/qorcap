@@ -1,0 +1,88 @@
+{
+  "schema": "qorcap-template-manifest/v0",
+  "held_out_of_training": [
+    "170123",
+    "021003",
+    "125430",
+    "084523",
+    "193534"
+  ],
+  "held_out_note": "170123, 021003 and 125430 are the public matches. 084523 and 193534 are the games Con labelled in sidecar/eval/human_labels.jsonl. Harvesting a glyph from any of them is training. New templates in this change were not cut from them.",
+  "new_templates": [],
+  "new_templates_not_built": {
+    "clock_glyphs": "Removed. The previous pack madden27_standard_clock_170123.npz was the mean of stock-pack argmax labels on all 90 clean 170123 kit frames (hl00 f007+12k, hl01/hl02 f006+12k). Counts were 0:87, 1:13, 2:3, 3:2, 4:47, 5:24, 7:42, 8:3, 9:22. There was no 6. That pack is deleted.",
+    "banner_goa": "Removed. Source was held-out hl00-q3-a3-h0 frame 175 (white GOA).",
+    "banner_touc": "Removed. Source was held-out hl01-q4-a9-h0 frame 174 (dark TOUC). The navy TOUCHDOWN on 125430 hl04 was not matched by it (NCC about 0.31) and is still undetected.",
+    "footage_checked": [
+      "sidecar/fixtures/m27_std_110028_*.jpg (standard bar, not a held-out match): clocks 1:07, 1:44 and a 1ST DOWNS banner. Not a FIELD GOAL or TOUCHDOWN, and not digits 0-9.",
+      "qortime tests/fixtures/madden27_live (session 2026-10-13, not a held-out match): a handful of 640x360 bands. Clocks include 3:24, 0:00, 2:34, 0:27. One covered panel is OFFENSIVE COVERAGE, not FIELD GOAL or TOUCHDOWN.",
+      "September 2026 HDMI clips named in the stock pack meta are not in either repo, only the already-averaged stock templates."
+    ],
+    "footage_needed": "Standard-bar frames, not from a held-out match, that show each clock digit 0-9 clearly enough for the stock gate, plus one FIELD GOAL banner and one TOUCHDOWN banner (gold and, separately, the navy TOUCHDOWN if that skin should match). Do not synthesize a font."
+  },
+  "preexisting_on_main": [
+    {
+      "pack": "qortime qor_receipt/_vendor/qoresence/vision/local_scorebug/packs/madden27_standard_v1.npz",
+      "what": "stock logo, score 0-7 and 9 (no score 8), clock 0-9, quarter words",
+      "source": "labels/madden27_box_labels.json: 11 Madden 27 HDMI clips plus hdmi_live_bottom and live_frame_receipt5, 244 frames, built 2026-10-08. Clip ids hdmi_clip_20260906_111605, hdmi_clip_20260906_121931, hdmi_clip_20260906_122006, hdmi_clip_20260911_224008, hdmi_clip_20260911_224621, hdmi_clip_20260911_234020, hdmi_clip_20260911_234709, hdmi_clip_20260911_235614, hdmi_clip_20260911_235918, hdmi_clip_20260912_013105, hdmi_clip_20260912_015442.",
+      "frame_index": null,
+      "frame_index_note": "The pack stores one mean vector per label. Individual frame indices were not kept in the npz.",
+      "held_out": false
+    },
+    {
+      "pack": "sidecar/packs/madden27_standard_score_110028.npz",
+      "what": "extra score glyphs 2 and 3",
+      "source": "match-20261017-110028, mean of 148 twos and 132 threes. tools/ was the 0.3.14 real-glyph add. Not one of the held-out matches and not in human_labels.jsonl.",
+      "source_file": "not retained; the npz source string is real:match-20261017-110028",
+      "frame_index": null,
+      "held_out": false
+    },
+    {
+      "pack": "sidecar/packs/madden27_standard_score_084523.npz",
+      "what": "extra score glyph 4 (111 glyphs, bands b0000-b0260)",
+      "source": "match-20261018-084523, tools/add_standard_four_084523.py",
+      "source_file": "not in the repo; the script reads BANDS_DIR/bNNNN.png",
+      "frame_index": "b0000 through b0260 were eligible; the npz does not list which of those produced a glyph",
+      "held_out": true,
+      "flag": "084523 is labelled by Con in sidecar/eval/human_labels.jsonl. This row was already on main. It was not rebuilt and it was not removed."
+    },
+    {
+      "pack": "sidecar/packs/madden27_sunday_night_v1.npz",
+      "what": "Sunday Night score, clock, and quarter",
+      "source": "Matches 20261017-002326 and 20261017-004308, plus glyphs whose source string also names match-20261017-021003 (score 0,1,2,3,4,6,8; clock 0-8; quarter 3 and 4).",
+      "frame_index": null,
+      "held_out": true,
+      "flag": "021003 is held out. Those rows were already on main. They were not rebuilt and they were not removed."
+    },
+    {
+      "pack": "sidecar/packs/madden27_thursday_night_v1.npz",
+      "what": "Thursday Night score, clock, quarter, badge",
+      "source": "match-20261017-010703, plus later real glyphs from 091651, 232726, 002316 and other October 17-18 matches named in source_vals. None of the source strings name 170123, 021003, 125430, 084523, or 193534.",
+      "frame_index": null,
+      "held_out": false
+    },
+    {
+      "pack": "sidecar/packs/madden27_monday_night_v1.npz",
+      "what": "Monday Night glyphs",
+      "source": "real:strip.mp4 for the original rows; score 5 is synthetic:clock_font_resized; extra rows from match-20261017-162055 (tools/add_monday_night_162055.py). Ids look like 162055:m12:clock:6:f_0751750:2, so the frame is in the id.",
+      "frame_index": "encoded in each 162055 id (f_0751750 and the other f_ files under sidecar/fixtures/mnp162055)",
+      "held_out": false
+    },
+    {
+      "pack": "sidecar/packs/madden27_end_menu_v1.npz and v2",
+      "what": "end-of-game menu digits",
+      "source": "v1 real 0, 1, 2, 4, 7 from match-20261016-125430 (95 frames, final 7-14) and match-20261016-143212 (300 frames, final 0-20). Synthetic 3, 5, 6, 8, 9 from Hind SemiBold, Prompt SemiBold, and Ubuntu Bold. v2 adds a real 9 path from match-20261016-170000, a 6 from match-20261017-091651, and 0/3/6 rows from match-20261017-110028 (15 frames). The npz source array says real:95 and real:300 without repeating the match id; the match ids are in tools/make_end_menu_pack.py.",
+      "frame_index": null,
+      "held_out": true,
+      "flag": "125430 is held out. The 95-frame real digits were already on main. They were not rebuilt and they were not removed. The synthetic digits are a font mean from that same tool, also already on main."
+    },
+    {
+      "pack": "sidecar/packs/madden27_psn_banner_v1.npz",
+      "what": "PSN name-tag glyphs",
+      "source": "source tags are only font or seen. The npz does not name a match id. tools/make_psn_pack.py can exclude a prefix such as 20261017-021003; the committed pack does not record whether that exclude was the one used.",
+      "frame_index": null,
+      "held_out": false,
+      "flag": "Not flagged as a held-out match because the pack does not name one. Not modified."
+    }
+  ]
+}

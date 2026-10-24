@@ -1,14 +1,19 @@
 """Full-resolution game clock for the standard bar.
 
 The score path stays on the 640×360 prep. The clock box is cut from the source frame, in the
-profile's own fractions, and matched with the same gates (white 0.93/0.06, red 0.88/0.08). Mean
-glyphs harvested from locked highlight frames are extra variants of the existing clock labels.
-They do not add a label and they are stacked on the pack after ``sha16`` is computed, so
-``model_id`` is unchanged.
+profile's own fractions, and matched with the stock clock glyphs and the same gates (white
+0.93/0.06, red 0.88/0.08). No clock glyph in this reader was harvested from a held-out match.
+The stock pack already has a ``6`` (nine glyphs from the September 2026 HDMI clips). A ``6`` that
+misses that gate abstains. Nothing here substitutes another digit for it.
 
-A clock is kept only when it holds or counts down inside its quarter. A higher quarter may jump
-the clock, up to 15:00. An upward flicker is dropped and does not move the baseline. Stoppage is
-a hold. With no ``t_ms`` the digits are read and the history is left alone.
+A clock is kept when it holds or counts down inside its quarter. A higher quarter may jump the
+clock, up to 15:00. A quarter that goes backwards is a cut: the baseline starts over, it is not
+a reject. A read with no quarter does not become the baseline, so it cannot blank the quarter
+that follows. An upward flicker, or a drop bigger than the time since the last accepted clock,
+is dropped and does not move the baseline until the same value has passed the gates on
+``reanchor_reads`` reads spanning ``reanchor_span_ms`` (default 4 reads and 2 s, the same rule
+as the score grammar). Stoppage is a hold. With no ``t_ms`` the digits are read and the history
+is left alone.
 """
 from __future__ import annotations
 
@@ -18,47 +23,91 @@ import numpy as np
 from qor_receipt._vendor.qoresence.vision.local_scorebug.glyphs import column_runs, norm_vec
 
 QUARTER_CLOCK_MAX_S = 15 * 60
+# Same bound as the score grammar: four gated reads spanning two seconds.
+REANCHOR_READS = 4
+REANCHOR_SPAN_MS = 2_000
+
+
+def _quarter(quarter):
+    if isinstance(quarter, int) and not isinstance(quarter, bool):
+        return quarter
+    return None
 
 
 class ClockHistory:
     """Last accepted clock. Reader state only."""
 
-    def __init__(self) -> None:
+    def __init__(self, reanchor_reads: int = REANCHOR_READS, reanchor_span_ms: int = REANCHOR_SPAN_MS) -> None:
+        self.reanchor_reads = int(reanchor_reads)
+        self.reanchor_span_ms = int(reanchor_span_ms)
         self.reset()
 
     def reset(self) -> None:
         self.last_t: int | None = None
         self.last_s: int | None = None
         self.last_q: int | None = None
+        self.last_accept_t: int | None = None
+        self._cand: int | None = None
+        self._cand_n = 0
+        self._cand_t0: int | None = None
+        self.reanchored = False
+
+    def _clear_cand(self) -> None:
+        self._cand = None
+        self._cand_n = 0
+        self._cand_t0 = None
+
+    def _accept(self, secs: int, quarter, t_ms: int) -> int:
+        self.last_s = int(secs)
+        q = _quarter(quarter)
+        if q is not None:
+            self.last_q = q
+        self.last_accept_t = int(t_ms)
+        self._clear_cand()
+        return int(secs)
+
+    def _reanchor(self, secs: int, t_ms: int) -> bool:
+        if secs != self._cand:
+            self._cand = int(secs)
+            self._cand_n = 1
+            self._cand_t0 = int(t_ms)
+            return False
+        self._cand_n += 1
+        span = int(t_ms) - (int(t_ms) if self._cand_t0 is None else int(self._cand_t0))
+        if self._cand_n >= self.reanchor_reads and span >= self.reanchor_span_ms:
+            self.reanchored = True
+            self._clear_cand()
+            return True
+        return False
 
     def filter(self, secs, quarter, t_ms):
         """Return ``secs`` when it is plausible, else None. None input does not move the baseline."""
         if secs is None or t_ms is None:
             return secs
         t_ms = int(t_ms)
+        secs = int(secs)
+        q = _quarter(quarter)
         if self.last_t is not None and t_ms < self.last_t:
             self.reset()
         self.last_t = t_ms
-        secs = int(secs)
         if self.last_s is None:
-            self.last_s = secs
-            self.last_q = quarter if isinstance(quarter, int) else None
-            return secs
-        if (
-            isinstance(quarter, int)
-            and not isinstance(quarter, bool)
-            and isinstance(self.last_q, int)
-            and quarter > self.last_q
-            and 0 <= secs <= QUARTER_CLOCK_MAX_S
-        ):
-            self.last_s = secs
-            self.last_q = quarter
-            return secs
+            # A quarter-less read must not freeze the baseline for the quarter that follows.
+            if q is None:
+                return secs
+            return self._accept(secs, q, t_ms)
+        if q is not None and self.last_q is not None and q < self.last_q:
+            return self._accept(secs, q, t_ms)
+        if q is not None and (self.last_q is None or q > self.last_q) and 0 <= secs <= QUARTER_CLOCK_MAX_S:
+            return self._accept(secs, q, t_ms)
         if secs <= self.last_s:
-            self.last_s = secs
-            if isinstance(quarter, int) and not isinstance(quarter, bool):
-                self.last_q = quarter
-            return secs
+            elapsed_s = 0 if self.last_accept_t is None else max(0.0, (t_ms - self.last_accept_t) / 1000.0)
+            if self.last_s - secs <= int(elapsed_s) + 1:
+                return self._accept(secs, q, t_ms)
+            if self._reanchor(secs, t_ms):
+                return self._accept(secs, q, t_ms)
+            return None
+        if self._reanchor(secs, t_ms):
+            return self._accept(secs, q, t_ms)
         return None
 
 

@@ -1834,9 +1834,40 @@ def keep_recovery_notes(res: dict, draft: dict) -> dict:
     return dict(res, notes=notes)
 
 
-def apply_final(res: dict, fin: dict | None, *, fallback: dict | None = None) -> dict:
+def _grammar_unresolved(core) -> bool:
+    """True when a standard-bar grammar on this reader must not name the winner."""
+    reader = getattr(core, "reader", None)
+    found = []
+    if reader is None:
+        return False
+    own = getattr(reader, "grammar", None)
+    if own is not None and hasattr(own, "allows_final_fallback"):
+        found.append(own)
+    for child in getattr(reader, "readers", ()) or ():
+        g = getattr(child, "grammar", None)
+        if g is not None and hasattr(g, "allows_final_fallback"):
+            found.append(g)
+    return any(not g.allows_final_fallback() for g in found)
+
+
+def apply_final(res: dict, fin: dict | None, *, fallback: dict | None = None, grammar_unresolved: bool = False) -> dict:
     """Result fields from a reader final. Only an end-of-game-menu final is ``final_confirmed``; a scorebug final
-    (clock_zero / scorebug_gone / final_screen) keeps its basis but stays unconfirmed; no final -> last read."""
+    (clock_zero / scorebug_gone / final_screen) keeps its basis but stays unconfirmed; no final -> last read.
+
+    ``grammar_unresolved`` means the score grammar was still disagreeing, or its last re-anchor was
+    not confirmed by the agreement window. The final then abstains: null scores, winner unknown.
+    It does not publish the last timeline score. An end-of-game menu final is a separate read and
+    is kept.
+    """
+    if grammar_unresolved and not is_end_menu_final(fin):
+        notes = [n for n in (res.get("notes") or []) if isinstance(n, str)]
+        note = "score grammar disagreed or the last re-anchor was unconfirmed; the final score abstains"
+        if note not in notes:
+            notes.append(note)
+        out = {k: v for k, v in res.items() if k not in ("final_basis", "final_confirmed", "scorebug_last", "notes")}
+        out.update(home_score=None, away_score=None, quarter=None, winner="unknown",
+                   method="last_scorebug_read_unconfirmed", final_confirmed=False, notes=notes)
+        return out
     res = {k: v for k, v in res.items() if k not in ("final_basis", "final_confirmed", "scorebug_last", "notes")}
     src = fin or fallback
     if src:
@@ -2360,7 +2391,8 @@ def finalize(bundle: Path, *, qt: Path, qorcap: str, ffmpeg: str, key_dir: Path,
          "method": "offline: QorTime ScorebugReader + AgreementWindow + detect_final over recorded video",
          "finalized_ms": int(time.time() * 1000)}, indent=2), encoding="utf-8")
 
-    res = apply_final(draft["result"], fin, fallback=game_segment_score(events))
+    res = apply_final(draft["result"], fin, fallback=game_segment_score(events),
+                      grammar_unresolved=_grammar_unresolved(shared["core"]))
     res = keep_recovery_notes(res, draft)
     if role != rec_role:
         corr = meta.get("role_correction") if isinstance(meta.get("role_correction"), dict) else {}

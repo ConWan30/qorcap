@@ -13,7 +13,9 @@ sys.path.insert(0, os.environ.get("QORTIME", "/workspace/qortime-src"))
 
 from qor_receipt._vendor.qoresence.vision.local_scorebug.reader import FrameRead  # noqa: E402
 from qorcap_clock import ClockHistory  # noqa: E402
-from qorcap_score_grammar import BANNER_WINDOW_MS, TRY_WINDOW_MS, ScoreGrammar, judge  # noqa: E402
+from qorcap_score_grammar import (  # noqa: E402
+    BANNER_WINDOW_MS, REANCHOR_READS, REANCHOR_SPAN_MS, TRY_WINDOW_MS, ScoreGrammar, judge,
+)
 
 
 def _fr(away, home, conf=0.91, margin=0.2, quarter=3):
@@ -34,6 +36,8 @@ def test_windows_are_the_documented_defaults():
     g = ScoreGrammar()
     assert g.banner_window_ms == BANNER_WINDOW_MS == 12_000
     assert g.try_window_ms == TRY_WINDOW_MS == 45_000
+    assert g.reanchor_reads == REANCHOR_READS == 4
+    assert g.reanchor_span_ms == REANCHOR_SPAN_MS == 2_000
     g.note_lock(0, 0, 0)
     g.note_banner(0, "fg")
     assert g.active_banner(12_000) == "fg"
@@ -148,6 +152,57 @@ def test_a_backward_timestamp_starts_a_new_sequence():
     assert g.active_banner(100) == "fg"
 
 
+def _feed(g, away, home, t0, n, step):
+    last = None
+    for i in range(n):
+        last = g.filter(_fr(away, home, conf=0.81), t0 + i * step, None)
+    return last
+
+
+def test_a_stable_illegal_score_reanchors_without_raising_confidence():
+    g = ScoreGrammar(reanchor_reads=4, reanchor_span_ms=1_000)
+    g.note_lock(0, 3, 7)  # wrong anchor; truth is 3-0
+    early = _feed(g, 3, 0, 0, 3, 200)
+    assert early.left_score is None and g.locked == (3, 7)
+    hit = g.filter(_fr(3, 0, conf=0.81, margin=0.11), 1_000, None)
+    assert hit.pair == (3, 0) and hit.score_conf == 0.81 and hit.score_margin == 0.11
+    assert hit.detail.get("grammar_reanchor") is True and hit.ok
+    assert g.locked == (3, 0) and g.allows_final_fallback() is False
+    # A wrong +3 off the old anchor must not survive the re-anchor.
+    assert g.filter(_fr(3, 10), 1_200, None).right_score is None
+    g.note_lock(1_000, 3, 0)
+    assert g.allows_final_fallback() is True
+
+
+def test_an_unconfirmed_reanchor_or_a_disagreement_blocks_the_final():
+    from qorcap_match import apply_final
+    stuck = _locked(0, 6)
+    assert stuck.filter(_fr(0, 7), 1_000, None).left_score is None
+    assert stuck.allows_final_fallback() is False
+    base = {"home_score": 6, "away_score": 0, "quarter": 1, "final_t_ms": 5, "winner": "home",
+            "method": "last_scorebug_read_unconfirmed"}
+    frozen = {"home": 6, "away": 0, "quarter": 1, "t_ms": 5}
+    out = apply_final(base, None, fallback=frozen, grammar_unresolved=True)
+    assert (out["home_score"], out["away_score"], out["winner"]) == (None, None, "unknown")
+    assert out["final_confirmed"] is False and "final_basis" not in out
+    menu = {"basis": "end_menu", "home": 14, "away": 7, "quarter": 4, "t_ms": 9, "final_confirmed": True}
+    kept = apply_final(base, menu, fallback=frozen, grammar_unresolved=True)
+    assert (kept["away_score"], kept["home_score"]) == (7, 14)
+
+
+def test_a_cut_keeps_a_try_that_is_then_read_on_the_same_score():
+    g = _locked(0, 0)
+    g.note_banner(1_000, "td")
+    g.note_lock(1_000, 0, 6)
+    assert g.phase == "try" and g.td_side == "home"
+    # Highlight cut: time goes backwards. The try is not discarded if 0-6 is locked again.
+    again = g.filter(_fr(0, 6), 100, None)
+    assert again.pair == (0, 6) and g.locked is None
+    g.note_lock(100, 0, 6)
+    assert g.phase == "try" and g.td_side == "home"
+    assert g.filter(_fr(0, 7), 400, None).pair == (0, 7)
+
+
 def test_clock_history_holds_or_counts_down_and_ignores_a_missing_timestamp():
     h = ClockHistory()
     assert h.filter(63, 3, None) == 63 and h.last_s is None
@@ -159,3 +214,34 @@ def test_clock_history_holds_or_counts_down_and_ignores_a_missing_timestamp():
     assert h.filter(900, 4, 2000) == 900  # a new quarter may reset, up to 15:00
     assert h.filter(10, 4, 100) == 10  # a new clip rewinds
     assert h.last_s == 10
+
+
+def test_harvest_refuses_held_out_footage(tmp_path):
+    sys.path.insert(0, str(HERE.parent / "tools"))
+    from harvest_standard_clock_banner import held_out_reason, main
+    assert held_out_reason("match-20261023-170123/f175.png") == "170123"
+    assert held_out_reason("hl00-q3-a3-h0/f175.png") == "hl00-q3-a3-h0"
+    assert held_out_reason("hl04-q2-a7-h13/f090.png") == "hl04-q2-a7-h13"
+    assert held_out_reason("match-20261018-084523/b0010.png") == "084523"
+    assert held_out_reason("match-20261017-110028/f100.png") is None
+    banned = tmp_path / "170123"
+    banned.mkdir()
+    assert main([str(banned)]) == 2
+
+
+def test_clock_does_not_lock_a_low_misread_or_a_quarterless_start_or_a_quarter_regression():
+    h = ClockHistory()
+    assert h.filter(67, 4, 0) == 67  # 1:07
+    assert h.filter(7, 4, 200) is None  # one 0:07 does not move the baseline
+    assert h.last_s == 67
+    t = 1_000
+    for secs in range(66, 7, -1):  # the next 59 true reads, 1:06 down to 0:08
+        assert h.filter(secs, 4, t) == secs
+        t += 1_000
+    bare = ClockHistory()
+    assert bare.filter(61, None, 0) == 61 and bare.last_s is None
+    assert bare.filter(900, 2, 1_000) == 900  # the quarter is not blanked
+    back = ClockHistory()
+    assert back.filter(47, 4, 0) == 47
+    assert back.filter(59, 3, 2_000) == 59  # Q4 then Q3 is a cut
+    assert back.last_q == 3
