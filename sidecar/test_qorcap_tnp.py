@@ -209,13 +209,33 @@ def test_auto_reads_ot_walkoff_not_the_orange_endzone():
 
 
 def test_start_match_passes_official_challenges_by_default():
+    """A double-clicked live match turns official challenges on.
+
+    Either explicit flag (``--official-challenges`` or ``--no-official-challenges``)
+    is the caller's choice and is left alone. ``finalize`` is an offline sign of a
+    finished bundle, so the launcher must not inject the live flag: argparse would
+    reject it before any clip is cut. The gate is the intent of that default, not
+    one exact source line.
+    """
     text = (HERE.parent / "start-match.ps1").read_text(encoding="utf-8")
-    assert "--official-challenges" in text and "--no-official-challenges" in text
-    assert "if (-not $hasChallengeFlag)" in text
+    code = "\n".join(ln for ln in text.splitlines() if not ln.strip().startswith("#"))
+    assert any(
+        "hasChallengeFlag" in ln and "--official-challenges" in ln and "--no-official-challenges" in ln
+        for ln in code.splitlines()
+    ), "either explicit challenge flag should count as the caller's choice"
+    assign = '$fwd = @("--official-challenges") + $fwd'
+    pos = code.find(assign)
+    assert pos != -1, "a live match should prepend --official-challenges"
+    assert code.find(assign, pos + len(assign)) == -1, "the default flag is injected in one place"
+    gate = code[code.rfind("if ", 0, pos):pos]
+    compact = "".join(gate.split())
+    assert "-not$hasChallengeFlag" in compact, gate
+    assert "-not$isFinalize" in compact, gate
     src = (HERE / "qorcap_match.py").read_text(encoding="utf-8")
     assert 'ap.add_argument("--official-challenges", action="store_true"' in src
     assert 'ap.add_argument("--no-official-challenges", action="store_true"' in src
-    assert "if a.no_official_challenges:" in src
+    opt_out = src.split("if a.no_official_challenges:", 1)
+    assert len(opt_out) == 2 and "official_challenges = False" in opt_out[1][:240]
 
 
 def test_reference_band_is_the_bar(tnp):
