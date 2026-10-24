@@ -17,10 +17,19 @@ fails closed.
 
 ``--suite`` also requires every file in that suite's list to have produced a
 testcase, and at least ``MIN_COLLECTED`` testcases. Dropping a file drops the
-count below the floor.
+count below the floor. Zero testcases fail even when the floor is zero. A floor
+below the number of listed entries fails on its own.
+
+Every ``sidecar/test_*.py`` and ``tools/test_*.py`` must be named by
+``LINUX_FILES`` or ``WINDOWS_FILES`` (a node id covers its file) or by
+``EXCLUDED_TEST_FILES`` with a reason. The skip message is compared as recorded,
+including surrounding whitespace. ``xfail(strict=False)`` in those files fails
+the suite: it would override ``-o xfail_strict=true``.
 """
+import re
 import sys
 import xml.etree.ElementTree as ET
+from pathlib import Path
 
 # Full node id. The skip reason is not checked. Keep this list short.
 ALLOWED = {
@@ -56,6 +65,7 @@ LINUX_FILES = (
     "sidecar/test_qorcap_highlights.py",
     "sidecar/test_auto_highlights.py",
     "sidecar/test_final_screen_pause.py",
+    "sidecar/test_post_final_tail.py",
     "sidecar/test_start_match_glimpse.py",
     "sidecar/test_qorcap_ai_loop.py",
     "sidecar/test_qorcap_console.py",
@@ -97,6 +107,7 @@ WINDOWS_FILES = (
     "sidecar/test_pairing.py",
     "sidecar/test_auto_highlights.py",
     "sidecar/test_final_screen_pause.py",
+    "sidecar/test_post_final_tail.py",
     "sidecar/test_start_match_glimpse.py",
     "sidecar/test_qorcap_ai_loop.py",
     "sidecar/test_qorcap_console.py",
@@ -131,10 +142,24 @@ WINDOWS_FILES = (
     "sidecar/test_qorcap_glimpse_witness.py",
     "sidecar/test_qorcap_submit.py",
 )
-# pytest --collect-only of the lists above (QORTIME importable). A dropped file
-# or node id lands under the floor.
-LINUX_MIN_COLLECTED = 535
-WINDOWS_MIN_COLLECTED = 517
+# pytest --collect-only -q of each --list with QORTIME importable. Pin the same
+# numbers in tools/test_assert_pytest_skips.py. See README "Sidecar CI suite list".
+# A dropped file or node id lands under the floor. Re-collect after any list or
+# test change. 535/517 before sidecar/test_post_final_tail.py (21) and the six
+# guard tests in tools/test_assert_pytest_skips.py: 535+21+6 and 517+21+6.
+LINUX_MIN_COLLECTED = 562
+WINDOWS_MIN_COLLECTED = 544
+
+# Present on disk, but not part of either sidecar suite. A reason is required.
+# An empty reason is treated as unlisted.
+EXCLUDED_TEST_FILES = {
+    "sidecar/test_contracts.py": (
+        "the contracts job runs this against unpinned qortime main, not the sidecar suite"
+    ),
+}
+
+_TEST_GLOBS = ("sidecar/test_*.py", "tools/test_*.py")
+_LOOSE_XFAIL = re.compile(r"xfail\s*\([^)]*strict\s*=\s*False", re.DOTALL)
 
 
 def suite_files(suite: str) -> tuple[str, ...]:
@@ -151,6 +176,56 @@ def suite_floor(suite: str) -> int:
     if suite == "windows":
         return WINDOWS_MIN_COLLECTED
     raise ValueError(f"suite must be linux or windows, not {suite!r}")
+
+
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parents[1]
+
+
+def _covered_files() -> set[str]:
+    covered = set()
+    for entry in (*LINUX_FILES, *WINDOWS_FILES):
+        covered.add(entry.split("::", 1)[0].replace("\\", "/"))
+    return covered
+
+
+def unlisted_test_files(root: Path | None = None) -> list[str]:
+    """Test modules that are neither listed nor excluded with a reason.
+
+    Reads the suite tuples and ``EXCLUDED_TEST_FILES`` at call time. A node id
+    covers its file. Dropping a path from both tuples makes that file unlisted.
+    """
+    root = root or _repo_root()
+    covered = _covered_files()
+    problems = []
+    for pattern in _TEST_GLOBS:
+        for path in sorted(root.glob(pattern)):
+            rel = path.relative_to(root).as_posix()
+            if rel in covered:
+                continue
+            reason = EXCLUDED_TEST_FILES.get(rel)
+            if isinstance(reason, str) and reason.strip():
+                continue
+            if rel in EXCLUDED_TEST_FILES:
+                problems.append(f"{rel}: exclusion has no reason")
+            else:
+                problems.append(
+                    f"{rel}: not in LINUX_FILES, WINDOWS_FILES, or EXCLUDED_TEST_FILES"
+                )
+    return problems
+
+
+def loose_xfails(root: Path | None = None) -> list[str]:
+    """``xfail(strict=False)`` overrides the CI ini and must not appear."""
+    root = root or _repo_root()
+    problems = []
+    for pattern in _TEST_GLOBS:
+        for path in sorted(root.glob(pattern)):
+            text = path.read_text(encoding="utf-8")
+            if _LOOSE_XFAIL.search(text):
+                rel = path.relative_to(root).as_posix()
+                problems.append(f"{rel}: xfail(strict=False) overrides xfail_strict")
+    return problems
 
 
 def host_platform() -> str:
@@ -195,7 +270,8 @@ def unexpected_skips(path: str, *, platform: str = "linux") -> list[str]:
         if not skipped:
             continue
         nodeid = case_nodeid(case)
-        msg = (skipped[0].get("message") or "").strip()
+        # Compare before stripping. A trailing space is not the recorded reason.
+        msg = skipped[0].get("message") or ""
         if nodeid in ALLOWED:
             continue
         expected = WINDOWS_SKIP_REASONS.get(nodeid) if plat == "windows" else None
@@ -212,6 +288,12 @@ def collection_problems(path: str, *, suite: str) -> list[str]:
     root = ET.parse(path).getroot()
     cases = list(root.iter("testcase"))
     problems = []
+    if len(cases) == 0:
+        problems.append(f"collected 0 testcases; sidecar {suite} suite ran nothing")
+    if floor < len(files):
+        problems.append(
+            f"sidecar {suite} floor {floor} is below {len(files)} listed entries"
+        )
     if len(cases) < floor:
         problems.append(f"collected {len(cases)} tests; sidecar {suite} floor is {floor}")
     seen_files = set()
@@ -292,11 +374,13 @@ def main(argv: list[str]) -> int:
         bad = unexpected_skips(path, platform=plat)
         if suite is not None:
             bad.extend(collection_problems(path, suite=suite))
+            bad.extend(unlisted_test_files())
+            bad.extend(loose_xfails())
     except ValueError as exc:
         print(str(exc), file=sys.stderr)
         return 2
     if bad:
-        print("unexpected pytest skips (a required test did not run):", file=sys.stderr)
+        print("sidecar suite check failed:", file=sys.stderr)
         for line in bad:
             print(line, file=sys.stderr)
         return 1

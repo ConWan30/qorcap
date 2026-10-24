@@ -1,4 +1,5 @@
 """A Windows-only submit skip must fail the job when it is recorded on Linux."""
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -71,6 +72,14 @@ def test_windows_skip_with_the_wrong_reason_fails(tmp_path):
     path = _xml(tmp_path, _SPOT, "no qortime checkout with the referee service")
     assert skips.unexpected_skips(path, platform="windows")
     assert skips.unexpected_skips(path, platform="linux")
+
+
+def test_skip_reason_is_compared_before_stripping_whitespace(tmp_path):
+    reason = skips.WINDOWS_SKIP_REASONS[_SPOT]
+    padded = _xml(tmp_path, _SPOT, reason + " ")
+    assert skips.unexpected_skips(padded, platform="windows")
+    exact = _xml(tmp_path, _SPOT, reason)
+    assert skips.unexpected_skips(exact, platform="windows") == []
 
 
 def test_prefixed_skip_reason_is_not_an_exact_match(tmp_path, monkeypatch, capsys):
@@ -149,6 +158,106 @@ def test_collected_below_the_floor_fails(tmp_path):
     assert skips.collection_problems(ok, suite="linux") == []
 
 
+def test_zero_collected_tests_fail(tmp_path, monkeypatch):
+    monkeypatch.setattr(skips, "LINUX_MIN_COLLECTED", 0)
+    path = tmp_path / "junit.xml"
+    path.write_text(
+        '<?xml version="1.0" encoding="utf-8"?><testsuite tests="0"></testsuite>\n',
+        encoding="utf-8",
+    )
+    bad = skips.collection_problems(str(path), suite="linux")
+    assert any("collected 0 testcases" in line for line in bad)
+
+
+def test_floor_below_listed_entries_fails(tmp_path, monkeypatch):
+    listed = len(skips.LINUX_FILES)
+    monkeypatch.setattr(skips, "LINUX_MIN_COLLECTED", listed - 1)
+    path = _suite_xml(tmp_path, skips.LINUX_FILES, listed)
+    bad = skips.collection_problems(path, suite="linux")
+    assert any(f"below {listed} listed entries" in line for line in bad)
+
+
+def test_unlisted_test_module_fails_the_suite(tmp_path, monkeypatch, capsys):
+    assert skips.unlisted_test_files() == []
+    dropped = "sidecar/test_pairing.py"
+    monkeypatch.setattr(
+        skips, "LINUX_FILES", tuple(f for f in skips.LINUX_FILES if f != dropped)
+    )
+    monkeypatch.setattr(
+        skips, "WINDOWS_FILES", tuple(f for f in skips.WINDOWS_FILES if f != dropped)
+    )
+    assert any(dropped in line for line in skips.unlisted_test_files())
+    reason = skips.EXCLUDED_TEST_FILES["sidecar/test_contracts.py"]
+    monkeypatch.setitem(skips.EXCLUDED_TEST_FILES, "sidecar/test_contracts.py", "   ")
+    assert any("test_contracts.py" in line and "no reason" in line for line in skips.unlisted_test_files())
+    monkeypatch.setitem(skips.EXCLUDED_TEST_FILES, "sidecar/test_contracts.py", reason)
+    files = tuple(f for f in skips.LINUX_FILES if f != dropped)
+    path = _suite_xml(tmp_path, files, skips.LINUX_MIN_COLLECTED)
+    monkeypatch.setattr(skips.sys, "platform", "linux")
+    assert skips.main(["assert_pytest_skips.py", "--suite", "linux", path]) == 1
+    assert dropped in capsys.readouterr().err
+
+
+def _loose_mark(body: str) -> str:
+    return "@pytest.mark.xfail(" + body + ")\ndef test_x():\n    assert False\n"
+
+
+def test_explicit_xfail_strict_false_fails(tmp_path, monkeypatch, capsys):
+    suite = tmp_path / "sidecar"
+    suite.mkdir()
+    (tmp_path / "tools").mkdir()
+    (suite / "test_loose.py").write_text(_loose_mark("strict=False"), encoding="utf-8")
+    (suite / "test_multiline.py").write_text(
+        _loose_mark("\n    strict=False,\n"),
+        encoding="utf-8",
+    )
+    (suite / "test_strict.py").write_text(_loose_mark("strict=True"), encoding="utf-8")
+    bad = skips.loose_xfails(tmp_path)
+    assert any("test_loose.py" in line for line in bad)
+    assert any("test_multiline.py" in line for line in bad)
+    assert not any("test_strict.py" in line for line in bad)
+    assert skips.loose_xfails() == []
+    monkeypatch.setattr(skips.sys, "platform", "linux")
+    needle = "xfail" + "(strict=False)"
+    monkeypatch.setattr(
+        skips,
+        "loose_xfails",
+        lambda root=None, needle=needle: [f"sidecar/test_loose.py: {needle} overrides xfail_strict"],
+    )
+    path = _suite_xml(tmp_path, skips.LINUX_FILES, skips.LINUX_MIN_COLLECTED)
+    assert skips.main(["assert_pytest_skips.py", "--suite", "linux", path]) == 1
+    assert needle in capsys.readouterr().err
+
+
+def test_list_failure_and_an_empty_list_do_not_run_pytest():
+    py = shlex.quote(sys.executable)
+    crash = subprocess.run(
+        ["bash", "-c", f"set -e\nSIDECAR_TESTS=($({py} -c 'import sys; sys.exit(3)'))\necho ran\n"],
+        capture_output=True,
+        text=True,
+    )
+    assert crash.returncode != 0
+    assert "ran" not in crash.stdout
+    empty = subprocess.run(
+        [
+            "bash",
+            "-c",
+            f"set -e\n"
+            f"SIDECAR_TESTS=($({py} -c 'import sys'))\n"
+            'if [[ ${#SIDECAR_TESTS[@]} -eq 0 ]]; then\n'
+            '  echo "sidecar linux suite list is empty" >&2\n'
+            "  exit 1\n"
+            "fi\n"
+            "echo ran\n",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert empty.returncode == 1
+    assert "empty" in empty.stderr
+    assert "ran" not in empty.stdout
+
+
 def test_missing_required_file_fails_even_when_the_count_is_high(tmp_path):
     files = skips.LINUX_FILES[1:]
     path = _suite_xml(tmp_path, files, skips.LINUX_MIN_COLLECTED + len(skips.LINUX_FILES))
@@ -175,8 +284,16 @@ def test_sidecar_ci_sets_xfail_strict_and_the_suite_gate():
     assert text.count("-o junit_family=xunit1") == 2
     assert "--list linux" in text and "--suite linux" in text
     assert "--list windows" in text and "--suite windows" in text
-    assert skips.LINUX_MIN_COLLECTED == 535
-    assert skips.WINDOWS_MIN_COLLECTED == 517
+    assert "SIDECAR_TESTS=($(python tools/assert_pytest_skips.py --list linux))" in text
+    assert "SIDECAR_TESTS=($(python tools/assert_pytest_skips.py --list windows))" in text
+    assert text.count("suite list is empty") == 2
+    assert "< <(" not in text
+    assert "mapfile" not in text
+    for files in (skips.LINUX_FILES, skips.WINDOWS_FILES):
+        pause = files.index("sidecar/test_final_screen_pause.py")
+        assert files[pause + 1] == "sidecar/test_post_final_tail.py"
+    assert skips.LINUX_MIN_COLLECTED == 562
+    assert skips.WINDOWS_MIN_COLLECTED == 544
 
 
 def test_xfail_strict_rejects_an_unexpected_pass(tmp_path):

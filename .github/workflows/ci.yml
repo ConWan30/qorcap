@@ -67,7 +67,8 @@ jobs:
           # File list and the collected-count floor live in tools/assert_pytest_skips.py.
           # xfail_strict fails an unexpected pass. junit_family=xunit1 keeps the file
           # attribute so the skip guard can match the full node id. A dropped file
-          # falls under the floor and is absent from the junit report.
+          # falls under the floor and is absent from the junit report. A test module
+          # that is in neither suite list nor EXCLUDED_TEST_FILES fails the suite check.
           # $(...) so a failing --list trips errexit. An empty array would make pytest
           # collect the whole repo.
           SIDECAR_TESTS=($(python tools/assert_pytest_skips.py --list linux))
