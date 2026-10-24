@@ -6,6 +6,7 @@ the real backends do nothing and do not raise.
 """
 import io
 import json
+import os
 import sys
 import threading
 import time
@@ -111,6 +112,11 @@ class _Ev:
         return {"basis": "play_call", "phase": self.phase, "t_ms": self.t_ms, "quarter": self.quarter}
 
 
+def _appended(obj) -> bytes:
+    """One JSON line as OfficialLive._append writes it, including the platform newline."""
+    return json.dumps(obj).encode("utf-8") + os.linesep.encode("utf-8")
+
+
 def _expected_files() -> dict[str, bytes]:
     gate = {
         "phase": "kickoff",
@@ -121,9 +127,9 @@ def _expected_files() -> dict[str, bytes]:
         "gate": {"basis": "play_call", "phase": "kickoff", "t_ms": 10, "quarter": 1},
     }
     files = dict(SEEDS)
-    files["anchors.jsonl"] = json.dumps({"type": "anchor"}).encode() + b"\n"
-    files["official_challenges.jsonl"] = json.dumps(TOKEN).encode() + b"\n"
-    files["challenge_gates.jsonl"] = json.dumps(gate).encode() + b"\n"
+    files["anchors.jsonl"] = _appended({"type": "anchor"})
+    files["official_challenges.jsonl"] = _appended(TOKEN)
+    files["challenge_gates.jsonl"] = _appended(gate)
     return files
 
 
