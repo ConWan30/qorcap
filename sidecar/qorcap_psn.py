@@ -84,8 +84,16 @@ _PACK: dict | None = None
 
 def load_pack(path: Path = PACK) -> dict:
     global _PACK
+    path = Path(path)
     if _PACK is not None and path == PACK:
         return _PACK
+    from qorcap_template_guard import file_authorized, log_templates_missing
+    if not file_authorized(path):
+        log_templates_missing()
+        pack = {"logo": None, "glyphs": {}, "source": {}, "version": "missing", "missing": True}
+        if path == PACK:
+            _PACK = pack
+        return pack
     import numpy as np
     z = np.load(path, allow_pickle=False)
     chars = [str(c) for c in z["chars"]]
@@ -120,6 +128,8 @@ def locate(img, pack: dict | None = None) -> list[dict]:
     """PS-logo anchors of the name banners; a surface counts only when BOTH of its banners are found."""
     import cv2
     pack = pack or load_pack()
+    if pack.get("missing") or pack.get("logo") is None:
+        return []
     g = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img
     found = []
     for (surf, side), (y0, y1, x0, x1) in REGIONS.items():
@@ -313,6 +323,10 @@ def read_frame(img, pack: dict | None = None) -> list[dict]:
 def consensus(reads: list[dict], pack: dict | None = None) -> dict:
     """Per side: vote every character across the sightings that agree on the name length. Fail closed with '?'."""
     pack = pack or load_pack()
+    if pack.get("missing"):
+        from qorcap_template_guard import TEMPLATES_MISSING_REASON
+        return {"handle": None, "pattern": None, "confidence_permille": 0, "sightings": len(reads), "agree": 0,
+                "why": TEMPLATES_MISSING_REASON}
     if len(reads) < MIN_SIGHTINGS:
         return {"handle": None, "pattern": None, "confidence_permille": 0, "sightings": len(reads), "agree": 0,
                 "why": f"name banner seen in {len(reads)} sampled frame(s), need {MIN_SIGHTINGS}"}

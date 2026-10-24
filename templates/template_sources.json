@@ -1,0 +1,5 @@
+{
+  "schema": "qorcap-template-sources/v0",
+  "description": "Template-only matches. They are never test or evaluation data. The harvest script accepts these ids and no others. This file is not a receipt field.",
+  "match_ids": ["102332", "111640"]
+}

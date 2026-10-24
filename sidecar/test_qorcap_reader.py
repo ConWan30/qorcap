@@ -257,10 +257,12 @@ def _fixture(name):
 
 
 def test_end_menu_detector_is_cursor_independent_on_real_frames():
-    """match-20261016-143212: cursor on RESTART (missed live by v0.3.2); match 125430: cursor on FINISH GAME."""
+    """match-20261016-143212: cursor on RESTART (missed live by v0.3.2).
+
+    The FINISH GAME frame is match 125430, which is held out, so it is not a fixture here.
+    """
     from qorcap_reader import madden_final_screen
     assert madden_final_screen(_fixture("m27_end_menu_restart.jpg"))
-    assert madden_final_screen(_fixture("m27_end_menu_finish.jpg"))
     assert not madden_final_screen(_fixture("m27_pause_menu.jpg"))
     assert not madden_final_screen(_fixture("m27_pause_menu_start.jpg"))
     import numpy as np

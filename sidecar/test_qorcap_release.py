@@ -37,7 +37,9 @@ def test_audit_finds_the_schema_and_skips_optional_programs():
     assert "contracts/receipt.v0.json" in files
     assert "contracts/compat.json" in files
     assert "sidecar/qorcap_console.py" not in files  # code, copied with the sidecar tree
-    assert "sidecar/packs/madden27_standard_score_110028.npz" in files
+    assert "sidecar/packs/madden27_standard_score_110028.npz" not in files
+    assert "sidecar/packs/madden27_standard_score_084523.npz" not in files
+    assert "sidecar/packs/madden27_end_menu_v2.npz" not in files
     assert "sidecar/glimpse/crop_v1.json" in files
     for name in ("ffmpeg.exe", "ffmpeg", "qorcap.exe", "qorcap", "qortime"):
         assert name not in files
@@ -56,10 +58,14 @@ def test_console_and_ai_loop_read_no_install_root_files(tmp_path):
 def test_release_workflow_copies_contracts_and_fails_when_one_is_missing():
     text = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
     assert "Copy-Item contracts" in text
+    assert "Copy-Item templates" in text
     assert "qorcap_release.py" in text
     for rel_path in (
         "contracts\\receipt.v0.json",
         "contracts\\compat.json",
+        "templates\\provenance.json",
+        "templates\\template_sources.json",
+        "templates\\heldout.json",
         "sidecar\\qorcap_console.py",
         "sidecar\\qorcap_ai_loop.py",
         "sidecar\\qorcap_challenge.py",

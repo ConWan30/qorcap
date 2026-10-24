@@ -1,0 +1,5 @@
+{
+  "schema": "qorcap-heldout-matches/v0",
+  "description": "Evaluation matches. A glyph cut from one of these is training on it. The harvest script refuses them. This file is not a receipt field.",
+  "match_ids": ["170123", "021003", "125430", "084523", "193534"]
+}

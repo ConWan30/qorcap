@@ -65,6 +65,9 @@ jobs:
           python -c "import cv2, numpy, cryptography"
           python -c "import os, pathlib; p=pathlib.Path(os.environ['QORTIME']); assert (p/'qor_receipt').is_dir(), p; assert (p/'tests/fixtures/madden27_live/q1_6-0.png').is_file(), 'pinned QorTime scorebug fixture missing'"
           python -m pytest -q --tb=short --junitxml="$RUNNER_TEMP/sidecar-pytest.xml" \
+            sidecar/test_template_provenance.py \
+            sidecar/test_harvest_templates.py \
+            sidecar/test_templates_missing.py \
             sidecar/test_pairing.py \
             sidecar/test_qorcap_highlights.py \
             sidecar/test_auto_highlights.py \
@@ -206,6 +209,9 @@ jobs:
           python -c "import cv2, numpy, cryptography"
           python -c "import os, pathlib; p=pathlib.Path(os.environ['QORTIME']); assert (p/'qor_receipt').is_dir(), p; assert (p/'tests/fixtures/madden27_live/q1_6-0.png').is_file(), 'pinned QorTime scorebug fixture missing'"
           python -m pytest -q --tb=short --junitxml="$RUNNER_TEMP/sidecar-pytest.xml" \
+            sidecar/test_template_provenance.py \
+            sidecar/test_harvest_templates.py \
+            sidecar/test_templates_missing.py \
             sidecar/test_pairing.py \
             sidecar/test_auto_highlights.py \
             sidecar/test_final_screen_pause.py \

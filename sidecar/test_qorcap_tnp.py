@@ -16,14 +16,23 @@ import qorcap_mnp as M  # noqa: E402
 import qorcap_snp as S  # noqa: E402
 import qorcap_tnp as T  # noqa: E402
 from qorcap_reader import madden_final_screen, prep  # noqa: E402
+from qorcap_standard import standard_reader  # noqa: E402
+from qorcap_template_guard import TEMPLATES_MISSING  # noqa: E402
 
 FX = HERE / "fixtures"
 TNP = ["m27_tnp_q1_6_0.jpg", "m27_tnp_q1_7_6.jpg", "m27_tnp_q1_7_13.jpg", "m27_tnp_q2_7_14.jpg", "m27_tnp_q2_7_14_oos.jpg",
        "m27_tnp_q3_27_20.jpg", "m27_tnp_q4_34_26.jpg"]
 PAIRS = [(6, 0), (7, 6), (7, 13), (7, 14), (7, 14), (27, 20), (34, 26)]
 OTHERS = ["m27_snp_ps_menu.jpg", "m27_snp_intro.jpg", "m27_snp_q1_7_7.jpg", "m27_snp_g2_q2_7_14.jpg", "m27_mnp_q1.jpg",
-          "m27_mnp_q2.jpg", "m27_mnp_q4_final.jpg", "m27_mnp_end_menu_online.jpg", "m27_end_menu_finish.jpg",
+          "m27_mnp_q2.jpg", "m27_mnp_q4_final.jpg", "m27_mnp_end_menu_online.jpg",
           "m27_pause_menu.jpg", "m27_tnp_no_bar.jpg"]
+
+
+def abstain(fr):
+    """A removed pack must not guess a score, a quarter, or a clock."""
+    assert fr.ok is False and fr.reason == TEMPLATES_MISSING, getattr(fr, "reason", fr)
+    assert fr.left_score is None and fr.right_score is None
+    assert fr.quarter is None and fr.clock_text is None
 
 
 def img(name):
@@ -45,28 +54,27 @@ def tnp():
     ("m27_tnp_q4_34_26.jpg", 34, 26, 4, "3:52"),
 ])
 def test_thursday_night_reads(tnp, name, away, home, q, clock):
+    """The Thursday Night pack is not an allowlisted template source, so the old eye label is not emitted."""
     fr = tnp.read(img(name))
-    assert fr.ok, fr.reason
-    assert (fr.left_score, fr.right_score, fr.quarter, fr.clock_text, fr.clock_red) == (away, home, q, clock, False)
-    assert fr.profile_id == "madden27_thursday_night" and fr.score_conf >= 0.8
+    abstain(fr)
+    assert (fr.left_score, fr.right_score, fr.quarter, fr.clock_text) != (away, home, q, clock)
 
 
 def test_red_final_seconds_clock(tnp):
-    fr = tnp.read(img("m27_tnp_q2_red_clock.jpg"))
-    assert fr.ok and (fr.left_score, fr.right_score, fr.quarter, fr.clock_text, fr.clock_red) == (14, 20, 2, "0:06", True)
+    abstain(tnp.read(img("m27_tnp_q2_red_clock.jpg")))
 
 
 @pytest.mark.parametrize("name", OTHERS)
 def test_not_thursday_night_is_layout_unknown(tnp, name):
-    assert tnp.read(img(name)).reason == "layout_unknown"
+    """No pack is loaded, so the badge check never runs and every frame abstains."""
+    assert tnp.read(img(name)).reason == TEMPLATES_MISSING
 
 
 @pytest.mark.parametrize("name", TNP)
 def test_other_profiles_do_not_claim_thursday_night(name):
-    from qor_receipt._vendor.qoresence.vision.local_scorebug.reader import ScorebugReader
-    assert M.MondayNightReader().read(img(name)).reason == "layout_unknown"
-    assert S.SundayNightReader().read(img(name)).reason == "layout_unknown"
-    assert ScorebugReader().read(prep(img(name))).ok is False
+    assert M.MondayNightReader().read(img(name)).reason == TEMPLATES_MISSING
+    assert S.SundayNightReader().read(img(name)).reason == TEMPLATES_MISSING
+    abstain(standard_reader().read(img(name)))
 
 
 def test_half_resolution_frame_never_misreads(tnp):
@@ -78,8 +86,7 @@ def test_half_resolution_frame_never_misreads(tnp):
 def test_tampered_score_digit_fails_closed(tnp):
     im = img("m27_tnp_q2_7_14.jpg").copy()
     im[644:676, 580:602] = im[644:676, 580:602].min()   # erase the away score
-    fr = tnp.read(im)
-    assert not fr.ok and fr.reason.startswith("score_away")
+    abstain(tnp.read(im))
 
 
 def test_clock_glyphs_are_m_ss():
@@ -100,42 +107,26 @@ def test_clear_colons_and_bridge():
 
 
 def test_pack_is_real_only(tnp):
-    assert all(v.startswith("real:match-20261017-") and "synthetic" not in v for v in tnp.source.values())
-    seen = lambda g: set(tnp.groups[g][0])  # noqa: E731
-    assert seen("clock") == set("0123456789")
-    # Today's match showed 0,1,3,6,7 (already in the 010703 pack). 5/8/9 were not on screen. Sunday Night's 5 and 9
-    # are synthetic clock-font resizes, so they are not copied here. 2ND has no crop from 091651.
-    assert seen("score") == set("0123467")
-    for d in "0123467":
-        assert tnp.source[f"score:{d}"].startswith("real:match-20261017-010703")
-        assert "091651" not in tnp.source[f"score:{d}"]
-    assert seen("quarter") == {"1", "2", "3", "4", "OT"}
-    assert tnp.source["quarter:OT"].startswith("real:match-20261017-091651")
-    assert "091651" in tnp.source["quarter:1"] and "091651" in tnp.source["quarter:4"]
-    assert tnp.source["quarter:2"] == "real:match-20261017-010703:63+match-20261017-232726:40+match-20261018-002316:40"
-    for q in "1234":
-        assert "match-20261017-232726:40" in tnp.source[f"quarter:{q}"]
+    """010703 / 091651 / 232726 / 002316 are not allowlisted template matches. The pack file is gone."""
+    assert tnp._missing and tnp.source == {} and tnp.groups == {} and tnp.badge is None
+    assert not Path(T.PACK).is_file()
 
 
 def test_unseen_digit_fails_closed_not_wrong():
-    """Drop the real "4" score templates: the 7-14 frames must fail closed (score_home_unsure), never read another number."""
+    """With no score templates loaded, a 7-14 frame abstains. It does not become another number."""
     r = T.ThursdayNightReader()
-    labs, vecs = r.groups["score"]
-    keep = [i for i, lab in enumerate(labs) if lab != "4"]
-    r.groups["score"] = ([labs[i] for i in keep], vecs[keep])
     for name in ["m27_tnp_q2_7_14.jpg", "m27_tnp_q2_7_14_oos.jpg"]:
-        fr = r.read(img(name))
-        assert not fr.ok and fr.reason == "score_home_unsure"
+        abstain(r.read(img(name)))
 
 
 def test_auto_picks_thursday_night_and_switches_back():
-    from qor_receipt._vendor.qoresence.vision.local_scorebug.reader import ScorebugReader
-    a = M.AutoProfileReader(ScorebugReader(), prep=prep)
-    fr = a.read(img("m27_tnp_q2_7_14.jpg"))
-    assert fr.ok and (fr.left_score, fr.right_score, fr.quarter) == (7, 14, 2) and a.active_profile == "madden27_thursday_night"
-    assert a.read(img("m27_snp_q1_7_7.jpg")).profile_id == "madden27_sunday_night"
-    assert a.read(img("m27_mnp_q2.jpg")).profile_id == "madden27_monday_night"
-    assert a.read(img("m27_tnp_q1_7_6.jpg")).profile_id == "madden27_thursday_night"
+    a = M.AutoProfileReader(standard_reader(), prep=prep)
+    assert [M.AutoProfileReader._pid(r) for r in a.readers[1:]] == [
+        "madden27_monday_night", "madden27_sunday_night", "madden27_thursday_night",
+    ]
+    for name in ("m27_tnp_q2_7_14.jpg", "m27_snp_q1_7_7.jpg", "m27_mnp_q2.jpg", "m27_tnp_q1_7_6.jpg"):
+        abstain(a.read(img(name)))
+    assert a.profile_counts == {}
 
 
 @pytest.mark.parametrize("name", TNP)
@@ -155,57 +146,41 @@ def test_end_menu_reader_ignores_thursday_night_gameplay(name):
 ])
 def test_match_091651_reads(tnp, name, away, home, q, clock, red):
     fr = tnp.read(img(name))
-    assert fr.ok, fr.reason
-    assert (fr.left_score, fr.right_score, fr.quarter, fr.clock_text, fr.clock_red) == (away, home, q, clock, red)
+    abstain(fr)
+    assert (fr.left_score, fr.right_score, fr.quarter, fr.clock_text, fr.clock_red) != (away, home, q, clock, red)
 
 
 def test_red_021_fails_closed_not_wrong(tnp):
-    """Final-minute 0:21: the red '1' drops out at the production ink threshold. Miss, never another clock."""
-    fr = tnp.read(img("m27_tnp_091651_q4_021.png"))
-    assert not fr.ok and fr.reason == "clock_glyph_count"
-    assert (fr.left_score, fr.right_score, fr.quarter) == (10, 7, 4)
-    assert fr.clock_text is None
+    """No clock templates: the frame abstains. It does not invent 10-7 or another clock."""
+    abstain(tnp.read(img("m27_tnp_091651_q4_021.png")))
 
 
 def test_unknown_quarter_still_returns_clock_and_locks_on_three_reads(tnp):
-    """Drop every quarter template: scores and clock still come back, and three agreeing frames lock them."""
+    """No templates at all: three frames post no score. The quarter-soft lock is covered with synthetic reads."""
     from types import SimpleNamespace as NS
     from qor_receipt._vendor.qoresence.vision.local_scorebug.agreement import AgreementWindow
     from qorcap_reader import ReaderCore
     r = T.ThursdayNightReader()
-    r.groups["quarter"] = ([], np.zeros((0, r.groups["quarter"][1].shape[1]), np.float32))
     im = img("m27_tnp_q2_7_14.jpg")
-    fr = r.read(im)
-    assert not fr.ok and fr.reason == "quarter_unsure"
-    assert (fr.left_score, fr.right_score, fr.quarter, fr.clock_text) == (7, 14, None, "3:43")
+    abstain(r.read(im))
     posts = []
     core = ReaderCore(posts.append, r, AgreementWindow(), None, lambda tl: NS(final=False))
-    for i in range(2):
+    for i in range(3):
         core.on_frame(i * 250, im)
     assert not [p for p in posts if p["type"] == "score"]
-    core.on_frame(500, im)
-    scores = [p for p in posts if p["type"] == "score"]
-    assert len(scores) == 1
-    assert scores[0]["away"] == 7 and scores[0]["home"] == 14 and scores[0]["quarter"] is None
-    assert scores[0]["clock_s"] == 3 * 60 + 43
+    assert any(row.get("obs") == TEMPLATES_MISSING for row in core.timeline)
 
 
 def test_auto_counts_thursday_night_when_quarter_fails():
-    from qor_receipt._vendor.qoresence.vision.local_scorebug.reader import ScorebugReader
-    a = M.AutoProfileReader(ScorebugReader(), prep=prep)
-    tnp_r = a.readers[-1]
-    tnp_r.groups["quarter"] = ([], np.zeros((0, tnp_r.groups["quarter"][1].shape[1]), np.float32))
-    fr = a.read(img("m27_tnp_q2_7_14.jpg"))
-    assert not fr.ok and fr.left_score == 7 and fr.right_score == 14 and fr.clock_text == "3:43"
-    assert a.active_profile == "madden27_thursday_night"
+    a = M.AutoProfileReader(standard_reader(), prep=prep)
+    abstain(a.read(img("m27_tnp_q2_7_14.jpg")))
+    assert a.profile_counts == {}
 
 
 def test_auto_reads_ot_walkoff_not_the_orange_endzone():
-    from qor_receipt._vendor.qoresence.vision.local_scorebug.reader import ScorebugReader
-    a = M.AutoProfileReader(ScorebugReader(), prep=prep)
-    fr = a.read(img("m27_tnp_091651_ot_10_16.jpg"))
-    assert fr.ok and (fr.left_score, fr.right_score, fr.quarter, fr.clock_text) == (10, 16, 5, "1:55")
-    assert a.active_profile == "madden27_thursday_night"
+    a = M.AutoProfileReader(standard_reader(), prep=prep)
+    abstain(a.read(img("m27_tnp_091651_ot_10_16.jpg")))
+    assert a.profile_counts == {}
 
 
 def test_start_match_passes_official_challenges_by_default():
@@ -256,14 +231,14 @@ def test_quarter_digit_is_cut_from_the_suffix_and_a_fused_ordinal_fails_closed(t
     x, y, w, h = (int(t) for t in st[best][:4])
     assert w > T.QUARTER_BLOB_MAX_W  # the uncut ordinal is wider than a digit or OT
     blob = (lab[y:y + h, x:x + w] == best).astype(np.uint8)
-    assert tnp.classify("quarter", T.skeleton(blob), T.QUARTER_SIZE)[0] is None
+    assert blob.any()
     assert T.GATE["quarter"][1] >= 0.30
-    # The real 2ND templates from match-20261017-010703 still win on that broadcast.
-    fr = tnp.read(img("m27_tnp_q2_7_14.jpg"))
-    assert fr.ok and fr.quarter == 2
+    assert "quarter" not in tnp.groups
+    abstain(tnp.read(img("m27_tnp_q2_7_14.jpg")))
 
 
 def test_quarter_does_not_go_backwards():
+    """The live reader posts nothing from these frames. Quarter order is covered by synthetic ReaderCore tests."""
     from types import SimpleNamespace as NS
     from qor_receipt._vendor.qoresence.vision.local_scorebug.agreement import AgreementWindow
     from qorcap_reader import ReaderCore
@@ -273,12 +248,10 @@ def test_quarter_does_not_go_backwards():
     q1 = img("m27_tnp_q1_6_0.jpg")
     for i in range(3):
         core.on_frame(i * 250, q3)
-    assert [p for p in posts if p["type"] == "score"][-1]["quarter"] == 3
     for i in range(3):
         core.on_frame(2000 + i * 250, q1)
-    last = [p for p in posts if p["type"] == "score"][-1]
-    assert (last["away"], last["home"], last["quarter"]) == (6, 0, None)
-    assert core._max_quarter == 3
+    assert not [p for p in posts if p["type"] == "score"]
+    assert core._max_quarter is None
 
 
 # v0.3.21: 6:00-quarter Thursday Night games (match-20261017-232726, match-20261018-002316). These frames are held
@@ -291,25 +264,19 @@ NEW_Q = [("m27_tnp_232726_q1_0_0.png", 0, 0, 1), ("m27_tnp_232726_q2_0_21.png", 
 @pytest.mark.parametrize("name,away,home,q", NEW_Q)
 def test_232726_002316_quarters_read(tnp, name, away, home, q):
     fr = tnp.read(img(name))
-    assert fr.quarter == q, fr.reason
-    assert (fr.left_score, fr.right_score) == (away, home)
+    abstain(fr)
+    assert (fr.left_score, fr.right_score, fr.quarter) != (away, home, q)
 
 
 @pytest.mark.parametrize("name,away,home,q", NEW_Q)
 def test_232726_002316_quarters_without_the_new_templates_fail_closed(name, away, home, q):
-    """With only the 010703/091651 quarter templates these bars post no quarter (what v0.3.20 did), never a wrong one."""
-    r = T.ThursdayNightReader()
-    labels, vecs = r.groups["quarter"]
-    keep = [i for i in range(len(labels)) if i < 208]
-    r.groups["quarter"] = ([labels[i] for i in keep], vecs[keep])
-    fr = r.read(img(name))
-    assert fr.quarter in (None, q)
-    assert (fr.left_score, fr.right_score) == (away, home)
+    """No quarter templates are loaded, so the bar posts no quarter and no score."""
+    fr = T.ThursdayNightReader().read(img(name))
+    abstain(fr)
+    assert (fr.left_score, fr.right_score, fr.quarter) != (away, home, q)
 
 
 def test_auto_reads_the_232726_quarter():
-    from qor_receipt._vendor.qoresence.vision.local_scorebug.reader import ScorebugReader
-    a = M.AutoProfileReader(ScorebugReader(), prep=prep)
-    fr = a.read(img("m27_tnp_232726_q3_7_21.png"))
-    assert fr.quarter == 3 and (fr.left_score, fr.right_score) == (7, 21)
-    assert a.active_profile == "madden27_thursday_night"
+    a = M.AutoProfileReader(standard_reader(), prep=prep)
+    abstain(a.read(img("m27_tnp_232726_q3_7_21.png")))
+    assert a.profile_counts == {}

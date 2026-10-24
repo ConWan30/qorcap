@@ -165,6 +165,14 @@ class ThursdayNightReader:
     wants_full_res = True
 
     def __init__(self, pack: str | Path = PACK) -> None:
+        from qorcap_template_guard import file_authorized
+
+        self.source = {}
+        self.groups = {}
+        self.badge = None
+        self._missing = not file_authorized(Path(pack))
+        if self._missing:
+            return
         d = np.load(str(pack))
         self.groups: dict[str, tuple[list[str], np.ndarray]] = {}
         for g in ("score", "clock", "quarter"):
@@ -197,10 +205,16 @@ class ThursdayNightReader:
         return (None, "frame_invalid") if hsv is None else (np.ascontiguousarray(hsv[BAR_Y[0]:BAR_Y[1], :, 2]), "ok")
 
     def present(self, frame) -> bool:
+        if self._missing or self.badge is None:
+            return False
         hsv = hsv_of(frame)
         return hsv is not None and badge_score(hsv, self.badge) >= BADGE_MIN
 
     def read(self, frame) -> Any:
+        if self._missing:
+            from qorcap_template_guard import TEMPLATES_MISSING, TEMPLATES_MISSING_REASON, log_templates_missing
+            log_templates_missing()
+            return _fr(ok=False, reason=TEMPLATES_MISSING, detail={"templates_missing": TEMPLATES_MISSING_REASON})
         hsv = hsv_of(frame)
         if hsv is None:
             return _fr(ok=False, reason="frame_invalid")

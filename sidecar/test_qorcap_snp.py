@@ -15,6 +15,8 @@ sys.path.insert(0, os.environ.get("QORTIME", "/workspace/qortime-src"))
 import qorcap_mnp as M  # noqa: E402
 import qorcap_snp as S  # noqa: E402
 from qorcap_reader import madden_final_screen, prep  # noqa: E402
+from qorcap_standard import standard_reader  # noqa: E402
+from qorcap_template_guard import TEMPLATES_MISSING  # noqa: E402
 
 FX = HERE / "fixtures"
 SNP = ["m27_snp_q1_kickoff_0_0.jpg", "m27_snp_q1_6_0.jpg", "m27_snp_q1_7_0.jpg", "m27_snp_q1_7_7.jpg", "m27_snp_g2_q2_7_14.jpg"]
@@ -22,6 +24,12 @@ SNP = ["m27_snp_q1_kickoff_0_0.jpg", "m27_snp_q1_6_0.jpg", "m27_snp_q1_7_0.jpg",
 
 def img(name):
     return cv2.imread(str(FX / name))
+
+
+def abstain(fr):
+    assert fr.ok is False and fr.reason == TEMPLATES_MISSING, getattr(fr, "reason", fr)
+    assert fr.left_score is None and fr.right_score is None
+    assert fr.quarter is None and fr.clock_text is None
 
 
 @pytest.fixture(scope="module")
@@ -40,24 +48,23 @@ def snp():
     ("m27_snp_g2_q2_7_14.jpg", 7, 14, 2, "4:09"),
 ])
 def test_sunday_night_reads(snp, name, away, home, q, clock):
+    """The Sunday Night pack mixed held-out match 021003 into its means. These frames abstain."""
     fr = snp.read(img(name))
-    assert fr.ok, fr.reason
-    assert (fr.left_score, fr.right_score, fr.quarter, fr.clock_text, fr.clock_red) == (away, home, q, clock, False)
-    assert fr.profile_id == "madden27_sunday_night" and fr.score_conf >= 0.8
+    abstain(fr)
+    assert (fr.left_score, fr.right_score, fr.quarter, fr.clock_text) != (away, home, q, clock)
 
 
 @pytest.mark.parametrize("name", ["m27_snp_ps_menu.jpg", "m27_snp_intro.jpg", "m27_mnp_q1.jpg", "m27_mnp_q2.jpg",
-                                  "m27_mnp_q4_final.jpg", "m27_mnp_end_menu_online.jpg", "m27_end_menu_finish.jpg",
+                                  "m27_mnp_q4_final.jpg", "m27_mnp_end_menu_online.jpg",
                                   "m27_pause_menu.jpg"])
 def test_not_sunday_night_is_layout_unknown(snp, name):
-    assert snp.read(img(name)).reason == "layout_unknown"
+    assert snp.read(img(name)).reason == TEMPLATES_MISSING
 
 
 @pytest.mark.parametrize("name", SNP)
 def test_other_profiles_do_not_claim_sunday_night(name):
-    from qor_receipt._vendor.qoresence.vision.local_scorebug.reader import ScorebugReader
-    assert M.MondayNightReader().read(img(name)).reason == "layout_unknown"
-    assert ScorebugReader().read(prep(img(name))).ok is False
+    assert M.MondayNightReader().read(img(name)).reason == TEMPLATES_MISSING
+    abstain(standard_reader().read(img(name)))
 
 
 def test_half_resolution_frame_never_misreads(snp):
@@ -69,8 +76,7 @@ def test_half_resolution_frame_never_misreads(snp):
 def test_tampered_score_digit_fails_closed(snp):
     im = img("m27_snp_q1_7_0.jpg").copy()
     im[672:694, 515:545] = im[672:694, 515:545].min()   # erase the away score
-    fr = snp.read(im)
-    assert not fr.ok and fr.reason.startswith("score_away")
+    abstain(snp.read(im))
 
 
 def test_clock_colon_is_cleared():
@@ -88,38 +94,26 @@ def test_clear_colons_keeps_digits():
 
 
 def test_pack_provenance_marks_synthetic_digits(snp):
-    real_score = {d for d in "0123456789" if snp.source[f"score:{d}"].startswith("real")}
-    # 2 was harvested live from match-20261017-021003 (eye-checked); 5/9 have not been seen on a real score yet
-    assert real_score == {"0", "1", "2", "3", "4", "6", "7", "8"}
-    assert all(snp.source[f"score:{d}"] == "synthetic:clock_font_resized" for d in "59")
-    assert all(snp.source[f"clock:{d}"].startswith("real") for d in "0123456789")
-    assert snp.source["quarter:1"].startswith("real") and snp.source["quarter:2"].startswith("real")
-    assert snp.source["quarter:3"].startswith("real")             # harvested live from match-20261017-021003
-    assert snp.source["quarter:4"].startswith("real")             # harvested live from match-20261017-021003
-    assert set(snp.groups["quarter"][0]) == {"1", "2", "3", "4"}
+    """The Sunday Night pack named held-out match 021003 inside its means. The file is gone."""
+    assert snp._missing and snp.source == {} and snp.groups == {}
+    assert not Path(S.PACK).is_file()
 
 
 def test_unseen_quarter_fails_closed_not_wrong():
-    """With only skeleton (synthetic) templates for 2/3/4, every real 2nd-quarter frame read quarter_unsure, never a
-    wrong quarter (measured on match-20261017-004308 before real 2ND frames were added); keep that property."""
-    d = np.load(str(S.PACK))
-    keep = [i for i, lab in enumerate(d["quarter_labels"]) if str(lab) != "2"]
+    """No quarter templates are loaded, so a 2nd-quarter frame abstains instead of posting a quarter."""
     r = S.SundayNightReader()
-    r.groups["quarter"] = ([str(d["quarter_labels"][i]) for i in keep], d["quarter_vecs"][keep].astype(np.float32))
     for name in ["m27_snp_g2_q2_7_7.jpg", "m27_snp_g2_q2_7_13.jpg", "m27_snp_g2_q2_7_14.jpg"]:
-        fr = r.read(img(name))
-        assert not fr.ok and fr.reason == "quarter_unsure"
+        abstain(r.read(img(name)))
 
 
 def test_auto_with_real_readers_picks_sunday_night():
-    from qor_receipt._vendor.qoresence.vision.local_scorebug.reader import ScorebugReader
-    a = M.AutoProfileReader(ScorebugReader(), prep=prep)
+    a = M.AutoProfileReader(standard_reader(), prep=prep)
     assert [M.AutoProfileReader._pid(r) for r in a.readers[1:]] == ["madden27_monday_night", "madden27_sunday_night",
                                                                                "madden27_thursday_night"]
-    fr = a.read(img("m27_snp_q1_7_7.jpg"))
-    assert fr.ok and (fr.left_score, fr.right_score) == (7, 7) and a.active_profile == "madden27_sunday_night"
-    assert a.read(img("m27_mnp_q2.jpg")).profile_id == "madden27_monday_night"   # still switches back
-    assert a.read(img("m27_end_menu_finish.jpg")).reason == "layout_unknown"
+    abstain(a.read(img("m27_snp_q1_7_7.jpg")))
+    abstain(a.read(img("m27_mnp_q2.jpg")))
+    abstain(a.read(img("m27_pause_menu.jpg")))
+    assert a.profile_counts == {}
 
 
 @pytest.mark.parametrize("name", SNP)

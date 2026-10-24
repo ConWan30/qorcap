@@ -133,17 +133,42 @@ class EndMenuReader:
         return corroborate(img, expected, self)
 
     def __init__(self, pack: str | Path | None = PACK, scorebug_pack=None) -> None:
-        d = np.load(str(pack))
-        self.labels = [str(x) for x in d["labels"]]
-        self.vecs = d["vecs"].astype(np.float32)
-        self.sources = [str(x) for x in d["source"]]
+        from qorcap_template_guard import file_authorized, harvested_vectors
+
+        self._missing = False
+        got = harvested_vectors("end_menu")
+        if got:
+            labels, rows, sources = [], [], []
+            for lab, vecs in got.items():
+                for row in vecs:
+                    labels.append(lab)
+                    rows.append(row)
+                    sources.append("allowlisted")
+            self.labels = labels
+            self.vecs = np.stack(rows, axis=0).astype(np.float32)
+            self.sources = sources
+            self.ot_vec = None
+        elif pack is not None and file_authorized(Path(pack)):
+            d = np.load(str(pack))
+            self.labels = [str(x) for x in d["labels"]]
+            self.vecs = d["vecs"].astype(np.float32)
+            self.sources = [str(x) for x in d["source"]]
+            self.ot_vec = d["ot_vec"].astype(np.float32).ravel() if "ot_vec" in d.files else None
+        else:
+            self._missing = True
+            self.labels = []
+            self.vecs = np.zeros((0, GLYPH[0] * GLYPH[1]), np.float32)
+            self.sources = []
+            self.ot_vec = None
         self.source = {}
         for lab, src in zip(self.labels, self.sources):
             self.source[lab] = src  # last vector wins; digit info below uses the vector that actually matched
-        self.ot_vec = d["ot_vec"].astype(np.float32).ravel() if "ot_vec" in d.files else None
-        if scorebug_pack is None:
-            scorebug_pack = load_scorebug_pack()
-        self.xpack = scorebug_pack  # QorTime TemplatePack (or None: cross-check skipped and reported)
+        if self._missing:
+            self.xpack = None
+        else:
+            if scorebug_pack is None:
+                scorebug_pack = load_scorebug_pack()
+            self.xpack = scorebug_pack  # QorTime TemplatePack (or None: cross-check skipped and reported)
 
     def _digit(self, g) -> tuple[str | None, dict]:
         v = norm_vec(g)
@@ -183,6 +208,10 @@ class EndMenuReader:
         return lab, info
 
     def read(self, img) -> EndMenuRead:
+        if self._missing:
+            from qorcap_template_guard import TEMPLATES_MISSING, TEMPLATES_MISSING_REASON, log_templates_missing
+            log_templates_missing()
+            return EndMenuRead(False, reason=TEMPLATES_MISSING, digits=[{"templates_missing": TEMPLATES_MISSING_REASON}])
         if img is None:
             return EndMenuRead(False, reason="no_frame")
         img = _prep(img)
