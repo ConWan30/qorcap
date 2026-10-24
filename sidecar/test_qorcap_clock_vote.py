@@ -319,8 +319,8 @@ def test_mixq_five_high_and_ten_low_emit_nothing_wrong_after_detection():
 def test_held_true_clock_voids_a_ten_second_low_stoppage_and_stays_blank():
     """A 10 s-low misread can stick on a stoppage. The true second, held, blanks it.
 
-    While the clock stays stopped, that higher second is not adopted. Nothing is
-    emitted after the blank. The true clock returns only when it runs.
+    While that higher second is held, the stoppage gate does not adopt it.
+    Nothing is emitted after the blank.
     """
     h = ClockHistory()
     assert h.filter(90, 1, 0) == 90
@@ -417,6 +417,81 @@ def test_plus_five_accepted_first_then_alternating_does_not_return():
         if det is not None and t > det and out is not None and out != truth:
             wrong += 1
     assert det is not None and wrong == 0
+
+
+def test_a_held_fifty_after_a_rejected_sixty_five_is_not_a_stoppage():
+    """The stoppage trajectory's low edge is the band's top rate, not 1.0x.
+
+    A held 65 is rejected, then 50 is held, then the true 60 returns. Replacing
+    the low edge ``s0 - hi*dt`` with ``s0 - dt`` publishes 10 values of 50
+    (7000 ms through 7900 ms). This window is 3.0 s of 50 and then the true 60.
+    """
+    h = ClockHistory()
+    assert h.filter(60, 1, 0) == 60
+    for t in range(100, 2_200, 100):
+        assert h.filter(65, 1, t) is None
+    assert h.suspended and h._published_s == 60
+    wrong = []
+    for t in range(5_000, 8_000, 100):
+        out = h.filter(50, 1, t)
+        if out is not None and out != 60:
+            wrong.append((t, out))
+    for t in range(8_000, 12_000, 100):
+        out = h.filter(60, 1, t)
+        if out is not None and out != 60:
+            wrong.append((t, out))
+    assert wrong == []
+    assert h.last_s == 60
+
+
+def test_held_misread_continuation_stays_blocked_for_the_quarter():
+    """A +5 misread held through a stoppage, then run, publishes nothing wrong.
+
+    Blocking only the held second lets the running gate adopt the countdown:
+    162 values from 6300 ms through 22400 ms. The true clock, held afterwards,
+    may return. It is the line the hold contradicted, not the misread.
+    """
+    h = ClockHistory()
+    assert h.filter(60, 1, 0) == 60
+    for t in range(100, 3_000, 100):
+        assert h.filter(65, 1, t) is None
+    assert h.suspended
+    wrong = 0
+    for t in range(3_000, 22_401, 100):
+        truth = 60 - (t - 3_000) // 1000
+        out = h.filter(truth + 5, 1, t)
+        if out is not None and out != truth:
+            wrong += 1
+    assert wrong == 0 and h.last_s is None
+    returned = None
+    for i in range(40):
+        t = 23_000 + i * 100
+        out = h.filter(41, 1, t)
+        if out is not None:
+            returned = (t, out, h.reanchor_kind)
+            break
+    assert returned == (25_000, 41, "stop")
+
+
+def test_held_pre_kickoff_fifteen_does_not_return_when_it_runs():
+    """A new quarter accepts the clock still on screen. A held 15:00 against it
+    is a contradicted held line, and that countdown stays blocked.
+    """
+    h = ClockHistory()
+    assert h.filter(5, 1, 0) == 5
+    assert h.filter(5, 2, 1_000) == 5
+    for t in range(1_100, 4_000, 100):
+        assert h.filter(900, 2, t) is None
+    assert h.suspended
+    assert h._blocked_other is not None
+    assert h._blocked_other[1] == 900 and h._blocked_other[2] == "hold"
+    published = []
+    for t in range(4_000, 20_000, 100):
+        secs = 900 - (t - 4_000) // 1000
+        out = h.filter(secs, 2, t)
+        if out is not None:
+            published.append((t, out))
+    assert published == [] and h.last_s is None
 
 
 def test_stoppage_does_not_keep_a_second_the_blocked_line_already_showed():
