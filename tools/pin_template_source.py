@@ -22,9 +22,33 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def pin(match_id: str, video: Path, sources_path: Path) -> str:
+HELD_IDS = ("170123", "021003", "125430", "084523", "193534")
+
+
+def _held_in_path(video: Path) -> str | None:
+    text = str(video)
+    for item in HELD_IDS:
+        if item in text:
+            return item
+    return None
+
+
+def _blocklist(path: Path) -> dict[str, str]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError) as exc:
+        raise SystemExit(f"refusing: held-out sha256 table unreadable ({exc}). allowlist not written.") from exc
+    rows = data.get("sha256") if isinstance(data, dict) else None
+    if not isinstance(rows, dict):
+        raise SystemExit("refusing: held-out sha256 table has no sha256 object. allowlist not written.")
+    return {str(key): str(value) for key, value in rows.items()}
+
+
+def pin(match_id: str, video: Path, sources_path: Path, hash_path: Path | None = None) -> str:
     if not video.is_file():
         raise SystemExit(f"refusing: {video} is not a file. allowlist not written.")
+    root = Path(__file__).resolve().parents[1]
+    hash_path = hash_path or (root / "sidecar" / "packs" / "held_out_sha256.json")
     try:
         data = json.loads(sources_path.read_text(encoding="utf-8-sig"))
     except (OSError, ValueError) as exc:
@@ -43,9 +67,25 @@ def pin(match_id: str, video: Path, sources_path: Path) -> str:
         raise SystemExit(
             f"refusing: allowlist folder {folder!r} is not the folder for {match_id}. allowlist not written."
         )
+    held = _held_in_path(video)
+    if held:
+        raise SystemExit(
+            f"refusing: {video} contains held-out id {held}. allowlist not written."
+        )
+    if video.parent.name != folder:
+        raise SystemExit(
+            f"refusing: {video.parent.name} is not the allowlisted folder {folder} for {match_id}. "
+            "allowlist not written."
+        )
     digest = sha256_file(video)
+    blocked = _blocklist(hash_path)
+    if digest in blocked:
+        raise SystemExit(
+            f"refusing: video sha256 matches held-out {blocked[digest]}. allowlist not written."
+        )
     row["video_sha256"] = digest
-    sources_path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    # LF even on Windows. write_text would translate newlines to CRLF.
+    sources_path.write_bytes((json.dumps(data, indent=2) + "\n").encode("utf-8"))
     return digest
 
 
@@ -55,9 +95,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--match-id", required=True)
     ap.add_argument("--video", type=Path, required=True)
     ap.add_argument("--sources", type=Path, default=root / "templates" / "template_sources.json")
+    ap.add_argument("--heldout-sha256", type=Path, default=root / "sidecar" / "packs" / "held_out_sha256.json")
     args = ap.parse_args(argv)
     try:
-        digest = pin(args.match_id, args.video, args.sources)
+        digest = pin(args.match_id, args.video, args.sources, args.heldout_sha256)
     except SystemExit as exc:
         if exc.code not in (None, 0):
             print(exc.code if isinstance(exc.code, str) else exc, file=sys.stderr)

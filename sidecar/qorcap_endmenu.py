@@ -133,10 +133,11 @@ class EndMenuReader:
         return corroborate(img, expected, self)
 
     def __init__(self, pack: str | Path | None = PACK, scorebug_pack=None) -> None:
-        from qorcap_template_guard import file_authorized, harvested_vectors
+        from qorcap_template_guard import digits_complete, file_authorized, harvested_vectors
 
         self._missing = False
-        got = harvested_vectors("end_menu")
+        # A partial digit set matches the nearest glyph. Abstain until 0-9 are all present.
+        got = harvested_vectors("end_menu") if digits_complete("end_menu") else {}
         if got:
             labels, rows, sources = [], [], []
             for lab, vecs in got.items():

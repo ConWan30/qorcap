@@ -72,7 +72,8 @@ def merge(dest: Path, outs: list[Path]) -> int:
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(src.read_bytes())
     base["templates"] = list(base["templates"]) + incoming
-    dest_prov.write_text(json.dumps(base, indent=2) + "\n", encoding="utf-8")
+    # LF even on Windows. write_text would translate newlines to CRLF.
+    dest_prov.write_bytes((json.dumps(base, indent=2) + "\n").encode("utf-8"))
     return len(incoming)
 
 

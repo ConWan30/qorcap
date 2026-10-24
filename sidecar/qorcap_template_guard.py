@@ -173,6 +173,7 @@ def digits_complete(role: str, *, profile: str | None = None, path: Path | None 
 
     A partial pack can match the nearest harvested glyph and report a wrong
     score. The standard reader abstains until the score set is complete, and
-    it does not install a partial clock set.
+    it does not install a partial clock set. The end-menu reader abstains
+    until end-menu digits 0-9 are all present.
     """
     return _DIGITS <= set(harvested_vectors(role, profile=profile, path=path))

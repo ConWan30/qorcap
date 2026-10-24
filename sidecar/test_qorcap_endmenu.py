@@ -12,6 +12,7 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+import pytest
 
 HERE = Path(__file__).parent
 sys.path.insert(0, str(HERE))
@@ -21,7 +22,70 @@ from qorcap_reader import ReaderCore, end_menu_consistency, madden_final_screen,
 from qor_receipt.final_detect import detect_final  # noqa: E402
 
 RST = cv2.imread(str(HERE / "fixtures" / "m27_end_menu_restart.jpg"))
-R = EndMenuReader()
+
+
+def _empty_provenance(monkeypatch, tmp_path):
+    import qorcap_template_guard as guard
+
+    prov = tmp_path / "provenance.json"
+    prov.write_text(json.dumps({
+        "schema": "qorcap-template-provenance/v0",
+        "harvest_script": "tools/harvest_templates.py",
+        "harvest_version": "3",
+        "templates": [],
+    }), encoding="utf-8")
+    monkeypatch.setattr(guard, "PROVENANCE_PATH", prov)
+
+
+@pytest.fixture
+def menu(monkeypatch, tmp_path):
+    """Build the reader after the provenance patch. Import time is too early."""
+    _empty_provenance(monkeypatch, tmp_path)
+    return EndMenuReader()
+
+
+def _end_menu_provenance(tmp_path, labels: str):
+    """Synthetic end-menu rows for 102332. ``labels`` is a string of digit characters."""
+    import hashlib
+
+    root = tmp_path / "installed"
+    rows = []
+    commit = "0204e6d8082f8c40ea1fe5e09bf16402aaee3ff2"
+    video = "ab" * 32
+    for lab in labels:
+        rel = f"end_menu/102332__{lab}__menu_away__f000000__g0.npy"
+        dest = root / rel
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        arr = np.zeros((12 * 18,), np.float32)
+        arr[int(lab)] = 1.0
+        np.save(dest, arr)
+        digest = hashlib.sha256(dest.read_bytes()).hexdigest()
+        rows.append({
+            "path": rel,
+            "sha256": digest,
+            "role": "end_menu",
+            "label": lab,
+            "profile": "end_menu",
+            "source_match_id": "102332",
+            "source_match_folder": "match-20261024-102332",
+            "video_sha256": video,
+            "frame_index": 0,
+            "t_ms": 0,
+            "start_frame_index": 0,
+            "end_frame_index": 0,
+            "harvest_version": "3",
+            "harvest_date": "2026-10-24T17:31:00Z",
+            "qortime_commit": commit,
+        })
+    prov = root / "provenance.json"
+    prov.write_text(json.dumps({
+        "schema": "qorcap-template-provenance/v0",
+        "harvest_script": "tools/harvest_templates.py",
+        "harvest_version": "3",
+        "qortime_commit": commit,
+        "templates": rows,
+    }), encoding="utf-8")
+    return prov
 
 
 class ScriptedEndMenu:
@@ -37,6 +101,30 @@ class ScriptedEndMenu:
 
     def period(self, _img):
         return self._period
+
+
+def test_a_partial_end_menu_set_abstains(monkeypatch, tmp_path):
+    """Digits 0-8 are not a pack. The reader abstains instead of matching the nearest glyph."""
+    import qorcap_template_guard as guard
+    from qorcap_template_guard import TEMPLATES_MISSING
+
+    prov = _end_menu_provenance(tmp_path, "012345678")
+    monkeypatch.setattr(guard, "PROVENANCE_PATH", prov)
+    reader = EndMenuReader()
+    assert reader._missing and reader.xpack is None
+    rd = reader.read(np.zeros((360, 640, 3), np.uint8))
+    assert rd.ok is False and rd.reason == TEMPLATES_MISSING
+    assert rd.away is None and rd.home is None
+
+
+def test_a_complete_end_menu_set_loads(monkeypatch, tmp_path):
+    import qorcap_template_guard as guard
+
+    prov = _end_menu_provenance(tmp_path, "0123456789")
+    monkeypatch.setattr(guard, "PROVENANCE_PATH", prov)
+    reader = EndMenuReader()
+    assert reader._missing is False
+    assert set(reader.labels) >= set("0123456789")
 
 
 def test_held_out_125430_finish_menu_reads_7_14():
@@ -55,25 +143,25 @@ def test_held_out_125430_finish_menu_reads_7_14():
     assert finish.ok and (finish.away, finish.home) == (7, 14), finish
 
 
-def test_reads_both_matches_away_left_home_right():
+def test_reads_both_matches_away_left_home_right(menu):
     """125430 supplied the 7 and the 4. That pack is gone, so the reader abstains and does not guess."""
     from qorcap_template_guard import TEMPLATES_MISSING
     blank = np.zeros((360, 640, 3), np.uint8)
     for frame in (blank, RST, cv2.resize(RST, (1280, 720))):
-        rd = R.read(frame)
+        rd = menu.read(frame)
         assert rd.ok is False and rd.reason == TEMPLATES_MISSING, rd
         assert rd.away is None and rd.home is None
-    assert R.xpack is None and R._missing
+    assert menu.xpack is None and menu._missing
     assert not (HERE / "packs" / "madden27_end_menu_v1.npz").is_file()
     assert not (HERE / "packs" / "madden27_end_menu_v2.npz").is_file()
 
 
-def test_unreadable_fails_closed():
-    assert not R.read(np.zeros((360, 640, 3), np.uint8)).ok
+def test_unreadable_fails_closed(menu):
+    assert not menu.read(np.zeros((360, 640, 3), np.uint8)).ok
     smudge = RST.copy()
     cv2.rectangle(smudge, (395, 40), (412, 50), (255, 255, 255), -1)   # damage the "2"
-    assert not R.read(smudge).ok
-    assert not R.read(None).ok
+    assert not menu.read(smudge).ok
+    assert not menu.read(None).ok
 
 
 def test_agreement_needs_consecutive_frames():
@@ -116,10 +204,10 @@ class Paused:
         pass
 
 
-def _core(last, reader=None):
+def _core(last, reader):
     posts = []
     core = ReaderCore(posts.append, None, None, Paused(), detect_final, final_screen_detector=madden_final_screen,
-                      end_menu_reader=R if reader is None else reader)
+                      end_menu_reader=reader)
     core.timeline = [dict(last)]
     return core, posts
 
@@ -191,13 +279,13 @@ def test_apply_final_fields():
     assert r["final_confirmed"] is False and r["method"] == "last_scorebug_read_unconfirmed" and "final_basis" not in r
 
 
-def test_tnp_ot_end_menu_reads_walkoff_and_sets_quarter():
+def test_tnp_ot_end_menu_reads_walkoff_and_sets_quarter(menu):
     from qorcap_template_guard import TEMPLATES_MISSING
     ot = cv2.imread(str(HERE / "fixtures" / "m27_tnp_091651_end_menu.jpg"))
     assert madden_final_screen(prep(ot))
-    rd = R.read(ot)
+    rd = menu.read(ot)
     assert not rd.ok and rd.reason == TEMPLATES_MISSING and rd.away is None and rd.home is None
-    assert R.period(ot) is None  # ot_vec lived in the removed pack
+    assert menu.period(ot) is None  # ot_vec lived in the removed pack
     menu = ScriptedEndMenu(10, 16, period="OT")
     # Walk-off: last scorebug is OT 1:55, same score. Clock is not 0:00; the menu still confirms.
     core, posts = _core({"t_ms": 0, "home": 16, "away": 10, "quarter": 5, "clock_s": 115, "clock_red": False}, menu)
@@ -394,7 +482,7 @@ def test_finalize_aggregates_091651_end_menu_to_confirmed_ot_final(capsys):
     assert "END MENU rejected" not in capsys.readouterr().err
 
 
-def test_standard_end_menu_reads_and_confirms_hou_30_jax_6():
+def test_standard_end_menu_reads_and_confirms_hou_30_jax_6(menu):
     """110028 is not an allowlisted template match, so the glyph reader abstains.
 
     The exact-match gate and the red-clock gate still run on a scripted 30-6.
@@ -403,10 +491,10 @@ def test_standard_end_menu_reads_and_confirms_hou_30_jax_6():
     from qorcap_template_guard import TEMPLATES_MISSING
     im = cv2.imread(str(HERE / "fixtures" / "m27_std_110028_end_menu.jpg"))
     assert madden_final_screen(prep(im))
-    rd = R.read(im)
+    rd = menu.read(im)
     assert not rd.ok and rd.reason == TEMPLATES_MISSING and rd.away is None and rd.home is None
-    menu = ScriptedEndMenu(30, 6)
-    core, posts = _core({"t_ms": 0, "home": 6, "away": 30, "quarter": 4, "clock_s": 3, "clock_red": True}, menu)
+    scripted = ScriptedEndMenu(30, 6)
+    core, posts = _core({"t_ms": 0, "home": 6, "away": 30, "quarter": 4, "clock_s": 3, "clock_red": True}, scripted)
     for k in range(6):
         core.on_frame(10_000 + k * 500, im)
     f = [p for p in posts if p.get("basis") == "end_menu"][0]
@@ -415,7 +503,7 @@ def test_standard_end_menu_reads_and_confirms_hou_30_jax_6():
     res = qm.apply_final({"final_t_ms": 1}, f)
     assert (res["away_score"], res["home_score"], res["quarter"], res["winner"]) == (30, 6, 4, "away")
     # A red 0:14 is still a running quarter.
-    core, posts = _core({"t_ms": 0, "home": 6, "away": 30, "quarter": 4, "clock_s": 14, "clock_red": True}, menu)
+    core, posts = _core({"t_ms": 0, "home": 6, "away": 30, "quarter": 4, "clock_s": 14, "clock_red": True}, scripted)
     for k in range(6):
         core.on_frame(10_000 + k * 500, im)
     assert not any(p.get("basis") == "end_menu" for p in posts)

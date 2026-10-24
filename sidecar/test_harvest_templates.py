@@ -415,7 +415,12 @@ def test_labels_with_a_utf8_bom_are_read(tmp_path):
 
 
 def test_missing_qortime_refuses_before_the_video_is_hashed(tmp_path, monkeypatch):
-    """A miss refuses before any video byte is hashed. CI's own qortime/ checkout must not count."""
+    """A miss refuses before any video byte is hashed.
+
+    Unsetting QORTIME is not enough. CI checks the pin out at ``<repo>/qortime``,
+    and ``find_qortime`` walks ``HERE.parent / "qortime"``. Point HERE at a
+    scratch sidecar so that lookup cannot see the checkout.
+    """
     import qorcap_match
 
     folder = _match(tmp_path, "555001")
@@ -424,13 +429,12 @@ def test_missing_qortime_refuses_before_the_video_is_hashed(tmp_path, monkeypatc
     labels = tmp_path / "labels.json"
     _labels(labels)
 
-    def gone(_arg, download=True):
-        raise SystemExit("QorTime code not found")
-
     def boom(*_a, **_k):
         raise AssertionError("hashed or decoded the video before QorTime was resolved")
 
-    monkeypatch.setattr(qorcap_match, "find_qortime", gone)
+    monkeypatch.delenv("QORTIME", raising=False)
+    monkeypatch.setenv("QORCAP_HOME", str(tmp_path / "no-qortime"))
+    monkeypatch.setattr(qorcap_match, "HERE", tmp_path / "sidecar")
     monkeypatch.setattr(H, "_sha256", boom)
     monkeypatch.setattr(H, "iter_decoded", boom)
     try:
@@ -569,8 +573,9 @@ def test_pin_preview_and_merge(tmp_path, capsys):
     import pin_template_source as pin
     import preview_frame as preview
 
-    folder = _match(tmp_path, "555001")
+    folder = _match(tmp_path, "102332")
     video = folder / "video.mp4"
+    assert video.parent.name == "match-20261024-102332"
     sources = tmp_path / "sources.json"
     sources.write_text((ROOT / "templates" / "template_sources.json").read_text(encoding="utf-8"), encoding="utf-8")
     before = sources.read_text(encoding="utf-8")
@@ -583,7 +588,9 @@ def test_pin_preview_and_merge(tmp_path, capsys):
     assert sources.read_text(encoding="utf-8") == before
     digest = pin.pin("102332", video, sources)
     assert digest == digest.lower() and len(digest) == 64
-    saved = json.loads(sources.read_text(encoding="utf-8"))
+    raw = sources.read_bytes()
+    assert b"\r" not in raw and raw.endswith(b"\n")
+    saved = json.loads(raw)
     row = next(item for item in saved["sources"] if item["match_id"] == "102332")
     assert row["video_sha256"] == digest
     assert saved["sources"][1]["video_sha256"] == ""
@@ -602,6 +609,8 @@ def test_pin_preview_and_merge(tmp_path, capsys):
     H.harvest(folder, out, labels, allow, HELD, HASHES, now=NOW)
     dest = tmp_path / "templates"
     assert merge.merge(dest, [out]) > 0
+    merged = (dest / "provenance.json").read_bytes()
+    assert b"\r" not in merged and merged.endswith(b"\n")
     snap = _snap(dest)
     try:
         merge.merge(dest, [out])
@@ -610,3 +619,133 @@ def test_pin_preview_and_merge(tmp_path, capsys):
     else:
         raise AssertionError("a duplicate path was merged")
     assert _snap(dest) == snap
+
+
+def test_a_held_out_filename_inside_an_allowlisted_match_is_refused(tmp_path):
+    """Deleting the match-folder filename scan lets this harvest succeed."""
+    folder = _match(tmp_path, "555001")
+    (folder / "frame_170123.jpg").write_bytes(b"not-a-jpeg")
+    before = _snap(folder)
+    allow = tmp_path / "allow.json"
+    _allow(allow, folder)
+    labels = tmp_path / "labels.json"
+    _labels(labels)
+    out = tmp_path / "out"
+    try:
+        H.harvest(folder, out, labels, allow, HELD, HASHES, now=NOW)
+    except H.Refuse as exc:
+        assert "170123" in str(exc)
+        assert "frame_170123.jpg" in str(exc)
+    else:
+        raise AssertionError("a held-out file name was harvested")
+    assert not out.exists()
+    assert _snap(folder) == before
+
+
+def test_a_video_sha_listed_in_the_held_out_table_is_refused(tmp_path):
+    """Deleting the sha-table check lets this harvest succeed. The allowlist pin matches."""
+    folder = _match(tmp_path, "555001")
+    before = _snap(folder)
+    allow = tmp_path / "allow.json"
+    _allow(allow, folder)
+    digest = H._sha256(folder / "video.mp4")
+    table = tmp_path / "held_out_sha256.json"
+    table.write_text(json.dumps({
+        "sha256": {digest: "site/matches/match-20261024-170123/clips/held.mp4"},
+    }), encoding="utf-8")
+    labels = tmp_path / "labels.json"
+    _labels(labels)
+    out = tmp_path / "out"
+    try:
+        H.harvest(folder, out, labels, allow, HELD, table, now=NOW)
+    except H.Refuse as exc:
+        assert "held-out footage" in str(exc)
+        assert "170123" in str(exc)
+    else:
+        raise AssertionError("a blocklisted video sha was harvested")
+    assert not out.exists()
+    assert _snap(folder) == before
+
+
+def test_a_different_qortime_commit_warns_and_still_harvests(tmp_path, monkeypatch, capsys):
+    folder = _match(tmp_path, "555001")
+    allow = tmp_path / "allow.json"
+    _allow(allow, folder)
+    labels = tmp_path / "labels.json"
+    _labels(labels)
+    real = H._qortime_commit(Path(os.environ["QORTIME"]))
+    monkeypatch.setattr(H, "QORTIME_PIN", "0" * 40)
+    doc = H.harvest(folder, tmp_path / "out", labels, allow, HELD, HASHES, dry_run=True, now=NOW)
+    err = capsys.readouterr().err
+    assert f"warning: QorTime commit {real} differs from the Start Match pin {'0' * 40}" in err
+    assert doc["templates"]
+    assert not (tmp_path / "out").exists()
+
+
+def _sources_copy(path: Path) -> str:
+    text = (ROOT / "templates" / "template_sources.json").read_text(encoding="utf-8")
+    path.write_text(text, encoding="utf-8")
+    return text
+
+
+def test_pin_refuses_a_video_outside_the_allowlisted_folder(tmp_path):
+    import pin_template_source as pin
+
+    folder = _match(tmp_path, "555001")
+    video = folder / "video.mp4"
+    sources = tmp_path / "sources.json"
+    before = _sources_copy(sources)
+    try:
+        pin.pin("102332", video, sources)
+    except SystemExit as exc:
+        assert "match-20261024-102332" in str(exc.code)
+        assert "555001" in str(exc.code)
+    else:
+        raise AssertionError("a video outside the allowlisted folder was pinned")
+    assert sources.read_text(encoding="utf-8") == before
+
+
+@pytest.mark.parametrize("held_id", ["170123", "021003", "125430", "084523", "193534"])
+def test_pin_refuses_a_held_out_id_anywhere_in_the_path(tmp_path, held_id):
+    """The parent folder is the allowlisted match. The held-out id is in the file name."""
+    import pin_template_source as pin
+
+    folder = tmp_path / "match-20261024-102332"
+    folder.mkdir()
+    src_root = tmp_path / "src"
+    src_root.mkdir()
+    src = _match(src_root, "102332")
+    video = folder / f"video-{held_id}.mp4"
+    video.write_bytes((src / "video.mp4").read_bytes())
+    assert video.parent.name == "match-20261024-102332"
+    sources = tmp_path / "sources.json"
+    before = _sources_copy(sources)
+    try:
+        pin.pin("102332", video, sources)
+    except SystemExit as exc:
+        assert held_id in str(exc.code)
+    else:
+        raise AssertionError(f"held-out id {held_id} in the path was pinned")
+    assert sources.read_text(encoding="utf-8") == before
+
+
+def test_pin_refuses_a_sha_listed_in_held_out_sha256(tmp_path):
+    import pin_template_source as pin
+
+    folder = _match(tmp_path, "102332")
+    video = folder / "video.mp4"
+    digest = pin.sha256_file(video)
+    table = tmp_path / "held_out_sha256.json"
+    table.write_text(json.dumps({
+        "sha256": {digest: "site/matches/match-20261024-125430/clips/held.mp4"},
+    }), encoding="utf-8")
+    sources = tmp_path / "sources.json"
+    before = _sources_copy(sources)
+    try:
+        pin.pin("102332", video, sources, table)
+    except SystemExit as exc:
+        assert "held-out" in str(exc.code)
+        assert "125430" in str(exc.code)
+    else:
+        raise AssertionError("a blocklisted video sha was pinned")
+    assert sources.read_text(encoding="utf-8") == before

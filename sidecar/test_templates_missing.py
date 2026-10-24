@@ -61,7 +61,8 @@ def test_standard_reader_abstains_and_the_model_id_changed(monkeypatch, tmp_path
     assert fr.detail["templates_missing"] == TEMPLATES_MISSING_REASON
 
 
-def test_primetime_and_end_menu_abstain_on_a_synthetic_frame():
+def test_primetime_and_end_menu_abstain_on_a_synthetic_frame(monkeypatch, tmp_path):
+    _empty_provenance(monkeypatch, tmp_path)
     for reader in (MondayNightReader(), SundayNightReader(), ThursdayNightReader()):
         fr = reader.read(np.zeros((720, 1280, 3), np.uint8))
         assert fr.reason == TEMPLATES_MISSING

@@ -32,6 +32,22 @@ def abstain(fr):
     assert fr.quarter is None and fr.clock_text is None
 
 
+@pytest.fixture(autouse=True)
+def _empty_provenance(monkeypatch, tmp_path):
+    """A committed harvest must not turn these abstentions into layout_unknown."""
+    import json
+    import qorcap_template_guard as guard
+
+    prov = tmp_path / "provenance.json"
+    prov.write_text(json.dumps({
+        "schema": "qorcap-template-provenance/v0",
+        "harvest_script": "tools/harvest_templates.py",
+        "harvest_version": "3",
+        "templates": [],
+    }), encoding="utf-8")
+    monkeypatch.setattr(guard, "PROVENANCE_PATH", prov)
+
+
 @pytest.fixture(scope="module")
 def snp():
     return S.SundayNightReader()

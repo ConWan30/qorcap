@@ -23,6 +23,8 @@ role, label, profile, and bytes (or an explicit missing marker) and the grammar
 and clock parameters. Relabelling a glyph changes the id even when the bytes
 do not. The reader abstains unless score digits 0-9 are all present. A partial
 clock set is not installed, and the stock clock font is not used in its place.
+The end-menu reader abstains unless end-menu digits 0-9 are all present.
+Both games' final screens are not a complete end-menu set.
 
 | | id |
 | --- | --- |

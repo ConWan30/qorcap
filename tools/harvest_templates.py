@@ -690,6 +690,11 @@ def harvest(match_dir: Path, out_dir: Path, labels_path: Path, allow_path: Path,
     QorTime is resolved before the match video is hashed or decoded.
     """
     qortime_path, qortime_commit = _resolve_qortime(qortime)
+    if qortime_commit != QORTIME_PIN:
+        print(
+            f"warning: QorTime commit {qortime_commit} differs from the Start Match pin {QORTIME_PIN}",
+            file=sys.stderr,
+        )
     match_dir = match_dir.resolve()
     out_dir = out_dir.resolve()
     if not match_dir.is_dir():
