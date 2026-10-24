@@ -2145,6 +2145,9 @@ def _scorebug_tied_not_over(row) -> bool:
     q = row.get("quarter")
     if isinstance(q, int) and not isinstance(q, bool) and q >= 5:
         return True
+    # Tied Q4 with a red clock of END_MENU_RED_CLOCK_S (5) or less is still clock-ready
+    # for the end menu, and this check does not treat that as tied-not-over. The span
+    # can start a tail. Harmless: the tail only adds time, and a tied menu is rejected.
     return row.get("clock_s") == 0
 
 
@@ -2303,6 +2306,32 @@ def end_menu_was_disputed(fin) -> bool:
     if fin.get("end_menu_disputed") is True:
         return True
     return any(isinstance(n, str) and "disagreed with the posted" in n for n in (fin.get("notes") or []))
+
+
+def select_offline_final(events) -> dict | None:
+    """Which final event offline finalize signs.
+
+    The first end-menu event still wins over a later scorebug final. A later event that
+    disputes that menu replaces it. Signing the first event again would confirm the
+    score the live reader had already dropped.
+    """
+    finals = [e for e in events or [] if isinstance(e, dict) and e.get("type") == "final"]
+    end_menus = [e for e in finals if is_end_menu_final(e)]
+    disputed = [e for e in end_menus if end_menu_was_disputed(e)]
+    if disputed:
+        return disputed[-1]
+    if end_menus:
+        return end_menus[0]
+    return finals[-1] if finals else None
+
+
+def apply_offline_final(result: dict, events, *, fallback=None, grammar_unresolved: bool = False) -> tuple[dict | None, dict]:
+    """Draft result from the offline events. A disputed end menu stays unconfirmed, with its note."""
+    fin = select_offline_final(events)
+    res = apply_final(result, fin, fallback=fallback, grammar_unresolved=grammar_unresolved)
+    if end_menu_was_disputed(fin):
+        res = _disputed_final_result({"result": res}, fin)["result"]
+    return fin, res
 
 
 def _disputed_final_result(draft: dict, live_final: dict) -> dict:
@@ -2817,8 +2846,9 @@ def finalize(bundle: Path, *, qt: Path, qorcap: str, ffmpeg: str, key_dir: Path,
     with open(bundle / "score_checkpoints.jsonl", "w", encoding="utf-8") as f:
         for c in scps:
             f.write(json.dumps(c) + "\n")
-    finals = [e for e in events if e["type"] == "final"]
-    fin = next((e for e in finals if is_end_menu_final(e)), finals[-1] if finals else None)
+    unresolved = _grammar_unresolved(shared["core"])
+    fin, res = apply_offline_final(
+        draft["result"], events, fallback=game_segment_score(events), grammar_unresolved=unresolved)
     reads = [e for e in events if e["type"] == "score"]
     (bundle / "final.offline.json").write_text(json.dumps(
         {"final": fin, "basis": fin and fin["basis"], "last_read": reads[-1] if reads else None, "frames": stats,
@@ -2826,10 +2856,6 @@ def finalize(bundle: Path, *, qt: Path, qorcap: str, ffmpeg: str, key_dir: Path,
          "score_checkpoints": len(scps), "score_checkpoint_head": scps[-1]["hash"] if scps else None,
          "method": "offline: QorTime ScorebugReader + AgreementWindow + detect_final over recorded video",
          "finalized_ms": int(time.time() * 1000)}, indent=2), encoding="utf-8")
-
-    unresolved = _grammar_unresolved(shared["core"])
-    res = apply_final(draft["result"], fin, fallback=game_segment_score(events),
-                      grammar_unresolved=unresolved)
     from qorcap_reanchor_notes import record_unresolved_final
     record_unresolved_final(bundle, res)
     res = keep_recovery_notes(res, draft)

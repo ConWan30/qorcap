@@ -655,7 +655,11 @@ class ReaderCore:
         #              "t_ms": int, ...optional "home","away","sha256"}
         self.delta_corroboration: list[dict] = []
         # Pause menu vs end screen. ``_pixel_match_since`` is the first frame of the current dark picture.
+        # A non-matching frame clears it, and a short labelled span is then dropped.
+        # ``_end_screen_earliest`` is the first match of this absence and stays until the next
+        # scorebug read, so a one-frame gap cannot move the input cutoff forward.
         self._pixel_match_since: int | None = None
+        self._end_screen_earliest: int | None = None
         self._options_presses_ms: list[int] = []
 
     def note_options(self, presses_ms) -> None:
@@ -725,6 +729,8 @@ class ReaderCore:
         if self.final_screen_detector is not None and self.final_screen_detector(img):
             if self._pixel_match_since is None:
                 self._pixel_match_since = t_ms
+            if self._end_screen_earliest is None:
+                self._end_screen_earliest = t_ms
             accept = self._accept_final_screen(t_ms)
             if self._opened_by_options(t_ms) and not accept:
                 self.stats["final_screen_rejected"] = self.stats.get("final_screen_rejected", 0) + 1
@@ -737,6 +743,7 @@ class ReaderCore:
             self._observe(t_ms, img, True, screen=accept)
             self._end_menu(t_ms, img)
             return
+        # Current run only. The earliest match stays until a scorebug read.
         self._pixel_match_since = None
         if self.pause is not None:
             self.pause.update(t_ms, img)
@@ -863,6 +870,8 @@ class ReaderCore:
             if isinstance(q, int) and not isinstance(q, bool) and q >= 2:
                 self.periods.release_for_new_quarter()
             self.periods.note(t_ms, rd.get("clock_s"))
+        # The scorebug is back. A new end screen starts its own cutoff.
+        self._end_screen_earliest = None
         self._close_spans()  # a fresh score read ends any absence span
         self._check_final(t_ms)
 
@@ -886,6 +895,8 @@ class ReaderCore:
             raw = bool(absent and self.final_screen_detector and self.final_screen_detector(img))
             if raw and self._pixel_match_since is None:
                 self._pixel_match_since = t_ms
+            if raw and self._end_screen_earliest is None:
+                self._end_screen_earliest = t_ms
             screen = bool(raw and self._accept_final_screen(t_ms))
         self._screen = span(self._screen, "final_screen", screen)
         if absent:
@@ -1065,7 +1076,7 @@ class ReaderCore:
               "t_ms": last["t_ms"]}
         notes = list(notes_c)
         corr = end_menu_delta_corroborated(
-            st, last, self.timeline, self.delta_corroboration, pixel_match_ms=self._pixel_match_since)
+            st, last, self.timeline, self.delta_corroboration, pixel_match_ms=self._end_screen_earliest)
         confirmed = corr is not None and corr.get("kind") != "no_scorebug"
         if (sb["away"], sb["home"]) != (st["away"], st["home"]):
             notes.append(f"final play score not shown on scorebug: last scorebug read AWAY {sb['away']} - HOME {sb['home']}"

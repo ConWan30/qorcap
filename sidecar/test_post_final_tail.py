@@ -600,6 +600,12 @@ def test_disputed_final_stays_unconfirmed_after_stop(tmp_path):
     assert core.final.get("end_menu_disputed") is True
     note = " ".join(n for n in core.final.get("notes") or [] if isinstance(n, str))
     assert "disagreed with the posted" in note and "not replaced" in note
+    # The flag and the note are one dispute. Either one is enough, and the sentence the
+    # reader writes is the sentence the matcher looks for.
+    sentence = next(n for n in core.final["notes"] if "not replaced" in n)
+    assert qm.end_menu_was_disputed({"end_menu_disputed": True, "notes": []}) is True
+    assert qm.end_menu_was_disputed({"notes": [sentence]}) is True
+    assert qm.end_menu_was_disputed({"final_confirmed": False, "notes": ["final_confirmed=false"]}) is False
 
     bundle = tmp_path / "match-dispute"
     bundle.mkdir()
@@ -704,6 +710,94 @@ def test_end_screen_cutoff_does_not_need_a_final_screen_label():
     haptic = end_menu_delta_corroborated(st_pixel, {"away": 13, "home": 13, "t_ms": 1_000}, timeline, early,
                                          pixel_match_ms=5_000)
     assert haptic and haptic["kind"] == "input_activity"
+
+
+def _blank():
+    return np.full((360, 640, 3), 40, np.uint8)
+
+
+def _feed_end_screen_gap(input_t):
+    """Unreadable end screen under 3 s, one non-matching frame, then a readable 10-16 menu.
+
+    The short labelled span is dropped. The cutoff has to be the first match, not the run after the gap.
+    """
+    score = {"t_ms": 1_000, "home": 10, "away": 10, "quarter": 4, "clock_s": 0, "clock_red": True}
+    reader = _LateDigits(10, 16, ready_at=7_000)
+    core, posts = _core(score, reader=reader, corr=[{"kind": "input_activity", "t_ms": input_t}])
+    menu, blank = _menu(), _blank()
+    assert madden_final_screen(menu) and not madden_final_screen(blank)
+    for t, img in ((5_000, menu), (5_500, menu), (6_000, menu), (6_500, blank),
+                   (7_000, menu), (7_500, menu), (8_000, menu), (8_500, menu)):
+        reader.t = t
+        core.on_frame(t, img)
+    return core, posts
+
+
+def test_end_screen_gap_does_not_let_the_first_stretch_confirm():
+    """Input during the first, unreadable stretch does not confirm the walk-off.
+
+    Resetting the earliest match on the non-matching frame, or dropping ``pixel_match_ms``
+    at the live call, lets this input confirm. Input from before the screen still does.
+    """
+    core, _posts = _feed_end_screen_gap(5_200)
+    assert core._end_screen_earliest == 5_000
+    assert not any(isinstance(r, dict) and r.get("obs") == "final_screen" and r.get("t_ms") == 5_000
+                   for r in core.timeline)
+    assert core.final["basis"] == "end_menu"
+    assert (core.final["away"], core.final["home"]) == (10, 16)
+    assert core.final["final_confirmed"] is False
+    assert core.final.get("delta_corroboration") is None
+
+    early, _ = _feed_end_screen_gap(1_500)
+    assert early.final["final_confirmed"] is True
+    assert early.final["delta_corroboration"]["kind"] == "input_activity"
+
+
+def test_live_call_passes_the_earliest_end_screen_match(monkeypatch):
+    """The live corroboration call passes the first end-screen match, not only the current run.
+
+    Omitting ``pixel_match_ms`` at that call leaves this as the missing sentinel.
+    """
+    import qorcap_reader as qr
+
+    missing = object()
+    seen = {}
+    real = qr.end_menu_delta_corroborated
+
+    def wrap(st, last, timeline, external, pixel_match_ms=missing):
+        seen["pixel_match_ms"] = pixel_match_ms
+        if pixel_match_ms is missing:
+            return real(st, last, timeline, external)
+        return real(st, last, timeline, external, pixel_match_ms=pixel_match_ms)
+
+    monkeypatch.setattr(qr, "end_menu_delta_corroborated", wrap)
+    core, _posts = _feed_end_screen_gap(5_200)
+    assert seen.get("pixel_match_ms") == 5_000
+    assert core.final["final_confirmed"] is False
+
+
+def test_offline_finalize_does_not_upgrade_a_disputed_end_menu():
+    """The first end-menu event is confirmed. The dispute post is later. Finalize signs the dispute.
+
+    Taking the first end-menu final again confirms 7-0 and drops the note.
+    """
+    score = {"t_ms": 1_000, "home": 0, "away": 7, "quarter": 4, "clock_s": 0, "clock_red": True}
+    reader = _SwitchScore((7, 0), (10, 0), at=9_000)
+    core, posts = _core(score, reader=reader)
+    for t, img in _menu_frames(5_000, 12_000):
+        reader.t = t
+        core.on_frame(t, img)
+    finals = [p for p in posts if p.get("type") == "final"]
+    assert len(finals) >= 2
+    assert finals[0]["final_confirmed"] is True and finals[0].get("end_menu_disputed") is not True
+    assert finals[-1].get("end_menu_disputed") is True and finals[-1]["final_confirmed"] is False
+    fin, res = qm.apply_offline_final(
+        {"home_score": 0, "away_score": 7, "quarter": 4, "winner": "away"}, posts)
+    assert fin is not None and fin.get("end_menu_disputed") is True
+    assert res["final_confirmed"] is False
+    assert (res["away_score"], res["home_score"]) == (7, 0)
+    kept = " ".join(n for n in res.get("notes") or [] if isinstance(n, str))
+    assert "disagreed with the posted" in kept and "not replaced" in kept
 
 
 # ---------------------------------------------------------------- chain model (tests only)
