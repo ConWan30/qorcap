@@ -30,7 +30,7 @@ jobs:
       # The receipt check is the real `python -m qor_receipt.cli verify`, not a stub.
       - run: sudo apt-get update && sudo apt-get install -y ffmpeg
       # opencv-python-headless: CPU scorebug reads. No GPU, no capture card, no HID.
-      - run: pip install cryptography pytest numpy opencv-python-headless
+      - run: pip install cryptography pytest numpy opencv-python-headless fastapi httpx
       - name: QorTime pin
         run: |
           git init qortime
@@ -47,8 +47,11 @@ jobs:
       # Allowlisted: test_local_021003_both_players (opponent frames are not in the repo).
       # Not this step, on purpose:
       # - sidecar/test_contracts.py stays in the "contracts (qortime main)" job (unpinned main).
-      # - sidecar/test_qorcap_submit.py drives the in-process referee (fastapi), not the reader.
       # - sidecar/test_qorcap_match.py launcher recording needs a built qorcap; it is not the glyph gate.
+      # sidecar/test_qorcap_submit.py is in this step. fastapi and httpx are installed above
+      # for the in-process referee. ffmpeg is installed, so those tests run. A skip of one
+      # of them fails this job: the Windows reasons are not accepted with --platform linux.
+      # The flag is checked against sys.platform. Omitting it means linux.
       # ffmpeg is installed above, so the highlights clip test and
       # test_close_stamp_lag_does_not_move_the_pause run here. They are not skipped.
       - name: Sidecar tests
@@ -71,6 +74,7 @@ jobs:
             sidecar/test_qorcap_console.py \
             sidecar/test_qorcap_release.py \
             tools/test_frame_clock_ab.py \
+            tools/test_assert_pytest_skips.py \
             sidecar/test_qorcap_reader.py \
             sidecar/test_qorcap_match.py::test_refresh_off_the_frame_thread_keeps_four_hertz \
             sidecar/test_qorcap_match.py::test_incremental_tail_matches_full_parse \
@@ -99,8 +103,9 @@ jobs:
             sidecar/test_qorcap_sidepick.py \
             sidecar/test_score_timeline.py \
             sidecar/test_qorcap_glimpse_watch.py \
-            sidecar/test_qorcap_glimpse_witness.py
-          python tools/assert_pytest_skips.py "$RUNNER_TEMP/sidecar-pytest.xml"
+            sidecar/test_qorcap_glimpse_witness.py \
+            sidecar/test_qorcap_submit.py
+          python tools/assert_pytest_skips.py --platform linux "$RUNNER_TEMP/sidecar-pytest.xml"
   # Contract bytes are compared to qortime main, not to QORTIME_PIN. The linux and windows
   # jobs keep fetching 0204e6d so `cargo test` and the bundled verifier stay reproducible.
   # This job goes red when qortime main changes schema/contracts or schema/receipt.v0.json.
@@ -173,7 +178,7 @@ jobs:
       # opencv-python-headless: CPU scorebug reads. No GPU, no capture card, no HID.
       # No ffmpeg on this job. Rust clip tests that cut with ffmpeg skip; sign/verify uses tests/fixtures/tiny_clip.mp4.
       # Pytest modules that need ffmpeg stay on the Linux job, where a missing ffmpeg fails the reader step.
-      - run: pip install cryptography pytest numpy opencv-python-headless
+      - run: pip install cryptography pytest numpy opencv-python-headless fastapi httpx
       # c2pa is built with rust_native_crypto (no OpenSSL, no HTTP). This job is the Windows compile check.
       - run: cargo test --locked
         env:
@@ -183,7 +188,11 @@ jobs:
       # stages files and loads the schema; numpy and opencv are for the readers.
       # No ffmpeg here: sidecar/test_qorcap_highlights.py and sidecar/test_qorcap_challenge.py
       # run on Linux, where ffmpeg is installed, so those tests are required there.
-      # Skip allowlist matches Linux (opponent PSN frames only).
+      # --platform windows accepts the submit skips whose junit message matches the
+      # recorded reason: no ffmpeg for the referee bundle, and select() cannot wait on a
+      # pipe (readline would block). Any other skip reason still fails. --platform must
+      # be windows here: it is checked against sys.platform, and an omitted flag means linux.
+      # The submit tests that do not need ffmpeg still run. fastapi and httpx are installed above.
       - name: Sidecar tests
         shell: bash
         env:
@@ -204,6 +213,7 @@ jobs:
             sidecar/test_qorcap_console.py \
             sidecar/test_qorcap_release.py \
             tools/test_frame_clock_ab.py \
+            tools/test_assert_pytest_skips.py \
             sidecar/test_qorcap_reader.py \
             sidecar/test_qorcap_match.py::test_refresh_off_the_frame_thread_keeps_four_hertz \
             sidecar/test_qorcap_match.py::test_incremental_tail_matches_full_parse \
@@ -229,8 +239,9 @@ jobs:
             sidecar/test_qorcap_sidepick.py \
             sidecar/test_score_timeline.py \
             sidecar/test_qorcap_glimpse_watch.py \
-            sidecar/test_qorcap_glimpse_witness.py
-          python tools/assert_pytest_skips.py "$RUNNER_TEMP/sidecar-pytest.xml"
+            sidecar/test_qorcap_glimpse_witness.py \
+            sidecar/test_qorcap_submit.py
+          python tools/assert_pytest_skips.py --platform windows "$RUNNER_TEMP/sidecar-pytest.xml"
       # No controller is the expected result: input-test returns 1.
       # pwsh forwards that native code as the step result unless the script exits 0 itself.
       - shell: pwsh

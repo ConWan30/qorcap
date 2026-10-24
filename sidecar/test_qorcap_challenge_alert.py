@@ -227,12 +227,14 @@ def test_three_beep_wav_is_full_scale_and_three_pulses():
     assert cfg.beep_volume == 1.0
     assert alert.config_from_env({"QORCAP_CHALLENGE_BEEP_HZ": "880"}).beep_hz == 880
     assert alert.config_from_env({"QORCAP_CHALLENGE_BEEP_HZ": "nope"}).beep_hz == 2400
-    assert alert.config_from_env({"QORCAP_CHALLENGE_BEEP_HZ": "50"}).beep_hz == 2400
+    assert alert.config_from_env({"QORCAP_CHALLENGE_BEEP_HZ": "50"}).beep_hz == 200
     assert alert.config_from_env({"QORCAP_CHALLENGE_BEEP_VOLUME": "0.5"}).beep_volume == 0.5
     assert alert.config_from_env({"QORCAP_CHALLENGE_BEEP_VOLUME": "50"}).beep_volume == 0.5
     assert alert.config_from_env({"QORCAP_CHALLENGE_BEEP_VOLUME": "1.0"}).beep_volume == 1.0
     assert alert.config_from_env({"QORCAP_CHALLENGE_BEEP_VOLUME": "100"}).beep_volume == 1.0
-    assert alert.config_from_env({"QORCAP_CHALLENGE_BEEP_VOLUME": "1"}).beep_volume == 0.01
+    # A bare 1 is 100%, not one percent. One percent is "1%".
+    assert alert.config_from_env({"QORCAP_CHALLENGE_BEEP_VOLUME": "1"}).beep_volume == 1.0
+    assert alert.config_from_env({"QORCAP_CHALLENGE_BEEP_VOLUME": "1%"}).beep_volume == 0.01
     assert alert.config_from_env({"QORCAP_CHALLENGE_BEEP_VOLUME": "1.5"}).beep_volume == 1.0
     silent = alert.config_from_env({"QORCAP_CHALLENGE_BEEP_VOLUME": "0"})
     assert silent.beep_volume == 0.0 and silent.beep is False
@@ -295,7 +297,7 @@ class _CPythonWinsound:
 
 def test_playsound_is_sync_memory_and_not_async(monkeypatch):
     fake = _CPythonWinsound()
-    monkeypatch.setattr(os, "name", "nt")
+    monkeypatch.setattr(alert, "_is_windows", lambda: True)
     monkeypatch.setitem(sys.modules, "winsound", fake)
     alert._WARNED.discard("beep")
     cfg = alert.config_from_env({
@@ -311,12 +313,11 @@ def test_playsound_is_sync_memory_and_not_async(monkeypatch):
 
 
 def test_each_backend_logs_once_and_writes_no_bundle_file(tmp_path, monkeypatch, caplog):
-    # Import ctypes before pretending to be Windows. ctypes reads os.name at import
-    # and would look for a Windows-only symbol.
+    # The platform gate is _is_windows, not os.name. ctypes reads os.name at import.
     import ctypes
     caplog.set_level(logging.WARNING, logger="qorcap.challenge_alert")
     alert._WARNED.clear()
-    monkeypatch.setattr(os, "name", "nt")
+    monkeypatch.setattr(alert, "_is_windows", lambda: True)
     fake = _CPythonWinsound()
 
     def no_device(sound, flags):
@@ -384,10 +385,11 @@ def test_schedule_failure_is_logged_and_the_record_stands(tmp_path, monkeypatch,
     caplog.set_level(logging.WARNING, logger="qorcap.challenge_alert")
     alert._WARNED.discard("schedule")
 
-    def boom(_msg):
+    def boom(*_args, **_kwargs):
         raise RuntimeError("schedule down")
 
-    monkeypatch.setattr(qs, "notify_challenge", boom)
+    # notify_challenge catches this. qorcap_submit does not wrap the call again.
+    monkeypatch.setattr(alert, "_schedule", boom)
     _live, api, _marks = _fire(tmp_path, legacy=[])
     assert any("schedule down" in rec.getMessage() for rec in caplog.records)
     assert _digests(_snapshot(tmp_path)) == _digests(_expected_files())
@@ -412,10 +414,11 @@ def test_challenge_fires_beep_toast_and_flash_once(tmp_path, monkeypatch):
     legacy = []
     live, api, _marks = _fire(tmp_path, legacy=legacy)
     _wait(calls, 3)
-    assert _names(calls) == ["beep", "toast", "flash"]
-    prompt = calls[1][1]
+    assert _names(calls) == ["toast", "flash", "beep"]
+    prompt = calls[0][1]
     assert "QORTIME CHALLENGE" in prompt and "CROSS" in prompt and "90 seconds" in prompt
-    assert calls[0][2].beep_hz == 2400 and calls[0][2].beep_volume == 1.0
+    beep = next(call for call in calls if call[0] == "beep")
+    assert beep[2].beep_hz == 2400 and beep[2].beep_volume == 1.0
     assert live.issued == {"kickoff"}
     assert live.open_until_ms == TOKEN["deadline_ms"]
     assert legacy == ["beep"]
@@ -436,7 +439,7 @@ def test_env_flag_disables_each_alert(tmp_path, monkeypatch, flag, skipped):
     _fire(tmp_path, legacy=[])
     _wait(calls, 2)
     assert skipped not in _names(calls)
-    assert _names(calls) == [name for name in ("beep", "toast", "flash") if name != skipped]
+    assert _names(calls) == [name for name in ("toast", "flash", "beep") if name != skipped]
 
 
 def test_disabling_alerts_matches_today(tmp_path, monkeypatch):
@@ -512,7 +515,7 @@ def test_alert_exception_does_not_change_the_recording(tmp_path, monkeypatch, ca
     time.sleep(0.05)
     err = capsys.readouterr()
     assert live.issued == {"kickoff"} and live.failures == 0
-    assert _names(calls) == ["beep", "toast", "flash"]
+    assert _names(calls) == ["toast", "flash", "beep"]
     assert errors == []
     assert "Exception in thread" not in err.err
     assert _digests(_snapshot(tmp_path)) == _digests(_expected_files())
@@ -549,3 +552,275 @@ def test_recorded_bytes_match_with_alerts_on_and_off(tmp_path, monkeypatch):
     assert (on / "receipt.json").read_bytes() == (off / "receipt.json").read_bytes() == SEEDS["receipt.json"]
     assert (on / "checkpoints.jsonl").read_bytes() == (off / "checkpoints.jsonl").read_bytes() == SEEDS["checkpoints.jsonl"]
     assert (on / "challenges.jsonl").read_bytes() == (off / "challenges.jsonl").read_bytes() == b""
+
+
+def _cfg(volume=None, hz=None, **extra):
+    env = dict(extra)
+    if volume is not None:
+        env["QORCAP_CHALLENGE_BEEP_VOLUME"] = volume
+    if hz is not None:
+        env["QORCAP_CHALLENGE_BEEP_HZ"] = hz
+    return alert.config_from_env(env)
+
+
+@pytest.mark.parametrize("raw", ["off", "OFF", "false", "False", "no", "NO", "0"])
+def test_volume_mute_tokens_silence_the_beep_only(raw):
+    cfg = _cfg(raw)
+    assert cfg.beep is False and cfg.beep_volume == 0.0
+    assert cfg.toast is True and cfg.flash is True
+
+
+def test_volume_off_does_not_play_and_still_toasts(monkeypatch):
+    calls = []
+    monkeypatch.setattr(alert, "default_backends", lambda: _backends(calls))
+    env = dict(_ON)
+    env["QORCAP_CHALLENGE_BEEP_VOLUME"] = "off"
+    alert.notify_challenge("QORTIME CHALLENGE", env=env)
+    assert alert.drain(2)
+    assert _names(calls) == ["toast", "flash"]
+
+
+def test_bare_one_is_full_scale_and_percent_sign_is_a_percent():
+    assert _cfg("1").beep_volume == 1.0
+    assert _cfg("2").beep_volume == 0.02
+    assert _cfg("80%").beep_volume == 0.8
+    assert _cfg("1%").beep_volume == 0.01
+    assert _cfg("100").beep_volume == 1.0
+    assert _cfg("0.5").beep_volume == 0.5
+    assert _cfg("1.0").beep_volume == 1.0
+    assert _cfg("0.0").beep is False and _cfg("0.0").beep_volume == 0.0
+    assert _cfg("0%").beep is False
+
+
+def test_garbage_volume_warns_once_and_uses_full_scale(caplog):
+    alert._WARNED.discard("beep_volume")
+    caplog.set_level(logging.WARNING, logger="qorcap.challenge_alert")
+    assert _cfg("loud").beep_volume == 1.0 and _cfg("loud").beep is True
+    assert _cfg("1.5").beep_volume == 1.0
+    assert _cfg("nope!!").beep_volume == 1.0
+    messages = [rec.getMessage() for rec in caplog.records if rec.name == "qorcap.challenge_alert"]
+    assert len(messages) == 1
+    assert "loud" in messages[0] and "full scale" in messages[0]
+    assert _cfg("loud").toast is True and _cfg("loud").flash is True
+
+
+@pytest.mark.parametrize("raw", ["inf", "+inf", "-inf", "nan", "NaN", "Infinity"])
+def test_nonfinite_hz_falls_back_and_still_toasts(raw, monkeypatch, caplog):
+    alert._WARNED.discard("beep_hz")
+    caplog.set_level(logging.WARNING, logger="qorcap.challenge_alert")
+    cfg = _cfg(hz=raw)
+    assert cfg.beep_hz == alert.DEFAULT_HZ
+    assert cfg.beep is True and cfg.toast is True and cfg.flash is True
+    assert any("non-finite" in rec.getMessage() for rec in caplog.records)
+    calls = []
+    monkeypatch.setattr(alert, "default_backends", lambda: _backends(calls))
+    env = dict(_ON)
+    env["QORCAP_CHALLENGE_BEEP_HZ"] = raw
+    alert.notify_challenge("QORTIME CHALLENGE", env=env)
+    _wait(calls, 3)
+    assert _names(calls) == ["toast", "flash", "beep"]
+    beep = next(call for call in calls if call[0] == "beep")
+    assert beep[2].beep_hz == alert.DEFAULT_HZ
+    assert beep[2].toast is True and beep[2].flash is True
+
+
+def test_hz_outside_range_is_clamped_and_warns_once(caplog):
+    alert._WARNED.discard("beep_hz")
+    caplog.set_level(logging.WARNING, logger="qorcap.challenge_alert")
+    low = _cfg(hz="50")
+    assert low.beep_hz == 200 and low.beep and low.toast and low.flash
+    high = _cfg(hz="9000")
+    assert high.beep_hz == 8000 and high.toast and high.flash
+    assert _cfg(hz="nope").beep_hz == alert.DEFAULT_HZ
+    messages = [rec.getMessage() for rec in caplog.records if rec.name == "qorcap.challenge_alert"]
+    assert len(messages) == 1
+    assert "clamped" in messages[0]
+
+
+def test_valid_hz_and_volume_do_not_warn(caplog):
+    alert._WARNED.discard("beep_hz")
+    alert._WARNED.discard("beep_volume")
+    caplog.set_level(logging.WARNING, logger="qorcap.challenge_alert")
+    cfg = alert.config_from_env({
+        "QORCAP_CHALLENGE_BEEP_HZ": "2400",
+        "QORCAP_CHALLENGE_BEEP_VOLUME": "0.5",
+    })
+    assert cfg.beep_hz == 2400 and cfg.beep_volume == 0.5 and cfg.beep and cfg.toast and cfg.flash
+    assert [rec for rec in caplog.records if rec.name == "qorcap.challenge_alert"] == []
+
+
+def test_drain_does_not_start_a_thread():
+    before = {t.ident for t in threading.enumerate()}
+    assert alert.drain(0.2) is True
+    extra = [t.name for t in threading.enumerate() if t.ident not in before]
+    assert "qorcap-challenge-alert-drain" not in extra
+    assert not any(t.name == "qorcap-challenge-alert-drain" for t in threading.enumerate())
+
+
+def test_negative_volume_warns_and_plays_at_full_scale(monkeypatch, caplog):
+    alert._WARNED.discard("beep_volume")
+    caplog.set_level(logging.WARNING, logger="qorcap.challenge_alert")
+    calls = []
+    monkeypatch.setattr(alert, "default_backends", lambda: _backends(calls))
+    env = dict(_ON)
+    env["QORCAP_CHALLENGE_BEEP_VOLUME"] = "-1"
+    alert.notify_challenge("QORTIME CHALLENGE", env=env)
+    assert alert.drain(2)
+    assert _names(calls) == ["toast", "flash", "beep"]
+    assert calls[-1][2].beep_volume == 1.0
+    assert any("-1" in rec.getMessage() and "full scale" in rec.getMessage() for rec in caplog.records)
+    half = _cfg("-0.5")
+    assert half.beep_volume == 1.0 and half.beep and half.toast and half.flash
+    alert._WARNED.discard("beep_volume")
+    caplog.clear()
+    signed_zero = _cfg("-0")
+    assert signed_zero.beep_volume == 1.0 and signed_zero.beep and signed_zero.toast and signed_zero.flash
+    assert _cfg("-0.0").beep_volume == 1.0 and _cfg("-0.0").beep is True
+    assert any("volume '-0'" in rec.getMessage() and "full scale" in rec.getMessage() for rec in caplog.records)
+
+
+def _players():
+    return [t for t in threading.enumerate() if t.name == "qorcap-challenge-beep" and t.is_alive()]
+
+
+def test_hung_beep_does_not_block_toast_flash_or_the_next_alert(monkeypatch, caplog):
+    caplog.set_level(logging.WARNING, logger="qorcap.challenge_alert")
+    monkeypatch.setattr(alert, "_BEEP_TIMEOUT_S", 0.2)
+    order = []
+    release = threading.Event()
+
+    def hung(prompt, cfg):
+        del prompt, cfg
+        order.append("beep-start")
+        release.wait(5)
+        order.append("beep-end")
+
+    def toast(prompt, cfg):
+        del prompt, cfg
+        order.append("toast")
+
+    def flash(prompt, cfg):
+        del prompt, cfg
+        order.append("flash")
+
+    monkeypatch.setattr(
+        alert, "default_backends",
+        lambda: alert.AlertBackends(beep=hung, toast=toast, flash=flash),
+    )
+    try:
+        started = time.perf_counter()
+        alert.notify_challenge("one", env=_ON)
+        deadline = time.monotonic() + 1.0
+        while order[:2] != ["toast", "flash"] and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert order[:2] == ["toast", "flash"]
+        assert time.perf_counter() - started < 0.5
+        assert "beep-end" not in order
+        alert.notify_challenge("two", env=_ON)
+        deadline = time.monotonic() + 2.0
+        while order.count("toast") < 2 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert order.count("toast") == 2
+        assert order.count("flash") == 2
+        assert order.count("beep-start") == 1
+        assert "beep-end" not in order
+        assert len(_players()) <= 1
+        messages = [rec.getMessage() for rec in caplog.records if rec.name == "qorcap.challenge_alert"]
+        assert any("timed out" in msg for msg in messages)
+        assert any("still running" in msg for msg in messages)
+    finally:
+        release.set()
+        deadline = time.monotonic() + 1.0
+        while _players() and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+
+def test_twenty_five_hangs_leave_one_player_thread(monkeypatch, caplog):
+    caplog.set_level(logging.WARNING, logger="qorcap.challenge_alert")
+    monkeypatch.setattr(alert, "_BEEP_TIMEOUT_S", 0.05)
+    order = []
+    release = threading.Event()
+
+    def hung(prompt, cfg):
+        del prompt, cfg
+        order.append("beep-start")
+        release.wait(30)
+
+    def mark(kind):
+        def fn(prompt, cfg):
+            del prompt, cfg
+            order.append(kind)
+        return fn
+
+    monkeypatch.setattr(
+        alert, "default_backends",
+        lambda: alert.AlertBackends(beep=hung, toast=mark("toast"), flash=mark("flash")),
+    )
+    deadline = time.monotonic() + 1.0
+    while _players() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert _players() == []
+    try:
+        for n in range(25):
+            alert.notify_challenge(f"hang-{n}", env=_ON)
+            assert alert.drain(2)
+        assert order.count("toast") == 25
+        assert order.count("flash") == 25
+        assert order.count("beep-start") == 1
+        assert len(_players()) <= 1
+        messages = [rec.getMessage() for rec in caplog.records if rec.name == "qorcap.challenge_alert"]
+        assert sum("timed out" in msg for msg in messages) == 1
+        assert sum("still running" in msg for msg in messages) == 24
+    finally:
+        release.set()
+        deadline = time.monotonic() + 1.0
+        while _players() and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+
+def test_beep_resumes_after_the_stuck_player_ends(monkeypatch):
+    monkeypatch.setattr(alert, "_BEEP_TIMEOUT_S", 0.05)
+    order = []
+    release = threading.Event()
+
+    def beep(prompt, cfg):
+        del prompt, cfg
+        order.append("beep-start")
+        release.wait(30)
+
+    def mark(kind):
+        def fn(prompt, cfg):
+            del prompt, cfg
+            order.append(kind)
+        return fn
+
+    monkeypatch.setattr(
+        alert, "default_backends",
+        lambda: alert.AlertBackends(beep=beep, toast=mark("toast"), flash=mark("flash")),
+    )
+    deadline = time.monotonic() + 1.0
+    while _players() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert _players() == []
+    try:
+        alert.notify_challenge("stuck", env=_ON)
+        assert alert.drain(2)
+        assert order.count("beep-start") == 1
+        alert.notify_challenge("while-stuck", env=_ON)
+        assert alert.drain(2)
+        assert order.count("beep-start") == 1
+        assert order.count("toast") == 2 and order.count("flash") == 2
+        release.set()
+        deadline = time.monotonic() + 1.0
+        while _players() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert _players() == []
+        alert.notify_challenge("after", env=_ON)
+        assert alert.drain(2)
+        assert order.count("beep-start") == 2
+        assert order.count("toast") == 3 and order.count("flash") == 3
+    finally:
+        release.set()
+        deadline = time.monotonic() + 1.0
+        while _players() and time.monotonic() < deadline:
+            time.sleep(0.01)
