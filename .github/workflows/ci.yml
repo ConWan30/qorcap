@@ -89,6 +89,11 @@ jobs:
             sidecar/test_qorcap_match.py::test_reader_stalled_notice_when_frames_arrive_without_rows \
             sidecar/test_qorcap_match.py::test_hung_inputs_read_does_not_confirm_final \
             sidecar/test_qorcap_match.py::test_reader_joined_and_health_sealed_before_sign \
+            sidecar/test_qorcap_match.py::test_stall_shapes_do_not_skew_the_verified_chain \
+            sidecar/test_qorcap_match.py::test_hung_haptics_read_does_not_confirm_final \
+            sidecar/test_qorcap_match.py::test_hung_manifest_read_does_not_confirm_final \
+            sidecar/test_qorcap_match.py::test_hung_on_frame_is_noticed_from_the_status_loop \
+            sidecar/test_qorcap_match.py::test_hung_refresh_shows_refresh_age_ms \
             sidecar/test_qorcap_match.py::test_reader_timing_log_names_the_three_clocks \
             sidecar/test_qorcap_standard.py \
             sidecar/test_qorcap_score_grammar.py \
@@ -233,6 +238,11 @@ jobs:
             sidecar/test_qorcap_match.py::test_reader_stalled_notice_when_frames_arrive_without_rows \
             sidecar/test_qorcap_match.py::test_hung_inputs_read_does_not_confirm_final \
             sidecar/test_qorcap_match.py::test_reader_joined_and_health_sealed_before_sign \
+            sidecar/test_qorcap_match.py::test_stall_shapes_do_not_skew_the_verified_chain \
+            sidecar/test_qorcap_match.py::test_hung_haptics_read_does_not_confirm_final \
+            sidecar/test_qorcap_match.py::test_hung_manifest_read_does_not_confirm_final \
+            sidecar/test_qorcap_match.py::test_hung_on_frame_is_noticed_from_the_status_loop \
+            sidecar/test_qorcap_match.py::test_hung_refresh_shows_refresh_age_ms \
             sidecar/test_qorcap_match.py::test_reader_timing_log_names_the_three_clocks \
             sidecar/test_qorcap_standard.py \
             sidecar/test_qorcap_score_grammar.py \

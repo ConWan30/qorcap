@@ -665,9 +665,22 @@ class JsonlTail:
         self.prefix = None
         self.tail_mark = None
 
-    def snapshot(self) -> list:
+    def _acquire(self, timeout: float | None) -> None:
+        """Wait up to ``timeout`` seconds for this tail's lock. None waits.
+
+        The pre-sign check passes the time it has left. A refresh stuck inside
+        the read holds the lock; waiting forever blocks the receipt.
+        """
+        if timeout is None:
+            self._lock.acquire()
+            return
+        if not self._lock.acquire(timeout=max(0.0, float(timeout))):
+            raise TailBusy(self.path.name)
+
+    def snapshot(self, timeout: float | None = None) -> list:
         """Parsed records equal to a full parse of the file as it is now."""
-        with self._lock:
+        self._acquire(timeout)
+        try:
             reset, new = self._pull()
             if reset:
                 self.rows = list(new)
@@ -677,17 +690,22 @@ class JsonlTail:
             if extra is None:
                 return list(self.rows)
             return self.rows + [extra]
+        finally:
+            self._lock.release()
 
-    def take(self) -> tuple[bool, list, object]:
+    def take(self, timeout: float | None = None) -> tuple[bool, list, object]:
         """``(reset, new complete rows, provisional last object)``.
 
         ``reset`` means the returned rows are the whole file and any aggregate
         built from earlier rows has to be discarded. The provisional object is
         included by a full parse and is not part of ``new``.
         """
-        with self._lock:
+        self._acquire(timeout)
+        try:
             reset, new = self._pull()
             return reset, new, _parse_json_line(self.buf)
+        finally:
+            self._lock.release()
 
     def _pull(self) -> tuple[bool, list]:
         """Caller holds ``self._lock``. Newly completed rows only, unless ``reset``."""
@@ -695,9 +713,10 @@ class JsonlTail:
         try:
             st = os.stat(self.path)
         except OSError:
-            had = self.prefix is not None or self.off != 0 or bool(self.buf) or bool(self.rows)
-            self._reset()
-            return had, []
+            # A transient stat failure is not a replaced file. Resetting here
+            # would publish an empty press list and make the next refresh
+            # re-parse the whole inputs file.
+            return False, []
         size = st.st_size
         ident = (getattr(st, "st_dev", None), getattr(st, "st_ino", None))
         try:
@@ -746,6 +765,10 @@ class JsonlTail:
         return reset, rows
 
 
+class TailBusy(Exception):
+    """A bundle jsonl lock was not free within the timeout. Fail closed."""
+
+
 class InputsBusy(Exception):
     """The shared inputs lock was not free within the timeout. Fail closed."""
 
@@ -777,12 +800,20 @@ class InputsShare:
         across the file read, so a stuck refresh blocks every other caller. The
         pre-sign check passes a timeout and does not read without the lock.
         """
-        if timeout is None:
+        deadline = None if timeout is None else time.monotonic() + float(timeout)
+
+        def left() -> float | None:
+            if deadline is None:
+                return None
+            return max(0.0, deadline - time.monotonic())
+
+        wait = left()
+        if wait is None:
             self._lock.acquire()
-        elif not self._lock.acquire(timeout=timeout):
+        elif not self._lock.acquire(timeout=wait):
             raise InputsBusy("inputs lock busy")
         try:
-            reset, new, extra = self.tail.take()
+            reset, new, extra = self.tail.take(timeout=left())
             if reset:
                 self._presses = []
                 self._prev = False
@@ -839,7 +870,7 @@ def note_options_from_inputs(core, path, timeout: float | None = None) -> None:
         return
     try:
         presses, _activity = shared_inputs(p).view(timeout=timeout)
-    except InputsBusy:
+    except (InputsBusy, TailBusy):
         raise
     except Exception:
         return
@@ -1087,6 +1118,9 @@ class ReaderCore:
                 self._close_spans()
                 if self.gate is not None:
                     self.gate.on_frame(t_ms, False, paused=True)
+                # A pause menu writes no timeline row. Counting the frame as
+                # progress keeps a long in-game pause from looking like a silent reader.
+                self.note_progress(t_ms)
                 return
         if self.gate is not None:
             pc = False
@@ -2047,8 +2081,21 @@ class BundleCorrTail:
         self.inputs = shared_inputs(self.bundle / "inputs.jsonl")
         self._clip_sha: dict[str, tuple] = {}
 
-    def snapshot(self) -> list[dict]:
+    def snapshot(self, timeout: float | None = None) -> list[dict]:
+        """Same rows as a full bundle read.
+
+        ``timeout`` is one deadline shared by the manifest lock, the haptics
+        lock, and the inputs view. None waits. The pre-sign check passes the
+        time it has left and fails closed when any of those locks is busy.
+        """
         b = self.bundle
+        deadline = None if timeout is None else time.monotonic() + float(timeout)
+
+        def left() -> float | None:
+            if deadline is None:
+                return None
+            return max(0.0, deadline - time.monotonic())
+
         clips: list[dict] = []
         bj = b / "bundle.json"
         if bj.is_file():
@@ -2057,7 +2104,7 @@ class BundleCorrTail:
                     clips.extend(json.loads(fh.read()).get("clips") or [])
             except Exception:
                 pass
-        for o in self.manifest.snapshot():
+        for o in self.manifest.snapshot(timeout=left()):
             if isinstance(o, dict) and o.get("type") == "clip":
                 clips.append(o)
         cdir = b / "clips"
@@ -2084,8 +2131,8 @@ class BundleCorrTail:
                     self._clip_sha[str(f)] = (key, sha)
                 clips.append({"type": "clip", "name": f.stem, "file": str(f), "sha256": sha,
                               "wall_ms": int(st.st_mtime * 1000)})
-        haptic_rows = [r for r in self.haptics.snapshot() if isinstance(r, dict)]
-        _presses, activity = self.inputs.view()
+        haptic_rows = [r for r in self.haptics.snapshot(timeout=left()) if isinstance(r, dict)]
+        _presses, activity = self.inputs.view(timeout=left())
         out = collect_delta_corroboration(clips=clips, haptic_records=haptic_rows, input_records=None)
         out.extend(activity)
         return out
@@ -2107,12 +2154,13 @@ def bundle_corr_tail(bundle) -> BundleCorrTail:
     return tail
 
 
-def load_delta_corroboration_from_bundle(bundle) -> list[dict]:
+def load_delta_corroboration_from_bundle(bundle, timeout: float | None = None) -> list[dict]:
     """Read clips (manifest/bundle.json) + haptics.jsonl + inputs.jsonl from a match bundle dir.
 
     Repeat calls tail the jsonl files. The result matches a full parse, including a partial last line.
+    ``timeout`` bounds every tail lock and the inputs view. None waits, which is the refresh path.
     """
-    return bundle_corr_tail(bundle).snapshot()
+    return bundle_corr_tail(bundle).snapshot(timeout=timeout)
 
 
 def http_post(base: str, body: dict) -> dict:

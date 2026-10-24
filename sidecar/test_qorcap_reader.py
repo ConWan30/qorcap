@@ -621,14 +621,15 @@ def test_reader_stalled_notice_and_resume():
     """
     from qorcap_reader import READER_STALL_MS, ReaderCore
 
+    assert READER_STALL_MS == 30_000
     posts = []
     core = ReaderCore(posts.append, None, None, None, _no_final)
     written = []
     core.health_write = written.append
     core.consider_stall(0)
-    core.consider_stall(READER_STALL_MS - 1)
+    core.consider_stall(29_900)
     assert written == []
-    core.consider_stall(READER_STALL_MS)
+    core.consider_stall(30_000)
     stalls = [row for row in written if row.get("kind") == "reader_stalled"]
     assert len(stalls) == 1
     assert stalls[0]["t_ms"] == READER_STALL_MS
@@ -700,3 +701,68 @@ def test_inputs_view_times_out_while_the_lock_is_held(tmp_path):
     finally:
         share._lock.release()
         th.join(2)
+
+
+def test_transient_stat_failure_keeps_presses(tmp_path, monkeypatch):
+    """A failed stat in the inputs pull must not clear OPTIONS presses or the offset.
+
+    Restoring the reset publishes an empty list and drops the tail back to byte 0.
+    """
+    import json
+    import os
+    import traceback
+
+    from qorcap_reader import OPTIONS_BIT, ReaderCore, note_options_from_inputs, shared_inputs
+
+    inputs = (tmp_path / "inputs.jsonl").resolve()
+    line = json.dumps({"type": "in", "b": OPTIONS_BIT, "t_ms": 1234}) + "\n"
+    inputs.write_text(line, encoding="utf-8")
+    core = ReaderCore(lambda body: None, None, None, None, _no_final)
+    note_options_from_inputs(core, inputs)
+    assert core._options_snapshot() == [1234]
+    share = shared_inputs(inputs)
+    off = share.tail.off
+    assert off == len(line.encode())
+    want = os.fspath(inputs)
+    seen = {"n": 0}
+    real = os.stat
+
+    def boom(path, *args, **kwargs):
+        # is_file and resolve also stat. Only the pull's stat is the transient failure.
+        if os.fspath(path) == want and any(frame.name == "_pull" for frame in traceback.extract_stack()):
+            seen["n"] += 1
+            raise OSError(2, "transient")
+        return real(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "stat", boom)
+    note_options_from_inputs(core, inputs)
+    assert seen["n"] == 1
+    assert core._options_snapshot() == [1234]
+    assert share.tail.off == off
+    assert share._published_presses == [1234]
+
+
+def test_long_pause_is_not_a_reader_stall():
+    """Paused frames are progress. A 45 s pause writes no reader_stalled row.
+
+    A quiet stretch that is not a pause still stalls; that is test_reader_stalled_notice_and_resume.
+    """
+    from qorcap_reader import ReaderCore
+
+    class Pause:
+        paused = True
+
+        def update(self, _t, _img):
+            return None
+
+    posts = []
+    core = ReaderCore(posts.append, None, None, Pause(), _no_final)
+    written = []
+    core.health_write = written.append
+    for i in range(181):
+        t = i * 250
+        core.on_frame(t, None)
+        core.consider_stall(t)
+    assert [row for row in written if row.get("kind") == "reader_stalled"] == []
+    assert core.stats["paused"] == 181
+    assert posts == []
