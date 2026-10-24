@@ -608,3 +608,95 @@ def test_exit_flush_marks_only_a_span_that_is_still_open():
     core.flush_health()
     assert len(written) == 1
     assert written[0]["open_at_exit"] is True and written[0]["count"] == 2
+
+
+def _no_final(_timeline):
+    return NS(final=False)
+
+
+def test_reader_stalled_notice_and_resume():
+    """Quiet frames write one reader_stalled, then one reader_resumed. A timing line does not clear it.
+
+    Emptying consider_stall leaves ``written`` without the notice.
+    """
+    from qorcap_reader import READER_STALL_MS, ReaderCore
+
+    posts = []
+    core = ReaderCore(posts.append, None, None, None, _no_final)
+    written = []
+    core.health_write = written.append
+    core.consider_stall(0)
+    core.consider_stall(READER_STALL_MS - 1)
+    assert written == []
+    core.consider_stall(READER_STALL_MS)
+    stalls = [row for row in written if row.get("kind") == "reader_stalled"]
+    assert len(stalls) == 1
+    assert stalls[0]["t_ms"] == READER_STALL_MS
+    assert stalls[0]["last_row_age_s"] == READER_STALL_MS / 1000.0
+    assert "obs" not in stalls[0]
+    core.consider_stall(READER_STALL_MS + 10_000)
+    assert len([row for row in written if row.get("kind") == "reader_stalled"]) == 1
+    # The 30 s timing summary is not a row. Appending one must not resume the reader.
+    written.append({"kind": "timing", "t_ms": READER_STALL_MS + 10_000})
+    core.consider_stall(READER_STALL_MS + 15_000)
+    assert [row for row in written if row.get("kind") == "reader_resumed"] == []
+    core.note_progress(READER_STALL_MS + 20_000)
+    resumed = [row for row in written if row.get("kind") == "reader_resumed"]
+    assert len(resumed) == 1
+    assert resumed[0]["last_row_age_s"] == (READER_STALL_MS + 20_000) / 1000.0
+    assert posts == []
+    core.consider_stall(READER_STALL_MS + 20_000 + READER_STALL_MS)
+    assert len([row for row in written if row.get("kind") == "reader_stalled"]) == 2
+
+
+def test_open_scorebug_absent_is_not_a_stall():
+    """A span that is still growing has been written. That is not a silent reader."""
+    from qorcap_reader import READER_STALL_MS, ReaderCore
+
+    posts = []
+    core = ReaderCore(posts.append, None, None, None, _no_final)
+    written = []
+    core.health_write = written.append
+    core.consider_stall(0)
+    core._observe(0, None, True)
+    core._observe(READER_STALL_MS, None, True)
+    core.consider_stall(READER_STALL_MS)
+    assert [row for row in written if row.get("kind") == "reader_stalled"] == []
+    core.consider_stall(READER_STALL_MS + READER_STALL_MS)
+    stalls = [row for row in written if row.get("kind") == "reader_stalled"]
+    assert len(stalls) == 1
+    assert not any(p.get("obs") == "reader_stalled" or p.get("kind") == "reader_stalled" for p in posts)
+
+
+def test_inputs_view_times_out_while_the_lock_is_held(tmp_path):
+    """A refresh stuck in the inputs read must not block the other caller forever."""
+    import threading
+    import time
+
+    from qorcap_reader import InputsBusy, shared_inputs
+
+    path = tmp_path / "inputs.jsonl"
+    path.write_text('{"type":"in","b":0,"t_ms":1}\n', encoding="utf-8")
+    share = shared_inputs(path)
+    assert share._lock.acquire(timeout=1)
+    done = {}
+
+    def worker():
+        t0 = time.perf_counter()
+        try:
+            share.view(timeout=0.2)
+            done["err"] = None
+        except InputsBusy as exc:
+            done["err"] = exc
+        done["dt"] = time.perf_counter() - t0
+
+    th = threading.Thread(target=worker)
+    th.start()
+    try:
+        th.join(1.0)
+        assert not th.is_alive()
+        assert isinstance(done.get("err"), InputsBusy)
+        assert done["dt"] < 1.0
+    finally:
+        share._lock.release()
+        th.join(2)

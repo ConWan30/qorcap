@@ -76,6 +76,18 @@ HEALTH_CLEAR_FRAMES = 3
 # window, so a flap still writes about one row per 30 s. Whatever is still held
 # or open is written when the reader exits.
 HEALTH_WARN_MS = 30_000
+# Frames are still arriving, but no timeline row and no reader_lag / score_unagreed
+# row has been written for this long. One reader_stalled notice, then one
+# reader_resumed when a row is written again. A live reader once stayed silent for
+# minutes after the scorebug left while capture kept recording. 30 s is the health
+# window: one slow frame stays quiet, and that stall cannot. The 30 s timing
+# summary is not one of these rows. The notice does not confirm a final and it is
+# not a timeline observation.
+READER_STALL_MS = 30_000
+# The pre-sign final check waits this long for the shared inputs lock. A refresh
+# stuck inside the file read holds that lock; waiting forever blocks the receipt.
+# On timeout the check fails closed (no confirmed final, one notice row).
+INPUTS_LOCK_TIMEOUT_S = 2.0
 
 
 def _seconds_text(ms: float) -> str:
@@ -734,6 +746,10 @@ class JsonlTail:
         return reset, rows
 
 
+class InputsBusy(Exception):
+    """The shared inputs lock was not free within the timeout. Fail closed."""
+
+
 class InputsShare:
     """One incremental parse of an inputs.jsonl, shared by OPTIONS and corroboration.
 
@@ -754,9 +770,18 @@ class InputsShare:
         self._saw_extra = False
         self._fold_log = _new_fold_log()
 
-    def view(self) -> tuple[list[int], list[dict]]:
-        """Current presses and input-activity rows, including a valid partial last line."""
-        with self._lock:
+    def view(self, timeout: float | None = None) -> tuple[list[int], list[dict]]:
+        """Current presses and input-activity rows, including a valid partial last line.
+
+        ``timeout`` is how long to wait for this lock. None waits. The lock is held
+        across the file read, so a stuck refresh blocks every other caller. The
+        pre-sign check passes a timeout and does not read without the lock.
+        """
+        if timeout is None:
+            self._lock.acquire()
+        elif not self._lock.acquire(timeout=timeout):
+            raise InputsBusy("inputs lock busy")
+        try:
             reset, new, extra = self.tail.take()
             if reset:
                 self._presses = []
@@ -778,6 +803,8 @@ class InputsShare:
                     self._published_activity = self._activity + _fold_activity([extra], self._fold_log)
                 self._saw_extra = extra is not None
             return self._published_presses, self._published_activity
+        finally:
+            self._lock.release()
 
 
 _INPUTS: dict[str, InputsShare] = {}
@@ -799,18 +826,21 @@ def shared_inputs(path) -> InputsShare:
         return share
 
 
-def note_options_from_inputs(core, path) -> None:
+def note_options_from_inputs(core, path, timeout: float | None = None) -> None:
     """Read OPTIONS rising edges from an inputs.jsonl. Missing file is a no-op.
 
     Repeat calls fold only the bytes appended since the last call. The press list
     is replaced by that snapshot, so a truncated or rotated file does not keep stale presses.
-    The same parse feeds delta corroboration.
+    The same parse feeds delta corroboration. ``InputsBusy`` is not swallowed: the
+    pre-sign check has to fail closed when the lock times out. Other read errors stay quiet.
     """
     p = Path(path)
     if not p.is_file():
         return
     try:
-        presses, _activity = shared_inputs(p).view()
+        presses, _activity = shared_inputs(p).view(timeout=timeout)
+    except InputsBusy:
+        raise
     except Exception:
         return
     core.set_options(presses)
@@ -940,6 +970,10 @@ class ReaderCore:
         self.health_write = None
         # Closed spans waiting out the 30 s row window. Not yet in ``health``.
         self._health_pending: dict[str, dict] = {}
+        # Last timeline or health row. None until the first frame or the first row.
+        # reader_stalled / reader_resumed do not move this. The timing summary does not either.
+        self._last_progress_ms: int | None = None
+        self._stall_open = False
 
     def note_options(self, presses_ms) -> None:
         """Remember OPTIONS press times (wall ms). Repeating a time is a no-op."""
@@ -1105,6 +1139,56 @@ class ReaderCore:
             return
         self._post_agreed(t_ms, res.read, soft)
 
+    def note_progress(self, t_ms: int) -> None:
+        """A timeline row or a reader_lag / score_unagreed row was written.
+
+        A reader_stalled notice is not progress, and neither is the 30 s timing line.
+        While a stall notice is open, the next real row writes one reader_resumed.
+        """
+        t_ms = int(t_ms)
+        if self._stall_open:
+            base = t_ms if self._last_progress_ms is None else int(self._last_progress_ms)
+            self._stall_open = False
+            self._emit_stall("reader_resumed", t_ms, max(0, t_ms - base))
+        if self._last_progress_ms is None or t_ms >= self._last_progress_ms:
+            self._last_progress_ms = t_ms
+
+    def consider_stall(self, t_ms: int) -> None:
+        """Frames are still arriving. One notice if no row has been written for 30 s.
+
+        The first call only remembers ``t_ms``. A later call at least READER_STALL_MS
+        after the last row writes one reader_stalled. Further quiet frames do not
+        write another until a row resumes the reader. This does not confirm a final
+        and it does not post a timeline observation.
+        """
+        t_ms = int(t_ms)
+        if self._last_progress_ms is None:
+            self._last_progress_ms = t_ms
+            return
+        if self._stall_open:
+            return
+        age = t_ms - self._last_progress_ms
+        if age < READER_STALL_MS:
+            return
+        self._stall_open = True
+        self._emit_stall("reader_stalled", t_ms, age)
+
+    def _emit_stall(self, kind: str, t_ms: int, age_ms: int) -> None:
+        """One watchdog row. Does not count as progress and is not a timeline obs."""
+        row = {
+            "kind": kind,
+            "t_ms": int(t_ms),
+            "last_row_age_s": round(max(0, int(age_ms)) / 1000.0, 3),
+        }
+        self.health.append(row)
+        write = self.health_write
+        if write is None:
+            return
+        try:
+            write(row)
+        except Exception as e:
+            print(f"reader health write failed: {type(e).__name__}: {e}", file=sys.stderr)
+
     def _agree_gap_ms(self) -> float:
         """The same gap AgreementWindow uses. Never wider than that window's own config."""
         cfg = getattr(self.agree, "config", None)
@@ -1257,12 +1341,12 @@ class ReaderCore:
             return
         self.health.append(row)
         write = self.health_write
-        if write is None:
-            return
-        try:
-            write(row)
-        except Exception as e:
-            print(f"reader health write failed: {type(e).__name__}: {e}", file=sys.stderr)
+        if write is not None:
+            try:
+                write(row)
+            except Exception as e:
+                print(f"reader health write failed: {type(e).__name__}: {e}", file=sys.stderr)
+        self.note_progress(int(row.get("until_ms") or row.get("t_ms") or 0))
 
     def health_observations(self) -> list[dict]:
         """Written rows, a span held for the 30 s window, and a span still open. Never a score."""
@@ -1341,6 +1425,7 @@ class ReaderCore:
             # flag stays on the in-memory row. The posted score event does not carry it.
             row = dict(rd, touchdown_hold=True) if touchdown_hold else rd
             self.timeline.append(row)
+            self.note_progress(t_ms)
             self.post(jcs_safe({"type": "score", **rd}))
             q = rd.get("quarter")
             if isinstance(q, int) and not isinstance(q, bool) and q >= 1:
@@ -1374,6 +1459,7 @@ class ReaderCore:
                 cur = {"t_ms": start, "until_ms": t_ms, "obs": name, "n": 0}
                 self.timeline.append(cur)
             cur["until_ms"], cur["n"] = t_ms, cur["n"] + 1
+            self.note_progress(t_ms)
             return cur
         self._absent = span(self._absent, "scorebug_absent", absent)
         if screen is None:
@@ -1400,6 +1486,7 @@ class ReaderCore:
             if n < FINAL_SCREEN_MIN_FRAMES or dur < FINAL_SCREEN_MIN_SPAN_MS:
                 self.timeline = [x for x in self.timeline if x is not s]
                 return
+        self.note_progress(int(s.get("until_ms") or s.get("t_ms") or 0))
         self.post(jcs_safe({"type": "obs", **s}))
 
     def _close_spans(self) -> None:
@@ -1598,6 +1685,7 @@ class ReaderCore:
         tag = "CONFIRMED" if confirmed else "UNCONFIRMED"
         print(f"FINAL (end-of-game menu, {st['frames']} frames, {tag}): away {st['away']} - home {st['home']}"
               + (f"  [{notes[0]}]" if notes else ""), file=sys.stderr)
+        self.note_progress(int(self.final.get("t_ms") or t_ms))
         self.post(jcs_safe(self.final))
 
     def _scorebug_between_menus(self, later_t) -> bool:
@@ -1688,6 +1776,7 @@ class ReaderCore:
                           "quarter": fin.quarter, "t_ms": fin.t_ms}
             print(f"FINAL ({fin.basis}): away {fin.away} - home {fin.home}"
                   + ("  (scorebug; waiting for the end-of-game menu to confirm)" if self.end_menu_reader else ""), file=sys.stderr)
+            self.note_progress(int(self.final.get("t_ms") or t_ms))
             self.post(jcs_safe(self.final))
 
 

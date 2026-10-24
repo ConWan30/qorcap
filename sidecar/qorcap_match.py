@@ -177,6 +177,10 @@ FRAME_PERIOD_S = 0.25  # the frame loop aims at 4 Hz, subtracting the work alrea
 # that window. A refresh with no new bytes is a short stat and read.
 REFRESH_PERIOD_S = 0.5
 READER_HEALTH_LOG_S = 30.0
+# The reader joins its refresh thread for 5 s and flushes health before that join.
+# This cap is longer, so a healthy exit flush lands before signing. A stuck reader
+# does not hold the receipt open.
+READER_JOIN_S = 6.0
 SHUTDOWN_TIMEOUT_S = 900  # input proof decodes the whole video once; never kill QorCap mid-bundle
 
 
@@ -212,6 +216,41 @@ def append_reader_health(path: Path, row: dict) -> None:
     """Append one diagnostics line beside the bundle. Not a receipt field."""
     with open(path, "a", encoding="utf-8") as fh:
         fh.write(json.dumps(row, separators=(",", ":")) + "\n")
+
+
+def note_inputs_unavailable(bundle: Path, t_ms: int | None = None) -> None:
+    """The pre-sign inputs read timed out. A notice only; not a receipt field."""
+    row = {
+        "kind": "inputs_unavailable",
+        "t_ms": int(time.time() * 1000 if t_ms is None else t_ms),
+        "notice": "inputs read held the lock; final not confirmed",
+    }
+    try:
+        append_reader_health(bundle / "reader_health.jsonl", row)
+    except Exception as e:
+        print(f"reader health write failed: {type(e).__name__}: {e}", file=sys.stderr)
+
+
+def seal_reader(stop: threading.Event, state: dict, timeout: float = READER_JOIN_S) -> bool:
+    """Join the score reader before the receipt is signed.
+
+    The reader writes reader_health.jsonl on its own thread, including the exit
+    flush. Signing before this join lets a row land after the receipt. This does
+    not set health_sealed: the final check may still append an inputs_unavailable
+    notice. Call mark_health_sealed after that check and before sign_and_report.
+    The cap is longer than the refresh join inside the reader (5 s).
+    """
+    stop.set()
+    thread = state.get("reader_thread")
+    if thread is None:
+        return True
+    thread.join(timeout=timeout)
+    return not thread.is_alive()
+
+
+def mark_health_sealed(state: dict) -> None:
+    """Drop later reader_health rows. The receipt is about to be signed."""
+    state["health_sealed"] = True
 
 
 def open_reader_health(core) -> dict:
@@ -389,6 +428,10 @@ def start_reader(api: Api, stop: threading.Event, state: dict, bundle: Path | No
     health_path = (bundle / "reader_health.jsonl") if bundle is not None else None
 
     def _write_health(row):
+        # Set after the final check and before the receipt is signed. A reader that
+        # is still alive after the join cap must not append past that signature.
+        if state.get("health_sealed"):
+            return
         if health_path is None:
             return
         try:
@@ -467,6 +510,7 @@ def start_reader(api: Api, stop: threading.Event, state: dict, bundle: Path | No
                     if stop.wait(0.5):
                         return
                     continue
+                t_ms = int(time.time() * 1000)
                 h = hashlib.sha256(data).digest()
                 # A perfectly static screen (end-of-game menu) can produce byte-identical snapshots; still feed
                 # it about once a second so time-based spans (final_screen >= 3 s) can grow.
@@ -476,18 +520,23 @@ def start_reader(api: Api, stop: threading.Event, state: dict, bundle: Path | No
                     if img is not None:
                         try:
                             t_on = time.perf_counter()
-                            core.on_frame(int(time.time() * 1000), img)
+                            core.on_frame(t_ms, img)
                             ons.append((time.perf_counter() - t_on) * 1000.0)
                         except Exception as e:  # never let one bad frame kill the reader thread
                             state["reader_error"] = f"{type(e).__name__}: {e}"
                 now = time.monotonic()
                 if now - window_start >= READER_HEALTH_LOG_S:
-                    row = reader_timing_row(int(time.time() * 1000), periods, state.get("refresh_ms"), ons, fetches,
+                    # This timing line is not progress. consider_stall ignores it, so a
+                    # reader that writes nothing else cannot stay quiet by logging the clock.
+                    row = reader_timing_row(t_ms, periods, state.get("refresh_ms"), ons, fetches,
                                             open_reader_health(core))
                     print(format_reader_timing(row), file=sys.stderr)
                     _write_health(row)
                     periods, ons, fetches = [], [], []
                     window_start = now
+                # Frames arrived. One notice if no timeline or health row was written
+                # for READER_STALL_MS. A stalled read must not stay silent.
+                core.consider_stall(t_ms)
                 remain = FRAME_PERIOD_S - (time.perf_counter() - tick)
                 if remain > 0 and stop.wait(remain):
                     return
@@ -1338,6 +1387,10 @@ def main(argv=None) -> int:
             except Exception:
                 pass
     stop.set()
+    # The exit flush runs on the reader thread. Join it, with a cap, before signing
+    # so that row cannot land after the receipt. The health file stays open until
+    # mark_health_sealed, after the final check.
+    seal_reader(stop, state)
     ignore_ctrl_c()  # from here on, a Ctrl+C must not abort signing (it caused 'receipt failed' + Y/N prompt)
     say("\n\nStopping QorCap: sealing and countersigning the final checkpoints ...")
     sweep()
@@ -1385,6 +1438,7 @@ def main(argv=None) -> int:
     say("\nFinishing up: signing the receipt ...")
     draft_p = bundle / "receipt.draft.json"
     if not draft_p.exists():
+        mark_health_sealed(state)
         say(f"FAIL: QorCap did not write the bundle. See {bundle / 'qorcap.log'}")
         return 2
     draft = json.loads(draft_p.read_text(encoding="utf-8"))
@@ -1406,6 +1460,8 @@ def main(argv=None) -> int:
     if not a.test_pattern and a.audio != "none":
         report_recording_audio(bundle, a.ffmpeg or next((str(c) for c in [HERE.parent / ("ffmpeg.exe" if WIN else "ffmpeg")]
                                                          if c.exists()), None) or shutil.which("ffmpeg"))
+    # After the final check's notice, before the signature. A late health row is dropped.
+    mark_health_sealed(state)
     code = sign_and_report(bundle, draft, cs.signed, device, referee, match_id=match_id, role=a.role,
                            started_ms=started_ms, qt=qt, qorcap=qorcap, no_open=a.no_open)
     if live is not None:
@@ -2507,8 +2563,17 @@ def tail_final_check(bundle: Path, draft: dict, *, ffmpeg: str, secs: int = TAIL
     core.reanchor_note = lambda row, bundle=bundle: append_note(bundle, row)
     core.timeline = [dict(r) for r in live]
     try:
-        from qorcap_reader import note_options_from_inputs
-        note_options_from_inputs(core, bundle / "inputs.jsonl")
+        from qorcap_reader import INPUTS_LOCK_TIMEOUT_S, InputsBusy, note_options_from_inputs
+        note_options_from_inputs(core, bundle / "inputs.jsonl", timeout=INPUTS_LOCK_TIMEOUT_S)
+    except InputsBusy:
+        # The refresh thread is still inside the inputs read and holds the shared lock.
+        # Do not wait it out and do not confirm a final from a read that did not finish.
+        # The match still stops and seals: this returns the draft.
+        note_inputs_unavailable(bundle)
+        say("  inputs.jsonl was still being read; final stays NOT confirmed.")
+        result = dict(draft.get("result") or {})
+        result["final_confirmed"] = False
+        return dict(draft, result=result)
     except Exception:
         pass
     try:
