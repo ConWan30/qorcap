@@ -415,17 +415,22 @@ def test_labels_with_a_utf8_bom_are_read(tmp_path):
 
 
 def test_missing_qortime_refuses_before_the_video_is_hashed(tmp_path, monkeypatch):
-    monkeypatch.delenv("QORTIME", raising=False)
-    monkeypatch.setenv("QORCAP_HOME", str(tmp_path / "no-qortime"))
+    """A miss refuses before any video byte is hashed. CI's own qortime/ checkout must not count."""
+    import qorcap_match
+
     folder = _match(tmp_path, "555001")
     allow = tmp_path / "allow.json"
     _allow(allow, folder)
     labels = tmp_path / "labels.json"
     _labels(labels)
 
+    def gone(_arg, download=True):
+        raise SystemExit("QorTime code not found")
+
     def boom(*_a, **_k):
         raise AssertionError("hashed or decoded the video before QorTime was resolved")
 
+    monkeypatch.setattr(qorcap_match, "find_qortime", gone)
     monkeypatch.setattr(H, "_sha256", boom)
     monkeypatch.setattr(H, "iter_decoded", boom)
     try:
@@ -435,6 +440,31 @@ def test_missing_qortime_refuses_before_the_video_is_hashed(tmp_path, monkeypatc
     else:
         raise AssertionError("missing QorTime was harvested")
     assert not (tmp_path / "out").exists()
+
+
+def test_qortime_is_resolved_before_the_video_hash(tmp_path, monkeypatch):
+    folder = _match(tmp_path, "555001")
+    allow = tmp_path / "allow.json"
+    _allow(allow, folder)
+    labels = tmp_path / "labels.json"
+    _labels(labels)
+    order = []
+    real_resolve = H._resolve_qortime
+    real_sha = H._sha256
+
+    def resolve(arg):
+        order.append("qortime")
+        return real_resolve(arg)
+
+    def sha(path):
+        order.append("hash")
+        return real_sha(path)
+
+    monkeypatch.setattr(H, "_resolve_qortime", resolve)
+    monkeypatch.setattr(H, "_sha256", sha)
+    H.harvest(folder, tmp_path / "out", labels, allow, HELD, HASHES, dry_run=True, now=NOW)
+    assert order[0] == "qortime"
+    assert "hash" in order and order.index("qortime") < order.index("hash")
 
 
 def test_uppercase_allowlist_pin_matches(tmp_path):
