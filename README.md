@@ -2,7 +2,7 @@
 
 # QorCap
 
-**Website:** https://conwan30.github.io/qorcap/ · **Download:** [v0.3.36](https://github.com/ConWan30/qorcap/releases/tag/v0.3.36) ([latest release](https://github.com/ConWan30/qorcap/releases/latest))
+**Website:** https://conwan30.github.io/qorcap/ · **Download:** [v0.3.37](https://github.com/ConWan30/qorcap/releases/tag/v0.3.37) ([latest release](https://github.com/ConWan30/qorcap/releases/latest))
 
 A small Windows recorder for a USB HDMI capture card (built for a generic **"USB3.0 Video"** card carrying a PS5),
 made for **[QorTime](https://github.com/ConWan30/qortime)** match receipts. It does two jobs:
@@ -26,7 +26,7 @@ with a local control surface). QorCap copies only that design idea, no code. No 
 
 ## Quickstart: double-click Start Match
 
-1. Download `qorcap-v0.3.36-windows-x64.zip` from the [latest release](https://github.com/ConWan30/qorcap/releases/latest)
+1. Download `qorcap-v0.3.37-windows-x64.zip` from the [latest release](https://github.com/ConWan30/qorcap/releases/latest)
    and unzip it, for example to `C:\QorCap` (right-click the zip, *Extract All*).
 2. Connect PS5 HDMI out to the **USB3.0 Video** card, and the card to a blue USB 3 port. Close OBS or the Camera app.
 3. Double-click **`Start Match`**. On the first run it downloads ffmpeg, installs Python 3.12 through winget if it
@@ -386,7 +386,7 @@ Global: `--port 8788`, `--ffmpeg PATH`, `--log FILE` (default `qorcap.log`, or `
 ## Run on Windows by hand (PowerShell, advanced)
 
 ```powershell
-# 1. unzip qorcap-v0.3.36-windows-x64.zip to C:\QorCap, then:
+# 1. unzip qorcap-v0.3.37-windows-x64.zip to C:\QorCap, then:
 cd C:\QorCap
 Unblock-File .\qorcap.exe, .\get-ffmpeg.ps1
 powershell -ExecutionPolicy Bypass -File .\get-ffmpeg.ps1     # puts ffmpeg.exe next to qorcap.exe
@@ -444,6 +444,8 @@ python tools/assert_pytest_skips.py --list windows | xargs python -m pytest --co
 ```
 
 The floor has to be at least the number of listed entries. A report with zero testcases fails even when the floor is zero. Do not lower the floor to hide a dropped file.
+
+**v0.3.37:** the live challenge card reads each press from `/status` `input.recent_presses` (the newest 64 rising edges on the referee's press clock), so a tap shorter than the card's poll still counts. The card follows the referee rule: OPTIONS, then exactly the pattern as the next presses. An extra or wrong press, including a rolled d-pad, resets the count and the card says so. Counting stops once the pattern is complete. Every press gets a line on the card (`Got LEFT. Next: DOWN.` or `Extra RIGHT (d-pad roll): not counted. Redo OPTIONS + all at next snap.`). Before this, the card skipped stray presses and could show PASS for a sequence the referee rejects. Presentation only: referee verification is unchanged, and nothing new is written to the bundle ([#113](https://github.com/ConWan30/qorcap/pull/113)). `receipt.v0.json` is unchanged.
 
 **v0.3.36:** `qorcap align-ab DIR --rumble-echo` can be tuned without a new release: `--re-pair-tol-ms`, `--re-max-lag-ms`, `--re-quiet-ms`, `--re-onset-threshold`, `--re-spike-threshold`, `--re-spike-pct`, and `--re-mode hist|strongest`. `--re-hist` prints the rumble-to-spike lag histogram (33 ms bins, with a chance column), and `--re-sweep` prints a 36-row parameter grid. Both go to stderr and the report only. `rumble_echo.json` holds the selected parameters. Defaults, gates, and the chance check are the v0.3.35 behaviour ([#110](https://github.com/ConWan30/qorcap/pull/110)). `receipt.v0.json` is unchanged.
 
