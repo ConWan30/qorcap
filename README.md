@@ -2,7 +2,7 @@
 
 # QorCap
 
-**Website:** https://conwan30.github.io/qorcap/ · **Download:** [v0.3.35](https://github.com/ConWan30/qorcap/releases/tag/v0.3.35) ([latest release](https://github.com/ConWan30/qorcap/releases/latest))
+**Website:** https://conwan30.github.io/qorcap/ · **Download:** [v0.3.36](https://github.com/ConWan30/qorcap/releases/tag/v0.3.36) ([latest release](https://github.com/ConWan30/qorcap/releases/latest))
 
 A small Windows recorder for a USB HDMI capture card (built for a generic **"USB3.0 Video"** card carrying a PS5),
 made for **[QorTime](https://github.com/ConWan30/qortime)** match receipts. It does two jobs:
@@ -26,7 +26,7 @@ with a local control surface). QorCap copies only that design idea, no code. No 
 
 ## Quickstart: double-click Start Match
 
-1. Download `qorcap-v0.3.35-windows-x64.zip` from the [latest release](https://github.com/ConWan30/qorcap/releases/latest)
+1. Download `qorcap-v0.3.36-windows-x64.zip` from the [latest release](https://github.com/ConWan30/qorcap/releases/latest)
    and unzip it, for example to `C:\QorCap` (right-click the zip, *Extract All*).
 2. Connect PS5 HDMI out to the **USB3.0 Video** card, and the card to a blue USB 3 port. Close OBS or the Camera app.
 3. Double-click **`Start Match`**. On the first run it downloads ffmpeg, installs Python 3.12 through winget if it
@@ -386,7 +386,7 @@ Global: `--port 8788`, `--ffmpeg PATH`, `--log FILE` (default `qorcap.log`, or `
 ## Run on Windows by hand (PowerShell, advanced)
 
 ```powershell
-# 1. unzip qorcap-v0.3.35-windows-x64.zip to C:\QorCap, then:
+# 1. unzip qorcap-v0.3.36-windows-x64.zip to C:\QorCap, then:
 cd C:\QorCap
 Unblock-File .\qorcap.exe, .\get-ffmpeg.ps1
 powershell -ExecutionPolicy Bypass -File .\get-ffmpeg.ps1     # puts ffmpeg.exe next to qorcap.exe
@@ -444,6 +444,8 @@ python tools/assert_pytest_skips.py --list windows | xargs python -m pytest --co
 ```
 
 The floor has to be at least the number of listed entries. A report with zero testcases fails even when the floor is zero. Do not lower the floor to hide a dropped file.
+
+**v0.3.36:** `qorcap align-ab DIR --rumble-echo` can be tuned without a new release: `--re-pair-tol-ms`, `--re-max-lag-ms`, `--re-quiet-ms`, `--re-onset-threshold`, `--re-spike-threshold`, `--re-spike-pct`, and `--re-mode hist|strongest`. `--re-hist` prints the rumble-to-spike lag histogram (33 ms bins, with a chance column), and `--re-sweep` prints a 36-row parameter grid. Both go to stderr and the report only. `rumble_echo.json` holds the selected parameters. Defaults, gates, and the chance check are the v0.3.35 behaviour ([#110](https://github.com/ConWan30/qorcap/pull/110)). `receipt.v0.json` is unchanged.
 
 **v0.3.35:** `qorcap align-ab` on a bundle recorded with the opt-in frame clock (`--frame-clock`, default off) searches the measured clock's latency one-sided (0 to 1500 ms in one-frame steps), scores only presses that have a frame stamp, and reports one per-session `measured_alignment.latency` (median, IQR, anchors). It is `unscorable` with fewer than 3 anchors, an IQR above 100 ms, or calibration halves more than 100 ms apart. In the input proof the fit stays the default, and the measured score replaces it only when it is scorable and not higher, so the frame clock can lower the alignment and cannot raise it. Frame-clock frame indices restart per part file ([#107](https://github.com/ConWan30/qorcap/pull/107)). `qorcap align-ab DIR --rumble-echo` pairs game rumble seen by the pad IMU (`haptics.jsonl`) with sharp visual changes and writes an advisory `rumble_echo.json` sidecar (latency, IQR, pairs, agreement with the press offset; status ok, partial, or unscorable). Nothing is sent to the controller, and it is not in the receipt, the input proof, or the hash chain ([#108](https://github.com/ConWan30/qorcap/pull/108)). QorTime site links point at https://qortime.com ([#106](https://github.com/ConWan30/qorcap/pull/106)). `receipt.v0.json` is unchanged.
 
