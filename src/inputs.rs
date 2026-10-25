@@ -105,6 +105,17 @@ fn append_bytes(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     f.sync_all()
 }
 
+/// How many rising edges `/status` keeps for the challenge card. ~10 s of fast tapping.
+pub const RECENT_PRESSES: usize = 64;
+
+/// One rising edge for the live challenge card. `seq` counts every edge since the log opened.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct LivePress {
+    pub seq: u64,
+    pub t_ms: u64,
+    pub button: String,
+}
+
 /// Live controller state for /status and `input-test`.
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct Live {
@@ -117,6 +128,10 @@ pub struct Live {
     pub reports: u64,
     pub logged: u64,
     pub presses: u64,
+    /// Newest rising edges, oldest first, at most `RECENT_PRESSES` (since 0.3.37). Display only: the console
+    /// reads these so a tap shorter than its /status poll still shows. `t_ms` is the referee's press clock
+    /// (`wall_anchor_ms + t_us / 1000`, the same value `press_events` derives from inputs.jsonl).
+    pub recent_presses: Vec<LivePress>,
     pub buttons: Vec<String>,
     pub l2: u8,
     pub r2: u8,
@@ -125,6 +140,12 @@ pub struct Live {
     pub last_report_mono_ms: Option<u64>,
     /// IMU haptic detector state (since 0.3.1).
     pub haptic: HapticLive,
+}
+
+impl Live {
+    fn presses_seq_next(&self) -> u64 {
+        self.recent_presses.last().map(|p| p.seq + 1).unwrap_or(1)
+    }
 }
 
 pub struct InputLog {
@@ -170,7 +191,14 @@ impl InputLog {
             None => true,
             Some((t0, q)) => {
                 if q.buttons != p.buttons {
-                    self.live.presses += (p.buttons & !q.buttons).count_ones() as u64;
+                    let rise = p.buttons & !q.buttons;
+                    self.live.presses += rise.count_ones() as u64;
+                    let t_ms = self.wall_anchor_ms + t_us / 1000;
+                    for name in hid::names(rise) {
+                        self.live.recent_presses.push(LivePress { seq: self.live.presses_seq_next(), t_ms, button: name.to_string() });
+                    }
+                    let n = self.live.recent_presses.len();
+                    if n > RECENT_PRESSES { self.live.recent_presses.drain(..n - RECENT_PRESSES); }
                     true
                 } else {
                     let analog = (q.lx, q.ly, q.rx, q.ry, q.l2, q.r2) != (p.lx, p.ly, p.rx, p.ry, p.l2, p.r2);
@@ -410,6 +438,28 @@ pub fn verify_chunks(recs: &[Value], chunks: &[Value]) -> (std::collections::Has
 mod tests {
     use super::*;
     fn pad(b: u32, l2: u8) -> Pad { Pad { buttons: b, l2, ..Pad::neutral() } }
+    #[test]
+    fn recent_presses_keep_short_taps_for_the_console() {
+        let mut l = InputLog::new(None, true, 1_700_000_000_000);
+        l.on_report(1_000, &pad(0, 0));
+        // A 40 ms tap a 125 ms /status poll would miss, then a rolled d-pad (UP then UP+RIGHT).
+        l.on_report(100_000, &pad(hid::LEFT, 0));
+        l.on_report(140_000, &pad(0, 0));
+        l.on_report(300_000, &pad(hid::UP, 0));
+        l.on_report(333_000, &pad(hid::UP | hid::RIGHT, 0));
+        l.on_report(400_000, &pad(0, 0));
+        assert!(l.live.buttons.is_empty(), "nothing held at the end, so held-state polling sees no taps");
+        let got: Vec<(u64, u64, &str)> = l.live.recent_presses.iter().map(|p| (p.seq, p.t_ms, p.button.as_str())).collect();
+        assert_eq!(got, vec![(1, 1_700_000_000_100, "LEFT"), (2, 1_700_000_000_300, "UP"), (3, 1_700_000_000_333, "RIGHT")]);
+        assert_eq!(l.live.presses, 3);
+        for i in 0..(RECENT_PRESSES as u64 + 10) {
+            l.on_report(500_000 + i * 2_000, &pad(hid::CROSS, 0));
+            l.on_report(501_000 + i * 2_000, &pad(0, 0));
+        }
+        assert_eq!(l.live.recent_presses.len(), RECENT_PRESSES);
+        assert_eq!(l.live.recent_presses.last().unwrap().seq, 3 + RECENT_PRESSES as u64 + 10);
+    }
+
     #[test]
     fn seal_hashes_records_and_chains() {
         let dir = std::env::temp_dir().join(format!("qorcap-inputs-{}", std::process::id()));

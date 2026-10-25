@@ -245,12 +245,23 @@ def test_snapshot_maps_status_without_inventing_a_device_claim():
         qc.console_snapshot({"state": "waiting_for_device"}, {}, 0, None), width=78, height=18))
 
 
-def test_button_edges_do_not_reset_and_settle_is_honest():
+def test_button_edges_follow_the_referee_rule_and_settle_is_honest():
     def card():
         return qc.ChallengeCard("kickoff", "game start", ["OPTIONS", "CROSS", "CIRCLE"], 0, 5_000)
 
-    done = card()
+    # An extra press inside the pattern breaks the try for the referee, so the card resets too
+    # (it used to skip the stray press and show PASS while the referee said pattern_mismatch).
+    stray = card()
     for press in ("OPTIONS", "UP", "CROSS", "CIRCLE"):
+        qc.note_held(stray, [press], trusted=True)
+        qc.note_held(stray, [], trusted=True)
+    qc.settle(stray, 1_000, trusted=True, now_s=1.0)
+    assert stray.result is None and stray.matched == 0 and stray.wrong == "UP"
+    qc.settle(stray, 9_000, trusted=True, now_s=9.0)
+    assert stray.result == "fail"
+
+    done = card()
+    for press in ("OPTIONS", "CROSS", "CIRCLE"):
         qc.note_held(done, [press], trusted=True)
         qc.note_held(done, [], trusted=True)
     qc.settle(done, 1_000, trusted=True, now_s=1.0)
@@ -477,3 +488,90 @@ def test_plain_flag_parses_for_live_and_finalize():
     final = subprocess.run([sys.executable, str(HERE / "qorcap_match.py"), "finalize", "--plain", "--help"],
                            capture_output=True, text=True, check=False)
     assert final.returncode == 0, final.stderr
+
+
+def _referee_ok(pattern, presses):
+    """Copy of the shape of qor_receipt.challenge.response_start + verify_response's pattern check."""
+    for i, b in enumerate(presses):
+        if b == "OPTIONS" and presses[i:i + len(pattern)] == pattern:
+            return True
+    return False
+
+
+def test_card_pass_matches_the_referee_pattern_rule():
+    import random
+
+    rng = random.Random(20261025)
+    alphabet = ["CROSS", "CIRCLE", "SQUARE", "TRIANGLE", "UP", "DOWN", "LEFT", "RIGHT", "OPTIONS", "R2"]
+    for _ in range(4000):
+        body = [rng.choice(alphabet[:8]) for _ in range(4)]
+        pattern = ["OPTIONS"] + body
+        presses = [rng.choice(alphabet) for _ in range(rng.randint(0, 14))]
+        if rng.random() < 0.3:
+            k = rng.randint(0, len(presses))
+            presses[k:k] = pattern
+        c = qc.ChallengeCard("end", "4th quarter", pattern, 0, 90_000)
+        for n, b in enumerate(presses):
+            qc.note_press(c, b, 1_000 + n * 300)
+        assert (c.matched == len(pattern)) == _referee_ok(pattern, presses), (pattern, presses)
+
+
+# match-20261025-115533 (QorCap 0.3.34), rising edges from inputs.jsonl, ms after issue.
+_HALFTIME = [(835, "OPTIONS"), (3070, "UP"), (3103, "RIGHT"), (3515, "SQUARE"), (3842, "LEFT"),
+             (5121, "LEFT"), (5231, "SQUARE"), (8053, "LEFT"), (8341, "SQUARE"), (11203, "CIRCLE")]
+_KICKOFF = [(1420, "OPTIONS"), (2543, "TRIANGLE"), (3010, "UP"), (3542, "LEFT"), (4271, "SQUARE"),
+            (6595, "LEFT"), (6676, "UP"), (6731, "SQUARE"), (9662, "CIRCLE")]
+
+
+def _edges(rows, issued):
+    return [{"seq": i + 1, "t_ms": issued + t, "button": b} for i, (t, b) in enumerate(rows)]
+
+
+def test_recorded_halftime_shows_the_break_instead_of_pass():
+    issued = 1_792_947_832_685
+    c = qc.ChallengeCard("halftime", "second half", ["OPTIONS", "UP", "SQUARE", "LEFT", "SQUARE"], issued, issued + 90_000)
+    edges = _edges(_HALFTIME, issued)
+    # Delivered in two polls; the second repeats the ring and must not double count.
+    assert qc.note_edges(c, edges[:3], trusted=True)
+    assert c.wrong == "RIGHT" and c.rolled and c.matched == 0
+    line = qc.press_feedback(c)
+    assert line == ("Extra RIGHT (d-pad roll): not counted. Redo OPTIONS + all at next snap.", "red")
+    assert len(line[0]) <= 72, "fits a 78-column card without clipping"
+    qc.note_edges(c, edges, trusted=True)
+    assert c.matched == 0 and c.result is None
+    qc.settle(c, issued + 90_001, trusted=True, now_s=1.0)
+    assert c.result == "fail"
+    assert not _referee_ok(c.pattern, [b for _, b in _HALFTIME])
+
+
+def test_recorded_kickoff_locks_after_the_answer():
+    issued = 1_792_947_450_099
+    c = qc.ChallengeCard("kickoff", "game start", ["OPTIONS", "TRIANGLE", "UP", "LEFT", "SQUARE"], issued, issued + 90_000)
+    qc.note_edges(c, _edges(_KICKOFF, issued), trusted=True)
+    assert c.matched == 5
+    assert c.presses == ["OPTIONS", "TRIANGLE", "UP", "LEFT", "SQUARE"], "presses after the answer are not counted"
+    qc.settle(c, issued + 5_000, trusted=True, now_s=1.0)
+    assert c.result == "pass" and c.note.startswith("Got it.")
+
+
+def test_short_taps_between_polls_still_count_and_old_edges_are_ignored():
+    c = qc.ChallengeCard("end", "4th quarter", ["OPTIONS", "LEFT", "DOWN"], 10_000, 100_000)
+    # A press before issue and an edge-only button do not count; held list is empty at every poll.
+    qc.note_edges(c, [{"seq": 7, "t_ms": 9_000, "button": "OPTIONS"}], trusted=True)
+    qc.note_held(c, [], trusted=True)
+    assert c.matched == 0 and c.edges
+    qc.note_edges(c, [{"seq": 8, "t_ms": 11_000, "button": "OPTIONS"}, {"seq": 9, "t_ms": 11_050, "button": "MUTE"},
+                      {"seq": 10, "t_ms": 11_400, "button": "LEFT"}], trusted=True)
+    qc.note_held(c, ["LEFT"], trusted=True)  # the held path must not count LEFT a second time
+    assert c.matched == 2 and qc.press_feedback(c) == ("Got LEFT. Next: DOWN. Press each button once.", "ok")
+    qc.note_edges(c, [{"seq": 30, "t_ms": 12_000, "button": "DOWN"}], trusted=True)
+    assert c.unhealthy, "a seq gap means the ring overflowed between polls"
+    assert c.matched == 3
+
+
+def test_observe_buttons_prefers_recent_presses():
+    ui = qc.MatchConsole(force=True, out=io.StringIO(), columns=78, rows=24, clock=lambda: 100.0)
+    ui.show_challenge(phase="end", label="4th quarter", pattern=["OPTIONS", "DOWN"], issued_ms=0, deadline_ms=10**12)
+    ui.observe_buttons([], trusted=False, recent=[{"seq": 1, "t_ms": 5, "button": "OPTIONS"},
+                                                 {"seq": 2, "t_ms": 90, "button": "DOWN"}])
+    assert ui._card.matched == 2

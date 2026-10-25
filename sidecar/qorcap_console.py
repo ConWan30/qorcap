@@ -249,25 +249,127 @@ class ChallengeCard:
     settled_at: float | None = None
     unhealthy: bool = False
     saw_trusted: bool = False
+    # Per-press feedback (0.3.37). ``last`` is the newest press, ``wrong`` the button that broke the current try.
+    last: str = ""
+    last_ok: bool = False
+    wrong: str = ""
+    rolled: bool = False
+    tries_broken: int = 0
+    edge_seq: int | None = None
+    edges: bool = False
+    _last_t_ms: int | None = None
+    _last_dpad: str = ""
 
     def text(self) -> str:
         parts = [self.label, self.result or "pending", self.note, " ".join(self.pattern)]
         return " ".join(parts)
 
 
+# The buttons the referee reads from inputs.jsonl (qor_receipt.review.bundle.BUTTON_BITS). Edge-only names such
+# as MUTE or the back paddles are not presses to the referee, so they do not break a try on this card either.
+REFEREE_BUTTONS = frozenset({
+    "CROSS", "CIRCLE", "SQUARE", "TRIANGLE", "L1", "R1", "L2", "R2", "CREATE", "OPTIONS", "L3", "R3",
+    "UP", "DOWN", "LEFT", "RIGHT", "PS", "TOUCHPAD",
+})
+_DPAD = frozenset({"UP", "DOWN", "LEFT", "RIGHT"})
+# Two d-pad edges this close together are one rolled thumb, not two deliberate presses.
+_ROLL_MS = 60
+_PAUSE = "OPTIONS"
+
+
+def note_press(card: ChallengeCard, button: str, t_ms: int | None = None) -> None:
+    """One rising edge, judged the way the referee judges the window.
+
+    The referee answer is the first OPTIONS press followed by exactly the pattern as the very next presses
+    (``qor_receipt.challenge.response_start``). Any other press in between breaks that try. The pattern body
+    never contains OPTIONS, so a wrong press resets the count to 0, or to 1 when it is OPTIONS itself. Once the
+    pattern is complete the referee has its answer and later presses cannot change it, so the card stops
+    counting. This only mirrors the rule for display; nothing here is recorded or sent.
+    """
+    b = str(button).upper()
+    if card.result or b not in REFEREE_BUTTONS:
+        return
+    if t_ms is not None and not (int(card.issued_ms) <= int(t_ms) <= int(card.deadline_ms)):
+        return
+    if card.matched >= len(card.pattern) > 0:
+        return
+    rolled = (b in _DPAD and card._last_dpad and card._last_dpad != b and t_ms is not None
+              and card._last_t_ms is not None and int(t_ms) - card._last_t_ms <= _ROLL_MS)
+    card.presses.append(b)
+    card.last = b
+    if card.matched < len(card.pattern) and b == card.pattern[card.matched]:
+        card.matched += 1
+        card.last_ok = True
+        card.wrong = ""
+        card.rolled = False
+    else:
+        if card.matched > 0:
+            card.tries_broken += 1
+            card.wrong = b
+            card.rolled = bool(rolled)
+        card.last_ok = False
+        card.matched = 1 if (b == _PAUSE and card.pattern and card.pattern[0] == _PAUSE) else 0
+        if card.matched:
+            card.last_ok = True
+    card._last_t_ms = int(t_ms) if t_ms is not None else None
+    card._last_dpad = b if b in _DPAD else ""
+
+
 def note_held(card: ChallengeCard, held: list[str], *, trusted: bool) -> None:
-    """Rising edges only. A button counts once per press, in the order this sample listed new holds."""
+    """Fallback for a QorCap without ``recent_presses``: rising edges of the held set at each poll.
+
+    A tap shorter than the poll can fall between two samples and never show. ``note_edges`` does not have
+    that gap; this path stays for older binaries and marks the card ``unhealthy`` the same way as before.
+    """
     if card.result:
         return
     prev = set(card.prev)
     fresh = [b for b in held if b not in prev]
     card.prev = list(held)
-    for b in fresh:
-        card.presses.append(b)
-        if card.matched < len(card.pattern) and b == card.pattern[card.matched]:
-            card.matched += 1
+    if not card.edges:
+        for b in fresh:
+            note_press(card, b)
     if trusted:
         card.saw_trusted = True
+
+
+def note_edges(card: ChallengeCard, recent: list, *, trusted: bool) -> bool:
+    """Rising edges from ``/status`` ``input.recent_presses`` (QorCap 0.3.37+). Returns False when absent.
+
+    Each edge has a ``seq``; only edges newer than the last one seen are applied, so a tap is counted once
+    whatever the poll rate. A gap in ``seq`` (more edges than the ring holds between two polls) marks the
+    card unhealthy, the same honest fallback as a slow poll on the held path.
+    """
+    if not isinstance(recent, list):
+        return False
+    card.edges = True
+    if card.result:
+        return True
+    rows = []
+    for e in recent:
+        if not isinstance(e, dict):
+            continue
+        seq, t_ms, button = e.get("seq"), e.get("t_ms"), e.get("button")
+        if isinstance(seq, bool) or not isinstance(seq, int) or not isinstance(button, str):
+            continue
+        if isinstance(t_ms, bool) or not isinstance(t_ms, int):
+            t_ms = None
+        rows.append((seq, t_ms, button))
+    rows.sort(key=lambda r: r[0])
+    if card.edge_seq is not None and rows and rows[0][0] > card.edge_seq + 1:
+        card.unhealthy = True
+    for seq, t_ms, button in rows:
+        if card.edge_seq is not None and seq <= card.edge_seq:
+            continue
+        card.edge_seq = seq
+        if t_ms is None:
+            continue
+        note_press(card, button, t_ms)
+    if card.edge_seq is None:
+        card.edge_seq = 0
+    if trusted:
+        card.saw_trusted = True
+    return True
 
 
 def settle(card: ChallengeCard, now_ms: int, *, trusted: bool, now_s: float) -> None:
@@ -278,7 +380,7 @@ def settle(card: ChallengeCard, now_ms: int, *, trusted: bool, now_s: float) -> 
     open_window = now_ms < card.deadline_ms
     if complete:
         card.result = "pass"
-        card.note = "Buttons matched on this pad. Not a referee result."
+        card.note = "Got it. Buttons matched on this pad. Not a referee result."
         card.settled_at = now_s
         return
     if open_window:
@@ -694,6 +796,9 @@ def layout_challenge(card: ChallengeCard, *, width: int = 78, height: int = 36, 
         specs.append(("center", on * filled + off * (bar_w - filled), clock_color))
         left = f"{remain} seconds left    entered {card.matched} of {len(card.pattern)}"
         specs.append(("center", left, "red" if remain <= 10 else "mute"))
+        fb = press_feedback(card)
+        if fb:
+            specs.append(("center", _clip(fb[0], width - 6), fb[1]))
         specs.append(("center", "If the snap comes first, do it at the next play.", "dim"))
     else:
         specs.append(("center", "The referee reads the controller log and the pause.", "dim"))
@@ -733,6 +838,21 @@ def layout_challenge(card: ChallengeCard, *, width: int = 78, height: int = 36, 
         _center(grid, y, spec[1], spec[2], 2, width - 2)
         y += 1
     return grid
+
+
+def press_feedback(card: ChallengeCard) -> tuple[str, str] | None:
+    """One line for the newest press: it counted, or it broke the try and what to do next."""
+    if card.result is not None or not card.last:
+        return None
+    if card.wrong:
+        extra = f"Extra {card.wrong} (d-pad roll)" if card.rolled else f"Extra {card.wrong}"
+        if card.matched:
+            return (f"{extra}: not counted. New try started at OPTIONS.", "red")
+        return (f"{extra}: not counted. Redo OPTIONS + all at next snap.", "red")
+    if card.last_ok and card.matched:
+        nxt = card.pattern[card.matched] if card.matched < len(card.pattern) else ""
+        return (f"Got {card.last}. Next: {nxt}. Press each button once." if nxt else f"Got {card.last}.", "ok")
+    return None
 
 
 def _frame_color(card: ChallengeCard) -> str:
@@ -875,11 +995,13 @@ class MatchConsole:
         self._wake.set()
         return bool(self.branded)
 
-    def observe_buttons(self, held, *, trusted: bool = False) -> None:
+    def observe_buttons(self, held, *, trusted: bool = False, recent=None) -> None:
+        """``recent`` is ``/status`` ``input.recent_presses`` when this QorCap has it; otherwise held-state edges."""
         with self._lock:
             card = self._card
             if card is None or card.result:
                 return
+            note_edges(card, recent, trusted=trusted)
             note_held(card, [str(b) for b in held], trusted=trusted)
         self._wake.set()
 
@@ -1000,13 +1122,15 @@ class MatchConsole:
                 continue
             try:
                 st = self._status_getter()
-                held = ((st or {}).get("input") or {}).get("buttons") or []
-                self.observe_buttons(held, trusted=False)
+                inp = (st or {}).get("input") or {}
+                held = inp.get("buttons") or []
+                self.observe_buttons(held, trusted=False, recent=inp.get("recent_presses"))
                 self._sampler_ready = True
-                # A slow or stalled read can miss a tap. Count the whole poll, not just the gap before it.
+                # A slow or stalled read can miss a tap on the held path. The edge ring does not miss one;
+                # its own seq gap check covers an overflow.
                 if time.monotonic() - last_ok > 0.45:
                     with self._lock:
-                        if self._card is not None:
+                        if self._card is not None and not self._card.edges:
                             self._card.unhealthy = True
                 last_ok = time.monotonic()
             except Exception:
@@ -1060,7 +1184,7 @@ def sample_card(result: str | None = None, *, verified: bool = False, matched: i
         card.matched = len(pattern)
         card.presses = list(pattern)
         card.result = "pass"
-        card.note = "Buttons matched on this pad. Not a referee result."
+        card.note = "Got it. Buttons matched on this pad. Not a referee result."
     elif result == "fail":
         card.matched = 2
         card.presses = ["OPTIONS", "CROSS", "UP"]
