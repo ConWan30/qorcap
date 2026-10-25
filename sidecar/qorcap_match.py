@@ -1428,8 +1428,9 @@ def main(argv=None) -> int:
                 try:
                     from qorcap_console import console_snapshot
                     ui.update(console_snapshot(st, info, len(cs.signed), live))
-                    held = ((st.get("input") or {}).get("buttons")) or []
-                    ui.observe_buttons(held, trusted=False)
+                    inp = st.get("input") or {}
+                    held = inp.get("buttons") or []
+                    ui.observe_buttons(held, trusted=False, recent=inp.get("recent_presses"))
                 except Exception:
                     ui.disable()
                     sys.stdout.write("\r" + line.ljust(110))
