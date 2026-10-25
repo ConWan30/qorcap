@@ -54,7 +54,7 @@ def upload_names() -> tuple[str, ...]:
     """
     return META_FILES
 HERE = Path(__file__).resolve().parent
-CLIENT_VERSION = "0.3.34"
+CLIENT_VERSION = "0.3.35"
 SUBMIT_TYPE = "qortime-submit/v1"   # = QorTime contracts compat.json submit_auth.request_type
 POW_PREFIX = "qortime-pow/v1|"      # = compat.json submit_auth.pow_prefix
 # Same wire value as qorcap_match.REFEREE_KIND_OFFLINE. A receipt carrying it was signed on this PC
