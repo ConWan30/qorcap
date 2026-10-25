@@ -453,7 +453,7 @@ def submit(bundle: Path, *, base: str, full: bool = False, key_path: Path | None
         say(f"  Problems:  {', '.join(v['errors'][:6])}")
     say("  Not proven: " + "; ".join((final.get("review") or {}).get("not_proven") or []))
     say(f"  Saved:     {bundle / out_name}")
-    say("  Check it:  https://conwan30.github.io/qortime/verify/  (open receipt.official.json; no key needed)")
+    say("  Check it:  https://qortime.com/verify/  (open receipt.official.json; no key needed)")
     return {"VERIFIED": 0, "PARTIAL": 1, "SELF_ATTESTED": 1}.get(v["status"], 2)
 
 

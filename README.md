@@ -35,7 +35,7 @@ with a local control surface). QorCap copies only that design idea, no code. No 
 5. Recording stops by itself when the final score is read from Madden's **end-of-game menu** (authoritative; a scorebug-only final waits up to 120 s for that menu). After a committed end screen (3 frames over 3 seconds) or a posted end-menu / final-screen final, capture keeps going for `QORCAP_POST_FINAL_TAIL_S` seconds as well (default 10, clamped to 0–60). That tail only adds time: it does not shorten the 4 s end-menu hold or the 120 s scorebug wait. Set it to `0` for the older stop. Enter or Q still stops at once. What actually happened (why the tail started, start and stop time, actual seconds) is `post_final_tail.json` in the match folder. It is not part of the receipt. You can also press **Enter** (or Q, or Ctrl+C).
 6. It signs `receipt.json`, runs `qortime verify` and `qorcap verify-bundle`, prints **VERIFIED / PARTIAL / FAIL**,
    and opens the match folder (`Documents\QorCap Matches\match-YYYYMMDD-HHMMSS`).
-7. To view it online, open https://conwan30.github.io/qortime/verify/, click *Choose file* and pick `receipt.json`
+7. To view it online, open https://qortime.com/verify/, click *Choose file* and pick `receipt.json`
    (or paste its text), paste the contents of `referee.pub` into the key box, then click *Verify*. It runs in the browser and
    uploads nothing.
 
