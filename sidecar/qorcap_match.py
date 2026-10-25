@@ -2648,6 +2648,33 @@ def _disputed_final_result(draft: dict, live_final: dict, *, grammar_unresolved:
     return dict(draft, result=result)
 
 
+def _scorebug_returned_after_final(fin, rows) -> bool:
+    """True when live posted an unconfirmed end-menu final and a real scorebug row is later.
+
+    Later evidence must not upgrade that final. A row at the menu's end is not after it.
+    An observation, a row with no home score, and a flushed touchdown hold are not a return.
+    """
+    if not isinstance(fin, dict) or fin.get("final_confirmed") is True:
+        return False
+    if not is_end_menu_final(fin):
+        return False
+    menu = fin.get("end_menu") if isinstance(fin.get("end_menu"), dict) else {}
+    start = menu.get("until_ms")
+    if isinstance(start, bool) or not isinstance(start, int):
+        start = fin.get("t_ms")
+    if isinstance(start, bool) or not isinstance(start, int):
+        return False
+    for r in rows or []:
+        if not isinstance(r, dict) or "obs" in r or "home" not in r or r.get("touchdown_hold") is True:
+            continue
+        t = r.get("t_ms")
+        if isinstance(t, bool) or not isinstance(t, int):
+            continue
+        if t > start:
+            return True
+    return False
+
+
 def tail_final_check(bundle: Path, draft: dict, *, ffmpeg: str, secs: int = TAIL_SECS, hz: float = TAIL_HZ,
                      core_factory=None, frames=None, grammar_unresolved: bool = False,
                      live_final=None) -> dict:
@@ -2656,20 +2683,51 @@ def tail_final_check(bundle: Path, draft: dict, *, ffmpeg: str, secs: int = TAIL
     and final.tail.json. Checkpoints are untouched (the chain is sealed at stop); only the draft result changes.
 
     The live post-final tail (``post_final_tail_s``) only keeps the recorder running before this. It does not
-    change the result written here. ``hz`` stays ``TAIL_HZ``.
+    change the result written here. ``hz`` stays ``TAIL_HZ``. The look-back stays ``secs``
+    (``TAIL_SECS``, 240). It is not shortened.
 
-    A disputed live final is not re-read. The re-read stops at the first end-menu agreement, so a
-    later disagreeing menu is invisible and the first score would be posted again as an exact match.
+    The window is decoded before any end menu is considered (``list`` of the frame generator).
+    Reading past the first menu does not decode more video. It only runs the reader on frames
+    that were already decoded.
+
+    A disputed live final is not re-read. Every other tail is fed through the last frame, on one
+    ``ReaderCore``. The tail inherits live's quarter floor: the highest integer quarter on the
+    live rows, and only a quarter of 1 or higher. Bool, None, zero, negative, and anything else
+    are not a quarter. A read below that floor is dropped, the same as live. Without the floor a
+    trailing Q3 misread is kept, the first menu fails the Q4 gate, and a later showing can confirm.
+
+    The tail also inherits live's first end-screen time. Frames already decoded in this window
+    that fall at or before the last live row are not read again. An end-screen picture among
+    them is recorded with ``_note_end_screen_time``, the memory live keeps after a scorebug
+    return. Evidence from that screen through the scorebug does not confirm a later menu.
+    No extra video is decoded.
+
+    An unconfirmed live final stays unconfirmed when a scorebug read returned after it. Later
+    evidence must not upgrade that final. The tail does not confirm what live would not.
+
+    A later menu that disagrees keeps the first score, with ``final_confirmed``
+    false and ``end_menu_disputed`` true. The note is the one ``_note_end_menu_disagreement``
+    writes: a scorebug between the menus is named only when a real scorebug row lies strictly
+    between them. Stopping at the first agreement would sign that first score confirmed.
     """
     if end_menu_was_disputed(live_final):
         return _disputed_final_result(draft, live_final, grammar_unresolved=grammar_unresolved)
     live = [r for r in read_jsonl(bundle / "timeline.jsonl") if "obs" not in r and "home" in r]
     if not live:
         return draft
+    hold_unconfirmed = _scorebug_returned_after_final(live_final, live)
+
+    def unchanged(current):
+        if not hold_unconfirmed:
+            return current
+        result = dict(current.get("result") or {})
+        result["final_confirmed"] = False
+        return dict(current, result=result)
+
     vids = video_files(bundle)
     manifest = [m for m in read_jsonl(bundle / "manifest.jsonl") if m.get("type") == "segment"]
     if not vids or not manifest:
-        return draft
+        return unchanged(draft)
     end_ms = int(manifest[-1]["wall_ms"])
     say(f"Final not seen live; checking the last {secs // 60} minutes of the recording for the end-of-game screen ...")
     events: list[dict] = []
@@ -2677,6 +2735,16 @@ def tail_final_check(bundle: Path, draft: dict, *, ffmpeg: str, secs: int = TAIL
     from qorcap_reanchor_notes import append_note
     core.reanchor_note = lambda row, bundle=bundle: append_note(bundle, row)
     core.timeline = [dict(r) for r in live]
+    # Highest quarter live posted, and only a quarter of 1 or higher. Zero and negative
+    # are not a floor. Set the attribute directly: a hasattr guard would skip the seed
+    # on a rename and the tail would confirm a later showing.
+    floor = None
+    for r in live:
+        q = r.get("quarter") if isinstance(r, dict) else None
+        if isinstance(q, bool) or not isinstance(q, int) or q < 1:
+            continue
+        floor = q if floor is None else max(floor, q)
+    core._max_quarter = floor
     # One deadline for every lock on this path: the inputs view, and the manifest
     # and haptics tails inside the bundle snapshot. A refresh stuck in any of
     # those reads must not hang the receipt. Fail closed: unconfirmed final,
@@ -2724,16 +2792,22 @@ def tail_final_check(bundle: Path, draft: dict, *, ffmpeg: str, secs: int = TAIL
         frames = decode_frames_tail(ffmpeg, vids[-1], secs, hz)
     pts = list(frames)
     if not pts:
-        return draft
+        return unchanged(draft)
     span = pts[-1][0]
+    from qorcap_reader import prep
+    det = getattr(core, "final_screen_detector", None)
     for vms, img in pts:
         t = end_ms - span + vms
         if t <= last_t:
+            # Already decoded. Remember the end screen live saw. Do not read the score again.
+            if det is not None and det(prep(img)):
+                core._note_end_screen_time(t)
             continue
         core.on_frame(t, img)
-        if getattr(core, "end_menu", None) is not None:
-            break
     fin = core.final
+    if hold_unconfirmed and isinstance(fin, dict):
+        fin = dict(fin)
+        fin["final_confirmed"] = False
     out = {"final": fin, "end_menu": getattr(core, "end_menu", None), "end_menu_rejected": getattr(core, "end_menu_rejected", None),
            "frames": core.stats, "window_secs": secs, "video": vids[-1].name,
            "method": "tail: QorCap end-of-game menu score reader (authoritative) + QorTime detect_final over the recorded last minutes, seeded with the live timeline"}
@@ -2741,8 +2815,8 @@ def tail_final_check(bundle: Path, draft: dict, *, ffmpeg: str, secs: int = TAIL
     if not fin:
         say("  no end-of-game screen in the recording's last minutes; final stays NOT confirmed.")
         if grammar_unresolved and draft.get("result", {}).get("method") != "end_menu_read":
-            return dict(draft, result=apply_final(draft["result"], None, grammar_unresolved=True))
-        return draft
+            return unchanged(dict(draft, result=apply_final(draft["result"], None, grammar_unresolved=True)))
+        return unchanged(draft)
     still = bool(grammar_unresolved) or _grammar_unresolved(core)
     if is_end_menu_final(fin):
         say(f"  FINAL (end-of-game menu, from recorded frames): AWAY {fin['away']} - HOME {fin['home']}")
@@ -2764,7 +2838,11 @@ def tail_final_check(bundle: Path, draft: dict, *, ffmpeg: str, secs: int = TAIL
         say(f"  (final clip not saved: {e})")
     # The tail reader starts with a fresh grammar, so a live disagreement stays in force.
     # An end-menu final is kept inside apply_final. A scorebug final does not clear it.
-    return dict(draft, result=apply_final(draft["result"], fin, grammar_unresolved=still))
+    # A scorebug that returned after an unconfirmed live final blocks the upgrade.
+    result = apply_final(draft["result"], fin, grammar_unresolved=still)
+    if hold_unconfirmed:
+        result["final_confirmed"] = False
+    return dict(draft, result=result)
 
 
 def decode_frames_tail(ffmpeg: str, video: Path, secs: int, hz: float, size=(1280, 720)):
