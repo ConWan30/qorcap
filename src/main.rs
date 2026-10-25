@@ -394,9 +394,10 @@ fn main() {
             sidecar("psn-names", bundle, python, vec!["--samples".to_string(), samples.to_string()], &ff)
         }
         Cmd::InputTest { secs } => input_test(secs),
-        Cmd::AlignAb { dir, frames, no_video } => {
+        Cmd::AlignAb { dir, frames, no_video, rumble_echo } => {
             // Prints both clocks. Does not write the receipt, the proof, or the hash chain.
-            let report = qorcap::align::ab_report(std::path::Path::new(&dir), if no_video { None } else { Some(ff.as_str()) }, frames);
+            // --rumble-echo writes only the rumble_echo.json sidecar.
+            let report = qorcap::align::ab_report_with(std::path::Path::new(&dir), if no_video { None } else { Some(ff.as_str()) }, frames, rumble_echo);
             println!("{}", serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".into()));
             0
         }

@@ -68,6 +68,22 @@ In `input_proof.json` (flag on only), the fit is still the default. The measured
 
 Practice session match-20261025-101040 (13 min, before this change): fit residual 253 / 516 / 718 ms (n=392); arrivals vs fit 522 / 549 / 573 ms; arrival jitter 4 / 33 / 116 ms. `fit_alignment` 738 vs chance 345 permille (z 4.92, offset 767 ms, IQR 167, halves 500 / 600 ms). `measured_alignment` 655 vs chance 361 (z 3.68, offset 0 ms, IQR 600, halves -100 / -800 ms). The two halves landed 700 ms apart, one of them on a negative offset. With the arrivals about 0.5 s ahead of the fit line, the measured offset should sit near 767 - 522, about 250 ms. Re-run `qorcap align-ab` on that bundle to get the post-change numbers. The synthetic tests are not a measurement.
 
+## Rumble Echo (third clock, advisory)
+
+```text
+qorcap align-ab PATH/TO/BUNDLE --rumble-echo
+```
+
+Game rumble is sent by the console at about the time it renders the hit. QorCap already sees the pad shake through the IMU in the USB input reports it reads (`haptics.jsonl`, see docs/HAPTICS.md). Nothing is sent to the controller. Rumble Echo pairs high-confidence rumble onsets (after one quiet second) with sharp visual spikes 0 to 1500 ms later. The peak of the lag histogram is the capture latency, with no human in the loop. With `frame_clock.jsonl` present it uses the measured arrivals, and otherwise the manifest fit.
+
+It writes `rumble_echo.json` (schema `qorcap-rumble-echo/v0`): `n_onsets`, `n_paired`, `chance_paired` (onsets shifted 4.1 s), `latency_ms`, `iqr_ms`, `press_offset_ms`, `agree_with_press_offset`, and `status`:
+
+- `ok`: at least 3 pairs, an IQR of 100 ms or less, at least 30 % of onsets paired, at least twice the chance pairs, and within 100 ms of the press offset.
+- `partial`: scorable but more than 100 ms from the press offset. The press offset also includes the game's response to a button, so some gap is expected.
+- `unscorable`: anything else.
+
+It is not in the receipt, the input proof, or the hash chain, and it cannot raise or fail anything. The IMU detector's own delay (32 ms window, actuator rise) makes it read slightly short.
+
 ## What this machine cannot show
 
 No capture card, no DualSense, and no copy of match-20261020-171032 were available here. The 33 ms figure is not measured. Encode delay (the frame is stamped when its PES arrives, after `-bf 0` encode) and several frames sharing one read are inside the stamp. Those have not been measured on the MS2131.
