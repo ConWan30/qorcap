@@ -40,6 +40,16 @@ const RATIO: f32 = 5.0;         // onset: energy >= RATIO * (baseline + EPS)
 const EPS: f32 = 0.5;
 const SEARCH: i64 = 90;         // offset search +/- frames (3 s)
 const STEP: i64 = 3;
+/// Measured clock (frame_clock.jsonl): one-sided latency search, 0 ..= 45 frames (0 ..= 1500 ms), one-frame steps.
+/// A stamp is the *arrival* of a frame on this machine, so the picture of a press can only arrive at or after
+/// the press. Negative offsets on this clock land on screen changes that came *before* the press (a player
+/// reacting to a menu or a whistle), which is the peak the symmetric +/-3 s search locked onto in practice.
+pub const MEAS_MIN_FRAMES: i64 = 0;
+pub const MEAS_MAX_FRAMES: i64 = 45;
+/// A measured session latency is scorable only with at least this many matched anchors ...
+pub const MEAS_MIN_ANCHORS: usize = 3;
+/// ... and an interquartile spread of anchor latencies no wider than this (ms). Otherwise "unscorable".
+pub const MEAS_MAX_IQR_MS: i64 = 100;
 const MIN_GAP_US: u64 = 400_000;
 const CHANCE_MIN_US: u64 = 3_000_000;
 const CHANCE_SPAN_US: u64 = 5_000_000;
@@ -184,15 +194,19 @@ pub fn measured_locate(clocks: &[FileClock], stamps: &[FrameStamp], t_us: u64) -
     best.map(|(_, ci, fr)| (ci, fr))
 }
 
+#[allow(dead_code)] // the pre-0.x mixed lookup, kept for its test; scoring no longer mixes the two clocks
 fn locate_frame(clocks: &[FileClock], stamps: &[FrameStamp], t_us: u64) -> Option<(usize, i64)> {
     measured_locate(clocks, stamps, t_us).or_else(|| locate(clocks, t_us))
 }
 
 /// Score a set of event times at offset `off` frames: (tested, matched, lags of matches).
+/// With stamps, only presses that have a stamp within 500 ms are scored: mixing the measured clock with the
+/// manifest fit (which sits ~0.5 s away from it on a real card) inside one offset search smears the offset.
 fn score(tracks: &[Energy], clocks: &[FileClock], stamps: &[FrameStamp], ts: &[u64], off: i64, n: usize) -> (usize, usize, Vec<usize>) {
     let (mut t, mut m, mut lags) = (0, 0, vec![]);
     for &x in ts {
-        let Some((i, k)) = locate_frame(clocks, stamps, x) else { continue };
+        let loc = if stamps.is_empty() { locate(clocks, x) } else { measured_locate(clocks, stamps, x) };
+        let Some((i, k)) = loc else { continue };
         let Some(tr) = tracks.get(i) else { continue };
         if tr.e.is_empty() { continue; }
         if let Some(r) = press_response(&tr.e, k + off, n) { t += 1; if let Some(l) = r { m += 1; lags.push(l); } }
@@ -201,14 +215,16 @@ fn score(tracks: &[Energy], clocks: &[FileClock], stamps: &[FrameStamp], ts: &[u
 }
 
 /// Offset (frames) maximising the match rate of `ts`; ties -> smallest |offset|.
+/// Fit clock: +/-3 s in 3-frame steps (unchanged). Measured clock: 0 ..= 1500 ms in 1-frame steps.
 fn calibrate(tracks: &[Energy], clocks: &[FileClock], stamps: &[FrameStamp], ts: &[u64], n: usize) -> i64 {
-    let mut best = (f64::MIN, 0i64);
-    let mut o = -SEARCH;
-    while o <= SEARCH {
+    let (lo, hi, step) = if stamps.is_empty() { (-SEARCH, SEARCH, STEP) } else { (MEAS_MIN_FRAMES, MEAS_MAX_FRAMES, 1) };
+    let mut best = (f64::MIN, lo.max(0).min(hi));
+    let mut o = lo;
+    while o <= hi {
         let (t, m, _) = score(tracks, clocks, stamps, ts, o, n);
         let r = if t >= 3 { m as f64 / t as f64 } else { -1.0 };
         if r > best.0 + 1e-9 || ((r - best.0).abs() <= 1e-9 && o.abs() < best.1.abs()) { best = (r, o); }
-        o += STEP;
+        o += step;
     }
     best.1
 }
@@ -256,8 +272,66 @@ pub fn align_tracks_with(tracks: &[Energy], clocks: &[FileClock], presses: &[u64
            "clock_fitted": clocks.iter().all(|c| c.fitted)});
     // Absent unless a measured clock was supplied. Adding the key on the fit path would change
     // input_proof.json for every bundle recorded with the flag off.
-    if !stamps.is_empty() { out["clock_source"] = json!("frame_clock"); out["frame_clock_frames"] = json!(stamps.len()); }
+    if !stamps.is_empty() {
+        out["clock_source"] = json!("frame_clock");
+        out["frame_clock_frames"] = json!(stamps.len());
+        let mut lat = latency_block(&ms);
+        // The two held-out halves must agree on the latency. A half that locks onto another peak
+        // (a neighbouring press, a reaction before the press) is not one session latency.
+        let split = fms_i((oa - ob).abs());
+        lat["halves_apart_ms"] = json!(split);
+        if split > MEAS_MAX_IQR_MS && lat["status"] == "ok" {
+            lat["status"] = json!("unscorable");
+            lat["reason"] = json!(format!("calibration halves {} ms apart (> {MEAS_MAX_IQR_MS} ms)", split));
+        }
+        out["latency"] = lat;
+    }
     out
+}
+
+/// Per-session capture latency on the measured clock, from held-out matched press -> screen anchors
+/// (`ms` = calibration offset + response lag of each matched press, sorted). The median is the single
+/// session latency (game render -> HDMI -> card -> USB -> ffmpeg -> this read, plus the game's own
+/// response): picture time = frame_clock `t_mono_us` - `latency_ms`. Fewer than 3 anchors or an IQR
+/// above 100 ms marks it "unscorable". This block only ever describes the measured clock; it is not
+/// read by the receipt and cannot raise anything.
+pub fn latency_block(ms: &[i64]) -> Value {
+    let n = ms.len();
+    let median = if n == 0 { Value::Null } else { json!(ms[n / 2]) };
+    let iqr = if n >= 4 { Some(ms[n * 3 / 4] - ms[n / 4]) } else { None };
+    let scorable = n >= MEAS_MIN_ANCHORS && iqr.map(|q| q <= MEAS_MAX_IQR_MS).unwrap_or(false);
+    let why = if n < MEAS_MIN_ANCHORS { Some(format!("{n} anchors (< {MEAS_MIN_ANCHORS})")) }
+        else if iqr.is_none() { Some(format!("{n} anchors: too few for an IQR")) }
+        else if !scorable { Some(format!("anchor IQR {} ms > {MEAS_MAX_IQR_MS} ms", iqr.unwrap())) } else { None };
+    json!({
+        "latency_ms": median, "iqr_ms": iqr, "anchors": n,
+        "search_ms": [fms_i(MEAS_MIN_FRAMES), fms_i(MEAS_MAX_FRAMES)],
+        "status": if scorable { "ok" } else { "unscorable" }, "reason": why,
+        "sign": "positive = the picture of a press arrives this long after the press (same convention as offset_ms on the fit path)",
+    })
+}
+
+fn fms_i(f: i64) -> i64 { (f as f64 * 1000.0 / FPS).round() as i64 }
+
+/// Lower-only choice for the input proof when frame_clock.jsonl is present. The fit is the default.
+/// The measured score replaces it only when its latency is scorable AND its z is not above the fit's,
+/// so the opt-in clock can lower the reported alignment but never raise it.
+pub fn lower_only(fit: Value, measured: Value) -> Value {
+    let z = |v: &Value| v["z_x100"].as_i64().unwrap_or(i64::MIN);
+    let scorable = measured["latency"]["status"] == "ok";
+    let mut chosen = if scorable && z(&measured) <= z(&fit) { measured.clone() } else { fit.clone() };
+    let used = if chosen.get("clock_source").is_some() { "frame_clock" } else { "fit" };
+    chosen["clock_source"] = json!(used);
+    chosen["frame_clock"] = json!({
+        "used": used == "frame_clock",
+        "rule": "lower-only: measured replaces the fit only when its latency is scorable and its z is not higher",
+        "latency": measured["latency"],
+        "measured_match_permille": measured["match_permille"], "measured_chance_permille": measured["chance_permille"],
+        "measured_z_x100": measured["z_x100"], "measured_offset_ms": measured["offset_ms"],
+        "fit_match_permille": fit["match_permille"], "fit_chance_permille": fit["chance_permille"],
+        "fit_z_x100": fit["z_x100"], "fit_offset_ms": fit["offset_ms"],
+    });
+    chosen
 }
 
 /// Full alignment over a bundle directory. `ffmpeg = None` skips the video pass (reports why).
@@ -276,8 +350,15 @@ pub fn align_bundle(dir: &std::path::Path, recs: &[Value], manifest: &[Value], t
             }
         }
         if clocks.iter().any(|c| !c.fitted) { notes.push("video clock from init segment (too few segments to fit frames vs time)".into()); }
-        if !stamps.is_empty() { notes.push("frame times from frame_clock.jsonl where a stamp is within 500 ms of the press; manifest fit otherwise".into()); }
-        align_tracks_with(&tracks, &clocks, &presses, n, &stamps)
+        if stamps.is_empty() {
+            align_tracks(&tracks, &clocks, &presses, n)
+        } else {
+            notes.push("frame_clock.jsonl present: scored on the manifest fit and on measured frame arrivals (presses with a stamp within 500 ms, latency searched 0-1500 ms); the lower of the two is reported".into());
+            let fit = align_tracks(&tracks, &clocks, &presses, n);
+            let measured = align_tracks_with(&tracks, &clocks, &presses, n, &stamps);
+            if measured["latency"]["status"] != "ok" { notes.push(format!("frame clock latency unscorable: {}", measured["latency"]["reason"].as_str().unwrap_or("?"))); }
+            lower_only(fit, measured)
+        }
     } else {
         notes.push(if clocks.is_empty() { "no video segments in manifest".into() } else { "ffmpeg not available: video pass skipped".into() });
         align_tracks(&[], &[], &[], n)
@@ -339,10 +420,11 @@ pub fn clock_ab(manifest: &[Value], stamps: &[FrameStamp]) -> Value {
     });
     let mine: Vec<&FrameStamp> = stamps.iter().filter(|s| s.file == c.file).collect();
     if mine.is_empty() { return json!({"fit": fit, "measured": Value::Null}); }
-    let mut vs: Vec<i64> = mine.iter().map(|s| {
+    let mut signed: Vec<i64> = mine.iter().map(|s| {
         let fitted = c.start_ms + c.ms_per_frame * s.frame as f64;
-        (s.t_mono_us as f64 / 1000.0 - fitted).round().abs() as i64
+        (s.t_mono_us as f64 / 1000.0 - fitted).round() as i64
     }).collect();
+    let mut vs: Vec<i64> = signed.iter().map(|v| v.abs()).collect();
     let nominal_us = (1_000_000.0 / FPS).round() as i64;
     let mut gaps: Vec<i64> = mine.windows(2).map(|w| {
         ((w[1].t_mono_us as i64 - w[0].t_mono_us as i64) - nominal_us).abs() / 1000
@@ -354,6 +436,7 @@ pub fn clock_ab(manifest: &[Value], stamps: &[FrameStamp]) -> Value {
             "vs_fit_abs_p50_ms": pct(&mut vs, 50),
             "vs_fit_abs_p95_ms": pct(&mut vs, 95),
             "vs_fit_abs_max_ms": vs.iter().copied().max().unwrap_or(0),
+            "vs_fit_signed_p50_ms": pct(&mut signed, 50),
             "interval_abs_dev_p50_ms": pct(&mut gaps, 50),
             "interval_abs_dev_p95_ms": pct(&mut gaps, 95),
             "interval_abs_dev_max_ms": gaps.iter().copied().max().unwrap_or(0),
@@ -391,7 +474,7 @@ pub fn ab_report(dir: &std::path::Path, ffmpeg: Option<&str>, n: usize) -> Value
     } else {
         out["video"] = json!("skipped");
     }
-    out["how_to_read"] = json!("fit.resid_* is the fragment-close straight line (flag off). measured.vs_fit_* is how far real frame arrivals sit from that line. measured.interval_* is frame-to-frame jitter of the arrivals (one frame is 33 ms). fit_alignment / measured_alignment are the input-proof scores. This command does not write a receipt.");
+    out["how_to_read"] = json!("fit.resid_* is the fragment-close straight line (flag off). measured.vs_fit_* is how far real frame arrivals sit from that line. measured.interval_* is frame-to-frame jitter of the arrivals (one frame is 33 ms). measured.vs_fit_signed_p50_ms < 0 means arrivals sit before the fit line. fit_alignment / measured_alignment are the input-proof scores; measured_alignment.latency is the per-session capture latency on the measured clock (status unscorable if IQR > 100 ms or < 3 anchors). This command does not write a receipt.");
     out
 }
 
@@ -552,5 +635,126 @@ mod tests {
         let ok = clock_ab(&m, &stamps);
         assert!(ok["measured"]["vs_fit_abs_max_ms"].as_i64().unwrap() <= 2, "{ok:#}");
         assert_eq!(ok["measured"]["interval_abs_dev_max_ms"], 0);
+    }
+
+    /// Synthetic session for the measured clock. Frame `f` is rendered at `g(f)` ms on the QorCap clock;
+    /// `g` wanders +/-450 ms around the nominal line (what the manifest fit cannot follow). Every frame
+    /// arrives a constant `lat_ms` later with deterministic +/-4 ms jitter (frame_clock.jsonl). The picture
+    /// changes on the frame rendered at each press. `react` puts a screen change 800 ms *before* every press
+    /// (a player reacting to a menu): the peak a negative offset search can lock onto.
+    struct Session { tracks: Vec<Energy>, clocks: Vec<FileClock>, presses: Vec<u64>, stamps: Vec<FrameStamp> }
+    fn session(lat_ms: f64, n_press: usize, skip_every: usize, react: bool) -> Session {
+        let mpf = 1000.0 / FPS;
+        let len = 400 + n_press * 110 + 200;
+        let g = |f: f64| f * mpf + 450.0 * (2.0 * std::f64::consts::PI * f / 6000.0).sin();
+        let mut st = 0x2545_F491_4F6C_DD1Du64;
+        let mut jit = || { st ^= st << 13; st ^= st >> 7; st ^= st << 17; (st % 9) as f64 - 4.0 };
+        let stamps: Vec<FrameStamp> = (0..len as i64).map(|f| FrameStamp {
+            file: "video.mp4".into(), frame: f, t_mono_us: ((g(f as f64) + lat_ms + jit()) * 1000.0).round() as u64, pts_90k: f as u64 * 3000,
+        }).collect();
+        let (mut presses, mut spikes, mut pre) = (vec![], vec![], vec![]);
+        let mut f = 400usize;
+        for i in 0..n_press {
+            f += 70 + (i * 37) % 41; // 2.3 - 3.7 s apart, irregular like real play
+            presses.push((g(f as f64) * 1000.0).round() as u64);
+            if skip_every == 0 || i % skip_every != skip_every - 1 { spikes.push(f); }
+            if react { pre.push(f - 24); }
+        }
+        let mut e: Vec<f32> = (0..len).map(|i| 1.0 + 0.2 * ((i * 7 % 5) as f32)).collect();
+        for &s in spikes.iter().chain(&pre) { for j in 0..4 { if s + j < len { e[s + j] = 40.0; } } }
+        // the fit: least squares of g over the whole file (what fragment-close stamps average to)
+        let n = len as f64;
+        let (mx, my) = ((0..len).map(|f| f as f64).sum::<f64>() / n, (0..len).map(|f| g(f as f64) + lat_ms).sum::<f64>() / n);
+        let sxy: f64 = (0..len).map(|f| (f as f64 - mx) * (g(f as f64) + lat_ms - my)).sum();
+        let sxx: f64 = (0..len).map(|f| (f as f64 - mx).powi(2)).sum();
+        let slope = sxy / sxx;
+        let clocks = vec![FileClock { file: "video.mp4".into(), start_ms: my - slope * mx, ms_per_frame: slope, end_ms: 1e9, fitted: true }];
+        Session { tracks: vec![Energy { e }], clocks, presses, stamps }
+    }
+
+    #[test]
+    fn measured_clock_recovers_a_constant_520ms_latency_within_one_frame_and_beats_the_fit() {
+        let s = session(520.0, 120, 0, false);
+        let fit = align_tracks(&s.tracks, &s.clocks, &s.presses, 15);
+        let m = align_tracks_with(&s.tracks, &s.clocks, &s.presses, 15, &s.stamps);
+        let lat = &m["latency"];
+        let l = lat["latency_ms"].as_i64().unwrap();
+        assert!((l - 520).abs() <= 34, "latency {l}\n{m:#}");
+        assert!(lat["iqr_ms"].as_i64().unwrap() <= 34, "{m:#}");
+        assert_eq!(lat["status"], "ok", "{m:#}");
+        assert!(lat["anchors"].as_u64().unwrap() >= 100, "{m:#}");
+        assert_eq!(m["offset_ms"], lat["latency_ms"]);
+        let cal: Vec<i64> = m["calibration_offsets_ms"].as_array().unwrap().iter().map(|v| v.as_i64().unwrap()).collect();
+        assert!(cal.iter().all(|&c| (0..=1500).contains(&c)), "{cal:?}");
+        let (fm, mm) = (fit["match_permille"].as_i64().unwrap(), m["match_permille"].as_i64().unwrap());
+        assert!(mm >= 950, "measured {mm}\n{m:#}");
+        assert!(mm >= fm, "fit {fm} measured {mm}");
+        assert!(m["z_x100"].as_i64().unwrap() >= fit["z_x100"].as_i64().unwrap_or(i64::MIN));
+    }
+
+    /// The practice-session failure: a screen change 800 ms before every press, and a third of the presses
+    /// do not change the picture. The measured search is one-sided, so it cannot pick the -800 ms peak.
+    #[test]
+    fn measured_search_ignores_screen_changes_before_the_press() {
+        let s = session(520.0, 120, 3, true);
+        let m = align_tracks_with(&s.tracks, &s.clocks, &s.presses, 15, &s.stamps);
+        let cal: Vec<i64> = m["calibration_offsets_ms"].as_array().unwrap().iter().map(|v| v.as_i64().unwrap()).collect();
+        assert!(cal.iter().all(|&c| c >= 0), "{cal:?}\n{m:#}");
+        let l = m["latency"]["latency_ms"].as_i64().unwrap();
+        assert!((l - 520).abs() <= 34, "latency {l}\n{m:#}");
+        assert_eq!(m["latency"]["status"], "ok");
+        // the old symmetric search on the same stamps finds the reaction peak instead
+        let mut best = (f64::MIN, 0i64);
+        let mut o = -SEARCH;
+        while o <= SEARCH {
+            let (t, mt, _) = score(&s.tracks, &s.clocks, &s.stamps, &s.presses, o, 15);
+            let r = if t >= 3 { mt as f64 / t as f64 } else { -1.0 };
+            if r > best.0 + 1e-9 || ((r - best.0).abs() <= 1e-9 && o.abs() < best.1.abs()) { best = (r, o); }
+            o += STEP;
+        }
+        assert!(best.1 < 0, "symmetric search picked {} frames", best.1);
+    }
+
+    #[test]
+    fn latency_is_unscorable_with_a_wide_iqr_or_few_anchors() {
+        assert_eq!(latency_block(&[]) ["status"], "unscorable");
+        assert_eq!(latency_block(&[500, 520]) ["status"], "unscorable");
+        assert_eq!(latency_block(&[500, 510, 520, 530, 540])["status"], "ok");
+        let wide = latency_block(&[-700, -500, -100, 0, 100, 400, 500]);
+        assert_eq!(wide["status"], "unscorable");
+        assert!(wide["reason"].as_str().unwrap().contains("IQR"));
+    }
+
+    /// Half the presses never change the picture: that half calibrates onto a neighbouring press.
+    /// The halves disagree, so the latency is unscorable rather than a confident wrong number.
+    #[test]
+    fn halves_that_disagree_make_the_latency_unscorable() {
+        let s = session(520.0, 120, 2, true);
+        let m = align_tracks_with(&s.tracks, &s.clocks, &s.presses, 15, &s.stamps);
+        assert!(m["latency"]["halves_apart_ms"].as_i64().unwrap() > MEAS_MAX_IQR_MS, "{m:#}");
+        assert_eq!(m["latency"]["status"], "unscorable", "{m:#}");
+    }
+
+    #[test]
+    fn lower_only_never_raises_the_fit() {
+        let fit = json!({"match_permille": 600, "chance_permille": 350, "z_x100": 300, "offset_ms": 700});
+        let better = json!({"match_permille": 900, "chance_permille": 350, "z_x100": 800, "offset_ms": 520, "clock_source": "frame_clock", "latency": {"status": "ok"}});
+        let worse = json!({"match_permille": 500, "chance_permille": 350, "z_x100": 150, "offset_ms": 520, "clock_source": "frame_clock", "latency": {"status": "ok"}});
+        let unscorable = json!({"match_permille": 400, "chance_permille": 350, "z_x100": 50, "offset_ms": 0, "clock_source": "frame_clock", "latency": {"status": "unscorable"}});
+        let a = lower_only(fit.clone(), better);
+        assert_eq!(a["match_permille"], 600); assert_eq!(a["clock_source"], "fit");
+        let b = lower_only(fit.clone(), worse);
+        assert_eq!(b["match_permille"], 500); assert_eq!(b["clock_source"], "frame_clock");
+        let c = lower_only(fit.clone(), unscorable);
+        assert_eq!(c["match_permille"], 600); assert_eq!(c["frame_clock"]["latency"]["status"], "unscorable");
+    }
+
+    #[test]
+    fn signed_vs_fit_shows_arrivals_before_the_line() {
+        let mut m = vec![json!({"type":"segment","kind":"init","file":"video.mp4","mono_ms":0,"frames":0})];
+        for i in 1..20 { let fr = i * 60; m.push(json!({"type":"segment","kind":"media","file":"video.mp4","mono_ms": fr * 1000 / 30 + 522, "frames": fr})); }
+        let stamps: Vec<FrameStamp> = (0..10).map(|f| FrameStamp { file: "video.mp4".into(), frame: f, t_mono_us: (f as f64 * 1_000_000.0 / FPS).round() as u64, pts_90k: 0 }).collect();
+        let z = clock_ab(&m, &stamps);
+        assert!((z["measured"]["vs_fit_signed_p50_ms"].as_i64().unwrap() + 522).abs() <= 2, "{z:#}");
     }
 }

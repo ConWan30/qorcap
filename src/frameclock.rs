@@ -43,6 +43,7 @@ struct State {
     next_frame: i64,
     last_pts: Option<u64>,
     frames: u64,
+    file: Option<String>,
 }
 
 /// Writer. Disabled: every method is a no-op and no file is created.
@@ -73,7 +74,7 @@ impl FrameClock {
                 }
             })
         } else { None };
-        Self { enabled: enabled && out.is_some(), state: Mutex::new(State { out, next_frame: 0, last_pts: None, frames: 0 }) }
+        Self { enabled: enabled && out.is_some(), state: Mutex::new(State { out, next_frame: 0, last_pts: None, frames: 0, file: None }) }
     }
 
     pub fn enabled(&self) -> bool { self.enabled }
@@ -83,6 +84,8 @@ impl FrameClock {
         if !self.enabled { return; }
         let mut g = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if g.out.is_none() { return; }
+        // A device reopen continues in a new part file whose frame 0 is its own first frame.
+        if g.file.as_deref() != Some(file) { g.file = Some(file.to_string()); g.next_frame = 0; g.last_pts = None; }
         let mut lines = String::new();
         for pkt in data.chunks_exact(TS) {
             let Some(pts) = video_pes_pts(pkt) else { continue; };
@@ -174,6 +177,12 @@ pub fn load(path: &Path) -> Vec<FrameStamp> {
         let (Some(frame), Some(t), Some(file)) = (v["frame"].as_i64(), v["t_mono_us"].as_u64(), v["file"].as_str()) else { continue };
         out.push(FrameStamp { file: file.to_string(), frame, t_mono_us: t, pts_90k: v["pts_90k"].as_u64().unwrap_or(0) });
     }
+    // Older writers kept counting across part files. Frame 0 of each file is that file's first stamp.
+    let mut first: Vec<(String, i64)> = vec![];
+    for s in &out { if !first.iter().any(|(f, _)| *f == s.file) { first.push((s.file.clone(), s.frame)); } }
+    for s in &mut out { if let Some((_, f0)) = first.iter().find(|(f, _)| *f == s.file) { s.frame -= f0; } }
+    // Arrival order is time order; keep it sorted for the nearest-stamp search.
+    out.sort_by_key(|s| s.t_mono_us);
     out
 }
 
@@ -238,6 +247,23 @@ mod tests {
         assert_eq!(stamps[2].t_mono_us, 5_033_000);
         let text = std::fs::read_to_string(dir.join(FILE_NAME)).unwrap();
         assert!(text.lines().next().unwrap().contains(SCHEMA));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_new_part_file_starts_at_frame_zero_and_old_files_are_rebased() {
+        let dir = std::env::temp_dir().join(format!("qorcap-fc-part-{}-{}", std::process::id(), line!()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let fc = FrameClock::open(true, Some(&dir));
+        fc.observe(&video_ts_packet(0x100, 0), 1_000, "video.mp4");
+        fc.observe(&video_ts_packet(0x100, 3_000), 2_000, "video.mp4");
+        fc.observe(&video_ts_packet(0x100, 0), 9_000, "video-part2.mp4");
+        let st = load(&dir.join(FILE_NAME));
+        assert_eq!(st.iter().map(|s| (s.file.as_str(), s.frame)).collect::<Vec<_>>(), vec![("video.mp4", 0), ("video.mp4", 1), ("video-part2.mp4", 0)]);
+        // an older writer's continuing counter
+        std::fs::write(dir.join(FILE_NAME), "{\"type\":\"frame\",\"file\":\"a.mp4\",\"frame\":0,\"t_mono_us\":1}\n{\"type\":\"frame\",\"file\":\"b.mp4\",\"frame\":7,\"t_mono_us\":2}\n").unwrap();
+        assert_eq!(load(&dir.join(FILE_NAME))[1].frame, 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

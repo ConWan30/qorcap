@@ -105,10 +105,11 @@ def clock_ab(manifest: list[dict], stamps: list[dict]) -> dict:
     mine = [s for s in stamps if s.get("type") == "frame" and s.get("file") == c["file"]]
     if not mine:
         return {"fit": fit, "measured": None}
-    vs = []
+    signed = []
     for s in mine:
         fitted = c["start_ms"] + c["ms_per_frame"] * int(s["frame"])
-        vs.append(abs(int(round(s["t_mono_us"] / 1000.0 - fitted))))
+        signed.append(int(round(s["t_mono_us"] / 1000.0 - fitted)))
+    vs = [abs(v) for v in signed]
     nominal_us = int(round(1_000_000.0 / FPS))
     gaps = [abs((int(b["t_mono_us"]) - int(a["t_mono_us"])) - nominal_us) // 1000 for a, b in zip(mine, mine[1:])]
     return {
@@ -118,6 +119,7 @@ def clock_ab(manifest: list[dict], stamps: list[dict]) -> dict:
             "vs_fit_abs_p50_ms": pct(vs, 50),
             "vs_fit_abs_p95_ms": pct(vs, 95),
             "vs_fit_abs_max_ms": max(vs) if vs else 0,
+            "vs_fit_signed_p50_ms": pct(signed, 50),
             "interval_abs_dev_p50_ms": pct(gaps, 50),
             "interval_abs_dev_p95_ms": pct(gaps, 95),
             "interval_abs_dev_max_ms": max(gaps) if gaps else 0,
@@ -133,7 +135,8 @@ def report(bundle: Path) -> dict:
     out["frame_clock_frames"] = len(stamps)
     out["how_to_read"] = (
         "fit.resid_* is the fragment-close straight line (the clock used with the flag off). "
-        "measured.vs_fit_* is how far real frame arrivals sit from that line. "
+        "measured.vs_fit_* is how far real frame arrivals sit from that line "
+        "(vs_fit_signed_p50_ms < 0: arrivals sit before the line). "
         "measured.interval_* is frame-to-frame jitter of those arrivals (one frame is 33 ms). "
         "This tool does not write a receipt. For match_permille / chance / offset run `qorcap align-ab DIR`."
     )
