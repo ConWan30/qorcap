@@ -394,10 +394,25 @@ fn main() {
             sidecar("psn-names", bundle, python, vec!["--samples".to_string(), samples.to_string()], &ff)
         }
         Cmd::InputTest { secs } => input_test(secs),
-        Cmd::AlignAb { dir, frames, no_video, rumble_echo } => {
+        Cmd::AlignAb { dir, frames, no_video, rumble_echo, re_pair_tol_ms, re_max_lag_ms, re_quiet_ms, re_onset_threshold,
+                       re_spike_threshold, re_spike_pct, re_mode, re_sweep, re_hist } => {
             // Prints both clocks. Does not write the receipt, the proof, or the hash chain.
-            // --rumble-echo writes only the rumble_echo.json sidecar.
-            let report = qorcap::align::ab_report_with(std::path::Path::new(&dir), if no_video { None } else { Some(ff.as_str()) }, frames, rumble_echo);
+            // --rumble-echo writes only the rumble_echo.json sidecar (selected params; never the sweep).
+            let mode: qorcap::rumble_echo::Mode = match re_mode.parse() { Ok(m) => m, Err(e) => { eprintln!("error: --re-mode {e}"); std::process::exit(2); } };
+            let opts = qorcap::rumble_echo::Opts {
+                params: qorcap::rumble_echo::Params {
+                    pair_tol_ms: re_pair_tol_ms as f64, max_lag_ms: re_max_lag_ms as f64, quiet_ms: re_quiet_ms as u64,
+                    onset_min_conf: re_onset_threshold as u64, spike_ratio: re_spike_threshold, spike_pct: re_spike_pct, mode,
+                },
+                sweep: re_sweep, histogram: re_hist,
+            };
+            let re = if rumble_echo || re_sweep || re_hist { Some(&opts) } else { None };
+            let report = qorcap::align::ab_report_with(std::path::Path::new(&dir), if no_video { None } else { Some(ff.as_str()) }, frames, re);
+            if let Some(rows) = report["rumble_echo_histogram"].as_array() {
+                let rows: Vec<[i64; 3]> = rows.iter().filter_map(|r| Some([r[0].as_i64()?, r[1].as_i64()?, r[2].as_i64()?])).collect();
+                eprint!("{}", qorcap::rumble_echo::histogram_text(&rows));
+            }
+            if let Some(rows) = report["rumble_echo_sweep"].as_array() { eprint!("{}", qorcap::rumble_echo::sweep_text(rows)); }
             println!("{}", serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".into()));
             0
         }

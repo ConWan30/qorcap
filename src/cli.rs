@@ -130,6 +130,33 @@ pub enum Cmd {
         /// spikes; writes rumble_echo.json beside the bundle (advisory, not in the receipt)
         #[arg(long)]
         rumble_echo: bool,
+        /// Rumble Echo: pair tolerance around the lag peak (ms)
+        #[arg(long, default_value_t = 50)]
+        re_pair_tol_ms: u32,
+        /// Rumble Echo: longest rumble -> picture lag searched (ms)
+        #[arg(long, default_value_t = 1500)]
+        re_max_lag_ms: u32,
+        /// Rumble Echo: quiet time with no haptic event before an onset (ms)
+        #[arg(long, default_value_t = 1000)]
+        re_quiet_ms: u32,
+        /// Rumble Echo: minimum haptic confidence (0-1000) for an onset
+        #[arg(long, default_value_t = 500)]
+        re_onset_threshold: u32,
+        /// Rumble Echo: spike = 2-frame energy >= this x the local 10-frame median
+        #[arg(long, default_value_t = 4.0)]
+        re_spike_threshold: f32,
+        /// Rumble Echo: keep only spikes at or above this strength percentile (e.g. 95 keeps the top 5 %)
+        #[arg(long)]
+        re_spike_pct: Option<f64>,
+        /// Rumble Echo: hist (every spike in the window; histogram peak) or strongest (strongest spike per onset)
+        #[arg(long, default_value = "hist")]
+        re_mode: String,
+        /// Rumble Echo: also run a small parameter grid and print a table to stderr (diagnostic only)
+        #[arg(long)]
+        re_sweep: bool,
+        /// Rumble Echo: print the lag histogram (33 ms bins, every spike after every onset) to stderr
+        #[arg(long)]
+        re_hist: bool,
     },
     /// Cut one range of a match bundle on the match clock (`qorcap clip export`).
     /// Content Credentials are off unless `--content-credentials` or `QORCAP_CONTENT_CREDENTIALS` is set.
@@ -440,6 +467,22 @@ mod tests {
         if let Cmd::Record(r) = Cli::try_parse_from(["qorcap", "record", "--frame-clock"]).unwrap().cmd { assert!(r.frame_clock); } else { panic!() }
         assert!(matches!(Cli::try_parse_from(["qorcap", "align-ab", "b", "--no-video"]).unwrap().cmd, Cmd::AlignAb { no_video: true, frames: 15, rumble_echo: false, .. }));
         assert!(matches!(Cli::try_parse_from(["qorcap", "align-ab", "b", "--rumble-echo"]).unwrap().cmd, Cmd::AlignAb { rumble_echo: true, .. }));
+        match Cli::try_parse_from(["qorcap", "align-ab", "b", "--rumble-echo"]).unwrap().cmd {
+            Cmd::AlignAb { re_pair_tol_ms, re_max_lag_ms, re_quiet_ms, re_onset_threshold, re_spike_threshold, re_spike_pct, re_mode, re_sweep, re_hist, .. } => {
+                assert_eq!((re_pair_tol_ms, re_max_lag_ms, re_quiet_ms, re_onset_threshold), (50, 1500, 1000, 500));
+                assert_eq!((re_spike_threshold, re_spike_pct, re_mode.as_str(), re_sweep, re_hist), (4.0, None, "hist", false, false));
+            }
+            _ => panic!(),
+        }
+        match Cli::try_parse_from(["qorcap", "align-ab", "b", "--rumble-echo", "--re-pair-tol-ms", "100", "--re-max-lag-ms", "1200",
+            "--re-quiet-ms", "500", "--re-onset-threshold", "700", "--re-spike-threshold", "3.5", "--re-spike-pct", "95",
+            "--re-mode", "strongest", "--re-sweep", "--re-hist"]).unwrap().cmd {
+            Cmd::AlignAb { re_pair_tol_ms, re_max_lag_ms, re_quiet_ms, re_onset_threshold, re_spike_threshold, re_spike_pct, re_mode, re_sweep, re_hist, .. } => {
+                assert_eq!((re_pair_tol_ms, re_max_lag_ms, re_quiet_ms, re_onset_threshold), (100, 1200, 500, 700));
+                assert_eq!((re_spike_threshold, re_spike_pct, re_mode.as_str(), re_sweep, re_hist), (3.5, Some(95.0), "strongest", true, true));
+            }
+            _ => panic!(),
+        }
     }
     #[test]
     fn parses_highlights() {
