@@ -377,7 +377,7 @@ def make_highlights(bundle: Path, out: Path | None = None, pre: float = PRE_S, p
         "claims": CLAIMS,
         "how_to_check": [
             "sha256 each clip file and compare with clips[].sha256",
-            "sha256 receipt.json and compare with receipt.sha256; verify the receipt at https://conwan30.github.io/qortime/verify/",
+            "sha256 receipt.json and compare with receipt.sha256; verify the receipt at https://qortime.com/verify/",
             ("for each clip: lock.hash must appear in receipt.checkpoints when lock.in_receipt is true, and "
              "lock.frames_hash must equal sha256(JCS(lock.evidence))"),
             "source.segments[].sha256 must match manifest.jsonl, which `qorcap verify-bundle` checks against the video bytes",

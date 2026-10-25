@@ -49,7 +49,7 @@ from pathlib import Path
 
 QORTIME_PIN = "0204e6d8082f8c40ea1fe5e09bf16402aaee3ff2"
 QORTIME_ZIP = f"https://github.com/ConWan30/qortime/archive/{QORTIME_PIN}.zip"
-VERIFY_URL = "https://conwan30.github.io/qortime/verify/"
+VERIFY_URL = "https://qortime.com/verify/"
 REFEREE_KIND = "local-self-attested"
 REFEREE_KIND_OFFLINE = "local-self-attested-offline"
 CAPTURE_APPS = ("obs64.exe", "obs32.exe", "obs.exe")
