@@ -84,6 +84,30 @@ It writes `rumble_echo.json` (schema `qorcap-rumble-echo/v0`): `n_onsets`, `n_pa
 
 It is not in the receipt, the input proof, or the hash chain, and it cannot raise or fail anything. The IMU detector's own delay (32 ms window, actuator rise) makes it read slightly short.
 
+### Tuning Rumble Echo (v0.3.36)
+
+```text
+qorcap align-ab PATH/TO/BUNDLE --rumble-echo --re-hist --re-sweep
+```
+
+`--re-hist` prints the lag histogram to stderr. It counts every spike 0 to max_lag after every onset in 33 ms bins, next to the same count for onsets shifted 4.1 s (chance). A real latency shows up as one bin clearly above its neighbours and above the chance column.
+
+`--re-sweep` also prints one row per combination of pair tolerance 50/100/150 ms, quiet 500/1000 ms, and spike percentile 90/95/98, in both modes. Each row lists onsets, spikes, paired, chance, latency, IQR, and status. Sweep rows go to stderr and to `rumble_echo_sweep` in the JSON. They are never written to `rumble_echo.json`, which always holds the selected parameters.
+
+Selected parameters (defaults are the v0.3.35 behaviour):
+
+| flag | default | meaning |
+|---|---|---|
+| `--re-pair-tol-ms` | 50 | pair tolerance around the lag peak. 50 ms is 1.5 frames, and wider tolerances add chance pairs as fast as real ones. |
+| `--re-max-lag-ms` | 1500 | longest rumble-to-picture lag searched |
+| `--re-quiet-ms` | 1000 | time with no haptic event before an onset |
+| `--re-onset-threshold` | 500 | minimum haptic confidence (0-1000) |
+| `--re-spike-threshold` | 4.0 | spike when 2-frame energy is at least this multiple of the 10-frame median |
+| `--re-spike-pct` | off | keep only spikes at or above this strength percentile |
+| `--re-mode` | `hist` | `hist`: every spike in the window and the histogram peak across onsets. `strongest`: only the strongest spike per onset. |
+
+The gates do not change: at least 3 pairs, an IQR of 100 ms or less, at least 30 % of onsets paired, at least twice the chance pairs, and within 100 ms of the press offset for `ok`. A sweep is many tries on one match, so a single `ok` row among 36 is weak evidence. Look for a histogram peak and rows that agree.
+
 ## What this machine cannot show
 
 No capture card, no DualSense, and no copy of match-20261020-171032 were available here. The 33 ms figure is not measured. Encode delay (the frame is stamped when its PES arrives, after `-bf 0` encode) and several frames sharing one read are inside the stamp. Those have not been measured on the MS2131.

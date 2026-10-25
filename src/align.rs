@@ -447,12 +447,13 @@ pub fn clock_ab(manifest: &[Value], stamps: &[FrameStamp]) -> Value {
 /// Offline A/B for one bundle. With a video and ffmpeg, scores the input proof's alignment twice
 /// (manifest fit, then measured stamps) on one decode. Never writes the receipt or the proof.
 pub fn ab_report(dir: &std::path::Path, ffmpeg: Option<&str>, n: usize) -> Value {
-    ab_report_with(dir, ffmpeg, n, false)
+    ab_report_with(dir, ffmpeg, n, None)
 }
 
 /// [`ab_report`] plus, when `rumble_echo` is set and the video was decoded, Rumble Echo
 /// (`rumble_echo.rs`): its JSON goes in the report and in the `rumble_echo.json` sidecar only.
-pub fn ab_report_with(dir: &std::path::Path, ffmpeg: Option<&str>, n: usize, rumble_echo: bool) -> Value {
+/// The sweep (`rumble_echo_sweep`) and lag histogram (`rumble_echo_histogram`) go to the report only.
+pub fn ab_report_with(dir: &std::path::Path, ffmpeg: Option<&str>, n: usize, rumble_echo: Option<&crate::rumble_echo::Opts>) -> Value {
     let read = |name: &str| frameclock_read(dir, name);
     let manifest = read("manifest.jsonl");
     let inputs = read("inputs.jsonl");
@@ -476,19 +477,15 @@ pub fn ab_report_with(dir: &std::path::Path, ffmpeg: Option<&str>, n: usize, rum
             out["fit_alignment"] = align_tracks_with(&tracks, &clocks, &presses, n, &[]);
             out["measured_alignment"] = if stamps.is_empty() { Value::Null } else { align_tracks_with(&tracks, &clocks, &presses, n, &stamps) };
             out["video"] = json!("decoded");
-            if rumble_echo {
+            if let Some(re) = rumble_echo {
                 let hap = crate::rumble_echo::load_haptics(dir);
                 let press = crate::rumble_echo::press_offset(&out, !stamps.is_empty());
-                let v = crate::rumble_echo::echo(&tracks, &clocks, &stamps, &hap, press);
-                out["rumble_echo_file"] = match crate::rumble_echo::write(dir, &v) {
-                    Ok(()) => json!(crate::rumble_echo::FILE_NAME), Err(e) => json!(format!("not written: {e}")),
-                };
-                out["rumble_echo"] = v;
+                crate::rumble_echo::run(dir, &tracks, &clocks, &stamps, &hap, press, re, &mut out);
             }
         }
     } else {
         out["video"] = json!("skipped");
-        if rumble_echo { out["rumble_echo"] = json!("skipped: needs the video decode (drop --no-video)"); }
+        if rumble_echo.is_some() { out["rumble_echo"] = json!("skipped: needs the video decode (drop --no-video)"); }
     }
     out["how_to_read"] = json!("fit.resid_* is the fragment-close straight line (flag off). measured.vs_fit_* is how far real frame arrivals sit from that line. measured.interval_* is frame-to-frame jitter of the arrivals (one frame is 33 ms). measured.vs_fit_signed_p50_ms < 0 means arrivals sit before the fit line. fit_alignment / measured_alignment are the input-proof scores; measured_alignment.latency is the per-session capture latency on the measured clock (status unscorable if IQR > 100 ms or < 3 anchors). This command does not write a receipt.");
     out
