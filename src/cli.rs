@@ -126,6 +126,10 @@ pub enum Cmd {
         /// Clock residuals only (no video decode)
         #[arg(long)]
         no_video: bool,
+        /// Also estimate capture latency from game rumble seen by the pad IMU (haptics.jsonl) vs visual
+        /// spikes; writes rumble_echo.json beside the bundle (advisory, not in the receipt)
+        #[arg(long)]
+        rumble_echo: bool,
     },
     /// Cut one range of a match bundle on the match clock (`qorcap clip export`).
     /// Content Credentials are off unless `--content-credentials` or `QORCAP_CONTENT_CREDENTIALS` is set.
@@ -434,7 +438,8 @@ mod tests {
         assert!(matches!(Cli::try_parse_from(["qorcap", "input-proof", "b", "--frames", "10"]).unwrap().cmd, Cmd::InputProof { frames: 10, .. }));
         if let Cmd::Record(r) = Cli::try_parse_from(["qorcap", "record", "--no-controller"]).unwrap().cmd { assert!(r.no_controller); assert!(!r.frame_clock); } else { panic!() }
         if let Cmd::Record(r) = Cli::try_parse_from(["qorcap", "record", "--frame-clock"]).unwrap().cmd { assert!(r.frame_clock); } else { panic!() }
-        assert!(matches!(Cli::try_parse_from(["qorcap", "align-ab", "b", "--no-video"]).unwrap().cmd, Cmd::AlignAb { no_video: true, frames: 15, .. }));
+        assert!(matches!(Cli::try_parse_from(["qorcap", "align-ab", "b", "--no-video"]).unwrap().cmd, Cmd::AlignAb { no_video: true, frames: 15, rumble_echo: false, .. }));
+        assert!(matches!(Cli::try_parse_from(["qorcap", "align-ab", "b", "--rumble-echo"]).unwrap().cmd, Cmd::AlignAb { rumble_echo: true, .. }));
     }
     #[test]
     fn parses_highlights() {
