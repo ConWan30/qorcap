@@ -594,6 +594,15 @@ device's alternative name, then video-only.
   `hid-playstation.c` and are not yet checked on a real DualSense / Edge, and thresholds are hand-set.
 - No PR to qortime yet for ingesting bundles.
 
+## Creator & contact
+
+Built by **Contravious Battle**, solo founder, QorTime.
+
+- Email: [kamazi.shotta@icloud.com](mailto:kamazi.shotta@icloud.com) (personal) · [qoresence@mail.grokbot.com](mailto:qoresence@mail.grokbot.com) (project inbox)
+- LinkedIn: [linkedin.com/in/contravious-battle-b8a25a445](https://www.linkedin.com/in/contravious-battle-b8a25a445)
+- X: [@ConWanZo](https://x.com/ConWanZo) (personal) · [@QorTimeHQ](https://x.com/QorTimeHQ) (project)
+- GitHub: [ConWan30](https://github.com/ConWan30)
+
 ## Build
 ```
 cargo test
