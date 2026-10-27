@@ -1,7 +1,10 @@
 # Meta AI Developer Hackathon: this repo vs QorTime
 
-QorCap is the **Windows capture client** for [QorTime](https://github.com/ConWan30/qortime). It is entered only as
-supporting infrastructure for the **Startup** track submission whose product surface is QorTime.
+> **The hackathon submission repo is [`ConWan30/qortime-ai`](https://github.com/ConWan30/qortime-ai)** (event work only).
+> **This repo is pre-existing context and is not the submission.**
+
+QorCap is the **Windows capture client** for [QorTime](https://github.com/ConWan30/qortime). It is pre-existing
+supporting infrastructure for the QorTime entry on the **Indie Developer** track (solo build).
 
 ## Pre-existing (before Mon Oct 26 2026, 12:00 PM CT)
 This entire repository is **pre-existing capture tooling** built before the hackathon kickoff. It records HDMI
