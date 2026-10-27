@@ -21,5 +21,6 @@ do not add Meta model calls.
 |---|---|
 | [#116](https://github.com/ConWan30/qorcap/pull/116) | Fix end-menu `home_glyph_count` on clipped logo fringe (online FINISH GAME) |
 | [#117](https://github.com/ConWan30/qorcap/pull/117) | v0.3.38: end-menu clipped logo fringe release |
+| [#118](https://github.com/ConWan30/qorcap/pull/118) | This file, README link, and re-vendored `contracts/compat.json` from qortime main (motion rule v4 contract drift); no recorder code change |
 
 No Meta-model work was built in this repository during the hackathon window.
