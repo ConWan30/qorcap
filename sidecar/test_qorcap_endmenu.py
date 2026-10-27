@@ -470,3 +470,55 @@ def test_jcs_safe_helper():
     out = jcs_safe(src)
     assert out == {"a": 1, "b_permille": 953, "c": {"d": [500, 2, None, True]}, "e": "x", "f": False}
     assert src["b"] == 0.9534  # input untouched
+
+
+def test_side_glyphs_drops_clipped_blob_when_two_clean_digits_exist():
+    """Online FINISH GAME home "13" + clipped logo fringe (match-20261026-205511 geometry).
+
+    Fixture is a black 640x360 frame stamped with binary digit masks only (no footage, no
+    gamertags). Before the fix, home_glyph_count failed; after, EndMenuReader returns 10-13.
+    """
+    import cv2
+    from pathlib import Path
+    from qorcap_endmenu import BAND_Y, SIDES, EndMenuReader, side_glyphs
+
+    img = cv2.imread(str(Path(__file__).resolve().parent / "fixtures" / "m27_end_menu_synth_1013_home_clip.png"))
+    assert img is not None
+    gs_h = side_glyphs(img, "home")
+    assert len(gs_h) == 2 and all(g is not None for g in gs_h)
+    gs_a = side_glyphs(img, "away")
+    assert len(gs_a) == 2 and all(g is not None for g in gs_a)
+    rd = EndMenuReader().read(img)
+    assert rd.ok and (rd.away, rd.home) == (10, 13), (rd.ok, rd.reason, rd.away, rd.home)
+
+    # Fail closed: one clean home digit + the same fringe stays unreadable (covered score).
+    import numpy as np
+    one = np.zeros((360, 640, 3), np.uint8)
+    # Keep only the home "1" mask region from the fixture; wipe away + home "3".
+    hx0, hx1 = SIDES["home"]
+    ax0, ax1 = SIDES["away"]
+    one[BAND_Y[0]:BAND_Y[1], ax0:ax1] = 0
+    band = img[BAND_Y[0]:BAND_Y[1], hx0:hx1].copy()
+    # Erase the rightmost clean digit ("3") roughly x>=20 in the home band, keep "1" and fringe.
+    band[:, 20:hx1 - hx0 - 12] = 0
+    one[BAND_Y[0]:BAND_Y[1], hx0:hx1] = band
+    rd2 = EndMenuReader().read(one)
+    assert not rd2.ok, (rd2.ok, rd2.reason, rd2.away, rd2.home)  # fail-closed; side in reason is not load-bearing
+
+
+def test_side_glyphs_keeps_fixture_end_menus():
+    """Pinned fixtures must still read the same scores after the clipped-blob drop."""
+    import cv2
+    from pathlib import Path
+    from qorcap_endmenu import EndMenuReader
+    r = EndMenuReader()
+    fix = Path(__file__).resolve().parent / "fixtures"
+    expect = {
+        "m27_end_menu_finish.jpg": (7, 14),
+        "m27_end_menu_restart.jpg": (0, 20),
+        "m27_std_110028_end_menu.jpg": (30, 6),
+        "m27_tnp_091651_end_menu.jpg": (10, 16),
+    }
+    for name, score in expect.items():
+        rd = r.read(cv2.imread(str(fix / name)))
+        assert rd.ok and (rd.away, rd.home) == score, (name, rd.ok, rd.reason, rd.away, rd.home)
