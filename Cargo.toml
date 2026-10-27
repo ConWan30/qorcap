@@ -1,6 +1,6 @@
 [package]
 name = "qorcap"
-version = "0.3.37"
+version = "0.3.38"
 edition = "2021"
 license = "MIT"
 description = "Lean, self-healing USB capture-card recorder for Windows (ffmpeg dshow backend)"
