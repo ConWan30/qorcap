@@ -21,6 +21,9 @@ made for **[QorTime](https://github.com/ConWan30/qortime)** match receipts. It d
 > cryptographic proof of player identity. Identity and liveness of the *player* are QorTime's job (player
 > keys, the HID nonce response, dual-attested mode).
 
+## Meta AI Developer Hackathon (Oct 26 – Nov 4 2026)
+QorCap is pre-existing capture tooling. In-window PRs and the pointer to Meta model work in QorTime are listed in [`HACKATHON.md`](HACKATHON.md).
+
 Design inspiration: [rec-rs](https://github.com/michaelshimeles/rec-rs) (a small, single-purpose recorder
 with a local control surface). QorCap copies only that design idea, no code. No OBS code is used either.
 
