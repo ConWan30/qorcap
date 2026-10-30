@@ -26,7 +26,7 @@
 ## 6. Monetization
 - **Stripe** account in **test mode**, created with qoresence@mail.grokbot.com, `acct_1UQVjXCatAPuUvUA`. **Business details and KYC are not done.** The Stripe connector is **not connected** because Con got locked out after login attempts.
 - Plan: paid **"Verified Match" receipts**, **tournament licenses**, sponsors. Model: a bot-run business in the style of Alex Finn.
-- **Caution:** this is gambling-adjacent (money matches). Stay a neutral evidence and verification service, don't handle wagers, and check the law before going live.
+- **Caution:** some users may run paid matches. Stay a neutral evidence and verification service, never hold or move anyone's money, and check the law before going live.
 
 ## 7. X marketing
 - **@QorTimeHQ** (renamed from @Qoresence). The launch post is pinned.
@@ -40,7 +40,7 @@
 
 3 (Oct 16): Drop a QorTime receipt into the verify page and get VERIFIED, PARTIAL or FAIL. Edit one number in the score and it fails. No account, no trusting us. https://qortime.com/verify/
 
-4 (Oct 17): How do you prove a person is playing, not a bot? At random moments the referee asks for a pause plus a button pattern. The controller log and the video both have to show it within 600 ms.
+4 (Oct 17): How do QorTime's timed challenges work? At random moments the referee asks for a pause plus a button pattern. The controller log and the video both have to show it within 600 ms. It checks that the inputs line up with the video; it never proves who is playing.
 
 5 (Oct 18): QorTime is early: no partners, no customers yet. The code is open → https://github.com/ConWan30/qortime. If you run money matches or tournaments, I'd love to hear what proof you'd need.
 </details>
