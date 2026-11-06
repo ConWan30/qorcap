@@ -258,7 +258,11 @@ impl Engine {
         drop(g);
         // Genesis checkpoint right away: the first segment checkpoint can be 5-10 s away (device open,
         // audio fallback retry, encoder warm-up) and the referee must see the chain start promptly.
-        self.checkpoint("start", match &self.args.side_source { Some(src) => json!({"side_source": src}), None => json!({}) });
+        let mut start_extra = serde_json::Map::new();
+        if let Some(src) = &self.args.side_source { start_extra.insert("side_source".into(), json!(src)); }
+        if let Some(game) = &self.args.game { start_extra.insert("game".into(), json!(game)); }
+        if let Some(profile) = &self.args.scorebug_profile { start_extra.insert("scorebug_profile".into(), json!(profile)); }
+        self.checkpoint("start", Value::Object(start_extra));
         // Until the first video segment exists (device open, audio fallbacks, encoder warm-up), keep the
         // referee fed every 4 s. Stops for good at the first segment, so mid-match gaps are still gaps.
         { let me = self.clone(); std::thread::spawn(move || {
@@ -944,6 +948,42 @@ mod tests {
     }
 
     #[test]
+    fn game_set_lands_on_the_draft_only_when_asked() {
+        use clap::Parser;
+        let dir = std::env::temp_dir().join(format!("qorcap-gameset-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let d = dir.to_string_lossy().into_owned();
+        let crate::cli::Cmd::Record(r) = crate::cli::Cli::try_parse_from([
+            "q", "record", "--device", "testpattern", "--bundle", &d,
+            "--game", "cod_mw4", "--scorebug-profile", "cod_mw4_hud",
+        ]).unwrap().cmd else { panic!() };
+        let e = Engine::new(r, "ffmpeg-x".into());
+        let out = e.write_bundle().unwrap();
+        let draft: Value = serde_json::from_str(&std::fs::read_to_string(out.join("receipt.draft.json")).unwrap()).unwrap();
+        assert_eq!(draft["match"]["game"], "cod_mw4");
+        assert_eq!(draft["match"]["scorebug_profile"], "cod_mw4_hud");
+        let b: Value = serde_json::from_str(&std::fs::read_to_string(out.join("bundle.json")).unwrap()).unwrap();
+        assert_eq!(b["game"], "cod_mw4");
+        assert_eq!(b["scorebug_profile"], "cod_mw4_hud");
+        let plain = std::env::temp_dir().join(format!("qorcap-gameset-plain-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&plain);
+        std::fs::create_dir_all(&plain).unwrap();
+        let p = plain.to_string_lossy().into_owned();
+        let crate::cli::Cmd::Record(r2) = crate::cli::Cli::try_parse_from(["q", "record", "--device", "testpattern", "--bundle", &p]).unwrap().cmd else { panic!() };
+        let e2 = Engine::new(r2, "ffmpeg-x".into());
+        let out2 = e2.write_bundle().unwrap();
+        let draft2: Value = serde_json::from_str(&std::fs::read_to_string(out2.join("receipt.draft.json")).unwrap()).unwrap();
+        assert_eq!(draft2["match"]["game"], "madden27");
+        assert_eq!(draft2["match"]["scorebug_profile"], "madden27_standard");
+        let b2: Value = serde_json::from_str(&std::fs::read_to_string(out2.join("bundle.json")).unwrap()).unwrap();
+        assert!(b2.get("game").is_none());
+        assert!(crate::cli::Cli::try_parse_from(["q", "record", "--game", "fifa"]).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&plain);
+    }
+
+    #[test]
     fn float_in_final_is_refused_without_poisoning_state() {
         // match-20261018-193534 (v0.3.24): the sidecar's end-menu final carried end_menu.conf/margin as floats;
         // jcs_sha panicked inside checkpoint() with the match state locked, every later lock() panicked on the
@@ -1460,6 +1500,10 @@ impl Engine {
             }
         });
         let mut receipt = ev::draft_receipt(&self.args.match_id, &self.args.role, &self.args.player_id, st.started_wall_ms, wall_ms(), &fin, &st.challenges);
+        if let Some(m) = receipt.get_mut("match").and_then(|m| m.as_object_mut()) {
+            if let Some(game) = self.args.game.as_deref() { m.insert("game".into(), json!(game)); }
+            if let Some(profile) = self.args.scorebug_profile.as_deref() { m.insert("scorebug_profile".into(), json!(profile)); }
+        }
         // End-of-game-menu read is required to confirm (v0.3.4). From v0.3.8 the sidecar may set
         // final_confirmed=false when a one-legal-step delta lacks corroboration; honor that field.
         // Corroboration is evidence for the menu read. receipt.v0.json closes `result`, so it
@@ -1530,6 +1574,8 @@ impl Engine {
         if let Some(reason) = reason.as_deref() { bundle["stop_reason"] = json!(reason); }
         if let Some(d) = corroboration { bundle["delta_corroboration"] = d; }
         if let Some(src) = self.args.side_source.as_deref() { bundle["side_source"] = json!(src); }
+        if let Some(game) = self.args.game.as_deref() { bundle["game"] = json!(game); }
+        if let Some(profile) = self.args.scorebug_profile.as_deref() { bundle["scorebug_profile"] = json!(profile); }
         drop(st);
         let dir = self.bundle_dir().unwrap_or_else(|| PathBuf::from("."));
         let _ = std::fs::create_dir_all(&dir);

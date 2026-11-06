@@ -1,0 +1,78 @@
+# Game sets
+
+Start Match asks which game to load, then which side you are on. Each set loads its own profile. A direct `qorcap_match.py` run with no `--game` stays on Madden, so older recordings keep the scorebug path.
+
+`Start Match.cmd --game madden` or `--game cod` skips the prompt. A one-shot `next-game.txt` in `%LOCALAPPDATA%\QorCap` does too (`madden` or `cod`, also `mw4` and `call of duty`). The file is renamed after use and ignored when it is older than 4 hours or not one of those words.
+
+The choice is written to `game_set.json` beside the match. That file is not a receipt field. The receipt still uses `match.game` and `match.scorebug_profile`.
+
+## Madden
+
+- Set id `madden`. Receipt game `madden27`. Profile starts at `madden27_standard` and can still move to a night profile when that reader agrees.
+- Loads home and away, the scorebug, and the end-of-game menu.
+- The match ends when that menu is read. Stopping the recorder is not that read.
+- Glimpse stays the Madden scorebug advisory. It does not feed a Call of Duty hook or the receipt.
+
+## Call of Duty (MW4 / modern)
+
+- Set id `cod`. Receipt game `cod_mw4`. Profile `cod_mw4_hud`.
+- The match window ends when the end screen agrees (3 frames across 3 seconds), the same bar Madden uses for a final screen. Stopping QorCap does not read that screen. The receipt quarter is 4 because this end screen has no game clock. It is not a Madden quarter.
+- `final_confirmed` is true only when a calibrated end-screen hook sets confirm. That is end-screen agreement. It is not a verification verdict. The shipped hook does not set it.
+
+### Controller and video clock
+
+The shared clock is the opt-in frame clock (`--frame-clock` or `QORCAP_FRAME_CLOCK=1`, default off). A stamp has to sit within 500 ms of both the screen time and the input time. That is the same window as `MEASURED_MAX_GAP_US` in `src/frameclock.rs`. The manifest fit is not a stamp. With the frame clock off, a hook is not Counted.
+
+`cod_session.json` records `clock_sync` as agreed, flagged a mismatch, or not Counted. The same status is copied onto `bundle.json`. Neither file is a receipt field, and the status is not a verification verdict.
+
+### HUD chain
+
+These are agreement signals for how the match was played.
+
+1. Hitmarker, against an R2 rising edge (more than 60 counts, the same step the haptic detector already uses).
+2. Kill popup, after a hitmarker that already agreed.
+3. Killfeed, after that popup.
+4. Pause menu, against OPTIONS (bit 9, the same bit the Madden path uses).
+5. Recoil and view motion, from a haptic row the existing detector already labeled high. A `grip_jolt` or `hand_motion` row stays low there, so it is not Counted.
+
+A hook that is not calibrated is not Counted. A calibrated hook whose prior step did not agree is flagged a mismatch. Crosshair is a crop, not a counted event. The shipped crops return `not_read`. They post no score and no final.
+
+### Scoreboard
+
+Kills and assists from an offline count can be compared with the end scoreboard. Both sides need both numbers. A missing number is not Counted. Different numbers are flagged a mismatch. This hook does not post a final and does not change the receipt by itself.
+
+### INFO-ONLY timing
+
+`stick_turn_vs_camera`, `rumble_vs_hit`, and `power_aware_timing` are labeled INFO-ONLY in the set config. Each status is not Counted. They stay that way until a held-out match promotes them. Battery versus plugged is not read, so no timing band is applied.
+
+### Session tags
+
+`cod_session.json` sits beside the match:
+
+- `power` is `unknown`.
+- `controller_path` is `usb` only when the input log header already says `usb-hid` (the path QorCap read). Otherwise it is `unknown`.
+
+These tags are not written onto input rows. Input rows stay in the checkpoint hash, and this set does not change them.
+
+### Receipt
+
+Agreement across the signals above is a checkable record of the match. Disagreement is flagged a mismatch, or the signal is not Counted. The recorder does not stamp a hosted verification on its own. A local signature stays on the path Start Match already uses.
+
+QorCap/QorTime’s CoD path is built so a player can leave a correlated match record (controller + video + HUD + scoreboard hooks) that others can check — a skill-verification layer for the CoD community that is not a kernel anti-cheat and not a ban product.
+
+Official challenges stay closed on this set. No Call of Duty pause moment is wired for them. Anchors can still run.
+
+## Fail closed
+
+- An unreadable `game_set.json` does not run the Madden scorebug. The receipt note says no score was Counted.
+- A missing `game_set.json` on an older bundle stays Madden, unless the bundle already names `cod_mw4`.
+- The Call of Duty offline pass does not decode the Madden scorebug.
+
+## Still to do
+
+- Calibrate the HUD crops and the end-screen hook from a held-out match before any pixel read is Counted.
+- Promote the scoreboard comparison into the end-screen confirmation once an offline kills and assists count exists.
+- Promote stick turn against camera turn, and rumble against an on-screen hit, only after that held-out match. They stay INFO-ONLY.
+- Read battery versus plugged only after a report map exists. Do not guess bytes. Power stays `unknown`.
+- Record the console link (wired or wireless) only when the log actually has it. `usb` today means the laptop read path.
+- Re-read the Call of Duty end screen during finalize once that hook is calibrated.
