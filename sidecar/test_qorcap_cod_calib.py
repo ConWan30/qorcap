@@ -68,9 +68,9 @@ VICTORY_OR_MID = (
 )
 
 
-def place(name: str, origin: tuple[int, int]):
+def place(name: str, origin: tuple[int, int], base=None):
     roi = frame(name)
-    canvas = np.zeros((720, 1280, 3), np.uint8)
+    canvas = np.zeros((720, 1280, 3), np.uint8) if base is None else base.copy()
     x, y = origin
     h, w = roi.shape[:2]
     canvas[y:y + h, x:x + w] = roi
@@ -150,13 +150,14 @@ def test_blur_does_not_confirm():
 
 def test_defeat_does_not_post_a_final_without_scores():
     posted = []
-    runner = C.CodSetRunner(posted.append)
+    runner = C.CodSetRunner(posted.append, side="home")
     img = place(HEADER_ROIS[1], HEADER_ORIGIN)
     for t in (0, 1000, 4000):
         runner.on_frame(t, img)
     assert posted == []
     assert runner.final is None
     assert runner.stats["posted_final"] == 0
+    assert runner.stats["end_direction_mismatch"] == 0
     splash_posts = []
     splash_runner = C.CodSetRunner(splash_posts.append)
     for t in (0, 1500, 4500):
@@ -278,3 +279,100 @@ def test_info_only_timing_stays_not_counted():
         assert row["label"] == "INFO-ONLY"
         assert row["status"] == C.NOT_COUNTED
     assert C.INFO_ONLY["power_aware_timing"]["power"] == "unknown"
+
+
+# Pastes that agreed before the location gate. None of these is the header box.
+_OFF_HEADER = ((40, 8), (500, 250), (980, 300), (40, 400), (819, 7))
+
+
+def _not_read(rd, name):
+    assert rd.confirm is False and rd.ok is False and rd.calibrated is False, name
+    assert rd.reason == "not_present", name
+    assert rd.home is None and rd.away is None
+
+
+def test_word_outside_its_box_is_not_read():
+    """A word pasted off its box stays not read, including on a mid-match frame.
+
+    The header at its measured corner still agrees. The same crop on the
+    killfeed side of that box, or lower in the wide end-screen crop, does not.
+    """
+    end = C.CodEndScreenReader()
+    mid = frame("mid_173922_120s.jpg")
+    for origin in _OFF_HEADER:
+        _not_read(end.read(place(HEADER_ROIS[0], origin)), f"blank {origin}")
+        _not_read(end.read(place(HEADER_ROIS[0], origin, mid)), f"mid {origin}")
+    held = end.read(place(HEADER_ROIS[0], HEADER_ORIGIN))
+    assert held.reason == "defeat" and held.confirm is True
+    # VICTORY header letters, lifted off end_173922_019 and pasted elsewhere.
+    src = frame("end_173922_019.jpg")
+    word = src[30:130, 40:300]
+    home = np.zeros((720, 1280, 3), np.uint8)
+    home[30:30 + word.shape[0], 40:40 + word.shape[1]] = word
+    assert end.read(home).reason == "victory"
+    for origin in ((980, 40), (500, 300), (40, 400), (700, 80)):
+        canvas = np.zeros((720, 1280, 3), np.uint8)
+        canvas[origin[1]:origin[1] + word.shape[0], origin[0]:origin[0] + word.shape[1]] = word
+        _not_read(end.read(canvas), f"victory {origin}")
+        on_mid = mid.copy()
+        on_mid[origin[1]:origin[1] + word.shape[0], origin[0]:origin[0] + word.shape[1]] = word
+        _not_read(end.read(on_mid), f"victory mid {origin}")
+
+
+def test_both_words_on_one_frame_are_ambiguous():
+    """VICTORY and DEFEAT are both evaluated. Both agreeing is not a win."""
+    end = C.CodEndScreenReader()
+    roi = frame(HEADER_ROIS[0])
+    x, y = HEADER_ORIGIN
+    for name in ("end_173922_017.jpg", "end_173922_019.jpg"):
+        both = frame(name)
+        both = both.copy()
+        both[y:y + roi.shape[0], x:x + roi.shape[1]] = roi
+        rd = end.read(both)
+        assert rd.reason == "ambiguous_result", name
+        assert rd.confirm is False and rd.ok is False and rd.calibrated is False
+        assert rd.home is None and rd.away is None
+    assert end.read(frame("end_173922_017.jpg")).reason == "victory"
+    assert end.read(place(HEADER_ROIS[0], HEADER_ORIGIN)).reason == "defeat"
+
+
+def _hue(img, degrees: float):
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    shift = int(round(degrees / 2.0))
+    hsv[:, :, 0] = ((hsv[:, :, 0].astype(np.int16) + shift) % 180).astype(np.uint8)
+    return cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
+
+
+def _gray(img):
+    return cv2.cvtColor(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY), cv2.COLOR_GRAY2BGR)
+
+
+def _jpeg(img, quality: int):
+    _ok, buf = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), quality])
+    return cv2.imdecode(buf, cv2.IMREAD_COLOR)
+
+
+def test_hue_gray_and_jpeg_treat_both_words_alike():
+    """The shared field and letter gates. Clean frames and JPEG 25 still agree.
+
+    A grayscale frame and a 60 degree hue shift do not agree for either word.
+    Sigma 2 drops both. The splash still drops earlier under a lighter blur
+    than the DEFEAT header; that stroke-width gap is still open.
+    """
+    end = C.CodEndScreenReader()
+    samples = {
+        "victory-splash": frame("end_173922_017.jpg"),
+        "victory-header": frame("end_173922_019.jpg"),
+        "defeat": place(HEADER_ROIS[0], HEADER_ORIGIN),
+        "defeat-031": place(HEADER_ROIS[1], HEADER_ORIGIN),
+    }
+    for name, img in samples.items():
+        clean = end.read(img)
+        assert clean.confirm is True and clean.reason in ("victory", "defeat"), name
+        _not_read(end.read(_gray(img)), f"gray {name}")
+        _not_read(end.read(_hue(img, 60)), f"hue {name}")
+        _not_read(end.read(cv2.GaussianBlur(img, (0, 0), 2)), f"blur {name}")
+        jpeg = end.read(_jpeg(img, 25))
+        assert jpeg.confirm is True and jpeg.reason == clean.reason, name
+    assert H._LETTER_MIN == 0.85 and H._LETTER_MEAN == 0.90 and H._LETTER_MARGIN == 0.08
+    assert H._FIELD_MIN == 0.20 and H._SHARP_MIN == 0.26

@@ -681,7 +681,7 @@ def start_cod_reader(api: Api, stop: threading.Event, state: dict, bundle: Path 
     import hashlib
 
     sys.path.insert(0, str(HERE))
-    from qorcap_cod import CodSetRunner, load_signal_files
+    from qorcap_cod import CodSetRunner, load_signal_files, side_from_bundle
 
     def post(b):
         try:
@@ -692,7 +692,11 @@ def start_cod_reader(api: Api, stop: threading.Event, state: dict, bundle: Path 
             state["final"] = b
         return r
 
-    runner = CodSetRunner(post, log_path=(bundle / "cod_signals.jsonl") if bundle is not None else None)
+    runner = CodSetRunner(
+        post,
+        log_path=(bundle / "cod_signals.jsonl") if bundle is not None else None,
+        side=side_from_bundle(bundle),
+    )
     state["core"] = runner
     # Leave the Madden pause gate unset. Official challenges stay closed.
     state["gate"] = None

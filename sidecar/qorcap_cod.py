@@ -60,12 +60,13 @@ NOT_COUNTED = "not Counted"
 # (name, x, y, w, h) in 0..1 of a 16:9 frame.
 # Measured on Con's private practice frames (match-20261105-173922,
 # match-20261101-092413, and the scoreboard strips). Pause is still only a crop.
-# end_screen holds the centered splash (VICTORY on end_173922_017, x 0.29-0.71,
-# y 0.40-0.62) and the match-complete header.
-# VICTORY sits top-left (x ~0.05-0.22, y ~0.07-0.15 on end_173922_019).
-# DEFEAT sits top-right (x ~0.81-0.96, y ~0.07-0.16). The older crop stopped
-# at x 0.83 and cut that word, so this crop runs out to that edge. The reader
-# agrees on that header. The glitched splash is not enough on its own.
+# end_screen is the search window. It stays wide so the letter sizes stay in
+# the calibrated band. A word still has to land in its own box, measured on
+# these frames: VICTORY splash x 0.29-0.71, y 0.40-0.62 (end_173922_017);
+# VICTORY header x 0.05-0.21, y 0.07-0.16 (end_173922_019); DEFEAT header
+# x 0.81-0.96, y 0.07-0.16. The older crop stopped at x 0.83 and cut DEFEAT,
+# so this window runs out to that edge. The glitched splash is not enough
+# on its own. A word outside its box is not read.
 # hitmarker is the center aim window. kill_popup is the center XP plate.
 # killfeed is the top-right, above the killstreak banner on these frames.
 # scoreboard is the whole frame: the K/A strip is a short crop, and the
@@ -176,15 +177,19 @@ class CodHudReader:
 class CodEndScreenReader:
     """The Call of Duty end screen. This is the end of the match.
 
-    ``confirm`` is set only when the frame shows a sharp VICTORY or a sharp
-    DEFEAT header on a red field. A blurred word does not confirm. Splash and
-    header reads stay presence-only: they do not fill home and away. The runner
-    still requires 3 strictly later timestamps across 3 seconds before it posts,
-    and it posts only when home and away are both read and the result is the
-    same on each of those frames. A gap, a non-end frame, or a different result
-    or score starts that count over. ``confirm`` is the only way the receipt
-    field ``final_confirmed`` becomes true. That field is the end-screen
-    agreement. It is not a verification verdict.
+    ``confirm`` is set only when the frame shows one sharp end word in its box:
+    VICTORY on the splash or the match-complete header, or DEFEAT on the
+    top-right header with a red field. Both words use the same letter gate.
+    A word outside its box does not confirm. If both words agree, the frame
+    is not read. A blurred word does not confirm. Splash and header reads stay
+    presence-only: they do not fill home and away. The runner still requires
+    3 strictly later timestamps across 3 seconds before it posts, and it posts
+    only when home and away are both read and the result is the same on each
+    of those frames. Once those scores exist, confirm also requires the word
+    to match the side chosen at the start. A gap, a non-end frame, or a
+    different result or score starts that count over. ``confirm`` is the only
+    way the receipt field ``final_confirmed`` becomes true. That field is the
+    end-screen agreement. It is not a verification verdict.
     """
 
     def read(self, img) -> RegionRead:
@@ -203,6 +208,46 @@ def _score(value) -> int | None:
     if n is None or n < 0:
         return None
     return n
+
+
+def end_word_fits_side(reason, home, away, side) -> bool | None:
+    """Whether the end word matches the side chosen at the start.
+
+    ``None`` when the check does not apply: the word is not victory or defeat,
+    the side is not home or away, or a score is missing. DEFEAT fits only when
+    that side is strictly behind. VICTORY fits only when that side is strictly
+    ahead. A tie fits neither word.
+    """
+    if reason not in ("victory", "defeat") or side not in ("home", "away"):
+        return None
+    ours_n, theirs_n = (home, away) if side == "home" else (away, home)
+    ours, theirs = _score(ours_n), _score(theirs_n)
+    if ours is None or theirs is None:
+        return None
+    if reason == "defeat":
+        return ours < theirs
+    return ours > theirs
+
+
+def side_from_bundle(bundle) -> str | None:
+    """The side chosen at the start, from ``side_choice.json``.
+
+    Missing, unreadable, or any other role stays ``None``. This does not read
+    a score.
+    """
+    if bundle is None:
+        return None
+    path = Path(bundle) / "side_choice.json"
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    role = data.get("role") if isinstance(data, dict) else None
+    if role in ("home", "away"):
+        return role
+    return None
 
 
 def screen_mono_us(screen_wall_ms, wall_anchor_ms) -> int | None:
@@ -382,11 +427,14 @@ class CodSetRunner:
     and do not post a final. In-match signals stay on ``cod_signals.jsonl``.
     """
 
-    def __init__(self, post, hud=None, end=None, log_path: Path | None = None) -> None:
+    def __init__(self, post, hud=None, end=None, log_path: Path | None = None,
+                 side: str | None = None) -> None:
         self.post = post
         self.hud = hud or CodHudReader()
         self.end = end or CodEndScreenReader()
         self.log_path = log_path
+        # Side chosen at the start. Used only once home and away are both read.
+        self.side = side if side in ("home", "away") else None
         self.final: dict | None = None
         self.reader = None  # no Madden scorebug grammar
         self.inputs: list = []
@@ -397,6 +445,7 @@ class CodSetRunner:
             "frames": 0, "agreed": 0, "errors": 0,
             "hud_not_read": 0, "end_screen_not_read": 0, "posted_final": 0,
             "not_counted": 0, "flagged_mismatch": 0,
+            "end_direction_mismatch": 0,
         }
         self._logged = False
         self._pair = None
@@ -469,14 +518,34 @@ class CodSetRunner:
         if when is None:
             self._clear_end_candidate()
             return
-        agreed = self._offer(when, end.reason, bool(end.confirm), home, away)
+        confirm = bool(end.confirm)
+        fits = end_word_fits_side(end.reason, home, away, self.side)
+        direction_note = None
+        # Victory and defeat confirm only when the word matches the side.
+        # A missing side fails closed. Other reasons are unchanged.
+        if end.reason in ("victory", "defeat") and fits is not True:
+            confirm = False
+            self.stats["end_direction_mismatch"] += 1
+            if fits is False:
+                direction_note = (
+                    "The end-screen word does not match the side chosen at the start, "
+                    "so it is not confirmed."
+                )
+            else:
+                direction_note = (
+                    "The side chosen at the start is not on this read, "
+                    "so the end-screen word is not confirmed."
+                )
+        agreed = self._offer(when, end.reason, confirm, home, away)
         if agreed is None:
             return
-        confirmed = bool(end.confirm)
+        confirmed = confirm
         notes = [
             "Call of Duty end screen agreed. This is the end of the match.",
             "The receipt quarter is 4 because this end screen has no game clock. It is not a Madden quarter.",
         ]
+        if direction_note:
+            notes.append(direction_note)
         if not confirmed:
             notes.append("The end-screen score is not Counted as confirmed.")
         event = {
