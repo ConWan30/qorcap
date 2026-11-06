@@ -17,6 +17,10 @@ How a Call of Duty match is played, and what this set lines up:
   Counted here.
 - Kills and assists against the end scoreboard are a separate hook. A missing
   number is not Counted. This hook does not post a final.
+- The match final, when the end word agrees, uses Qortrola30's own scoreboard
+  row (kills and deaths, assists when that column is on the board). That row
+  is not home or away. Another player's row is not used. A missing row or an
+  unreadable digit is not Counted.
 - Stick turn against camera turn, and rumble against an on-screen hit, are
   INFO-ONLY. They are not Counted.
 - The match ends when the end screen agrees, the way Madden's final screen
@@ -112,6 +116,24 @@ END_AGREE_SPAN_MS = 3000
 # A hole longer than the bar is not one showing. The candidate starts over.
 # A 2000 ms step, which the three-frame check uses, is still inside this cap.
 END_AGREE_GAP_MS = END_AGREE_SPAN_MS
+# Offline video probe. The last few end frames, not a long end-window scan.
+END_PROBE_FRAMES = 5
+# At 4 Hz this is about eight frames. The probe keeps the last five.
+END_PROBE_TAIL_S = 2
+
+# Con's end-scoreboard row. Letters may differ in case. A different tag is not this row.
+OWNER_TAG = "Qortrola30"
+
+
+def same_owner_tag(text) -> bool:
+    """True when ``text`` is Con's gamertag. Case does not matter. Spaces do not count.
+
+    The letters have to agree with ``OWNER_TAG``. Another player's name does not.
+    """
+    if not isinstance(text, str):
+        return False
+    folded = "".join(text.split()).casefold()
+    return bool(folded) and folded == OWNER_TAG.casefold()
 
 STUB_NOTE = "hook only: this region is cropped and not read. It is not Counted."
 
@@ -131,6 +153,9 @@ class RegionRead:
     assists: int | None = None
     board_kills: int | None = None
     board_assists: int | None = None
+    deaths: int | None = None
+    confirms: int | None = None
+    player_tag: str | None = None
 
 
 def crop_box(img, box: tuple[float, float, float, float]):
@@ -183,13 +208,14 @@ class CodEndScreenReader:
     A word outside its box does not confirm. If both words agree, the frame
     is not read. A blurred word does not confirm. Splash and header reads stay
     presence-only: they do not fill home and away. The runner still requires
-    3 strictly later timestamps across 3 seconds before it posts, and it posts
-    only when home and away are both read and the result is the same on each
-    of those frames. Once those scores exist, confirm also requires the word
-    to match the side chosen at the start. A gap, a non-end frame, or a
-    different result or score starts that count over. ``confirm`` is the only
-    way the receipt field ``final_confirmed`` becomes true. That field is the
-    end-screen agreement. It is not a verification verdict.
+    3 strictly later timestamps across 3 seconds before it posts. That bar is
+    reached when home and away are both read, or when this word agrees and
+    Qortrola30's own scoreboard row has readable kills and deaths. Another
+    player's row is not that row. Once home and away exist, confirm also
+    requires the word to match the side chosen at the start. A gap, a non-end
+    frame, or a different result or score starts that count over. ``confirm``
+    is the only way the receipt field ``final_confirmed`` becomes true. That
+    field is the end-screen agreement. It is not a verification verdict.
     """
 
     def read(self, img) -> RegionRead:
@@ -420,11 +446,13 @@ class CodSetRunner:
 
     HUD hooks are logged and are not posted to ``/events``. The only event
     this runner posts is a final, after a calibrated end screen agrees for
-    3 strictly later timestamps across 3 seconds, with the same result and the
-    same home and away. A frame that is not that end screen, a missing score
-    pair, a repeated or earlier timestamp, or a gap longer than 3 seconds
-    starts the count over. Scoreboard kills and assists are not home and away
-    and do not post a final. In-match signals stay on ``cod_signals.jsonl``.
+    3 strictly later timestamps across 3 seconds. The scored path keeps the
+    same result and the same home and away. The owner-row path posts when the
+    end word agrees and Qortrola30's row has readable kills and deaths, and
+    it does not fill home or away from that row. A frame that is not that end
+    screen, a missing pair, a repeated or earlier timestamp, or a gap longer
+    than 3 seconds starts the count over. The K/A scoreboard hook is not that
+    row and does not post a final. In-match signals stay on ``cod_signals.jsonl``.
     """
 
     def __init__(self, post, hud=None, end=None, log_path: Path | None = None,
@@ -504,13 +532,9 @@ class CodSetRunner:
         if self.final is not None:
             return
         # Home and away come only from this end-screen read. A scoreboard
-        # kill, assist, or team total is not that pair and is not a final.
+        # kill, assist, or team total is not that pair. The owner row is a
+        # separate read and is not copied into home or away.
         if not (end.ok and end.calibrated):
-            self.stats["end_screen_not_read"] += 1
-            self._clear_end_candidate()
-            return
-        home, away = _score(end.home), _score(end.away)
-        if home is None or away is None or not isinstance(end.reason, str) or not end.reason:
             self.stats["end_screen_not_read"] += 1
             self._clear_end_candidate()
             return
@@ -518,59 +542,20 @@ class CodSetRunner:
         if when is None:
             self._clear_end_candidate()
             return
-        confirm = bool(end.confirm)
-        fits = end_word_fits_side(end.reason, home, away, self.side)
-        direction_note = None
-        # Victory and defeat confirm only when the word matches the side.
-        # A missing side fails closed. Other reasons are unchanged.
-        if end.reason in ("victory", "defeat") and fits is not True:
-            confirm = False
-            self.stats["end_direction_mismatch"] += 1
-            if fits is False:
-                direction_note = (
-                    "The end-screen word does not match the side chosen at the start, "
-                    "so it is not confirmed."
-                )
-            else:
-                direction_note = (
-                    "The side chosen at the start is not on this read, "
-                    "so the end-screen word is not confirmed."
-                )
-        agreed = self._offer(when, end.reason, confirm, home, away)
-        if agreed is None:
+        home, away = _score(end.home), _score(end.away)
+        if home is not None and away is not None and isinstance(end.reason, str) and end.reason:
+            self._post_scored_end(int(t_ms), when, end, home, away)
             return
-        confirmed = confirm
-        notes = [
-            "Call of Duty end screen agreed. This is the end of the match.",
-            "The receipt quarter is 4 because this end screen has no game clock. It is not a Madden quarter.",
-        ]
-        if direction_note:
-            notes.append(direction_note)
-        if not confirmed:
-            notes.append("The end-screen score is not Counted as confirmed.")
-        event = {
-            "type": "final",
-            "basis": "end_menu",
-            "method": "end_menu_read",
-            "home": home,
-            "away": away,
-            "quarter": 4,
-            "t_ms": agreed["t_ms"],
-            "final_confirmed": confirmed,
-            "notes": notes,
-            "game_set": "cod",
-            "end_screen": {
-                "frames": agreed["frames"],
-                "region": END_NAME,
-                "until_ms": agreed["until_ms"],
-            },
-        }
-        self.final = event
-        self.stats["posted_final"] += 1
-        self._write({"t_ms": int(t_ms), "kind": "end_screen", "status": AGREED,
-                     "final_confirmed": confirmed, "home": home, "away": away,
-                     "frames": agreed["frames"]})
-        self.post(event)
+        try:
+            from qorcap_cod_hud import read_owner_row
+            owner = read_owner_row(img)
+        except Exception as e:
+            self.stats["errors"] += 1
+            print(f"Call of Duty owner-row hook error: {type(e).__name__}: {e}", file=sys.stderr)
+            self.stats["end_screen_not_read"] += 1
+            self._clear_end_candidate()
+            return
+        self._post_owner_end(int(t_ms), when, end, owner)
 
     def _signals(self, t_ms: int, by_name: dict) -> list[dict]:
         screen_us = screen_mono_us(t_ms, self.wall_anchor_ms)
@@ -628,15 +613,138 @@ class CodSetRunner:
         self._t0 = t_ms
         self._last_t = t_ms
 
-    def _offer(self, t_ms: int, reason: str, confirm: bool, home: int, away: int) -> dict | None:
+    def _post_scored_end(self, t_ms: int, when: int, end: RegionRead, home: int, away: int) -> None:
+        """The path that already has home and away. The word has to fit the side."""
+        confirm = bool(end.confirm)
+        fits = end_word_fits_side(end.reason, home, away, self.side)
+        direction_note = None
+        # Victory and defeat confirm only when the word matches the side.
+        # A missing side fails closed. Other reasons are unchanged.
+        if end.reason in ("victory", "defeat") and fits is not True:
+            confirm = False
+            self.stats["end_direction_mismatch"] += 1
+            if fits is False:
+                direction_note = (
+                    "The end-screen word does not match the side chosen at the start, "
+                    "so it is not confirmed."
+                )
+            else:
+                direction_note = (
+                    "The side chosen at the start is not on this read, "
+                    "so the end-screen word is not confirmed."
+                )
+        agreed = self._offer(when, end.reason, confirm, home, away)
+        if agreed is None:
+            return
+        confirmed = confirm
+        notes = [
+            "Call of Duty end screen agreed. This is the end of the match.",
+            "The receipt quarter is 4 because this end screen has no game clock. It is not a Madden quarter.",
+        ]
+        if direction_note:
+            notes.append(direction_note)
+        if not confirmed:
+            notes.append("The end-screen score is not Counted as confirmed.")
+        self._commit_final(t_ms, agreed, end.reason, confirmed, home, away, notes, owner=None)
+
+    def _post_owner_end(self, t_ms: int, when: int, end: RegionRead, owner: RegionRead) -> None:
+        """End word plus Qortrola30's row. Home and away stay unread.
+
+        The word names victory or defeat. The row says whose match it is.
+        Kills and deaths have to be read. Assists count only when that column
+        is on the board. A missing row, a different tag, or an unreadable
+        digit is not Counted.
+        """
+        kills = _score(getattr(owner, "kills", None))
+        deaths = _score(getattr(owner, "deaths", None))
+        assists = _score(getattr(owner, "assists", None))
+        confirms = _score(getattr(owner, "confirms", None))
+        tag = getattr(owner, "player_tag", None)
+        ready = (
+            isinstance(end.reason, str)
+            and end.reason in ("victory", "defeat")
+            and bool(end.confirm)
+            and owner.ok
+            and owner.calibrated
+            and same_owner_tag(tag or "")
+            and kills is not None
+            and deaths is not None
+        )
+        if not ready:
+            self.stats["end_screen_not_read"] += 1
+            self._clear_end_candidate()
+            return
+        extra = (OWNER_TAG.casefold(), kills, deaths, assists, confirms)
+        agreed = self._offer(when, end.reason, True, None, None, extra=extra)
+        if agreed is None:
+            return
+        notes = [
+            "Call of Duty end screen agreed. This is the end of the match.",
+            "The receipt quarter is 4 because this end screen has no game clock. It is not a Madden quarter.",
+            (
+                f"The end word is {end.reason}. {OWNER_TAG}'s scoreboard row was read: "
+                f"kills {kills}, deaths {deaths}."
+            ),
+            "Home and away were not read. Those row numbers are not a home or away score.",
+        ]
+        if assists is None:
+            notes.append("Assists were not on this board.")
+        else:
+            notes.append(f"Assists on that row: {assists}.")
+        if confirms is not None:
+            notes.append(f"Confirms on that row: {confirms}.")
+        owner_doc = {
+            "tag": OWNER_TAG,
+            "kills": kills,
+            "deaths": deaths,
+            "assists": assists,
+            "confirms": confirms,
+            "result": end.reason,
+        }
+        self._commit_final(t_ms, agreed, end.reason, True, None, None, notes, owner=owner_doc)
+
+    def _commit_final(self, t_ms, agreed, reason, confirmed, home, away, notes, owner) -> None:
+        event = {
+            "type": "final",
+            "basis": "end_menu",
+            "method": "end_menu_read",
+            "home": home,
+            "away": away,
+            "quarter": 4,
+            "t_ms": agreed["t_ms"],
+            "final_confirmed": confirmed,
+            "notes": notes,
+            "game_set": "cod",
+            "end_screen": {
+                "frames": agreed["frames"],
+                "region": END_NAME,
+                "until_ms": agreed["until_ms"],
+            },
+        }
+        if owner is not None:
+            event["owner_row"] = owner
+        self.final = event
+        self.stats["posted_final"] += 1
+        logged = {
+            "t_ms": int(t_ms), "kind": "end_screen", "status": AGREED,
+            "final_confirmed": confirmed, "home": home, "away": away,
+            "result": reason, "frames": agreed["frames"],
+        }
+        if owner is not None:
+            logged["owner_row"] = owner
+        self._write(logged)
+        self.post(event)
+
+    def _offer(self, t_ms: int, reason: str, confirm: bool, home, away, extra=None) -> dict | None:
         """One more end-screen sample. None until the bar is met.
 
         The sample counts only when its timestamp is strictly later than the
         last accepted one, the gap is within the cap, and the result and the
-        score pair are unchanged. Anything else starts a new candidate at this
-        timestamp and does not post.
+        pair are unchanged. ``extra`` is the owner row when home and away are
+        unread. Anything else starts a new candidate at this timestamp and
+        does not post.
         """
-        key = (reason, bool(confirm), home, away)
+        key = (reason, bool(confirm), home, away, extra)
         if key != self._pair or not isinstance(self._last_t, int):
             self._begin_end_candidate(t_ms, key)
             return None
@@ -777,7 +885,58 @@ def clock_sync_status(frame_stamps, inputs, wall_anchor_ms) -> str:
     return MISMATCH
 
 
-def session_document(*, frame_stamps=None, inputs=None, wall_anchor_ms=None) -> dict:
+def owner_row_from_signals(bundle: Path) -> dict | None:
+    """The owner row on a posted end screen, from ``cod_signals.jsonl``.
+
+    Missing or unreadable stays ``None``. This does not read another player's row.
+    """
+    path = Path(bundle) / "cod_signals.jsonl"
+    if not path.is_file():
+        return None
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return None
+    found = None
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(row, dict) or row.get("kind") != "end_screen":
+            continue
+        owner = row.get("owner_row")
+        if isinstance(owner, dict) and same_owner_tag(str(owner.get("tag") or "")):
+            found = owner
+    return found
+
+
+def _public_owner_row(owner: dict) -> dict:
+    """The fields that sit beside the match. No other name is copied."""
+    kills, deaths = _score(owner.get("kills")), _score(owner.get("deaths"))
+    if kills is None or deaths is None:
+        return {}
+    assists = _score(owner.get("assists"))
+    confirms = _score(owner.get("confirms"))
+    result = owner.get("result") if owner.get("result") in ("victory", "defeat") else None
+    return {
+        "tag": OWNER_TAG,
+        "kills": kills,
+        "deaths": deaths,
+        "assists": assists,
+        "confirms": confirms,
+        "result": result,
+        "note": (
+            "Read from this player's end scoreboard row. "
+            "Not a home or away score. Not a verification verdict."
+        ),
+    }
+
+
+def session_document(*, frame_stamps=None, inputs=None, wall_anchor_ms=None, owner_row=None) -> dict:
     """Power and controller path beside the match. Not a receipt field.
 
     ``controller_path`` is ``usb`` only when the input log header already says
@@ -791,7 +950,7 @@ def session_document(*, frame_stamps=None, inputs=None, wall_anchor_ms=None) -> 
             break
     path = "usb" if isinstance(header, dict) and header.get("transport") == "usb-hid" else "unknown"
     stamps = list(frame_stamps or [])
-    return {
+    doc = {
         "schema": "qorcap-cod-session/v0",
         "controller_path": path,
         "power": "unknown",
@@ -803,6 +962,11 @@ def session_document(*, frame_stamps=None, inputs=None, wall_anchor_ms=None) -> 
             "They are not a receipt field and not a verification verdict."
         ),
     }
+    if isinstance(owner_row, dict):
+        public = _public_owner_row(owner_row)
+        if public:
+            doc["owner_row"] = public
+    return doc
 
 
 def attach_session(bundle: Path) -> dict:
@@ -833,8 +997,82 @@ def write_session(bundle: Path) -> dict:
     loaded = load_signal_files(bundle)
     doc = session_document(
         frame_stamps=loaded["frame_stamps"], inputs=loaded["inputs"],
-        wall_anchor_ms=loaded["wall_anchor_ms"])
+        wall_anchor_ms=loaded["wall_anchor_ms"],
+        owner_row=owner_row_from_signals(bundle))
     (bundle / "cod_session.json").write_text(json.dumps(doc, indent=2) + "\n", encoding="utf-8")
+    return doc
+
+
+def probe_end_frames(frames) -> dict:
+    """Read the last ``END_PROBE_FRAMES`` end frames. Does not scan a longer window.
+
+    ``frames`` is ``(t_ms, image)`` from the end of the match, oldest first.
+    A final is posted only when the same end word and the same owner row agree
+    on 3 strictly later timestamps across 3 seconds inside those frames.
+    Five frames closer together than that do not post.
+    """
+    tail = list(frames or [])[-END_PROBE_FRAMES:]
+    posted: list = []
+    runner = CodSetRunner(posted.append)
+    summaries = []
+    times = []
+    for item in tail:
+        if not isinstance(item, (tuple, list)) or len(item) < 2:
+            continue
+        t_ms, img = item[0], item[1]
+        if isinstance(t_ms, bool) or not isinstance(t_ms, int):
+            continue
+        times.append(t_ms)
+        runner.on_frame(t_ms, img)
+        summaries.append(_summarize_end_frame(img))
+    span = (times[-1] - times[0]) if len(times) >= 2 else 0
+    final = posted[-1] if posted else None
+    if final is not None:
+        reason = "the end word and the owner row agreed across the 3-frame bar"
+    elif not any(row.get("result") for row in summaries):
+        reason = "the end word was not read on the last frames"
+    elif not any(row.get("owner_row") for row in summaries):
+        reason = "the owner row was not read on the last frames"
+    else:
+        reason = "the last frames do not meet 3 timestamps across 3 seconds"
+    return {
+        "schema": "qorcap-cod-end-probe/v0",
+        "frames": len(summaries),
+        "span_ms": span,
+        "posted": final is not None,
+        "reason": reason,
+        "reads": summaries,
+        "note": (
+            "Last 5 end frames only. Not a long end-window scan. "
+            "Not a home or away score. Not a verification verdict."
+        ),
+    }
+
+
+def _summarize_end_frame(img) -> dict:
+    """The end word and the owner row on one frame. Other names are not copied."""
+    from qorcap_cod_hud import read_owner_row
+    end = CodEndScreenReader().read(img)
+    result = end.reason if end.ok and end.reason in ("victory", "defeat") else None
+    owner = read_owner_row(img)
+    row = None
+    if owner.ok and owner.calibrated and same_owner_tag(owner.player_tag or ""):
+        kills, deaths = _score(owner.kills), _score(owner.deaths)
+        if kills is not None and deaths is not None:
+            row = {
+                "tag": OWNER_TAG,
+                "kills": kills,
+                "deaths": deaths,
+                "assists": _score(owner.assists),
+                "confirms": _score(owner.confirms),
+            }
+    return {"result": result, "owner_row": row}
+
+
+def record_end_probe(bundle: Path, frames) -> dict:
+    """Write ``cod_end_probe.json``. Does not edit a receipt."""
+    doc = probe_end_frames(frames)
+    (Path(bundle) / "cod_end_probe.json").write_text(json.dumps(doc, indent=2) + "\n", encoding="utf-8")
     return doc
 
 

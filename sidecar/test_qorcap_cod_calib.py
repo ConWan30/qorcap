@@ -1,10 +1,12 @@
 """Calibrated Call of Duty reads on Con's private practice frames.
 
 A present signal is ok and calibrated. An empty or wrong crop stays not read.
-VICTORY and DEFEAT agree as an end screen and do not invent home and away, so
-they do not post a final. DEFEAT does not agree on a VICTORY frame, and
-VICTORY does not agree on a DEFEAT frame. Scoreboard K/A is read when the
-digits are there, and the comparison stays not Counted without an offline count.
+VICTORY and DEFEAT agree as an end screen and do not invent home and away.
+They post a final only when Qortrola30's own scoreboard row is readable on
+the same frames for 3 timestamps across 3 seconds. DEFEAT does not agree on
+a VICTORY frame, and VICTORY does not agree on a DEFEAT frame. Scoreboard
+K/A is read when the digits are there, and the comparison stays not Counted
+without an offline count. That K/A row is not the owner row.
 """
 import json
 from pathlib import Path
@@ -376,3 +378,149 @@ def test_hue_gray_and_jpeg_treat_both_words_alike():
         assert jpeg.confirm is True and jpeg.reason == clean.reason, name
     assert H._LETTER_MIN == 0.85 and H._LETTER_MEAN == 0.90 and H._LETTER_MARGIN == 0.08
     assert H._FIELD_MIN == 0.20 and H._SHARP_MIN == 0.26
+
+
+def test_same_owner_tag_is_case_insensitive():
+    assert C.same_owner_tag("Qortrola30")
+    assert C.same_owner_tag("qortrola30")
+    assert C.same_owner_tag("QORTROLA30")
+    assert C.same_owner_tag(" Qortrola30 ")
+    assert C.same_owner_tag("Qortrola31") is False
+    assert C.same_owner_tag("") is False
+    assert C.same_owner_tag(None) is False
+
+
+def test_owner_row_reads_qortrola30_kills_and_deaths():
+    """The end scoreboard row is Con's. Kills and deaths are read. Assists are not on this board.
+
+    Confirms are not assists. Home and away stay empty. A strip with no gamertag,
+    the splash, and a wiped name or wiped kill digits stay not read.
+    """
+    board = frame("end_173922_019.jpg")
+    row = H.read_owner_row(board)
+    assert row.ok and row.calibrated and row.reason == "owner_row"
+    assert C.same_owner_tag(row.player_tag)
+    assert row.player_tag == "Qortrola30"
+    assert row.kills == 13 and row.deaths == 13
+    assert row.assists is None and row.confirms == 7
+    assert row.home is None and row.away is None
+    end = C.CodEndScreenReader().read(board)
+    assert end.reason == "victory" and end.confirm is True
+    assert end.home is None and end.away is None
+    shifted = np.zeros_like(board)
+    shifted[4:, 6:] = board[:-4, :-6]
+    moved = H.read_owner_row(shifted)
+    assert moved.ok and (moved.kills, moved.deaths, moved.confirms) == (13, 13, 7)
+    jpeg = cv2.imdecode(cv2.imencode(".jpg", board, [int(cv2.IMWRITE_JPEG_QUALITY), 40])[1], cv2.IMREAD_COLOR)
+    again = H.read_owner_row(jpeg)
+    assert again.ok and (again.kills, again.deaths) == (13, 13)
+    up = cv2.resize(board, (1920, 1080), interpolation=cv2.INTER_LINEAR)
+    scaled = H.read_owner_row(up)
+    assert scaled.ok and (scaled.kills, scaled.deaths, scaled.assists, scaled.confirms) == (13, 13, None, 7)
+    for name in ("end_173922_017.jpg", "mid_173922_120s.jpg", "sb_001.png", "sb_002.png", "sb_003.png", "end_173922_007.jpg"):
+        missed = H.read_owner_row(frame(name))
+        assert missed.ok is False and missed.calibrated is False, name
+        assert missed.kills is None and missed.deaths is None and missed.player_tag is None
+    wiped = board.copy()
+    wiped[528:556, 160:250] = 0
+    gone = H.read_owner_row(wiped)
+    assert gone.ok is False and gone.player_tag is None and gone.kills is None
+    no_kills = board.copy()
+    no_kills[530:552, 420:460] = 0
+    blank_k = H.read_owner_row(no_kills)
+    assert blank_k.ok is False and blank_k.kills is None and blank_k.deaths is None
+    blur = H.read_owner_row(cv2.GaussianBlur(board, (0, 0), 1.2))
+    assert blur.ok is False and blur.kills is None
+
+
+def test_owner_row_and_victory_reach_the_three_frame_bar(tmp_path):
+    """Word plus the owner row, held for 3 timestamps across 3 seconds, posts.
+
+    Home and away stay unread. The receipt path keeps null scores and winner
+    unknown. The row is logged and copied onto the session sidecar.
+    """
+    img = frame("end_173922_019.jpg")
+    posted = []
+    runner = C.CodSetRunner(posted.append, log_path=tmp_path / "cod_signals.jsonl")
+    runner.on_frame(0, img)
+    assert posted == []
+    runner.on_frame(1000, img)
+    assert posted == []
+    runner.on_frame(4000, img)
+    assert len(posted) == 1
+    event = posted[0]
+    assert event["basis"] == "end_menu" and event["method"] == "end_menu_read"
+    assert event["final_confirmed"] is True
+    assert event["home"] is None and event["away"] is None
+    assert event["quarter"] == 4
+    assert event["owner_row"]["tag"] == "Qortrola30"
+    assert event["owner_row"]["kills"] == 13 and event["owner_row"]["deaths"] == 13
+    assert event["owner_row"]["assists"] is None and event["owner_row"]["confirms"] == 7
+    assert event["owner_row"]["result"] == "victory"
+    text = " ".join(event["notes"]).lower()
+    assert "qortrola30" in text and "victory" in text
+    assert "verified" not in text and "cheat" not in text
+    assert "not a home or away score" in text
+    lines = (tmp_path / "cod_signals.jsonl").read_text(encoding="utf-8").splitlines()
+    end_row = json.loads(lines[-1])
+    assert end_row["kind"] == "end_screen" and end_row["owner_row"]["kills"] == 13
+    from qorcap_match import apply_final
+    result = apply_final({"notes": []}, event)
+    assert result["home_score"] is None and result["away_score"] is None
+    assert result["winner"] == "unknown"
+    assert result["final_confirmed"] is True
+    assert result["method"] == "end_menu_read"
+    assert "owner_row" not in result
+    C.write_session(tmp_path)
+    session = json.loads((tmp_path / "cod_session.json").read_text(encoding="utf-8"))
+    assert session["owner_row"]["tag"] == "Qortrola30"
+    assert session["owner_row"]["kills"] == 13 and session["owner_row"]["deaths"] == 13
+    assert "not a receipt field" in session["note"]
+    assert "not a verification verdict" in session["owner_row"]["note"].lower()
+
+
+def test_owner_row_fails_closed_and_the_probe_keeps_the_last_five_frames(tmp_path):
+    """No row, one frame, or five frames inside a second do not post.
+
+    The probe looks only at the last five frames. Earlier agreeing frames
+    outside that tail do not post a final.
+    """
+    board = frame("end_173922_019.jpg")
+    splash = frame("end_173922_017.jpg")
+    posted = []
+    runner = C.CodSetRunner(posted.append)
+    for t in (0, 1500, 3000):
+        runner.on_frame(t, splash)
+    assert posted == [] and runner.final is None
+    one = []
+    C.CodSetRunner(one.append).on_frame(0, board)
+    assert one == []
+    tight = []
+    runner = C.CodSetRunner(tight.append)
+    for t in (0, 200, 400, 600, 800):
+        runner.on_frame(t, board)
+    assert tight == [] and runner.final is None
+    # Three early agreeing frames, then five frames with no row. The probe
+    # keeps the tail, so the early agreement does not post.
+    frames = [(0, board), (1500, board), (3000, board)]
+    frames += [(4000 + i * 200, splash) for i in range(5)]
+    probe = C.probe_end_frames(frames)
+    assert probe["frames"] == 5
+    assert probe["posted"] is False
+    assert probe["reason"] == "the owner row was not read on the last frames"
+    assert all(row["owner_row"] is None for row in probe["reads"])
+    held = [(0, splash), (1000, board), (2500, board), (4000, board)]
+    posted_probe = C.probe_end_frames(held)
+    assert posted_probe["posted"] is True
+    assert posted_probe["frames"] == 4
+    assert posted_probe["reads"][-1]["result"] == "victory"
+    assert posted_probe["reads"][-1]["owner_row"]["deaths"] == 13
+    C.record_end_probe(tmp_path, held)
+    saved = json.loads((tmp_path / "cod_end_probe.json").read_text(encoding="utf-8"))
+    assert saved["schema"] == "qorcap-cod-end-probe/v0"
+    assert saved["posted"] is True
+    assert "not a verification verdict" in saved["note"].lower()
+    blob = json.dumps(saved)
+    assert "Qortrola30" in blob
+    tags = [row.get("owner_row", {}).get("tag") for row in saved["reads"] if row.get("owner_row")]
+    assert tags and set(tags) == {"Qortrola30"}
