@@ -7,11 +7,14 @@ write a receipt field.
 
 XP plates are presence only. A 25 or a 50 is not an assist and not a kill.
 The red kill marker is presence only. It is not a kill count.
-DEFEAT agrees on the top-right header the same way VICTORY does, when the
-six letters agree, the field around the word is red, and the word is sharp
-enough. A blurred word does not agree. The Kill Confirmed header is a thinner
-cut: pieces of one letter are joined, then checked against that header's own
-letters, on the same gates. Home and away stay unread when the screen does not
+DEFEAT agrees on the top-right header the same way VICTORY agrees on its
+splash or its match-complete header. Both words use one letter gate, one
+sharpness floor, and a field-color share. The word also has to sit in its
+own box. A word elsewhere in the wide crop does not agree. If both words
+agree on one frame, the read is ambiguous and does not confirm. The Kill
+Confirmed header is a thinner cut: pieces of one letter are joined, then
+checked against that header's own letters, on the same gates. A blurred
+word does not agree. Home and away stay unread when the screen does not
 label them.
 """
 from __future__ import annotations
@@ -21,26 +24,29 @@ from pathlib import Path
 PACK_PATH = Path(__file__).resolve().parent / "packs" / "cod_mw4_hud_v1.npz"
 FIXTURE_DIR = Path(__file__).resolve().parent / "fixtures" / "cod"
 
-# Letter row on the splash and on the match-complete header.
-_LETTER_MIN = 0.70
-_LETTER_MEAN = 0.85
+# One letter gate for both words. The practice frames clear it:
+# VICTORY header 019 is at least 0.87 per letter, mean about 0.93, margin at least 0.13.
+# DEFEAT headers are at least 0.96 per letter, margin at least 0.14.
 # E and F are close. A letter that does not clear the next one stays unread.
+_LETTER_MIN = 0.85
+_LETTER_MEAN = 0.90
 _LETTER_MARGIN = 0.08
 # DEFEAT template order. The two E's are separate samples of the same letter.
 _DEFEAT_LETTERS = ("D", "E", "F", "E", "A", "T")
-# DEFEAT is tighter than VICTORY. Every letter has to clear this, and the mean too.
-_DEFEAT_LETTER_MIN = 0.85
-_DEFEAT_LETTER_MEAN = 0.90
 # Top Sobel gradient over the word's text contrast. A 3x3 Sobel peaks near
 # eight times a one-pixel step, so the ratio is divided by 8. The gradient
 # is the 99th percentile and the contrast is the 5th-to-98th percentile gap.
-# A clean word sits near 0.45. A sigma-2 blur sits near 0.20. Below this the
-# word does not agree. The 95th percentile over the 10-90 gap scored the large
-# splash near 0.33. A one-pixel blur and a 720p frame scaled up to 1080p then
-# fell short of this floor, while those letters still matched.
+# The same floor is used for both words. A clean word sits near 0.45. A
+# sigma-2 blur sits near 0.20. Below this the word does not agree. The 95th
+# percentile over the 10-90 gap scored the large splash near 0.33. A one-pixel
+# blur and a 720p frame scaled up to 1080p then fell short of this floor,
+# while those letters still matched.
 _SHARP_MIN = 0.26
-# Share of the word box that is red (OpenCV hue near 0, saturation at least 60).
-_RED_MIN = 0.20
+# Share of the word box that is that word's field color (saturation at least 60).
+# DEFEAT is red (OpenCV hue near 0). VICTORY is the teal measured on both
+# practice frames (median hue 88). The same share floor applies to both.
+_FIELD_MIN = 0.20
+_VICTORY_HUE = (70, 105)
 # Top-right header crop from the practice frames, pasted back at this origin
 # on a 1280x720 frame. The crop is the word and the red field. It has no scoreboard.
 DEFEAT_HEADER_ROI = "defeat_header_030.png"
@@ -55,6 +61,18 @@ _LETTER_HEIGHT_MIN = 0.10
 # than one letter, so a small gap does not merge them.
 _STENCIL_GAP = 4
 _LETTER_WIDTH_RATIO = 0.62
+# Full-frame fractions, then the measured letter width and height.
+# The letter box has to sit inside the region and match that word's size
+# within _WORD_SIZE_TOL. A header-sized word inside the splash rectangle
+# does not agree. Measured on 1280x720.
+# DEFEAT letters at the header origin: x 0.812-0.954, y 0.068-0.154 (0.142 by 0.086).
+DEFEAT_WORD_BOX = (0.78, 0.03, 0.20, 0.17, 0.142, 0.086)
+# VICTORY splash on end_173922_017: x 0.291-0.709, y 0.400-0.618 (0.417 by 0.218).
+VICTORY_SPLASH_BOX = (0.24, 0.34, 0.52, 0.34, 0.417, 0.218)
+# VICTORY header on end_173922_019: x 0.047-0.213, y 0.068-0.154 (0.166 by 0.086).
+VICTORY_HEADER_BOX = (0.02, 0.03, 0.26, 0.17, 0.166, 0.086)
+VICTORY_WORD_BOXES = (VICTORY_SPLASH_BOX, VICTORY_HEADER_BOX)
+_WORD_SIZE_TOL = 0.25
 # Header words on the personal K/A row.
 _HEADER_MIN = 0.70
 # Digit prototypes from those same rows.
@@ -147,13 +165,26 @@ def _white_mask(img):
     return ((v > 170) & (s < 90)).astype(np.uint8) * 255
 
 
-def _victory(img) -> bool:
-    """A VICTORY word: V, a narrow I, then C T O R Y, one row, tall glyphs."""
+def _wanted_clears(scores, want: int) -> bool:
+    """The wanted template is the best, by the shared letter min and margin."""
+    top = float(scores[want])
+    if top < _LETTER_MIN:
+        return False
+    rest = [float(scores[i]) for i in range(len(scores)) if i != want]
+    second = max(rest) if rest else -1.0
+    return top - second >= _LETTER_MARGIN
+
+
+def _victory_hits(img) -> list:
+    """VICTORY rows that clear the shared letter, sharpness, and field gates.
+
+    Each hit is the six wide letters. Location is checked by the caller.
+    """
     cv2, np = _libs()
     pack = _pack()
     bgr = _as_bgr(img)
     if cv2 is None or pack is None or bgr is None or "victory" not in pack:
-        return False
+        return []
     templates = pack["victory"].astype(np.float32)
     mask = _white_mask(bgr)
     h, w = bgr.shape[:2]
@@ -172,7 +203,7 @@ def _victory(img) -> bool:
         scores = templates @ vec
         glyphs.append({"x": x, "y": y, "w": ww, "h": hh, "scores": scores})
     if len(glyphs) < 6:
-        return False
+        return []
     glyphs.sort(key=lambda g: g["y"] + g["h"] / 2)
     rows: list[dict] = []
     for g in glyphs:
@@ -187,11 +218,17 @@ def _victory(img) -> bool:
                 break
         if not placed:
             rows.append({"items": [g], "cy": cy, "h": float(g["h"])})
+    hits = []
     for row in rows:
         found = _victory_row(row["items"])
-        if found and _sharpness(bgr, found) >= _SHARP_MIN:
-            return True
-    return False
+        if not found:
+            continue
+        if _sharpness(bgr, found) < _SHARP_MIN:
+            continue
+        if _field_share(bgr, found, "victory") < _FIELD_MIN:
+            continue
+        hits.append(found)
+    return hits
 
 
 def _victory_row(items):
@@ -203,18 +240,30 @@ def _victory_row(items):
         return None
     items = [it for it in items if abs(it["h"] - med) / med <= 0.30]
     # V C T O R Y are template indexes 0,2,3,4,5,6. I is index 1 and is narrow.
-    need = (0, 2, 3, 4, 5, 6)
-    found = []
-    start = 0
     labeled = []
     for it in items:
         idx = int(np.argmax(it["scores"]))
         labeled.append((idx, float(it["scores"][idx]), it))
+    # A false V earlier on the same band does not hide a later word.
+    for j, (idx, _score, it) in enumerate(labeled):
+        if idx == 0 and _wanted_clears(it["scores"], 0):
+            found = _victory_from(labeled, j)
+            if found:
+                return found
+    return None
+
+
+def _victory_from(labeled, start_at: int):
+    """One VICTORY chain starting at ``start_at``. None when the chain breaks."""
+    np = _libs()[1]
+    need = (0, 2, 3, 4, 5, 6)
+    found = []
+    start = start_at
     for want in need:
         hit = None
         for j in range(start, len(labeled)):
-            idx, score, it = labeled[j]
-            if idx == want and score >= _LETTER_MIN:
+            idx, _score, it = labeled[j]
+            if idx == want and _wanted_clears(it["scores"], want):
                 hit = j
                 break
         if hit is None:
@@ -435,8 +484,13 @@ def _sharpness(bgr, glyphs) -> float:
     return top / contrast / 8.0
 
 
-def _red_around(bgr, glyphs) -> float:
-    """Share of the word box that is red at saturation 60 or higher."""
+def _field_share(bgr, glyphs, kind: str) -> float:
+    """Share of the word box that is this word's field color.
+
+    ``red`` is DEFEAT (hue near 0). ``victory`` is the teal measured on the
+    practice splash and header (OpenCV hue about 88). Saturation is at least 60
+    either way, and the share has to clear the same floor.
+    """
     cv2, np = _libs()
     box = _word_box(glyphs, bgr.shape)
     if cv2 is None or box is None:
@@ -444,8 +498,14 @@ def _red_around(bgr, glyphs) -> float:
     x0, y0, x1, y1 = box
     hsv = cv2.cvtColor(bgr[y0:y1, x0:x1], cv2.COLOR_BGR2HSV)
     hue, sat = hsv[:, :, 0], hsv[:, :, 1]
-    red = ((hue <= 10) | (hue >= 170)) & (sat >= 60)
-    return float(np.mean(red))
+    if kind == "red":
+        mask = ((hue <= 10) | (hue >= 170)) & (sat >= 60)
+    elif kind == "victory":
+        lo, hi = _VICTORY_HUE
+        mask = (hue >= lo) & (hue <= hi) & (sat >= 60)
+    else:
+        return 0.0
+    return float(np.mean(mask))
 
 
 def _defeat_row(items):
@@ -468,13 +528,26 @@ def _defeat_row(items):
         best, top = ranked[0]
         second = ranked[1][1] if len(ranked) > 1 else -1.0
         labeled.append((best, top, top - second, it))
+    # A glyph earlier on the same band can score as D. Try each D so the
+    # header is still found when VICTORY sits on that band.
+    for j, (ch, score, margin, _it) in enumerate(labeled):
+        if ch == "D" and score >= _LETTER_MIN and margin >= _LETTER_MARGIN:
+            found = _defeat_from(labeled, j)
+            if found:
+                return found
+    return None
+
+
+def _defeat_from(labeled, start_at: int):
+    """One DEFEAT chain starting at ``start_at``. None when the chain breaks."""
+    np = _libs()[1]
     found = []
-    start = 0
+    start = start_at
     for want in _DEFEAT_LETTERS:
         hit = None
         for j in range(start, len(labeled)):
             ch, score, margin, _it = labeled[j]
-            if ch == want and score >= _DEFEAT_LETTER_MIN and margin >= _LETTER_MARGIN:
+            if ch == want and score >= _LETTER_MIN and margin >= _LETTER_MARGIN:
                 hit = j
                 break
         if hit is None:
@@ -482,7 +555,7 @@ def _defeat_row(items):
         found.append(labeled[hit])
         start = hit + 1
     scores = [sc for _, sc, _, _ in found]
-    if float(np.mean(scores)) < _DEFEAT_LETTER_MEAN:
+    if float(np.mean(scores)) < _LETTER_MEAN:
         return None
     med_w = float(np.median([it["w"] for _, _, _, it in found]))
     xs = [it["x"] for _, _, _, it in found]
@@ -495,9 +568,9 @@ def _defeat_row(items):
 def _defeat_rows(pack):
     """Calibrated header rows. Row 0 is the solid cut. Later rows are thinner cuts.
 
-    A word still has to clear 0.85 on every letter, mean 0.90, the margin, the
-    sharpness gate, and the red field. Another row does not relax those gates,
-    and the glitched splash is not a row.
+    A word still has to clear the shared letter gate, the sharpness floor, and
+    the red field. Another row does not relax those gates, and the glitched
+    splash is not a row.
     """
     rows = pack["defeat"].astype(_libs()[1].float32)
     if rows.ndim != 3 or rows.shape[1] != len(_DEFEAT_LETTERS) or rows.shape[0] < 1:
@@ -505,49 +578,99 @@ def _defeat_rows(pack):
     return rows
 
 
-def _defeat_on_row(bgr, glyphs, templates) -> bool:
-    scored = []
-    for glyph in glyphs:
-        item = dict(glyph)
-        item["scores"] = templates @ glyph["vec"]
-        scored.append(item)
-    for row in _band_rows(scored):
-        found = _defeat_row(row["items"])
-        if not found:
-            continue
-        if _sharpness(bgr, found) < _SHARP_MIN:
-            continue
-        if _red_around(bgr, found) < _RED_MIN:
-            continue
-        return True
-    return False
+def _defeat_hits(img) -> list:
+    """DEFEAT rows that clear the shared letter, sharpness, and red-field gates.
 
-
-def _defeat(img) -> bool:
-    """A sharp DEFEAT header on a red field.
-
-    The letters are the top-right header. Each one has to clear 0.85 and the
-    mean has to clear 0.90, and the field around the word has to be red. Solid
-    letters match the first calibrated row. A thinner cut is joined, then
-    matched to its own row, on those same gates. The centered splash is cut by
-    scan lines, so it stays unread. A blurred word stays unread. Team totals
-    are not home and away: the screen does not label those sides, and the
-    receipt side is the side chosen at the start.
+    Each hit is the six header letters. Solid letters match the first
+    calibrated row. A thinner cut is joined, then matched to its own row, on
+    those same gates. Location is checked by the caller. The centered splash
+    is cut by scan lines, so it stays unread. A blurred word stays unread.
+    Team totals are not home and away: the screen does not label those sides,
+    and the receipt side is the side chosen at the start.
     """
     cv2, _np = _libs()
     pack = _pack()
     bgr = _as_bgr(img)
     if cv2 is None or pack is None or bgr is None or "defeat" not in pack:
-        return False
+        return []
     rows = _defeat_rows(pack)
     if rows is None:
-        return False
+        return []
     glyphs = _letter_glyphs(_white_mask(bgr))
     if len(glyphs) < 6:
-        return False
+        return []
+    hits = []
+    seen = set()
     for templates in rows:
-        if _defeat_on_row(bgr, glyphs, templates):
-            return True
+        scored = []
+        for glyph in glyphs:
+            item = dict(glyph)
+            item["scores"] = templates @ glyph["vec"]
+            scored.append(item)
+        for row in _band_rows(scored):
+            found = _defeat_row(row["items"])
+            if not found:
+                continue
+            if _sharpness(bgr, found) < _SHARP_MIN:
+                continue
+            if _field_share(bgr, found, "red") < _FIELD_MIN:
+                continue
+            key = tuple((int(g["x"]), int(g["y"]), int(g["w"]), int(g["h"])) for g in found)
+            if key in seen:
+                continue
+            seen.add(key)
+            hits.append(found)
+    return hits
+
+
+def _crop_origin(img, name: str) -> tuple[int, int]:
+    """Pixel origin of a normalized crop, using the same rounding as ``crop_box``."""
+    h, w = int(img.shape[0]), int(img.shape[1])
+    x, y, _bw, _bh = _region(name)
+    x0 = max(0, min(w - 1, int(round(float(x) * w))))
+    y0 = max(0, min(h - 1, int(round(float(y) * h))))
+    return x0, y0
+
+
+def _norm_word(glyphs, origin: tuple[int, int], shape) -> tuple[float, float, float, float] | None:
+    """Letter box as fractions of the full frame. Glyphs are in crop pixels."""
+    if not glyphs:
+        return None
+    ox, oy = origin
+    h, w = int(shape[0]), int(shape[1])
+    if h < 1 or w < 1:
+        return None
+    x0 = min(int(g["x"]) for g in glyphs) + ox
+    y0 = min(int(g["y"]) for g in glyphs) + oy
+    x1 = max(int(g["x"]) + int(g["w"]) for g in glyphs) + ox
+    y1 = max(int(g["y"]) + int(g["h"]) for g in glyphs) + oy
+    return (x0 / w, y0 / h, (x1 - x0) / w, (y1 - y0) / h)
+
+
+def _inside(word, box, slack: float = 0.002) -> bool:
+    """True when ``word`` sits inside ``box``. Both are (x, y, w, h) fractions."""
+    if word is None:
+        return False
+    x, y, w, h = word
+    bx, by, bw, bh = box
+    return (x >= bx - slack and y >= by - slack
+            and x + w <= bx + bw + slack and y + h <= by + bh + slack)
+
+
+def _located(glyphs, origin, shape, boxes) -> bool:
+    """Letter box inside the region, and close to that word's measured size."""
+    word = _norm_word(glyphs, origin, shape)
+    if word is None:
+        return False
+    for box in boxes:
+        if not _inside(word, box[:4]):
+            continue
+        expect_w, expect_h = box[4], box[5]
+        if abs(word[2] - expect_w) > expect_w * _WORD_SIZE_TOL:
+            continue
+        if abs(word[3] - expect_h) > expect_h * _WORD_SIZE_TOL:
+            continue
+        return True
     return False
 
 
@@ -854,12 +977,21 @@ def read_end(img):
     bgr = _as_bgr(src)
     if bgr is None:
         return _not_read("end_screen", "frame_invalid", "frame could not be cropped; it is not Counted")
-    if _victory(bgr):
+    origin = _crop_origin(img, "end_screen")
+    shape = getattr(img, "shape", bgr.shape)
+    victory = [g for g in _victory_hits(bgr) if _located(g, origin, shape, VICTORY_WORD_BOXES)]
+    defeat = [g for g in _defeat_hits(bgr) if _located(g, origin, shape, (DEFEAT_WORD_BOX,))]
+    # Both words are evaluated. A frame that agrees as both is not read.
+    if victory and defeat:
+        return _not_read(
+            "end_screen", "ambiguous_result",
+            "VICTORY and DEFEAT both agree on this frame, so it is not read.")
+    if victory:
         return _present(
             "end_screen", "victory",
             "VICTORY on the end screen. Home and away were not both read, so no final score is posted.",
             confirm=True)
-    if _defeat(bgr):
+    if defeat:
         return _present(
             "end_screen", "defeat",
             "DEFEAT on the end screen. Home and away were not both read, so no final score is posted.",

@@ -204,10 +204,15 @@ def _blank_end():
     return C.RegionRead("end_screen", "not_read", False, "not_present", False)
 
 
-def _run_end(reads):
+def _run_end(reads, side="home"):
+    """Feed scripted end reads. ``side`` is the side chosen at the start.
+
+    The default is home, so a victory with home ahead can still confirm.
+    Pass ``side=None`` when the test is about a missing side.
+    """
     posted = []
     runner = C.CodSetRunner(posted.append, hud=type("H", (), {"read": lambda self, img: []})(),
-                            end=_scripted(rd for _t, rd in reads))
+                            end=_scripted(rd for _t, rd in reads), side=side)
     for t, _rd in reads:
         runner.on_frame(t, _Img())
     return posted
@@ -241,9 +246,11 @@ def test_end_screen_bar_needs_distinct_times_and_resets():
     gapped = _run_end([(0, same), (1000, same), (10000, same), (11000, same), (14000, same)])
     assert len(gapped) == 1 and gapped[0]["t_ms"] == 10000
 
-    defeat = _scored("defeat", 3, 1, confirm=True)
+    # Home is behind, so this DEFEAT matches the side and can still confirm.
+    defeat = _scored("defeat", 1, 3, confirm=True)
     switched = _run_end([(0, same), (1000, same), (4000, defeat), (5000, defeat), (8000, defeat)])
     assert len(switched) == 1 and switched[0]["t_ms"] == 4000 and switched[0]["final_confirmed"] is True
+    assert switched[0]["home"] == 1 and switched[0]["away"] == 3
 
     other = _scored("victory", 4, 1, confirm=True)
     rescored = _run_end([(0, same), (1000, same), (2000, other), (3000, other), (5000, other)])
@@ -269,6 +276,64 @@ def test_end_screen_bar_needs_distinct_times_and_resets():
         runner.on_frame(t, _Img())
     assert posted == []
     assert runner.final is None
+
+
+def test_defeat_ahead_of_our_side_is_not_confirmed():
+    """Once home and away exist, the word has to match the side chosen at the start.
+
+    DEFEAT with that side ahead does not confirm. VICTORY with that side behind
+    does not confirm. A tie does not confirm. A missing side does not confirm
+    either word. A matching DEFEAT still confirms. The real reader still leaves
+    home and away empty, so this rule does not post a final on the practice frames.
+    """
+    ahead = _scored("defeat", 8, 3, confirm=True)
+    posted = _run_end([(0, ahead), (1500, ahead), (3000, ahead)], side="home")
+    assert len(posted) == 1
+    assert posted[0]["final_confirmed"] is False
+    assert posted[0]["home"] == 8 and posted[0]["away"] == 3
+    assert any("does not match the side" in note for note in posted[0]["notes"])
+
+    behind = _scored("victory", 3, 8, confirm=True)
+    victory_behind = _run_end([(0, behind), (1500, behind), (3000, behind)], side="home")
+    assert victory_behind[0]["final_confirmed"] is False
+
+    matched = _scored("defeat", 3, 8, confirm=True)
+    ok = _run_end([(0, matched), (1500, matched), (3000, matched)], side="home")
+    assert ok[0]["final_confirmed"] is True
+
+    away_ahead = _scored("defeat", 3, 8, confirm=True)
+    away = _run_end([(0, away_ahead), (1500, away_ahead), (3000, away_ahead)], side="away")
+    assert away[0]["final_confirmed"] is False
+
+    away_behind = _scored("defeat", 8, 3, confirm=True)
+    away_ok = _run_end([(0, away_behind), (1500, away_behind), (3000, away_behind)], side="away")
+    assert away_ok[0]["final_confirmed"] is True
+
+    tie = _scored("victory", 4, 4, confirm=True)
+    tied = _run_end([(0, tie), (1500, tie), (3000, tie)], side="home")
+    assert tied[0]["final_confirmed"] is False
+
+    noside = _run_end([(0, matched), (1500, matched), (3000, matched)], side=None)
+    assert noside[0]["final_confirmed"] is False
+    assert any("not on this read" in note for note in noside[0]["notes"])
+
+    assert C.end_word_fits_side("defeat", 8, 3, "home") is False
+    assert C.end_word_fits_side("defeat", 3, 8, "home") is True
+    assert C.end_word_fits_side("victory", None, None, "home") is None
+    assert C.side_from_bundle(None) is None
+
+
+def test_side_file_names_the_side_chosen_at_the_start(tmp_path):
+    assert C.side_from_bundle(tmp_path) is None
+    path = tmp_path / "side_choice.json"
+    path.write_text("{", encoding="utf-8")
+    assert C.side_from_bundle(tmp_path) is None
+    path.write_text(json.dumps({"role": "away"}), encoding="utf-8")
+    assert C.side_from_bundle(tmp_path) == "away"
+    path.write_text(json.dumps({"role": "left"}), encoding="utf-8")
+    assert C.side_from_bundle(tmp_path) is None
+    src = Path(M.__file__).read_text(encoding="utf-8")
+    assert "side=side_from_bundle(bundle)" in src
 
 
 def test_calibrated_end_screen_needs_three_frames(tmp_path):
