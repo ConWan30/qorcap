@@ -1,9 +1,10 @@
 """Calibrated Call of Duty reads on Con's private practice frames.
 
 A present signal is ok and calibrated. An empty or wrong crop stays not read.
-VICTORY agrees as an end screen and does not invent home and away, so it does
-not post a final. Scoreboard K/A is read when the digits are there, and the
-comparison stays not Counted without an offline count.
+VICTORY and DEFEAT agree as an end screen and do not invent home and away, so
+they do not post a final. DEFEAT does not agree on a VICTORY frame, and
+VICTORY does not agree on a DEFEAT frame. Scoreboard K/A is read when the
+digits are there, and the comparison stays not Counted without an offline count.
 """
 import json
 from pathlib import Path
@@ -42,6 +43,101 @@ def test_victory_splash_agrees_and_midmatch_does_not():
         rd = end.read(frame(name))
         assert rd.confirm is False and rd.ok is False and rd.calibrated is False
         assert rd.reason == "not_present"
+
+
+# Header word crops, pasted at the corner they occupied on the 720p frame.
+# The crops are the word and the red field. They do not include the scoreboard.
+HEADER_ROIS = (
+    "defeat_header_030.png",
+    "defeat_header_031.png",
+    "defeat_header_033.png",
+)
+HEADER_ORIGIN = H.DEFEAT_HEADER_ORIGIN
+# The glitched splash. It stays in the tree as a negative: the letters do not clear the header.
+SPLASH_ROI = "defeat_splash_028.png"
+SPLASH_ORIGIN = (340, 250)
+VICTORY_OR_MID = (
+    "end_173922_017.jpg",
+    "end_173922_019.jpg",
+    "end_173922_007.jpg",
+    "end_173922_010.jpg",
+    "mid_173922_120s.jpg",
+)
+
+
+def place(name: str, origin: tuple[int, int]):
+    roi = frame(name)
+    canvas = np.zeros((720, 1280, 3), np.uint8)
+    x, y = origin
+    h, w = roi.shape[:2]
+    canvas[y:y + h, x:x + w] = roi
+    return canvas
+
+
+def test_defeat_confirms_and_does_not_cross_victory():
+    """DEFEAT agrees on the top-right header crops.
+
+    Home and away stay unread. The glitched splash does not clear the header
+    letters, so it does not agree. A VICTORY or mid-match frame does not agree
+    as DEFEAT, and a DEFEAT frame does not agree as VICTORY.
+    """
+    end = C.CodEndScreenReader()
+    for name in HEADER_ROIS:
+        rd = end.read(place(name, HEADER_ORIGIN))
+        assert rd.ok and rd.calibrated and rd.confirm, name
+        assert rd.reason == "defeat"
+        assert rd.home is None and rd.away is None
+    splash = end.read(place(SPLASH_ROI, SPLASH_ORIGIN))
+    assert splash.confirm is False and splash.ok is False and splash.reason == "not_present"
+    for name in VICTORY_OR_MID:
+        rd = end.read(frame(name))
+        assert rd.reason != "defeat"
+        assert rd.confirm is (rd.reason == "victory")
+    assert end.read(frame("end_173922_017.jpg")).reason == "victory"
+    assert end.read(frame("end_173922_019.jpg")).reason == "victory"
+    wiped = place(HEADER_ROIS[0], HEADER_ORIGIN)
+    wiped[30:130, 980:1260] = 0
+    missing = end.read(wiped)
+    assert missing.confirm is False and missing.ok is False and missing.reason == "not_present"
+    cut = place(HEADER_ROIS[1], HEADER_ORIGIN)
+    cut[40:120, 1155:1200] = 0
+    assert end.read(cut).confirm is False and end.read(cut).home is None
+
+
+def test_blur_does_not_confirm():
+    """A sigma-2 blur still looks like the letters and does not agree.
+
+    A clean word sits near 0.45 on the sharpness gate. This blur sits near 0.20.
+    """
+    end = C.CodEndScreenReader()
+    for name in HEADER_ROIS:
+        sharp = place(name, HEADER_ORIGIN)
+        assert end.read(sharp).reason == "defeat"
+        blur = cv2.GaussianBlur(sharp, (0, 0), 2)
+        rd = end.read(blur)
+        assert rd.confirm is False and rd.ok is False and rd.reason == "not_present", name
+    for name in ("end_173922_017.jpg", "end_173922_019.jpg"):
+        assert end.read(frame(name)).reason == "victory"
+        blur = cv2.GaussianBlur(frame(name), (0, 0), 2)
+        rd = end.read(blur)
+        assert rd.confirm is False and rd.ok is False and rd.reason == "not_present", name
+
+
+def test_defeat_does_not_post_a_final_without_scores():
+    posted = []
+    runner = C.CodSetRunner(posted.append)
+    img = place(HEADER_ROIS[1], HEADER_ORIGIN)
+    for t in (0, 1000, 4000):
+        runner.on_frame(t, img)
+    assert posted == []
+    assert runner.final is None
+    assert runner.stats["posted_final"] == 0
+    splash_posts = []
+    splash_runner = C.CodSetRunner(splash_posts.append)
+    for t in (0, 1500, 4500):
+        splash_runner.on_frame(t, place(SPLASH_ROI, SPLASH_ORIGIN))
+    assert splash_posts == []
+    assert splash_runner.final is None
 
 
 def test_victory_does_not_post_a_final_without_scores():
