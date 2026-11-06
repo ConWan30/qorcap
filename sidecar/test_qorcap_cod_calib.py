@@ -53,6 +53,9 @@ HEADER_ROIS = (
     "defeat_header_033.png",
 )
 HEADER_ORIGIN = H.DEFEAT_HEADER_ORIGIN
+# Kill Confirmed word crop. Thinner letters, same gates. No scoreboard.
+KC_HEADER = H.DEFEAT_KC_ROI
+KC_ORIGIN = H.DEFEAT_KC_ORIGIN
 # The glitched splash. It stays in the tree as a negative: the letters do not clear the header.
 SPLASH_ROI = "defeat_splash_028.png"
 SPLASH_ORIGIN = (340, 250)
@@ -77,9 +80,10 @@ def place(name: str, origin: tuple[int, int]):
 def test_defeat_confirms_and_does_not_cross_victory():
     """DEFEAT agrees on the top-right header crops.
 
-    Home and away stay unread. The glitched splash does not clear the header
-    letters, so it does not agree. A VICTORY or mid-match frame does not agree
-    as DEFEAT, and a DEFEAT frame does not agree as VICTORY.
+    Home and away stay unread. The Kill Confirmed header agrees on the same
+    gates after its split letters are joined. The glitched splash does not
+    clear the header letters, so it does not agree. A VICTORY or mid-match
+    frame does not agree as DEFEAT, and a DEFEAT frame does not agree as VICTORY.
     """
     end = C.CodEndScreenReader()
     for name in HEADER_ROIS:
@@ -87,6 +91,10 @@ def test_defeat_confirms_and_does_not_cross_victory():
         assert rd.ok and rd.calibrated and rd.confirm, name
         assert rd.reason == "defeat"
         assert rd.home is None and rd.away is None
+    kc = end.read(place(KC_HEADER, KC_ORIGIN))
+    assert kc.ok and kc.calibrated and kc.confirm
+    assert kc.reason == "defeat"
+    assert kc.home is None and kc.away is None
     splash = end.read(place(SPLASH_ROI, SPLASH_ORIGIN))
     assert splash.confirm is False and splash.ok is False and splash.reason == "not_present"
     for name in VICTORY_OR_MID:
@@ -110,9 +118,11 @@ def test_blur_does_not_confirm():
     A clean word sits near 0.45 on the sharpness gate. This blur sits near 0.20.
     """
     end = C.CodEndScreenReader()
-    for name in HEADER_ROIS:
-        sharp = place(name, HEADER_ORIGIN)
-        assert end.read(sharp).reason == "defeat"
+    samples = [(name, HEADER_ORIGIN) for name in HEADER_ROIS]
+    samples.append((KC_HEADER, KC_ORIGIN))
+    for name, origin in samples:
+        sharp = place(name, origin)
+        assert end.read(sharp).reason == "defeat", name
         blur = cv2.GaussianBlur(sharp, (0, 0), 2)
         rd = end.read(blur)
         assert rd.confirm is False and rd.ok is False and rd.reason == "not_present", name

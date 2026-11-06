@@ -9,8 +9,10 @@ XP plates are presence only. A 25 or a 50 is not an assist and not a kill.
 The red kill marker is presence only. It is not a kill count.
 DEFEAT agrees on the top-right header the same way VICTORY does, when the
 six letters agree, the field around the word is red, and the word is sharp
-enough. A blurred word does not agree. Home and away stay unread when the
-screen does not label them.
+enough. A blurred word does not agree. The Kill Confirmed header is a thinner
+cut: pieces of one letter are joined, then checked against that header's own
+letters, on the same gates. Home and away stay unread when the screen does not
+label them.
 """
 from __future__ import annotations
 
@@ -39,6 +41,16 @@ _RED_MIN = 0.20
 # on a 1280x720 frame. The crop is the word and the red field. It has no scoreboard.
 DEFEAT_HEADER_ROI = "defeat_header_030.png"
 DEFEAT_HEADER_ORIGIN = (980, 8)
+# Kill Confirmed header (match-20261104-202724). Same kind of word crop, at the
+# corner it occupied on that 720p frame. The letters are a thinner cut.
+DEFEAT_KC_ROI = "defeat_header_202724_030.png"
+DEFEAT_KC_ORIGIN = (968, 18)
+# A finished DEFEAT letter is at least this share of the crop. Splash scraps are shorter.
+_LETTER_HEIGHT_MIN = 0.10
+# Pieces of one thinner letter sit within this many pixels. A and T together are wider
+# than one letter, so a small gap does not merge them.
+_STENCIL_GAP = 4
+_LETTER_WIDTH_RATIO = 0.62
 # Header words on the personal K/A row.
 _HEADER_MIN = 0.70
 # Digit prototypes from those same rows.
@@ -224,29 +236,142 @@ def _victory_row(items):
     return [it for _, _, it in found]
 
 
+def _component_mask(lab, comp):
+    """Binary mask of one component, tight on its box."""
+    x, y, ww, hh = comp["x"], comp["y"], comp["w"], comp["h"]
+    return (lab[y:y + hh, x:x + ww] == comp["i"]).astype(_libs()[1].uint8) * 255
+
+
+def _glyph_from_mask(mask, x, y):
+    """A normalised glyph, or None when the patch has no ink."""
+    np = _libs()[1]
+    vec = _vec(np, mask, (16, 32))
+    if vec is None:
+        return None
+    return {"x": int(x), "y": int(y), "w": int(mask.shape[1]), "h": int(mask.shape[0]), "vec": vec}
+
+
+def _letter_components(mask):
+    """White components that could be part of a header letter.
+
+    Huge blobs (the glitched splash) and specks stay out. The height floor is
+    not applied here: a thinner cut splits one letter into a tall piece and a
+    shorter piece, and the short piece is still part of the letter.
+    """
+    cv2, _np = _libs()
+    h, w = mask.shape[:2]
+    n, lab, st, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    comps = []
+    for i in range(1, n):
+        x, y, ww, hh, area = (int(t) for t in st[i])
+        if hh > h * 0.50 or ww > w * 0.14 or area < 80:
+            continue
+        comps.append({"x": x, "y": y, "w": ww, "h": hh, "area": area, "i": i})
+    return lab, comps
+
+
+def _strict_letters(lab, comps, shape):
+    """Letters that already clear the height floor as one component.
+
+    Splash scan-line scraps are shorter than the header letters. A shorter
+    floor would take those scraps as letters, so this floor stays put.
+    """
+    h = shape[0]
+    glyphs = []
+    for comp in comps:
+        ww, hh = comp["w"], comp["h"]
+        if hh < h * _LETTER_HEIGHT_MIN or ww / max(hh, 1) > 0.90:
+            continue
+        glyph = _glyph_from_mask(_component_mask(lab, comp), comp["x"], comp["y"])
+        if glyph is not None:
+            glyphs.append(glyph)
+    return glyphs
+
+
+def _join_split_letters(lab, comps, anchors, shape):
+    """Join pieces of one thinner letter. A row of six whole letters is not passed here.
+
+    The band is the tall pieces. A shorter piece joins when it sits in that band
+    and the joined width is still one letter. Two neighboring letters, such as
+    A and T, are wider than that, so they stay apart. The joined box uses the
+    band height when the piece starts at the cap, so a sliced letter is not
+    dropped by the height floor. No ink is invented in the gap.
+    """
+    np = _libs()[1]
+    h, w = shape[:2]
+    if len(anchors) < 4:
+        return None
+    y0 = int(np.median([g["y"] for g in anchors]))
+    y1 = int(np.median([g["y"] + g["h"] for g in anchors]))
+    band_h = max(1, y1 - y0)
+    max_w = band_h * _LETTER_WIDTH_RATIO
+    eligible = []
+    for comp in comps:
+        if comp["w"] > max_w:
+            continue
+        top, bot = comp["y"], comp["y"] + comp["h"]
+        if min(bot, y1) - max(top, y0) < 4:
+            continue
+        eligible.append(comp)
+    eligible.sort(key=lambda comp: (comp["x"], -comp["h"]))
+    clusters: list[list] = []
+    for comp in eligible:
+        placed = False
+        for cluster in clusters:
+            left = min(it["x"] for it in cluster)
+            right = max(it["x"] + it["w"] for it in cluster)
+            if comp["x"] <= right + _STENCIL_GAP:
+                new_left = min(left, comp["x"])
+                new_right = max(right, comp["x"] + comp["w"])
+                if new_right - new_left <= max_w:
+                    cluster.append(comp)
+                    placed = True
+                    break
+        if not placed:
+            clusters.append([comp])
+    glyphs = []
+    for cluster in clusters:
+        if min(it["y"] for it in cluster) > y0 + 12:
+            continue
+        x0 = min(it["x"] for it in cluster)
+        x1 = max(it["x"] + it["w"] for it in cluster)
+        top = min(it["y"] for it in cluster)
+        bot = max(it["y"] + it["h"] for it in cluster)
+        if abs(top - y0) <= 8:
+            top = min(top, y0)
+            bot = max(bot, y1)
+        ww, hh = x1 - x0, bot - top
+        if hh < h * _LETTER_HEIGHT_MIN or hh > h * 0.50 or ww > w * 0.14 or ww / max(hh, 1) > 0.90:
+            continue
+        canvas = np.zeros((hh, ww), np.uint8)
+        for comp in cluster:
+            part = _component_mask(lab, comp)
+            yy, xx = comp["y"] - top, comp["x"] - x0
+            canvas[yy:yy + comp["h"], xx:xx + comp["w"]] = np.maximum(
+                canvas[yy:yy + comp["h"], xx:xx + comp["w"]], part)
+        if int((canvas > 0).sum()) < 80:
+            continue
+        glyph = _glyph_from_mask(canvas, x0, top)
+        if glyph is not None:
+            glyphs.append(glyph)
+    return glyphs
+
+
 def _letter_glyphs(mask):
     """Tall narrow glyphs for a DEFEAT word.
 
-    The height floor is above the VICTORY walk. Splash scan-line scraps are
-    shorter than the header letters, and a shorter floor would take those
-    scraps as letters.
+    A header whose six letters are already separate components is returned as
+    those components. A thinner cut that comes back short of six is joined
+    first. The height floor on a finished letter does not move.
     """
-    cv2, np = _libs()
-    h, w = mask.shape[:2]
-    n, lab, st, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
-    glyphs = []
-    for i in range(1, n):
-        x, y, ww, hh, area = (int(t) for t in st[i])
-        if hh < h * 0.10 or hh > h * 0.50 or ww > w * 0.14 or area < 80:
-            continue
-        if ww / max(hh, 1) > 0.90:
-            continue
-        g = (lab[y:y + hh, x:x + ww] == i).astype(np.uint8) * 255
-        vec = _vec(np, g, (16, 32))
-        if vec is None:
-            continue
-        glyphs.append({"x": x, "y": y, "w": ww, "h": hh, "vec": vec})
-    return glyphs
+    lab, comps = _letter_components(mask)
+    strict = _strict_letters(lab, comps, mask.shape)
+    if len(strict) >= 6:
+        return strict
+    joined = _join_split_letters(lab, comps, strict, mask.shape)
+    if not joined:
+        return strict
+    return joined
 
 
 def _band_rows(glyphs):
@@ -358,32 +483,26 @@ def _defeat_row(items):
     return [it for _, _, _, it in found]
 
 
-def _defeat(img) -> bool:
-    """A sharp DEFEAT header on a red field.
+def _defeat_rows(pack):
+    """Calibrated header rows. Row 0 is the solid cut. Later rows are thinner cuts.
 
-    The letters are the clean top-right header. Each one has to clear 0.85
-    and the mean has to clear 0.90, and the field around the word has to be
-    red. The centered splash is cut by scan lines, so its D and T do not match
-    that header and it stays unread. A blurred word stays unread. Team totals
-    are not home and away: the screen does not label those sides, and the
-    receipt side is the side chosen at the start.
+    A word still has to clear 0.85 on every letter, mean 0.90, the margin, the
+    sharpness gate, and the red field. Another row does not relax those gates,
+    and the glitched splash is not a row.
     """
-    cv2, np = _libs()
-    pack = _pack()
-    bgr = _as_bgr(img)
-    if cv2 is None or pack is None or bgr is None or "defeat" not in pack:
-        return False
-    rows = pack["defeat"].astype(np.float32)
+    rows = pack["defeat"].astype(_libs()[1].float32)
     if rows.ndim != 3 or rows.shape[1] != len(_DEFEAT_LETTERS) or rows.shape[0] < 1:
-        return False
-    # Header letters only. A second row cannot stand in for a word that misses them.
-    templates = rows[0]
-    glyphs = _letter_glyphs(_white_mask(bgr))
-    if len(glyphs) < 6:
-        return False
-    for g in glyphs:
-        g["scores"] = templates @ g["vec"]
-    for row in _band_rows(glyphs):
+        return None
+    return rows
+
+
+def _defeat_on_row(bgr, glyphs, templates) -> bool:
+    scored = []
+    for glyph in glyphs:
+        item = dict(glyph)
+        item["scores"] = templates @ glyph["vec"]
+        scored.append(item)
+    for row in _band_rows(scored):
         found = _defeat_row(row["items"])
         if not found:
             continue
@@ -392,6 +511,34 @@ def _defeat(img) -> bool:
         if _red_around(bgr, found) < _RED_MIN:
             continue
         return True
+    return False
+
+
+def _defeat(img) -> bool:
+    """A sharp DEFEAT header on a red field.
+
+    The letters are the top-right header. Each one has to clear 0.85 and the
+    mean has to clear 0.90, and the field around the word has to be red. Solid
+    letters match the first calibrated row. A thinner cut is joined, then
+    matched to its own row, on those same gates. The centered splash is cut by
+    scan lines, so it stays unread. A blurred word stays unread. Team totals
+    are not home and away: the screen does not label those sides, and the
+    receipt side is the side chosen at the start.
+    """
+    cv2, _np = _libs()
+    pack = _pack()
+    bgr = _as_bgr(img)
+    if cv2 is None or pack is None or bgr is None or "defeat" not in pack:
+        return False
+    rows = _defeat_rows(pack)
+    if rows is None:
+        return False
+    glyphs = _letter_glyphs(_white_mask(bgr))
+    if len(glyphs) < 6:
+        return False
+    for templates in rows:
+        if _defeat_on_row(bgr, glyphs, templates):
+            return True
     return False
 
 
@@ -746,17 +893,31 @@ def _place_fixture(fixture_dir: Path, name: str, origin: tuple[int, int]):
     return canvas
 
 
-def _defeat_pack_rows(fixture_dir: Path):
-    """The six clean header letters, D E F E A T. The glitched splash is not a template."""
-    cv2, np = _libs()
-    header_im = _place_fixture(fixture_dir, DEFEAT_HEADER_ROI, DEFEAT_HEADER_ORIGIN)
+def _defeat_header_vecs(fixture_dir: Path, name: str, origin: tuple[int, int]):
+    """Six header letters, left to right, from one placed word crop."""
+    np = _libs()[1]
+    header_im = _place_fixture(fixture_dir, name, origin)
     header = _crop(header_im, "end_screen")
     if header is None:
-        raise RuntimeError("DEFEAT header crop could not be placed")
+        raise RuntimeError(f"{name} could not be placed")
     header_g = sorted(_letter_glyphs(_white_mask(header)), key=lambda g: g["x"])
     if len(header_g) != 6:
-        raise RuntimeError(f"expected 6 DEFEAT header letters, saw {len(header_g)}")
-    return np.stack([np.stack([g["vec"] for g in header_g])]).astype(np.float32)
+        raise RuntimeError(f"expected 6 DEFEAT header letters in {name}, saw {len(header_g)}")
+    return np.stack([g["vec"] for g in header_g]).astype(np.float32)
+
+
+def _defeat_pack_rows(fixture_dir: Path):
+    """One row per calibrated header cut, D E F E A T.
+
+    Row 0 is the solid Domination header. Row 1 is the thinner Kill Confirmed
+    header. The glitched splash is not a template.
+    """
+    np = _libs()[1]
+    rows = [
+        _defeat_header_vecs(fixture_dir, DEFEAT_HEADER_ROI, DEFEAT_HEADER_ORIGIN),
+        _defeat_header_vecs(fixture_dir, DEFEAT_KC_ROI, DEFEAT_KC_ORIGIN),
+    ]
+    return np.stack(rows).astype(np.float32)
 
 
 def build_calibration_pack(fixture_dir: Path = FIXTURE_DIR, out_path: Path = PACK_PATH) -> None:
