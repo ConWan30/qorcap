@@ -47,15 +47,22 @@ def test_victory_splash_agrees_and_midmatch_does_not():
 
 # Header word crops, pasted at the corner they occupied on the 720p frame.
 # The crops are the word and the red field. They do not include the scoreboard.
+# 030/031/033 are Domination match-20261101-092413. tdm is Team Deathmatch 162225.
+# kc is the sliced Kill Confirmed header, match-20261104-202724.
 HEADER_ROIS = (
     "defeat_header_030.png",
     "defeat_header_031.png",
     "defeat_header_033.png",
+    "defeat_header_tdm_030.png",
+    "defeat_header_kc_030.png",
 )
 HEADER_ORIGIN = H.DEFEAT_HEADER_ORIGIN
 # The glitched splash. It stays in the tree as a negative: the letters do not clear the header.
 SPLASH_ROI = "defeat_splash_028.png"
 SPLASH_ORIGIN = (340, 250)
+# Kill Confirmed splash from match-20261104-202724. Same miss: the centered word does not agree.
+KC_SPLASH_ROI = "defeat_splash_kc_028.png"
+KC_SPLASH_ORIGIN = (340, 240)
 VICTORY_OR_MID = (
     "end_173922_017.jpg",
     "end_173922_019.jpg",
@@ -75,7 +82,7 @@ def place(name: str, origin: tuple[int, int]):
 
 
 def test_defeat_confirms_and_does_not_cross_victory():
-    """DEFEAT agrees on the top-right header crops.
+    """DEFEAT agrees on Domination, Team Deathmatch, and the sliced Kill Confirmed header.
 
     Home and away stay unread. The glitched splash does not clear the header
     letters, so it does not agree. A VICTORY or mid-match frame does not agree
@@ -89,6 +96,8 @@ def test_defeat_confirms_and_does_not_cross_victory():
         assert rd.home is None and rd.away is None
     splash = end.read(place(SPLASH_ROI, SPLASH_ORIGIN))
     assert splash.confirm is False and splash.ok is False and splash.reason == "not_present"
+    kc_splash = end.read(place(KC_SPLASH_ROI, KC_SPLASH_ORIGIN))
+    assert kc_splash.confirm is False and kc_splash.ok is False and kc_splash.reason == "not_present"
     for name in VICTORY_OR_MID:
         rd = end.read(frame(name))
         assert rd.reason != "defeat"
@@ -99,9 +108,15 @@ def test_defeat_confirms_and_does_not_cross_victory():
     wiped[30:130, 980:1260] = 0
     missing = end.read(wiped)
     assert missing.confirm is False and missing.ok is False and missing.reason == "not_present"
+    wiped_kc = place("defeat_header_kc_030.png", HEADER_ORIGIN)
+    wiped_kc[30:130, 980:1260] = 0
+    assert end.read(wiped_kc).confirm is False and end.read(wiped_kc).reason == "not_present"
     cut = place(HEADER_ROIS[1], HEADER_ORIGIN)
     cut[40:120, 1155:1200] = 0
     assert end.read(cut).confirm is False and end.read(cut).home is None
+    cut_kc = place("defeat_header_kc_030.png", HEADER_ORIGIN)
+    cut_kc[40:120, 1080:1120] = 0
+    assert end.read(cut_kc).confirm is False and end.read(cut_kc).home is None
 
 
 def test_blur_does_not_confirm():

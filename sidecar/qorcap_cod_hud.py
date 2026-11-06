@@ -9,8 +9,9 @@ XP plates are presence only. A 25 or a 50 is not an assist and not a kill.
 The red kill marker is presence only. It is not a kill count.
 DEFEAT agrees on the top-right header the same way VICTORY does, when the
 six letters agree, the field around the word is red, and the word is sharp
-enough. A blurred word does not agree. Home and away stay unread when the
-screen does not label them.
+enough. A sliced header joins the strokes of one letter and matches that
+letter row. The same gates apply to every row. A blurred word does not agree.
+Home and away stay unread when the screen does not label them.
 """
 from __future__ import annotations
 
@@ -39,6 +40,20 @@ _RED_MIN = 0.20
 # on a 1280x720 frame. The crop is the word and the red field. It has no scoreboard.
 DEFEAT_HEADER_ROI = "defeat_header_030.png"
 DEFEAT_HEADER_ORIGIN = (980, 8)
+# Sliced header from Kill Confirmed match-20261104-202724. Same corner.
+DEFEAT_HEADER_KC_ROI = "defeat_header_kc_030.png"
+# A stroke of a sliced letter. Splash scan-line scraps are shorter than this.
+_STROKE_H_MIN = 0.07
+# A finished letter after its strokes are joined. A sliced letter can sit a
+# little under the solid header. Subtitle text is shorter than this.
+_LETTER_H_MIN = 0.08
+# A solid letter is wider than this share of its height. A narrower stroke
+# joins the next stroke when the gap is still inside one letter.
+_STROKE_ASPECT = 0.32
+_STROKE_GAP = 0.10
+_LETTER_ASPECT_MAX = 0.72
+# A sliced letter can be about a third shorter than the band and still be that word.
+_DEFEAT_ROW_H = 0.40
 # Header words on the personal K/A row.
 _HEADER_MIN = 0.70
 # Digit prototypes from those same rows.
@@ -224,29 +239,90 @@ def _victory_row(items):
     return [it for _, _, it in found]
 
 
-def _letter_glyphs(mask):
-    """Tall narrow glyphs for a DEFEAT word.
-
-    The height floor is above the VICTORY walk. Splash scan-line scraps are
-    shorter than the header letters, and a shorter floor would take those
-    scraps as letters.
-    """
+def _stroke_pieces(mask):
+    """Narrow white strokes. Splash scraps stay under the height floor."""
     cv2, np = _libs()
     h, w = mask.shape[:2]
     n, lab, st, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
-    glyphs = []
+    pieces = []
     for i in range(1, n):
         x, y, ww, hh, area = (int(t) for t in st[i])
-        if hh < h * 0.10 or hh > h * 0.50 or ww > w * 0.14 or area < 80:
+        if hh < h * _STROKE_H_MIN or hh > h * 0.50 or ww > w * 0.14 or area < 80:
             continue
         if ww / max(hh, 1) > 0.90:
             continue
         g = (lab[y:y + hh, x:x + ww] == i).astype(np.uint8) * 255
-        vec = _vec(np, g, (16, 32))
+        pieces.append({"x": x, "y": y, "w": ww, "h": hh, "mask": g})
+    return pieces
+
+
+def _join_strokes(pieces):
+    """Join strokes that still belong to one letter.
+
+    A solid letter is one stroke and comes back as it is. A sliced letter is
+    a few narrow strokes with a small gap. A stroke that is already as wide
+    as a letter is left alone, so two neighboring letters stay apart.
+    """
+    np = _libs()[1]
+    pieces = sorted(pieces, key=lambda p: (p["x"], p["y"]))
+    groups: list[list] = []
+    cur: list = []
+
+    def box(gs):
+        x0 = min(p["x"] for p in gs)
+        y0 = min(p["y"] for p in gs)
+        x1 = max(p["x"] + p["w"] for p in gs)
+        y1 = max(p["y"] + p["h"] for p in gs)
+        return x0, y0, x1, y1
+
+    for piece in pieces:
+        if not cur:
+            cur = [piece]
+            continue
+        x0, y0, x1, y1 = box(cur)
+        width = x1 - x0
+        height = max(1, y1 - y0)
+        gap = piece["x"] - x1
+        overlap = min(y1, piece["y"] + piece["h"]) - max(y0, piece["y"])
+        overlap_frac = overlap / max(1, min(height, piece["h"]))
+        narrow = width < height * _STROKE_ASPECT
+        close = gap <= max(2, int(round(height * _STROKE_GAP)))
+        combined = (piece["x"] + piece["w"]) - x0
+        if narrow and close and overlap_frac >= 0.55 and combined <= height * _LETTER_ASPECT_MAX:
+            cur.append(piece)
+        else:
+            groups.append(cur)
+            cur = [piece]
+    if cur:
+        groups.append(cur)
+
+    glyphs = []
+    for gs in groups:
+        x0, y0, x1, y1 = box(gs)
+        if y1 <= y0 or x1 <= x0:
+            continue
+        canvas = np.zeros((y1 - y0, x1 - x0), np.uint8)
+        for piece in gs:
+            yy = piece["y"] - y0
+            xx = piece["x"] - x0
+            patch = canvas[yy:yy + piece["h"], xx:xx + piece["w"]]
+            canvas[yy:yy + piece["h"], xx:xx + piece["w"]] = np.maximum(patch, piece["mask"])
+        vec = _vec(np, canvas, (16, 32))
         if vec is None:
             continue
-        glyphs.append({"x": x, "y": y, "w": ww, "h": hh, "vec": vec})
+        glyphs.append({"x": x0, "y": y0, "w": x1 - x0, "h": y1 - y0, "vec": vec})
     return glyphs
+
+
+def _letter_glyphs(mask):
+    """Letters of a DEFEAT word, solid or sliced.
+
+    Splash scan-line scraps are shorter than a stroke, so they are not letters.
+    A finished letter still has to clear the letter floor. A short scrap that
+    never joins a letter stays out.
+    """
+    h = mask.shape[0]
+    return [g for g in _join_strokes(_stroke_pieces(mask)) if g["h"] >= h * _LETTER_H_MIN]
 
 
 def _band_rows(glyphs):
@@ -322,7 +398,7 @@ def _defeat_row(items):
     med = float(np.median(heights))
     if med < 8:
         return None
-    items = [it for it in items if abs(it["h"] - med) / med <= 0.30]
+    items = [it for it in items if abs(it["h"] - med) / med <= _DEFEAT_ROW_H]
     labeled = []
     for it in items:
         by: dict[str, float] = {}
@@ -358,15 +434,32 @@ def _defeat_row(items):
     return [it for _, _, _, it in found]
 
 
+def _score_letter_rows(rows, glyphs):
+    """Score the same glyphs against each header sample.
+
+    Each row is one complete sample. The caller does not mix letters across
+    rows: a miss on one sample stays a miss.
+    """
+    scored_rows = []
+    for templates in rows:
+        scored = []
+        for g in glyphs:
+            item = dict(g)
+            item["scores"] = templates @ g["vec"]
+            scored.append(item)
+        scored_rows.append(scored)
+    return scored_rows
+
+
 def _defeat(img) -> bool:
     """A sharp DEFEAT header on a red field.
 
-    The letters are the clean top-right header. Each one has to clear 0.85
-    and the mean has to clear 0.90, and the field around the word has to be
-    red. The centered splash is cut by scan lines, so its D and T do not match
-    that header and it stays unread. A blurred word stays unread. Team totals
-    are not home and away: the screen does not label those sides, and the
-    receipt side is the side chosen at the start.
+    The solid header and the sliced header are separate letter rows. Each
+    letter has to clear 0.85 and the mean has to clear 0.90, and the field
+    around the word has to be red. The centered splash is cut by scan lines,
+    so its letters do not clear either row and it stays unread. A blurred
+    word stays unread. Team totals are not home and away: the screen does not
+    label those sides, and the receipt side is the side chosen at the start.
     """
     cv2, np = _libs()
     pack = _pack()
@@ -376,22 +469,19 @@ def _defeat(img) -> bool:
     rows = pack["defeat"].astype(np.float32)
     if rows.ndim != 3 or rows.shape[1] != len(_DEFEAT_LETTERS) or rows.shape[0] < 1:
         return False
-    # Header letters only. A second row cannot stand in for a word that misses them.
-    templates = rows[0]
     glyphs = _letter_glyphs(_white_mask(bgr))
     if len(glyphs) < 6:
         return False
-    for g in glyphs:
-        g["scores"] = templates @ g["vec"]
-    for row in _band_rows(glyphs):
-        found = _defeat_row(row["items"])
-        if not found:
-            continue
-        if _sharpness(bgr, found) < _SHARP_MIN:
-            continue
-        if _red_around(bgr, found) < _RED_MIN:
-            continue
-        return True
+    for scored in _score_letter_rows(rows, glyphs):
+        for row in _band_rows(scored):
+            found = _defeat_row(row["items"])
+            if not found:
+                continue
+            if _sharpness(bgr, found) < _SHARP_MIN:
+                continue
+            if _red_around(bgr, found) < _RED_MIN:
+                continue
+            return True
     return False
 
 
@@ -746,17 +836,29 @@ def _place_fixture(fixture_dir: Path, name: str, origin: tuple[int, int]):
     return canvas
 
 
-def _defeat_pack_rows(fixture_dir: Path):
-    """The six clean header letters, D E F E A T. The glitched splash is not a template."""
-    cv2, np = _libs()
-    header_im = _place_fixture(fixture_dir, DEFEAT_HEADER_ROI, DEFEAT_HEADER_ORIGIN)
+def _header_letter_vecs(fixture_dir: Path, name: str, origin: tuple[int, int]):
+    """Six header letters, left to right. The glitched splash is not a sample."""
+    np = _libs()[1]
+    header_im = _place_fixture(fixture_dir, name, origin)
     header = _crop(header_im, "end_screen")
     if header is None:
-        raise RuntimeError("DEFEAT header crop could not be placed")
+        raise RuntimeError(f"{name} could not be placed")
     header_g = sorted(_letter_glyphs(_white_mask(header)), key=lambda g: g["x"])
     if len(header_g) != 6:
-        raise RuntimeError(f"expected 6 DEFEAT header letters, saw {len(header_g)}")
-    return np.stack([np.stack([g["vec"] for g in header_g])]).astype(np.float32)
+        raise RuntimeError(f"{name}: expected 6 DEFEAT header letters, saw {len(header_g)}")
+    return np.stack([g["vec"] for g in header_g]).astype(np.float32)
+
+
+def _defeat_pack_rows(fixture_dir: Path):
+    """Solid header, then the sliced header. Each row is D E F E A T."""
+    np = _libs()[1]
+    samples = (
+        (DEFEAT_HEADER_ROI, DEFEAT_HEADER_ORIGIN),
+        (DEFEAT_HEADER_KC_ROI, DEFEAT_HEADER_ORIGIN),
+    )
+    return np.stack([
+        _header_letter_vecs(fixture_dir, name, origin) for name, origin in samples
+    ]).astype(np.float32)
 
 
 def build_calibration_pack(fixture_dir: Path = FIXTURE_DIR, out_path: Path = PACK_PATH) -> None:

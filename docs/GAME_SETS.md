@@ -73,7 +73,7 @@ Official challenges stay closed on this set. No Call of Duty pause moment is wir
 Calibrated from Con's private practice frames (Kill Confirmed match-20261105-173922, plus earlier scoreboard and HUD crops). This is not a public verification.
 
 - VICTORY on the splash and on the match-complete header. A mid-match frame does not confirm. A blurred word does not confirm.
-- DEFEAT on the top-right header when all six letters agree and the field around the word is red, from the header crops of match-20261101-092413. The glitched splash does not agree. A blurred word does not agree. A VICTORY frame does not confirm as DEFEAT, and a DEFEAT frame does not confirm as VICTORY.
+- DEFEAT on the top-right header when all six letters agree and the field around the word is red. Checked on Domination (match-20261101-092413), Team Deathmatch (162225), and Kill Confirmed (match-20261104-202724) private practice frames. The sliced Kill Confirmed letters are the same header read. The glitched splash does not agree. A blurred word does not agree. A VICTORY frame does not confirm as DEFEAT, and a DEFEAT frame does not confirm as VICTORY. This is not a public verification.
 - Hitmarker strokes, the red kill marker (presence only, not a kill count), the XP plate (presence only; a 25 or a 50 is not an assist), and killfeed weapon-icon presence.
 - Scoreboard K and A when that digit row is visible. Missing digits stay not Counted.
 
