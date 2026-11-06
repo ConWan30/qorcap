@@ -116,6 +116,9 @@ def test_blur_does_not_confirm():
     """A sigma-2 blur still looks like the letters and does not agree.
 
     A clean word sits near 0.45 on the sharpness gate. This blur sits near 0.20.
+    A one-pixel blur of the splash, and that splash scaled from 720p up to
+    1080p, still agree. A sigma-2 blur of the scaled splash does not. The
+    letter score is not what rejects the blur.
     """
     end = C.CodEndScreenReader()
     samples = [(name, HEADER_ORIGIN) for name in HEADER_ROIS]
@@ -126,11 +129,23 @@ def test_blur_does_not_confirm():
         blur = cv2.GaussianBlur(sharp, (0, 0), 2)
         rd = end.read(blur)
         assert rd.confirm is False and rd.ok is False and rd.reason == "not_present", name
-    for name in ("end_173922_017.jpg", "end_173922_019.jpg"):
-        assert end.read(frame(name)).reason == "victory"
-        blur = cv2.GaussianBlur(frame(name), (0, 0), 2)
+    splash = frame("end_173922_017.jpg")
+    header = frame("end_173922_019.jpg")
+    assert end.read(splash).reason == "victory"
+    assert end.read(header).reason == "victory"
+    assert end.read(cv2.GaussianBlur(splash, (0, 0), 1)).reason == "victory"
+    up = cv2.resize(splash, (1920, 1080), interpolation=cv2.INTER_LINEAR)
+    scaled = end.read(up)
+    assert scaled.ok and scaled.calibrated and scaled.confirm and scaled.reason == "victory"
+    for img, name in ((splash, "splash"), (header, "header"), (up, "upscaled")):
+        blur = cv2.GaussianBlur(img, (0, 0), 2)
         rd = end.read(blur)
         assert rd.confirm is False and rd.ok is False and rd.reason == "not_present", name
+    mid = end.read(frame("mid_173922_120s.jpg"))
+    assert mid.confirm is False and mid.ok is False and mid.reason == "not_present"
+    defeat = end.read(place(HEADER_ROIS[0], HEADER_ORIGIN))
+    assert defeat.reason == "defeat"
+    assert end.read(splash).reason != "defeat"
 
 
 def test_defeat_does_not_post_a_final_without_scores():

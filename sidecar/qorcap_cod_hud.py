@@ -32,8 +32,12 @@ _DEFEAT_LETTERS = ("D", "E", "F", "E", "A", "T")
 _DEFEAT_LETTER_MIN = 0.85
 _DEFEAT_LETTER_MEAN = 0.90
 # Top Sobel gradient over the word's text contrast. A 3x3 Sobel peaks near
-# eight times a one-pixel step, so the ratio is divided by 8. A clean word
-# sits near 0.45. A sigma-2 blur sits near 0.20. Below this the word does not agree.
+# eight times a one-pixel step, so the ratio is divided by 8. The gradient
+# is the 99th percentile and the contrast is the 5th-to-98th percentile gap.
+# A clean word sits near 0.45. A sigma-2 blur sits near 0.20. Below this the
+# word does not agree. The 95th percentile over the 10-90 gap scored the large
+# splash near 0.33. A one-pixel blur and a 720p frame scaled up to 1080p then
+# fell short of this floor, while those letters still matched.
 _SHARP_MIN = 0.26
 # Share of the word box that is red (OpenCV hue near 0, saturation at least 60).
 _RED_MIN = 0.20
@@ -408,7 +412,12 @@ def _word_box(glyphs, shape, pad: int = 2):
 def _sharpness(bgr, glyphs) -> float:
     """Top gradient divided by text contrast on the word box.
 
-    A clean word lands near 0.45. A sigma-2 blur lands near 0.20.
+    The gradient is the 99th percentile of a 3x3 Sobel magnitude. Contrast
+    is the gap from the 5th to the 98th percentile of the gray word box.
+    A 3x3 Sobel peaks near eight times a one-pixel step, so the ratio is
+    divided by 8. A clean splash and a clean header land near 0.45. A
+    sigma-2 blur lands near 0.20. Below the floor the word does not agree.
+    A low contrast returns 0, so an unreadable box does not agree.
     """
     cv2, np = _libs()
     box = _word_box(glyphs, bgr.shape)
@@ -416,13 +425,13 @@ def _sharpness(bgr, glyphs) -> float:
         return 0.0
     x0, y0, x1, y1 = box
     gray = cv2.cvtColor(bgr[y0:y1, x0:x1], cv2.COLOR_BGR2GRAY).astype(np.float32)
-    lo, hi = np.percentile(gray, [10.0, 90.0])
+    lo, hi = np.percentile(gray, [5.0, 98.0])
     contrast = float(hi - lo)
     if contrast < 8.0:
         return 0.0
     gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
     gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
-    top = float(np.percentile(cv2.magnitude(gx, gy), 95.0))
+    top = float(np.percentile(cv2.magnitude(gx, gy), 99.0))
     return top / contrast / 8.0
 
 
