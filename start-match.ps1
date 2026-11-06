@@ -12,7 +12,8 @@ function Find-ThisRunBundle($argList, $since) {
   $valueFlags = @(
     "--out", "--qorcap", "--ffmpeg", "--qortime", "--side", "--role", "--key-dir", "--device",
     "--encoder", "--res", "--fps", "--input-format", "--audio", "--referee-url", "--port",
-    "--player-id", "--test-secs", "--hz", "--role-reason", "--pre", "--post", "--samples"
+    "--player-id", "--test-secs", "--hz", "--role-reason", "--pre", "--post", "--samples",
+    "--game"
   )
   $root = Join-Path ([Environment]::GetFolderPath("MyDocuments")) "QorCap Matches"
   $explicit = $null
@@ -122,6 +123,13 @@ if (-not $hasChallengeFlag -and -not $isFinalize) { $fwd = @("--official-challen
 $hasSide = $false
 foreach ($x in $fwd) { if ($x -eq "--side" -or $x -eq "--role" -or $x -like "--side=*" -or $x -like "--role=*") { $hasSide = $true } }
 if (-not $hasSide -and -not $isFinalize) { $fwd = @("--side", "ask") + $fwd }
+
+# Game set: Madden or Call of Duty, before the side prompt. "Start Match.cmd --game cod"
+# (or madden) skips the prompt. A one-shot next-game.txt in %LOCALAPPDATA%\QorCap does too
+# (renamed after use; ignored if older than 4 h or not madden/cod).
+$hasGame = $false
+foreach ($x in $fwd) { if ($x -eq "--game" -or $x -like "--game=*") { $hasGame = $true } }
+if (-not $hasGame -and -not $isFinalize) { $fwd = @("--game", "ask") + $fwd }
 
 # Glimpse defaults (v0.3.28). The default lives in this launcher. qorcap.exe stays default-off:
 # this script does not pass the record frame flag, and the flag-off tests are unchanged.

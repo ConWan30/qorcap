@@ -373,6 +373,15 @@ pub struct RecordArgs {
     /// start checkpoint and bundle.json. Omitted = not recorded (older launchers, tests).
     #[arg(long, value_parser = ["prompt", "flag", "file"])]
     pub side_source: Option<String>,
+    /// Receipt ``match.game``. Omitted keeps ``madden27`` (older launchers and tests).
+    #[arg(long, value_parser = ["madden27", "cod_mw4"])]
+    pub game: Option<String>,
+    /// Receipt ``match.scorebug_profile``. Omitted keeps ``madden27_standard``.
+    #[arg(long, value_parser = [
+        "madden27_standard", "madden27_monday_night", "madden27_sunday_night",
+        "madden27_thursday_night", "cod_mw4_hud"
+    ])]
+    pub scorebug_profile: Option<String>,
     #[arg(long, default_value = "local:player")]
     pub player_id: String,
     /// Seconds saved for each automatic score-change clip
