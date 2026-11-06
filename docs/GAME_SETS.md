@@ -16,8 +16,8 @@ The choice is written to `game_set.json` beside the match. That file is not a re
 ## Call of Duty (MW4 / modern)
 
 - Set id `cod`. Receipt game `cod_mw4`. Profile `cod_mw4_hud`.
-- The match window ends when the end screen agrees (3 strictly later timestamps across 3 seconds), the same bar Madden uses for a final screen. A frame that is not the end screen, a missing home and away, a repeated timestamp, or a gap longer than 3 seconds starts that count over. The result and the score pair have to stay the same. A scoreboard number is not that pair. Stopping QorCap does not read that screen. The receipt quarter is 4 because this end screen has no game clock. It is not a Madden quarter.
-- `final_confirmed` is true only when a calibrated end-screen hook sets confirm. That is end-screen agreement. It is not a verification verdict. The hook sets confirm when it reads VICTORY or DEFEAT. These practice frames do not assign home and away, so they do not post a final score.
+- The match window ends when the end screen agrees (3 strictly later timestamps across 3 seconds), the same bar Madden uses for a final screen. Home and away have to both be read before that count starts. A frame that is not the end screen clears it. A repeated timestamp or a gap longer than 3 seconds starts it over. The result and the score pair have to stay the same. A scoreboard number is not that pair. Stopping QorCap does not read that screen. The receipt quarter is 4 because this end screen has no game clock. It is not a Madden quarter.
+- `final_confirmed` is written only when a calibrated end-screen hook sets confirm and the runner posts a final. That is end-screen agreement. It is not a verification verdict. DEFEAT can agree on the header. Home and away stay unassigned on these frames, so the 3-frame, 3-second bar is never reached and no final is posted today.
 
 ### Controller and video clock
 
@@ -58,7 +58,7 @@ These tags are not written onto input rows. Input rows stay in the checkpoint ha
 
 Agreement across the signals above is a checkable record of the match. Disagreement is flagged a mismatch, or the signal is not Counted. The recorder does not stamp a hosted verification on its own. A local signature stays on the path Start Match already uses.
 
-QorCap/QorTime’s CoD path is built so a player can leave a correlated match record (controller + video + HUD + scoreboard hooks) that others can check — a skill-verification layer for the CoD community that is not a kernel anti-cheat and not a ban product.
+QorCap/QorTime’s CoD path is built so a player can leave a correlated match record (controller + video + HUD + scoreboard hooks) that others can check: agreed, Counted, a receipt, a mismatch, or not Counted.
 
 Official challenges stay closed on this set. No Call of Duty pause moment is wired for them. Anchors can still run.
 
