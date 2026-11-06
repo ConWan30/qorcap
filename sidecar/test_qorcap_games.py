@@ -186,6 +186,91 @@ def test_long_input_log_keeps_the_wall_anchor(tmp_path):
     assert any(isinstance(r, dict) and r.get("type") == "header" for r in loaded["inputs"])
 
 
+def _scripted(reads):
+    pending = list(reads)
+
+    class End:
+        def read(self, img):
+            return pending.pop(0)
+
+    return End()
+
+
+def _scored(reason, home, away, *, confirm=False, ok=True, calibrated=True):
+    return C.RegionRead("end_screen", "read", ok, reason, calibrated, home=home, away=away, confirm=confirm)
+
+
+def _blank_end():
+    return C.RegionRead("end_screen", "not_read", False, "not_present", False)
+
+
+def _run_end(reads):
+    posted = []
+    runner = C.CodSetRunner(posted.append, hud=type("H", (), {"read": lambda self, img: []})(),
+                            end=_scripted(rd for _t, rd in reads))
+    for t, _rd in reads:
+        runner.on_frame(t, _Img())
+    return posted
+
+
+def test_end_screen_bar_needs_distinct_times_and_resets():
+    """The match window counts strictly later timestamps of one result and one score.
+
+    A repeated timestamp, a gap longer than the bar, a non-end frame, or a
+    different result or score starts over. Scoreboard digits are not the pair.
+    """
+    same = _scored("victory", 3, 1, confirm=True)
+    assert _run_end([(0, same), (0, same), (0, same), (3000, same)]) == []
+    assert _run_end([(0, same), (1000, same), (4001, same)]) == []
+    held = _run_end([(0, same), (1000, same), (4000, same)])
+    assert len(held) == 1 and held[0]["t_ms"] == 0 and held[0]["home"] == 3 and held[0]["away"] == 1
+    assert held[0]["final_confirmed"] is True
+
+    restarted = _run_end([
+        (0, same),
+        (1000, same),
+        (1500, _blank_end()),
+        (2000, same),
+        (3000, same),
+        (5000, same),
+    ])
+    assert len(restarted) == 1
+    assert restarted[0]["t_ms"] == 2000
+    assert restarted[0]["end_screen"]["until_ms"] == 5000
+
+    gapped = _run_end([(0, same), (1000, same), (10000, same), (11000, same), (14000, same)])
+    assert len(gapped) == 1 and gapped[0]["t_ms"] == 10000
+
+    defeat = _scored("defeat", 3, 1, confirm=True)
+    switched = _run_end([(0, same), (1000, same), (4000, defeat), (5000, defeat), (8000, defeat)])
+    assert len(switched) == 1 and switched[0]["t_ms"] == 4000 and switched[0]["final_confirmed"] is True
+
+    other = _scored("victory", 4, 1, confirm=True)
+    rescored = _run_end([(0, same), (1000, same), (2000, other), (3000, other), (5000, other)])
+    assert len(rescored) == 1 and rescored[0]["home"] == 4 and rescored[0]["t_ms"] == 2000
+
+    quiet = _scored("victory", 3, 1, confirm=False)
+    mixed = _run_end([(0, same), (1000, same), (4000, quiet), (5000, quiet), (8000, quiet)])
+    assert len(mixed) == 1 and mixed[0]["t_ms"] == 4000 and mixed[0]["final_confirmed"] is False
+
+    board = C.RegionRead("scoreboard", "read", True, "scoreboard_ka", True, board_kills=90, board_assists=12)
+    posted = []
+
+    class Hud:
+        def read(self, img):
+            return [board]
+
+    class Presence:
+        def read(self, img):
+            return C.RegionRead("end_screen", "read", True, "defeat", True, confirm=True)
+
+    runner = C.CodSetRunner(posted.append, hud=Hud(), end=Presence())
+    for t in (0, 1000, 4000):
+        runner.on_frame(t, _Img())
+    assert posted == []
+    assert runner.final is None
+
+
 def test_calibrated_end_screen_needs_three_frames(tmp_path):
     class End:
         def __init__(self, read):

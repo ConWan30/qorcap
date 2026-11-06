@@ -16,8 +16,8 @@ The choice is written to `game_set.json` beside the match. That file is not a re
 ## Call of Duty (MW4 / modern)
 
 - Set id `cod`. Receipt game `cod_mw4`. Profile `cod_mw4_hud`.
-- The match window ends when the end screen agrees (3 frames across 3 seconds), the same bar Madden uses for a final screen. Stopping QorCap does not read that screen. The receipt quarter is 4 because this end screen has no game clock. It is not a Madden quarter.
-- `final_confirmed` is true only when a calibrated end-screen hook sets confirm. That is end-screen agreement. It is not a verification verdict. The hook sets confirm when it reads VICTORY. DEFEAT is not in this calibration set, so it does not confirm. These practice frames do not assign home and away, so they do not post a final score.
+- The match window ends when the end screen agrees (3 strictly later timestamps across 3 seconds), the same bar Madden uses for a final screen. A frame that is not the end screen, a missing home and away, a repeated timestamp, or a gap longer than 3 seconds starts that count over. The result and the score pair have to stay the same. A scoreboard number is not that pair. Stopping QorCap does not read that screen. The receipt quarter is 4 because this end screen has no game clock. It is not a Madden quarter.
+- `final_confirmed` is true only when a calibrated end-screen hook sets confirm. That is end-screen agreement. It is not a verification verdict. The hook sets confirm when it reads VICTORY or DEFEAT. These practice frames do not assign home and away, so they do not post a final score.
 
 ### Controller and video clock
 
@@ -72,14 +72,14 @@ Official challenges stay closed on this set. No Call of Duty pause moment is wir
 
 Calibrated from Con's private practice frames (Kill Confirmed match-20261105-173922, plus earlier scoreboard and HUD crops). This is not a public verification.
 
-- VICTORY on the splash and on the match-complete header. A mid-match frame does not confirm.
+- VICTORY on the splash and on the match-complete header. A mid-match frame does not confirm. A blurred word does not confirm.
+- DEFEAT on the top-right header when all six letters agree and the field around the word is red, from the header crops of match-20261101-092413. The glitched splash does not agree. A blurred word does not agree. A VICTORY frame does not confirm as DEFEAT, and a DEFEAT frame does not confirm as VICTORY.
 - Hitmarker strokes, the red kill marker (presence only, not a kill count), the XP plate (presence only; a 25 or a 50 is not an assist), and killfeed weapon-icon presence.
 - Scoreboard K and A when that digit row is visible. Missing digits stay not Counted.
 
 Still open:
 
-- DEFEAT has no calibration frame here, so it does not confirm.
-- Home and away are not assigned from the team totals on these frames. No final score is posted until both are read. Re-read the end screen during finalize once that read exists.
+- Home and away are not assigned from the team totals on these frames. The screen does not label those sides, and the receipt side is the side chosen at the start. No final score is posted until both are read. Re-read the end screen during finalize once that read exists.
 - The scoreboard comparison stays not Counted until an offline kills and assists count exists. It does not post a final.
 - Pause and the crosshair are still not read.
 - Stick turn against camera turn, rumble against an on-screen hit, and power stay INFO-ONLY and not Counted.

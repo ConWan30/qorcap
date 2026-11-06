@@ -27,11 +27,11 @@ must sit within ``FRAME_CLOCK_GAP_US`` (500 ms, ``MEASURED_MAX_GAP_US``) of
 both the screen time and the input time. The manifest fit is not used. With
 the frame clock off, a hook is not Counted.
 
-Hitmarker, kill popup, killfeed presence, VICTORY on the end screen, and
-scoreboard K/A are calibrated from Con's private practice frames. They set
-``calibrated`` and ``ok`` only when that signal is on the frame. Pause and the
-crosshair stay not read. An unreadable hook is not Counted, posts no score,
-and posts no final. Those frames are not a public verification.
+Hitmarker, kill popup, killfeed presence, VICTORY and DEFEAT on the end
+screen, and scoreboard K/A are calibrated from Con's private practice frames.
+They set ``calibrated`` and ``ok`` only when that signal is on the frame.
+Pause and the crosshair stay not read. An unreadable hook is not Counted,
+posts no score, and posts no final. Those frames are not a public verification.
 
 Words on the log and the receipt note: agreed, flagged a mismatch, Counted,
 receipt. A local end-screen read is not a verification verdict.
@@ -58,11 +58,14 @@ MISMATCH = "flagged a mismatch"
 NOT_COUNTED = "not Counted"
 
 # (name, x, y, w, h) in 0..1 of a 16:9 frame.
-# Measured on Con's private practice frames (match-20261105-173922 and the
-# scoreboard strips). Pause is still only a crop.
-# end_screen holds the splash VICTORY (x 0.29-0.71, y 0.40-0.62 on
-# end_173922_017) and the match-complete VICTORY header (x ~0.05-0.22,
-# y ~0.07-0.15 on end_173922_019).
+# Measured on Con's private practice frames (match-20261105-173922,
+# match-20261101-092413, and the scoreboard strips). Pause is still only a crop.
+# end_screen holds the centered splash (VICTORY on end_173922_017, x 0.29-0.71,
+# y 0.40-0.62) and the match-complete header.
+# VICTORY sits top-left (x ~0.05-0.22, y ~0.07-0.15 on end_173922_019).
+# DEFEAT sits top-right (x ~0.81-0.96, y ~0.07-0.16). The older crop stopped
+# at x 0.83 and cut that word, so this crop runs out to that edge. The reader
+# agrees on that header. The glitched splash is not enough on its own.
 # hitmarker is the center aim window. kill_popup is the center XP plate.
 # killfeed is the top-right, above the killstreak banner on these frames.
 # scoreboard is the whole frame: the K/A strip is a short crop, and the
@@ -74,7 +77,7 @@ REGIONS: tuple[tuple[str, tuple[float, float, float, float]], ...] = (
     ("kill_popup", (0.30, 0.28, 0.40, 0.36)),
     ("killfeed", (0.64, 0.01, 0.34, 0.16)),
     ("pause", (0.20, 0.15, 0.60, 0.70)),
-    ("end_screen", (0.03, 0.02, 0.80, 0.68)),
+    ("end_screen", (0.02, 0.02, 0.96, 0.68)),
     ("scoreboard", (0.00, 0.00, 1.00, 1.00)),
 )
 HUD_NAMES = ("crosshair", "hitmarker", "kill_popup", "killfeed", "pause", "scoreboard")
@@ -105,6 +108,9 @@ INFO_ONLY = {
 
 END_AGREE_FRAMES = 3
 END_AGREE_SPAN_MS = 3000
+# A hole longer than the bar is not one showing. The candidate starts over.
+# A 2000 ms step, which the three-frame check uses, is still inside this cap.
+END_AGREE_GAP_MS = END_AGREE_SPAN_MS
 
 STUB_NOTE = "hook only: this region is cropped and not read. It is not Counted."
 
@@ -170,11 +176,15 @@ class CodHudReader:
 class CodEndScreenReader:
     """The Call of Duty end screen. This is the end of the match.
 
-    ``confirm`` is set only when the frame shows VICTORY. The runner still
-    requires the same 3 frames across 3 seconds before it posts, and it posts
-    only when home and away are both read. ``confirm`` is the only way the
-    receipt field ``final_confirmed`` becomes true. That field is the
-    end-screen agreement. It is not a verification verdict.
+    ``confirm`` is set only when the frame shows a sharp VICTORY or a sharp
+    DEFEAT header on a red field. A blurred word does not confirm. Splash and
+    header reads stay presence-only: they do not fill home and away. The runner
+    still requires 3 strictly later timestamps across 3 seconds before it posts,
+    and it posts only when home and away are both read and the result is the
+    same on each of those frames. A gap, a non-end frame, or a different result
+    or score starts that count over. ``confirm`` is the only way the receipt
+    field ``final_confirmed`` becomes true. That field is the end-screen
+    agreement. It is not a verification verdict.
     """
 
     def read(self, img) -> RegionRead:
@@ -365,8 +375,11 @@ class CodSetRunner:
 
     HUD hooks are logged and are not posted to ``/events``. The only event
     this runner posts is a final, after a calibrated end screen agrees for
-    3 frames across 3 seconds. In-match signals (hitmarker, killfeed, pause,
-    recoil) stay on ``cod_signals.jsonl``. They do not become a score.
+    3 strictly later timestamps across 3 seconds, with the same result and the
+    same home and away. A frame that is not that end screen, a missing score
+    pair, a repeated or earlier timestamp, or a gap longer than 3 seconds
+    starts the count over. Scoreboard kills and assists are not home and away
+    and do not post a final. In-match signals stay on ``cod_signals.jsonl``.
     """
 
     def __init__(self, post, hud=None, end=None, log_path: Path | None = None) -> None:
@@ -389,6 +402,7 @@ class CodSetRunner:
         self._pair = None
         self._n = 0
         self._t0 = None
+        self._last_t = None
         self.last_hitmarker = NOT_COUNTED
         self.last_hitmarker_us = None
 
@@ -436,17 +450,26 @@ class CodSetRunner:
         except Exception as e:
             self.stats["errors"] += 1
             print(f"Call of Duty end-screen hook error: {type(e).__name__}: {e}", file=sys.stderr)
+            self._clear_end_candidate()
             return
         if self.final is not None:
             return
+        # Home and away come only from this end-screen read. A scoreboard
+        # kill, assist, or team total is not that pair and is not a final.
         if not (end.ok and end.calibrated):
             self.stats["end_screen_not_read"] += 1
+            self._clear_end_candidate()
             return
         home, away = _score(end.home), _score(end.away)
-        if home is None or away is None:
+        if home is None or away is None or not isinstance(end.reason, str) or not end.reason:
             self.stats["end_screen_not_read"] += 1
+            self._clear_end_candidate()
             return
-        agreed = self._offer(int(t_ms), home, away)
+        when = t_ms if isinstance(t_ms, int) and not isinstance(t_ms, bool) else None
+        if when is None:
+            self._clear_end_candidate()
+            return
+        agreed = self._offer(when, end.reason, bool(end.confirm), home, away)
         if agreed is None:
             return
         confirmed = bool(end.confirm)
@@ -524,14 +547,35 @@ class CodSetRunner:
             {"signal": "end_screen", "status": NOT_COUNTED},
         ]
 
-    def _offer(self, t_ms: int, home: int, away: int) -> dict | None:
-        pair = (home, away)
-        if pair != self._pair:
-            self._pair = pair
-            self._n = 1
-            self._t0 = t_ms
+    def _clear_end_candidate(self) -> None:
+        self._pair = None
+        self._n = 0
+        self._t0 = None
+        self._last_t = None
+
+    def _begin_end_candidate(self, t_ms: int, key: tuple) -> None:
+        self._pair = key
+        self._n = 1
+        self._t0 = t_ms
+        self._last_t = t_ms
+
+    def _offer(self, t_ms: int, reason: str, confirm: bool, home: int, away: int) -> dict | None:
+        """One more end-screen sample. None until the bar is met.
+
+        The sample counts only when its timestamp is strictly later than the
+        last accepted one, the gap is within the cap, and the result and the
+        score pair are unchanged. Anything else starts a new candidate at this
+        timestamp and does not post.
+        """
+        key = (reason, bool(confirm), home, away)
+        if key != self._pair or not isinstance(self._last_t, int):
+            self._begin_end_candidate(t_ms, key)
+            return None
+        if t_ms <= self._last_t or t_ms - self._last_t > END_AGREE_GAP_MS:
+            self._begin_end_candidate(t_ms, key)
             return None
         self._n += 1
+        self._last_t = t_ms
         t0 = self._t0 if isinstance(self._t0, int) else t_ms
         if self._n >= END_AGREE_FRAMES and t_ms - t0 >= END_AGREE_SPAN_MS:
             return {"home": home, "away": away, "frames": self._n, "t_ms": t0, "until_ms": t_ms}

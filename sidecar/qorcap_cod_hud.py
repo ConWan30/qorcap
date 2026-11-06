@@ -7,6 +7,10 @@ write a receipt field.
 
 XP plates are presence only. A 25 or a 50 is not an assist and not a kill.
 The red kill marker is presence only. It is not a kill count.
+DEFEAT agrees on the top-right header the same way VICTORY does, when the
+six letters agree, the field around the word is red, and the word is sharp
+enough. A blurred word does not agree. Home and away stay unread when the
+screen does not label them.
 """
 from __future__ import annotations
 
@@ -18,6 +22,23 @@ FIXTURE_DIR = Path(__file__).resolve().parent / "fixtures" / "cod"
 # Letter row on the splash and on the match-complete header.
 _LETTER_MIN = 0.70
 _LETTER_MEAN = 0.85
+# E and F are close. A letter that does not clear the next one stays unread.
+_LETTER_MARGIN = 0.08
+# DEFEAT template order. The two E's are separate samples of the same letter.
+_DEFEAT_LETTERS = ("D", "E", "F", "E", "A", "T")
+# DEFEAT is tighter than VICTORY. Every letter has to clear this, and the mean too.
+_DEFEAT_LETTER_MIN = 0.85
+_DEFEAT_LETTER_MEAN = 0.90
+# Top Sobel gradient over the word's text contrast. A 3x3 Sobel peaks near
+# eight times a one-pixel step, so the ratio is divided by 8. A clean word
+# sits near 0.45. A sigma-2 blur sits near 0.20. Below this the word does not agree.
+_SHARP_MIN = 0.26
+# Share of the word box that is red (OpenCV hue near 0, saturation at least 60).
+_RED_MIN = 0.20
+# Top-right header crop from the practice frames, pasted back at this origin
+# on a 1280x720 frame. The crop is the word and the red field. It has no scoreboard.
+DEFEAT_HEADER_ROI = "defeat_header_030.png"
+DEFEAT_HEADER_ORIGIN = (980, 8)
 # Header words on the personal K/A row.
 _HEADER_MIN = 0.70
 # Digit prototypes from those same rows.
@@ -151,18 +172,19 @@ def _victory(img) -> bool:
         if not placed:
             rows.append({"items": [g], "cy": cy, "h": float(g["h"])})
     for row in rows:
-        if _victory_row(row["items"]):
+        found = _victory_row(row["items"])
+        if found and _sharpness(bgr, found) >= _SHARP_MIN:
             return True
     return False
 
 
-def _victory_row(items) -> bool:
+def _victory_row(items):
     np = _libs()[1]
     items = sorted(items, key=lambda g: g["x"])
     heights = [it["h"] for it in items]
     med = float(np.median(heights))
     if med < 8:
-        return False
+        return None
     items = [it for it in items if abs(it["h"] - med) / med <= 0.30]
     # V C T O R Y are template indexes 0,2,3,4,5,6. I is index 1 and is narrow.
     need = (0, 2, 3, 4, 5, 6)
@@ -180,26 +202,197 @@ def _victory_row(items) -> bool:
                 hit = j
                 break
         if hit is None:
-            return False
+            return None
         found.append(labeled[hit])
         start = hit + 1
     scores = [sc for _, sc, _ in found]
     if float(np.mean(scores)) < _LETTER_MEAN:
-        return False
+        return None
     v = found[0][2]
     c = found[1][2]
     if not (v["x"] < c["x"]):
-        return False
+        return None
     med_w = float(np.median([it["w"] for _, _, it in found]))
     between = [it for _, _, it in labeled if v["x"] < it["x"] < c["x"]]
     if not any(it["w"] <= med_w * 0.55 for it in between):
-        return False
+        return None
     # The six wide letters sit in one band, not scattered across the frame.
     xs = [it["x"] for _, _, it in found]
     span = xs[-1] - xs[0]
     if span < med_w * 4 or span > med_w * 14:
+        return None
+    return [it for _, _, it in found]
+
+
+def _letter_glyphs(mask):
+    """Tall narrow glyphs for a DEFEAT word.
+
+    The height floor is above the VICTORY walk. Splash scan-line scraps are
+    shorter than the header letters, and a shorter floor would take those
+    scraps as letters.
+    """
+    cv2, np = _libs()
+    h, w = mask.shape[:2]
+    n, lab, st, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    glyphs = []
+    for i in range(1, n):
+        x, y, ww, hh, area = (int(t) for t in st[i])
+        if hh < h * 0.10 or hh > h * 0.50 or ww > w * 0.14 or area < 80:
+            continue
+        if ww / max(hh, 1) > 0.90:
+            continue
+        g = (lab[y:y + hh, x:x + ww] == i).astype(np.uint8) * 255
+        vec = _vec(np, g, (16, 32))
+        if vec is None:
+            continue
+        glyphs.append({"x": x, "y": y, "w": ww, "h": hh, "vec": vec})
+    return glyphs
+
+
+def _band_rows(glyphs):
+    """Stack glyphs whose centers sit on one horizontal band."""
+    np = _libs()[1]
+    rows: list[dict] = []
+    for g in sorted(glyphs, key=lambda it: it["y"] + it["h"] / 2):
+        cy = g["y"] + g["h"] / 2
+        placed = False
+        for row in rows:
+            if abs(cy - row["cy"]) <= max(g["h"], row["h"]) * 0.40:
+                row["items"].append(g)
+                row["cy"] = float(np.mean([it["y"] + it["h"] / 2 for it in row["items"]]))
+                row["h"] = float(np.median([it["h"] for it in row["items"]]))
+                placed = True
+                break
+        if not placed:
+            rows.append({"items": [g], "cy": cy, "h": float(g["h"])})
+    return rows
+
+
+def _word_box(glyphs, shape, pad: int = 2):
+    """Tight box around the matched letters, in the same image as those glyphs."""
+    h, w = shape[:2]
+    x0 = max(0, min(int(g["x"]) for g in glyphs) - pad)
+    y0 = max(0, min(int(g["y"]) for g in glyphs) - pad)
+    x1 = min(w, max(int(g["x"] + g["w"]) for g in glyphs) + pad)
+    y1 = min(h, max(int(g["y"] + g["h"]) for g in glyphs) + pad)
+    if x1 - x0 < 8 or y1 - y0 < 8:
+        return None
+    return x0, y0, x1, y1
+
+
+def _sharpness(bgr, glyphs) -> float:
+    """Top gradient divided by text contrast on the word box.
+
+    A clean word lands near 0.45. A sigma-2 blur lands near 0.20.
+    """
+    cv2, np = _libs()
+    box = _word_box(glyphs, bgr.shape)
+    if cv2 is None or box is None:
+        return 0.0
+    x0, y0, x1, y1 = box
+    gray = cv2.cvtColor(bgr[y0:y1, x0:x1], cv2.COLOR_BGR2GRAY).astype(np.float32)
+    lo, hi = np.percentile(gray, [10.0, 90.0])
+    contrast = float(hi - lo)
+    if contrast < 8.0:
+        return 0.0
+    gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+    top = float(np.percentile(cv2.magnitude(gx, gy), 95.0))
+    return top / contrast / 8.0
+
+
+def _red_around(bgr, glyphs) -> float:
+    """Share of the word box that is red at saturation 60 or higher."""
+    cv2, np = _libs()
+    box = _word_box(glyphs, bgr.shape)
+    if cv2 is None or box is None:
+        return 0.0
+    x0, y0, x1, y1 = box
+    hsv = cv2.cvtColor(bgr[y0:y1, x0:x1], cv2.COLOR_BGR2HSV)
+    hue, sat = hsv[:, :, 0], hsv[:, :, 1]
+    red = ((hue <= 10) | (hue >= 170)) & (sat >= 60)
+    return float(np.mean(red))
+
+
+def _defeat_row(items):
+    """D E F E A T, left to right, one band. A near-tie or a short row stays unread."""
+    np = _libs()[1]
+    items = sorted(items, key=lambda g: g["x"])
+    heights = [it["h"] for it in items]
+    med = float(np.median(heights))
+    if med < 8:
+        return None
+    items = [it for it in items if abs(it["h"] - med) / med <= 0.30]
+    labeled = []
+    for it in items:
+        by: dict[str, float] = {}
+        for i, ch in enumerate(_DEFEAT_LETTERS):
+            score = float(it["scores"][i])
+            if ch not in by or score > by[ch]:
+                by[ch] = score
+        ranked = sorted(by.items(), key=lambda kv: -kv[1])
+        best, top = ranked[0]
+        second = ranked[1][1] if len(ranked) > 1 else -1.0
+        labeled.append((best, top, top - second, it))
+    found = []
+    start = 0
+    for want in _DEFEAT_LETTERS:
+        hit = None
+        for j in range(start, len(labeled)):
+            ch, score, margin, _it = labeled[j]
+            if ch == want and score >= _DEFEAT_LETTER_MIN and margin >= _LETTER_MARGIN:
+                hit = j
+                break
+        if hit is None:
+            return None
+        found.append(labeled[hit])
+        start = hit + 1
+    scores = [sc for _, sc, _, _ in found]
+    if float(np.mean(scores)) < _DEFEAT_LETTER_MEAN:
+        return None
+    med_w = float(np.median([it["w"] for _, _, _, it in found]))
+    xs = [it["x"] for _, _, _, it in found]
+    span = xs[-1] - xs[0]
+    if med_w < 1 or span < med_w * 4 or span > med_w * 14:
+        return None
+    return [it for _, _, _, it in found]
+
+
+def _defeat(img) -> bool:
+    """A sharp DEFEAT header on a red field.
+
+    The letters are the clean top-right header. Each one has to clear 0.85
+    and the mean has to clear 0.90, and the field around the word has to be
+    red. The centered splash is cut by scan lines, so its D and T do not match
+    that header and it stays unread. A blurred word stays unread. Team totals
+    are not home and away: the screen does not label those sides, and the
+    receipt side is the side chosen at the start.
+    """
+    cv2, np = _libs()
+    pack = _pack()
+    bgr = _as_bgr(img)
+    if cv2 is None or pack is None or bgr is None or "defeat" not in pack:
         return False
-    return True
+    rows = pack["defeat"].astype(np.float32)
+    if rows.ndim != 3 or rows.shape[1] != len(_DEFEAT_LETTERS) or rows.shape[0] < 1:
+        return False
+    # Header letters only. A second row cannot stand in for a word that misses them.
+    templates = rows[0]
+    glyphs = _letter_glyphs(_white_mask(bgr))
+    if len(glyphs) < 6:
+        return False
+    for g in glyphs:
+        g["scores"] = templates @ g["vec"]
+    for row in _band_rows(glyphs):
+        found = _defeat_row(row["items"])
+        if not found:
+            continue
+        if _sharpness(bgr, found) < _SHARP_MIN:
+            continue
+        if _red_around(bgr, found) < _RED_MIN:
+            continue
+        return True
+    return False
 
 
 def _hitmarker_white(img) -> bool:
@@ -510,6 +703,11 @@ def read_end(img):
             "end_screen", "victory",
             "VICTORY on the end screen. Home and away were not both read, so no final score is posted.",
             confirm=True)
+    if _defeat(bgr):
+        return _present(
+            "end_screen", "defeat",
+            "DEFEAT on the end screen. Home and away were not both read, so no final score is posted.",
+            confirm=True)
     return _not_read("end_screen", "not_present", "This frame is not an end screen. No final is posted.")
 
 
@@ -533,6 +731,34 @@ def read_hud(img) -> list:
     return out
 
 
+def _place_fixture(fixture_dir: Path, name: str, origin: tuple[int, int]):
+    """Paste a word crop onto a blank 720p frame at its original corner."""
+    cv2, np = _libs()
+    roi = cv2.imread(str(fixture_dir / name))
+    if roi is None:
+        raise RuntimeError(f"missing {name}")
+    canvas = np.zeros((720, 1280, 3), np.uint8)
+    x, y = origin
+    h, w = roi.shape[:2]
+    if y < 0 or x < 0 or y + h > canvas.shape[0] or x + w > canvas.shape[1]:
+        raise RuntimeError(f"{name} does not fit at {origin}")
+    canvas[y:y + h, x:x + w] = roi
+    return canvas
+
+
+def _defeat_pack_rows(fixture_dir: Path):
+    """The six clean header letters, D E F E A T. The glitched splash is not a template."""
+    cv2, np = _libs()
+    header_im = _place_fixture(fixture_dir, DEFEAT_HEADER_ROI, DEFEAT_HEADER_ORIGIN)
+    header = _crop(header_im, "end_screen")
+    if header is None:
+        raise RuntimeError("DEFEAT header crop could not be placed")
+    header_g = sorted(_letter_glyphs(_white_mask(header)), key=lambda g: g["x"])
+    if len(header_g) != 6:
+        raise RuntimeError(f"expected 6 DEFEAT header letters, saw {len(header_g)}")
+    return np.stack([np.stack([g["vec"] for g in header_g])]).astype(np.float32)
+
+
 def build_calibration_pack(fixture_dir: Path = FIXTURE_DIR, out_path: Path = PACK_PATH) -> None:
     """Rebuild the template pack from the committed practice fixtures."""
     cv2, np = _libs()
@@ -553,6 +779,7 @@ def build_calibration_pack(fixture_dir: Path = FIXTURE_DIR, out_path: Path = PAC
     if len(letters) != 7:
         raise RuntimeError(f"expected 7 VICTORY letters, saw {len(letters)}")
     victory = np.stack([vec for _, vec in letters]).astype(np.float32)
+    defeat = _defeat_pack_rows(fixture_dir)
 
     board = cv2.imread(str(fixture_dir / "sb_003.png"))
     hsv = cv2.cvtColor(board, cv2.COLOR_BGR2HSV)
@@ -605,6 +832,7 @@ def build_calibration_pack(fixture_dir: Path = FIXTURE_DIR, out_path: Path = PAC
     np.savez_compressed(
         out_path,
         victory=victory,
+        defeat=defeat,
         header_labels=np.array([s.encode("ascii") for s in _HEADER_ORDER]),
         header_vecs=header_vecs,
         digit_labels=np.array([s.encode("ascii") for s in digit_labels]),
