@@ -27,9 +27,11 @@ must sit within ``FRAME_CLOCK_GAP_US`` (500 ms, ``MEASURED_MAX_GAP_US``) of
 both the screen time and the input time. The manifest fit is not used. With
 the frame clock off, a hook is not Counted.
 
-Shipped screen hooks crop a 16:9 box and return ``not_read``. They are not
-calibrated from a held-out match. An uncalibrated hook is not Counted, posts
-no score, and posts no final.
+Hitmarker, kill popup, killfeed presence, VICTORY on the end screen, and
+scoreboard K/A are calibrated from Con's private practice frames. They set
+``calibrated`` and ``ok`` only when that signal is on the frame. Pause and the
+crosshair stay not read. An unreadable hook is not Counted, posts no score,
+and posts no final. Those frames are not a public verification.
 
 Words on the log and the receipt note: agreed, flagged a mismatch, Counted,
 receipt. A local end-screen read is not a verification verdict.
@@ -55,15 +57,25 @@ AGREED = "agreed"
 MISMATCH = "flagged a mismatch"
 NOT_COUNTED = "not Counted"
 
-# (name, x, y, w, h) in 0..1 of the full frame. Uncalibrated orientation.
+# (name, x, y, w, h) in 0..1 of a 16:9 frame.
+# Measured on Con's private practice frames (match-20261105-173922 and the
+# scoreboard strips). Pause is still only a crop.
+# end_screen holds the splash VICTORY (x 0.29-0.71, y 0.40-0.62 on
+# end_173922_017) and the match-complete VICTORY header (x ~0.05-0.22,
+# y ~0.07-0.15 on end_173922_019).
+# hitmarker is the center aim window. kill_popup is the center XP plate.
+# killfeed is the top-right, above the killstreak banner on these frames.
+# scoreboard is the whole frame: the K/A strip is a short crop, and the
+# header match is what decides it. KILLS sits near x 0.32-0.39 of that strip
+# and ASSISTS near x 0.54-0.64.
 REGIONS: tuple[tuple[str, tuple[float, float, float, float]], ...] = (
-    ("crosshair", (0.47, 0.45, 0.06, 0.10)),
-    ("hitmarker", (0.44, 0.42, 0.12, 0.16)),
-    ("kill_popup", (0.35, 0.32, 0.30, 0.22)),
-    ("killfeed", (0.62, 0.02, 0.36, 0.28)),
+    ("crosshair", (0.47, 0.46, 0.06, 0.08)),
+    ("hitmarker", (0.40, 0.42, 0.20, 0.22)),
+    ("kill_popup", (0.30, 0.28, 0.40, 0.36)),
+    ("killfeed", (0.64, 0.01, 0.34, 0.16)),
     ("pause", (0.20, 0.15, 0.60, 0.70)),
-    ("end_screen", (0.12, 0.08, 0.76, 0.84)),
-    ("scoreboard", (0.18, 0.12, 0.64, 0.76)),
+    ("end_screen", (0.03, 0.02, 0.80, 0.68)),
+    ("scoreboard", (0.00, 0.00, 1.00, 1.00)),
 )
 HUD_NAMES = ("crosshair", "hitmarker", "kill_popup", "killfeed", "pause", "scoreboard")
 END_NAME = "end_screen"
@@ -95,14 +107,6 @@ END_AGREE_FRAMES = 3
 END_AGREE_SPAN_MS = 3000
 
 STUB_NOTE = "hook only: this region is cropped and not read. It is not Counted."
-END_STUB_NOTE = "Call of Duty end-screen hook is not calibrated. No final is posted."
-
-
-def _box(name: str) -> tuple[float, float, float, float]:
-    for region, box in REGIONS:
-        if region == name:
-            return box
-    raise KeyError(name)
 
 
 @dataclass
@@ -116,6 +120,10 @@ class RegionRead:
     home: int | None = None
     away: int | None = None
     confirm: bool = False
+    kills: int | None = None
+    assists: int | None = None
+    board_kills: int | None = None
+    board_assists: int | None = None
 
 
 def crop_box(img, box: tuple[float, float, float, float]):
@@ -143,37 +151,35 @@ def crop_box(img, box: tuple[float, float, float, float]):
     return crop
 
 
-def _stub(name: str, img, note: str) -> RegionRead:
-    if crop_box(img, _box(name)) is None:
-        return RegionRead(name, "not_read", False, "frame_invalid", False,
-                          "frame could not be cropped; it is not Counted")
-    return RegionRead(name, "not_read", False, "stub_not_calibrated", False, note)
-
-
 class CodHudReader:
     """Crosshair, hitmarker, kill popup, killfeed, pause, and scoreboard crops.
 
-    The shipped hooks are stubs: ``ok`` and ``calibrated`` stay false.
+    Hitmarker, kill popup, killfeed, and scoreboard K/A are calibrated.
+    Crosshair and pause stay not read. ``ok`` and ``calibrated`` are true only
+    when that signal is on the frame.
     """
 
     profile_id = PROFILE_ID
     wants_full_res = True
 
     def read(self, img) -> list[RegionRead]:
-        return [_stub(name, img, STUB_NOTE) for name in HUD_NAMES]
+        from qorcap_cod_hud import read_hud
+        return list(read_hud(img))
 
 
 class CodEndScreenReader:
     """The Call of Duty end screen. This is the end of the match.
 
-    The shipped hook is a stub. A replacement sets ``ok`` and ``calibrated``
-    only from a real end screen, and puts both scores on the read.
-    ``confirm`` is the only way the receipt field ``final_confirmed`` becomes
-    true. That field is the end-screen agreement. It is not a verification verdict.
+    ``confirm`` is set only when the frame shows VICTORY. The runner still
+    requires the same 3 frames across 3 seconds before it posts, and it posts
+    only when home and away are both read. ``confirm`` is the only way the
+    receipt field ``final_confirmed`` becomes true. That field is the
+    end-screen agreement. It is not a verification verdict.
     """
 
     def read(self, img) -> RegionRead:
-        return _stub(END_NAME, img, END_STUB_NOTE)
+        from qorcap_cod_hud import read_end
+        return read_end(img)
 
 
 def _as_int(value) -> int | None:
