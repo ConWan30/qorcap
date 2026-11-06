@@ -17,7 +17,7 @@ The choice is written to `game_set.json` beside the match. That file is not a re
 
 - Set id `cod`. Receipt game `cod_mw4`. Profile `cod_mw4_hud`.
 - The match window ends when the end screen agrees (3 frames across 3 seconds), the same bar Madden uses for a final screen. Stopping QorCap does not read that screen. The receipt quarter is 4 because this end screen has no game clock. It is not a Madden quarter.
-- `final_confirmed` is true only when a calibrated end-screen hook sets confirm. That is end-screen agreement. It is not a verification verdict. The shipped hook does not set it.
+- `final_confirmed` is true only when a calibrated end-screen hook sets confirm. That is end-screen agreement. It is not a verification verdict. The hook sets confirm when it reads VICTORY. DEFEAT is not in this calibration set, so it does not confirm. These practice frames do not assign home and away, so they do not post a final score.
 
 ### Controller and video clock
 
@@ -35,11 +35,11 @@ These are agreement signals for how the match was played.
 4. Pause menu, against OPTIONS (bit 9, the same bit the Madden path uses).
 5. Recoil and view motion, from a haptic row the existing detector already labeled high. A `grip_jolt` or `hand_motion` row stays low there, so it is not Counted.
 
-A hook that is not calibrated is not Counted. A calibrated hook whose prior step did not agree is flagged a mismatch. Crosshair is a crop, not a counted event. The shipped crops return `not_read`. They post no score and no final.
+A hook that is not calibrated is not Counted. A calibrated hook whose prior step did not agree is flagged a mismatch. Crosshair is a crop, not a counted event. Hitmarker, the XP plate (presence only; a 25 or a 50 is not an assist), and killfeed weapon-icon presence are calibrated from Con's private practice frames. Pause and the crosshair still return `not_read`. They post no score and no final.
 
 ### Scoreboard
 
-Kills and assists from an offline count can be compared with the end scoreboard. Both sides need both numbers. A missing number is not Counted. Different numbers are flagged a mismatch. This hook does not post a final and does not change the receipt by itself.
+Kills and assists from an offline count can be compared with the end scoreboard. Both sides need both numbers. The calibrated hook reads K and A when the SCORE / KILLS / ASSISTS / DEATHS row is visible. A missing number is not Counted. Different numbers are flagged a mismatch. There is no offline count on these frames, so the comparison stays not Counted. This hook does not post a final and does not change the receipt by itself.
 
 ### INFO-ONLY timing
 
@@ -70,9 +70,18 @@ Official challenges stay closed on this set. No Call of Duty pause moment is wir
 
 ## Still to do
 
-- Calibrate the HUD crops and the end-screen hook from a held-out match before any pixel read is Counted.
-- Promote the scoreboard comparison into the end-screen confirmation once an offline kills and assists count exists.
-- Promote stick turn against camera turn, and rumble against an on-screen hit, only after that held-out match. They stay INFO-ONLY.
+Calibrated from Con's private practice frames (Kill Confirmed match-20261105-173922, plus earlier scoreboard and HUD crops). This is not a public verification.
+
+- VICTORY on the splash and on the match-complete header. A mid-match frame does not confirm.
+- Hitmarker strokes, the red kill marker (presence only, not a kill count), the XP plate (presence only; a 25 or a 50 is not an assist), and killfeed weapon-icon presence.
+- Scoreboard K and A when that digit row is visible. Missing digits stay not Counted.
+
+Still open:
+
+- DEFEAT has no calibration frame here, so it does not confirm.
+- Home and away are not assigned from the team totals on these frames. No final score is posted until both are read. Re-read the end screen during finalize once that read exists.
+- The scoreboard comparison stays not Counted until an offline kills and assists count exists. It does not post a final.
+- Pause and the crosshair are still not read.
+- Stick turn against camera turn, rumble against an on-screen hit, and power stay INFO-ONLY and not Counted.
 - Read battery versus plugged only after a report map exists. Do not guess bytes. Power stays `unknown`.
 - Record the console link (wired or wireless) only when the log actually has it. `usb` today means the laptop read path.
-- Re-read the Call of Duty end screen during finalize once that hook is calibrated.
