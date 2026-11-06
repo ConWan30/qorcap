@@ -674,7 +674,7 @@ def start_reader(api: Api, stop: threading.Event, state: dict, bundle: Path | No
 def start_cod_reader(api: Api, stop: threading.Event, state: dict, bundle: Path | None = None) -> threading.Thread:
     """Call of Duty frame loop. Does not start the Madden scorebug reader.
 
-    HUD and end-screen hooks stay fail-closed until a calibrated reader is wired.
+    The end word plus Qortrola30's scoreboard row can post a final. Home and away stay unread on that path.
     Controller and frame-clock rows are refreshed about once a second. No frame
     clock means those signals are not Counted.
     """
@@ -3436,7 +3436,16 @@ def finalize(bundle: Path, *, qt: Path, qorcap: str, ffmpeg: str, key_dir: Path,
             say("Game set file could not be read. No score was Counted.")
         else:
             say("Call of Duty set. The Madden scorebug is not read.")
-            say("Offline end-screen re-read is not wired. The score stays Counted only when the match already posted an end screen.")
+            try:
+                from qorcap_cod import END_PROBE_TAIL_S, record_end_probe
+                frames = list(decode_frames_tail(ffmpeg, vids[-1], END_PROBE_TAIL_S, FIN_HZ)) if vids else []
+                probe = record_end_probe(bundle, frames)
+                say(f"End probe used the last {probe['frames']} frame(s). It does not scan a long window.")
+                if not probe["posted"]:
+                    say(f"  {probe['reason']}. The score stays not Counted unless the match already posted an end screen.")
+            except Exception as e:
+                say(f"  Call of Duty end probe was not written: {type(e).__name__}: {e}")
+                say("The score stays Counted only when the match already posted an end screen.")
         draft = stamp_draft(draft, spec)
         if role != rec_role:
             corr = meta.get("role_correction") if isinstance(meta.get("role_correction"), dict) else {}

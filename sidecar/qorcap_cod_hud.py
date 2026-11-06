@@ -85,6 +85,24 @@ _ICON_MIN = 0.70
 
 _HEADER_ORDER = ("SCORE", "KILLS", "ASSISTS", "DEATHS")
 
+# Qortrola30 on end_173922_019. The row template scores 1.0 on its own pixels.
+# The same letters on the personal card score about 0.56. A neighboring name
+# fragment scores about 0.42. JPEG quality 40 still scores about 0.91.
+# Below this the letters did not agree, so the row is not read.
+_OWNER_MIN = 0.80
+# KILLS on that frame scores about 0.96. The other team's header scores about 0.54.
+# DEATHS on the personal card scores about 0.86. The next hit scores about 0.40.
+# A 720p frame scaled to 1080p scores about 0.74 on KILLS and about 0.72 on CONFIRMS.
+# Splash and mid-match frames stay under 0.52.
+_ROW_HEADER_MIN = 0.70
+# Small end-screen digits. A clean glyph matches its own sample near 1.0.
+# The next digit on these samples stays under 0.50.
+_ROW_DIGIT_MIN = 0.75
+_ROW_DIGIT_MARGIN = 0.15
+# Bright letters of the gamertag. Header words are dimmer, so they use their own mask.
+_OWNER_SEARCH_VALUE = 150
+_HEADER_SEARCH_VALUE = 90
+
 
 def _libs():
     try:
@@ -912,6 +930,239 @@ def _scoreboard_numbers(img) -> tuple[int, int] | None:
     return int(k_text), int(a_text)
 
 
+def _board_scale(img):
+    """720p and 1080p 16:9 frames. A short strip or a word crop is not the board."""
+    h, w = int(img.shape[0]), int(img.shape[1])
+    if h < 2 or w < 2:
+        return None
+    scale = h / 720.0
+    if scale < 0.90 or scale > 1.60:
+        return None
+    if w / float(h) < 1.4:
+        return None
+    return scale
+
+
+def _scaled_u8(mask, scale: float):
+    cv2, np = _libs()
+    if abs(scale - 1.0) < 0.02:
+        return mask
+    out = cv2.resize(mask, None, fx=float(scale), fy=float(scale), interpolation=cv2.INTER_AREA)
+    return (out > 40).astype(np.uint8) * 255
+
+
+def _value_mask(img, thr: int):
+    cv2, np = _libs()
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    return (hsv[:, :, 2] > thr).astype(np.uint8) * 255
+
+
+def _best_mask(search, mask, scale: float, thr: float):
+    """Best template hit, or None under ``thr``. One scale, from the frame height."""
+    cv2, np = _libs()
+    if search is None or mask is None or cv2 is None:
+        return None
+    templ = _scaled_u8(mask, scale)
+    if templ is None or templ.ndim != 2 or templ.shape[0] < 8 or templ.shape[1] < 8:
+        return None
+    if search.shape[0] < templ.shape[0] or search.shape[1] < templ.shape[1]:
+        return None
+    res = cv2.matchTemplate(search, templ, cv2.TM_CCOEFF_NORMED)
+    score = float(res.max())
+    if score < thr:
+        return None
+    y, x = np.unravel_index(int(res.argmax()), res.shape)
+    return (score, int(x), int(y), int(templ.shape[1]), int(templ.shape[0]))
+
+
+def _column_header(hit, row_x: int, row_y: int, scale: float):
+    """A header above this row and on its side of the board. Far columns are not this row."""
+    if hit is None:
+        return None
+    _score, x, y, w, h = hit
+    if y + h > row_y + int(6 * scale):
+        return None
+    if row_y - y > int(200 * scale):
+        return None
+    if x + w < row_x:
+        return None
+    if x - row_x > int(520 * scale):
+        return None
+    return hit
+
+
+def _personal_header(hit, row_x: int, row_y: int, row_h: int, scale: float):
+    """A label below the row, on the personal card. A column header above the row is not this."""
+    if hit is None:
+        return None
+    _score, x, y, _w, _h = hit
+    if y < row_y + max(4, row_h // 2):
+        return None
+    if y - row_y > int(220 * scale):
+        return None
+    if x < row_x - int(40 * scale):
+        return None
+    if x - row_x > int(800 * scale):
+        return None
+    return hit
+
+
+def _row_digit_bank():
+    pack = _pack()
+    np = _libs()[1]
+    if pack is None or np is None or "row_digit_vecs" not in pack or "row_digit_labels" not in pack:
+        return None
+    return pack["row_digit_vecs"].astype(np.float32), _labels(pack, "row_digit_labels")
+
+
+def _row_digit_string(img, x0: int, x1: int, y0: int, y1: int, thr: int, scale: float) -> str | None:
+    """Digits in one column. None when a glyph is missing or too close to another digit."""
+    cv2, np = _libs()
+    bgr = _as_bgr(img)
+    bank = _row_digit_bank()
+    if cv2 is None or bgr is None or bank is None:
+        return None
+    vecs, labels = bank
+    h, w = bgr.shape[:2]
+    x0, x1 = max(0, int(x0)), min(w, int(x1))
+    y0, y1 = max(0, int(y0)), min(h, int(y1))
+    if x1 - x0 < 3 or y1 - y0 < 3:
+        return None
+    hsv = cv2.cvtColor(bgr[y0:y1, x0:x1], cv2.COLOR_BGR2HSV)
+    mask = (hsv[:, :, 2] > thr).astype(np.uint8) * 255
+    n, lab, st, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    minh = max(5, int(round(6 * scale)))
+    maxw = max(10, int(round(18 * scale)))
+    comps = []
+    for i in range(1, n):
+        x, y, ww, hh, area = (int(t) for t in st[i])
+        if area < 8 or hh < minh or ww < 2 or ww > maxw:
+            continue
+        g = (lab[y:y + hh, x:x + ww] == i).astype(np.uint8) * 255
+        comps.append((x, g))
+    comps.sort()
+    if not comps or len(comps) > 3:
+        return None
+    text = ""
+    for _, glyph in comps:
+        vec = _vec(np, glyph, (12, 18))
+        if vec is None:
+            return None
+        scores = vecs @ vec
+        by: dict[str, float] = {}
+        for lab_i, name in enumerate(labels):
+            score = float(scores[lab_i])
+            if name not in by or score > by[name]:
+                by[name] = score
+        ranked = sorted(by.items(), key=lambda kv: -kv[1])
+        best, top = ranked[0]
+        second = ranked[1][1] if len(ranked) > 1 else -1.0
+        if top < _ROW_DIGIT_MIN or top - second < _ROW_DIGIT_MARGIN:
+            return None
+        text += best
+    return text if text.isdigit() else None
+
+
+def _stat_int(text: str | None) -> int | None:
+    if not text or not text.isdigit() or len(text) > 3:
+        return None
+    return int(text)
+
+
+def _digits_for_column(img, hit, row_y: int, row_h: int, scale: float) -> int | None:
+    _score, x, _y, w, _h = hit
+    text = _row_digit_string(
+        img, x - int(4 * scale), x + w + int(8 * scale),
+        row_y - int(2 * scale), row_y + row_h + int(6 * scale), 130, scale)
+    return _stat_int(text)
+
+
+def _digits_under_label(img, hit, scale: float) -> int | None:
+    _score, x, y, w, h = hit
+    text = _row_digit_string(
+        img, x - int(8 * scale), x + w + int(12 * scale),
+        y + h, y + h + int(28 * scale), 130, scale)
+    return _stat_int(text)
+
+
+def read_owner_row(img):
+    """Qortrola30's end-scoreboard row.
+
+    The gamertag letters have to agree. Kills come from the KILLS column on
+    that row. Deaths come from a DEATHS column on that row, or from the DEATHS
+    label on the personal card below it when the row has no deaths column.
+    Assists are read only when that column is on the board. Confirms are not
+    assists. A missing row, a different tag, or an unreadable kill or death
+    is not read. This does not fill home or away.
+    """
+    from qorcap_cod import OWNER_TAG
+    bgr = _as_bgr(img)
+    if bgr is None:
+        return _not_read("owner_row", "frame_invalid", "frame could not be cropped; it is not Counted")
+    scale = _board_scale(bgr)
+    pack = _pack()
+    if scale is None or pack is None or "owner_mask" not in pack:
+        return _not_read(
+            "owner_row", "not_present",
+            "Qortrola30's scoreboard row was not read. It is not Counted.")
+    name_hit = _best_mask(_value_mask(bgr, _OWNER_SEARCH_VALUE), pack["owner_mask"], scale, _OWNER_MIN)
+    if name_hit is None:
+        return _not_read(
+            "owner_row", "not_present",
+            "Qortrola30's scoreboard row was not read. It is not Counted.")
+    _name_score, row_x, row_y, _row_w, row_h = name_hit
+    header_search = _value_mask(bgr, _HEADER_SEARCH_VALUE)
+    found = {}
+    for key, label in (
+        ("kills_header_mask", "KILLS"),
+        ("assists_header_mask", "ASSISTS"),
+        ("deaths_header_mask", "DEATHS"),
+        ("confirms_header_mask", "CONFIRMS"),
+    ):
+        if key not in pack:
+            continue
+        hit = _best_mask(header_search, pack[key], scale, _ROW_HEADER_MIN)
+        if hit is not None:
+            found[label] = hit
+    kills_h = _column_header(found.get("KILLS"), row_x, row_y, scale)
+    if kills_h is None:
+        return _not_read(
+            "owner_row", "not_present",
+            "Kills were not read on Qortrola30's row. They are not Counted.")
+    kills = _digits_for_column(bgr, kills_h, row_y, row_h, scale)
+    if kills is None:
+        return _not_read(
+            "owner_row", "not_present",
+            "Kills were not read on Qortrola30's row. They are not Counted.")
+    assists = None
+    assists_h = _column_header(found.get("ASSISTS"), row_x, row_y, scale)
+    if assists_h is not None:
+        assists = _digits_for_column(bgr, assists_h, row_y, row_h, scale)
+        if assists is None:
+            return _not_read(
+                "owner_row", "not_present",
+                "Assists are on the board and were not read. They are not Counted.")
+    confirms = None
+    confirms_h = _column_header(found.get("CONFIRMS"), row_x, row_y, scale)
+    if confirms_h is not None:
+        confirms = _digits_for_column(bgr, confirms_h, row_y, row_h, scale)
+    deaths_h = _column_header(found.get("DEATHS"), row_x, row_y, scale)
+    if deaths_h is not None:
+        deaths = _digits_for_column(bgr, deaths_h, row_y, row_h, scale)
+    else:
+        personal = _personal_header(found.get("DEATHS"), row_x, row_y, row_h, scale)
+        deaths = _digits_under_label(bgr, personal, scale) if personal is not None else None
+    if deaths is None:
+        return _not_read(
+            "owner_row", "not_present",
+            "Deaths were not read for Qortrola30. They are not Counted.")
+    return _present(
+        "owner_row", "owner_row",
+        "Qortrola30's scoreboard row was read. Kills and deaths are that row, not a home or away score.",
+        kills=kills, deaths=deaths, assists=assists, confirms=confirms, player_tag=OWNER_TAG,
+    )
+
+
 def read_hitmarker(img, *, cropped: bool = False):
     src = _crop(img, "hitmarker") if cropped else img
     bgr = _as_bgr(src)
@@ -989,12 +1240,12 @@ def read_end(img):
     if victory:
         return _present(
             "end_screen", "victory",
-            "VICTORY on the end screen. Home and away were not both read, so no final score is posted.",
+            "VICTORY on the end screen. Home and away were not read on this hook.",
             confirm=True)
     if defeat:
         return _present(
             "end_screen", "defeat",
-            "DEFEAT on the end screen. Home and away were not both read, so no final score is posted.",
+            "DEFEAT on the end screen. Home and away were not read on this hook.",
             confirm=True)
     return _not_read("end_screen", "not_present", "This frame is not an end screen. No final is posted.")
 
@@ -1130,6 +1381,50 @@ def build_calibration_pack(fixture_dir: Path = FIXTURE_DIR, out_path: Path = PAC
     ys, xs = np.where(binary > 0)
     icon = binary[ys.min():ys.max() + 1, xs.min():xs.max() + 1]
 
+    end = cv2.imread(str(fixture_dir / "end_173922_019.jpg"))
+    if end is None:
+        raise RuntimeError("missing end_173922_019.jpg")
+    end_v = cv2.cvtColor(end, cv2.COLOR_BGR2HSV)[:, :, 2]
+    owner_mask = (end_v[534:550, 172:238] > 150).astype(np.uint8) * 255
+    kills_header_mask = (end_v[400:417, 427:456] > 80).astype(np.uint8) * 255
+    confirms_header_mask = (end_v[400:414, 527:577] > 80).astype(np.uint8) * 255
+    deaths_header_mask = (end_v[632:640, 758:791] > 120).astype(np.uint8) * 255
+    if min(owner_mask.mean(), kills_header_mask.mean(), deaths_header_mask.mean()) < 10:
+        raise RuntimeError("owner row templates are empty")
+    # Measured glyph x on the 720p frame. The second 2 of 2245 is dimmer and is not a sample.
+    row_specs = (
+        (530, 552, 300, 580, 145, ((331, "2"), (345, "4"), (352, "5"), (432, "1"), (439, "3"), (534, "7"))),
+        (645, 670, 580, 1000, 120, ((628, "1"), (636, "7"), (768, "1"), (776, "3"))),
+    )
+    row_labels: list[str] = []
+    row_vecs = []
+    for y0, y1, x0, x1, thr, spec in row_specs:
+        mask = (end_v[y0:y1, x0:x1] > thr).astype(np.uint8) * 255
+        n, lab, st, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+        got = set()
+        for i in range(1, n):
+            x, y, ww, hh, area = (int(t) for t in st[i])
+            if area < 8 or hh < 6 or ww < 2:
+                continue
+            name = None
+            for kx, label in spec:
+                if abs((x + x0) - kx) <= 4:
+                    name = label
+                    break
+            if name is None:
+                continue
+            g = (lab[y:y + hh, x:x + ww] == i).astype(np.uint8) * 255
+            vec = _vec(np, g, (12, 18))
+            if vec is None:
+                raise RuntimeError(f"empty digit glyph {name} at {x + x0}")
+            row_labels.append(name)
+            row_vecs.append(vec)
+            got.add(name)
+        missing = {label for _kx, label in spec} - got
+        if missing:
+            raise RuntimeError(f"missing owner-row digits {sorted(missing)}")
+    row_digit_vecs = np.stack(row_vecs).astype(np.float32)
+
     out_path.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(
         out_path,
@@ -1141,4 +1436,10 @@ def build_calibration_pack(fixture_dir: Path = FIXTURE_DIR, out_path: Path = PAC
         digit_vecs=digit_vecs,
         xp=xp,
         icon=icon,
+        owner_mask=owner_mask,
+        kills_header_mask=kills_header_mask,
+        confirms_header_mask=confirms_header_mask,
+        deaths_header_mask=deaths_header_mask,
+        row_digit_labels=np.array([s.encode("ascii") for s in row_labels]),
+        row_digit_vecs=row_digit_vecs,
     )
