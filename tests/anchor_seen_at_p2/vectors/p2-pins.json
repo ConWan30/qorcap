@@ -1,0 +1,94 @@
+{
+ "base": {
+  "commit": "4d119020cec8c3b6ae55c30c8bb17f5c6ab845ad",
+  "label": "supplied by operator"
+ },
+ "observed_file_pins": [
+  {
+   "bytes": 151179,
+   "label": "observed by generator",
+   "path": "docs/anchor-seen-at-p2.md",
+   "sha256": "a198ebdcfc2e2d953bb8ce4d2d3ededab839d6c4e8269cc13761cc1b57c8c7fd"
+  },
+  {
+   "bytes": 141150,
+   "label": "observed by generator",
+   "path": "tests/anchor_seen_at_p2/vectors/gen_vectors.py",
+   "sha256": "e85da44e84058c0e93302cc9a05f700cf42d687df70461aab9619887c985425d"
+  },
+  {
+   "bytes": 1715553,
+   "label": "observed by generator",
+   "path": "tests/anchor_seen_at_p2/vectors/p2-vectors.json",
+   "sha256": "985fac40f4d3a617c75c44ce06ebc805a5db553ac9926ed6ccafe5540adb64d1"
+  }
+ ],
+ "supplied_pin_assertions": [
+  {
+   "bytes": "63841",
+   "label": "supplied pin assertion, not an observed file hash",
+   "sha256": "21e9cc222d5a30ec6fa8fff1d1f0b69e29a121589560fc656a7963fc44159910",
+   "source": "P2-SCHEMAS-r1-candidate.md"
+  },
+  {
+   "bytes": "27712",
+   "label": "supplied pin assertion, not an observed file hash",
+   "sha256": "ed189d630682ac72458374cfef34f296f0943f36159422b77aa148246b2575dd",
+   "source": "P2-SCHEMAS-r1-qordata-review.md"
+  },
+  {
+   "bytes": "28865",
+   "label": "supplied pin assertion, not an observed file hash",
+   "sha256": "df2a60e8e28029ea4fcf8a9900ee383a0dc09e9acc6b7aa6b9ad57c03a9070df",
+   "source": "p2-schemas-r1-redteam.md"
+  },
+  {
+   "bytes": "28276",
+   "label": "supplied pin assertion, not an observed file hash",
+   "sha256": "13ed0a76d386abe683d8c2cf36b215dd62c946f92daa3e856e5e287f2fca3389",
+   "source": "P2-BRIEF-QORARCH.md"
+  },
+  {
+   "bytes": "17767",
+   "label": "supplied pin assertion, not an observed file hash",
+   "sha256": "57d5b42d551cf7a008e91859452109079701e0c41414f45e55372f2618f22bb1",
+   "source": "P2-NOVELTY.md"
+  },
+  {
+   "bytes": "68899",
+   "label": "supplied pin assertion, not an observed file hash",
+   "sha256": "d4bf5fd56ca1770c0bbe723014dd4c00a4b5972645592b91d3b1c33f00ca1fd4",
+   "source": "PHASE2-DESIGN-r2.md"
+  },
+  {
+   "bytes": "10789",
+   "label": "supplied pin assertion, not an observed file hash",
+   "sha256": "d4a2a28396fa2d2c1ea729f093c9b4f10d792296b54803e7c519ecfc3d3535ad",
+   "source": "PHASE2-DESIGN-r3-addendum.md"
+  },
+  {
+   "bytes": "30596",
+   "label": "supplied pin assertion, not an observed file hash",
+   "sha256": "b6818017965c2ff9a21d246d4f7fb7764eaf1eab53d7ec498bda63762ddafdd3",
+   "source": "ACCEPTANCE-AND-BUDGETS.md"
+  },
+  {
+   "bytes": "12044",
+   "label": "supplied pin assertion, not an observed file hash",
+   "sha256": "f3f021933a5f21bdce1ed67da21f3da5ab2577d905dc61365082245f4592f90f",
+   "source": "redteam-qorproof-r3.md"
+  },
+  {
+   "bytes": "19104",
+   "label": "supplied pin assertion, not an observed file hash",
+   "sha256": "8ad7b50473ef3e511c3a7ab03bed55928eadf06f7cfa1db497566314e4446f33",
+   "source": "redteam-qorproof-r2.md"
+  },
+  {
+   "bytes": "UNKNOWN",
+   "label": "supplied pin assertion, not an observed file hash",
+   "sha256": "741d3aa11d849046e5620c1e9d13f2b5bbd2c94567e873418e869ea3e2d49ce6",
+   "source": "Handoff P2-GROK-HANDOFF.md"
+  }
+ ]
+}
