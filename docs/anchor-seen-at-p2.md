@@ -933,13 +933,13 @@ Status `RESOLVED` means this candidate states one rule and where it is written. 
 
 Canonical bytes, lengths, and digests are not written in this document. digest: see p2-vectors.json.
 
-`tests/anchor_seen_at_p2/vectors/gen_vectors.py` is a Python 3 standard-library generator. It does not import repository code. It implements the §2 framing (`J`, `E`, `F`, `D`, `Hash`, `Raw`, `ModelSigned`) and emits one record per vector ID in §3–§9. Encoding cases are `kind=computed` (canonical text, byte length, domain, and digest). Cases that need a model transition are `kind=behavioral`, with `executed` set to `NOT EXECUTED (no model code in this stage)`. A behavioral row is not a pass.
+`tests/anchor_seen_at_p2/vectors/gen_vectors.py` is a Python 3 standard-library generator. It does not import repository code. It implements the §2 framing (`J`, `E`, `F`, `D`, `Hash`, `Raw`, `ModelSigned`) and emits one record per vector ID in §3–§9. The generator run reported 181 vector IDs; 141 kind computed, 40 kind behavioral. Each record has `outcome_status`. Kind `behavioral` is `NOT EXECUTED (no model code in this stage)`. Kind `computed` is either an encoding or digest fact whose `expected_outcome` is still a schema expectation for a future model, also NOT EXECUTED, or a schema-level validator result this generator evaluated. That validator result is not the model parser. A behavioral row is not a pass.
 
 Regenerate with `python3 tests/anchor_seen_at_p2/vectors/gen_vectors.py --write`. The same command exits nonzero if a self-check fails or a doc vector ID is missing. `python3 tests/anchor_seen_at_p2/vectors/gen_vectors.py --check` rebuilds in memory and exits nonzero if either JSON file differs.
 
 ## 12. Pins
 
-`tests/anchor_seen_at_p2/vectors/p2-pins.json` is written only by that generator. It labels the base commit `4d119020cec8c3b6ae55c30c8bb17f5c6ab845ad` as supplied by the operator. It records SHA-256 and byte length of this document, of `gen_vectors.py`, and of `p2-vectors.json` as observed when the generator runs. The §0 source table is copied through as supplied pins, not re-hashed. This section does not restate those digests.
+`tests/anchor_seen_at_p2/vectors/p2-pins.json` is written only by that generator. It labels the base commit `4d119020cec8c3b6ae55c30c8bb17f5c6ab845ad` as supplied by the operator. It records SHA-256 and byte length of this document, of `gen_vectors.py`, and of `p2-vectors.json` as observed when the generator runs. Because those pins include this document's own SHA-256, any later edit to this document requires regenerating the pins. The §0 source table is copied through as supplied pins, not re-hashed. This section does not restate those digests.
 
 ## 13. C1 scan status
 

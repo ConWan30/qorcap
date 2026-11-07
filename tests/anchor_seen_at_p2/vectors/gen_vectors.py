@@ -394,8 +394,22 @@ def encoded(type_name: str, payload: dict) -> dict:
     }
 
 
-def computed(vector_id: str, outcome: str, **fields: object) -> dict:
-    row = {"expected_outcome": outcome, "id": vector_id, "kind": "computed"}
+ENCODING_STATUS = (
+    "encoding/digest facts computed by this generator; the expected_outcome is a schema "
+    "expectation for the future model, NOT EXECUTED"
+)
+VALIDATOR_STATUS = (
+    "validator result computed by this generator (schema-level check only, not the model parser)"
+)
+
+
+def computed(vector_id: str, outcome: str, validator_result: bool = False, **fields: object) -> dict:
+    row = {
+        "expected_outcome": outcome,
+        "id": vector_id,
+        "kind": "computed",
+        "outcome_status": VALIDATOR_STATUS if validator_result else ENCODING_STATUS,
+    }
     row.update(fields)
     return row
 
@@ -409,6 +423,7 @@ def behavioral(vector_id: str, outcome: str, payload: dict, type_name: str = "No
         "expected_outcome": outcome,
         "id": vector_id,
         "kind": "behavioral",
+        "outcome_status": NOT_EXECUTED,
         "type": type_name,
     }
 
@@ -653,6 +668,7 @@ def build_b1(base: dict, checks: dict) -> list[dict]:
             mutated_expected_id=mutated_id,
             same_key=logical_key(mutated) == logical_key(core),
             validator=err or "ok",
+            validator_result=outcome == "domain",
         )
         if mutated_id == base["issue_id"]:
             raise SystemExit(f"{vector_id} did not change expected_id")
@@ -664,12 +680,16 @@ def build_b1(base: dict, checks: dict) -> list[dict]:
         checks["mutations"] += 1
     stale = dict(base["issue"])
     stale["expected_id"] = nh(0xABCDEF)
+    matches_core = stale["expected_id"] == base["issue_id"]
+    if matches_core or not valid_h(stale["expected_id"]):
+        raise SystemExit("stale expected_id was not a well-formed non-match")
     rows.append(
         computed(
             "V-B1-MUT-STALE-ID",
             "binding",
             request=encoded("IssueRequest", stale),
-            matches_core=stale["expected_id"] == base["issue_id"],
+            matches_core=matches_core,
+            validator_result=True,
         )
     )
     omitted = {key: value for key, value in base["issue"].items() if key != "expected_id"}
@@ -687,6 +707,7 @@ def build_b1(base: dict, checks: dict) -> list[dict]:
             malformed='{"schema":"proposed.aux.model.p2.r1.IssueRequest","payload":{"expected_id":null}}',
             round_trip_ok=omit_ok,
             validator="binding",
+            validator_result=True,
         )
     )
     if omit_ok:
@@ -1088,11 +1109,21 @@ def state_vectors(checks: dict) -> list[dict]:
             bad = {"durable_resolution": None, "raw_response_hash": None, "result": "retained"}
         if vector_id == "V-B5-LH-EMPTY-NZ":
             bad = {"last_digest": nh(99), "rejected": "true"}
+        evaluated = False
         if vector_id == "V-B5-CH-INVAL-H":
             if valid_id(nh(1)):
                 raise SystemExit("event hash accepted as Id")
+            evaluated = True
             checks["negatives"] += 1
-        rows.append(computed(vector_id, outcome, malformed=J(bad), validator=outcome))
+        rows.append(
+            computed(
+                vector_id,
+                outcome,
+                malformed=J(bad),
+                validator=outcome,
+                validator_result=evaluated,
+            )
+        )
         checks["negatives"] += 1
     return rows
 
@@ -1294,6 +1325,12 @@ def build() -> tuple[dict, dict]:
         raise SystemExit(f"coverage mismatch missing={missing} extra={extra}")
     if checks["mutations"] < 1 or checks["negatives"] < 1 or not checks["acyclic"]:
         raise SystemExit(f"self-check failed {checks}")
+    for row in by_id.values():
+        status = row.get("outcome_status")
+        if row["kind"] == "behavioral" and status != NOT_EXECUTED:
+            raise SystemExit(f"{row['id']} behavioral outcome_status")
+        if row["kind"] == "computed" and status not in {ENCODING_STATUS, VALIDATOR_STATUS}:
+            raise SystemExit(f"{row['id']} computed outcome_status")
     coverage = {item: by_id[item]["kind"] for item in wanted}
     document = {
         "coverage": coverage,
