@@ -46,6 +46,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import sys
 import threading
 import time
@@ -136,6 +137,30 @@ SIGNAL_SCHEMA = "qorcap-cod-signals/v0"
 READER_STATS_SCHEMA = "qorcap-cod-reader-stats/v0"
 # Counts copied onto the stop file. Other runner counters stay off that file.
 READER_STATS_KEYS = ("frames", "agreed", "flagged_mismatch", "not_counted", "hud_not_read", "errors")
+# reader_tick is time.time()*1000 in the reader loop. End-word t_ms is the
+# capture step's frame time (producer monotonic milliseconds). Not one clock.
+READER_TICK_CLOCK = "wall_unix_ms"
+END_WORD_CLOCK = "capture_monotonic_ms"
+READER_STATS_ERROR_MAX = 180
+# authorization: Bearer <token> is one secret. A standalone Bearer token is the
+# same class. The token must contain a digit or a token mark so "bearer of"
+# stays readable.
+_STATS_BEARER_RE = re.compile(
+    r"(?i)\bbearer\s+(?=[A-Za-z0-9\-._~+/]*[0-9\-._~+/=])[A-Za-z0-9\-._~+/=]+"
+)
+_STATS_SECRET_RE = re.compile(
+    r"(?i)\b(api_key|token|secret|password|passwd|authorization)\b\s*[:=]\s*(?:bearer\s+)?\S+"
+)
+_STATS_QUOTED_PATH_RE = re.compile(
+    r"""["'](?:[A-Za-z]:[\\/]|\\\\|~[\\/]|/)[^"']*["']"""
+)
+# Drive, UNC (\\server\share and //server/share), tilde, or a Unix path of at
+# least two segments. A single /word is left alone.
+_STATS_PATH_START_RE = re.compile(
+    r"(?<![A-Za-z0-9])(?:[A-Za-z]:[\\/]|\\\\[^\\\s]+\\[^\\\s]+|//[^/\s]+/[^/\s]+|~[\\/]|(?:/[\w.-]+){2,})"
+)
+_STATS_PATH_SEG_RE = re.compile(r"[\w.\\/-]+")
+_STATS_PATH_MARK_RE = re.compile(r"(?:[\\/]|\.[A-Za-z0-9]{1,8}$)")
 # At 4 Hz this is about eight frames. The probe keeps the last five.
 END_PROBE_TAIL_S = 2
 
@@ -714,6 +739,8 @@ class CodSetRunner:
         self.end_word_first_ms = None
         self.end_word_last_ms = None
         self.owner_row_ever_read = False
+        self._observe_lock = threading.Lock()
+        self._published = None
 
     def set_signals(self, inputs, frame_stamps, haptics, wall_anchor_ms) -> None:
         """Replace the clocks used on the next frame. Empty lists count nothing."""
@@ -738,6 +765,43 @@ class CodSetRunner:
         if self.end_word_first_ms is None:
             self.end_word_first_ms = t_ms
         self.end_word_last_ms = t_ms
+
+    def publish_reader_observation(self, *, reader_error=None, cod_signal_error=None, reader_tick=None) -> None:
+        """Store one coherent copy of the stop fields. The copy is replaced, not merged.
+
+        The lock covers only this copy. A later frame can replace it. A stop
+        that did not join the reader keeps the copy it already took.
+        """
+        snap = {
+            "stats": {key: _stat_count(self.stats, key) for key in READER_STATS_KEYS},
+            "reader_error": reader_error if isinstance(reader_error, str) else None,
+            "cod_signal_error": cod_signal_error if isinstance(cod_signal_error, str) else None,
+            "reader_tick": _optional_ms(reader_tick),
+            "end_word_first_ms": _optional_ms(self.end_word_first_ms),
+            "end_word_last_ms": _optional_ms(self.end_word_last_ms),
+            "owner_row_ever_read": bool(self.owner_row_ever_read),
+            "published": True,
+        }
+        with self._observe_lock:
+            self._published = snap
+
+    def published_reader_observation(self) -> dict | None:
+        """Return the last published copy, or None when the reader has not published."""
+        with self._observe_lock:
+            snap = self._published
+            if not isinstance(snap, dict):
+                return None
+            stats = snap.get("stats")
+            return {
+                "stats": dict(stats) if isinstance(stats, dict) else None,
+                "reader_error": snap.get("reader_error"),
+                "cod_signal_error": snap.get("cod_signal_error"),
+                "reader_tick": snap.get("reader_tick"),
+                "end_word_first_ms": snap.get("end_word_first_ms"),
+                "end_word_last_ms": snap.get("end_word_last_ms"),
+                "owner_row_ever_read": snap.get("owner_row_ever_read"),
+                "published": True,
+            }
 
     def on_frame(self, t_ms: int, img, source=None) -> None:
         self._source = source if isinstance(source, dict) else None
@@ -1793,48 +1857,183 @@ def _stat_count(stats: dict, key: str) -> int:
     return raw
 
 
-def _optional_text(value) -> str | None:
-    if isinstance(value, str) and value:
-        return value
-    return None
-
-
 def _optional_ms(value) -> int | None:
     if isinstance(value, bool) or not isinstance(value, int):
         return None
     return value
 
 
-def reader_stats_document(runner, *, reader_error=None, cod_signal_error=None, reader_tick=None) -> dict:
-    """Counts from the live reader at stop. No images. Not a receipt field.
+def _path_segment(text: str, at: int) -> tuple[str, int] | None:
+    matched = _STATS_PATH_SEG_RE.match(text, at)
+    if not matched:
+        return None
+    return matched.group(0), matched.end()
 
-    ``reader_error`` and ``cod_signal_error`` are the last strings on the
-    match state, or null when that loop never stored one. ``reader_tick`` is
-    the last loop stamp, or null when the loop never ticked.
+
+def _path_continuation_end(text: str, at: int) -> int | None:
+    """Extend a path across spaces when the next piece still looks like a path.
+
+    ``My Documents\\file.cfg`` stays one path. The word ``missing`` before another
+    path does not, so two paths keep the words between them.
     """
-    stats = getattr(runner, "stats", None)
-    counts = {key: _stat_count(stats, key) for key in READER_STATS_KEYS}
+    n = len(text)
+    if at >= n or not text[at].isspace():
+        return None
+    k = at
+    while k < n and text[k].isspace():
+        k += 1
+    if k >= n or _STATS_PATH_START_RE.match(text, k):
+        return None
+    first = _path_segment(text, k)
+    if first is None:
+        return None
+    body, end = first
+    if not _STATS_PATH_MARK_RE.search(body):
+        p = end
+        while p < n and text[p].isspace():
+            p += 1
+        if p >= n or _STATS_PATH_START_RE.match(text, p):
+            return None
+        nxt = _path_segment(text, p)
+        if nxt is None or not _STATS_PATH_MARK_RE.search(nxt[0]):
+            return None
+        end = nxt[1]
+    while True:
+        p = end
+        while p < n and text[p].isspace():
+            p += 1
+        if p >= n or _STATS_PATH_START_RE.match(text, p):
+            break
+        nxt = _path_segment(text, p)
+        if nxt is None or not _STATS_PATH_MARK_RE.search(nxt[0]):
+            break
+        end = nxt[1]
+    return end
+
+
+def _scrub_unquoted_paths(text: str) -> str:
+    parts: list[str] = []
+    i = 0
+    n = len(text)
+    while i < n:
+        matched = _STATS_PATH_START_RE.search(text, i)
+        if not matched:
+            parts.append(text[i:])
+            break
+        parts.append(text[i:matched.start()])
+        j = matched.end()
+        while j < n and text[j] not in " \t\r\n\"'":
+            if text[j] in ",;:)]}>":
+                break
+            j += 1
+        while True:
+            nxt = _path_continuation_end(text, j)
+            if nxt is None:
+                break
+            j = nxt
+        parts.append("[path]")
+        i = j
+    return "".join(parts)
+
+
+def scrub_reader_error(value) -> str | None:
+    """Shorten a stored reader string and drop path-like and secret-like pieces.
+
+    Empty becomes null. Bearer tokens, UNC paths, tilde paths, and paths that
+    contain spaces are removed along with key=value secrets. This does not
+    decide that the reader is healthy.
+    """
+    if not isinstance(value, str):
+        return None
+    text = value.replace("\r", " ").replace("\n", " ")
+    # Paths first so a spaced tail after a secret value is not left behind.
+    text = _STATS_QUOTED_PATH_RE.sub("[path]", text)
+    text = _scrub_unquoted_paths(text)
+    text = _STATS_SECRET_RE.sub(r"\1=[redacted]", text)
+    text = _STATS_BEARER_RE.sub("Bearer [redacted]", text)
+    text = " ".join(text.split())
+    if not text:
+        return None
+    if len(text) > READER_STATS_ERROR_MAX:
+        text = text[: READER_STATS_ERROR_MAX - 6].rstrip() + " [cut]"
+    return text
+
+
+def _blank_observation() -> dict:
     return {
-        "schema": READER_STATS_SCHEMA,
-        "stats": counts,
-        "reader_error": _optional_text(reader_error),
-        "cod_signal_error": _optional_text(cod_signal_error),
+        "stats": None,
+        "reader_error": None,
+        "cod_signal_error": None,
+        "reader_tick": None,
+        "end_word_first_ms": None,
+        "end_word_last_ms": None,
+        "owner_row_ever_read": None,
+        "published": False,
+    }
+
+
+def observation_from_runner(runner, *, reader_error=None, cod_signal_error=None, reader_tick=None) -> dict:
+    """Read the runner after its thread has stopped. Counts come from ``runner.stats``."""
+    stats = getattr(runner, "stats", None)
+    if not isinstance(stats, dict):
+        return _blank_observation()
+    return {
+        "stats": {key: _stat_count(stats, key) for key in READER_STATS_KEYS},
+        "reader_error": reader_error if isinstance(reader_error, str) else None,
+        "cod_signal_error": cod_signal_error if isinstance(cod_signal_error, str) else None,
         "reader_tick": _optional_ms(reader_tick),
         "end_word_first_ms": _optional_ms(getattr(runner, "end_word_first_ms", None)),
         "end_word_last_ms": _optional_ms(getattr(runner, "end_word_last_ms", None)),
         "owner_row_ever_read": bool(getattr(runner, "owner_row_ever_read", False)),
-        "note": "Reader counts at stop. Not a receipt field. No images.",
+        "published": True,
     }
 
 
-def write_reader_stats(bundle: Path, runner, *, reader_error=None, cod_signal_error=None, reader_tick=None) -> dict:
+def reader_stats_document(observation: dict, *, reader_join: str) -> dict:
+    """Counts at stop. No images. Not a receipt field.
+
+    ``reader_join`` is ``joined`` when the reader thread had exited,
+    ``timed_out`` when the join wait ended first, or ``not_joined`` when stop
+    did not wait. A missing publication keeps counts null instead of writing
+    zeros. ``reader_tick`` is wall Unix milliseconds. The end-word fields are
+    capture monotonic milliseconds. Those clocks are not subtracted here.
+    """
+    obs = observation if isinstance(observation, dict) else _blank_observation()
+    stats = obs.get("stats")
+    if isinstance(stats, dict):
+        counts = {key: _stat_count(stats, key) for key in READER_STATS_KEYS}
+    else:
+        counts = None
+    owner = obs.get("owner_row_ever_read")
+    if not isinstance(owner, bool):
+        owner = None
+    if reader_join not in ("joined", "timed_out", "not_joined"):
+        reader_join = "not_joined"
+    return {
+        "schema": READER_STATS_SCHEMA,
+        "reader_join": reader_join,
+        "stats": counts,
+        "reader_error": scrub_reader_error(obs.get("reader_error")),
+        "cod_signal_error": scrub_reader_error(obs.get("cod_signal_error")),
+        "reader_tick": _optional_ms(obs.get("reader_tick")),
+        "reader_tick_clock": READER_TICK_CLOCK,
+        "end_word_first_ms": _optional_ms(obs.get("end_word_first_ms")),
+        "end_word_last_ms": _optional_ms(obs.get("end_word_last_ms")),
+        "end_word_clock": END_WORD_CLOCK,
+        "owner_row_ever_read": owner,
+        "note": (
+            "Reader counts from this sidecar when stop passes practice and the game is Call of Duty. "
+            "This file has no switch that reads another installed build. Not a receipt field. No images. "
+            "reader_tick is wall Unix milliseconds. end_word_first_ms and end_word_last_ms are capture "
+            "monotonic milliseconds. Do not subtract those clocks. A timed-out join keeps the last "
+            "published copy and is not a finished reader."
+        ),
+    }
+
+
+def write_reader_stats(bundle: Path, observation: dict, *, reader_join: str) -> dict:
     """Write ``cod_reader_stats.json``. Does not append ``cod_signals.jsonl`` or edit a receipt."""
-    doc = reader_stats_document(
-        runner,
-        reader_error=reader_error,
-        cod_signal_error=cod_signal_error,
-        reader_tick=reader_tick,
-    )
+    doc = reader_stats_document(observation, reader_join=reader_join)
     (Path(bundle) / "cod_reader_stats.json").write_text(
         json.dumps(doc, indent=2) + "\n", encoding="utf-8")
     return doc

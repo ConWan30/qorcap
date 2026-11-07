@@ -4,8 +4,10 @@ Madden stays the default when --game is omitted. Call of Duty hooks fail closed
 until a calibrated reader is wired. Words on the log are agreed, flagged a
 mismatch, and not Counted.
 """
+import inspect
 import io
 import json
+import threading
 from pathlib import Path
 
 import qorcap_cod as C
@@ -509,16 +511,24 @@ def test_reader_stats_file_counts_errors_and_end_word_range(tmp_path, monkeypatc
     assert runner.end_word_last_ms == 4_500
     assert runner.owner_row_ever_read is True
     before = log.read_bytes()
+    receipt = tmp_path / "receipt.json"
+    receipt.write_text('{"result":{}}\n', encoding="utf-8")
+    receipt_before = receipt.read_bytes()
     state = {
         "core": runner,
         "reader_error": "TimeoutError: snapshot",
         "cod_signal_error": "OSError: inputs",
         "reader_tick": 1_700_000_000_123,
     }
-    assert M.maybe_write_cod_reader_stats(tmp_path, state, "cod") is True
+    assert M.maybe_write_cod_reader_stats(
+        tmp_path, state, "cod", practice=True, reader_joined=True) is True
     assert log.read_bytes() == before
+    assert receipt.read_bytes() == receipt_before
     saved = json.loads((tmp_path / "cod_reader_stats.json").read_text(encoding="utf-8"))
     assert saved["schema"] == "qorcap-cod-reader-stats/v0"
+    assert saved["reader_join"] == "joined"
+    assert saved["reader_tick_clock"] == C.READER_TICK_CLOCK
+    assert saved["end_word_clock"] == C.END_WORD_CLOCK
     assert saved["stats"] == {
         "frames": 3,
         "agreed": runner.stats["agreed"],
@@ -536,7 +546,7 @@ def test_reader_stats_file_counts_errors_and_end_word_range(tmp_path, monkeypatc
     assert saved["end_word_last_ms"] == 4_500
     assert saved["owner_row_ever_read"] is True
     assert "not a receipt field" in saved["note"].lower()
-    assert not (tmp_path / "receipt.json").exists()
+    assert receipt.is_file()
 
 
 def test_reader_stats_omit_errors_until_one_is_stored_and_skip_an_unread_owner(tmp_path):
@@ -545,7 +555,10 @@ def test_reader_stats_omit_errors_until_one_is_stored_and_skip_an_unread_owner(t
     runner.on_frame(8_000, _Img())
     assert runner.owner_row_ever_read is False
     assert runner.end_word_first_ms == 8_000 and runner.end_word_last_ms == 8_000
-    doc = C.write_reader_stats(tmp_path, runner, reader_error=None, cod_signal_error="", reader_tick=False)
+    doc = C.write_reader_stats(
+        tmp_path,
+        C.observation_from_runner(runner, reader_error=None, cod_signal_error="", reader_tick=False),
+        reader_join="joined")
     assert doc["reader_error"] is None
     assert doc["cod_signal_error"] is None
     assert doc["reader_tick"] is None
@@ -560,13 +573,287 @@ def test_madden_stop_does_not_write_reader_stats(tmp_path):
     runner.stats["frames"] = 9
     runner.end_word_first_ms = 1
     state = {"core": runner, "reader_error": "kept", "reader_tick": 5}
-    assert M.maybe_write_cod_reader_stats(tmp_path, state, "madden") is False
-    assert M.maybe_write_cod_reader_stats(tmp_path, state, "closed") is False
+    assert M.maybe_write_cod_reader_stats(tmp_path, state, "madden", practice=True, reader_joined=True) is False
+    assert M.maybe_write_cod_reader_stats(tmp_path, state, "closed", practice=True, reader_joined=True) is False
+    assert M.maybe_write_cod_reader_stats(tmp_path, state, "cod", practice=False, reader_joined=True) is False
+    assert M.maybe_write_cod_reader_stats(tmp_path, {}, "cod", practice=True, reader_joined=True) is False
     assert not (tmp_path / "cod_reader_stats.json").exists()
     assert not (tmp_path / "cod_signals.jsonl").exists()
     src = Path(M.__file__).read_text(encoding="utf-8")
-    stop = src.split("seal_reader(stop, state, sweep=sweep)", 1)[1].split("say(\"\\nFinishing up:", 1)[0]
-    assert "maybe_write_cod_reader_stats(bundle, state, game)" in stop
+    assert "run_with_reader_stats(save_tail, persist_stats)" in src
+    handler = src.split("except KeyboardInterrupt:", 1)[1]
+    fault = handler.split("except Exception:", 1)[1].split("finally:", 1)[0]
+    # A capture-loop error must not join, persist, or raise before the save.
+    assert "seal_reader(" not in fault
+    assert "persist_stats()" not in fault
+    assert "raise" not in fault
+    assert handler.index("finally:") < handler.index("def save_tail(")
+    assert handler.index("def save_tail(") < handler.index(
+        "run_with_reader_stats(save_tail, persist_stats)")
+    persist = src.split("def persist_stats():", 1)[1].split("\n    tail_s = ", 1)[0]
+    assert "seal_reader(" not in persist
+    assert "stop.set()" not in persist
+    main_src = inspect.getsource(M.main)
+    wait_at = main_src.index("wait_and_countersign(")
+    seal_at = main_src.index("seal_reader(")
+    assert main_src.rindex("stop.set()", 0, wait_at) < wait_at < seal_at
+    assert "seal_reader(" not in main_src[main_src.rindex("stop.set()", 0, wait_at):wait_at]
     madden = src.split("def start_reader(", 1)[1].split("def start_cod_reader(", 1)[0]
     assert "write_reader_stats" not in madden
     assert "cod_reader_stats" not in madden
+
+
+def test_practice_gate_is_explicit_and_does_not_claim_another_build(tmp_path):
+    runner = C.CodSetRunner(lambda _e: None, hud=_hud(), end=_end([
+        C.RegionRead("end_screen", "read", True, "victory", True, home=1, away=0, confirm=True),
+    ]))
+    runner.on_frame(100, _Img())
+    state = {"core": runner, "reader_tick": 10}
+    assert M.maybe_write_cod_reader_stats(tmp_path, state, "cod", practice=True, reader_joined=True) is True
+    saved = json.loads((tmp_path / "cod_reader_stats.json").read_text(encoding="utf-8"))
+    assert "another installed build" in saved["note"]
+    assert "not a receipt field" in saved["note"].lower()
+    assert saved["reader_tick_clock"] == "wall_unix_ms"
+    assert saved["end_word_clock"] == "capture_monotonic_ms"
+    assert saved["end_word_first_ms"] == 100 and saved["end_word_last_ms"] == 100
+    other = tmp_path / "other"
+    other.mkdir()
+    assert M.maybe_write_cod_reader_stats(other, state, "cod", practice=False, reader_joined=True) is False
+    assert not (other / "cod_reader_stats.json").exists()
+
+
+def test_exception_and_failed_diagnostics_do_not_block_save(tmp_path, monkeypatch):
+    receipt = tmp_path / "receipt.json"
+    receipt.write_text('{"kept":1}\n', encoding="utf-8")
+    before = receipt.read_bytes()
+    signals = tmp_path / "cod_signals.jsonl"
+    signals.write_text('{"kind":"set"}\n', encoding="utf-8")
+    sig_before = signals.read_bytes()
+    runner = C.CodSetRunner(lambda _e: None)
+    runner.stats["frames"] = 4
+    state = {"core": runner, "reader_tick": 40}
+
+    def body_fails():
+        raise RuntimeError("sweep broke")
+
+    def persist_ok():
+        M.maybe_write_cod_reader_stats(tmp_path, state, "cod", practice=True, reader_joined=True)
+
+    failed = False
+    try:
+        M.run_with_reader_stats(body_fails, persist_ok)
+    except RuntimeError as e:
+        failed = str(e) == "sweep broke"
+    assert failed is True
+    saved = json.loads((tmp_path / "cod_reader_stats.json").read_text(encoding="utf-8"))
+    assert saved["reader_join"] == "joined"
+    assert saved["stats"]["frames"] == 4
+    assert receipt.read_bytes() == before
+    assert signals.read_bytes() == sig_before
+
+    def broken_write(bundle, observation, *, reader_join):
+        raise OSError("synthetic disk")
+
+    monkeypatch.setattr(C, "write_reader_stats", broken_write)
+
+    def broken_say(*_a, **_k):
+        raise BrokenPipeError("synthetic closed stdout")
+
+    monkeypatch.setattr(M, "say", broken_say)
+    side = tmp_path / "side"
+    side.mkdir()
+
+    def body_saves():
+        receipt.write_text('{"kept":1,"saved":true}\n', encoding="utf-8")
+        return 7
+
+    def persist_bad():
+        assert M.maybe_write_cod_reader_stats(
+            side, state, "cod", practice=True, reader_joined=True) is False
+
+    assert M.run_with_reader_stats(body_saves, persist_bad) == 7
+    assert json.loads(receipt.read_text(encoding="utf-8"))["saved"] is True
+    assert not (side / "cod_reader_stats.json").exists()
+    assert signals.read_bytes() == sig_before
+
+
+def test_join_timeout_keeps_a_frozen_copy_while_the_reader_continues(tmp_path):
+    runner = C.CodSetRunner(lambda _e: None, log_path=tmp_path / "cod_signals.jsonl")
+    runner.stats["frames"] = 5
+    runner.end_word_first_ms = 1000
+    runner.end_word_last_ms = 1000
+    raw = "OSError: /tmp/synth-player/config.json missing C:\\Users\\synth\\qorcap.cfg " + ("pad " * 80)
+    runner.publish_reader_observation(
+        reader_error=raw,
+        cod_signal_error="OSError: /tmp/synth-player/notes.txt missing",
+        reader_tick=111)
+    log_before = (tmp_path / "cod_signals.jsonl").read_bytes() if (tmp_path / "cod_signals.jsonl").exists() else b""
+    release = threading.Event()
+
+    def linger():
+        release.wait(3)
+        runner.stats["frames"] = 6
+        runner.end_word_last_ms = 9000
+        runner.publish_reader_observation(reader_error="later", cod_signal_error=None, reader_tick=999)
+
+    thread = threading.Thread(target=linger, name="qorcap-cod-reader")
+    thread.start()
+    stop = threading.Event()
+    state = {"core": runner, "reader_thread": thread, "reader_error": "SHOULD_NOT_USE", "reader_tick": 1}
+    joined = M.seal_reader(stop, state, timeout=0.05, slice_s=0.02)
+    assert joined is False
+    assert M.maybe_write_cod_reader_stats(
+        tmp_path, state, "cod", practice=True, reader_joined=False) is True
+    release.set()
+    thread.join(timeout=2)
+    assert thread.is_alive() is False
+    assert runner.stats["frames"] == 6
+    saved = json.loads((tmp_path / "cod_reader_stats.json").read_text(encoding="utf-8"))
+    assert saved["reader_join"] == "timed_out"
+    assert saved["stats"]["frames"] == 5
+    assert saved["end_word_first_ms"] == 1000 and saved["end_word_last_ms"] == 1000
+    assert saved["reader_tick"] == 111
+    assert saved["reader_tick_clock"] == "wall_unix_ms"
+    assert saved["end_word_clock"] == "capture_monotonic_ms"
+    blob = json.dumps(saved)
+    assert "synth-player" not in blob
+    assert "qorcap.cfg" not in blob
+    assert "Users" not in blob
+    assert "[path]" in saved["reader_error"]
+    assert "[path]" in saved["cod_signal_error"]
+    assert saved["reader_error"].startswith("OSError: [path] missing [path]")
+    assert saved["reader_error"].endswith(" [cut]")
+    assert len(saved["reader_error"]) <= C.READER_STATS_ERROR_MAX
+    assert "missing" in saved["cod_signal_error"]
+    signal_path = tmp_path / "cod_signals.jsonl"
+    assert (signal_path.read_bytes() if signal_path.exists() else b"") == log_before
+
+    done = C.CodSetRunner(lambda _e: None)
+    done.stats["frames"] = 2
+
+    def finish():
+        done.stats["frames"] = 6
+        done.publish_reader_observation(reader_error=None, cod_signal_error=None, reader_tick=8)
+
+    live = threading.Thread(target=finish, name="qorcap-cod-reader")
+    live.start()
+    live_state = {"core": done, "reader_thread": live, "reader_tick": 8}
+    assert M.seal_reader(threading.Event(), live_state, timeout=2) is True
+    assert M.maybe_write_cod_reader_stats(tmp_path, live_state, "cod", practice=True, reader_joined=True) is True
+    joined_doc = json.loads((tmp_path / "cod_reader_stats.json").read_text(encoding="utf-8"))
+    assert joined_doc["reader_join"] == "joined"
+    assert joined_doc["stats"]["frames"] == 6
+    assert joined_doc["reader_tick"] == 8
+
+
+def test_missing_join_is_not_labeled_timed_out(tmp_path):
+    """None means not_joined even while the reader thread is alive.
+
+    False stays timed_out after that thread has exited. A claimed join that
+    is still alive keeps the published copy and does not say joined.
+    """
+    runner = C.CodSetRunner(lambda _e: None)
+    runner.stats["frames"] = 4
+    runner.publish_reader_observation(reader_error=None, cod_signal_error=None, reader_tick=20)
+    release = threading.Event()
+
+    def linger():
+        release.wait(3)
+        runner.stats["frames"] = 9
+        runner.publish_reader_observation(reader_error="later", cod_signal_error=None, reader_tick=99)
+
+    thread = threading.Thread(target=linger, name="qorcap-cod-reader")
+    thread.start()
+    try:
+        state = {"core": runner, "reader_thread": thread, "reader_tick": 1, "reader_error": "LIVE"}
+        assert M.maybe_write_cod_reader_stats(
+            tmp_path, state, "cod", practice=True, reader_joined=None) is True
+        saved = json.loads((tmp_path / "cod_reader_stats.json").read_text(encoding="utf-8"))
+        assert saved["reader_join"] == "not_joined"
+        assert saved["stats"]["frames"] == 4
+        assert saved["reader_tick"] == 20
+        assert saved["reader_error"] is None
+
+        claimed = tmp_path / "claimed"
+        claimed.mkdir()
+        assert M.maybe_write_cod_reader_stats(
+            claimed, state, "cod", practice=True, reader_joined=True) is True
+        claimed_doc = json.loads((claimed / "cod_reader_stats.json").read_text(encoding="utf-8"))
+        assert claimed_doc["reader_join"] == "timed_out"
+        assert claimed_doc["stats"]["frames"] == 4
+        assert claimed_doc["reader_error"] is None
+    finally:
+        release.set()
+        thread.join(2)
+
+    assert thread.is_alive() is False
+    dead = tmp_path / "dead"
+    dead.mkdir()
+    assert M.maybe_write_cod_reader_stats(
+        dead, {"core": runner}, "cod", practice=True, reader_joined=False) is True
+    timed = json.loads((dead / "cod_reader_stats.json").read_text(encoding="utf-8"))
+    assert timed["reader_join"] == "timed_out"
+
+    blank = tmp_path / "blank"
+    blank.mkdir()
+    bare = C.CodSetRunner(lambda _e: None)
+    bare.stats["frames"] = 8
+    assert M.maybe_write_cod_reader_stats(
+        blank, {"core": bare}, "cod", practice=True, reader_joined=None) is True
+    empty = json.loads((blank / "cod_reader_stats.json").read_text(encoding="utf-8"))
+    assert empty["reader_join"] == "not_joined"
+    assert empty["stats"] is None
+
+
+def test_scrub_reader_error_drops_bearer_unc_tilde_and_spaced_paths():
+    bearer = C.scrub_reader_error(
+        "OSError: Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.payload.sig failed")
+    assert "eyJhbGciOiJIUzI1NiJ9" not in bearer
+    assert "payload.sig" not in bearer
+    assert "[redacted]" in bearer
+    assert bearer.startswith("OSError:")
+
+    standalone = C.scrub_reader_error("read failed Bearer ya29.a0AfH6SM-example-token now")
+    assert "ya29" not in standalone
+    assert "a0AfH6SM" not in standalone
+    assert "Bearer [redacted]" in standalone
+    assert standalone.endswith("now")
+
+    keyed = C.scrub_reader_error("OSError: token=example")
+    assert "example" not in keyed
+    assert "token=[redacted]" in keyed
+
+    unc = C.scrub_reader_error(r"OSError: \\server\share\room\clip.mp4 missing")
+    assert "server" not in unc
+    assert "share" not in unc
+    assert "clip.mp4" not in unc
+    assert unc == "OSError: [path] missing"
+
+    spaced_unc = C.scrub_reader_error(r"OSError: \\server\share\My Folder\clip.mp4 missing")
+    assert "server" not in spaced_unc
+    assert "Folder" not in spaced_unc
+    assert "clip.mp4" not in spaced_unc
+    assert spaced_unc == "OSError: [path] missing"
+
+    tilde = C.scrub_reader_error(
+        "OSError: ~/Library/Application Support/qorcap/secret.cfg missing")
+    assert "Library" not in tilde
+    assert "Application" not in tilde
+    assert "secret.cfg" not in tilde
+    assert "qorcap" not in tilde
+    assert tilde == "OSError: [path] missing"
+
+    spaced = C.scrub_reader_error(
+        r"OSError: C:\Users\synth\My Documents\qorcap.cfg missing /home/synth/My Matches/end.png")
+    assert "synth" not in spaced
+    assert "Documents" not in spaced
+    assert "qorcap.cfg" not in spaced
+    assert "Matches" not in spaced
+    assert "end.png" not in spaced
+    assert spaced == "OSError: [path] missing [path]"
+
+    quoted = C.scrub_reader_error(
+        r'OSError: "C:\Program Files\QorCap\device.cfg" missing')
+    assert "Program" not in quoted
+    assert "device.cfg" not in quoted
+    assert quoted == "OSError: [path] missing"
