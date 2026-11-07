@@ -65,9 +65,24 @@ def test_resolve_game_flag_then_file_then_prompt(tmp_path):
 def test_launcher_asks_for_the_game_before_python():
     ps = (Path(__file__).resolve().parents[1] / "start-match.ps1").read_text(encoding="utf-8")
     src = Path(M.__file__).read_text(encoding="utf-8")
+    launch = '& $vpy (Join-Path $here "sidecar\\qorcap_match.py")'
+    # A one-shot next-game.txt still reaches Python as --game ask. The cards pass madden or cod.
     assert '$fwd = @("--game", "ask") + $fwd' in ps
-    assert ps.index('"--game", "ask"') < ps.index('& $vpy (Join-Path $here "sidecar\\qorcap_match.py")')
+    assert ps.index('"--game", "ask"') < ps.index(launch)
+    assert ps.index("Show-QorCapGamePicker") < ps.index(launch)
     assert '"--game"' in ps
+    assert "[Console]::IsInputRedirected" in ps
+    assert "last-game.txt" in ps
+    assert "[1]  MADDEN  (scorebug - home/away - end menu)" in ps
+    assert "[2]  CALL OF DUTY  (HUD - killfeed - Qortrola30 end row)" in ps
+    assert "Profile locked: CALL OF DUTY  cod_mw4_hud" in ps
+    assert "Profile locked: MADDEN  madden27_standard" in ps
+    assert "frame clock ON" in ps and "practice  ·  not sent" in ps
+    assert "[Console]::ReadKey($true)" in ps
+    assert "-ForegroundColor DarkRed" in ps
+    assert "-ForegroundColor Yellow" not in ps and "-ForegroundColor DarkYellow" not in ps
+    card = (Path(__file__).resolve().parents[1] / "Test Without Card.cmd").read_text(encoding="utf-8")
+    assert "start-match.ps1" in card and "--test-pattern" in card
     assert 'choices=["madden", "cod", "ask"]' in src
     assert src.index("resolve_game(") < src.index("resolve_side(")
     assert 'if game == "cod":\n        start_cod_reader' in src
