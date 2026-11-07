@@ -2,7 +2,7 @@
 
 # QorCap
 
-**Website:** https://conwan30.github.io/qorcap/ · **Download:** [v0.3.40](https://github.com/ConWan30/qorcap/releases/tag/v0.3.40) ([latest release](https://github.com/ConWan30/qorcap/releases/latest))
+**Website:** https://conwan30.github.io/qorcap/ · **Download:** [v0.3.41](https://github.com/ConWan30/qorcap/releases/tag/v0.3.41) ([latest release](https://github.com/ConWan30/qorcap/releases/latest))
 
 A small Windows recorder for a USB HDMI capture card (built for a generic **"USB3.0 Video"** card carrying a PS5),
 made for **[QorTime](https://github.com/ConWan30/qortime)** match receipts. It does two jobs:
@@ -29,7 +29,7 @@ with a local control surface). QorCap copies only that design idea, no code. No 
 
 ## Quickstart: double-click Start Match
 
-1. Download `qorcap-v0.3.40-windows-x64.zip` from the [latest release](https://github.com/ConWan30/qorcap/releases/latest)
+1. Download `qorcap-v0.3.41-windows-x64.zip` from the [latest release](https://github.com/ConWan30/qorcap/releases/latest)
    and unzip it, for example to `C:\QorCap` (right-click the zip, *Extract All*).
 2. Connect PS5 HDMI out to the **USB3.0 Video** card, and the card to a blue USB 3 port. Close OBS or the Camera app.
 3. Double-click **`Start Match`**. On the first run it downloads ffmpeg, installs Python 3.12 through winget if it
@@ -400,7 +400,7 @@ Global: `--port 8788`, `--ffmpeg PATH`, `--log FILE` (default `qorcap.log`, or `
 ## Run on Windows by hand (PowerShell, advanced)
 
 ```powershell
-# 1. unzip qorcap-v0.3.40-windows-x64.zip to C:\QorCap, then:
+# 1. unzip qorcap-v0.3.41-windows-x64.zip to C:\QorCap, then:
 cd C:\QorCap
 Unblock-File .\qorcap.exe, .\get-ffmpeg.ps1
 powershell -ExecutionPolicy Bypass -File .\get-ffmpeg.ps1     # puts ffmpeg.exe next to qorcap.exe
@@ -458,6 +458,8 @@ python tools/assert_pytest_skips.py --list windows | xargs python -m pytest --co
 ```
 
 The floor has to be at least the number of listed entries. A report with zero testcases fails even when the floor is zero. Do not lower the floor to hide a dropped file.
+
+**v0.3.41:** For Call of Duty, the practice picker no longer asks home or away. `start_cod_reader()` is called with `side=None`, so a leftover `side_choice.json` is never read. CoD stays in the legacy `home` signing-role bucket that `receipt.v0` requires. Madden still asks home or away. `receipt.v0.json` is unchanged.
 
 **v0.3.40:** `start-match.ps1` is UTF-8 with a BOM so Windows PowerShell 5.1 can parse the QORCAP / QORTIME cards. Shipped `.ps1` files must be pure ASCII or carry that BOM, and they must parse under `powershell.exe` 5.1. `hb` rows add `max_rx_gap_us`, `stale_over_50ms`, `short_reads`, `parse_faults`, and `first_rx_t_us`, reset every heartbeat, so a stall that recovers inside the interval stays visible after `last_rx_t_us` moves. `dev_counter` is a diagnostic raw report byte with unvalidated semantics. Epoch increments on every HID handle open and on a device identity change, and stale telemetry resets on reconnect. `receipt.v0.json` is unchanged.
 
