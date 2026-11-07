@@ -10,3 +10,6 @@ mod envelope_tests;
 mod isolation;
 mod readiness_tests;
 mod service;
+
+mod p1_tests;
+mod p1_external;

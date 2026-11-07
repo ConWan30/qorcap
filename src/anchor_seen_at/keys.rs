@@ -80,6 +80,21 @@ impl TrustPolicy {
         })
     }
 
+    pub(crate) fn archive(&self) -> serde_json::Value {
+        let keys: Vec<_> = self.keys.iter().map(|k| {
+            let status = match &k.status {
+                KeyStatus::Active => serde_json::json!({"kind":"active"}),
+                KeyStatus::Revoked => serde_json::json!({"kind":"revoked"}),
+                KeyStatus::Retired { archived_ack_ids } => serde_json::json!({"kind":"retired", "archived_ack_ids":archived_ack_ids}),
+            };
+            serde_json::json!({"key_id":k.key_id, "alg":k.alg, "public_key":super::canon::b64url(k.public_key.as_bytes()),
+                "scope":match k.scope { KeyScope::Challenge => "challenge", KeyScope::Ack => "ack" },
+                "service":k.service, "audience":k.audience, "status":status})
+        }).collect();
+        serde_json::json!({"trust_policy_id":self.trust_policy_id, "service":self.service,
+            "audience":self.audience, "policy_ids":self.policy_ids, "keys":keys})
+    }
+
     pub fn resolve(&self, q: &KeyLookup) -> Result<VerifyingKey, Reason> {
         ensure(q.service == self.service && q.audience == self.audience, Reason::KeyServiceMismatch)?;
         ensure(self.policy_ids.contains(q.policy_id), Reason::PolicyMismatch)?;

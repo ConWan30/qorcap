@@ -23,6 +23,7 @@ pub mod coverage;
 pub mod envelope;
 pub mod keys;
 pub mod local_store;
+pub mod p1;
 pub mod readiness;
 pub mod service_double;
 pub mod types;
