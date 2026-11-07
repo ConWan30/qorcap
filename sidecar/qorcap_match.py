@@ -293,6 +293,90 @@ def seal_reader(stop: threading.Event, state: dict, timeout: float | None = READ
     return not thread.is_alive()
 
 
+def run_with_reader_stats(body, persist):
+    """Run capture and receipt save, then best-effort reader stats.
+
+    ``persist`` runs on the way out, including when ``body`` raises. Exceptions
+    from ``persist`` are discarded so optional diagnostics cannot replace the
+    save result or hide ``body``'s exception. ``persist`` runs after ``body``
+    returns, so a slow stats write does not run before the save.
+    """
+    try:
+        return body()
+    finally:
+        try:
+            persist()
+        except Exception:
+            pass
+
+
+def _reader_thread_alive(state) -> bool:
+    thread = state.get("reader_thread") if isinstance(state, dict) else None
+    alive = getattr(thread, "is_alive", None)
+    if not callable(alive):
+        return False
+    try:
+        return bool(alive())
+    except Exception:
+        return False
+
+
+def maybe_write_cod_reader_stats(bundle: Path, state: dict, game: str, *,
+                                 practice: bool = False, reader_joined: bool | None = None) -> bool:
+    """Write Call of Duty reader counts when this stop passes ``practice=True``.
+
+    This sidecar has no flag that inspects another installed build. Passing
+    ``practice=True`` is the caller's explicit gate for this process. Madden,
+    any other game, ``practice`` other than True, or a missing reader returns
+    without creating a file. The signal log is not appended.
+
+    ``reader_joined`` True reads the runner only when its thread is not alive
+    and records ``joined``. False keeps the last published copy and records
+    ``timed_out``, including when that thread has since exited. None records
+    ``not_joined`` and keeps the published copy even if the thread is still
+    alive. True while the thread is still alive is not a finished join: the
+    published copy is kept and the label is ``timed_out``. A missing copy does
+    not invent zero counts.
+    """
+    if practice is not True or game != "cod":
+        return False
+    try:
+        from qorcap_cod import observation_from_runner, write_reader_stats
+        core = state.get("core") if isinstance(state, dict) else None
+        if core is None or not isinstance(getattr(core, "stats", None), dict):
+            return False
+        alive = _reader_thread_alive(state)
+        if reader_joined is True and not alive:
+            observation = observation_from_runner(
+                core,
+                reader_error=state.get("reader_error"),
+                cod_signal_error=state.get("cod_signal_error"),
+                reader_tick=state.get("reader_tick"),
+            )
+            join = "joined"
+        else:
+            published = None
+            getter = getattr(core, "published_reader_observation", None)
+            if callable(getter):
+                published = getter()
+            observation = published if isinstance(published, dict) else None
+            if observation is None:
+                from qorcap_cod import _blank_observation
+                observation = _blank_observation()
+            # None is a missing join even when the thread is still alive.
+            # False is a timeout. True only reaches here when the thread is
+            # still alive, so that claim is a timeout, not a finished join.
+            join = "not_joined" if reader_joined is None else "timed_out"
+        write_reader_stats(bundle, observation, reader_join=join)
+    except Exception as e:
+        try:
+            say(f"  Call of Duty reader counts were not written: {type(e).__name__}")
+        except Exception:
+            pass
+        return False
+    return True
+
+
 def mark_health_sealed(state: dict) -> None:
     """Drop later reader_health rows. The receipt is about to be signed."""
     state["health_sealed"] = True
@@ -868,12 +952,23 @@ def start_cod_reader(api: Api, stop: threading.Event, state: dict, bundle: Path 
         except Exception as e:
             state["cod_signal_error"] = f"{type(e).__name__}: {e}"
 
+    def publish():
+        try:
+            runner.publish_reader_observation(
+                reader_error=state.get("reader_error"),
+                cod_signal_error=state.get("cod_signal_error"),
+                reader_tick=state.get("reader_tick"),
+            )
+        except Exception:
+            pass
+
     def loop():
         try:
             import cv2
             import numpy as np
         except Exception as e:
             state["reader_error"] = f"cod_reader_unavailable: {type(e).__name__}"
+            publish()
             return
         last_refresh = 0.0
         seen = set()
@@ -901,6 +996,7 @@ def start_cod_reader(api: Api, stop: threading.Event, state: dict, bundle: Path 
                     )
                     if stop.wait(0.5):
                         break
+                    publish()
                     continue
                 try:
                     img = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
@@ -917,7 +1013,12 @@ def start_cod_reader(api: Api, stop: threading.Event, state: dict, bundle: Path 
                         runner.note_capture_gap(f"frame_hook:{type(e).__name__}")
                 if stop.wait(0.25):
                     break
+                publish()
         finally:
+            try:
+                publish()
+            except Exception:
+                pass
             try:
                 runner.close_signals()
             except Exception:
@@ -1797,6 +1898,17 @@ def main(argv=None) -> int:
                 pass
         return got
 
+    # practice=True is this sidecar's explicit stop gate. This process does not
+    # read another installed build. Other games still write nothing.
+    # joined stays None until save_tail seals, which is after countersign.
+    # persist_stats must not join: that stamp lands before wait_and_countersign.
+    stop_box = {"joined": None}
+    capture_fault = None
+
+    def persist_stats():
+        maybe_write_cod_reader_stats(
+            bundle, state, game, practice=True, reader_joined=stop_box["joined"])
+
     tail_s = post_final_tail_s()
     stop_reason = "final"
     try:
@@ -1887,119 +1999,180 @@ def main(argv=None) -> int:
             _remember_tail_stop(state, now_mono, int(time.time() * 1000))
     except KeyboardInterrupt:
         stop_reason = "ctrl_c"
-        _remember_tail_stop(state, time.monotonic(), int(time.time() * 1000))
-        say("\n\nStopping (Ctrl+C) ...")
+        try:
+            _remember_tail_stop(state, time.monotonic(), int(time.time() * 1000))
+        except Exception:
+            pass
+        try:
+            say("\n\nStopping (Ctrl+C) ...")
+        except Exception:
+            pass
+    except Exception:
+        # The match save still runs. Joining or persisting here would seal the
+        # reader before wait_and_countersign and could skip the receipt.
+        capture_fault = sys.exc_info()[1]
+        stop_reason = "capture_error"
+        try:
+            _remember_tail_stop(state, time.monotonic(), int(time.time() * 1000))
+        except Exception:
+            pass
+        try:
+            say("\n\nStopping after a capture error. The match save still runs.")
+        except Exception:
+            pass
     finally:
         if ui is not None:
             try:
                 ui.close()
             except Exception:
                 pass
-    stop.set()
-    # Do not join the reader here. Checkpoints are still landing about every 2 s,
-    # and a multi-second join stamps them late enough for verify_chain's clock_skew.
-    # The join is after wait_and_countersign, in short slices that keep sweeping.
-    ignore_ctrl_c()  # from here on, a Ctrl+C must not abort signing (it caused 'receipt failed' + Y/N prompt)
-    say("\n\nStopping QorCap: sealing and countersigning the final checkpoints ...")
-    sweep()
-    try:
-        api.post("/shutdown", shutdown_body(stop_reason))
-    except Exception:
-        pass
-    # Countersign the stop checkpoints over the API while QorCap is still up; QorCap waits for our report
-    # before the input-proof analysis (v0.3.2 stamped the tail ~105 s late: gap_too_long + clock_skew).
-    phase = {"last": None}
-
-    def tick():
-        try:
-            st = api.get("/status", timeout=1)
-        except Exception:
-            return
-        s_ = st.get("state")
-        if s_ != phase["last"]:
-            phase["last"] = s_
-            msg = {"countersigning": "  final checkpoints: countersigning ...",
-                   "finishing": f"  final checkpoints countersigned ({len(cs.signed)}). Checking controller input against the video (1-2 minutes, please wait) ...",
-                   "stopped": "  QorCap finished the match bundle."}.get(s_)
-            if msg:
+    def save_tail():
+        def note(msg: str = "") -> None:
+            try:
                 say(msg)
-    wait_and_countersign(proc, bundle / "checkpoints.jsonl", cs, timeout=SHUTDOWN_TIMEOUT_S, sweep=sweep, on_tick=tick)
-    log.close()
-    # Sidecar file only. Not a bundle.json field and not a receipt field.
-    if state.get("tail_stop_wall_ms") is None:
-        _remember_tail_stop(state, time.monotonic(), int(time.time() * 1000))
-    record_post_final_tail(
-        bundle,
-        configured_s=tail_s,
-        start_reason=state.get("final_screen_start_reason"),
-        start_t_ms=state.get("final_screen_wall_ms"),
-        stop_t_ms=state.get("tail_stop_wall_ms"),
-        actual_s=state.get("tail_actual_s"))
+            except Exception:
+                pass
 
-    # Countersign anything QorCap wrote while shutting down (still within seconds of t_ms).
-    for line in (bundle / "checkpoints.jsonl").read_text(encoding="utf-8").splitlines() if (bundle / "checkpoints.jsonl").exists() else []:
-        if line.strip():
-            c = json.loads(line)
-            if c["seq"] >= len(cs.signed):
-                cs.offer(c)
-
-    # The chain is countersigned. Join the reader in slices so a checkpoint that
-    # arrives during the join is still stamped, then the final check may append
-    # one notice. The health file stays open until mark_health_sealed.
-    seal_reader(stop, state, sweep=sweep)
-
-    say("\nFinishing up: signing the receipt ...")
-    draft_p = bundle / "receipt.draft.json"
-    if not draft_p.exists():
-        mark_health_sealed(state)
-        say(f"FAIL: QorCap did not write the bundle. See {bundle / 'qorcap.log'}")
-        return 2
-    draft = json.loads(draft_p.read_text(encoding="utf-8"))
-    from qorcap_games import recorded_set, stamp_draft, uses_madden_reader
-    spec = recorded_set(bundle)
-    # Same abstain rule as offline finalize. An end-menu final is kept. The rule is on, not behind a flag.
-    live_fin = state.get("final")
-    unresolved = _grammar_unresolved(state.get("core")) if uses_madden_reader(spec) else False
-    if live_fin and is_end_menu_final(live_fin):
-        draft = apply_stopped_match_final(draft, live_fin, grammar_unresolved=unresolved)
-    elif unresolved:
-        draft = apply_stopped_match_final(draft, None, grammar_unresolved=True)
-    if uses_madden_reader(spec) and not a.test_pattern and draft["result"].get("method") != "end_menu_read" and a.ffmpeg:
-        draft = tail_final_check(bundle, draft, ffmpeg=a.ffmpeg, grammar_unresolved=unresolved, live_final=live_fin)
-    elif uses_madden_reader(spec) and not a.test_pattern and draft["result"].get("method") == "end_menu_read" and draft["result"].get("final_confirmed") is not True and a.ffmpeg:
-        # Stop-time fallback: re-read with bundle haptics/clips so a live-uncorroborated delta can still confirm.
-        # A disputed end menu is not re-read: the first agreeing frame would exact-match and upgrade it.
-        draft = tail_final_check(bundle, draft, ffmpeg=a.ffmpeg, grammar_unresolved=unresolved, live_final=live_fin)
-    draft = stamp_draft(draft, spec)
-    from qorcap_reanchor_notes import record_unresolved_final
-    record_unresolved_final(bundle, draft.get("result"))
-    if not a.test_pattern and a.audio != "none":
-        report_recording_audio(bundle, a.ffmpeg or next((str(c) for c in [HERE.parent / ("ffmpeg.exe" if WIN else "ffmpeg")]
-                                                         if c.exists()), None) or shutil.which("ffmpeg"))
-    # After the final check's notice, before the signature. A late health row is dropped.
-    mark_health_sealed(state)
-    code = sign_and_report(bundle, draft, cs.signed, device, referee, match_id=match_id, role=a.role,
-                           started_ms=started_ms, qt=qt, qorcap=qorcap, no_open=a.no_open)
-    if spec.set_id == "cod":
+        stop.set()
+        # Do not join the reader here. Checkpoints are still landing about every 2 s,
+        # and a multi-second join stamps them late enough for verify_chain's clock_skew.
+        # The join is after wait_and_countersign, in short slices that keep sweeping.
+        ignore_ctrl_c()  # from here on, a Ctrl+C must not abort signing (it caused 'receipt failed' + Y/N prompt)
+        note("\n\nStopping QorCap: sealing and countersigning the final checkpoints ...")
         try:
-            from qorcap_cod import attach_session
-            attach_session(bundle)
-        except Exception as e:
-            say(f"  Call of Duty session tags were not written: {type(e).__name__}: {e}")
-    if live is not None:
-        say(f"  Official anchors: {live.anchors} (link failures: {live.failures})")
-    ff = a.ffmpeg or next((str(c) for c in [HERE.parent / ("ffmpeg.exe" if WIN else "ffmpeg")] if c.exists()), None) or shutil.which("ffmpeg") or "ffmpeg"
+            sweep()
+        except Exception:
+            pass
+        try:
+            api.post("/shutdown", shutdown_body(stop_reason))
+        except Exception:
+            pass
+        # Countersign the stop checkpoints over the API while QorCap is still up; QorCap waits for our report
+        # before the input-proof analysis (v0.3.2 stamped the tail ~105 s late: gap_too_long + clock_skew).
+        phase = {"last": None}
 
-    def _highlights():
-        # After sign_and_report only. The recorder has stopped; a fresh marker still skips this.
-        post_match_highlights(bundle, ff, qorcap=qorcap, qortime=qt)
+        def tick():
+            try:
+                st = api.get("/status", timeout=1)
+            except Exception:
+                return
+            s_ = st.get("state")
+            if s_ != phase["last"]:
+                phase["last"] = s_
+                msg = {"countersigning": "  final checkpoints: countersigning ...",
+                       "finishing": f"  final checkpoints countersigned ({len(cs.signed)}). Checking controller input against the video (1-2 minutes, please wait) ...",
+                       "stopped": "  QorCap finished the match bundle."}.get(s_)
+                if msg:
+                    note(msg)
+        wait_and_countersign(proc, bundle / "checkpoints.jsonl", cs, timeout=SHUTDOWN_TIMEOUT_S, sweep=sweep, on_tick=tick)
+        try:
+            log.close()
+        except Exception:
+            pass
+        # Sidecar file only. Not a bundle.json field and not a receipt field.
+        # A failure here must not skip the seal or the receipt.
+        try:
+            if state.get("tail_stop_wall_ms") is None:
+                _remember_tail_stop(state, time.monotonic(), int(time.time() * 1000))
+            record_post_final_tail(
+                bundle,
+                configured_s=tail_s,
+                start_reason=state.get("final_screen_start_reason"),
+                start_t_ms=state.get("final_screen_wall_ms"),
+                stop_t_ms=state.get("tail_stop_wall_ms"),
+                actual_s=state.get("tail_actual_s"))
+        except Exception:
+            pass
 
-    def _submit():
-        if code != 2 and (a.submit or not a.no_submit_prompt) and not a.test_pattern:
-            offer_submit(bundle, a.referee_url, auto=a.submit, ask=ask_with_timeout)
+        # Countersign anything QorCap wrote while shutting down (still within seconds of t_ms).
+        try:
+            cp_path = bundle / "checkpoints.jsonl"
+            cp_lines = cp_path.read_text(encoding="utf-8").splitlines() if cp_path.is_file() else []
+        except Exception:
+            cp_lines = []
+        for line in cp_lines:
+            if not line.strip():
+                continue
+            try:
+                c = json.loads(line)
+                if c["seq"] >= len(cs.signed):
+                    cs.offer(c)
+            except Exception:
+                continue
 
+        # The chain is countersigned. Join the reader in slices so a checkpoint that
+        # arrives during the join is still stamped, then the final check may append
+        # one notice. The health file stays open until mark_health_sealed.
+        try:
+            stop_box["joined"] = bool(seal_reader(stop, state, sweep=sweep))
+        except Exception:
+            stop_box["joined"] = False
+
+        note("\nFinishing up: signing the receipt ...")
+        draft_p = bundle / "receipt.draft.json"
+        if not draft_p.exists():
+            mark_health_sealed(state)
+            note(f"FAIL: QorCap did not write the bundle. See {bundle / 'qorcap.log'}")
+            return 2, None, None
+        draft = json.loads(draft_p.read_text(encoding="utf-8"))
+        from qorcap_games import recorded_set, stamp_draft, uses_madden_reader
+        spec = recorded_set(bundle)
+        # Same abstain rule as offline finalize. An end-menu final is kept. The rule is on, not behind a flag.
+        live_fin = state.get("final")
+        unresolved = _grammar_unresolved(state.get("core")) if uses_madden_reader(spec) else False
+        if live_fin and is_end_menu_final(live_fin):
+            draft = apply_stopped_match_final(draft, live_fin, grammar_unresolved=unresolved)
+        elif unresolved:
+            draft = apply_stopped_match_final(draft, None, grammar_unresolved=True)
+        if uses_madden_reader(spec) and not a.test_pattern and draft["result"].get("method") != "end_menu_read" and a.ffmpeg:
+            draft = tail_final_check(bundle, draft, ffmpeg=a.ffmpeg, grammar_unresolved=unresolved, live_final=live_fin)
+        elif uses_madden_reader(spec) and not a.test_pattern and draft["result"].get("method") == "end_menu_read" and draft["result"].get("final_confirmed") is not True and a.ffmpeg:
+            # Stop-time fallback: re-read with bundle haptics/clips so a live-uncorroborated delta can still confirm.
+            # A disputed end menu is not re-read: the first agreeing frame would exact-match and upgrade it.
+            draft = tail_final_check(bundle, draft, ffmpeg=a.ffmpeg, grammar_unresolved=unresolved, live_final=live_fin)
+        draft = stamp_draft(draft, spec)
+        from qorcap_reanchor_notes import record_unresolved_final
+        record_unresolved_final(bundle, draft.get("result"))
+        if not a.test_pattern and a.audio != "none":
+            report_recording_audio(bundle, a.ffmpeg or next((str(c) for c in [HERE.parent / ("ffmpeg.exe" if WIN else "ffmpeg")]
+                                                             if c.exists()), None) or shutil.which("ffmpeg"))
+        # After the final check's notice, before the signature. A late health row is dropped.
+        mark_health_sealed(state)
+        code = sign_and_report(bundle, draft, cs.signed, device, referee, match_id=match_id, role=a.role,
+                               started_ms=started_ms, qt=qt, qorcap=qorcap, no_open=a.no_open)
+        if spec.set_id == "cod":
+            try:
+                from qorcap_cod import attach_session
+                attach_session(bundle)
+            except Exception as e:
+                note(f"  Call of Duty session tags were not written: {type(e).__name__}: {e}")
+        if live is not None:
+            note(f"  Official anchors: {live.anchors} (link failures: {live.failures})")
+        ff = a.ffmpeg or next((str(c) for c in [HERE.parent / ("ffmpeg.exe" if WIN else "ffmpeg")] if c.exists()), None) or shutil.which("ffmpeg") or "ffmpeg"
+
+        def _highlights():
+            # After sign_and_report only. The recorder has stopped; a fresh marker still skips this.
+            post_match_highlights(bundle, ff, qorcap=qorcap, qortime=qt)
+
+        def _submit():
+            if code != 2 and (a.submit or not a.no_submit_prompt) and not a.test_pattern:
+                offer_submit(bundle, a.referee_url, auto=a.submit, ask=ask_with_timeout)
+
+        return code, _highlights, _submit
+
+    try:
+        code, highlights, submit = run_with_reader_stats(save_tail, persist_stats)
+    except Exception as save_exc:
+        if capture_fault is not None:
+            raise save_exc from capture_fault
+        raise
+    if capture_fault is not None:
+        try:
+            say(f"  Capture loop error ({type(capture_fault).__name__}) did not skip the match save.")
+        except Exception:
+            pass
     return after_receipt(code, auto_highlights=a.auto_highlights and not a.no_auto_highlights,
-                         highlights=_highlights, submit=_submit)
+                         highlights=highlights, submit=submit)
 
 
 SUBMIT_PROMPT_TIMEOUT_S = 600
