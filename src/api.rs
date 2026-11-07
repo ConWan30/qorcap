@@ -24,18 +24,32 @@ pub fn route(e: &Arc<Engine>, method: &str, url: &str, body: &str) -> Resp {
         ("POST", "/record/stop") => match e.stop_recording() { Some(p) => j(200, json!({"ok": true, "file": p})), None => j(409, json!({"ok": false, "error": "not recording"})) },
         ("POST", "/replay/save") => match e.save_replay(b["out"].as_str()) { Ok(p) => j(200, json!({"ok": true, "file": p})), Err(m) => j(409, json!({"ok": false, "error": m})) },
         ("GET", "/snapshot.jpg") => {
-            let now = crate::engine::wall_ms();
-            match e.snap_pub.lock().unwrap_or_else(|err| err.into_inner()).serve(now) {
-                crate::snap::Serve::Fresh { bytes, source_ms, generation } => {
-                    e.tap.offer(&bytes, source_ms);
+            match e.snap_pub.lock().unwrap_or_else(|err| err.into_inner()).serve() {
+                crate::snap::Serve::Fresh {
+                    bytes, epoch, seq, pts_us, mono_us, generation, api, capture_id,
+                    session_id, clock_id, clock_source, mono_origin_ns, schema,
+                } => {
+                    // The glimpse tap keeps its own wall clock. Capture mono stays on the snapshot headers.
+                    e.tap.offer(&bytes, crate::engine::wall_ms());
                     return Resp { code: 200, ctype: "image/jpeg", body: bytes, headers: vec![
-                        ("X-Qorcap-Snapshot-Source-Ms", source_ms.to_string()),
+                        ("X-Qorcap-Snapshot-Api", api.to_string()),
+                        ("X-Qorcap-Snapshot-Schema", schema.to_string()),
+                        ("X-Qorcap-Snapshot-Session", session_id),
+                        ("X-Qorcap-Snapshot-Clock", clock_id),
+                        ("X-Qorcap-Snapshot-Clock-Source", clock_source),
+                        ("X-Qorcap-Snapshot-Mono-Origin-Ns", mono_origin_ns.to_string()),
+                        ("X-Qorcap-Snapshot-Epoch", epoch.to_string()),
+                        ("X-Qorcap-Snapshot-Generation", epoch.to_string()),
+                        ("X-Qorcap-Snapshot-Seq", seq.to_string()),
+                        ("X-Qorcap-Snapshot-Capture-Id", capture_id),
+                        ("X-Qorcap-Snapshot-Mono-Us", mono_us.to_string()),
+                        ("X-Qorcap-Snapshot-Pts-Us", pts_us.to_string()),
                         ("X-Qorcap-Snapshot-Gen", generation.to_string()),
                         ("Cache-Control", "no-store".to_string()),
                     ] };
                 }
-                crate::snap::Serve::Stale | crate::snap::Serve::Superseded => {
-                    return j(503, json!({"ok": false, "error": "stale frame"}));
+                crate::snap::Serve::AwaitingProducer => {
+                    return j(503, json!({"ok": false, "error": "stale generation"}));
                 }
                 crate::snap::Serve::Absent => {}
             }
@@ -254,6 +268,146 @@ mod tests {
         for c in all["checkpoints"].as_array().unwrap() { prev = crate::evidence::check_checkpoint(c, &prev).unwrap(); }
     }
     #[test]
+    fn legacy_file_snapshot_stays_readable_without_capture_provenance() {
+        let e = engine(&[]);
+        let jpeg = [0xFF, 0xD8, 0x44, 0xFF, 0xD9];
+        std::fs::write(&e.snapshot, &jpeg).unwrap();
+        {
+            let mut p = e.snap_pub.lock().unwrap_or_else(|err| err.into_inner());
+            p.begin_epoch(&jpeg);
+            p.note_progress(1, 10);
+            let prov = p.pending_provenance();
+            assert!(!p.consider(&jpeg, &e.snapshot, prov));
+            assert!(matches!(p.serve(), crate::snap::Serve::AwaitingProducer));
+        }
+        let r = route(&e, "GET", "/snapshot.jpg", "");
+        assert_eq!(r.code, 503, "old incoming bytes are not served before the producer starts");
+        assert!(r.headers.iter().all(|(k, _)| !k.to_ascii_lowercase().contains("source") && *k != "X-Qorcap-Snapshot-Mono-Us"));
+        let newer = [0xFF, 0xD8, 0x55, 0xFF, 0xD9];
+        {
+            let mut p = e.snap_pub.lock().unwrap_or_else(|err| err.into_inner());
+            p.mark_producer_started();
+            p.note_progress(2, 80_000);
+            let prov = p.pending_provenance();
+            assert!(p.consider(&newer, &e.snapshot, prov));
+        }
+        let fresh = route(&e, "GET", "/snapshot.jpg", "");
+        assert_eq!(fresh.code, 200);
+        assert_eq!(fresh.body, newer);
+        assert!(fresh.headers.iter().any(|(k, v)| *k == "X-Qorcap-Snapshot-Api" && v == "1"));
+        assert!(fresh.headers.iter().any(|(k, v)| *k == "X-Qorcap-Snapshot-Schema" && v == "qorcap-snapshot/v1"));
+        assert!(fresh.headers.iter().any(|(k, v)| *k == "X-Qorcap-Snapshot-Epoch" && v == "1"));
+        assert!(fresh.headers.iter().any(|(k, v)| *k == "X-Qorcap-Snapshot-Seq" && v == "2"));
+        assert!(fresh.headers.iter().any(|(k, v)| *k == "X-Qorcap-Snapshot-Mono-Us" && v == "80000"));
+        assert!(fresh.headers.iter().any(|(k, v)| *k == "X-Qorcap-Snapshot-Capture-Id" && v == "1:2"));
+        assert!(fresh.headers.iter().all(|(k, _)| *k != "X-Qorcap-Snapshot-Source-Ms"));
+    }
+
+    #[test]
+    fn a_checkpoint_that_cannot_be_synced_does_not_acknowledge_a_seal() {
+        let e = engine(&["--game", "cod_mw4"]);
+        {
+            let mut input = e.input.lock().unwrap_or_else(|err| err.into_inner());
+            input.close_seal();
+            assert!(input.seal_binding().is_some());
+        }
+        let path = e.bundle_dir().unwrap().join("checkpoints.jsonl");
+        if path.exists() { let _ = std::fs::remove_file(&path); }
+        std::fs::create_dir(&path).unwrap();
+        let failed = e.checkpoint("start", json!({}));
+        assert_eq!(failed["persisted"], false);
+        assert!(!failed["error"].as_str().unwrap_or("").is_empty());
+        assert!(e.input.lock().unwrap_or_else(|err| err.into_inner()).seal_binding().is_some());
+        assert!(e.status().checkpoint_persist_error.is_some());
+        std::fs::remove_dir(&path).unwrap();
+        let ok = e.checkpoint("start", json!({}));
+        assert!(ok.get("hash").is_some(), "{ok}");
+        assert_eq!(ok["seq"], 0);
+        assert!(e.input.lock().unwrap_or_else(|err| err.into_inner()).seal_binding().is_none());
+        assert!(e.status().checkpoint_persist_error.is_none());
+    }
+
+    fn seal_ready(e: &Engine) -> u64 {
+        let mut input = e.input.lock().unwrap_or_else(|err| err.into_inner());
+        input.close_seal();
+        input.seal_binding().unwrap()["revision"].as_u64().unwrap()
+    }
+
+    fn listen(e: &Engine) -> std::sync::mpsc::Receiver<String> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        e.subs.lock().unwrap_or_else(|err| err.into_inner()).push(tx);
+        rx
+    }
+
+    #[test]
+    fn qordata_flush_error_does_not_ack_or_broadcast() {
+        let e = engine(&["--game", "cod_mw4"]);
+        let revision = seal_ready(&e);
+        assert_eq!(revision, 1);
+        *e.persist_fault.lock().unwrap_or_else(|err| err.into_inner()) = Some(crate::engine::PersistFault {
+            stage: "flush", partial: None, remaining: 1,
+        });
+        let rx = listen(&e);
+        let failed = e.checkpoint("start", json!({}));
+        assert_eq!(failed["persisted"], false);
+        assert!(e.input.lock().unwrap_or_else(|err| err.into_inner()).seal_binding().unwrap()["revision"] == 1);
+        assert!(rx.try_recv().is_err(), "a flush error must not broadcast");
+        let path = e.bundle_dir().unwrap().join("checkpoints.jsonl");
+        let len = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        assert_eq!(len, 0, "flush failure rewinds the append");
+    }
+
+    #[test]
+    fn qordata_sync_error_retries_the_same_revision_once() {
+        let e = engine(&["--game", "cod_mw4"]);
+        assert_eq!(seal_ready(&e), 1);
+        *e.persist_fault.lock().unwrap_or_else(|err| err.into_inner()) = Some(crate::engine::PersistFault {
+            stage: "sync", partial: None, remaining: 1,
+        });
+        let rx = listen(&e);
+        let failed = e.checkpoint("start", json!({}));
+        assert_eq!(failed["persisted"], false);
+        assert!(rx.try_recv().is_err());
+        assert_eq!(e.input.lock().unwrap_or_else(|err| err.into_inner()).seal_binding().unwrap()["revision"], 1);
+        let ok = e.checkpoint("start", json!({}));
+        assert!(ok.get("hash").is_some(), "{ok}");
+        assert_eq!(ok["qorcap"]["session_seal"]["revision"], 1);
+        assert!(e.input.lock().unwrap_or_else(|err| err.into_inner()).seal_binding().is_none());
+        assert!(rx.try_recv().is_ok());
+        assert!(rx.try_recv().is_err(), "one broadcast");
+        let text = std::fs::read_to_string(e.bundle_dir().unwrap().join("checkpoints.jsonl")).unwrap();
+        let lines: Vec<_> = text.lines().filter(|l| !l.is_empty()).collect();
+        assert_eq!(lines.len(), 1, "retry does not duplicate the line");
+        let row: Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(row["seq"], 0);
+    }
+
+    #[test]
+    fn qordata_partial_write_rewinds_before_retry() {
+        let e = engine(&["--game", "cod_mw4"]);
+        seal_ready(&e);
+        *e.persist_fault.lock().unwrap_or_else(|err| err.into_inner()) = Some(crate::engine::PersistFault {
+            stage: "write", partial: Some(7), remaining: 1,
+        });
+        let failed = e.checkpoint("start", json!({}));
+        assert_eq!(failed["persisted"], false);
+        assert!(e.input.lock().unwrap_or_else(|err| err.into_inner()).seal_binding().is_some());
+        let path = e.bundle_dir().unwrap().join("checkpoints.jsonl");
+        assert_eq!(std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0), 0);
+        let ok = e.checkpoint("start", json!({}));
+        assert!(ok.get("hash").is_some(), "{ok}");
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.ends_with('\n'));
+        let lines: Vec<_> = text.lines().filter(|l| !l.is_empty()).collect();
+        assert_eq!(lines.len(), 1);
+        for (i, line) in lines.iter().enumerate() {
+            let row: Value = serde_json::from_str(line).unwrap();
+            assert_eq!(row["seq"], i as u64);
+        }
+        assert!(e.input.lock().unwrap_or_else(|err| err.into_inner()).seal_binding().is_none());
+    }
+
+    #[test]
     fn glimpse_frame_tap_is_opt_in_memory_only_and_rate_limited() {
         // Off by default: 404, and the reader's /snapshot.jpg path is unchanged.
         let off = engine(&[]);
@@ -290,6 +444,7 @@ mod tests {
         let e = engine(&[]);
         std::fs::write(&e.snapshot, [0xFF, 0xD8, 0xFF, 0xD9]).unwrap();
         let r = route(&e, "GET", "/snapshot.jpg", ""); assert_eq!((r.code, r.ctype), (200, "image/jpeg"));
+        assert!(r.headers.iter().all(|(k, _)| *k != "X-Qorcap-Snapshot-Api"));
         let port = 18000 + (std::process::id() % 2000) as u16;
         let h = serve(e.clone(), port).unwrap();
         let (c, b) = call(port, "GET", "/status", "").unwrap();

@@ -48,6 +48,16 @@ pub struct Status {
     /// v0.3.26: this console's QorTime side (home | away), fixed before the first checkpoint, and how it was chosen.
     pub role: String,
     pub side_source: Option<String>,
+    /// Set when a checkpoint line could not be flushed and synced. The seal stays unbound.
+    pub checkpoint_persist_error: Option<String>,
+}
+
+/// One injected append failure. Remaining counts down so a retry can succeed.
+#[derive(Clone, Debug)]
+pub struct PersistFault {
+    pub stage: &'static str,
+    pub partial: Option<usize>,
+    pub remaining: u32,
 }
 
 pub struct Recorder { reader: Option<std::thread::JoinHandle<()>>, child: Child, stdin: Option<ChildStdin>, pub path: String, started: Instant, deadline: Option<Instant>, wait_key: bool, base: String, part: u32 }
@@ -86,6 +96,8 @@ pub struct Engine {
     bundle_write: Mutex<()>,
     /// Set once the full stop write (including the input proof) has finished, so a late fast write cannot replace it.
     bundle_finalized: AtomicBool,
+    /// Test hook. A fault fails one append stage and rewinds a torn tail.
+    pub persist_fault: Mutex<Option<PersistFault>>,
 }
 
 /// QorTime evidence state for this run.
@@ -125,8 +137,48 @@ fn football_step(prev_h: i64, prev_a: i64, h: i64, a: i64) -> bool {
     matches!(dh + da, 1 | 2 | 3 | 6 | 7 | 8)
 }
 
-fn append_jsonl(path: &Path, v: &Value) -> bool {
-    use std::io::Write as _;
+trait SyncWrite {
+    fn write_all_buf(&mut self, buf: &[u8]) -> std::io::Result<()>;
+    fn flush_buf(&mut self) -> std::io::Result<()>;
+    fn sync_data(&mut self) -> std::io::Result<()>;
+    fn rewind(&mut self, len: u64) -> std::io::Result<()>;
+}
+
+impl SyncWrite for std::fs::File {
+    fn write_all_buf(&mut self, buf: &[u8]) -> std::io::Result<()> { Write::write_all(self, buf) }
+    fn flush_buf(&mut self) -> std::io::Result<()> { Write::flush(self) }
+    fn sync_data(&mut self) -> std::io::Result<()> { self.sync_all() }
+    fn rewind(&mut self, len: u64) -> std::io::Result<()> { self.set_len(len) }
+}
+
+/// Write, flush, and sync. Any stage error rewinds to the pre-write length.
+fn commit_durable<W: SyncWrite>(w: &mut W, bytes: &[u8], start_len: u64) -> Result<(), String> {
+    if let Err(e) = w.write_all_buf(bytes) {
+        let _ = w.rewind(start_len);
+        return Err(format!("write: {e}"));
+    }
+    if let Err(e) = w.flush_buf() {
+        let _ = w.rewind(start_len);
+        return Err(format!("flush: {e}"));
+    }
+    if let Err(e) = w.sync_data() {
+        let _ = w.rewind(start_len);
+        return Err(format!("sync: {e}"));
+    }
+    Ok(())
+}
+
+fn file_ends_with(path: &Path, line: &[u8]) -> bool {
+    let Ok(buf) = std::fs::read(path) else { return false };
+    if !buf.ends_with(line) || line.is_empty() { return false; }
+    buf.len() == line.len() || buf[buf.len() - line.len() - 1] == b'\n'
+}
+
+fn append_jsonl(path: &Path, v: &Value) -> Result<(), String> {
+    append_jsonl_fault(path, v, None)
+}
+
+fn append_jsonl_fault(path: &Path, v: &Value, mut fault: Option<&mut PersistFault>) -> Result<(), String> {
     use std::fs::OpenOptions;
     if let Some(d) = path.parent() { if !d.as_os_str().is_empty() { let _ = std::fs::create_dir_all(d); } }
     // v0.3.11: one write_all of the whole line under a process-wide lock. `writeln!(f, "{v}")` on an unbuffered
@@ -134,15 +186,52 @@ fn append_jsonl(path: &Path, v: &Value) -> bool {
     // interleaved the two lines (seen in the test-pattern run: "corrupt JSONL line" -> unknown chain heads).
     static APPEND: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let line = format!("{v}\n");
+    let bytes = line.as_bytes();
     let _g = APPEND.lock().unwrap_or_else(|e| e.into_inner());
+    if file_ends_with(path, bytes) {
+        return Ok(());
+    }
     match OpenOptions::new().create(true).append(true).open(path) {
         Ok(mut f) => {
-            if let Err(e) = f.write_all(line.as_bytes()) { error!("cannot write {}: {e}", path.display()); return false; }
-            let _ = f.flush();
-            let _ = f.sync_all(); // durable append: a crash leaves at most one torn line
-            true
+            let start = f.metadata().map(|m| m.len()).unwrap_or(0);
+            if let Some(hit) = fault.as_mut() {
+                if hit.remaining > 0 {
+                    let stage = hit.stage;
+                    let partial = hit.partial;
+                    hit.remaining -= 1;
+                    let err = match stage {
+                        "write" => {
+                            let n = partial.unwrap_or(0).min(bytes.len());
+                            if n > 0 { let _ = Write::write_all(&mut f, &bytes[..n]); }
+                            let _ = f.set_len(start);
+                            "write: ENOSPC".to_string()
+                        }
+                        "flush" => {
+                            let _ = Write::write_all(&mut f, bytes);
+                            let _ = f.set_len(start);
+                            "flush: EIO".to_string()
+                        }
+                        "sync" => {
+                            let _ = Write::write_all(&mut f, bytes);
+                            let _ = Write::flush(&mut f);
+                            let _ = f.set_len(start);
+                            "sync: EIO".to_string()
+                        }
+                        other => format!("fault: {other}"),
+                    };
+                    error!("cannot append {}: {err}", path.display());
+                    return Err(format!("append {}: {err}", path.display()));
+                }
+            }
+            commit_durable(&mut f, bytes, start).map_err(|e| {
+                error!("cannot append {}: {e}", path.display());
+                format!("append {}: {e}", path.display())
+            })
         }
-        Err(e) => { error!("cannot append {}: {e}", path.display()); false }
+        Err(e) => {
+            error!("cannot append {}: {e}", path.display());
+            Err(format!("append {}: {e}", path.display()))
+        }
     }
 }
 
@@ -223,7 +312,8 @@ impl Engine {
             snapshot: dir.join("snapshot.jpg"), snap_pub: Mutex::new(crate::snap::Publisher::new()), tap: crate::glimpse::FrameTap::with_ring(args.glimpse_frame || crate::glimpse::env_enabled(), crate::glimpse::ring_enabled()), exit_when_recording_ends: AtomicBool::new(false), started: Instant::now(), last_data_ms: AtomicU64::new(0), input, frame_clock,
             running: AtomicBool::new(false), api_closed: AtomicBool::new(false), sealed: AtomicBool::new(false),
             countersigned: std::sync::atomic::AtomicI64::new(-1),
-            stop_reason: Mutex::new(None), bundle_write: Mutex::new(()), bundle_finalized: AtomicBool::new(false), args })
+            stop_reason: Mutex::new(None), bundle_write: Mutex::new(()), bundle_finalized: AtomicBool::new(false),
+            persist_fault: Mutex::new(None), args })
     }
     fn ms(&self) -> u64 { self.started.elapsed().as_millis() as u64 }
     /// The monotonic clock behind every mono_ms (manifest, checkpoints) and inputs.jsonl t_us.
@@ -640,7 +730,8 @@ impl Engine {
         // and replaces snapshot.jpg. ffmpeg does not atomic-rename over the file the reader opens.
         let incoming = self.snapshot.with_file_name("snapshot.incoming.jpg");
         let args = ffmpeg::capture_args_with(&self.args, input_format, audio, &incoming.to_string_lossy(), stamp.as_deref());
-        self.snap_pub.lock().unwrap_or_else(|e| e.into_inner()).invalidate();
+        let prior = std::fs::read(&incoming).unwrap_or_default();
+        self.snap_pub.lock().unwrap_or_else(|e| e.into_inner()).begin_epoch(&prior);
         let stop_pub = Arc::new(AtomicBool::new(false));
         let publisher = {
             let flag = stop_pub.clone();
@@ -650,8 +741,9 @@ impl Engine {
             std::thread::spawn(move || {
                 while !flag.load(Ordering::SeqCst) {
                     if let Ok(bytes) = std::fs::read(&inc) {
-                        let source_ms = wall_ms();
-                        me.snap_pub.lock().unwrap_or_else(|e| e.into_inner()).consider(&bytes, &dest, source_ms);
+                        let mut pub_ = me.snap_pub.lock().unwrap_or_else(|e| e.into_inner());
+                        let prov = pub_.pending_provenance();
+                        pub_.consider(&bytes, &dest, prov);
                     }
                     std::thread::sleep(Duration::from_millis(40));
                 }
@@ -661,6 +753,7 @@ impl Engine {
         info!("opening \"{}\" format={input_format} audio={:?} ({:?}) {}x{}@{} enc={}", self.args.device, audio.map(|a| &a.name), audio.map(|a| a.strategy), self.args.res.0, self.args.res.1, self.args.fps, self.args.encoder);
         let child = ffmpeg::command(&self.ffmpeg).args(&args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn();
         let mut child = match child { Ok(c) => c, Err(e) => { let m = format!("cannot start ffmpeg `{}`: {e}", self.ffmpeg); error!("{m}"); self.set_state("reopening", Some(m)); return (false, ffmpeg::Failure::Other); } };
+        self.snap_pub.lock().unwrap_or_else(|e| e.into_inner()).mark_producer_started();
         let mut stdout = child.stdout.take().unwrap();
         let stderr = child.stderr.take().unwrap();
         let child = Arc::new(Mutex::new(child));
@@ -669,13 +762,23 @@ impl Engine {
         // stderr: progress key=value -> status; everything else -> log
         { let me = self.clone(); let last_err = last_err.clone(); std::thread::spawn(move || {
             use std::io::BufRead;
+            let mut cursor = ProgressCursor::default();
             for line in std::io::BufReader::new(stderr).lines().map_while(Result::ok) {
                 let l = line.trim();
                 if let Some((k, v)) = l.split_once('=') {
                     if !k.contains(' ') {
                         let mut s = me.status.lock().unwrap_or_else(|e| e.into_inner());
-                        match k { "frame" => s.frames = v.parse().unwrap_or(s.frames), "fps" => s.fps_actual = v.parse().unwrap_or(0.0),
-                            "dup_frames" => s.dup_frames = v.parse().unwrap_or(0), "drop_frames" => s.drop_frames = v.parse().unwrap_or(0), _ => {} }
+                        match k {
+                            "frame" => s.frames = v.parse().unwrap_or(s.frames),
+                            "fps" => s.fps_actual = v.parse().unwrap_or(0.0),
+                            "dup_frames" => s.dup_frames = v.parse().unwrap_or(0),
+                            "drop_frames" => s.drop_frames = v.parse().unwrap_or(0),
+                            _ => {}
+                        }
+                        drop(s);
+                        if let Some((seq, pts_us)) = cursor.observe(k, v) {
+                            me.snap_pub.lock().unwrap_or_else(|e| e.into_inner()).note_progress(seq, pts_us);
+                        }
                         continue;
                     }
                 }
@@ -762,6 +865,23 @@ fn finish(mut r: Recorder) -> String {
     r.path
 }
 
+/// ffmpeg `-progress` cursor. `frame` and `out_time_us` become a capture sequence and pts.
+/// Wall time is not part of this pair.
+#[derive(Default)]
+struct ProgressCursor { frame: Option<u64>, pts_us: Option<u64> }
+
+impl ProgressCursor {
+    fn observe(&mut self, key: &str, value: &str) -> Option<(u64, u64)> {
+        match key {
+            "frame" => self.frame = value.parse().ok(),
+            "out_time_us" => self.pts_us = value.parse().ok(),
+            "progress" => return Some((self.frame?, self.pts_us?)),
+            _ => {}
+        }
+        None
+    }
+}
+
 pub fn parse_bitrate(s: &str) -> Option<u64> {
     let s = s.trim();
     let (n, m) = match s.chars().last()? { 'k' | 'K' => (&s[..s.len() - 1], 1_000), 'm' | 'M' => (&s[..s.len() - 1], 1_000_000), _ => (s, 1) };
@@ -771,6 +891,40 @@ pub fn parse_bitrate(s: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    struct Boom { fail: &'static str }
+    impl SyncWrite for Boom {
+        fn write_all_buf(&mut self, _: &[u8]) -> std::io::Result<()> { Ok(()) }
+        fn flush_buf(&mut self) -> std::io::Result<()> {
+            if self.fail == "flush" { Err(std::io::Error::other("flush failed")) } else { Ok(()) }
+        }
+        fn sync_data(&mut self) -> std::io::Result<()> {
+            if self.fail == "sync" { Err(std::io::Error::other("sync failed")) } else { Ok(()) }
+        }
+        fn rewind(&mut self, _: u64) -> std::io::Result<()> { Ok(()) }
+    }
+
+    #[test]
+    fn flush_and_sync_errors_block_a_durable_append() {
+        let line = b"{}\n";
+        let flush = commit_durable(&mut Boom { fail: "flush" }, line, 0);
+        assert!(flush.unwrap_err().contains("flush"));
+        let sync = commit_durable(&mut Boom { fail: "sync" }, line, 0);
+        assert!(sync.unwrap_err().contains("sync"));
+        let mut ok = Boom { fail: "none" };
+        assert!(commit_durable(&mut ok, line, 0).is_ok());
+    }
+
+    #[test]
+    fn progress_cursor_pairs_frame_and_pts_without_a_wall_clock() {
+        let mut cursor = ProgressCursor::default();
+        assert!(cursor.observe("frame", "4").is_none());
+        assert!(cursor.observe("out_time_us", "N/A").is_none());
+        assert!(cursor.observe("progress", "continue").is_none());
+        assert_eq!(cursor.observe("out_time_us", "250000"), None);
+        assert_eq!(cursor.observe("progress", "continue"), Some((4, 250_000)));
+        assert!(cursor.observe("fps", "29.97").is_none());
+    }
+
     #[test]
     fn names() {
         assert_eq!(part_name("a/b.mp4", 1), "a/b.mp4");
@@ -1293,7 +1447,7 @@ impl Engine {
         let st = self.ev.lock().unwrap_or_else(|e| e.into_inner());
         let v = json!({"type": "reopen", "mono_ms": self.ms(), "wall_ms": wall_ms(), "chain_head": st.seg.head, "segment_seq": st.seg.seq});
         drop(st);
-        append_jsonl(&self.ev_path("manifest.jsonl"), &v);
+        let _ = append_jsonl(&self.ev_path("manifest.jsonl"), &v);
     }
 
     /// Called for every completed fMP4 segment (exact bytes on disk).
@@ -1308,7 +1462,7 @@ impl Engine {
             "sha256": sha, "prev": prev, "chain_head": head, "mono_ms": self.ms(), "wall_ms": wall_ms(), "frames": frames,
             "device": self.args.device, "device_id": st.device_id});
         drop(st);
-        append_jsonl(&self.ev_path("manifest.jsonl"), &m);
+        let _ = append_jsonl(&self.ev_path("manifest.jsonl"), &m);
         crate::inputproof::touch_recording_marker(self.bundle_dir().as_deref());
         self.broadcast("segment", &m);
         // Seal controller inputs received up to now into this segment's chunk (same clock, same checkpoint).
@@ -1332,6 +1486,7 @@ impl Engine {
         if let Some(seal) = &seal_bind {
             if let Value::Object(e) = &mut ext { e.insert("session_seal".into(), seal.clone()); }
         }
+        let position = (st.cps.seq, st.cps.prev.clone());
         let cp = match st.cps.next_with_input(wall_ms(), ext, input_hash) {
             Ok(cp) => cp,
             Err(e) => {
@@ -1341,10 +1496,22 @@ impl Engine {
                 return Value::Null;
             }
         };
+        let path = self.ev_path("checkpoints.jsonl");
+        let mut fault_slot = self.persist_fault.lock().unwrap_or_else(|e| e.into_inner());
+        let persisted = append_jsonl_fault(&path, &cp, fault_slot.as_mut());
+        drop(fault_slot);
+        if let Err(e) = persisted {
+            st.cps.seq = position.0;
+            st.cps.prev = position.1;
+            drop(st);
+            self.status.lock().unwrap_or_else(|err| err.into_inner()).checkpoint_persist_error = Some(e.clone());
+            error!("checkpoint '{trigger}' not durable: {e}");
+            return json!({"persisted": false, "error": e, "trigger": trigger});
+        }
         st.checkpoints.push(cp.clone());
         drop(st);
-        let persisted = append_jsonl(&self.ev_path("checkpoints.jsonl"), &cp);
-        if persisted && seal_bind.is_some() {
+        self.status.lock().unwrap_or_else(|err| err.into_inner()).checkpoint_persist_error = None;
+        if seal_bind.is_some() {
             self.input.lock().unwrap_or_else(|e| e.into_inner()).acknowledge_seal();
         }
         self.broadcast("checkpoint", &cp);
@@ -1368,7 +1535,7 @@ impl Engine {
             if std::fs::write(&tmp, text).is_ok() { let _ = std::fs::rename(&tmp, &self.stamp_file); }
         }
         self.ev.lock().unwrap_or_else(|e| e.into_inner()).challenges.push(c.clone());
-        append_jsonl(&self.ev_path("challenges.jsonl"), &c);
+        let _ = append_jsonl(&self.ev_path("challenges.jsonl"), &c);
         let cp = self.checkpoint("challenge", json!({"nonce": nonce}));
         info!("referee challenge {nonce} received; pattern {pattern:?}; bound at checkpoint {}", cp["seq"]);
         Ok(json!({"ok": true, "challenge": c, "checkpoint": cp}))
@@ -1401,7 +1568,7 @@ impl Engine {
                             "post-game score reset to away {a} - home {h} after the scorebug left; kept the last legal score away {pa} - home {ph}"));
                         st.timeline.push(read.clone());
                         drop(st);
-                        append_jsonl(&self.ev_path("timeline.jsonl"), &read);
+                        let _ = append_jsonl(&self.ev_path("timeline.jsonl"), &read);
                         return Ok(json!({"ok": true, "new_session": true}));
                     }
                 }
@@ -1426,7 +1593,7 @@ impl Engine {
                 let clock_changed = st.last_clock.map(|c| c != clock_state).unwrap_or(false);
                 st.last_clock = Some(clock_state);
                 drop(st);
-                append_jsonl(&self.ev_path("timeline.jsonl"), &read);
+                let _ = append_jsonl(&self.ev_path("timeline.jsonl"), &read);
                 let mut out = json!({"ok": true});
                 if score_changed {
                     let cp = self.checkpoint("score_change", json!({"prev_score": prev_score.map(|p| {
@@ -1456,7 +1623,7 @@ impl Engine {
                     }
                     st.timeline.push(v.clone());
                 }
-                append_jsonl(&self.ev_path("timeline.jsonl"), &v);
+                let _ = append_jsonl(&self.ev_path("timeline.jsonl"), &v);
                 Ok(json!({"ok": true}))
             }
             "final" => {
@@ -1513,7 +1680,7 @@ impl Engine {
                 let sha = std::fs::read(&p).map(|d| ev::sha256_hex(&d)).unwrap_or_default();
                 let c = json!({"type": "clip", "name": name, "file": p, "sha256": sha, "secs": secs, "wall_ms": wall_ms()});
                 me.ev.lock().unwrap_or_else(|e| e.into_inner()).clips.push(c.clone());
-                append_jsonl(&me.ev_path("manifest.jsonl"), &c);
+                let _ = append_jsonl(&me.ev_path("manifest.jsonl"), &c);
                 me.broadcast("clip", &c);
             }
             Err(e) => warn!("auto clip {name} failed: {e}"),

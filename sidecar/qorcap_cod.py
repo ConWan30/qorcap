@@ -227,8 +227,9 @@ class CodEndScreenReader:
     player's row is not that row. Once home and away exist, confirm also
     requires the word to match the side chosen at the start. A gap, a non-end
     frame, or a different result or score starts that count over. ``confirm``
-    is the only way the receipt field ``final_confirmed`` becomes true. That
-    field is the end-screen agreement. It is not a verification verdict.
+    is the visual read. ``final_confirmed`` also needs a durable seal, every
+    supporting frame strictly after the seal end, a stable capture epoch, and
+    an anchor that was validated for this session. A free-form string is not that.
     """
 
     def read(self, img) -> RegionRead:
@@ -338,23 +339,45 @@ def verify_signal_chain(text: str) -> list[str]:
             expect = None
         if expect is not None and row.get("hash") != expect:
             errs.append(f"line {i} hash does not match")
+        claimed = row.get("chain_seq")
+        if isinstance(claimed, bool) or claimed != seq:
+            errs.append(f"line {i} chain_seq does not match")
         prev = row.get("hash") or prev
         seq += 1
         rows.append(row)
     if not rows or rows[-1].get("kind") != "terminal":
         errs.append("no terminal commitment")
         return errs
+    terminals = [n for n, row in enumerate(rows) if row.get("kind") == "terminal"]
+    if terminals != [len(rows) - 1]:
+        errs.append("terminal is not unique")
     prior = rows[:-1]
     last = rows[-1]
-    if last.get("count") != len(prior):
+    count = last.get("count")
+    entry_count = last.get("entry_count", count)
+    if isinstance(count, bool) or isinstance(entry_count, bool) or count != len(prior) or entry_count != len(prior):
         errs.append("terminal count does not match")
+    if "entry_count" in last and last.get("entry_count") != count:
+        errs.append("terminal entry_count does not match")
     root = SIGNAL_GENESIS if not prior else prior[-1].get("hash")
     if last.get("root") != root:
         errs.append("terminal root does not match")
+    if "chain_root_hash" in last and last.get("chain_root_hash") != root:
+        errs.append("terminal chain_root does not match")
+    if len(prior) == 0:
+        if last.get("first_seq") is not None or last.get("last_seq") is not None:
+            errs.append("terminal seq range does not match")
+    else:
+        if "first_seq" in last and last.get("first_seq") != 0:
+            errs.append("terminal seq range does not match")
+        if "last_seq" in last and last.get("last_seq") != len(prior) - 1:
+            errs.append("terminal seq range does not match")
     if last.get("complete") is not False:
         errs.append("local hash links are not completeness")
     if last.get("anchored") is not False:
         errs.append("local hash links are not an anchor")
+    # truncated:true is a self-consistent declaration. It is not a hash failure.
+    # Acceptance treats it as an unknown chain rather than a complete record.
     return errs
 
 
@@ -370,6 +393,20 @@ def _in_fire_window(edges, screen_us) -> bool:
         if 0 <= dt <= FIRE_WINDOW_US:
             return True
     return False
+
+
+def _independent_anchor(token, seal_hash) -> bool:
+    """An independent anchor is ``independent-v1:`` plus 64 lowercase hex digits.
+
+    A free-form string is not one, and neither is the seal hash.
+    """
+    prefix = "independent-v1:"
+    if not isinstance(token, str) or not token.startswith(prefix):
+        return False
+    hexpart = token[len(prefix):]
+    if len(hexpart) != 64 or any(c not in "0123456789abcdef" for c in hexpart):
+        return False
+    return not (isinstance(seal_hash, str) and seal_hash and token == seal_hash)
 
 
 def screen_mono_us(screen_wall_ms, wall_anchor_ms) -> int | None:
@@ -534,7 +571,23 @@ def scoreboard_status(*, calibrated: bool, kills, assists, board_kills, board_as
 
 
 def _public(rd: RegionRead) -> dict:
-    return {"region": rd.region, "status": rd.status, "reason": rd.reason, "calibrated": bool(rd.calibrated)}
+    out = {"region": rd.region, "status": rd.status, "reason": rd.reason, "calibrated": bool(rd.calibrated)}
+    digits = {}
+    for key in ("home", "away", "kills", "assists", "board_kills", "board_assists", "deaths", "confirms"):
+        val = getattr(rd, key, None)
+        if isinstance(val, int) and not isinstance(val, bool):
+            out[key] = val
+            digits[key] = val
+        else:
+            out[key] = None
+    tag = getattr(rd, "player_tag", None)
+    out["player_tag"] = tag if isinstance(tag, str) else None
+    candidates = getattr(rd, "candidates", None)
+    out["digits"] = digits
+    out["candidates"] = list(candidates) if isinstance(candidates, list) else []
+    from qorcap_qordata import evidence_hash
+    out["evidence_hash"] = evidence_hash(out)
+    return out
 
 
 class CodSetRunner:
@@ -570,7 +623,24 @@ class CodSetRunner:
             "hud_not_read": 0, "end_screen_not_read": 0, "posted_final": 0,
             "not_counted": 0, "flagged_mismatch": 0,
             "end_direction_mismatch": 0,
+            "signal_log_failures": 0,
+            "capture_gaps": 0,
         }
+        self.capture_epoch = None
+        self.epoch_fault = False
+        self.independent_anchor = None
+        self.seal_hash = None
+        self.seal_durable = False
+        self.anchor_validated = False
+        self.session_id = None
+        self.capture_generation = None
+        self._bound_clock = None
+        self._support = []
+        self._attempt_seq = 0
+        self._frame_end = {"status": "not_evaluated", "reason": None}
+        self._frame_emitted = False
+        self._pending_reads = []
+        self._pending_signals = []
         self._logged = False
         self._chain_prev = SIGNAL_GENESIS
         self._chain_seq = 0
@@ -601,62 +671,82 @@ class CodSetRunner:
 
     def on_frame(self, t_ms: int, img, source=None) -> None:
         self._source = source if isinstance(source, dict) else None
+        if isinstance(self._source, dict) and isinstance(self._source.get("clock_id"), str) and self._source.get("clock_id"):
+            if self._bound_clock is None:
+                self._bound_clock = self._source["clock_id"]
+            elif self._source["clock_id"] != self._bound_clock:
+                self.epoch_fault = True
+                self._clear_end_candidate()
         self.stats["frames"] += 1
+        self._frame_emitted = False
+        self._frame_end = {"status": "not_evaluated", "reason": None}
+        self._pending_reads = []
+        self._pending_signals = []
+        self._note_capture_epoch()
         try:
-            reads = list(self.hud.read(img))
-        except Exception as e:
-            self.stats["errors"] += 1
-            print(f"Call of Duty HUD hook error: {type(e).__name__}: {e}", file=sys.stderr)
-            reads = []
-        by_name = {rd.region: rd for rd in reads}
-        signals = self._signals(int(t_ms), by_name)
-        for rd in reads:
-            if not (rd.ok and rd.calibrated):
-                self.stats["hud_not_read"] += 1
-        for row in signals:
-            if row["status"] == AGREED:
-                self.stats["agreed"] += 1
-            elif row["status"] == MISMATCH:
-                self.stats["flagged_mismatch"] += 1
-            else:
-                self.stats["not_counted"] += 1
-        self._keep_real(img)
-        self._note_lag(int(t_ms), img)
-        self._stream_hud(int(t_ms), reads, signals)
-        try:
-            end = self.end.read(img)
-        except Exception as e:
-            self.stats["errors"] += 1
-            print(f"Call of Duty end-screen hook error: {type(e).__name__}: {e}", file=sys.stderr)
-            self._clear_end_candidate()
-            return
-        if self.final is not None:
-            return
-        # Home and away come only from this end-screen read. A scoreboard
-        # kill, assist, or team total is not that pair. The owner row is a
-        # separate read and is not copied into home or away.
-        if not (end.ok and end.calibrated):
-            self.stats["end_screen_not_read"] += 1
-            self._clear_end_candidate()
-            return
-        when = t_ms if isinstance(t_ms, int) and not isinstance(t_ms, bool) else None
-        if when is None:
-            self._clear_end_candidate()
-            return
-        home, away = _score(end.home), _score(end.away)
-        if home is not None and away is not None and isinstance(end.reason, str) and end.reason:
-            self._post_scored_end(int(t_ms), when, end, home, away)
-            return
-        try:
-            from qorcap_cod_hud import read_owner_row
-            owner = read_owner_row(img)
-        except Exception as e:
-            self.stats["errors"] += 1
-            print(f"Call of Duty owner-row hook error: {type(e).__name__}: {e}", file=sys.stderr)
-            self.stats["end_screen_not_read"] += 1
-            self._clear_end_candidate()
-            return
-        self._post_owner_end(int(t_ms), when, end, owner)
+            try:
+                reads = list(self.hud.read(img))
+            except Exception as e:
+                self.stats["errors"] += 1
+                print(f"Call of Duty HUD hook error: {type(e).__name__}: {e}", file=sys.stderr)
+                reads = []
+            by_name = {rd.region: rd for rd in reads}
+            signals = self._signals(int(t_ms), by_name)
+            for rd in reads:
+                if not (rd.ok and rd.calibrated):
+                    self.stats["hud_not_read"] += 1
+            for row in signals:
+                if row["status"] == AGREED:
+                    self.stats["agreed"] += 1
+                elif row["status"] == MISMATCH:
+                    self.stats["flagged_mismatch"] += 1
+                else:
+                    self.stats["not_counted"] += 1
+            self._pending_reads = reads
+            self._pending_signals = signals
+            self._keep_real(img)
+            self._note_lag(int(t_ms), img)
+            try:
+                end = self.end.read(img)
+            except Exception as e:
+                self.stats["errors"] += 1
+                print(f"Call of Duty end-screen hook error: {type(e).__name__}: {e}", file=sys.stderr)
+                self._frame_end = {"status": "fault", "reason": "end_hook_error"}
+                self._clear_end_candidate()
+                return
+            if self.final is not None:
+                self._frame_end = {"status": "already_final", "reason": None}
+                return
+            # Home and away come only from this end-screen read. A scoreboard
+            # kill, assist, or team total is not that pair. The owner row is a
+            # separate read and is not copied into home or away.
+            if not (end.ok and end.calibrated):
+                self.stats["end_screen_not_read"] += 1
+                self._frame_end = {"status": "abstain", "reason": "end_not_read"}
+                self._clear_end_candidate()
+                return
+            when = t_ms if isinstance(t_ms, int) and not isinstance(t_ms, bool) else None
+            if when is None:
+                self._frame_end = {"status": "abstain", "reason": "frame_time_missing"}
+                self._clear_end_candidate()
+                return
+            home, away = _score(end.home), _score(end.away)
+            if home is not None and away is not None and isinstance(end.reason, str) and end.reason:
+                self._post_scored_end(int(t_ms), when, end, home, away)
+                return
+            try:
+                from qorcap_cod_hud import read_owner_row
+                owner = read_owner_row(img)
+            except Exception as e:
+                self.stats["errors"] += 1
+                print(f"Call of Duty owner-row hook error: {type(e).__name__}: {e}", file=sys.stderr)
+                self.stats["end_screen_not_read"] += 1
+                self._frame_end = {"status": "fault", "reason": "owner_hook_error"}
+                self._clear_end_candidate()
+                return
+            self._post_owner_end(int(t_ms), when, end, owner)
+        finally:
+            self._emit_frame(int(t_ms))
 
     def _signals(self, t_ms: int, by_name: dict) -> list[dict]:
         screen_us = screen_mono_us(t_ms, self.wall_anchor_ms)
@@ -738,12 +828,35 @@ class CodSetRunner:
         self._n = 0
         self._t0 = None
         self._last_t = None
+        self._support = []
+
+    def _capture_ref(self) -> dict:
+        src = self._source if isinstance(self._source, dict) else {}
+        mono = None
+        if src.get("clock") == "capture_pts":
+            raw = src.get("mono_us")
+            if isinstance(raw, int) and not isinstance(raw, bool):
+                mono = raw
+        capture_id = src.get("capture_id")
+        if not isinstance(capture_id, str) or not capture_id:
+            capture_id = src.get("frame_id") if isinstance(src.get("frame_id"), str) else None
+        generation = src.get("capture_generation")
+        if isinstance(generation, bool) or not isinstance(generation, int):
+            generation = self.capture_generation
+        return {
+            "capture_id": capture_id,
+            "mono_us": mono,
+            "epoch": src.get("epoch"),
+            "capture_generation": generation,
+            "session_id": src.get("session_id") or self.session_id,
+        }
 
     def _begin_end_candidate(self, t_ms: int, key: tuple) -> None:
         self._pair = key
         self._n = 1
         self._t0 = t_ms
         self._last_t = t_ms
+        self._support = [self._capture_ref()]
 
     def _post_scored_end(self, t_ms: int, when: int, end: RegionRead, home: int, away: int) -> None:
         """The path that already has home and away. The word has to fit the side."""
@@ -767,8 +880,13 @@ class CodSetRunner:
                 )
         agreed = self._offer(when, end.reason, confirm, home, away)
         if agreed is None:
+            self._frame_end = {"status": "not_ready", "reason": end.reason, "visual_ok": confirm}
             return
-        confirmed = confirm
+        gate = self.final_eligibility(visual_ok=confirm, evidence_us=self._evidence_us())
+        confirmed = gate["confirmed"]
+        self._frame_end = {
+            "status": "scored", "reason": end.reason, "visual_ok": confirm, "eligible": confirmed,
+        }
         notes = [
             "Call of Duty end screen agreed. This is the end of the match.",
             "The receipt quarter is 4 because this end screen has no game clock. It is not a Madden quarter.",
@@ -777,7 +895,8 @@ class CodSetRunner:
             notes.append(direction_note)
         if not confirmed:
             notes.append("The end-screen score is not Counted as confirmed.")
-        self._commit_final(t_ms, agreed, end.reason, confirmed, home, away, notes, owner=None)
+        self._emit_frame(t_ms)
+        self._commit_final(t_ms, agreed, end.reason, confirmed, home, away, notes, owner=None, visual=confirm)
 
     def _post_owner_end(self, t_ms: int, when: int, end: RegionRead, owner: RegionRead) -> None:
         """End word plus Qortrola30's row. Home and away stay unread.
@@ -804,19 +923,20 @@ class CodSetRunner:
         )
         if not ready:
             self.stats["end_screen_not_read"] += 1
+            self._frame_end = {"status": "abstain", "reason": "owner_row_not_read"}
             self._clear_end_candidate()
             return
         extra = (OWNER_TAG.casefold(), kills, deaths, assists, confirms)
         agreed = self._offer(when, end.reason, True, None, None, extra=extra)
         if agreed is None:
+            self._frame_end = {"status": "not_ready", "reason": end.reason, "visual_ok": False}
             return
         from qorcap_cod_hud import consensus_owner_row
         verdict = consensus_owner_row(self._real_frames, self.own_kill_coverage())
         if verdict["status"] != "accepted":
-            self._write({
-                "t_ms": int(t_ms), "kind": "owner_row", "status": NOT_COUNTED,
-                "reason": verdict["reason"], "consensus": "abstain",
-            })
+            self._frame_end = {
+                "status": "abstain", "reason": verdict["reason"], "consensus": "abstain", "visual_ok": False,
+            }
             if verdict["reason"] != "short_real_window":
                 self._clear_end_candidate()
             return
@@ -843,11 +963,17 @@ class CodSetRunner:
             "confirms": confirms,
             "result": end.reason,
         }
-        window = self._seal_window()
-        confirmed = window.get("status") == "resolved" and window.get("releases_counts") is True
-        self._commit_final(t_ms, agreed, end.reason, confirmed, None, None, notes, owner=owner_doc)
+        gate = self.final_eligibility(visual_ok=True, evidence_us=self._evidence_us())
+        confirmed = gate["confirmed"]
+        self._frame_end = {
+            "status": "accepted", "reason": end.reason, "visual_ok": True, "eligible": confirmed,
+        }
+        if not confirmed:
+            notes.append("The end-screen score is not Counted as confirmed.")
+        self._emit_frame(t_ms)
+        self._commit_final(t_ms, agreed, end.reason, confirmed, None, None, notes, owner=owner_doc, visual=True)
 
-    def _commit_final(self, t_ms, agreed, reason, confirmed, home, away, notes, owner) -> None:
+    def _commit_final(self, t_ms, agreed, reason, confirmed, home, away, notes, owner, visual=False) -> None:
         event = {
             "type": "final",
             "basis": "end_menu",
@@ -856,7 +982,8 @@ class CodSetRunner:
             "away": away,
             "quarter": 4,
             "t_ms": agreed["t_ms"],
-            "final_confirmed": confirmed,
+            "visual_confirmed": bool(visual),
+            "final_confirmed": bool(confirmed),
             "notes": notes,
             "game_set": "cod",
             "end_screen": {
@@ -897,6 +1024,7 @@ class CodSetRunner:
             return None
         self._n += 1
         self._last_t = t_ms
+        self._support.append(self._capture_ref())
         t0 = self._t0 if isinstance(self._t0, int) else t_ms
         if self._n >= END_AGREE_FRAMES and t_ms - t0 >= END_AGREE_SPAN_MS:
             return {"home": home, "away": away, "frames": self._n, "t_ms": t0, "until_ms": t_ms}
@@ -914,11 +1042,17 @@ class CodSetRunner:
         captured = src.get("captured_us")
         if isinstance(captured, bool) or not isinstance(captured, int):
             captured = None
+        ref = self._capture_ref()
         self._real_frames.append({
             "img": stored,
             "source_id": src.get("frame_id") if isinstance(src.get("frame_id"), str) else None,
+            "capture_id": ref["capture_id"],
             "seq": src.get("seq") if isinstance(src.get("seq"), int) and not isinstance(src.get("seq"), bool) else None,
             "captured_us": captured,
+            "mono_us": ref["mono_us"],
+            "epoch": ref["epoch"],
+            "capture_generation": ref["capture_generation"],
+            "session_id": ref["session_id"],
             "pixel_id": _pixel_id(stored),
         })
         if len(self._real_frames) > 5:
@@ -1004,6 +1138,126 @@ class CodSetRunner:
             return status, reason
         return NOT_COUNTED, window.get("reason") or "seal_window_unresolved"
 
+    def _note_capture_epoch(self) -> None:
+        src = self._source if isinstance(self._source, dict) else {}
+        epoch = src.get("epoch")
+        if isinstance(epoch, bool) or not isinstance(epoch, int):
+            return
+        if self.capture_epoch is None:
+            self.capture_epoch = epoch
+        elif self.capture_epoch != epoch:
+            self.epoch_fault = True
+
+    def _evidence_us(self):
+        """Capture-relative evidence time. A wall clock is not evidence."""
+        src = self._source if isinstance(self._source, dict) else {}
+        clock = src.get("clock")
+        if clock == "wall":
+            return None
+        if clock == "capture_pts":
+            n = src.get("mono_us")
+            return n if isinstance(n, int) and not isinstance(n, bool) else None
+        n = src.get("captured_us")
+        if isinstance(n, int) and not isinstance(n, bool):
+            return n
+        return None
+
+    def final_eligibility(self, *, visual_ok: bool, evidence_us) -> dict:
+        """One gate for the scored path and the owner path.
+
+        A visual read can still post. ``confirmed`` needs every supporting
+        frame strictly after ``end_us``, unique capture ids, a durable seal,
+        a stable epoch, and a validated anchor. Missing any of those keeps
+        the final unconfirmed. This does not invent a lag or an anchor.
+        """
+        from qorcap_qordata import eligibility_decision
+
+        window = self._seal_window()
+        end_us = window.get("end_us") if window.get("releases_counts") is True else None
+        frames = list(self._support)
+        support_ids = [frame.get("capture_id") for frame in frames]
+        for item in self._real_frames:
+            capture_id = item.get("capture_id") or item.get("source_id")
+            if capture_id in support_ids:
+                continue
+            frames.append({
+                "capture_id": capture_id,
+                "mono_us": item.get("mono_us"),
+                "epoch": item.get("epoch"),
+                "capture_generation": item.get("capture_generation"),
+                "session_id": item.get("session_id") or self.session_id,
+            })
+        epoch_ok = (
+            isinstance(self.capture_epoch, int)
+            and not isinstance(self.capture_epoch, bool)
+            and self.epoch_fault is not True
+        )
+        anchor_ok = self.anchor_validated is True and _independent_anchor(self.independent_anchor, self.seal_hash)
+        decision = eligibility_decision(
+            path="shared",
+            end_us=end_us,
+            frames=frames,
+            seal_ready=self.seal_durable is True and window.get("releases_counts") is True,
+            anchor_ready=anchor_ok,
+            epoch_valid=epoch_ok,
+            lag_present=window.get("releases_counts") is True,
+            session_id=self.session_id,
+            capture_generation=self.capture_generation,
+        )
+        confirmed = bool(visual_ok) and decision["eligible"]
+        after = bool(frames) and "pre_exclusion_frame" not in decision["reason_codes"] and "boundary_not_after_end" not in decision["reason_codes"]
+        return {
+            "confirmed": confirmed,
+            "visual_ok": bool(visual_ok),
+            "after_end_us": after and confirmed,
+            "epoch_ok": epoch_ok,
+            "anchor_ok": anchor_ok,
+            "end_us": end_us,
+            "reason": decision["reason"],
+            "evidence_us": evidence_us,
+        }
+
+    def note_capture_failure(self, *, reason_code: str, attempt_seq=None, http_status=None,
+                             observed_mono_us=None, detail=None) -> bool:
+        """Log one capture failure and drop the current final candidate.
+
+        The row does not inherit the previous frame's capture id or mono time.
+        """
+        self._clear_end_candidate()
+        if isinstance(attempt_seq, int) and not isinstance(attempt_seq, bool):
+            self._attempt_seq = attempt_seq
+        else:
+            self._attempt_seq += 1
+            attempt_seq = self._attempt_seq
+        return self._write({
+            "t_ms": 0,
+            "kind": "capture_failure",
+            "reason_code": reason_code,
+            "reason": detail if detail is not None else reason_code,
+            "attempt_seq": attempt_seq,
+            "http_status": http_status,
+            "capture_id": None,
+            "capture_mono_us": None,
+            "mono_us": None,
+            "observed_mono_us": observed_mono_us,
+            "anchored": False,
+            "evaluated": True,
+            "_no_source": True,
+        })
+
+    def note_capture_gap(self, reason: str) -> bool:
+        """Record an HTTP, decode, provenance, or API failure on the signal chain."""
+        from qorcap_qordata import reason_code_for
+
+        self.stats["capture_gaps"] = self.stats.get("capture_gaps", 0) + 1
+        return self.note_capture_failure(reason_code=reason_code_for(reason), detail=str(reason))
+
+    def _emit_frame(self, t_ms: int) -> None:
+        if self._frame_emitted:
+            return
+        self._frame_emitted = True
+        self._stream_hud(int(t_ms), self._pending_reads, self._pending_signals, self._frame_end)
+
     def _source_row(self) -> dict:
         src = self._source if isinstance(self._source, dict) else {}
         seq = src.get("seq")
@@ -1013,83 +1267,103 @@ class CodSetRunner:
         if isinstance(captured, bool) or not isinstance(captured, int):
             captured = None
         frame_id = src.get("frame_id") if isinstance(src.get("frame_id"), str) else None
-        return {"frame_id": frame_id, "seq": seq, "captured_us": captured, "anchored": False}
+        clock = src.get("clock") if isinstance(src.get("clock"), str) else None
+        return {"frame_id": frame_id, "seq": seq, "captured_us": captured, "clock": clock, "anchored": False}
 
-    def _stream_hud(self, t_ms: int, reads, signals) -> None:
+    def _stream_hud(self, t_ms: int, reads, signals, end_eval) -> None:
         regions = [_public(rd) for rd in reads]
-        snap = (
-            tuple((s.get("signal"), s.get("status"), s.get("reason")) for s in signals),
-            tuple((r.get("region"), r.get("status"), r.get("calibrated"), r.get("reason")) for r in regions),
-            self.stats["errors"],
-        )
         source = self._source_row()
-        if not self._logged:
-            self._logged = True
-            self._last_snap = snap
-            self._write({
-                "t_ms": int(t_ms), "kind": "set",
-                "regions": regions,
-                "signals": signals,
-                "source_frame": source,
-                "frame_index": source["seq"],
-                "anchored": False,
-                "poll_index": self.stats["frames"] - 1,
-                "frame_clock_gap_us": FRAME_CLOCK_GAP_US,
-                "note": (
-                    "A signal is Counted only when the on-screen hook and the controller "
-                    "agree on the frame clock. Otherwise it is flagged a mismatch, or it is not Counted."
-                ),
-            })
-            return
-        changed = snap != self._last_snap
-        poll = self.stats["frames"] - 1
-        fresh = poll > 0 and poll % 60 == 0
-        if not changed and not fresh:
-            return
-        self._last_snap = snap
-        self._write({
+        row = {
             "t_ms": int(t_ms),
-            "kind": "hud" if changed else "freshness",
+            "kind": "set" if not self._logged else "hud",
             "regions": regions,
             "signals": signals,
             "source_frame": source,
             "frame_index": source["seq"],
             "anchored": False,
-            "poll_index": poll,
-        })
+            "poll_index": self.stats["frames"] - 1,
+            "eval_n": self.stats["frames"],
+            "evaluated": True,
+            "end_eval": end_eval if isinstance(end_eval, dict) else {"status": "not_evaluated", "reason": None},
+        }
+        if not self._logged:
+            self._logged = True
+            row["frame_clock_gap_us"] = FRAME_CLOCK_GAP_US
+            row["note"] = (
+                "A signal is Counted only when the on-screen hook and the controller "
+                "agree on the frame clock. Otherwise it is flagged a mismatch, or it is not Counted."
+            )
+        self._write(row)
 
     def close_signals(self) -> bool:
-        """Commit the terminal root. A prefix without this row is incomplete."""
+        """Commit the terminal root. A failed write stays retryable."""
         if self._signals_closed:
             return False
-        self._signals_closed = True
-        return self._write({
+        count = self._chain_seq
+        ok = self._write({
             "t_ms": 0,
             "kind": "terminal",
-            "count": self._chain_seq,
+            "count": count,
+            "entry_count": count,
             "root": self._chain_prev,
+            "chain_root_hash": self._chain_prev,
+            "first_seq": 0 if count else None,
+            "last_seq": (count - 1) if count else None,
+            "truncated": False,
             "complete": False,
             "anchored": False,
+            "session_id": self.session_id,
             "note": "Local hash links are not an anchor and are not completeness.",
         })
+        if ok:
+            self._signals_closed = True
+        return ok
 
     def _write(self, row: dict) -> bool:
         if self.log_path is None:
             return False
         body = {k: v for k, v in row.items() if k not in ("prev", "hash")}
+        no_source = bool(body.pop("_no_source", False))
         body.setdefault("schema", SIGNAL_SCHEMA)
-        source = self._source_row()
-        body.setdefault("frame_index", source["seq"])
-        body.setdefault("anchored", False)
-        body.setdefault("source_frame", source)
-        if "mono_us" not in body:
-            captured = source.get("captured_us")
-            body["mono_us"] = captured if isinstance(captured, int) else screen_mono_us(body.get("t_ms"), self.wall_anchor_ms)
         prev = self._chain_prev
         seq = self._chain_seq
+        body["chain_seq"] = seq
+        if no_source:
+            body["mono_us"] = None
+            body["capture_id"] = None
+            body["capture_mono_us"] = None
+            body["frame_index"] = None
+            body["source_frame"] = None
+            body["anchored"] = False
+            body["clock"] = "unbound"
+        else:
+            source = self._source_row()
+            body.setdefault("frame_index", source["seq"])
+            body.setdefault("anchored", False)
+            body.setdefault("source_frame", source)
+            if "mono_us" not in body:
+                src = self._source if isinstance(self._source, dict) else {}
+                if src.get("clock") == "capture_pts" and isinstance(src.get("mono_us"), int) and not isinstance(src.get("mono_us"), bool):
+                    body["mono_us"] = src["mono_us"]
+                    body["clock"] = "capture_pts"
+                    if isinstance(src.get("clock_id"), str):
+                        body["clock_id"] = src["clock_id"]
+                    if isinstance(src.get("capture_id"), str):
+                        body["capture_id"] = src["capture_id"]
+                elif src.get("clock") == "wall":
+                    body["mono_us"] = None
+                    body["clock"] = "wall"
+                    wall = src.get("wall_ms")
+                    if isinstance(wall, int) and not isinstance(wall, bool):
+                        body["wall_ms"] = wall
+                else:
+                    # No producer binding. Do not subtract a wall anchor into mono_us.
+                    body["mono_us"] = None
+                    body["clock"] = "unbound"
         try:
             digest = hashlib.sha256(_canon({"prev": prev, "seq": seq, "row": body}).encode("utf-8")).hexdigest()
         except TypeError as e:
+            self.stats["signal_log_failures"] = self.stats.get("signal_log_failures", 0) + 1
             print(f"Call of Duty signal log skipped a non-integer row: {e}", file=sys.stderr)
             return False
         stored = dict(body)
@@ -1101,6 +1375,7 @@ class CodSetRunner:
                 fh.flush()
                 os.fsync(fh.fileno())
         except OSError as e:
+            self.stats["signal_log_failures"] = self.stats.get("signal_log_failures", 0) + 1
             print(f"Call of Duty signal log failed: {type(e).__name__}: {e}", file=sys.stderr)
             return False
         self._chain_prev = digest

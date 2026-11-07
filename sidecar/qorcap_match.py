@@ -671,40 +671,144 @@ def start_reader(api: Api, stop: threading.Event, state: dict, bundle: Path | No
     return t
 
 
-def snapshot_submission(source_ms, generation, body_hash, now_ms, seen, max_age_ms=2000):
-    """A snapshot the capture already timed. A cached body with a new wall clock is not a new frame."""
-    nums = (source_ms, generation, now_ms)
-    if not all(isinstance(n, int) and not isinstance(n, bool) for n in nums):
+SNAPSHOT_API_VERSION = 1
+SNAPSHOT_SCHEMA = "qorcap-snapshot/v1"
+CLOCK_SOURCES = {"monotonic_ns", "perf_counter_ns", "producer_instant"}
+
+
+def _plain_int(value):
+    if isinstance(value, bool) or not isinstance(value, int):
         return None
-    if not isinstance(body_hash, str) or not body_hash:
-        return None
-    if not isinstance(max_age_ms, int) or isinstance(max_age_ms, bool) or max_age_ms < 0:
-        return None
-    if source_ms > now_ms + 250 or now_ms - source_ms > max_age_ms:
-        return None
-    key = (generation, source_ms, body_hash)
-    if key in seen:
-        return None
-    seen.add(key)
+    return value
+
+
+def split_clocks(*, wall_ms, pts_us, anchor_wall_ms) -> dict:
+    """Wall time stays wall time. It is not a monotonic capture clock.
+
+    A wall anchor does not unlock ``mono_us``. Producer mono comes from a
+    bound snapshot header, not from ``wall_ms * 1000`` or wall subtraction.
+    """
     return {
-        "captured_ms": source_ms,
-        "captured_us": source_ms * 1000,
-        "generation": generation,
-        "frame_id": body_hash,
-        "seq": generation,
+        "wall_ms": _plain_int(wall_ms),
+        "pts_us": _plain_int(pts_us),
+        "mono_us": None,
+        "clock": "unbound",
+        "anchor_wall_ms": _plain_int(anchor_wall_ms),
     }
 
 
-def _header_int(headers, name):
-    if headers is None:
+def order_captures(doc: dict) -> dict:
+    from qorcap_qordata import order_captures as _order
+    return _order(doc)
+
+
+def snapshot_submission(api_version, epoch, seq, pts_us, body_hash, seen):
+    """One capture generation. A missing API version is an incompatibility, not a skip.
+
+    Wall time is not an argument. A repeated epoch and sequence is not a new frame.
+    """
+    version = _plain_int(api_version)
+    if version != SNAPSHOT_API_VERSION:
+        return {"error": "snapshot_api_incompatible", "api_version": version}
+    epoch_n, seq_n, pts_n = _plain_int(epoch), _plain_int(seq), _plain_int(pts_us)
+    if epoch_n is None or seq_n is None or pts_n is None or epoch_n < 0 or seq_n < 0 or pts_n < 0:
+        return {"error": "snapshot_provenance_missing"}
+    if not isinstance(body_hash, str) or not body_hash or not isinstance(seen, set):
+        return {"error": "snapshot_provenance_missing"}
+    for prev_epoch, prev_seq, prev_pts, _prev_hash in seen:
+        if prev_epoch == epoch_n and (seq_n <= prev_seq or pts_n <= prev_pts):
+            return {"error": "snapshot_repeated", "epoch": epoch_n, "seq": seq_n}
+    seen.add((epoch_n, seq_n, pts_n, body_hash))
+    return {
+        "ok": True,
+        "epoch": epoch_n,
+        "seq": seq_n,
+        "pts_us": pts_n,
+        "frame_id": body_hash,
+        "clock": "capture_pts",
+    }
+
+
+def cod_capture_step(headers, body, seen, anchor_wall_ms, decoded):
+    """Turn one CoD snapshot response into a frame or an explicit chain reason.
+
+    The API version and the schema have to match this sidecar. A missing clock
+    binding is a failure. ``anchor_wall_ms`` is not a substitute for that binding.
+    """
+    import hashlib
+
+    del anchor_wall_ms  # wall subtraction is not capture mono
+    schema = _header_text(headers, "X-Qorcap-Snapshot-Schema")
+    api_version = _header_int(headers, "X-Qorcap-Snapshot-Api")
+    if api_version != SNAPSHOT_API_VERSION or schema != SNAPSHOT_SCHEMA:
+        return {"error": "version_mismatch", "api_version": api_version, "schema": schema}
+    session_id = _header_text(headers, "X-Qorcap-Snapshot-Session")
+    clock_id = _header_text(headers, "X-Qorcap-Snapshot-Clock")
+    clock_source = _header_text(headers, "X-Qorcap-Snapshot-Clock-Source")
+    origin = _header_int(headers, "X-Qorcap-Snapshot-Mono-Origin-Ns")
+    capture_id = _header_text(headers, "X-Qorcap-Snapshot-Capture-Id")
+    generation = _header_int(headers, "X-Qorcap-Snapshot-Generation")
+    mono_us = _header_int(headers, "X-Qorcap-Snapshot-Mono-Us")
+    if (
+        not session_id or not clock_id or clock_source not in CLOCK_SOURCES or origin is None
+        or not capture_id or generation is None or mono_us is None
+    ):
+        return {"error": "clock_binding_missing"}
+    epoch = _header_int(headers, "X-Qorcap-Snapshot-Epoch")
+    seq = _header_int(headers, "X-Qorcap-Snapshot-Seq")
+    pts_us = _header_int(headers, "X-Qorcap-Snapshot-Pts-Us")
+    if isinstance(body, (bytes, bytearray)) and body:
+        body_hash = hashlib.sha256(body).hexdigest()
+    else:
+        body_hash = ""
+    sub = snapshot_submission(api_version, epoch, seq, pts_us if pts_us is not None else mono_us, body_hash, seen)
+    if sub.get("error"):
+        return sub
+    if not decoded:
+        return {"error": "snapshot_decode", "epoch": sub["epoch"], "seq": sub["seq"]}
+    if capture_id == body_hash:
+        # Pixel identity is not the capture id. A header that only echoes the
+        # body hash has not named a producer capture.
+        return {"error": "missing_provenance"}
+    return {
+        "ok": True,
+        "t_ms": mono_us // 1000,
+        "source": {
+            "frame_id": capture_id,
+            "capture_id": capture_id,
+            "seq": sub["seq"],
+            "epoch": sub["epoch"],
+            "capture_generation": generation,
+            "session_id": session_id,
+            "clock_id": clock_id,
+            "clock_source": clock_source,
+            "mono_origin_ns": origin,
+            "pts_us": sub["pts_us"],
+            "mono_us": mono_us,
+            "clock": "capture_pts",
+            "captured_us": mono_us,
+        },
+    }
+
+
+def _header_text(headers, name):
+    if headers is None or not hasattr(headers, "get"):
         return None
-    raw = headers.get(name) if hasattr(headers, "get") else None
+    raw = headers.get(name)
+    if not isinstance(raw, str) or not raw:
+        return None
+    return raw
+
+
+def _header_int(headers, name):
+    raw = _header_text(headers, name)
     if raw is None:
         return None
     try:
-        return int(raw)
+        value = int(raw)
     except (TypeError, ValueError):
         return None
+    return value
 
 
 def start_cod_reader(api: Api, stop: threading.Event, state: dict, bundle: Path | None = None) -> threading.Thread:
@@ -714,8 +818,6 @@ def start_cod_reader(api: Api, stop: threading.Event, state: dict, bundle: Path 
     Controller and frame-clock rows are refreshed about once a second. No frame
     clock means those signals are not Counted.
     """
-    import hashlib
-
     sys.path.insert(0, str(HERE))
     from qorcap_cod import CodSetRunner, load_signal_files, side_from_bundle
 
@@ -765,21 +867,25 @@ def start_cod_reader(api: Api, stop: threading.Event, state: dict, bundle: Path 
                 try:
                     with urllib.request.urlopen(api.base + "/snapshot.jpg", timeout=3) as r:
                         data = r.read()
-                        source_ms = _header_int(r.headers, "X-Qorcap-Snapshot-Source-Ms")
-                        generation = _header_int(r.headers, "X-Qorcap-Snapshot-Gen")
-                except Exception:
+                        headers = r.headers
+                except Exception as e:
+                    runner.note_capture_gap(f"snapshot_http:{type(e).__name__}")
                     if stop.wait(0.5):
                         break
                     continue
-                body_hash = hashlib.sha256(data).hexdigest()
-                submitted = snapshot_submission(source_ms, generation, body_hash, int(time.time() * 1000), seen)
-                if submitted is not None:
+                try:
                     img = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
-                    if img is not None:
-                        try:
-                            runner.on_frame(submitted["captured_ms"], img, source=submitted)
-                        except Exception as e:
-                            state["reader_error"] = f"{type(e).__name__}: {e}"
+                except Exception:
+                    img = None
+                step = cod_capture_step(headers, data, seen, runner.wall_anchor_ms, img is not None)
+                if step.get("error"):
+                    runner.note_capture_gap(step["error"])
+                else:
+                    try:
+                        runner.on_frame(step["t_ms"], img, source=step["source"])
+                    except Exception as e:
+                        state["reader_error"] = f"{type(e).__name__}: {e}"
+                        runner.note_capture_gap(f"frame_hook:{type(e).__name__}")
                 if stop.wait(0.25):
                     break
         finally:

@@ -122,7 +122,8 @@ def test_hitmarker_outside_the_fire_window_is_not_counted_and_consensus_abstains
     assert signals["hitmarker"]["reason"] == "outside_fire_window"
     assert signals["hitmarker"]["gated"] is False
     assert signals["killfeed"]["reason"] == "no_nearby_hitmarker"
-    assert row["kind"] == "set" and row["frame_index"] == 12 and row["mono_us"] == 1_000_000
+    assert row["kind"] == "set" and row["frame_index"] == 12 and row["mono_us"] is None
+    assert row["clock"] == "unbound"
     assert row["anchored"] is False and row["source_frame"]["frame_id"] == "frame-a"
     assert row["prev"] == C.SIGNAL_GENESIS and len(row["hash"]) == 64
     assert runner.own_kill_coverage()["coverage"] == "unknown"
@@ -204,8 +205,142 @@ def test_stick_stays_counted_grip_off_rumble_info_only():
     assert doc["grip"] == "off"
     assert doc["counted"]["stick_turn_vs_camera"]["label"] == "Counted"
     assert doc["info_only"]["rumble_vs_hit"]["status"] == C.NOT_COUNTED
+
+
+def _blank_end():
+    class End:
+        def read(self, img):
+            return C.RegionRead("end_screen", "not_read", False, "not_present", False)
+
+    return End()
+
+
+def test_wall_time_is_not_stored_as_mono_us(tmp_path):
+    wall = 1_700_000_000_000
+    clocks = qm.split_clocks(wall_ms=wall, pts_us=50_000, anchor_wall_ms=wall - 10)
+    assert clocks["clock"] == "unbound"
+    assert clocks["wall_ms"] == wall
+    assert clocks["pts_us"] == 50_000
+    assert clocks["mono_us"] is None
+    assert clocks["mono_us"] != wall * 1000
+    ordered = qm.order_captures({
+        "session_id": "s1",
+        "clock_id": "boot1:producer1",
+        "clock_source": "monotonic_ns",
+        "mono_origin_ns": 9_000_000_000,
+        "frames": [
+            {"capture_id": "a", "mono_us": 1_000_000, "wall_time_ms": wall + 2_000},
+            {"capture_id": "b", "mono_us": 1_250_000, "wall_time_ms": wall},
+        ],
+    })
+    assert ordered["ordered_capture_ids"] == ["a", "b"]
+    assert ordered["wall_time_used_for_order"] is False
+
+    class Hud:
+        def read(self, img):
+            return []
+
+    runner = C.CodSetRunner(lambda _e: None, hud=Hud(), end=_blank_end(), log_path=tmp_path / "wall.jsonl")
+    runner.wall_anchor_ms = 0
+    runner.on_frame(1000, object(), source={
+        "frame_id": "wall-frame", "seq": 1, "captured_us": wall * 1000, "clock": "wall", "wall_ms": wall,
+    })
+    row = json.loads((tmp_path / "wall.jsonl").read_text(encoding="utf-8").splitlines()[0])
+    assert row["mono_us"] is None and row["clock"] == "wall" and row["wall_ms"] == wall
+    runner.on_frame(1000, object(), source={"frame_id": "bare", "seq": 2, "captured_us": 9_999_999})
+    bare = json.loads((tmp_path / "wall.jsonl").read_text(encoding="utf-8").splitlines()[1])
+    assert bare["mono_us"] is None
+    assert bare["mono_us"] != 9_999_999
+    assert bare["clock"] == "unbound"
+
+
+def test_signal_stream_keeps_every_frame_digit_change_and_capture_gap(tmp_path):
+    class Hud:
+        def __init__(self):
+            self.kills = 1
+
+        def read(self, img):
+            return [C.RegionRead("scoreboard", "read", True, "scoreboard_ka", True, kills=self.kills, assists=0)]
+
+    path = tmp_path / "cod_signals.jsonl"
+    runner = C.CodSetRunner(lambda _e: None, hud=Hud(), end=_blank_end(), log_path=path)
+    runner.on_frame(0, object(), source={"frame_id": "a", "seq": 1, "captured_us": 10})
+    runner.on_frame(10, object(), source={"frame_id": "b", "seq": 2, "captured_us": 20})
+    runner.hud.kills = 2
+    runner.on_frame(20, object(), source={"frame_id": "c", "seq": 3, "captured_us": 30})
+    rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    assert [row["kind"] for row in rows] == ["set", "hud", "hud"]
+    assert [row["eval_n"] for row in rows] == [1, 2, 3]
+    assert [row["frame_index"] for row in rows] == [1, 2, 3]
+    assert rows[0]["regions"][0]["kills"] == 1
+    assert rows[1]["regions"][0]["kills"] == 1
+    assert rows[2]["regions"][0]["kills"] == 2
+    assert rows[0]["regions"][0]["status"] == rows[2]["regions"][0]["status"]
+    assert all(row["end_eval"]["reason"] == "end_not_read" for row in rows)
+    assert all(row["evaluated"] is True for row in rows)
+    assert runner.note_capture_gap("snapshot_http:URLError") is True
+    assert runner.note_capture_gap("snapshot_api_incompatible") is True
+    assert runner.note_capture_gap("snapshot_decode") is True
+    chained = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    assert [row["reason_code"] for row in chained if row["kind"] == "capture_failure"] == [
+        "http_error", "version_mismatch", "decode_error",
+    ]
+    assert all(row.get("capture_id") is None for row in chained if row["kind"] == "capture_failure")
+    runner.log_path = tmp_path
+    assert runner.close_signals() is False
+    assert runner._signals_closed is False
+    runner.log_path = path
+    assert runner.close_signals() is True
+    assert runner.close_signals() is False
+    assert C.verify_signal_chain(path.read_text(encoding="utf-8")) == []
+    runner.log_path = tmp_path
+    before = runner.stats["signal_log_failures"]
+    stuck = runner._chain_seq
+    assert runner.note_capture_gap("snapshot_http:OSError") is False
+    assert runner.stats["signal_log_failures"] == before + 1
+    assert runner._chain_seq == stuck
+
+
+def test_snapshot_api_version_is_required_and_madden_stays_on_its_clock():
+    import inspect
+
     seen = set()
-    fresh = qm.snapshot_submission(1_000, 3, "abc", 1_200, seen)
-    assert fresh["captured_ms"] == 1_000 and fresh["seq"] == 3
-    assert qm.snapshot_submission(1_000, 3, "abc", 1_500, seen) is None
-    assert qm.snapshot_submission(1_000, 3, "abc", 9_000, set()) is None
+    fresh = qm.snapshot_submission(qm.SNAPSHOT_API_VERSION, 1, 3, 1_000, "abc", seen)
+    assert fresh["ok"] is True and fresh["pts_us"] == 1_000 and fresh["seq"] == 3
+    assert "captured_us" not in fresh
+    assert qm.snapshot_submission(qm.SNAPSHOT_API_VERSION, 1, 3, 2_000, "def", seen)["error"] == "snapshot_repeated"
+    assert qm.snapshot_submission(None, 1, 4, 3_000, "ghi", set())["error"] == "snapshot_api_incompatible"
+    assert qm.snapshot_submission(2, 1, 4, 3_000, "ghi", set())["error"] == "snapshot_api_incompatible"
+    legacy = qm.cod_capture_step({}, b"\xff\xd8\xff\xd9", set(), 10, True)
+    assert legacy["error"] == "version_mismatch"
+    headers = {
+        "X-Qorcap-Snapshot-Api": "1",
+        "X-Qorcap-Snapshot-Schema": qm.SNAPSHOT_SCHEMA,
+        "X-Qorcap-Snapshot-Epoch": "1",
+        "X-Qorcap-Snapshot-Seq": "1",
+        "X-Qorcap-Snapshot-Pts-Us": "40000",
+    }
+    assert qm.cod_capture_step(headers, b"jpeg-a", set(), None, True)["error"] == "clock_binding_missing"
+    bound_headers = dict(headers)
+    bound_headers.update({
+        "X-Qorcap-Snapshot-Session": "s1",
+        "X-Qorcap-Snapshot-Clock": "boot1:producer1",
+        "X-Qorcap-Snapshot-Clock-Source": "producer_instant",
+        "X-Qorcap-Snapshot-Mono-Origin-Ns": "0",
+        "X-Qorcap-Snapshot-Capture-Id": "c1",
+        "X-Qorcap-Snapshot-Generation": "1",
+        "X-Qorcap-Snapshot-Mono-Us": "40000",
+    })
+    bound = qm.cod_capture_step(bound_headers, b"jpeg-b", set(), 10, True)
+    assert bound["source"]["clock"] == "capture_pts"
+    assert bound["source"]["mono_us"] == 40_000
+    assert bound["source"]["mono_us"] != 10 * 1000
+    assert bound["source"]["capture_id"] == "c1"
+    old_schema = dict(bound_headers)
+    old_schema["X-Qorcap-Snapshot-Schema"] = "qorcap-snapshot/v0"
+    assert qm.cod_capture_step(old_schema, b"jpeg-old", set(), 10, True)["error"] == "version_mismatch"
+    assert qm.cod_capture_step(bound_headers, b"jpeg-c", set(), 10, False)["error"] == "snapshot_decode"
+    madden = inspect.getsource(qm.start_reader)
+    assert "snapshot_submission" not in madden
+    assert "cod_capture_step" not in madden
+    assert "t_ms = int(time.time() * 1000)" in madden

@@ -298,7 +298,7 @@ impl InputLog {
     fn note_span(&mut self, p: &Pad) {
         let c = p.counter;
         let hw = p.sensor_ts;
-        let quiet = p.buttons == 0 && p.lx == 128 && p.ly == 128 && p.rx == 128 && p.ry == 128;
+        let quiet = p.buttons == 0 && p.lx == 128 && p.ly == 128 && p.rx == 128 && p.ry == 128 && p.l2 == 0 && p.r2 == 0;
         if self.span.n == 0 {
             self.span.neutral = quiet;
             if let Some(prev) = self.prev_counter {
@@ -1020,19 +1020,47 @@ mod tests {
         assert!(hbs.iter().all(|h| h["seq_breaks"] == 0), "{hbs:?}");
         assert!(hbs.iter().all(|h| h["hw_advance"].as_u64().unwrap_or(0) > 0));
         assert!(hbs.iter().all(|h| h["neutral"] == true), "{hbs:?}");
-        let idle = crate::pad_link::classify_span(&hbs, 1_100_000, 3_800_000);
+        let idle = crate::pad_link::classify_span(&hbs, 1_100_000, 3_800_000, &crate::pad_link::TrustedBoundary::new());
         assert_eq!(idle.class, "unknown", "{idle:?}");
         assert_eq!(idle.reason, "no_trusted_anchor");
         assert!(!idle.is_idle(), "a local digest is not a trusted anchor");
         l.note_fault(5 * HB_INTERVAL_US);
         let with_zero: Vec<Value> = l.pending().iter().filter(|r| r["type"] == "hb").cloned().collect();
-        let dropped = crate::pad_link::classify_span(&with_zero, 4_100_000, 5 * HB_INTERVAL_US);
+        let dropped = crate::pad_link::classify_span(&with_zero, 4_100_000, 5 * HB_INTERVAL_US, &crate::pad_link::TrustedBoundary::new());
         assert_eq!(dropped.class, "unknown", "{dropped:?}");
-        let unknown = crate::pad_link::classify_span(&hbs, 20 * HB_INTERVAL_US, 21 * HB_INTERVAL_US);
+        let unknown = crate::pad_link::classify_span(&hbs, 20 * HB_INTERVAL_US, 21 * HB_INTERVAL_US, &crate::pad_link::TrustedBoundary::new());
         assert_eq!(unknown.class, "unknown");
         assert!(!unknown.is_idle());
         let header = l.pending().iter().find(|r| r["type"] == "header").unwrap();
         assert!(header["axes"].as_str().unwrap().contains("no deadzone"));
+    }
+
+    #[test]
+    fn trigger_pressure_is_not_neutral() {
+        let mut l = InputLog::new(None, true, 0);
+        l.on_handle_open(0, "DualSense Edge (USB)", "serial:EDGE1");
+        let mut t = 0u64;
+        let mut counter: u8 = 0;
+        let mut hw: u32 = 1_000;
+        while t <= HB_INTERVAL_US {
+            let mut pressed = pad(0, 0);
+            pressed.r2 = 20;
+            pressed.counter = counter;
+            pressed.sensor_ts = hw;
+            l.on_report(t, &pressed);
+            counter = counter.wrapping_add(1);
+            hw = hw.wrapping_add(12_000);
+            t += 4_000;
+        }
+        let hbs: Vec<Value> = l.pending().iter().filter(|r| r["type"] == "hb").cloned().collect();
+        assert!(!hbs.is_empty(), "{hbs:?}");
+        assert!(hbs.iter().all(|h| h["neutral"] == false), "{hbs:?}");
+        let mut held = pad(0, 40);
+        held.counter = counter;
+        held.sensor_ts = hw;
+        l.on_report(t, &held);
+        let later: Vec<Value> = l.pending().iter().filter(|r| r["type"] == "hb").cloned().collect();
+        assert!(later.iter().all(|h| h["neutral"] == false), "{later:?}");
     }
 
     #[test]

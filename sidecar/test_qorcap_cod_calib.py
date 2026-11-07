@@ -489,8 +489,22 @@ def test_owner_row_and_victory_reach_the_three_frame_bar(tmp_path):
         [], [], 0)
     ready.menu_exit_us = 2_100_000
     ready.lag_us_override = 100_000
+    ready.capture_epoch = 1
+    ready.capture_generation = 1
+    ready.session_id = "s1"
+    ready.seal_durable = True
+    ready.anchor_validated = True
+    ready.independent_anchor = "independent-v1:" + ("ab" * 32)
     for n, t in enumerate((0, 1000, 2000, 3000, 4000)):
-        ready.on_frame(t, variant(n + 5), source={"frame_id": f"g{n}", "seq": n, "captured_us": t * 1000})
+        ready.on_frame(t, variant(n + 5), source={
+            "frame_id": f"g{n}",
+            "capture_id": f"g{n}",
+            "seq": n,
+            "epoch": 1,
+            "clock": "capture_pts",
+            "mono_us": 3_000_000 + n * 1_000,
+            "captured_us": 3_000_000 + n * 1_000,
+        })
     assert confirmed[0]["final_confirmed"] is True
     assert result["method"] == "end_menu_read"
     assert "owner_row" not in result
