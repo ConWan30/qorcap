@@ -26,6 +26,13 @@
 //! identity/anti-cheat. The reader loop that receives HID reports writes one every 1000 ms
 //! of host monotonic time, including when buttons and sticks do not change. The row is sealed in the same
 //! chunk hash chain as the other input rows. `receipt.v0` is unchanged.
+//!
+//! `dev_counter` is a diagnostic copy of one raw report byte (USB offset 7). Its semantics are unvalidated.
+//! `max_rx_gap_us` is the largest gap between consecutive received reports in the interval, including the
+//! gap from the previous interval's last report. It is measured before `last_rx_t_us` moves, so a stall
+//! that recovers before the heartbeat stays visible. `stale_over_50ms`, `short_reads`, `parse_faults`,
+//! and `first_rx_t_us` reset every heartbeat. Epoch increments on every HID handle open and on a device
+//! identity change. Stale telemetry resets on reconnect.
 use crate::evidence::{self as ev, GENESIS};
 use crate::haptics::{Detector, HapticLive};
 use crate::hid::{self, Pad, ReportSource};
@@ -42,6 +49,10 @@ pub const SCHEMA: &str = "qorcap-inputs/v0";
 pub const ANALOG_MIN_GAP_US: u64 = 4_000;
 /// Host monotonic gap between `hb` rows. Independent of whether a button or stick changed.
 pub const HB_INTERVAL_US: u64 = 1_000_000;
+/// An inter-report gap above this counts in `stale_over_50ms`.
+pub const STALE_RX_GAP_US: u64 = 50_000;
+/// USB input report 0x01 is 64 bytes. A shorter read is `short_reads`, not a parse failure.
+const USB_REPORT_LEN: usize = 64;
 
 pub fn empty_hash() -> String { ev::jcs_sha(&json!([])) }
 
@@ -169,14 +180,19 @@ pub struct InputLog {
     imu_committed: Option<(bool, u32)>,
     /// Next `hb_seq` to write. Starts at 0. `u64` saturates; it does not wrap.
     hb_seq: u64,
-    /// Connection epoch. Starts at 0 and increments on every transition into `connected`.
+    /// Connection epoch. Starts at 0. Increments on every HID handle open and on a device identity change.
     epoch: u64,
     last_hb_t_us: Option<u64>,
     rx_at_last_hb: u64,
     last_rx_t_us: Option<u64>,
-    /// Report counter from the newest parsed USB/Bluetooth report. Null until one arrives.
+    /// Raw report counter byte from the newest parsed report. Diagnostic only; semantics are unvalidated.
     dev_counter: Option<u64>,
     faults_since_hb: u64,
+    max_rx_gap_us: u64,
+    stale_over_50ms: u64,
+    short_reads: u64,
+    parse_faults: u64,
+    first_rx_t_us: Option<u64>,
 }
 
 impl InputLog {
@@ -186,7 +202,8 @@ impl InputLog {
             live: Live { enabled, state: if enabled { "searching".into() } else { "off".into() }, ..Default::default() },
             detector: Detector::new(wall_anchor_ms), haptic_path, wall_anchor_ms, imu_committed: None,
             hb_seq: 0, epoch: 0, last_hb_t_us: None, rx_at_last_hb: 0, last_rx_t_us: None,
-            dev_counter: None, faults_since_hb: 0 };
+            dev_counter: None, faults_since_hb: 0, max_rx_gap_us: 0, stale_over_50ms: 0,
+            short_reads: 0, parse_faults: 0, first_rx_t_us: None };
         if enabled {
             l.pending.push(json!({"type": "header", "schema": SCHEMA, "t_us": 0,
                 "clock": "qorcap-mono-us (same Instant as manifest/checkpoint mono_ms)", "wall_anchor_ms": wall_anchor_ms,
@@ -201,8 +218,8 @@ impl InputLog {
     /// A heartbeat is considered here too, so identical reports still advance `hb`.
     pub fn on_report(&mut self, t_us: u64, p: &Pad) -> bool {
         self.live.reports += 1;
-        self.last_rx_t_us = Some(t_us);
-        // USB 0x01 and Bluetooth 0x31 both carry the report counter (byte 7, or +1 on BT).
+        self.observe_rx(t_us);
+        // USB 0x01 and Bluetooth 0x31 both carry this byte (offset 7, or +1 on BT). Copied, not interpreted.
         self.dev_counter = Some(p.counter as u64);
         self.live.last_report_mono_ms = Some(t_us / 1000);
         self.live.l2 = p.l2; self.live.r2 = p.r2; self.live.sticks = [p.lx, p.ly, p.rx, p.ry];
@@ -244,6 +261,40 @@ impl InputLog {
         self.poll_heartbeat(t_us);
     }
 
+    /// `read` returned fewer bytes than a USB 0x01 report.
+    pub fn note_short_read(&mut self, t_us: u64) {
+        self.short_reads = self.short_reads.saturating_add(1);
+        self.poll_heartbeat(t_us);
+    }
+
+    /// `read` returned a full-sized buffer that was not a DualSense input report.
+    pub fn note_parse_fault(&mut self, t_us: u64) {
+        self.parse_faults = self.parse_faults.saturating_add(1);
+        self.poll_heartbeat(t_us);
+    }
+
+    /// Gap is taken from the previous received report before `last_rx_t_us` is replaced.
+    fn observe_rx(&mut self, t_us: u64) {
+        if let Some(prev) = self.last_rx_t_us {
+            let gap = t_us.saturating_sub(prev);
+            if gap > self.max_rx_gap_us { self.max_rx_gap_us = gap; }
+            if gap > STALE_RX_GAP_US { self.stale_over_50ms = self.stale_over_50ms.saturating_add(1); }
+        }
+        if self.first_rx_t_us.is_none() { self.first_rx_t_us = Some(t_us); }
+        self.last_rx_t_us = Some(t_us);
+    }
+
+    fn reset_stale_telemetry(&mut self) {
+        self.max_rx_gap_us = 0;
+        self.stale_over_50ms = 0;
+        self.short_reads = 0;
+        self.parse_faults = 0;
+        self.faults_since_hb = 0;
+        self.first_rx_t_us = None;
+        self.last_rx_t_us = None;
+        self.dev_counter = None;
+    }
+
     fn poll_heartbeat(&mut self, t_us: u64) {
         if !self.live.enabled { return; }
         let due = match self.last_hb_t_us {
@@ -263,15 +314,32 @@ impl InputLog {
             "last_rx_t_us": self.last_rx_t_us.map(Value::from).unwrap_or(Value::Null),
             "dev_counter": self.dev_counter.map(Value::from).unwrap_or(Value::Null),
             "faults": self.faults_since_hb,
+            "max_rx_gap_us": self.max_rx_gap_us,
+            "stale_over_50ms": self.stale_over_50ms,
+            "short_reads": self.short_reads,
+            "parse_faults": self.parse_faults,
+            "first_rx_t_us": self.first_rx_t_us.map(Value::from).unwrap_or(Value::Null),
         }));
         self.hb_seq = self.hb_seq.saturating_add(1);
         self.rx_at_last_hb = rx_total;
         self.faults_since_hb = 0;
+        self.max_rx_gap_us = 0;
+        self.stale_over_50ms = 0;
+        self.short_reads = 0;
+        self.parse_faults = 0;
+        self.first_rx_t_us = None;
         self.last_hb_t_us = Some(t_us);
     }
 
     pub fn on_status(&mut self, t_us: u64, state: &str, detail: &str) {
         self.on_status_with_id(t_us, state, detail, None);
+    }
+
+    /// One successful HID `open`, including a reopen that keeps the same id string.
+    pub fn on_handle_open(&mut self, t_us: u64, detail: &str, pad_id: &str) {
+        self.live.state = "opening".into();
+        let id = if pad_id.is_empty() { None } else { Some(pad_id) };
+        self.on_status_with_id(t_us, "connected", detail, id);
     }
 
     /// `pad_id` is the USB serial (`serial:…`), a device instance id (`instance:…`), or a hidraw id
@@ -284,8 +352,12 @@ impl InputLog {
             Some(new) => self.live.pad_id.as_ref() == Some(new),
         };
         if self.live.state == state && same_id { return; }
-        if state == "connected" && self.live.state != "connected" {
+        // A stall that recovers on the same handle is not a new epoch: resetting here would hide the gap.
+        let handle_open = state == "connected" && !matches!(self.live.state.as_str(), "connected" | "stalled");
+        let identity = state == "connected" && self.live.state == "connected" && self.live.pad_id.is_some() && !same_id;
+        if handle_open || identity {
             self.epoch = self.epoch.saturating_add(1);
+            self.reset_stale_telemetry();
         }
         self.live.state = state.into();
         self.live.warning = match state {
@@ -421,7 +493,7 @@ where F: Fn() -> Result<Box<dyn ReportSource>, String> + Send + 'static {
                     let pad_id = dev.pad_id();
                     let detail = InputLog::connect_detail(&name, &pad_id);
                     info!("CONTROLLER: reading {name} id={pad_id} HID reports on the QorCap clock");
-                    log.lock().unwrap_or_else(|e| e.into_inner()).on_status_with_id(us(), "connected", &detail, Some(&pad_id));
+                    log.lock().unwrap_or_else(|e| e.into_inner()).on_handle_open(us(), &detail, &pad_id);
                     let mut last_rx = Instant::now();
                     while !stop.load(Ordering::SeqCst) {
                         match dev.read(&mut buf, 100) {
@@ -432,6 +504,9 @@ where F: Fn() -> Result<Box<dyn ReportSource>, String> + Send + 'static {
                                     if l.live.state != "connected" { l.on_status_with_id(t, "connected", &detail, Some(&pad_id)); }
                                     l.on_report(t, &p);
                                     last_rx = Instant::now();
+                                } else {
+                                    let mut l = log.lock().unwrap_or_else(|e| e.into_inner());
+                                    if n < USB_REPORT_LEN { l.note_short_read(t); } else { l.note_parse_fault(t); }
                                 }
                             }
                             Ok(None) => {
@@ -686,5 +761,85 @@ mod tests {
             println!("{row}");
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn heartbeat_keeps_a_recovered_gap_and_resets_on_reconnect() {
+        let mut l = InputLog::new(None, true, 0);
+        l.on_handle_open(0, "DualSense Edge (USB)", "serial:EDGE1");
+        assert_eq!(l.epoch, 1);
+        let mut quiet = pad(0, 0);
+        quiet.counter = 9;
+        let mut t = 0u64;
+        while t <= HB_INTERVAL_US {
+            l.on_report(t, &quiet);
+            t += 4_000;
+        }
+        // 300 ms with no reports, then the link recovers inside the next interval.
+        // The gap starts at the previous interval's last report.
+        let resume = HB_INTERVAL_US + 300_000;
+        l.on_report(resume, &quiet);
+        t = resume + 4_000;
+        while t <= 2 * HB_INTERVAL_US {
+            l.on_report(t, &quiet);
+            t += 4_000;
+        }
+        let recovered = l.pending().iter().rev().find(|r| r["type"] == "hb").unwrap().clone();
+        assert_eq!(recovered["t_us"], 2 * HB_INTERVAL_US);
+        assert!(recovered["max_rx_gap_us"].as_u64().unwrap() >= 300_000, "{recovered}");
+        assert!(recovered["stale_over_50ms"].as_u64().unwrap() >= 1, "{recovered}");
+        assert_eq!(recovered["last_rx_t_us"], 2 * HB_INTERVAL_US, "last_rx is fresh and must not hide the gap");
+        assert_eq!(recovered["first_rx_t_us"], resume);
+        assert_eq!(recovered["dev_counter"], 9);
+        assert_eq!(recovered["short_reads"], 0);
+        assert_eq!(recovered["parse_faults"], 0);
+        // Same handle, stalled, then a report: the gap stays. This is not a new epoch.
+        let epoch_at_recovery = l.epoch;
+        l.on_status(2 * HB_INTERVAL_US + 1_000, "stalled", "no reports for 2 s");
+        l.on_status_with_id(2 * HB_INTERVAL_US + 350_000, "connected", "DualSense Edge (USB)", Some("serial:EDGE1"));
+        assert_eq!(l.epoch, epoch_at_recovery, "stall recovery on the same handle does not bump epoch");
+        l.note_short_read(2 * HB_INTERVAL_US + 10);
+        l.note_parse_fault(2 * HB_INTERVAL_US + 20);
+        l.note_fault(2 * HB_INTERVAL_US + 30);
+        l.note_fault(3 * HB_INTERVAL_US);
+        let poisoned = l.pending().iter().rev().find(|r| r["type"] == "hb").unwrap().clone();
+        assert_eq!(poisoned["short_reads"], 1);
+        assert_eq!(poisoned["parse_faults"], 1);
+        assert!(poisoned["faults"].as_u64().unwrap() >= 1);
+        l.on_status(3 * HB_INTERVAL_US + 1_000, "unplugged", "usb disconnect");
+        l.on_handle_open(3 * HB_INTERVAL_US + 2_000, "DualSense Edge (USB)", "serial:EDGE1");
+        assert!(l.epoch > epoch_at_recovery, "reconnect bumps epoch");
+        let after_reopen = l.epoch;
+        l.on_handle_open(3 * HB_INTERVAL_US + 3_000, "DualSense Edge (USB)", "serial:EDGE1");
+        assert!(l.epoch > after_reopen, "a new handle bumps epoch even when the id string is unchanged");
+        let after_same_id = l.epoch;
+        l.on_status_with_id(3 * HB_INTERVAL_US + 4_000, "connected", "DualSense Edge (USB)", Some("serial:EDGE2"));
+        assert!(l.epoch > after_same_id, "a device identity change bumps epoch");
+        let base = 4 * HB_INTERVAL_US;
+        t = base;
+        while t <= base + HB_INTERVAL_US {
+            l.on_report(t, &quiet);
+            t += 4_000;
+        }
+        let after: Vec<Value> = l.pending().iter().filter(|r| r["type"] == "hb" && r["t_us"].as_u64().unwrap_or(0) >= base).cloned().collect();
+        assert!(after.len() >= 2, "{after:?}");
+        assert_eq!(after[0]["t_us"], base);
+        assert_eq!(after[0]["max_rx_gap_us"], 0, "the gap across reconnect is not a stall: {after:?}");
+        assert_eq!(after[0]["first_rx_t_us"], base);
+        assert_eq!(after[0]["short_reads"], 0);
+        assert_eq!(after[0]["parse_faults"], 0);
+        assert_eq!(after[0]["faults"], 0);
+        assert_eq!(after[0]["stale_over_50ms"], 0);
+        let clean = after.last().unwrap();
+        assert_eq!(clean["max_rx_gap_us"], 4_000, "only the post-reconnect report spacing remains: {clean}");
+        assert_eq!(clean["stale_over_50ms"], 0);
+        assert_eq!(clean["short_reads"], 0);
+        assert_eq!(clean["parse_faults"], 0);
+        assert_eq!(clean["faults"], 0);
+        assert_eq!(clean["last_rx_t_us"], base + HB_INTERVAL_US);
+        let first = l.pending().iter().find(|r| r["type"] == "hb" && r["t_us"] == HB_INTERVAL_US).unwrap();
+        println!("{first}");
+        println!("{recovered}");
+        println!("{clean}");
     }
 }

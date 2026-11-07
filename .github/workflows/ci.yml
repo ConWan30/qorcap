@@ -130,6 +130,38 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Shipped PowerShell is ASCII or UTF-8 BOM and parses on 5.1
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          if ($PSVersionTable.PSVersion.Major -ne 5) {
+            throw "expected Windows PowerShell 5.1, got $($PSVersionTable.PSVersion)"
+          }
+          $release = Get-Content -Raw .github\workflows\release.yml
+          $shipped = [regex]::Matches($release, '[A-Za-z0-9_.\-]+\.ps1') |
+            ForEach-Object { $_.Value } | Sort-Object -Unique
+          if ($shipped -notcontains "start-match.ps1" -or $shipped -notcontains "get-ffmpeg.ps1") {
+            throw "release workflow did not name the shipped ps1 files: $($shipped -join ', ')"
+          }
+          foreach ($name in $shipped) {
+            $path = Join-Path (Get-Location) $name
+            if (-not (Test-Path -LiteralPath $path)) { throw "shipped script missing: $name" }
+            $bytes = [System.IO.File]::ReadAllBytes($path)
+            $bom = ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF)
+            $nonAscii = $false
+            foreach ($b in $bytes) { if ($b -gt 127) { $nonAscii = $true; break } }
+            if ($nonAscii -and -not $bom) {
+              throw "$name has non-ASCII bytes and no UTF-8 BOM. Windows PowerShell 5.1 would read it as ANSI."
+            }
+            $tokens = $null
+            $errors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile($path, [ref]$tokens, [ref]$errors)
+            if ($errors -and $errors.Count -gt 0) {
+              $errors | ForEach-Object { Write-Host $_.ToString() }
+              throw "$name did not parse on Windows PowerShell 5.1 ($($errors.Count) error(s))"
+            }
+            Write-Host "$name ok (bom=$bom)"
+          }
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/setup-python@v5
         with:
