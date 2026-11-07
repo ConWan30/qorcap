@@ -435,7 +435,7 @@ def test_scored_end_final_uses_the_eligibility_gate():
         "capture_id": "c2", "frame_id": "c2", "seq": 2, "epoch": 1,
         "clock": "capture_pts", "mono_us": 4_000_000, "captured_us": 4_000_000,
     })
-    assert armed["visual_confirmed"] is True and armed["final_confirmed"] is True
+    assert armed["visual_confirmed"] is True and armed["final_confirmed"] is False
     early = feed({
         "capture_id": "c2", "frame_id": "c2", "seq": 2, "epoch": 1,
         "clock": "capture_pts", "mono_us": 1, "captured_us": 1,

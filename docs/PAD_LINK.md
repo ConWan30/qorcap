@@ -10,8 +10,8 @@ The row now also commits, for that second:
 
 Axes stay raw 0..255, center 128, no deadzone. The counter-step rule is PROVISIONAL.
 
-A quiet stretch stays unknown unless every covering heartbeat passes the interval gates already on the row: one epoch, no faults, no short reads, no parse faults, no stale gap, `max_rx_gap_us` at most 50 ms, and a fresh first and last report. The span also has to be neutral (buttons up, sticks at 128, L2 and R2 at rest) and carry one independent anchor registered on a trusted boundary. A free-form string is not that anchor. `rx_bind` is a local digest of bytes this process read. It is not that anchor.
+A quiet stretch stays unknown unless every covering heartbeat passes the interval gates already on the row: one epoch, no faults, no short reads, no parse faults, no stale gap, `max_rx_gap_us` at most 50 ms, and a fresh first and last report. The span also has to be neutral (buttons up, sticks at 128, L2 and R2 at rest) and carry one independent anchor that an authority has validated. A free-form string is not that anchor. A token shaped like `independent-v1:` plus 64 hex digits is not that evidence either. `rx_bind` is a local digest of bytes this process read. It is not that anchor.
 
-A report count can add support only after those gates. A missing `hb_seq` or a zero `rx_delta` stays unknown. Unknown is not idle. The capture does not mint an independent anchor, so a live gap stays unknown.
+A report count can add support only after those gates. A missing `hb_seq` or a zero `rx_delta` stays unknown. Unknown is not idle. The capture does not mint an independent anchor and does not run an authority, so a live gap stays unknown.
 
 `pad_link.v0.json` is a reading of those rows. Its SHA-256 is on the stop checkpoint. Editing an `hb` row breaks the chunk hash.

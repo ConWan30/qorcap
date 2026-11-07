@@ -47,6 +47,7 @@ import hashlib
 import json
 import os
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -364,13 +365,15 @@ def verify_signal_chain(text: str) -> list[str]:
         errs.append("terminal root does not match")
     if "chain_root_hash" in last and last.get("chain_root_hash") != root:
         errs.append("terminal chain_root does not match")
+    if not isinstance(last.get("truncated"), bool):
+        errs.append("terminal truncated flag missing")
+    if any(key not in last for key in ("count", "entry_count", "first_seq", "last_seq")):
+        errs.append("terminal coverage missing")
     if len(prior) == 0:
         if last.get("first_seq") is not None or last.get("last_seq") is not None:
             errs.append("terminal seq range does not match")
     else:
-        if "first_seq" in last and last.get("first_seq") != 0:
-            errs.append("terminal seq range does not match")
-        if "last_seq" in last and last.get("last_seq") != len(prior) - 1:
+        if last.get("first_seq") != 0 or last.get("last_seq") != len(prior) - 1:
             errs.append("terminal seq range does not match")
     if last.get("complete") is not False:
         errs.append("local hash links are not completeness")
@@ -396,17 +399,46 @@ def _in_fire_window(edges, screen_us) -> bool:
 
 
 def _independent_anchor(token, seal_hash) -> bool:
-    """An independent anchor is ``independent-v1:`` plus 64 lowercase hex digits.
+    """A formatted token is not authority evidence.
 
-    A free-form string is not one, and neither is the seal hash.
+    ``independent-v1:`` plus 64 hex digits, a boolean, and the seal hash do
+    not validate an anchor. This process does not run an authority.
     """
-    prefix = "independent-v1:"
-    if not isinstance(token, str) or not token.startswith(prefix):
-        return False
-    hexpart = token[len(prefix):]
-    if len(hexpart) != 64 or any(c not in "0123456789abcdef" for c in hexpart):
-        return False
-    return not (isinstance(seal_hash, str) and seal_hash and token == seal_hash)
+    del token, seal_hash
+    return False
+
+
+def producer_screen_us(source) -> int | None:
+    """Screen time from a measured monotonic sample.
+
+    Media PTS and wall-anchor subtraction are not that sample. An unmeasured
+    mapping stays unknown.
+    """
+    if not isinstance(source, dict):
+        return None
+    clock = source.get("clock")
+    source_name = source.get("clock_source")
+    measured = clock in ("monotonic_ns", "perf_counter_ns") or source_name in (
+        "monotonic_ns", "perf_counter_ns")
+    if not measured:
+        return None
+    sample = source.get("mono_us")
+    if isinstance(sample, bool) or not isinstance(sample, int) or sample < 0:
+        return None
+    return sample
+
+
+def _http_status_from_gap(reason: str):
+    text = str(reason)
+    for token in text.replace(":", " ").replace(",", " ").split():
+        if token.isdigit():
+            number = int(token)
+            if 100 <= number <= 599:
+                return number
+    lowered = text.lower()
+    if "httperror" in lowered or "http_error" in lowered or "snapshot_http" in lowered:
+        return 503
+    return None
 
 
 def screen_mono_us(screen_wall_ms, wall_anchor_ms) -> int | None:
@@ -650,6 +682,7 @@ class CodSetRunner:
         self._feed_present = False
         self._source = None
         self._signals_closed = False
+        self._log_fault = False
         self.menu_exit_us = None
         self.lag_us_override = None
         self._last_gated_hit_us = None
@@ -749,7 +782,7 @@ class CodSetRunner:
             self._emit_frame(int(t_ms))
 
     def _signals(self, t_ms: int, by_name: dict) -> list[dict]:
-        screen_us = screen_mono_us(t_ms, self.wall_anchor_ms)
+        screen_us = producer_screen_us(self._source)
         stamps = self.frame_stamps
         edges = trigger_edges(self.inputs)
         trigger = nearest_us(edges, screen_us)
@@ -833,9 +866,11 @@ class CodSetRunner:
     def _capture_ref(self) -> dict:
         src = self._source if isinstance(self._source, dict) else {}
         mono = None
-        if src.get("clock") == "capture_pts":
+        if src.get("clock") in ("capture_pts", "monotonic_ns", "perf_counter_ns") or src.get("clock_source") in (
+            "monotonic_ns", "perf_counter_ns",
+        ):
             raw = src.get("mono_us")
-            if isinstance(raw, int) and not isinstance(raw, bool):
+            if isinstance(raw, int) and not isinstance(raw, bool) and raw >= 0:
                 mono = raw
         capture_id = src.get("capture_id")
         if not isinstance(capture_id, str) or not capture_id:
@@ -1089,7 +1124,7 @@ class CodSetRunner:
         try:
             frame_id = self._source.get("frame_id") if isinstance(self._source, dict) else None
             self._lag.observe(
-                img, self.inputs, screen_mono_us(t_ms, self.wall_anchor_ms),
+                img, self.inputs, producer_screen_us(self._source),
                 source_frame=frame_id if isinstance(frame_id, str) else None)
         except Exception:
             return
@@ -1141,12 +1176,23 @@ class CodSetRunner:
     def _note_capture_epoch(self) -> None:
         src = self._source if isinstance(self._source, dict) else {}
         epoch = src.get("epoch")
-        if isinstance(epoch, bool) or not isinstance(epoch, int):
-            return
-        if self.capture_epoch is None:
-            self.capture_epoch = epoch
-        elif self.capture_epoch != epoch:
-            self.epoch_fault = True
+        if isinstance(epoch, int) and not isinstance(epoch, bool):
+            if self.capture_epoch is None:
+                self.capture_epoch = epoch
+            elif self.capture_epoch != epoch:
+                self.epoch_fault = True
+        session = src.get("session_id")
+        if isinstance(session, str) and session:
+            if not isinstance(self.session_id, str) or not self.session_id:
+                self.session_id = session
+            elif self.session_id != session:
+                self.epoch_fault = True
+        generation = src.get("capture_generation")
+        if isinstance(generation, int) and not isinstance(generation, bool):
+            if self.capture_generation is None:
+                self.capture_generation = generation
+            elif self.capture_generation != generation:
+                self.epoch_fault = True
 
     def _evidence_us(self):
         """Capture-relative evidence time. A wall clock is not evidence."""
@@ -1154,9 +1200,9 @@ class CodSetRunner:
         clock = src.get("clock")
         if clock == "wall":
             return None
-        if clock == "capture_pts":
+        if clock in ("capture_pts", "monotonic_ns", "perf_counter_ns"):
             n = src.get("mono_us")
-            return n if isinstance(n, int) and not isinstance(n, bool) else None
+            return n if isinstance(n, int) and not isinstance(n, bool) and n >= 0 else None
         n = src.get("captured_us")
         if isinstance(n, int) and not isinstance(n, bool):
             return n
@@ -1192,7 +1238,8 @@ class CodSetRunner:
             and not isinstance(self.capture_epoch, bool)
             and self.epoch_fault is not True
         )
-        anchor_ok = self.anchor_validated is True and _independent_anchor(self.independent_anchor, self.seal_hash)
+        # A boolean and a formatted token are not authority evidence.
+        anchor_ok = _independent_anchor(self.independent_anchor, self.seal_hash)
         decision = eligibility_decision(
             path="shared",
             end_us=end_us,
@@ -1203,6 +1250,7 @@ class CodSetRunner:
             lag_present=window.get("releases_counts") is True,
             session_id=self.session_id,
             capture_generation=self.capture_generation,
+            binding_epoch=self.capture_epoch,
         )
         confirmed = bool(visual_ok) and decision["eligible"]
         after = bool(frames) and "pre_exclusion_frame" not in decision["reason_codes"] and "boundary_not_after_end" not in decision["reason_codes"]
@@ -1214,6 +1262,7 @@ class CodSetRunner:
             "anchor_ok": anchor_ok,
             "end_us": end_us,
             "reason": decision["reason"],
+            "reason_codes": decision["reason_codes"],
             "evidence_us": evidence_us,
         }
 
@@ -1245,12 +1294,20 @@ class CodSetRunner:
             "_no_source": True,
         })
 
-    def note_capture_gap(self, reason: str) -> bool:
+    def note_capture_gap(self, reason: str, http_status=None, observed_mono_us=None) -> bool:
         """Record an HTTP, decode, provenance, or API failure on the signal chain."""
         from qorcap_qordata import reason_code_for
 
         self.stats["capture_gaps"] = self.stats.get("capture_gaps", 0) + 1
-        return self.note_capture_failure(reason_code=reason_code_for(reason), detail=str(reason))
+        status = http_status if isinstance(http_status, int) and not isinstance(http_status, bool) else _http_status_from_gap(reason)
+        if isinstance(observed_mono_us, bool) or not isinstance(observed_mono_us, int):
+            observed_mono_us = time.monotonic_ns() // 1000
+        return self.note_capture_failure(
+            reason_code=reason_code_for(reason),
+            detail=str(reason),
+            http_status=status,
+            observed_mono_us=observed_mono_us,
+        )
 
     def _emit_frame(self, t_ms: int) -> None:
         if self._frame_emitted:
@@ -1268,7 +1325,20 @@ class CodSetRunner:
             captured = None
         frame_id = src.get("frame_id") if isinstance(src.get("frame_id"), str) else None
         clock = src.get("clock") if isinstance(src.get("clock"), str) else None
-        return {"frame_id": frame_id, "seq": seq, "captured_us": captured, "clock": clock, "anchored": False}
+        row = {"frame_id": frame_id, "seq": seq, "captured_us": captured, "clock": clock, "anchored": False}
+        session = src.get("session_id") if isinstance(src.get("session_id"), str) and src.get("session_id") else self.session_id
+        if isinstance(session, str) and session:
+            row["session_id"] = session
+        epoch = src.get("epoch")
+        if isinstance(epoch, int) and not isinstance(epoch, bool):
+            row["epoch"] = epoch
+        origin = src.get("mono_origin_ns")
+        if isinstance(origin, int) and not isinstance(origin, bool):
+            row["mono_origin_ns"] = origin
+        generation = src.get("capture_generation")
+        if isinstance(generation, int) and not isinstance(generation, bool):
+            row["capture_generation"] = generation
+        return row
 
     def _stream_hud(self, t_ms: int, reads, signals, end_eval) -> None:
         regions = [_public(rd) for rd in reads]
@@ -1309,7 +1379,7 @@ class CodSetRunner:
             "chain_root_hash": self._chain_prev,
             "first_seq": 0 if count else None,
             "last_seq": (count - 1) if count else None,
-            "truncated": False,
+            "truncated": self._log_fault is True,
             "complete": False,
             "anchored": False,
             "session_id": self.session_id,
@@ -1341,15 +1411,21 @@ class CodSetRunner:
             body.setdefault("frame_index", source["seq"])
             body.setdefault("anchored", False)
             body.setdefault("source_frame", source)
+            for key in ("session_id", "epoch", "mono_origin_ns", "capture_generation"):
+                if key in source and key not in body:
+                    body[key] = source[key]
             if "mono_us" not in body:
                 src = self._source if isinstance(self._source, dict) else {}
-                if src.get("clock") == "capture_pts" and isinstance(src.get("mono_us"), int) and not isinstance(src.get("mono_us"), bool):
+                measured = src.get("clock") in ("capture_pts", "monotonic_ns", "perf_counter_ns")
+                if measured and isinstance(src.get("mono_us"), int) and not isinstance(src.get("mono_us"), bool):
                     body["mono_us"] = src["mono_us"]
-                    body["clock"] = "capture_pts"
+                    body["clock"] = src.get("clock")
                     if isinstance(src.get("clock_id"), str):
                         body["clock_id"] = src["clock_id"]
                     if isinstance(src.get("capture_id"), str):
                         body["capture_id"] = src["capture_id"]
+                    if isinstance(src.get("mono_origin_ns"), int) and not isinstance(src.get("mono_origin_ns"), bool):
+                        body["mono_origin_ns"] = src["mono_origin_ns"]
                 elif src.get("clock") == "wall":
                     body["mono_us"] = None
                     body["clock"] = "wall"
@@ -1363,6 +1439,7 @@ class CodSetRunner:
         try:
             digest = hashlib.sha256(_canon({"prev": prev, "seq": seq, "row": body}).encode("utf-8")).hexdigest()
         except TypeError as e:
+            self._log_fault = True
             self.stats["signal_log_failures"] = self.stats.get("signal_log_failures", 0) + 1
             print(f"Call of Duty signal log skipped a non-integer row: {e}", file=sys.stderr)
             return False
@@ -1375,6 +1452,7 @@ class CodSetRunner:
                 fh.flush()
                 os.fsync(fh.fileno())
         except OSError as e:
+            self._log_fault = True
             self.stats["signal_log_failures"] = self.stats.get("signal_log_failures", 0) + 1
             print(f"Call of Duty signal log failed: {type(e).__name__}: {e}", file=sys.stderr)
             return False

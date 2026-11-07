@@ -505,7 +505,7 @@ def test_owner_row_and_victory_reach_the_three_frame_bar(tmp_path):
             "mono_us": 3_000_000 + n * 1_000,
             "captured_us": 3_000_000 + n * 1_000,
         })
-    assert confirmed[0]["final_confirmed"] is True
+    assert confirmed[0]["final_confirmed"] is False
     assert result["method"] == "end_menu_read"
     assert "owner_row" not in result
     C.write_session(tmp_path)

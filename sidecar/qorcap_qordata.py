@@ -144,7 +144,7 @@ def classify_provenance_variant(variant: dict) -> str:
 
 
 def eligibility_decision(*, path, end_us, frames, seal_ready, anchor_ready, epoch_valid,
-                         lag_present, session_id, capture_generation) -> dict:
+                         lag_present, session_id, capture_generation, binding_epoch=None) -> dict:
     """One gate for both final paths. Equality at ``end_us`` is not eligible.
 
     Missing lag, seal, anchor, or epoch stays unknown. This function does not
@@ -174,6 +174,12 @@ def eligibility_decision(*, path, end_us, frames, seal_ready, anchor_ready, epoc
             reasons.append("capture_id_missing")
         else:
             ids.append(capture_id)
+        if isinstance(session_id, str) and session_id and frame.get("session_id") != session_id:
+            reasons.append("session_mismatch")
+        if _int(capture_generation) is not None and _int(frame.get("capture_generation")) != _int(capture_generation):
+            reasons.append("generation_mismatch")
+        if _int(binding_epoch) is not None and _int(frame.get("epoch")) != _int(binding_epoch):
+            reasons.append("epoch_mismatch")
         mono = _int(frame.get("mono_us"))
         if mono is None or end is None:
             if end is not None:
@@ -186,7 +192,10 @@ def eligibility_decision(*, path, end_us, frames, seal_ready, anchor_ready, epoc
     if len(ids) != len(set(ids)):
         reasons.append("duplicate_capture_id")
     primary = None
-    for name in ("pre_exclusion_frame", "boundary_not_after_end", "duplicate_capture_id"):
+    for name in (
+        "pre_exclusion_frame", "boundary_not_after_end", "duplicate_capture_id",
+        "session_mismatch", "generation_mismatch", "epoch_mismatch",
+    ):
         if name in reasons:
             primary = name
             break
@@ -219,17 +228,13 @@ def pad_neutral(pad: dict) -> bool:
 
 
 def _anchor_supported(hb: dict, validation) -> bool:
-    token = hb.get("trusted_anchor") if isinstance(hb, dict) else None
-    if not isinstance(validation, str) or not validation:
-        return False
-    if not isinstance(token, str) or not token.startswith("independent-v1:"):
-        return False
-    if token == hb.get("rx_bind"):
-        return False
-    hexpart = token[len("independent-v1:"):]
-    if len(hexpart) != 64 or any(c not in "0123456789abcdef" for c in hexpart):
-        return False
-    return True
+    """A formatted token is not authority evidence.
+
+    ``validation`` is not an authority result. This process does not register
+    an anchor from a string.
+    """
+    del hb, validation
+    return False
 
 
 def chain_acceptance(text: str) -> dict:

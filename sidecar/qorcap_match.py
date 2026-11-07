@@ -706,17 +706,24 @@ def snapshot_submission(api_version, epoch, seq, pts_us, body_hash, seen):
     """One capture generation. A missing API version is an incompatibility, not a skip.
 
     Wall time is not an argument. A repeated epoch and sequence is not a new frame.
+    Media PTS may be absent. It is not the capture identity, so several completions
+    may share one PTS.
     """
     version = _plain_int(api_version)
     if version != SNAPSHOT_API_VERSION:
         return {"error": "snapshot_api_incompatible", "api_version": version}
-    epoch_n, seq_n, pts_n = _plain_int(epoch), _plain_int(seq), _plain_int(pts_us)
-    if epoch_n is None or seq_n is None or pts_n is None or epoch_n < 0 or seq_n < 0 or pts_n < 0:
+    epoch_n, seq_n = _plain_int(epoch), _plain_int(seq)
+    pts_n = _plain_int(pts_us)
+    if epoch_n is None or seq_n is None or epoch_n < 0 or seq_n < 0:
+        return {"error": "snapshot_provenance_missing"}
+    if pts_us is not None and (pts_n is None or pts_n < 0):
         return {"error": "snapshot_provenance_missing"}
     if not isinstance(body_hash, str) or not body_hash or not isinstance(seen, set):
         return {"error": "snapshot_provenance_missing"}
-    for prev_epoch, prev_seq, prev_pts, _prev_hash in seen:
-        if prev_epoch == epoch_n and (seq_n <= prev_seq or pts_n <= prev_pts):
+    for prev_epoch, prev_seq, _prev_pts, _prev_hash in seen:
+        # Media PTS can stay on one progress line while several JPEGs complete.
+        # The capture sequence is the frame identity. PTS is not.
+        if prev_epoch == epoch_n and seq_n <= prev_seq:
             return {"error": "snapshot_repeated", "epoch": epoch_n, "seq": seq_n}
     seen.add((epoch_n, seq_n, pts_n, body_hash))
     return {
@@ -761,7 +768,7 @@ def cod_capture_step(headers, body, seen, anchor_wall_ms, decoded):
         body_hash = hashlib.sha256(body).hexdigest()
     else:
         body_hash = ""
-    sub = snapshot_submission(api_version, epoch, seq, pts_us if pts_us is not None else mono_us, body_hash, seen)
+    sub = snapshot_submission(api_version, epoch, seq, pts_us, body_hash, seen)
     if sub.get("error"):
         return sub
     if not decoded:
@@ -785,7 +792,7 @@ def cod_capture_step(headers, body, seen, anchor_wall_ms, decoded):
             "mono_origin_ns": origin,
             "pts_us": sub["pts_us"],
             "mono_us": mono_us,
-            "clock": "capture_pts",
+            "clock": clock_source if clock_source in ("monotonic_ns", "perf_counter_ns") else "capture_pts",
             "captured_us": mono_us,
         },
     }
@@ -869,7 +876,16 @@ def start_cod_reader(api: Api, stop: threading.Event, state: dict, bundle: Path 
                         data = r.read()
                         headers = r.headers
                 except Exception as e:
-                    runner.note_capture_gap(f"snapshot_http:{type(e).__name__}")
+                    status = getattr(e, "code", None)
+                    if isinstance(status, str) and status.isdigit():
+                        status = int(status)
+                    if isinstance(status, bool) or not isinstance(status, int):
+                        status = None
+                    runner.note_capture_gap(
+                        f"snapshot_http:{type(e).__name__}",
+                        http_status=status,
+                        observed_mono_us=time.monotonic_ns() // 1000,
+                    )
                     if stop.wait(0.5):
                         break
                     continue

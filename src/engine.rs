@@ -98,6 +98,8 @@ pub struct Engine {
     bundle_finalized: AtomicBool,
     /// Test hook. A fault fails one append stage and rewinds a torn tail.
     pub persist_fault: Mutex<Option<PersistFault>>,
+    /// Set when a rewind could not be confirmed. The next append repairs the tail before it acks.
+    tail_needs_repair: AtomicBool,
 }
 
 /// QorTime evidence state for this run.
@@ -151,19 +153,30 @@ impl SyncWrite for std::fs::File {
     fn rewind(&mut self, len: u64) -> std::io::Result<()> { self.set_len(len) }
 }
 
-/// Write, flush, and sync. Any stage error rewinds to the pre-write length.
+/// Put the writer back at `start_len` and sync that length. A failed rewind stays in the error.
+fn rollback_durable<W: SyncWrite>(w: &mut W, start_len: u64) -> Result<(), String> {
+    w.rewind(start_len).map_err(|e| format!("rewind: {e}"))?;
+    w.sync_data().map_err(|e| format!("rewind sync: {e}"))?;
+    Ok(())
+}
+
+fn stage_error<W: SyncWrite>(w: &mut W, start_len: u64, stage: &str, err: impl std::fmt::Display) -> String {
+    match rollback_durable(w, start_len) {
+        Ok(()) => format!("{stage}: {err}"),
+        Err(rewind) => format!("{stage}: {err}; {rewind}"),
+    }
+}
+
+/// Write, flush, and sync. Any stage error rewinds to the pre-write length and reports a failed rewind.
 fn commit_durable<W: SyncWrite>(w: &mut W, bytes: &[u8], start_len: u64) -> Result<(), String> {
     if let Err(e) = w.write_all_buf(bytes) {
-        let _ = w.rewind(start_len);
-        return Err(format!("write: {e}"));
+        return Err(stage_error(w, start_len, "write", e));
     }
     if let Err(e) = w.flush_buf() {
-        let _ = w.rewind(start_len);
-        return Err(format!("flush: {e}"));
+        return Err(stage_error(w, start_len, "flush", e));
     }
     if let Err(e) = w.sync_data() {
-        let _ = w.rewind(start_len);
-        return Err(format!("sync: {e}"));
+        return Err(stage_error(w, start_len, "sync", e));
     }
     Ok(())
 }
@@ -172,6 +185,22 @@ fn file_ends_with(path: &Path, line: &[u8]) -> bool {
     let Ok(buf) = std::fs::read(path) else { return false };
     if !buf.ends_with(line) || line.is_empty() { return false; }
     buf.len() == line.len() || buf[buf.len() - line.len() - 1] == b'\n'
+}
+
+/// Drop a torn trailing line and sync the kept prefix. An already-terminated file is synced as it stands.
+fn repair_jsonl_tail(path: &Path) -> Result<(), String> {
+    if !path.exists() { return Ok(()); }
+    let buf = std::fs::read(path).map_err(|e| format!("rewind: {e}"))?;
+    let keep = if buf.is_empty() || buf.last() == Some(&b'\n') {
+        buf.len()
+    } else {
+        buf.iter().rposition(|b| *b == b'\n').map(|i| i + 1).unwrap_or(0)
+    };
+    let f = std::fs::OpenOptions::new().write(true).open(path).map_err(|e| format!("rewind: {e}"))?;
+    if keep != buf.len() {
+        f.set_len(keep as u64).map_err(|e| format!("rewind: {e}"))?;
+    }
+    f.sync_all().map_err(|e| format!("rewind sync: {e}"))
 }
 
 fn append_jsonl(path: &Path, v: &Value) -> Result<(), String> {
@@ -189,7 +218,28 @@ fn append_jsonl_fault(path: &Path, v: &Value, mut fault: Option<&mut PersistFaul
     let bytes = line.as_bytes();
     let _g = APPEND.lock().unwrap_or_else(|e| e.into_inner());
     if file_ends_with(path, bytes) {
-        return Ok(());
+        // The bytes are present. They are not durable until this sync succeeds.
+        match OpenOptions::new().read(true).write(true).open(path) {
+            Ok(f) => {
+                if let Some(hit) = fault.as_mut() {
+                    if hit.remaining > 0 && hit.stage == "sync" {
+                        hit.remaining -= 1;
+                        let err = "sync: EIO".to_string();
+                        error!("cannot append {}: {err}", path.display());
+                        return Err(format!("append {}: {err}", path.display()));
+                    }
+                }
+                return f.sync_all().map_err(|e| {
+                    let err = format!("sync: {e}");
+                    error!("cannot append {}: {err}", path.display());
+                    format!("append {}: {err}", path.display())
+                });
+            }
+            Err(e) => {
+                error!("cannot append {}: {e}", path.display());
+                return Err(format!("append {}: {e}", path.display()));
+            }
+        }
     }
     match OpenOptions::new().create(true).append(true).open(path) {
         Ok(mut f) => {
@@ -203,19 +253,25 @@ fn append_jsonl_fault(path: &Path, v: &Value, mut fault: Option<&mut PersistFaul
                         "write" => {
                             let n = partial.unwrap_or(0).min(bytes.len());
                             if n > 0 { let _ = Write::write_all(&mut f, &bytes[..n]); }
-                            let _ = f.set_len(start);
-                            "write: ENOSPC".to_string()
+                            match rollback_durable(&mut f, start) {
+                                Ok(()) => "write: ENOSPC".to_string(),
+                                Err(rewind) => format!("write: ENOSPC; {rewind}"),
+                            }
                         }
                         "flush" => {
                             let _ = Write::write_all(&mut f, bytes);
-                            let _ = f.set_len(start);
-                            "flush: EIO".to_string()
+                            match rollback_durable(&mut f, start) {
+                                Ok(()) => "flush: EIO".to_string(),
+                                Err(rewind) => format!("flush: EIO; {rewind}"),
+                            }
                         }
                         "sync" => {
                             let _ = Write::write_all(&mut f, bytes);
                             let _ = Write::flush(&mut f);
-                            let _ = f.set_len(start);
-                            "sync: EIO".to_string()
+                            match rollback_durable(&mut f, start) {
+                                Ok(()) => "sync: EIO".to_string(),
+                                Err(rewind) => format!("sync: EIO; {rewind}"),
+                            }
                         }
                         other => format!("fault: {other}"),
                     };
@@ -306,14 +362,16 @@ impl Engine {
         let frame_on = crate::frameclock::flag_enabled(args.frame_clock, std::env::var(crate::frameclock::ENV).ok().as_deref());
         let frame_clock = Arc::new(crate::frameclock::FrameClock::open(frame_on, args.bundle.as_deref().map(Path::new)));
         let st = Status { state: "starting".into(), device: args.device.clone(), res: format!("{}x{}", args.res.0, args.res.1), fps_target: args.fps, replay_window: args.replay.unwrap_or(0), role: args.role.clone(), side_source: args.side_source.clone(), ..Default::default() };
+        let mut snap = crate::snap::Publisher::new();
+        snap.bind_session(&args.match_id);
         Arc::new(Self { ffmpeg, ring: Mutex::new(ReplayRing::new(window, cap)), rec: Mutex::new(None), status: Mutex::new(st), shutdown: AtomicBool::new(false),
             ev: Mutex::new(MatchState { started_wall_ms: wall_ms(), score: Value::Null, ..Default::default() }), subs: Mutex::new(vec![]),
             stamp_file: dir.join("stamp.txt"),
-            snapshot: dir.join("snapshot.jpg"), snap_pub: Mutex::new(crate::snap::Publisher::new()), tap: crate::glimpse::FrameTap::with_ring(args.glimpse_frame || crate::glimpse::env_enabled(), crate::glimpse::ring_enabled()), exit_when_recording_ends: AtomicBool::new(false), started: Instant::now(), last_data_ms: AtomicU64::new(0), input, frame_clock,
+            snapshot: dir.join("snapshot.jpg"), snap_pub: Mutex::new(snap), tap: crate::glimpse::FrameTap::with_ring(args.glimpse_frame || crate::glimpse::env_enabled(), crate::glimpse::ring_enabled()), exit_when_recording_ends: AtomicBool::new(false), started: Instant::now(), last_data_ms: AtomicU64::new(0), input, frame_clock,
             running: AtomicBool::new(false), api_closed: AtomicBool::new(false), sealed: AtomicBool::new(false),
             countersigned: std::sync::atomic::AtomicI64::new(-1),
             stop_reason: Mutex::new(None), bundle_write: Mutex::new(()), bundle_finalized: AtomicBool::new(false),
-            persist_fault: Mutex::new(None), args })
+            persist_fault: Mutex::new(None), tail_needs_repair: AtomicBool::new(false), args })
     }
     fn ms(&self) -> u64 { self.started.elapsed().as_millis() as u64 }
     /// The monotonic clock behind every mono_ms (manifest, checkpoints) and inputs.jsonl t_us.
@@ -685,6 +743,11 @@ impl Engine {
             extra.insert("pad_link_file".into(), json!("pad_link.v0.json"));
         }
         let cp = self.checkpoint("stop", Value::Object(extra));
+        let durable = cp.get("hash").is_some() && cp.get("persisted") != Some(&Value::Bool(false));
+        if !durable {
+            warn!("stop checkpoint is not durable; the chain stays open");
+            return None;
+        }
         self.sealed.store(true, Ordering::SeqCst);
         let last = cp["seq"].as_u64()?;
         self.status.lock().unwrap_or_else(|e| e.into_inner()).final_checkpoint_seq = Some(last);
@@ -741,7 +804,9 @@ impl Engine {
             std::thread::spawn(move || {
                 while !flag.load(Ordering::SeqCst) {
                     if let Ok(bytes) = std::fs::read(&inc) {
+                        let modified = std::fs::metadata(&inc).ok().and_then(|m| m.modified().ok());
                         let mut pub_ = me.snap_pub.lock().unwrap_or_else(|e| e.into_inner());
+                        pub_.observe_file(bytes.len() as u64, modified, &bytes);
                         let prov = pub_.pending_provenance();
                         pub_.consider(&bytes, &dest, prov);
                     }
@@ -912,6 +977,40 @@ mod tests {
         assert!(sync.unwrap_err().contains("sync"));
         let mut ok = Boom { fail: "none" };
         assert!(commit_durable(&mut ok, line, 0).is_ok());
+    }
+
+    struct RewindFails;
+    impl SyncWrite for RewindFails {
+        fn write_all_buf(&mut self, _: &[u8]) -> std::io::Result<()> { Err(std::io::Error::other("write failed")) }
+        fn flush_buf(&mut self) -> std::io::Result<()> { Ok(()) }
+        fn sync_data(&mut self) -> std::io::Result<()> { Ok(()) }
+        fn rewind(&mut self, _: u64) -> std::io::Result<()> { Err(std::io::Error::other("set_len failed")) }
+    }
+
+    #[test]
+    fn a_failed_rewind_stays_in_the_append_error() {
+        let err = commit_durable(&mut RewindFails, b"{}\n", 4).unwrap_err();
+        assert!(err.contains("write"), "{err}");
+        assert!(err.contains("rewind"), "{err}");
+    }
+
+    #[test]
+    fn a_matching_suffix_syncs_before_it_is_success() {
+        let dir = std::env::temp_dir().join(format!("qorcap-suffix-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("checkpoints.jsonl");
+        let row = json!({"seq": 0});
+        let line = format!("{row}\n");
+        std::fs::write(&path, &line).unwrap();
+        let mut fault = PersistFault { stage: "sync", partial: None, remaining: 1 };
+        let err = append_jsonl_fault(&path, &row, Some(&mut fault)).unwrap_err();
+        assert!(err.contains("sync"), "{err}");
+        assert_eq!(fault.remaining, 0);
+        assert_eq!(std::fs::read(&path).unwrap(), line.as_bytes());
+        assert!(append_jsonl_fault(&path, &row, Some(&mut fault)).is_ok());
+        assert_eq!(std::fs::read(&path).unwrap(), line.as_bytes(), "a synced retry does not duplicate the line");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1478,6 +1577,17 @@ impl Engine {
             warn!("checkpoint '{trigger}' after the stop checkpoint refused (chain is sealed)");
             return Value::Null;
         }
+        let path = self.ev_path("checkpoints.jsonl");
+        if self.tail_needs_repair.load(Ordering::SeqCst) {
+            match repair_jsonl_tail(&path) {
+                Ok(()) => self.tail_needs_repair.store(false, Ordering::SeqCst),
+                Err(e) => {
+                    self.status.lock().unwrap_or_else(|err| err.into_inner()).checkpoint_persist_error = Some(e.clone());
+                    error!("checkpoint '{trigger}' tail is not repaired: {e}");
+                    return json!({"persisted": false, "error": e, "trigger": trigger});
+                }
+            }
+        }
         let mut st = self.ev.lock().unwrap_or_else(|e| e.into_inner());
         let mut ext = json!({"trigger": trigger, "segment_seq": st.seg.seq, "segment_hash": st.last_seg_sha, "chain_head": st.seg.head,
             "score": st.score, "mono_ms": self.ms(), "match_id": self.args.match_id, "role": self.args.role});
@@ -1496,7 +1606,6 @@ impl Engine {
                 return Value::Null;
             }
         };
-        let path = self.ev_path("checkpoints.jsonl");
         let mut fault_slot = self.persist_fault.lock().unwrap_or_else(|e| e.into_inner());
         let persisted = append_jsonl_fault(&path, &cp, fault_slot.as_mut());
         drop(fault_slot);
@@ -1504,6 +1613,7 @@ impl Engine {
             st.cps.seq = position.0;
             st.cps.prev = position.1;
             drop(st);
+            if e.contains("rewind") { self.tail_needs_repair.store(true, Ordering::SeqCst); }
             self.status.lock().unwrap_or_else(|err| err.into_inner()).checkpoint_persist_error = Some(e.clone());
             error!("checkpoint '{trigger}' not durable: {e}");
             return json!({"persisted": false, "error": e, "trigger": trigger});

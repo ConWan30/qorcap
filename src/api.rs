@@ -31,7 +31,7 @@ pub fn route(e: &Arc<Engine>, method: &str, url: &str, body: &str) -> Resp {
                 } => {
                     // The glimpse tap keeps its own wall clock. Capture mono stays on the snapshot headers.
                     e.tap.offer(&bytes, crate::engine::wall_ms());
-                    return Resp { code: 200, ctype: "image/jpeg", body: bytes, headers: vec![
+                    let mut headers = vec![
                         ("X-Qorcap-Snapshot-Api", api.to_string()),
                         ("X-Qorcap-Snapshot-Schema", schema.to_string()),
                         ("X-Qorcap-Snapshot-Session", session_id),
@@ -43,10 +43,13 @@ pub fn route(e: &Arc<Engine>, method: &str, url: &str, body: &str) -> Resp {
                         ("X-Qorcap-Snapshot-Seq", seq.to_string()),
                         ("X-Qorcap-Snapshot-Capture-Id", capture_id),
                         ("X-Qorcap-Snapshot-Mono-Us", mono_us.to_string()),
-                        ("X-Qorcap-Snapshot-Pts-Us", pts_us.to_string()),
                         ("X-Qorcap-Snapshot-Gen", generation.to_string()),
                         ("Cache-Control", "no-store".to_string()),
-                    ] };
+                    ];
+                    if let Some(pts) = pts_us {
+                        headers.push(("X-Qorcap-Snapshot-Pts-Us", pts.to_string()));
+                    }
+                    return Resp { code: 200, ctype: "image/jpeg", body: bytes, headers };
                 }
                 crate::snap::Serve::AwaitingProducer => {
                     return j(503, json!({"ok": false, "error": "stale generation"}));
@@ -297,9 +300,16 @@ mod tests {
         assert!(fresh.headers.iter().any(|(k, v)| *k == "X-Qorcap-Snapshot-Api" && v == "1"));
         assert!(fresh.headers.iter().any(|(k, v)| *k == "X-Qorcap-Snapshot-Schema" && v == "qorcap-snapshot/v1"));
         assert!(fresh.headers.iter().any(|(k, v)| *k == "X-Qorcap-Snapshot-Epoch" && v == "1"));
-        assert!(fresh.headers.iter().any(|(k, v)| *k == "X-Qorcap-Snapshot-Seq" && v == "2"));
-        assert!(fresh.headers.iter().any(|(k, v)| *k == "X-Qorcap-Snapshot-Mono-Us" && v == "80000"));
-        assert!(fresh.headers.iter().any(|(k, v)| *k == "X-Qorcap-Snapshot-Capture-Id" && v == "1:2"));
+        assert!(fresh.headers.iter().any(|(k, v)| *k == "X-Qorcap-Snapshot-Seq" && v == "1"));
+        assert!(fresh.headers.iter().any(|(k, v)| *k == "X-Qorcap-Snapshot-Pts-Us" && v == "80000"));
+        let mono = fresh.headers.iter().find(|(k, _)| *k == "X-Qorcap-Snapshot-Mono-Us").map(|(_, v)| v.as_str()).unwrap_or("");
+        assert_ne!(mono, "80000", "media PTS is not the monotonic sample");
+        assert!(mono.chars().all(|c| c.is_ascii_digit()) && !mono.is_empty());
+        assert!(fresh.headers.iter().any(|(k, v)| *k == "X-Qorcap-Snapshot-Clock-Source" && v == "monotonic_ns"));
+        assert!(fresh.headers.iter().any(|(k, v)| *k == "X-Qorcap-Snapshot-Session" && v == "unassigned"));
+        assert!(fresh.headers.iter().any(|(k, v)| *k == "X-Qorcap-Snapshot-Mono-Origin-Ns" && v != "0"));
+        let capture = fresh.headers.iter().find(|(k, _)| *k == "X-Qorcap-Snapshot-Capture-Id").map(|(_, v)| v.clone()).unwrap_or_default();
+        assert!(capture.starts_with("1:1:"), "{capture}");
         assert!(fresh.headers.iter().all(|(k, _)| *k != "X-Qorcap-Snapshot-Source-Ms"));
     }
 
@@ -495,6 +505,24 @@ mod tests {
         assert!(waited >= std::time::Duration::from_millis(250) && waited < std::time::Duration::from_secs(5), "{waited:?}");
         assert_eq!(h.join().unwrap(), 200);
         assert_eq!(e.status().final_checkpoint_seq, Some(1));
+    }
+
+    #[test]
+    fn a_failed_stop_does_not_seal_and_the_same_revision_can_retry() {
+        let e = engine(&["--game", "cod_mw4"]);
+        *e.persist_fault.lock().unwrap_or_else(|err| err.into_inner()) = Some(crate::engine::PersistFault {
+            stage: "sync", partial: None, remaining: 1,
+        });
+        assert!(e.seal_and_wait_countersign(std::time::Duration::from_secs(1)).is_none());
+        assert!(!e.sealed.load(Ordering::SeqCst), "a failed stop checkpoint must not seal the chain");
+        assert!(e.status().checkpoint_persist_error.is_some());
+        let retried = e.seal_and_wait_countersign(std::time::Duration::from_secs(1));
+        assert!(retried.is_some(), "the stop can be written once the fault clears");
+        assert!(e.sealed.load(Ordering::SeqCst));
+        assert!(e.checkpoint("late", json!({})).is_null());
+        let text = std::fs::read_to_string(e.bundle_dir().unwrap().join("checkpoints.jsonl")).unwrap();
+        let lines: Vec<_> = text.lines().filter(|l| !l.is_empty()).collect();
+        assert_eq!(lines.len(), 1, "the failed stop does not leave a second line: {lines:?}");
     }
     #[test]
     fn recording_marker_guards_input_proof() {

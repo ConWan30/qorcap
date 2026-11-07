@@ -7,8 +7,10 @@
 //!
 //! `rx_bind` is a digest of bytes this process already read. It is not an anchor.
 //! Idle also needs a neutral span, including L2 and R2 at rest, and one independent
-//! anchor registered on a trusted boundary. A free-form string is not that anchor.
-//! Without it, the span stays unknown. A missing row or a zero count is unknown, not a drop.
+//! anchor that an authority has already validated. A free-form string is not that
+//! anchor, and neither is a token that only has the `independent-v1:` shape.
+//! This process does not run an authority and does not register one. Without
+//! that evidence the span stays unknown. A missing row or a zero count is unknown, not a drop.
 //!
 //! `unknown` is not idle. Counter-step and sensor-tick rules are PROVISIONAL.
 use crate::inputs::{HB_INTERVAL_US, STALE_RX_GAP_US};
@@ -25,11 +27,11 @@ pub struct TrustedBoundary { verified: std::collections::BTreeSet<String> }
 impl TrustedBoundary {
     pub fn new() -> Self { Self { verified: std::collections::BTreeSet::new() } }
 
-    /// Accept one independent anchor. A free-form string, including `"x"`, is refused.
+    /// Refuse every token. A matching `independent-v1:` shape is not validation evidence,
+    /// and this process does not run an authority that could supply one.
     pub fn note_independent(&mut self, evidence: &str) -> bool {
-        if !independent_anchor(evidence) { return false; }
-        self.verified.insert(evidence.to_string());
-        true
+        let _ = (evidence, independent_anchor(evidence));
+        false
     }
 
     pub fn accepts(&self, evidence: &str) -> bool {
@@ -193,7 +195,7 @@ mod tests {
 
     fn boundary() -> TrustedBoundary {
         let mut b = TrustedBoundary::new();
-        assert!(b.note_independent(TOKEN));
+        assert!(!b.note_independent(TOKEN), "a formatted token is not validation evidence");
         b
     }
 
@@ -225,8 +227,16 @@ mod tests {
         for row in &mut local { row["rx_bind"] = json!(TOKEN); }
         let digest = classify_span(&local, 1_100_000, 3_900_000, &boundary());
         assert_eq!(digest.reason, "no_trusted_anchor");
+        let forged = "independent-v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        assert!(!open.note_independent(forged));
+        assert!(!open.accepts(forged));
+        let mut shaped = rows.clone();
+        for row in &mut shaped { row["trusted_anchor"] = json!(forged); }
+        let format_only = classify_span(&shaped, 1_100_000, 3_900_000, &open);
+        assert_eq!((format_only.class, format_only.reason), ("unknown", "no_trusted_anchor"));
         let idle = classify_span(&rows, 1_100_000, 3_900_000, &boundary());
-        assert!(idle.is_idle(), "{idle:?}");
+        assert!(!idle.is_idle(), "{idle:?}");
+        assert_eq!(idle.reason, "no_trusted_anchor");
     }
 
     #[test]
@@ -234,8 +244,8 @@ mod tests {
         let rows = vec![ticking(1_000_000, 0), ticking(2_000_000, 1), ticking(3_000_000, 2), ticking(4_000_000, 3)];
         let gate = boundary();
         let idle = classify_span(&rows, 1_100_000, 3_900_000, &gate);
-        assert!(idle.is_idle(), "{idle:?}");
-        assert_eq!(idle.reason, "counts_support");
+        assert!(!idle.is_idle(), "{idle:?}");
+        assert_eq!(idle.reason, "no_trusted_anchor");
         let mut local = rows.clone();
         for row in &mut local { row["trusted_anchor"] = json!("local-digest"); }
         let no_anchor = classify_span(&local, 1_100_000, 3_900_000, &gate);
