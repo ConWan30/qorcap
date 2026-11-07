@@ -1487,7 +1487,14 @@ def resolve_game(a, *, game_file: Path, read_key=None, out=None) -> tuple[str | 
 
 def resolve_side(a, *, side_file: Path, read_key=None, out=None, game: str = "madden") -> tuple[str | None, str | None]:
     """(side, source). source: flag | file | prompt; (home, None) is the legacy default for direct CLI runs without
-    --side (tests); (None, None) = no answer possible (no console)."""
+    --side (tests); (None, None) = no answer possible (no console).
+
+    Call of Duty has no home/away pick: no prompt, no side file, no flag. It returns the same (home, None) the
+    no-side path above already returns, so no side_choice.json and no --side-source are written and the Call of
+    Duty end-word check sees no chosen side (fails closed). "home" there is only the required receipt role
+    slot (receipt.v0 role enum), not a Madden scorebug side."""
+    if game == "cod":
+        return "home", None
     if a.side in ("home", "away"):
         return a.side, "flag"
     if a.role in ("home", "away"):
@@ -1619,7 +1626,10 @@ def main(argv=None) -> int:
     a.role = side
     say(f"Game: {'CALL OF DUTY' if game == 'cod' else 'MADDEN'}"
         + (f"  (from {game_source})" if game_source else "  (default; pass --game madden|cod)"))
-    say(f"Side: {side.upper()}" + (f"  (from {side_source})" if side_source else "  (default; pass --side home|away)"))
+    if game == "cod":
+        say("Side: not used for Call of Duty (no home/away pick).")
+    else:
+        say(f"Side: {side.upper()}" + (f"  (from {side_source})" if side_source else "  (default; pass --side home|away)"))
 
     root = Path(a.out) if a.out else Path.home() / "Documents" / "QorCap Matches"
     stamp = time.strftime("%Y%m%d-%H%M%S")
