@@ -1,4 +1,4 @@
-P2 SCHEMA r2 CANDIDATE — NOT FROZEN — PENDING QorData acceptance then QorProof PASS/freeze — no model code
+P2 SCHEMA r3 CANDIDATE — NOT FROZEN — PENDING QorData acceptance then QorProof PASS/freeze — no model code
 
 Private engineering schema candidate. Not a freeze, not schema PASS, not implementation acceptance, not permission to write model code. Feature `practice-anchor-transaction-model` is not added by this document and stays absent. No Rust, tests, or Cargo change belongs to this candidate.
 
@@ -87,9 +87,18 @@ Hash dependency rule carried forward: no record's preimage contains its own id, 
 - One time-field spelling: `enqueue_at`. The spelling `enqueue` is rejected, including as an alias.
 - `ClientExpectedCore` is the only request-independent client declaration. Its domain is `Hash("ClientExpectedCore", core)` under the framing above. Fields are closed in §3.
 - `RoleKind` gains `observe`, `hold`, and `recover` as distinct kinds. r1 kinds remain for the records that already had them.
-- Schema string prefix and `D(T)` prefix stay the r1 strings. The candidate revision is r2; the framing label is not forked. A new type name is a new `T` under that same framing.
+- Schema string prefix and `D(T)` prefix stay the r1 strings. The candidate revision is r3; the framing label is not forked. A new type name is a new `T` under that same framing.
+- `AuthBinding.scope:Scope` is replaced by `AuthBinding.subject:AuthSubject` (§4.0). A registry arm does not contain a lineage `Scope`.
+- `policy_update` request and signed payload are `PolicyCore` only. `E(PolicyRecord)` is not a request and not a signed payload (§4.0, §5.1).
+- `SourceBound` stays exactly `{last, head}`. No `start_ordinal`, `start_head`, `end_ordinal`, or `end_head`.
+- Opening `Range` is unchanged and still has no source-domain field. The opening `Commitment` gains `capture_domain:ClockDomain` and `source_domain:ClockDomain`, immediately after `pins` and before `source`.
+- `CheckpointRequest`, `Observation`, and `HoldRequest` each gain, immediately after `source_bound`: `pins:Pins`, `source_schema:H`, `capture_domain:ClockDomain`, `source_domain:ClockDomain`, in that order. On `CheckpointRequest` those four sit before `idempotency`. On `HoldRequest` they sit before `expected_revision`. On `Observation` they sit before `journal`; `reason` stays where r1 placed it, after `journal` and before `expected_revision`.
+- `CheckpointRecord` gains `client_checkpoint_id:H` after `owner_generation` and before `journal`. That field is only on the checkpoint row (§4.0, §8). Consume does not store it.
+- r1 `JournalRef.checkpoint` and `prior_checkpoint` are deleted. §8 replaces them.
 
-Records carried forward unchanged in name, except where a later closed section replaces a field, include `Scope`, `RegistryScope`, `Pins`, `ClockDomain`, `Mono`, `Wall`, `SourceBound`, `Range`, `CaptureRange`, `ParentBoundary`, and the request and record types named in §4. Their r1 field lists remain in force until a later section states a delta. r1 `JournalRef.checkpoint` is not a solved identity. §8 replaces that field. The closed inventory is §2.2.
+Any field not listed here or in the r1 record it carries forward is not allowed (`schema`).
+
+Records carried forward unchanged except for the deltas above: `Scope`, `RegistryScope`, `Pins`, `ClockDomain`, `Mono`, `Wall`, `Range`, `CaptureRange`, `ParentBoundary`, and the request types named in §4 whose fields are not in the delta list. The closed inventory is §2.2.
 
 Clock-role pairs carried forward: `server_mono` with `model_counter` and `ns`; `client_mono` with `client_declared` and `ns`; `capture_declared` with `capture_declared` and `ns`; `wall_audit` with `wall_declared` and `unix_us`. Every `process`, `boot`, `clock_epoch`, and `leader` stays explicit. No cross-role subtraction. Same-role elapsed requires equality of every domain field and nondecreasing samples, checked arithmetic only. `Wall` is audit, not a timing authority.
 
@@ -115,15 +124,17 @@ Enums:
 - `StreamLife`: `open` | `closed`.
 - `ImageStatus`: `available` | `unavailable`.
 - `ModelAlg`: `synthetic_hash_only` only.
+- `AuthArm`: `lineage` | `registry`.
 - r1 `Error` is closed as carried: `malformed`, `noncanonical`, `schema`, `oversize`, `limit_unset`, `quota`, `unauthorized`, `policy_unknown`, `domain`, `regression`, `overflow`, `entropy`, `collision`, `expired`, `invalidated`, `binding`, `fork`, `conflict`, `closed`, `quarantined`, `stale_writer`, `commit_unknown`, `unavailable`, `not_found`, `incomplete`, `retirement_disabled`. No new error tag.
 - r1 `Observation.reason`: `source_change` | `negative_history` | `clock_change` | `unavailable` only.
 
 Types introduced or replaced:
 
-- `ClientExpectedCore`, `LogicalOpKey`, `LogicalOpRecord` (§3). `request_type` is `IssueRequest` | `ConsumeRequest` only.
+- `ClientExpectedCore`, `LogicalOpKey`, `ClientDispatchRecord`, `ServiceCommitKey` (§3.4). `request_type` is `IssueRequest` | `ConsumeRequest` only.
+- `AuthSubject`, `AuthBinding` (§4.0). r1 `AuthBinding.scope` is not a field.
 - `PolicyRole`, `PolicyCore`, `PolicyRecord`, `LimitSet`, `ServerDomainPin`, `ConfigCore`, `ConfigRecord`, `MinimumKey`, `Minimum`, `Continuity`, `ExternalBasis` (§5). r1 `RoleRule` is deleted. r1 `HistoricalRule` is replaced by the §5 record (no nested `RoleRef`).
 - `CommitWitness` (§6).
-- `ClientCheckpointCore`, `GenesisCore`, `ServiceReceipt` (§8). `JournalRef` is replaced by the §8 record. The r1 names `checkpoint` and `prior_checkpoint` are not fields.
+- `ClientCheckpointCore`, `GenesisCore` (§8). The service receipt is `CheckpointRecord`, not a second type. `JournalRef` is the §8 record. The r1 names `checkpoint` and `prior_checkpoint` are not fields.
 - `StreamOrigin` (§9). r1 `StreamRow` gains `origin:StreamOrigin?` and `fork:ForkLatch`.
 
 `Usage` is the r1 counter record plus exactly two fields, all required `U`: `records`, `stored_bytes`, `outstanding`, `inflight`, `concurrent`, `retry_attempts`, `pages`, `proof_hashes`, `signer_calls`, `store_calls`, `denial_records`, `denial_bytes`, `fault_records`, `audit_records`, `calls`, `call_bytes`. Disposable scratch (`workspace_bytes`, `parse_bytes`) is not a `Usage` field.
@@ -184,18 +195,13 @@ Construction order, which is acyclic:
 
 There is no direct or transitive edge from the core to a request hash, tag, response hash, or current root.
 
-### 3.4 First-writer logical-operation registry
+### 3.4 Two registries
 
-The registry is client-fixture state plus the service's retained original bytes. It is keyed by stable context, not by content hash alone.
+There are two registries. They are not one map and they do not commit at the same boundary. `LogicalOpKey` is the client key. The service key is different.
 
 ```text
 LogicalOpKey={scope:Scope, stream:Id, exchange:Id, operation:ClientOp}
-```
-
-`operation` is part of the key, so issue and consume are different keys even when scope, stream, and exchange match.
-
-```text
-LogicalOpRecord={
+ClientDispatchRecord={
   key:LogicalOpKey,
   core:ClientExpectedCore,
   expected_id:H,
@@ -206,26 +212,40 @@ LogicalOpRecord={
   prior_ack:H?,
   client_nonce:H
 }
+ServiceCommitKey={scope:Scope, stream:Id, idempotency:Id, operation:Op}
 ```
 
-`request_type` must match `key.operation` (`IssueRequest` iff `issue`, `ConsumeRequest` iff `consume`). `expected_id` must equal `Hash("ClientExpectedCore", core)`. `request_hash` must equal `Raw(request_bytes)`, and those bytes must decode as the declared request type and carry the same `expected_id`, scope, stream, operation, and the projected owner fields. `core` fields `scope`, `stream`, `exchange`, and `operation` must equal `key`.
+`operation` is part of `LogicalOpKey`, so issue and consume are different client keys even when scope, stream, and exchange match. `request_type` matches `key.operation`. `expected_id` equals `Hash("ClientExpectedCore", core)`. `request_hash` equals `Raw(request_bytes)`. Those bytes decode as the declared request type and carry the same `expected_id`, scope, stream, operation, and owner fields. Core `scope`, `stream`, `exchange`, and `operation` equal the key.
 
-First committed writer for a key wins. The record is immutable. Registration happens before dispatch of that attempt and is durable across restore when the client fixture is present.
+**(a) Client pre-dispatch registry.** The value is one immutable `ClientDispatchRecord`. Its durability point is the client fixture's own commit, and that commit finishes **before dispatch**. Dispatch is not allowed for a key that has no durable client record. This commit is not the service image swap and does not write an `Original`. The first durable client record for a key wins. A second core, `expected_id`, or request body for that key is `conflict` and is not stored. Identical bytes are the same record, not a second writer. If the client commit does not complete, the key stays unregistered and nothing may later be treated as that attempt's original.
 
-Collision and conflict, total:
+**(b) Service commit identity.** For `issue` and `consume` only, the service retains one r1 `Original` at the service atomic swap, which is **after** dispatch. The key is `ServiceCommitKey`. The identity is that `Original`: exact `request_bytes`, `request_hash`, `response_bytes`, `response_hash`, and `event` `Ref`. Issue's `Ref` is `Hash(Challenge)` with type `Challenge`. Consume's `Ref` is `Hash(AckCore)` with type `AckCore`. No other row is that identity. The service does not consult the client registry to mint bytes. It stores the request that arrived, and only if the swap commits.
+
+**(c) Reconciliation.** Compare request bytes and `request_hash` only. Do not fill either side from the other.
+
+| Order | Required outcome |
+|---|---|
+| Client durability does not complete. Dispatch does not happen. | No `ClientDispatchRecord`. No service `Original`. No later body may be called the original for that key. |
+| Client record is durable. Crash before dispatch. | Client record stands. No `Original`. A later attempt must present those same bytes or it is `conflict`. It must not replace the record. |
+| Dispatch happens. Service crashes before the swap. No `Original`. | Client record stands unchanged. Service outcome is not success. Retry sends the same bytes. A different body is `conflict` and does not become the original. |
+| Service swap commits. Response is lost. | The service `Original` stands. The retry oracle below returns those exact bytes. The client record is not rewritten. |
+| Restore. Image has the `Original`. Client fixture has the matching record. | Both stand. No rewrite. |
+| Restore. Image has the `Original`. Client fixture is missing. | Service bytes stay historical. Client state stays `unknown`. Do not rebuild the client record from the `Original`. |
+| Restore. Client record exists. Image has no `Original`. | Client record stands. Service stays not success. Do not invent an `Original` from the client record. |
+| Restore. Both exist and the request bytes differ. | `conflict`. Neither side is replaced. |
+| Two service commits race after two dispatches of different bodies for one `ServiceCommitKey`. | One `Original`. The other is `conflict`. The client key's first durable record is the only client original. A service `Original` whose bytes are not that client record does not replace it. |
+
+An original is never replaced when dispatch did not happen or when the service swap did not commit. Missing client originals stay `unknown`.
+
+Collision, in addition to the schedule:
 
 | Situation | Outcome |
 |---|---|
-| No record for key, request matches its own core and hash | First writer. Record stored. |
-| Record exists, request bytes identical, raw identical, core identical | Not a conflict. Retry oracle below. |
-| Same key, different core or different `expected_id` | `conflict`. First record stands. The new id does not become the logical original. |
-| Same key, same core and `expected_id`, different request bytes or different raw | `conflict`. Loser does not inherit the winner response. |
-| `expected_id` presented with a key other than the key implied by its core | `binding`. Reject. |
-| `expected_id` not equal to hash of the accompanying core | `binding`. Reject. |
-| Two racers, different bytes, same key, either commit order | One winner. The other is `conflict` after the winner commits, including when the loser is retried after expiry or restart. |
-| Two racers, identical bytes, same key | One commitment. The retry returns the winner's original bytes. No second advancement. |
-
-Concurrent registration is decided by the same commit that retains the original, not by a side map that can diverge from `Original`.
+| No client record, request matches its own core and hash, client commit completes | First client writer, before dispatch. |
+| Client record exists, bytes and raw and core identical | Not a new writer. Retry oracle only after a service `Original` exists. Before that, the same bytes may be dispatched again and still create at most one `Original`. |
+| Same client key, different core or `expected_id` or body | `conflict`. First client record stands. |
+| `expected_id` does not match the core, or the key implied by the core | `binding`. No record. |
+| Identical service request after a committed `Original` | Retry oracle. No second advancement. |
 
 ### 3.5 Issue and consume are not aliases
 
@@ -320,11 +340,51 @@ Field and nested-domain mutations. Each id is one mutation of an otherwise valid
 | `V-B1-RACE-AB-RST` | same as `V-B1-RACE-AB` after restart | oracle unchanged; missing client fixture stays `unknown` (`V-B1-ATK-04`) |
 | `V-B1-RACE-BA-RST` | same as `V-B1-RACE-BA` after restart | oracle unchanged |
 
+Registration boundary. These are required fixtures for the generator. digest: see p2-vectors.json. Model outcomes are not executed by the generator.
+
+| ID | Required outcome |
+|---|---|
+| `V-F1-PRE-DUR` | `ClientDispatchRecord` is durable before dispatch. Its bytes do not include a service `Original`. |
+| `V-F1-NO-DISPATCH` | Client commit does not finish. No dispatch. No `Original`. No replacement body. |
+| `V-F1-NO-COMMIT` | Dispatch happened. Service crashes before swap. Client record unchanged. No `Original`. |
+| `V-F1-LOST-RESP` | Service `Original` exists. Response lost. Retry returns those bytes. Client record not rewritten. |
+| `V-F1-REST-MATCH` | Restore finds matching client record and `Original`. Neither changes. |
+| `V-F1-REST-NOCLIENT` | `Original` present, client fixture missing. Client state `unknown`. No rebuild. |
+| `V-F1-REST-NOORIG` | Client record present, no `Original`. Not service success. No invented `Original`. |
+| `V-F1-REST-DIVERGE` | Both present, request bytes differ. `conflict`. No replacement. |
+
 Scope, stream, and exchange mutations change the key, so they must not be implemented as in-place edits of the first record. Purpose, ordinal, pins, and times do not change the key and therefore cannot be "fixed" by publishing a new id.
 
 ## 4. B2 — total operation, response, role, auth, and event map
 
-r1 request names are kept. No wrapper types are introduced around them. `policy_update` request bytes are `E(PolicyRecord)` as r1 stated, not a new request struct. `ReadOriginalRequest` is the r1 archive request and is not renamed.
+r1 request names are kept except where §2.1 states a field delta. `policy_update` request bytes are `J(E("PolicyCore", core))` only. `E(PolicyRecord)` is not the request, not the signed payload, and not a second result. `ReadOriginalRequest` is the r1 archive request and is not renamed.
+
+### 4.0 Closed cross-record map
+
+One table. Restore uses the same lookup. A missing target is `incomplete` or `unknown`, not a fabricated row.
+
+```text
+AuthSubject={arm:lineage, scope:Scope}
+          |{arm:registry, registry:RegistryScope}
+AuthBinding={subject:AuthSubject, stream:Id?, operation:Op,
+             owner_generation:U?, holder:Id?, issuer:Id,
+             policy_generation:U, policy_digest:H}
+```
+
+Exactly one arm. `arm=lineage` requires `scope` and forbids `registry`. `arm=registry` requires `registry` and forbids `scope`. Building a lineage `Scope` from registry fields is `schema`.
+
+| Field | Type | Preimage | Lookup, including restore |
+|---|---|---|---|
+| `AuthBinding.subject` | `AuthSubject` | inside the auth check only; not inside `PolicyCore` | Lineage ops require `arm=lineage` and `subject.scope` equal to the request lineage `Scope`. `policy_update` requires `arm=registry` and `subject.registry` equal to `PolicyCore.registry`. The other arm is `unauthorized`. |
+| `policy_update` request | `PolicyCore` | `J(E("PolicyCore", core))`. Digest is not a field. | `Hash("PolicyCore", core)` |
+| stored policy | `PolicyRecord={core:PolicyCore, digest:H}` | `digest` is outside the core. It must equal the hash above. | Registry row keyed by `(registry, generation)`. Not an `Original`. Not a `GlobalEntry`. |
+| signed policy | `ModelSigned` over `PolicyCore` | payload id is that same digest. Kind `policy`. | Tag checks §2. The payload is not `PolicyRecord`. |
+| consume result | `AckCore` | r1 `AckCore`, no receipt id inside it | `Ref` type `AckCore`, id `Hash("AckCore", ack)`. One `Original`. One `GlobalEntry`. Charges are the consume row in §6 only. |
+| consume journal link | `JournalRef` inside `Commitment` | part of `ConsumeRequest` | `client_checkpoint` looks up `ClientCheckpointCore` retained with that consume's client record. `prior_service_receipt` looks up an existing `CheckpointRecord` or is null. Consume does not insert a `CheckpointRecord`. |
+| checkpoint result | `CheckpointRecord` | `request_hash`, scope, stream, `owner_generation`, `client_checkpoint_id`, `journal`, `source_bound` | This is the only service receipt. Id `Hash("CheckpointRecord", record)`. `Ref` type `CheckpointRecord`. One `Original`. One `GlobalEntry`. Charges are the checkpoint row in §6 only. No consume charge is added. |
+| `StreamOrigin` | §9 | not hashed as a request | Recomputed only from the opening consume `Original.request_bytes`, using the fields in §9.1. |
+
+Opening `Commitment` field order for the new members: `pins`, then `capture_domain`, then `source_domain`, then `source`. Later requests insert `pins`, `source_schema`, `capture_domain`, `source_domain` immediately after `source_bound`, in the positions §2.1 names. A later request that omits any of the four is `malformed`. It is not given a default domain.
 
 r1 said every mutating operation is an `Original` plus a `GlobalEntry`. That blanket rule conflicts with `PolicyRecord` (registry scope, no lineage `Scope`, no idempotency id) and with internal `recover` (no caller request). The correction is an explicit class, not a fabricated scope or idempotency id.
 
@@ -340,27 +400,27 @@ Classes:
 
 Historical reads authorize against the current archive and historical policy (`PolicyRecord.archive` and `HistoricalRule`), not against the write authority that was current when the row was produced. Unknown historical cutoff is `policy_unknown`, never "all history". A retired role may be read only when current archive is `allow` and the matching historical decision is `allow`. `deny` and `unknown` do not qualify the read. Current write role is neither necessary nor sufficient for archive.
 
-`RoleRef.policy` on a tag must equal the policy digest that authorized that commit. That digest must not be defined as a hash of a record that contains the digest or of a `RoleRef` that points at the same new policy. The exact policy preimage is §5 B3. Until that section is written, producers have no authority to fill `policy` by hashing `PolicyRecord` wholesale.
+`RoleRef.policy` on a tag must equal the policy digest that authorized that commit. That digest is `Hash("PolicyCore", core)` (§5.1). It is not a hash of `PolicyRecord` and not a hash of a `RoleRef`. Producers have no authority to fill `policy` by hashing `PolicyRecord` wholesale.
 
 Holder release stays disabled. Rows that mention `terminal` define the negative and quarantine shape only. The positive terminal transition stays BLOCKED and is not a success path.
 
 ### 4.1 Caller operations
 
-Auth columns: "requested" is the caller's presented `AuthBinding`. "required" is what the model checks now. `AuthBinding.stream` and `holder` and `owner_generation` follow the nullability in the row. A presented holder never substitutes for archive policy.
+Auth columns: "requested" is the caller's presented `AuthBinding`. "required" is what the model checks now. Every lineage row requires `AuthSubject.arm=lineage` and `subject.scope` equal to that row's scope. `policy_update` is the only registry arm. `AuthBinding.stream` and `holder` and `owner_generation` follow the nullability in the row. A presented holder never substitutes for archive policy. There is no `AuthBinding.scope` field.
 
 | Op | Request canonical | Result canonical | Requested auth | Required current auth | Stream | Owner gen | Holder | ModelSigned kind | Ref target | Original | Idempotency key | Event class | Counters touched (identity only; charge rules are §6) |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|
 | `owner_grant` | `E(OwnerRequest)` | `ModelSigned<OwnerRecord>` | `Op=owner_grant`, scope match, stream set, holder set to the requested holder, owner gen = `expected_owner_generation` | current role kind `owner`, state `active`, same scope and stream; policy generation and digest match the retained minimum (minimum rules §5) | required | required; must match expected | required; bound by the synthetic issuer, not by principal id alone | `owner` on `OwnerRecord` | `Hash(OwnerRecord)` | yes | `OwnerRequest.idempotency` | ledger | `records`, `stored_bytes`, `store_calls`, `signer_calls`, denial and audit and fault counters on refusal |
 | `issue` | `E(IssueRequest)` including `expected_id` | `ModelSigned<Challenge>` only after confirmed commit | `Op=issue`, scope, stream, owner gen, holder null | current owner role `active` for scope and stream; core registry agrees; caps set | required | required | null; non-null holder is `unauthorized` | `challenge` on `Challenge` | `Hash(Challenge)` | yes | `IssueRequest.idempotency` | ledger | `outstanding`, `inflight` or `concurrent` while prepared, `signer_calls`, `store_calls`, `records`, `stored_bytes`, retry counters if this is a retry, denial and audit and fault on refusal |
-| `consume` | `E(ConsumeRequest)` including `commitment.expected_id` | `ModelSigned<AckCore>` only after confirmed commit | `Op=consume`, scope, stream, owner gen, holder null | current owner role `active`; challenge unused and unexpired at post-sign admission; fence and revision unchanged at commit; admission label only `post_sign_admission_only` | required | required | null | `ack` on `AckCore` | `Hash(AckCore)` | yes | `ConsumeRequest.idempotency` | ledger | same reservation family as issue, plus no second charge that resets retained retry cost (rule detail §6) |
-| `archive_read` | `E(ReadOriginalRequest)` | stored `response_bytes` of the matching `Original`, not a new tag | `Op=archive_read`; `AuthBinding.scope` equals `ReadOriginalRequest.scope`; stream and owner gen and holder null | current `PolicyRecord.archive=allow` and historical decision `allow` for the target record's role through a resolvable cutoff; `request_hash` and `response_hash` and `operation` match one stored `Original`; ids alone do not authorize | null on the auth binding; the stored original's stream is whatever that original recorded | null on the auth binding | null; holder id is not read authority and not a substitute for archive | none minted; the historical object's existing kind is the one historical policy evaluates | the stored `Original.event` | no new original | none; do not invent one | read | `store_calls` or page counters only if a later accounting section assigns them; no stream advance; no consume |
+| `consume` | `E(ConsumeRequest)` including `commitment.expected_id` | `ModelSigned<AckCore>` only. No `CheckpointRecord` in this commit. | `Op=consume`, `AuthSubject.arm=lineage`, scope, stream, owner gen, holder null | current owner role `active`; challenge unused and unexpired at post-sign admission; fence and revision unchanged at commit; admission label only `post_sign_admission_only` | required | required | null | `ack` on `AckCore` | `Hash(AckCore)` | yes, one row | `ConsumeRequest.idempotency` | ledger | the consume row in §6 only. No receipt charge. |
+| `archive_read` | `E(ReadOriginalRequest)` | stored `response_bytes` of the matching `Original`, not a new tag | `Op=archive_read`; `AuthSubject.arm=lineage`; `subject.scope` equals `ReadOriginalRequest.scope`; stream and owner gen and holder null | current `PolicyRecord.archive=allow` and historical decision `allow` for the target record's role through a resolvable cutoff; `request_hash` and `response_hash` and `operation` match one stored `Original`; ids alone do not authorize | null on the auth binding; the stored original's stream is whatever that original recorded | null on the auth binding | null; holder id is not read authority and not a substitute for archive | none minted; the historical object's existing kind is the one historical policy evaluates | the stored `Original.event` | no new original | none; do not invent one | read | `store_calls` or page counters only if a later accounting section assigns them; no stream advance; no consume |
 | `snapshot` | `E(SnapshotRequest)` | `ModelSigned<Manifest>` after the side table commit | `Op=snapshot`, scope, stream null (the view covers the lineage, not one caller-chosen stream), holder null, owner gen null | current role kind `snapshot`, state `active`, for that scope; observer basis complete; archive rules do not turn the manifest into write authority | null | null | null | `snapshot` on `Manifest` | `Hash(Manifest)` | no `Original` row; bytes live in `SnapshotStored` | `SnapshotRequest.idempotency` | side | `pages`, `page_items`, `proof_hashes`, `signer_calls`, `store_calls`, `records`, `stored_bytes` |
 | `page` | `E(PageRequest)` | `E(Page)` bytes already fixed by the manifest, no new tag | `Op=page`, scope equals the manifest scope, stream null, holder null, owner gen null | current archive `allow` for kind `snapshot` and the page's historical role; cursor and manifest id recompute; wrong scope is `unauthorized` without foreign bodies | null | null | null | none minted | none new; page id is `Hash(Page)` as an integrity id, not a new ledger `Ref` | no | none | read | `pages`, `page_items`, `proof_hashes`, `store_calls` |
-| `checkpoint` | `E(CheckpointRequest)` | `ModelSigned<CheckpointRecord>` | `Op=checkpoint`, scope, stream, owner gen, holder null | current role kind `checkpoint`, `active` | required | required | null | `checkpoint` | `Hash(CheckpointRecord)` | yes | `CheckpointRequest.idempotency` | ledger | `records`, `stored_bytes`, `store_calls`, `signer_calls`, denial and audit and fault |
+| `checkpoint` | `E(CheckpointRequest)` including the four context fields in §4.0 | `ModelSigned<CheckpointRecord>` only. This row is the service receipt. | `Op=checkpoint`, `AuthSubject.arm=lineage`, scope, stream, owner gen, holder null | current role kind `checkpoint`, `active` | required | required | null | `checkpoint` on `CheckpointRecord` | `Hash(CheckpointRecord)` | yes, one row | `CheckpointRequest.idempotency` | ledger | the checkpoint row in §6 only. Not a second consume charge. |
 | `observe` | `E(Observation)` as the request (r1 name; the request is the `Observation` record) | `ModelSigned<ObservationRecord>` | `Op=observe`, scope, stream, owner gen, holder null | current role kind `observe`, `active`; not kind `checkpoint` | required | required | null | `observe` | `Hash(ObservationRecord)` | yes | `Observation.idempotency` | ledger | same counter family as checkpoint |
 | `hold` | `E(HoldRequest)` | `ModelSigned<HoldRecord>` with `state=held` or, if uncertainty is committed, `quarantined` | `Op=hold`, scope, stream, owner gen, holder equal to `HoldRequest.holder` | current role kind `hold`, `active`, plus holder binding; principal match is not sufficient | required | required | required | `hold` | `Hash(HoldRecord)` | yes | `HoldRequest.idempotency` | ledger | `records`, `stored_bytes`, `store_calls`, `signer_calls`; outstanding hold is not a releasable reservation |
 | `terminal` | `E(TerminalRequest)` | no success result in this candidate | `Op=terminal`, scope, stream, holder, owner gen | normal path: `retirement_disabled` before any CAS; holder, candidate, and revision checks still apply to the denial | required | required | required | kind `terminal` is reserved for a future reviewed oracle and is not produced by the normal path | none on the normal path | no success original; denial may append a bounded denial (§6) | `TerminalRequest.idempotency` is recorded only on a denial accounting row if §6 defines one; it is not a success key | internal denial, not a ledger success | denial and fault counters only; no release of `records` or holds |
-| `policy_update` | `E(PolicyRecord)` | `ModelSigned<PolicyRecord>` | `Op=policy_update`; auth scope's registry fields must equal `PolicyRecord.registry`; lineage is not an input; stream null; holder null; owner gen null | current role kind `policy`, `active`, for that registry; new generation must be a checked successor of the current generation; same generation with any different digest is `fork` / `conflict` and not a writer | null | null | null | `policy` | `Hash` of the policy payload under the §5 preimage, not a self-hash | no | none | registry | `records`, `stored_bytes`, `signer_calls`, `store_calls` for the policy row only |
+| `policy_update` | `E(PolicyCore)` | stored `PolicyRecord`; `ModelSigned` payload is `PolicyCore`, not `PolicyRecord` | `Op=policy_update`; `AuthSubject.arm=registry`; `subject.registry` equals `PolicyCore.registry`; no lineage field; stream null; holder null; owner gen null | current role kind `policy`, `active`, for that registry; new generation must be a checked successor; same generation and a different digest is `fork` | null | null | null | `policy` on `PolicyCore` | digest `Hash("PolicyCore", core)` | no | none | registry | `records`, `stored_bytes`, `signer_calls`, `store_calls` for the policy row only |
 | `recover` | none | `RecoveryRecord` retained internally, optionally framed as `ModelSigned<RecoveryRecord>` with kind `recover` for image integrity only; not returned as a caller success | none; there is no caller | service continuity inside the model: new service epoch and strictly increased writer term; no grant while observer basis is unknown | none | none | none | `recover` if an internal tag is stored; the tag is not an external credential | `Hash(RecoveryRecord)` as an internal id | no | none | internal | `store_calls` for the image write; invalidate unused old-domain challenges without charging them as new issues |
 
 `ReadOriginalRequest` shape, unchanged from r1 and normative for auth:
@@ -392,7 +452,7 @@ These are not extra `Op` values and must not grow request bytes, lineage, or ide
 | snapshot materialize | the snapshot request | side-table manifest | as `snapshot` | not ledger | mixing pages across revisions is `fork` |
 | page outcome | the page request | one page or refusal | as `page` | not ledger | omitted page is `incomplete`, not an empty success |
 | archive outcome | the read request | historical bytes or refusal | as `archive_read` | not ledger | current archive policy, not the old writer role |
-| policy outcome | `E(PolicyRecord)` | registry row or `fork` | as `policy_update` | not ledger | lower generation is `regression` |
+| policy outcome | `E(PolicyCore)` only | stored `PolicyRecord` or `fork`; signed payload stays `PolicyCore` | as `policy_update` | not ledger | lower generation is `regression` |
 | recover outcome | none | internal `RecoveryRecord` or withhold | no caller auth | not ledger | missing observer basis: no recovered grant |
 
 Refusal of any row may append bounded denial, audit, or fault state only as §6 later specifies. Refusal never mints a positive `Ref`, never advances a stream, and never clears a prior `unknown`.
@@ -424,6 +484,12 @@ digest: see p2-vectors.json.
 | `V-B2-INT-01` | Each internal row in §4.2 leaves request-byte and idempotency fields absent. |
 | `V-B2-NULL-HOLD` | Non-null holder on issue, consume, checkpoint, observe, snapshot, page, archive, or policy is `unauthorized`. |
 | `V-B2-NULL-OWNER` | Null stream or null owner generation on owner, issue, consume, checkpoint, observe, hold, or terminal is `unauthorized` or `malformed` as a missing required field, not a global event. |
+| `V-F2-AUTH-LIN` | Lineage op presents `AuthSubject.arm=lineage` and `subject.scope` equal to the request scope. | check uses that scope. No registry arm. |
+| `V-F2-AUTH-REG` | `policy_update` presents `arm=registry` and `subject.registry` equal to `PolicyCore.registry`. | registry check. No lineage `Scope` on the binding. |
+| `V-F2-AUTH-FAKE` | `policy_update` presents `arm=lineage`, or a lineage `Scope` built from registry fields. | `schema` or `unauthorized`. No fabricated lineage. |
+| `V-F2-POL-CORE` | Policy request bytes and `ModelSigned` payload are `PolicyCore`. Stored row is `PolicyRecord`. | digest outside the core. `E(PolicyRecord)` is not the request. |
+| `V-F2-RECEIPT-CONSUME` | Successful consume. | one `AckCore` `Original` and one `GlobalEntry`. No `CheckpointRecord`. No receipt charge. `prior_service_receipt` is a lookup or null. |
+| `V-F2-RECEIPT-CKPT` | Successful checkpoint. | one `CheckpointRecord` row, id `Hash("CheckpointRecord", record)`. That row is the only service receipt. Checkpoint charge only. |
 
 ## 5. B3 — config, policy digests, minima, continuity
 
@@ -766,7 +832,7 @@ No step uses "any milestone `>= deadline`" on a null. That reading is rejected b
 
 ## 8. B6 — client checkpoint identity and service receipt
 
-r1 `JournalRef.checkpoint` is one required `H`, while `CheckpointRequest` and `CheckpointRecord` both embed `JournalRef`. That single field cannot be both the client commitment and the service receipt: the receipt hash would contain itself, and the first request would need a receipt that does not exist yet. r2 splits them. `Z` and an arbitrary `H` are not a root.
+r1 `JournalRef.checkpoint` is one required `H`, while `CheckpointRequest` and `CheckpointRecord` both embed `JournalRef`. That single field cannot be both the client commitment and the service receipt: the receipt hash would contain itself, and the first request would need a receipt that does not exist yet. r3 keeps two ids and one receipt type. The service receipt is `CheckpointRecord`. There is no `ServiceReceipt` type. `Z` and an arbitrary `H` are not a root. This section agrees with §4.0 and the §4.1 consume and checkpoint rows: consume commits `AckCore` only; only the `checkpoint` op commits `CheckpointRecord`.
 
 ### 8.1 Two ids
 
@@ -791,28 +857,28 @@ JournalRef={
   prior_service_receipt:H?
 }
 
-ServiceReceipt={
+CheckpointRecord={
   request_hash:H, scope:Scope, stream:Id, owner_generation:U,
   client_checkpoint_id:H, journal:JournalRef, source_bound:SourceBound
 }
-service_receipt_id = Hash("ServiceReceipt", receipt)
+service_receipt_id = Hash("CheckpointRecord", record)
 ```
 
-`ClientCheckpointCore` has no service-receipt field, no request hash, no tag, and no ledger root. `GenesisCore` has no receipt and no client-checkpoint id. `ServiceReceipt` has no `service_receipt_id` field. `JournalRef` inside a receipt names `prior_service_receipt` (a past id or null), never the receipt's own id.
+`ClientCheckpointCore` has no service-receipt field, no request hash, no tag, and no ledger root. `GenesisCore` has no receipt and no client-checkpoint id. `CheckpointRecord` has no `service_receipt_id` field. `JournalRef` inside a checkpoint record names `prior_service_receipt` (a past id or null), never that record's own id. `SourceBound` on the record is exactly `{last, head}`.
 
 Lookup, and only that lookup:
 
 | Id | Preimage | Table |
 |---|---|---|
 | `genesis_id` | `GenesisCore` | external trusted genesis fixture |
-| `client_checkpoint_id` | `ClientCheckpointCore` | retained next to the original request, outside the receipt preimage |
-| `service_receipt_id` | `ServiceReceipt` | committed checkpoint row |
+| `client_checkpoint_id` | `ClientCheckpointCore` | retained next to the consume client record, outside the checkpoint preimage |
+| `service_receipt_id` | `CheckpointRecord` | the checkpoint `Original` row only |
 
-A client id is not found in the receipt table. A receipt id is not found in the client-core table. Using one in the other's field is `binding`. `Z` is rejected in all three id positions and in both prior fields. An `H` that is not the hash of a retained core, genesis core, or receipt is `not_found` and does not create history.
+A client id is not found in the checkpoint table. A receipt id is not found in the client-core table. Using one in the other's field is `binding`. `Z` is rejected in all three id positions and in both prior fields. An `H` that is not the hash of a retained core, genesis core, or checkpoint record is `not_found` and does not create history.
 
-r1 names `checkpoint` and `prior_checkpoint` are deleted. `CheckpointRecord` in r1 is this `ServiceReceipt` (kind `checkpoint`, `Ref` target `service_receipt_id`). The request type stays `CheckpointRequest`, with its `journal` field using the `JournalRef` above. `Commitment.journal` uses the same `JournalRef`.
+r1 names `checkpoint` and `prior_checkpoint` are deleted. The request type stays `CheckpointRequest`, with its `journal` field using the `JournalRef` above. `Commitment.journal` uses the same `JournalRef`. Consume stores neither name.
 
-`JournalRef` counters must match the `ClientCheckpointCore` with the same span and `head`. `client_checkpoint` must equal `Hash("ClientCheckpointCore", core)`. `ServiceReceipt.client_checkpoint_id` must equal `journal.client_checkpoint`.
+`JournalRef` counters must match the `ClientCheckpointCore` with the same span and `head`. `client_checkpoint` must equal `Hash("ClientCheckpointCore", core)`. `CheckpointRecord.client_checkpoint_id` must equal `journal.client_checkpoint`.
 
 ### 8.2 Null priors and genesis
 
@@ -821,20 +887,22 @@ Trusted synthetic genesis is an external fixture row, same trust class as `Exter
 | Situation | `prior_client_checkpoint` | `prior_service_receipt` |
 |---|---|---|
 | `GenesisCore` | the core has no prior field | the core has no receipt field |
-| First client checkpoint after that genesis | `genesis_id` | null |
-| Later client checkpoint while no receipt is committed yet | previous client id | null |
-| Any request after a receipt exists | previous client id | that `service_receipt_id` |
+| First client checkpoint, including the opening consume, after that genesis | `genesis_id` | null. No `CheckpointRecord` exists yet. |
+| Later consume while no checkpoint row is committed | previous client id | null |
+| Any consume or checkpoint request after a `CheckpointRecord` exists | previous client id | that record's `Hash("CheckpointRecord", record)` |
 
-Null `prior_client_checkpoint` does not start history. With no genesis fixture, the stream is `incomplete` and `unknown`. A null `prior_service_receipt` is legal only while that stream has no committed receipt. If a receipt exists and the prior is null, the outcome is `incomplete` and new grants on the stream are `unknown`. Self as prior (the prior client id equal to this core's own id, or the prior receipt equal to the receipt being hashed) is `binding`. The receipt id this commit will produce cannot appear in the request: the request is an input to that hash, and the id does not exist until the hash is computed.
+Null `prior_client_checkpoint` does not start history. With no genesis fixture, the stream is `incomplete` and `unknown`. A null `prior_service_receipt` is legal only while that stream has no committed `CheckpointRecord`. If a checkpoint row exists and the prior is null, the outcome is `incomplete` and new grants on the stream are `unknown`. Self as prior (the prior client id equal to this core's own id, or the prior receipt equal to the checkpoint record being hashed) is `binding`. The receipt id this checkpoint commit will produce cannot appear in the request: the request is an input to that hash, and the id does not exist until the hash is computed. A consume never produces that id.
 
 ### 8.3 Constructive order
 
-None of these requests contains a future or current service receipt.
+None of these requests contains a future or current service receipt id.
 
-1. Fixture stores `GenesisCore`. `genesis_id` is its hash. No receipt exists.
+1. Fixture stores `GenesisCore`. `genesis_id` is its hash. No `CheckpointRecord` exists.
 2. First `issue`. `IssueRequest` has no `JournalRef` and no receipt field. Constructible immediately after genesis.
-3. First `consume` or first `checkpoint` op, whichever commits first. The caller builds `ClientCheckpointCore` with `prior_client_checkpoint = genesis_id` and with no receipt field. The request sets `prior_service_receipt` null and `client_checkpoint` to that core's hash. The server resolves `genesis_id` in the genesis table, then commits `ServiceReceipt`. The receipt id is `Hash("ServiceReceipt", receipt)` after the request bytes exist. It is not written back into the request.
-4. Linked extension. The next core's `prior_client_checkpoint` is the previous client id. The request's `prior_service_receipt` is the receipt from step 3. The new receipt hash covers that request and does not contain itself.
+3. First `consume`. The caller builds `ClientCheckpointCore` with `prior_client_checkpoint = genesis_id` and with no receipt field. The request sets `prior_service_receipt` null and `client_checkpoint` to that core's hash. The server resolves `genesis_id` in the genesis table, then commits one `AckCore` `Original` and one `GlobalEntry`. It does not commit a `CheckpointRecord`. Charges are the consume row in §6 only. The client checkpoint id stays on the client record. It is not a second output.
+4. First `checkpoint` op. The request names the client checkpoint id from step 3 and keeps `prior_service_receipt` null, because no checkpoint row exists yet. The server commits one `CheckpointRecord`. Its id is `Hash("CheckpointRecord", record)` after the request bytes exist. It is not written back into the request. Charges are the checkpoint row in §6 only. This commit does not add a consume charge.
+5. Later consume. `prior_service_receipt` is the id from step 4. The consume still commits `AckCore` only and does not insert another `CheckpointRecord`.
+6. Linked checkpoint extension. The next core's `prior_client_checkpoint` is the previous client id. The request's `prior_service_receipt` is the previous checkpoint record id. The new record hash covers that request and does not contain itself.
 
 The nullable prior fields exist so a missing link can be encoded and rejected. They are not an alternate root. `Z` is not that encoding.
 
@@ -842,16 +910,16 @@ The nullable prior fields exist so a missing link can be encoded and rejected. T
 
 ### 8.4 Vectors
 
-digest: see p2-vectors.json.
+digest: see p2-vectors.json. `V-F2-RECEIPT-CONSUME` and `V-F2-RECEIPT-CKPT` in §4.3 are the same receipt rule.
 
 | ID | Case | Outcome |
 |---|---|---|
-| `V-B6-BOOT` | Genesis, then issue, then first consume with `prior_service_receipt` null and `prior_client_checkpoint = genesis_id`, then receipt hash | commit. Request bytes do not contain the receipt id |
-| `V-B6-EXT` | Next checkpoint names that client id and that receipt | commit. New receipt id differs from both |
+| `V-B6-BOOT` | Genesis, then issue, then first consume with `prior_service_receipt` null and `prior_client_checkpoint = genesis_id` | consume commits `AckCore` only. No `CheckpointRecord`. Request bytes do not contain a receipt id. |
+| `V-B6-EXT` | Next checkpoint names that client id and null prior receipt, then a later consume names the new checkpoint id | checkpoint commits one `CheckpointRecord`. Later consume does not write a second receipt. New id differs from the client id. |
 | `V-B6-WRONG-ROOT` | Same priors, `head` or source head swapped | `fork`, no commit |
 | `V-B6-SELF` | Prior client id set to this core's own id, or a core field added that copies the id | `binding` |
-| `V-B6-CURRENT` | Request field set to the receipt id this commit would produce, or to the latest receipt used as the client id | `binding` |
-| `V-B6-MISSING` | Extension with null receipt prior after `V-B6-BOOT`, or prior id that does not resolve | `incomplete`, grant `unknown` |
+| `V-B6-CURRENT` | Request field set to the checkpoint id this commit would produce, or to the latest receipt used as the client id | `binding` |
+| `V-B6-MISSING` | Extension with null receipt prior after a checkpoint row exists, or prior id that does not resolve | `incomplete`, grant `unknown` |
 | `V-B6-Z` | `Z` as genesis, client id, receipt, or either prior | `binding` |
 | `V-B6-ANY-H` | Random `H` as genesis or as first prior | `not_found`, no new history |
 
@@ -870,21 +938,32 @@ StreamOrigin={
 }
 ```
 
-`pins` are the opening commitment's `Pins`. `source_schema` is the opening `Range.source_schema`. Every opening `CaptureRange.domain` must equal `capture_domain`, and the source high-water domain declared on that opening must equal `source_domain`. Mixed domains at opening are `domain` and do not store an origin. `source_domain` and `capture_domain` are full `ClockDomain` values (every id), not a role name alone.
+Restore reads only the opening consume `Original.request_bytes`. Decode that body as `ConsumeRequest`. Read `commitment` in the §4.0 order (`pins`, `capture_domain`, `source_domain`, `source`). The lookup is exact:
 
-r1 `StreamRow` gains `origin:StreamOrigin?` and `fork:ForkLatch`. `origin` is null only before the opening consume commits. After that it is required. Restore recomputes `origin` from the opening `Original` bytes. Disagreement with the stored origin is `fork` / `unknown` and is not rewritten from the image's later rows or from current auth.
+| `StreamOrigin` field | Type | Byte it is copied from |
+|---|---|---|
+| `pins` | `Pins` | `commitment.pins` |
+| `capture_domain` | `ClockDomain` | `commitment.capture_domain` |
+| `source_domain` | `ClockDomain` | `commitment.source_domain` |
+| `source_schema` | `H` | `commitment.source.source_schema` (carried r1 `Range` field; `Range` still has no source-domain field) |
+
+Every opening `CaptureRange.domain` must equal `capture_domain`. The source high-water domain is `commitment.source_domain`, not a field of `Range` and not a field of `SourceBound`. `SourceBound` stays `{last, head}`. Mixed capture domains at opening, or a missing `capture_domain` or `source_domain` on that commitment, are `domain` or `malformed` and do not store an origin. No default domain is filled in. `source_domain` and `capture_domain` are full `ClockDomain` values (every id), not a role name alone.
+
+r1 `StreamRow` gains `origin:StreamOrigin?` and `fork:ForkLatch`. `origin` is null only before the opening consume commits. After that it is required. Restore recomputes `origin` by the table above. Disagreement with the stored origin is `fork` / `unknown` and is not rewritten from the image's later rows or from current auth. If the opening bytes omit a listed field, restore stores nothing and the stream stays `unknown`.
 
 Genesis `GenesisCore.origin` must equal this opening origin. A mismatch is `binding` and does not open the stream.
 
 ### 9.2 Later equality
 
-Interval, close, checkpoint, observe, hold, and later consume requests must present the same `pins`, the same `source_schema`, and the same two domains. Inequality is `binding` if the request is a new body under an existing key, and `fork` if it would otherwise commit a second context for the stream. Current role, archive allow, revocation, or a newer eligibility or checker digest does not replace `origin`. Those checks can still deny (`unauthorized`, `policy_unknown`). They cannot authorize a different pin. A revoked role denies the call and leaves `origin` as it was.
+`CheckpointRequest`, `Observation`, and `HoldRequest` carry the four fields in the §2.1 positions: immediately after `source_bound`, in the order `pins`, `source_schema`, `capture_domain`, `source_domain`. `Observation.reason` stays after `journal`. A later consume carries `pins`, `capture_domain`, and `source_domain` on `Commitment` and `source_schema` on `Range`. Omitting any of the four is `malformed`. It is not repaired by copying the stored origin into the request.
 
-Restore applies the same equality before any grant.
+Those four must equal the stored `StreamOrigin`. Inequality is `binding` if the request is a new body under an existing key, and `fork` if it would otherwise commit a second context for the stream. Current role, archive allow, revocation, or a newer eligibility or checker digest does not replace `origin`. Those checks can still deny (`unauthorized`, `policy_unknown`). They cannot authorize a different pin. A revoked role denies the call and leaves `origin` as it was.
+
+Restore applies the same equality before any grant. A missing later field fails closed: `malformed`, no grant, origin unchanged.
 
 ### 9.3 Equal height is not progress
 
-Same source endpoint (`SourceBound.last` or the range end) and same height (`count` or `last` equal to the committed head's endpoint) with a different `SourceBound.head` or `end_head` is `fork`, not a nonregression success. Same journal `first`/`last`/`count` with a different `head` or a different `client_checkpoint` id is `fork`. The latch is `ForkLatch=latched` on that stream and is sticky. `first_break` is set if it was null and is not cleared. Grant state for new work on that stream is `unknown`.
+Same source endpoint (`SourceBound.last` or the range `last`) and same height (`count` or `last` equal to the committed head's endpoint) with a different `SourceBound.head` is `fork`, not a nonregression success. `SourceBound` has no `end_head`. `Range.end_head` is a different field and is not a source-bound member. Same journal `first`/`last`/`count` with a different `head` or a different `client_checkpoint` id is `fork`. The latch is `ForkLatch=latched` on that stream and is sticky. `first_break` is set if it was null and is not cleared. Grant state for new work on that stream is `unknown`.
 
 An exact duplicate of a committed winning request is the §3 retry twin, not a fork. It does not clear a latch that is already `latched`. A new exchange, a higher endpoint, or any later well-formed span does not clear `latched` and does not repair an older `unknown`.
 
@@ -894,7 +973,10 @@ An exact duplicate of a committed winning request is the §3 retry twin, not a f
 | `V-B7-EQ` | Later op, same pins, schema, and both domains | other checks aside, not a context reject |
 | `V-B7-PIN` | One pin field, `source_schema`, or either domain differs | `fork` or `binding`; origin unchanged |
 | `V-B7-AUTH` | Current archive allow with a different checker pin | origin unchanged; call denied |
-| `V-B7-FORK-HEAD` | Same endpoint and height, different source head | `fork`; latch sticky; `unknown` |
+| `V-F2-ORIGIN-FIELDS` | Opening consume carries `commitment.pins`, `capture_domain`, `source_domain`, and `source.source_schema` | origin stored by the §9.1 lookup only |
+| `V-F2-LATER-EQ` | Later checkpoint, observe, or hold presents the same four fields | not a context reject on those four |
+| `V-F2-MISS-DOMAIN` | Opening or later request omits `source_domain` or `capture_domain` | `malformed` or `domain`; no stored origin on an opening miss; no default; no grant |
+| `V-B7-FORK-HEAD` | Same endpoint and height, different `SourceBound.head` | `fork`; latch sticky; `unknown` |
 | `V-B7-FORK-JRN` | Same journal span, different head or client checkpoint id | `fork`; latch sticky |
 | `V-B7-DUP` | Byte-identical retry | twin; no second commit; latch not cleared |
 | `V-B7-FWD` | Later span after a latch | still `unknown` |
@@ -910,20 +992,22 @@ Status `RESOLVED` means this candidate states one rule and where it is written. 
 |---|---|---|---|
 | 1. Grammar, domains, public tags | RESOLVED as synthetic `E`/`J`/`F`/`Raw`, explicit null, r1 framing prefix | §2, §2.2 | QorData, then QorProof. Tags are not authentication |
 | 2. Full hash-only witness | RESOLVED by adopting r1 §7.1–7.2 unchanged | §2.2, §7.6 | QorData, then QorProof. Not a compact codec. O(n) leakage stays a limit |
-| 3. API, reservation, accounting | RESOLVED | §4, §5, §6 | QorData, then QorProof. Caps are not live defaults |
+| 3. API, reservation, accounting (B2) | r3: addresses QorData F1/F2 — pending re-review | §4.0, §4.1 | Not self-RESOLVED. F3 and F4 accounting remain open. Caps are not live defaults |
 | 4. Nonempty close | RESOLVED as the r3 split: opening `[0, MAX-2]`, close `[MAX-1, MAX-1]`, not a first close of `[0, MAX-1]` | §2 | QorData, then QorProof |
 | 5. Holder release and terminal oracle | RESOLVED as release DISABLED. Positive terminal path BLOCKED. No unlock in this candidate | §4, §7.2 | QorData, then QorProof. A future private test oracle is UNKNOWN and is not authorized here |
-| 6. Image, restore, retry | RESOLVED | §3.6, §5.4, §6.3, §8, §9 | QorData, then QorProof. Stable image is model-durable only |
+| 6. Image, restore, retry (B1) | r3: addresses QorData F1/F2 — pending re-review | §3.4, §3.6, §8, §9 | Not self-RESOLVED. Two registries and the §3.4 schedule are written. F3–F5 remain open. Stable image is model-durable only |
 | 7. Real source, custody, current-policy freshness, hosting, cost, retention, collection | UNKNOWN | not selected | No authority in this candidate or in the schema reviews. Publication-time freshness is not asserted. Dependent final or pilot stays BLOCKED |
 | `enqueue_at` spelling, core without `original_request_hash` | RESOLVED | §3 | QorData, then QorProof |
 | Owner generation, prior ack, and client nonce outside the core and inside request bytes | RESOLVED | §3.2 | QorData, then QorProof |
 | `RoleKind` adds `observe`, `hold`, `recover` | RESOLVED | §2, §4 | QorData, then QorProof |
-| Policy request is `PolicyCore`; digest outside the payload; `RoleRule` deleted | RESOLVED | §5.1 | QorData, then QorProof |
+| Policy request is `PolicyCore`; digest outside the payload; `RoleRule` deleted (B2) | r3: addresses QorData F1/F2 — pending re-review | §4.0, §5.1 | Not self-RESOLVED |
 | `invalidated_by` is a service-epoch `Id` | RESOLVED | §7.1 | QorData, then QorProof |
 | Audit and fault are counter-only; denial keeps the bounded `Denial` list | RESOLVED | §6.1 | QorData, then QorProof |
-| Client checkpoint id versus service receipt id | RESOLVED | §8 | QorData, then QorProof |
+| Client checkpoint id versus service receipt id (B2) | r3: addresses QorData F1/F2 — pending re-review | §4.0, §8 | Not self-RESOLVED. Receipt is `CheckpointRecord` from the checkpoint op only |
 | Null client prior does not start history; genesis id is the first prior | RESOLVED | §8.3 | QorData, then QorProof |
-| Stream origin equality and sticky equal-height fork | RESOLVED | §9 | QorData, then QorProof |
+| Stream origin equality and sticky equal-height fork (B7) | r3: addresses QorData F1/F2 — pending re-review | §2.1, §9 | Not self-RESOLVED |
+| Two registries: client pre-dispatch record and service `Original` (B1) | r3: addresses QorData F1/F2 — pending re-review | §3.4 | Not self-RESOLVED |
+| `AuthSubject` tagged union (B2) | r3: addresses QorData F1/F2 — pending re-review | §4.0 | Not self-RESOLVED |
 | Numeric `LimitSet` values, including any replacement for the supplied 61295-versus-16384 example | UNKNOWN | §5.2, §6.2 | No authority. Fixtures may supply inputs later. This candidate does not pick them |
 | Qualified C1 result on these bytes | UNKNOWN in this file | §13 | The operator runs the counts-only scan on the final committed bytes, commit message, and candidate PR text. Results are review evidence outside this file. Not stated here. Not zero |
 | Fresh git confirmation of the supplied base | UNKNOWN to this writer | §0 | Supplied pin only. Movement requires a stop |
