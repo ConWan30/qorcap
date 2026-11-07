@@ -1,0 +1,225 @@
+//! Design section 9, coverage (and section 5): opening is not continuous coverage.
+
+use crate::fixtures::*;
+use qorcap::anchor_seen_at::coverage::{self, RangeStatus, Segment};
+use qorcap::anchor_seen_at::types::Purpose;
+use qorcap::anchor_seen_at::*;
+
+fn states(w: &World, v: &[Exchange]) -> Vec<AnchorState> { v.iter().map(|e| e.state(&w.policy)).collect() }
+fn unknown(first: u64, last: u64, r: Reason) -> Segment { Segment { first_seq: first, last_seq: last, status: RangeStatus::Unknown(r) } }
+
+#[test]
+fn complete_stream_with_close_is_fully_seen_at() {
+    let w = World::new();
+    let v = full_stream(&w, &Session::new("cov-full"));
+    let view = coverage::build(&states(&w, &v), 29);
+    assert!(view.complete);
+    assert_eq!(view.unknown_rows(), 0);
+    assert_eq!(view.segments.len(), 3);
+}
+
+#[test]
+fn opening_never_clears_later_intervals() {
+    let w = World::new();
+    let v = full_stream(&w, &Session::new("cov-open"));
+    let view = coverage::build(&states(&w, &v[..1]), 29);
+    assert!(!view.complete);
+    assert!(view.is_seen_at(9));
+    assert_eq!(view.segments.last().unwrap(), &unknown(10, 29, Reason::MissingClose));
+}
+
+#[test]
+fn missing_interval_stays_unknown_and_a_later_valid_close_does_not_clear_it() {
+    let w = World::new();
+    let v = full_stream(&w, &Session::new("cov-gap"));
+    let view = coverage::build(&states(&w, &[v[0].clone(), v[2].clone()]), 29);
+    assert!(!view.complete);
+    assert_eq!(view.segments.last().unwrap(), &unknown(10, 29, Reason::Gap));
+    assert!(!view.is_seen_at(25), "the close's own range is not rescued past the gap");
+}
+
+#[test]
+fn duplicate_ack_does_not_advance_coverage() {
+    let w = World::new();
+    let v = full_stream(&w, &Session::new("cov-dup"));
+    let st = states(&w, &[v[0].clone(), v[0].clone(), v[0].clone()]);
+    assert_eq!(coverage::build(&st, 29), coverage::build(&states(&w, &v[..1]), 29));
+}
+
+#[test]
+fn arrival_order_does_not_change_the_view() {
+    let w = World::new();
+    let v = full_stream(&w, &Session::new("cov-order"));
+    let fwd = coverage::build(&states(&w, &v), 29);
+    let rev = coverage::build(&states(&w, &[v[2].clone(), v[0].clone(), v[1].clone()]), 29);
+    assert_eq!(fwd, rev);
+}
+
+#[test]
+fn two_distinct_acks_at_one_index_are_a_fork() {
+    let w = World::new();
+    let v = full_stream(&w, &Session::new("cov-fork"));
+    let mut st = states(&w, &v);
+    let mut twin = st[1].retained().unwrap().clone();
+    twin.ack_id = hex64("twin");
+    st.push(AnchorState::SeenAtRetained(twin));
+    let view = coverage::build(&st, 29);
+    assert!(!view.complete);
+    assert_eq!(view.segments.last().unwrap(), &unknown(10, 29, Reason::Fork));
+}
+
+#[test]
+fn reordered_or_relinked_interval_is_rejected() {
+    let w = World::new();
+    let v = full_stream(&w, &Session::new("cov-relink"));
+    let base = states(&w, &v);
+    let edits: Vec<(Reason, Box<dyn Fn(&mut qorcap::anchor_seen_at::check::SeenAtFact)>)> = vec![
+        (Reason::Fork, Box::new(|f| f.commitment.prior_ack_id = Some(hex64("other-prior")))),
+        (Reason::Fork, Box::new(|f| f.commitment.chain.predecessor_head = hex64("changed-predecessor"))),
+        (Reason::LedgerRollback, Box::new(|f| f.ledger_seq = 0)),
+        (Reason::BindingMismatch, Box::new(|f| f.commitment.capture_epoch_id = id("new-capture-epoch"))),
+    ];
+    for (want, edit) in edits {
+        let mut st = base.clone();
+        let mut f = st[1].retained().unwrap().clone();
+        edit(&mut f);
+        st[1] = AnchorState::SeenAtRetained(f);
+        let view = coverage::build(&st, 29);
+        assert_eq!(view.segments.last().unwrap(), &unknown(10, 29, want));
+        assert!(!view.complete);
+    }
+}
+
+#[test]
+fn late_interval_leaves_its_range_and_everything_after_unknown() {
+    let w = World::new();
+    let v = full_stream(&w, &Session::new("cov-late"));
+    let mut st = states(&w, &v);
+    st[1] = AnchorState::SeenAtLate(st[1].retained().unwrap().clone());
+    let view = coverage::build(&st, 29);
+    assert_eq!(view.segments.last().unwrap(), &unknown(10, 29, Reason::LateAck));
+}
+
+#[test]
+fn rows_after_close_stay_unknown_and_the_close_trailer_is_outside_its_prefix() {
+    let w = World::new();
+    let v = full_stream(&w, &Session::new("cov-after"));
+    let view = coverage::build(&states(&w, &v), 35);
+    assert!(!view.complete);
+    assert_eq!(view.segments.last().unwrap(), &unknown(30, 35, Reason::RowsAfterClose));
+    // the close commitment covers rows up to 29 and does not reference its own ack
+    let close = &v[2].commitment;
+    assert_eq!(close.chain.last_seq, "29");
+    assert!(!qorcap::evidence::jcs(&serde_json::to_value(close).unwrap()).unwrap().contains(&v[2].ack_id()));
+}
+
+#[test]
+fn missing_close_leaves_an_incomplete_tail() {
+    let w = World::new();
+    let v = full_stream(&w, &Session::new("cov-noclose"));
+    let view = coverage::build(&states(&w, &v[..2]), 29);
+    assert!(!view.complete);
+    assert_eq!(view.segments.last().unwrap(), &unknown(20, 29, Reason::MissingClose));
+}
+
+#[test]
+fn no_ack_at_all_is_unknown_over_the_whole_prefix() {
+    let view = coverage::build(&[AnchorState::default()], 9);
+    assert_eq!(view.segments, vec![unknown(0, 9, Reason::NoAck)]);
+    assert!(!view.complete);
+}
+
+#[test]
+fn opening_that_starts_mid_chain_leaves_earlier_rows_unknown() {
+    let w = World::new();
+    let s = Session::new("cov-mid");
+    let o = exchange(&w, &s, Purpose::Opening, 0, None, 0, 9);
+    let mut f = o.state(&w.policy).retained().unwrap().clone();
+    f.commitment.chain.predecessor_seq = Some("4".into());
+    f.commitment.chain.first_seq = "5".into();
+    let view = coverage::build(&[AnchorState::SeenAtRetained(f)], 9);
+    assert_eq!(view.segments[0], unknown(0, 4, Reason::Gap));
+    assert!(view.is_seen_at(5));
+}
+
+#[test]
+fn lost_ack_stays_unknown_and_recovery_is_forward_only() {
+    // Loss: the interval ack is simply absent (an explicit unknown state is supplied too).
+    let w = World::new();
+    let v = full_stream(&w, &Session::new("cov-loss"));
+    let mut st = states(&w, &[v[0].clone(), v[2].clone()]);
+    st.insert(1, AnchorState::default());
+    let view = coverage::build(&st, 29);
+    assert!(!view.complete);
+    assert_eq!(view.segments.last().unwrap(), &unknown(10, 29, Reason::Gap));
+    assert!(!view.is_seen_at(25), "a later close never recovers the lost range");
+}
+
+#[test]
+fn reordered_chain_range_is_a_fork_and_restart_invalidates_the_stream() {
+    let w = World::new();
+    let v = full_stream(&w, &Session::new("cov-reorder-restart"));
+    let base = states(&w, &v);
+    // Reorder: the interval claims a range that does not start where the opening ended.
+    let mut st = base.clone();
+    let mut f = st[1].retained().unwrap().clone();
+    f.commitment.chain.first_seq = "11".into();
+    st[1] = AnchorState::SeenAtRetained(f);
+    let view = coverage::build(&st, 29);
+    assert_eq!(view.segments.last().unwrap(), &unknown(10, 29, Reason::Fork));
+    assert!(!view.complete);
+    // Restart: a new service boot/clock epoch mid-stream breaks the link, and the
+    // otherwise-valid close after it does not clear the break.
+    let mut st = base.clone();
+    let mut f = st[1].retained().unwrap().clone();
+    f.server_boot_id = id("restarted-boot");
+    f.server_clock_epoch_id = id("restarted-clock");
+    st[1] = AnchorState::SeenAtRetained(f);
+    let view = coverage::build(&st, 29);
+    assert_eq!(view.segments.last().unwrap(), &unknown(10, 29, Reason::ServerEpochMismatch));
+    assert!(!view.complete);
+    assert!(!view.is_seen_at(25));
+}
+
+#[test]
+fn ledger_entries_recompute_and_link_the_stream() {
+    use qorcap::anchor_seen_at::canon::{self, ZERO_HEAD};
+    use qorcap::anchor_seen_at::DOMAIN_LEDGER_ENTRY;
+    use serde_json::json;
+    let w = World::new();
+    let v = full_stream(&w, &Session::new("cov-ledger"));
+    assert_eq!(w.svc.ledger_len(), 3);
+    // Independently recompute each entry from the ack facts and walk the chain.
+    let mut prev_head = ZERO_HEAD.to_string();
+    for ex in &v {
+        let a = ex.ack().unsigned_payload;
+        assert_eq!(a.prev_ledger_entry_digest, prev_head, "each ack names the recomputed prior entry");
+        let entry = json!({"ledger_seq": a.ledger_seq, "ack_id": ex.ack_id(), "commitment_digest": a.commitment_digest, "prev": a.prev_ledger_entry_digest});
+        prev_head = canon::digest(DOMAIN_LEDGER_ENTRY, &entry).unwrap();
+        // The coverage helper must recompute the same digest from the checked fact.
+        let fact = ex.state(&w.policy).retained().unwrap().clone();
+        assert_eq!(coverage::ledger_entry_digest(&fact).as_deref(), Some(prev_head.as_str()));
+    }
+    assert_eq!(prev_head, w.svc.ledger_head(), "recomputed head matches the service ledger");
+    // A fact whose ledger linkage does not recompute breaks coverage from that point.
+    let mut st = states(&w, &v);
+    let mut f = st[2].retained().unwrap().clone();
+    f.prev_ledger_entry_digest = hex64("not-the-ledger-entry");
+    st[2] = AnchorState::SeenAtRetained(f);
+    let view = coverage::build(&st, 29);
+    assert!(!view.complete);
+    assert_eq!(view.segments.last().unwrap(), &unknown(20, 29, Reason::LedgerRollback));
+}
+
+#[test]
+fn count_only_continuity_cannot_be_declared() {
+    let w = World::new();
+    let s = Session::new("cov-count");
+    let o = exchange(&w, &s, Purpose::Opening, 0, None, 0, 9);
+    let ch = challenge(&w, &s, Purpose::Interval);
+    let c = s.commitment(&ch, 1, Some(&o.ack_id()), 10, 19);
+    let body = tamper(&commit_body(&ch, &c), |v| v["commitment"]["row_count"] = serde_json::json!("10"));
+    assert!(w.svc.post_commitments(&body).is_err());
+    let body = tamper(&commit_body(&ch, &c), |v| { v["commitment"]["capture_ranges"] = serde_json::json!([]); });
+    assert!(w.svc.post_commitments(&body).is_err());
+}
