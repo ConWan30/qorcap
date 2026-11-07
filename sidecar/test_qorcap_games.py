@@ -470,3 +470,103 @@ def test_scored_end_final_uses_the_eligibility_gate():
     for t in (0, 1000, 4000):
         runner.on_frame(t, _Img(), source={"captured_us": 4_000_000, "mono_us": 4_000_000, "clock": "capture_pts", "epoch": 1})
     assert posted[0]["visual_confirmed"] is False and posted[0]["final_confirmed"] is False
+
+
+def _hud():
+    return type("H", (), {"read": lambda self, img: []})()
+
+
+def _end(reads):
+    pending = list(reads)
+
+    class End:
+        def read(self, img):
+            return pending.pop(0)
+
+    return End()
+
+
+def test_reader_stats_file_counts_errors_and_end_word_range(tmp_path, monkeypatch):
+    """Stop writes counts only. The signal log is not given a new row."""
+    log = tmp_path / "cod_signals.jsonl"
+    word = C.RegionRead("end_screen", "read", True, "victory", True, confirm=True)
+    blank = C.RegionRead("end_screen", "read", True, "scoreboard", True)
+    other = C.RegionRead(
+        "end_screen", "read", True, "victory", True, confirm=True,
+        player_tag="Qortrola30", kills=4, deaths=1,
+    )
+    # The owner hook is the one the runner imports. One readable row is enough.
+    monkeypatch.setattr(
+        "qorcap_cod_hud.read_owner_row",
+        lambda img: other,
+    )
+    runner = C.CodSetRunner(lambda _e: None, hud=_hud(), end=_end([word, blank, word]), log_path=log)
+    runner.stats["frames"] = 0
+    runner.on_frame(1_000, _Img())
+    runner.on_frame(2_000, _Img())
+    runner.on_frame(4_500, _Img())
+    assert runner.end_word_first_ms == 1_000
+    assert runner.end_word_last_ms == 4_500
+    assert runner.owner_row_ever_read is True
+    before = log.read_bytes()
+    state = {
+        "core": runner,
+        "reader_error": "TimeoutError: snapshot",
+        "cod_signal_error": "OSError: inputs",
+        "reader_tick": 1_700_000_000_123,
+    }
+    assert M.maybe_write_cod_reader_stats(tmp_path, state, "cod") is True
+    assert log.read_bytes() == before
+    saved = json.loads((tmp_path / "cod_reader_stats.json").read_text(encoding="utf-8"))
+    assert saved["schema"] == "qorcap-cod-reader-stats/v0"
+    assert saved["stats"] == {
+        "frames": 3,
+        "agreed": runner.stats["agreed"],
+        "flagged_mismatch": runner.stats["flagged_mismatch"],
+        "not_counted": runner.stats["not_counted"],
+        "hud_not_read": runner.stats["hud_not_read"],
+        "errors": runner.stats["errors"],
+    }
+    assert set(saved["stats"]) == {"frames", "agreed", "flagged_mismatch", "not_counted", "hud_not_read", "errors"}
+    assert "img" not in json.dumps(saved)
+    assert saved["reader_error"] == "TimeoutError: snapshot"
+    assert saved["cod_signal_error"] == "OSError: inputs"
+    assert saved["reader_tick"] == 1_700_000_000_123
+    assert saved["end_word_first_ms"] == 1_000
+    assert saved["end_word_last_ms"] == 4_500
+    assert saved["owner_row_ever_read"] is True
+    assert "not a receipt field" in saved["note"].lower()
+    assert not (tmp_path / "receipt.json").exists()
+
+
+def test_reader_stats_omit_errors_until_one_is_stored_and_skip_an_unread_owner(tmp_path):
+    scored = C.RegionRead("end_screen", "read", True, "defeat", True, home=2, away=9, confirm=True)
+    runner = C.CodSetRunner(lambda _e: None, hud=_hud(), end=_end([scored]))
+    runner.on_frame(8_000, _Img())
+    assert runner.owner_row_ever_read is False
+    assert runner.end_word_first_ms == 8_000 and runner.end_word_last_ms == 8_000
+    doc = C.write_reader_stats(tmp_path, runner, reader_error=None, cod_signal_error="", reader_tick=False)
+    assert doc["reader_error"] is None
+    assert doc["cod_signal_error"] is None
+    assert doc["reader_tick"] is None
+    assert doc["owner_row_ever_read"] is False
+    assert doc["end_word_first_ms"] == 8_000
+    signals = tmp_path / "cod_signals.jsonl"
+    assert not signals.exists()
+
+
+def test_madden_stop_does_not_write_reader_stats(tmp_path):
+    runner = C.CodSetRunner(lambda _e: None)
+    runner.stats["frames"] = 9
+    runner.end_word_first_ms = 1
+    state = {"core": runner, "reader_error": "kept", "reader_tick": 5}
+    assert M.maybe_write_cod_reader_stats(tmp_path, state, "madden") is False
+    assert M.maybe_write_cod_reader_stats(tmp_path, state, "closed") is False
+    assert not (tmp_path / "cod_reader_stats.json").exists()
+    assert not (tmp_path / "cod_signals.jsonl").exists()
+    src = Path(M.__file__).read_text(encoding="utf-8")
+    stop = src.split("seal_reader(stop, state, sweep=sweep)", 1)[1].split("say(\"\\nFinishing up:", 1)[0]
+    assert "maybe_write_cod_reader_stats(bundle, state, game)" in stop
+    madden = src.split("def start_reader(", 1)[1].split("def start_cod_reader(", 1)[0]
+    assert "write_reader_stats" not in madden
+    assert "cod_reader_stats" not in madden

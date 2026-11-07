@@ -293,6 +293,32 @@ def seal_reader(stop: threading.Event, state: dict, timeout: float | None = READ
     return not thread.is_alive()
 
 
+def maybe_write_cod_reader_stats(bundle: Path, state: dict, game: str) -> bool:
+    """Write Call of Duty reader counts after the reader thread has stopped.
+
+    Madden and any other game return without creating a file. The signal log
+    is not appended. A missing reader writes nothing rather than a zero file.
+    """
+    if game != "cod":
+        return False
+    try:
+        from qorcap_cod import write_reader_stats
+        core = state.get("core") if isinstance(state, dict) else None
+        if core is None or not isinstance(getattr(core, "stats", None), dict):
+            return False
+        write_reader_stats(
+            bundle,
+            core,
+            reader_error=state.get("reader_error"),
+            cod_signal_error=state.get("cod_signal_error"),
+            reader_tick=state.get("reader_tick"),
+        )
+    except Exception as e:
+        say(f"  Call of Duty reader counts were not written: {type(e).__name__}: {e}")
+        return False
+    return True
+
+
 def mark_health_sealed(state: dict) -> None:
     """Drop later reader_health rows. The receipt is about to be signed."""
     state["health_sealed"] = True
@@ -1947,6 +1973,7 @@ def main(argv=None) -> int:
     # arrives during the join is still stamped, then the final check may append
     # one notice. The health file stays open until mark_health_sealed.
     seal_reader(stop, state, sweep=sweep)
+    maybe_write_cod_reader_stats(bundle, state, game)
 
     say("\nFinishing up: signing the receipt ...")
     draft_p = bundle / "receipt.draft.json"

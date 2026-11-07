@@ -133,6 +133,9 @@ FIRE_WINDOW_US = 250_000
 KILLFEED_NEAR_US = 2_000_000
 SIGNAL_GENESIS = "0" * 64
 SIGNAL_SCHEMA = "qorcap-cod-signals/v0"
+READER_STATS_SCHEMA = "qorcap-cod-reader-stats/v0"
+# Counts copied onto the stop file. Other runner counters stay off that file.
+READER_STATS_KEYS = ("frames", "agreed", "flagged_mismatch", "not_counted", "hud_not_read", "errors")
 # At 4 Hz this is about eight frames. The probe keeps the last five.
 END_PROBE_TAIL_S = 2
 
@@ -707,6 +710,10 @@ class CodSetRunner:
         self._last_t = None
         self.last_hitmarker = NOT_COUNTED
         self.last_hitmarker_us = None
+        # Stop-time health only. These do not change what a frame posts or logs.
+        self.end_word_first_ms = None
+        self.end_word_last_ms = None
+        self.owner_row_ever_read = False
 
     def set_signals(self, inputs, frame_stamps, haptics, wall_anchor_ms) -> None:
         """Replace the clocks used on the next frame. Empty lists count nothing."""
@@ -725,6 +732,12 @@ class CodSetRunner:
 
     def _screen_us(self):
         return producer_screen_us(self._source, self.input_origin_ns)
+
+    def _note_end_word(self, t_ms: int) -> None:
+        """Remember the first and last frame time a victory or defeat word was read."""
+        if self.end_word_first_ms is None:
+            self.end_word_first_ms = t_ms
+        self.end_word_last_ms = t_ms
 
     def on_frame(self, t_ms: int, img, source=None) -> None:
         self._source = source if isinstance(source, dict) else None
@@ -779,6 +792,13 @@ class CodSetRunner:
                 self._frame_end = {"status": "fault", "reason": "end_hook_error"}
                 self._clear_end_candidate()
                 return
+            when = t_ms if isinstance(t_ms, int) and not isinstance(t_ms, bool) else None
+            if (
+                when is not None
+                and end.ok and end.calibrated
+                and isinstance(end.reason, str) and end.reason in ("victory", "defeat")
+            ):
+                self._note_end_word(when)
             if self.final is not None:
                 self._frame_end = {"status": "already_final", "reason": None}
                 return
@@ -790,7 +810,6 @@ class CodSetRunner:
                 self._frame_end = {"status": "abstain", "reason": "end_not_read"}
                 self._clear_end_candidate()
                 return
-            when = t_ms if isinstance(t_ms, int) and not isinstance(t_ms, bool) else None
             if when is None:
                 self._frame_end = {"status": "abstain", "reason": "frame_time_missing"}
                 self._clear_end_candidate()
@@ -987,6 +1006,7 @@ class CodSetRunner:
             self._frame_end = {"status": "abstain", "reason": "owner_row_not_read"}
             self._clear_end_candidate()
             return
+        self.owner_row_ever_read = True
         extra = (OWNER_TAG.casefold(), kills, deaths, assists, confirms)
         agreed = self._offer(when, end.reason, True, None, None, extra=extra)
         if agreed is None:
@@ -1763,6 +1783,60 @@ def attach_session(bundle: Path) -> dict:
     meta["game"] = GAME_ID
     meta["scorebug_profile"] = PROFILE_ID
     p.write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
+    return doc
+
+
+def _stat_count(stats: dict, key: str) -> int:
+    raw = stats.get(key, 0) if isinstance(stats, dict) else 0
+    if isinstance(raw, bool) or not isinstance(raw, int):
+        return 0
+    return raw
+
+
+def _optional_text(value) -> str | None:
+    if isinstance(value, str) and value:
+        return value
+    return None
+
+
+def _optional_ms(value) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value
+
+
+def reader_stats_document(runner, *, reader_error=None, cod_signal_error=None, reader_tick=None) -> dict:
+    """Counts from the live reader at stop. No images. Not a receipt field.
+
+    ``reader_error`` and ``cod_signal_error`` are the last strings on the
+    match state, or null when that loop never stored one. ``reader_tick`` is
+    the last loop stamp, or null when the loop never ticked.
+    """
+    stats = getattr(runner, "stats", None)
+    counts = {key: _stat_count(stats, key) for key in READER_STATS_KEYS}
+    return {
+        "schema": READER_STATS_SCHEMA,
+        "stats": counts,
+        "reader_error": _optional_text(reader_error),
+        "cod_signal_error": _optional_text(cod_signal_error),
+        "reader_tick": _optional_ms(reader_tick),
+        "end_word_first_ms": _optional_ms(getattr(runner, "end_word_first_ms", None)),
+        "end_word_last_ms": _optional_ms(getattr(runner, "end_word_last_ms", None)),
+        "owner_row_ever_read": bool(getattr(runner, "owner_row_ever_read", False)),
+        "note": "Reader counts at stop. Not a receipt field. No images.",
+    }
+
+
+def write_reader_stats(bundle: Path, runner, *, reader_error=None, cod_signal_error=None, reader_tick=None) -> dict:
+    """Write ``cod_reader_stats.json``. Does not append ``cod_signals.jsonl`` or edit a receipt."""
+    doc = reader_stats_document(
+        runner,
+        reader_error=reader_error,
+        cod_signal_error=cod_signal_error,
+        reader_tick=reader_tick,
+    )
+    (Path(bundle) / "cod_reader_stats.json").write_text(
+        json.dumps(doc, indent=2) + "\n", encoding="utf-8")
     return doc
 
 
