@@ -19,10 +19,14 @@ label them.
 """
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 PACK_PATH = Path(__file__).resolve().parent / "packs" / "cod_mw4_hud_v1.npz"
+# Text supplement. Masks and labels only. The shipped npz is not rewritten.
+TEXT_PACK_PATH = Path(__file__).resolve().parent / "packs" / "cod_owner_row_digits.json"
 FIXTURE_DIR = Path(__file__).resolve().parent / "fixtures" / "cod"
+SYNTHETIC_SAMPLE_NOTE = "synthetic sample, real-match recall UNMEASURED"
 
 # One letter gate for both words. The practice frames clear it:
 # VICTORY header 019 is at least 0.87 per letter, mean about 0.93, margin at least 0.13.
@@ -99,6 +103,10 @@ _ROW_HEADER_MIN = 0.70
 # The next digit on these samples stays under 0.50.
 _ROW_DIGIT_MIN = 0.75
 _ROW_DIGIT_MARGIN = 0.15
+# One column may be a score such as 1250, or a longer stat. Seven glyphs are not read.
+_ROW_GLYPH_MAX = 6
+# Derived ASSISTS and TDM DEATHS masks were cut at this value. The match gate is unchanged.
+_DERIVED_HEADER_VALUE = 80
 # Bright letters of the gamertag. Header words are dimmer, so they use their own mask.
 _OWNER_SEARCH_VALUE = 150
 _HEADER_SEARCH_VALUE = 90
@@ -113,14 +121,62 @@ def _libs():
     return cv2, np
 
 
+def _mask_from_rows(rows) -> object:
+    """0/1 text rows to a uint8 mask. None when the rows are empty or ragged."""
+    np = _libs()[1]
+    if np is None or not rows:
+        return None
+    width = len(rows[0])
+    if width < 1 or any(len(row) != width for row in rows):
+        return None
+    mask = np.zeros((len(rows), width), np.uint8)
+    for y, row in enumerate(rows):
+        for x, ch in enumerate(row):
+            if ch == "1":
+                mask[y, x] = 255
+    return mask
+
+
+def _apply_text_supplement(data):
+    """Merge the text digit bank and the derived column headers. The npz is not written."""
+    np = _libs()[1]
+    if np is None or not TEXT_PACK_PATH.is_file():
+        return data
+    extra = json.loads(TEXT_PACK_PATH.read_text(encoding="utf-8"))
+    labels = [bytes(x).decode("ascii") for x in data["row_digit_labels"]] if "row_digit_labels" in data else []
+    vecs = [data["row_digit_vecs"][i].astype(np.float32) for i in range(len(labels))] if labels else []
+    for item in extra.get("digits", []):
+        mask = _mask_from_rows(item.get("mask_rows"))
+        vec = _vec(np, mask, (12, 18)) if mask is not None else None
+        if vec is None:
+            continue
+        labels.append(str(item["label"]))
+        vecs.append(vec.astype(np.float32))
+    if vecs:
+        data["row_digit_labels"] = np.array([s.encode("ascii") for s in labels])
+        data["row_digit_vecs"] = np.stack(vecs).astype(np.float32)
+    headers = extra.get("headers") or {}
+    if "assists" in headers:
+        mask = _mask_from_rows(headers["assists"].get("mask_rows"))
+        if mask is not None:
+            data["assists_header_mask"] = mask
+    if "deaths_column" in headers:
+        mask = _mask_from_rows(headers["deaths_column"].get("mask_rows"))
+        if mask is not None:
+            data["deaths_column_header_mask"] = mask
+    return data
+
+
 def _pack():
     cv2, np = _libs()
     if np is None or not PACK_PATH.is_file():
         return None
     try:
-        return np.load(PACK_PATH, allow_pickle=False)
+        raw = np.load(PACK_PATH, allow_pickle=False)
     except Exception:
         return None
+    data = {key: raw[key] for key in raw.files}
+    return _apply_text_supplement(data)
 
 
 def _as_bgr(img):
@@ -991,6 +1047,36 @@ def _column_header(hit, row_x: int, row_y: int, scale: float):
     return hit
 
 
+def _best_column_hit(search, mask, scale: float, thr: float, row_x: int, row_y: int):
+    """Highest template peak that sits in this row's column band.
+
+    The global peak can be the same word on the personal card. That peak is
+    not this column. The match gate is the same ``thr`` as the other headers.
+    """
+    cv2, np = _libs()
+    if search is None or mask is None or cv2 is None:
+        return None
+    templ = _scaled_u8(mask, scale)
+    if templ is None or templ.ndim != 2 or templ.shape[0] < 8 or templ.shape[1] < 8:
+        return None
+    if search.shape[0] < templ.shape[0] or search.shape[1] < templ.shape[1]:
+        return None
+    work = cv2.matchTemplate(search, templ, cv2.TM_CCOEFF_NORMED)
+    height, width = int(templ.shape[0]), int(templ.shape[1])
+    for _ in range(8):
+        score = float(work.max())
+        if score < thr:
+            return None
+        y, x = np.unravel_index(int(work.argmax()), work.shape)
+        hit = (score, int(x), int(y), width, height)
+        if _column_header(hit, row_x, row_y, scale) is not None:
+            return hit
+        y0, y1 = max(0, int(y) - 6), min(work.shape[0], int(y) + 7)
+        x0, x1 = max(0, int(x) - 6), min(work.shape[1], int(x) + 7)
+        work[y0:y1, x0:x1] = -1.0
+    return None
+
+
 def _personal_header(hit, row_x: int, row_y: int, row_h: int, scale: float):
     """A label below the row, on the personal card. A column header above the row is not this."""
     if hit is None:
@@ -1033,15 +1119,47 @@ def _row_digit_string(img, x0: int, x1: int, y0: int, y1: int, thr: int, scale: 
     n, lab, st, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
     minh = max(5, int(round(6 * scale)))
     maxw = max(10, int(round(18 * scale)))
-    comps = []
+    kept = []
+    frags = []
     for i in range(1, n):
         x, y, ww, hh, area = (int(t) for t in st[i])
-        if area < 8 or hh < minh or ww < 2 or ww > maxw:
+        if ww < 2 or ww > maxw or hh < 1:
             continue
         g = (lab[y:y + hh, x:x + ww] == i).astype(np.uint8) * 255
-        comps.append((x, g))
-    comps.sort()
-    if not comps or len(comps) > 3:
+        piece = {"x": x, "y": y, "w": ww, "h": hh, "area": area, "glyph": g}
+        if area >= 8 and hh >= minh:
+            kept.append(piece)
+        elif 3 <= area < 8 or (area >= 3 and hh < minh):
+            frags.append(piece)
+    # A bright cut can split one glyph. Join a short piece only when it sits
+    # on the same x span, within two pixels. A piece that is not there stays
+    # out, so a cut glyph is not completed with invented ink.
+    for frag in frags:
+        for host in kept:
+            overlap = min(host["x"] + host["w"], frag["x"] + frag["w"]) - max(host["x"], frag["x"])
+            if overlap < max(2, frag["w"] // 2):
+                continue
+            below = frag["y"] - (host["y"] + host["h"])
+            above = host["y"] - (frag["y"] + frag["h"])
+            if not (0 <= below <= 2 or 0 <= above <= 2):
+                continue
+            x0b = min(host["x"], frag["x"])
+            y0b = min(host["y"], frag["y"])
+            x1b = max(host["x"] + host["w"], frag["x"] + frag["w"])
+            y1b = max(host["y"] + host["h"], frag["y"] + frag["h"])
+            if x1b - x0b > maxw:
+                continue
+            canvas = np.zeros((y1b - y0b, x1b - x0b), np.uint8)
+            canvas[host["y"] - y0b:host["y"] - y0b + host["h"], host["x"] - x0b:host["x"] - x0b + host["w"]] = host["glyph"]
+            canvas[frag["y"] - y0b:frag["y"] - y0b + frag["h"], frag["x"] - x0b:frag["x"] - x0b + frag["w"]] = np.maximum(
+                canvas[frag["y"] - y0b:frag["y"] - y0b + frag["h"], frag["x"] - x0b:frag["x"] - x0b + frag["w"]],
+                frag["glyph"],
+            )
+            host["x"], host["y"], host["w"], host["h"] = x0b, y0b, x1b - x0b, y1b - y0b
+            host["glyph"] = canvas
+            break
+    comps = sorted(((piece["x"], piece["glyph"]) for piece in kept), key=lambda item: item[0])
+    if not comps or len(comps) > _ROW_GLYPH_MAX:
         return None
     text = ""
     for _, glyph in comps:
@@ -1064,7 +1182,7 @@ def _row_digit_string(img, x0: int, x1: int, y0: int, y1: int, thr: int, scale: 
 
 
 def _stat_int(text: str | None) -> int | None:
-    if not text or not text.isdigit() or len(text) > 3:
+    if not text or not text.isdigit() or len(text) > _ROW_GLYPH_MAX:
         return None
     return int(text)
 
@@ -1115,7 +1233,6 @@ def read_owner_row(img):
     found = {}
     for key, label in (
         ("kills_header_mask", "KILLS"),
-        ("assists_header_mask", "ASSISTS"),
         ("deaths_header_mask", "DEATHS"),
         ("confirms_header_mask", "CONFIRMS"),
     ):
@@ -1135,7 +1252,11 @@ def read_owner_row(img):
             "owner_row", "not_present",
             "Kills were not read on Qortrola30's row. They are not Counted.")
     assists = None
-    assists_h = _column_header(found.get("ASSISTS"), row_x, row_y, scale)
+    assists_h = None
+    if "assists_header_mask" in pack:
+        assists_h = _best_column_hit(
+            _value_mask(bgr, _DERIVED_HEADER_VALUE), pack["assists_header_mask"],
+            scale, _ROW_HEADER_MIN, row_x, row_y)
     if assists_h is not None:
         assists = _digits_for_column(bgr, assists_h, row_y, row_h, scale)
         if assists is None:
@@ -1146,7 +1267,13 @@ def read_owner_row(img):
     confirms_h = _column_header(found.get("CONFIRMS"), row_x, row_y, scale)
     if confirms_h is not None:
         confirms = _digits_for_column(bgr, confirms_h, row_y, row_h, scale)
-    deaths_h = _column_header(found.get("DEATHS"), row_x, row_y, scale)
+    deaths_h = None
+    if "deaths_column_header_mask" in pack:
+        deaths_h = _best_column_hit(
+            _value_mask(bgr, _DERIVED_HEADER_VALUE), pack["deaths_column_header_mask"],
+            scale, _ROW_HEADER_MIN, row_x, row_y)
+    if deaths_h is None:
+        deaths_h = _column_header(found.get("DEATHS"), row_x, row_y, scale)
     if deaths_h is not None:
         deaths = _digits_for_column(bgr, deaths_h, row_y, row_h, scale)
     else:
