@@ -71,6 +71,7 @@ jobs:
         run: |
           python -c "import cv2, numpy, cryptography"
           python -c "import os, pathlib; p=pathlib.Path(os.environ['QORTIME']); assert (p/'qor_receipt').is_dir(), p; assert (p/'tests/fixtures/madden27_live/q1_6-0.png').is_file(), 'pinned QorTime scorebug fixture missing'"
+          # Includes sidecar/test_qorcap_cod_agreement.py via the canonical suite list.
           # Floor is a minimum. Any PR that adds tests must set both
           # LINUX_MIN_COLLECTED and WINDOWS_MIN_COLLECTED to the new collect-only
           # counts, and a merge resolution must re-collect. Leaving the old floor
@@ -223,6 +224,7 @@ jobs:
         run: |
           python -c "import cv2, numpy, cryptography"
           python -c "import os, pathlib; p=pathlib.Path(os.environ['QORTIME']); assert (p/'qor_receipt').is_dir(), p; assert (p/'tests/fixtures/madden27_live/q1_6-0.png').is_file(), 'pinned QorTime scorebug fixture missing'"
+          # Includes sidecar/test_qorcap_cod_agreement.py via the canonical suite list.
           # Floor is a minimum. Any PR that adds tests must set both
           # LINUX_MIN_COLLECTED and WINDOWS_MIN_COLLECTED to the new collect-only
           # counts, and a merge resolution must re-collect. Leaving the old floor

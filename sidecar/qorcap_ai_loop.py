@@ -337,6 +337,66 @@ def normalize_label_view(obj: Any) -> dict:
     }
 
 
+def referee_label_view(match_id: str, review: dict) -> dict:
+    """Adapt independent review.checks, never the model's verdict or prose.
+
+    The caller must authenticate the referee review before using it as a label.
+    This adapter neither verifies signatures nor accepts AI verdict documents.
+    """
+    if not isinstance(review, dict) or "schema" in review or "source" in review:
+        raise OwnOutputRejected("expected independent review.checks")
+    checks = review.get("checks")
+    if not isinstance(checks, dict):
+        raise SchemaError("review.checks")
+    rows = {}
+    for cid in REVIEW_CHECK_IDS:
+        raw = checks.get(cid)
+        if not isinstance(raw, dict):
+            continue
+        row = {"state": raw.get("state")}
+        if cid == "final_reread":
+            value = _final_score_value(raw.get("value"))
+            if value is not None:
+                row["value"] = value
+        rows[cid] = row
+    return normalize_label_view({"schema": LABEL_VIEW_SCHEMA, "source": "referee",
+                                 "match_id": match_id, "checks": rows})
+
+
+def _final_score_value(value: Any) -> dict | None:
+    if not isinstance(value, dict):
+        return None
+    cod = value.get("game") == "cod"
+    required = ("kills", "deaths") if cod else ("away", "home")
+    if any(not _is_int(value.get(k)) or not 0 <= value[k] <= _SAFE_INT for k in required):
+        return None
+    if cod and value.get("outcome") not in ("victory", "defeat"):
+        return None
+    out = {k: value[k] for k in required}
+    if cod:
+        out.update(game="cod", outcome=value["outcome"])
+    optional = "assists" if cod else "quarter"
+    if _is_int(value.get(optional)) and 0 <= value[optional] <= _SAFE_INT:
+        out[optional] = value[optional]
+    return out
+
+
+def _final_score_pair(proposed, independent) -> tuple[str, str]:
+    actual = _final_score_value(independent)
+    wanted = _final_score_value(proposed)
+    if actual is None or wanted is None:
+        return "unverifiable", "no_independent_value"
+    if (actual.get("game") == "cod") != (wanted.get("game") == "cod"):
+        return "contradicted", "value_mismatch"
+    # Compare required fields first; a missing optional read is not a contradiction.
+    for key, value in wanted.items():
+        if key in actual and actual[key] != value:
+            return "contradicted", "value_mismatch"
+    if any(key not in actual for key in wanted):
+        return "unverifiable", "no_independent_value"
+    return "confirmed", "value_match"
+
+
 def _check_rows(relates: list[str], checks: dict[str, dict]) -> list[dict]:
     rows = []
     for cid in relates:
@@ -393,6 +453,8 @@ def _pair(proposal: dict, checks: dict[str, dict]) -> tuple[str, str]:
         value = ran.get("value") if "value" in ran else None
         if value is None or proposal["value"] is None:
             results.append(("unverifiable", "no_independent_value"))
+        elif cid == "final_reread" and proposal["kind"] == "score_read":
+            results.append(_final_score_pair(proposal["value"], value))
         elif value == proposal["value"]:
             results.append(("confirmed", "value_match"))
         else:

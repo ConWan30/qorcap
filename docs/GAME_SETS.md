@@ -98,3 +98,15 @@ Still open:
 - Stick turn against camera turn, rumble against an on-screen hit, and power stay INFO-ONLY and not Counted.
 - Read battery versus plugged only after a report map exists. Do not guess bytes. Power stays `unknown`.
 - Record the console link (wired or wireless) only when the log actually has it. `usb` today means the laptop read path.
+
+### CoD three-leg Counted gate
+
+A visual final may remain advisory. Counted additionally requires an ownership-qualified,
+covered, deduplicated killfeed tally to match scoreboard kills, readable scoreboard deaths,
+and a calibrated VICTORY/DEFEAT end screen. All three leg times must be frame-clock stamped
+and span no more than `FRAME_CLOCK_GAP_US` (500 ms). Any extra shared values must agree.
+Missing legs, unknown coverage, expired windows, or mismatches record an explicit reason in
+`agreement`; none is guessed. Existing multi-frame consensus and seal/anchor gates still apply.
+A lone hitmarker, popup, generic killfeed icon, or standalone board comparison is advisory.
+The current generic-icon reader does not establish own-kill coverage, so this leg remains UNKNOWN
+and cannot release a Counted final. Stick remains Counted; rumble stays info-only.
