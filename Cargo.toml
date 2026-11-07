@@ -42,7 +42,15 @@ lzma-rs = "0.3"
 # Enables the `testpattern` pseudo-device (ffmpeg lavfi testsrc + sine) so the
 # full pipeline can be exercised without a capture card.
 test-pattern = []
+# PRACTICE-ONLY, off by default: Track 1 seen-at acknowledgment types and an in-process service
+# double (src/anchor_seen_at). Not wired into any match, receipt or verdict path.
+practice-anchor-seen-at = []
 default = ["test-pattern"]
+
+[[test]]
+name = "anchor_seen_at"
+path = "tests/anchor_seen_at/main.rs"
+required-features = ["practice-anchor-seen-at"]
 
 [profile.release]
 opt-level = 3
