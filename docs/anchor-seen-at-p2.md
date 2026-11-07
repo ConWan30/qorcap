@@ -94,6 +94,11 @@ Hash dependency rule carried forward: no record's preimage contains its own id, 
 - Opening `Range` is unchanged and still has no source-domain field. The opening `Commitment` gains `capture_domain:ClockDomain` and `source_domain:ClockDomain`, immediately after `pins` and before `source`.
 - `CheckpointRequest`, `Observation`, and `HoldRequest` each gain, immediately after `source_bound`: `pins:Pins`, `source_schema:H`, `capture_domain:ClockDomain`, `source_domain:ClockDomain`, in that order. On `CheckpointRequest` those four sit before `idempotency`. On `HoldRequest` they sit before `expected_revision`. On `Observation` they sit before `journal`; `reason` stays where r1 placed it, after `journal` and before `expected_revision`.
 - `CheckpointRecord` gains `client_checkpoint_id:H` after `owner_generation` and before `journal`. That field is only on the checkpoint row (§4.0, §8). Consume does not store it.
+- `MinimumKey.scope_digest` is deleted. `MinimumKey` carries `subject:ScopeTag` (§5.3). `ScopeTag` is `{arm:lineage, scope:Scope}` or `{arm:registry, registry:RegistryScope}`.
+- Scalar `Usage` is not the accounting stock. `ExternalBasis.accounting` is `Accounting` (§5.3, §6): a bounded list of `KeyedStock`. New names: `StockKey`, `StockClass`, `MetricName`, `KeyedStock`, `Accounting`, `Floor`, `ExpectedMember`, `ExpectedSet`.
+- The old `Usage` field `pages` is split into `retained_pages` (inventory) and `page_fetches` (disposable meter). The old field `proof_hashes` is split into `retained_proof_hashes` (inventory) and `proof_compares` (disposable meter). Neither old name is a field.
+- `CommitWitness.phase` adds `receive`, `reserve`, and `work` (§6.3). `WitnessOutcome` is unchanged.
+- Opening `capture_domain` and `source_domain` are frozen declarations on the opening commitment. They are not a calibrated clock and not a measured mapping (§9.1).
 - r1 `JournalRef.checkpoint` and `prior_checkpoint` are deleted. §8 replaces them.
 
 Any field not listed here or in the r1 record it carries forward is not allowed (`schema`).
@@ -118,7 +123,11 @@ Enums:
 - `EventClass`: `ledger` | `side` | `read` | `registry` | `internal`.
 - `AttemptResult`: `pending` | `missing` | `invalid` | `late` | `retained` | `unavailable`.
 - `CheckpointKind`: `global` | `owner` | `journal` | `policy` | `terminal`.
-- `WitnessPhase`: `prepare` | `swap` | `confirm` | `deliver`.
+- `WitnessPhase`: `receive` | `reserve` | `work` | `prepare` | `swap` | `confirm` | `deliver`.
+- `StockClass`: `gauge` | `cumulative` | `inventory` | `meter`.
+- `MetricName`: `records` | `stored_bytes` | `outstanding` | `inflight` | `concurrent` | `retry_attempts` | `retained_pages` | `page_fetches` | `retained_proof_hashes` | `proof_compares` | `signer_calls` | `store_calls` | `denial_records` | `denial_bytes` | `fault_records` | `audit_records` | `calls` | `call_bytes`.
+- `ExpectedClass`: `registry` | `role` | `lineage_scope` | `policy` | `minimum` | `observer`.
+- `Authn`: `authenticated` | `unauthenticated`.
 - `WitnessOutcome`: `committed` | `refused` | `unknown`.
 - `ForkLatch`: `open` | `latched`.
 - `StreamLife`: `open` | `closed`.
@@ -132,14 +141,14 @@ Types introduced or replaced:
 
 - `ClientExpectedCore`, `LogicalOpKey`, `ClientDispatchRecord`, `ServiceCommitKey` (§3.4). `request_type` is `IssueRequest` | `ConsumeRequest` only.
 - `AuthSubject`, `AuthBinding` (§4.0). r1 `AuthBinding.scope` is not a field.
-- `PolicyRole`, `PolicyCore`, `PolicyRecord`, `LimitSet`, `ServerDomainPin`, `ConfigCore`, `ConfigRecord`, `MinimumKey`, `Minimum`, `Continuity`, `ExternalBasis` (§5). r1 `RoleRule` is deleted. r1 `HistoricalRule` is replaced by the §5 record (no nested `RoleRef`).
+- `PolicyRole`, `PolicyCore`, `PolicyRecord`, `LimitSet`, `ServerDomainPin`, `ConfigCore`, `ConfigRecord`, `ScopeTag`, `MinimumKey`, `Minimum`, `Floor`, `StockKey`, `KeyedStock`, `Accounting`, `Continuity`, `ExpectedMember`, `ExpectedSet`, `ExternalBasis` (§5, §6). r1 `RoleRule` is deleted. r1 `HistoricalRule` is replaced by the §5 record (no nested `RoleRef`). r1 scalar `Usage` is not a field of `ExternalBasis`.
 - `CommitWitness` (§6).
 - `ClientCheckpointCore`, `GenesisCore` (§8). The service receipt is `CheckpointRecord`, not a second type. `JournalRef` is the §8 record. The r1 names `checkpoint` and `prior_checkpoint` are not fields.
 - `StreamOrigin` (§9). r1 `StreamRow` gains `origin:StreamOrigin?` and `fork:ForkLatch`.
 
-`Usage` is the r1 counter record plus exactly two fields, all required `U`: `records`, `stored_bytes`, `outstanding`, `inflight`, `concurrent`, `retry_attempts`, `pages`, `proof_hashes`, `signer_calls`, `store_calls`, `denial_records`, `denial_bytes`, `fault_records`, `audit_records`, `calls`, `call_bytes`. Disposable scratch (`workspace_bytes`, `parse_bytes`) is not a `Usage` field.
+There is no scalar `Usage` record. Stocks are `KeyedStock` rows inside `Accounting` (§5.3). Disposable scratch (`workspace_bytes`, `parse_bytes`) is a `LimitSet` ceiling and a `meter` only. It is not an image stock.
 
-`LimitSet` fields, each required `U`, and no others: `request_input_bytes`, `canonical_bytes`, `decoded_bytes`, `parse_bytes`, `depth`, `tokens`, `string_bytes`, `list_items`, `output_bytes`, `workspace_bytes`, `recovery_image_bytes`, `records`, `stored_bytes`, `outstanding`, `inflight`, `concurrent`, `retry_attempts`, `pages`, `page_items`, `proof_hashes`, `signer_calls`, `store_calls`, `issue_lifetime_ns`, `operation_age_ns`, `denial_records`, `denial_bytes`, `fault_records`, `audit_records`, `calls`, `call_bytes`, `minima_entries`, `accounting_basis_bytes`.
+`LimitSet` fields, each required `U`, and no others: `request_input_bytes`, `canonical_bytes`, `decoded_bytes`, `parse_bytes`, `depth`, `tokens`, `string_bytes`, `list_items`, `output_bytes`, `workspace_bytes`, `recovery_image_bytes`, `records`, `stored_bytes`, `outstanding`, `inflight`, `concurrent`, `retry_attempts`, `retained_pages`, `page_fetches`, `page_items`, `retained_proof_hashes`, `proof_compares`, `signer_calls`, `store_calls`, `issue_lifetime_ns`, `operation_age_ns`, `denial_records`, `denial_bytes`, `fault_records`, `audit_records`, `calls`, `call_bytes`, `minima_entries`, `accounting_basis_bytes`, `stock_entries`, `expected_entries`. The names `pages` and `proof_hashes` are not fields.
 
 Tree rules adopted unchanged from r1 §7.1–7.2, and thereby closed: leaf `Hash(TreeLeaf,{epoch,position,entry_digest})`; empty tree `SHA-256(F(D("tree.empty"), empty))`; single leaf is those 32 raw bytes; larger trees split at the largest power of two strictly below the length and hash `F(D("tree.node"), left || right)`. The witness carries every leaf hash, not foreign bodies. `LedgerHead` empty and nonempty conditions are §7.6. No compact omission codec is added.
 
@@ -215,7 +224,20 @@ ClientDispatchRecord={
 ServiceCommitKey={scope:Scope, stream:Id, idempotency:Id, operation:Op}
 ```
 
-`operation` is part of `LogicalOpKey`, so issue and consume are different client keys even when scope, stream, and exchange match. `request_type` matches `key.operation`. `expected_id` equals `Hash("ClientExpectedCore", core)`. `request_hash` equals `Raw(request_bytes)`. Those bytes decode as the declared request type and carry the same `expected_id`, scope, stream, operation, and owner fields. Core `scope`, `stream`, `exchange`, and `operation` equal the key.
+`operation` on `LogicalOpKey` is projected. It is not a wire field. `IssueRequest` and `ConsumeRequest` have no `operation` member. Adding one is `schema`. The request type determines the operation: `IssueRequest` projects `issue`; `ConsumeRequest` projects `consume`. `request_type` must equal that projection, and `key.operation` must equal it. `expected_id` equals `Hash("ClientExpectedCore", core)`. `request_hash` equals `Raw(request_bytes)`.
+
+Projection, checked by the trusted client fixture. The server still sees only the opaque `expected_id`.
+
+| Core or key field | Equals |
+|---|---|
+| `operation` | the request type, as above. Not a field read from the request body. |
+| `scope`, `stream`, `purpose`, `ack_ordinal`, `pins` | the same members on `IssueRequest`, or on `ConsumeRequest.commitment` |
+| `exchange` | `IssueRequest.exchange` or `ConsumeRequest.commitment.exchange` |
+| `owner_generation`, `prior_ack`, `client_nonce` | those members on the issue request bytes, or on the nested consume commitment bytes. They are not core fields (§3.2). |
+
+A mismatch is `binding` and stores no record. This is the meaning of "request matches its own core."
+
+A consume's linked issue is the issue `ClientDispatchRecord` in the same exchange group `(scope, stream, exchange)` whose `request_hash` equals the issue `Raw` named by the challenge, and whose challenge bytes are that issue's committed response. A challenge from another exchange group is `binding` even when every hash verifies on its own. The two `expected_id` values stay unequal (§3.5).
 
 **(a) Client pre-dispatch registry.** The value is one immutable `ClientDispatchRecord`. Its durability point is the client fixture's own commit, and that commit finishes **before dispatch**. Dispatch is not allowed for a key that has no durable client record. This commit is not the service image swap and does not write an `Original`. The first durable client record for a key wins. A second core, `expected_id`, or request body for that key is `conflict` and is not stored. Identical bytes are the same record, not a second writer. If the client commit does not complete, the key stays unregistered and nothing may later be treated as that attempt's original.
 
@@ -228,7 +250,10 @@ ServiceCommitKey={scope:Scope, stream:Id, idempotency:Id, operation:Op}
 | Client durability does not complete. Dispatch does not happen. | No `ClientDispatchRecord`. No service `Original`. No later body may be called the original for that key. |
 | Client record is durable. Crash before dispatch. | Client record stands. No `Original`. A later attempt must present those same bytes or it is `conflict`. It must not replace the record. |
 | Dispatch happens. Service crashes before the swap. No `Original`. | Client record stands unchanged. Service outcome is not success. Retry sends the same bytes. A different body is `conflict` and does not become the original. |
+| Dispatch happens. Service refuses (resolved refusal, no swap). | Client record stands. No `Original`. The refusal does not free the client record for a later deadline or a different body. |
 | Service swap commits. Response is lost. | The service `Original` stands. The retry oracle below returns those exact bytes. The client record is not rewritten. |
+| Restart after a durable client record and no `Original`. | Same as crash before swap. The client record is not replaced. |
+| Restart after a committed `Original`. | Retry oracle. Both race orders in §3.8 keep the winner's bytes. |
 | Restore. Image has the `Original`. Client fixture has the matching record. | Both stand. No rewrite. |
 | Restore. Image has the `Original`. Client fixture is missing. | Service bytes stay historical. Client state stays `unknown`. Do not rebuild the client record from the `Original`. |
 | Restore. Client record exists. Image has no `Original`. | Client record stands. Service stays not success. Do not invent an `Original` from the client record. |
@@ -352,6 +377,14 @@ Registration boundary. These are required fixtures for the generator. digest: se
 | `V-F1-REST-NOCLIENT` | `Original` present, client fixture missing. Client state `unknown`. No rebuild. |
 | `V-F1-REST-NOORIG` | Client record present, no `Original`. Not service success. No invented `Original`. |
 | `V-F1-REST-DIVERGE` | Both present, request bytes differ. `conflict`. No replacement. |
+| `V-F1-PROJ-OK` | Request type, projected operation, and the equality rows above all match. | client record accepted. No wire `operation` field. |
+| `V-F1-PROJ-MIS` | One of scope, stream, purpose, ack ordinal, or pins differs from the core. | `binding`. No record. |
+| `V-F1-PROJ-OWN` | Owner generation, prior ack, or client nonce differs from the request or nested commitment bytes. | `binding`. No record. |
+| `V-F1-NO-WIRE` | Request body contains an `operation` member. | `schema`. |
+| `V-F1-LINK` | Consume names the issue `Raw` and challenge inside the same exchange group. | link resolves. Ids stay distinct. |
+| `V-F1-XGROUP` | Challenge bytes verify but belong to another exchange group. | `binding`. |
+| `V-F1-REFUSE` | Service returns a resolved refusal. | client record stands. No `Original`. No new deadline. |
+| `V-F1-RESTART` | Restart with a durable client record and no `Original`. | record unchanged. No replacement. |
 
 Scope, stream, and exchange mutations change the key, so they must not be implemented as in-place edits of the first record. Purpose, ordinal, pins, and times do not change the key and therefore cannot be "fixed" by publishing a new id.
 
@@ -379,10 +412,25 @@ Exactly one arm. `arm=lineage` requires `scope` and forbids `registry`. `arm=reg
 | `policy_update` request | `PolicyCore` | `J(E("PolicyCore", core))`. Digest is not a field. | `Hash("PolicyCore", core)` |
 | stored policy | `PolicyRecord={core:PolicyCore, digest:H}` | `digest` is outside the core. It must equal the hash above. | Registry row keyed by `(registry, generation)`. Not an `Original`. Not a `GlobalEntry`. |
 | signed policy | `ModelSigned` over `PolicyCore` | payload id is that same digest. Kind `policy`. | Tag checks §2. The payload is not `PolicyRecord`. |
+| current authorizing policy | the already retained `PolicyRecord` | not the `PolicyCore` submitted on this call | `AuthBinding.policy_generation` and `policy_digest` must equal that retained row. Using the new core's digest as the authorizing digest is `unauthorized`. The new core is stored only as a checked successor. |
 | consume result | `AckCore` | r1 `AckCore`, no receipt id inside it | `Ref` type `AckCore`, id `Hash("AckCore", ack)`. One `Original`. One `GlobalEntry`. Charges are the consume row in §6 only. |
 | consume journal link | `JournalRef` inside `Commitment` | part of `ConsumeRequest` | `client_checkpoint` looks up `ClientCheckpointCore` retained with that consume's client record. `prior_service_receipt` looks up an existing `CheckpointRecord` or is null. Consume does not insert a `CheckpointRecord`. |
 | checkpoint result | `CheckpointRecord` | `request_hash`, scope, stream, `owner_generation`, `client_checkpoint_id`, `journal`, `source_bound` | This is the only service receipt. Id `Hash("CheckpointRecord", record)`. `Ref` type `CheckpointRecord`. One `Original`. One `GlobalEntry`. Charges are the checkpoint row in §6 only. No consume charge is added. |
-| `StreamOrigin` | §9 | not hashed as a request | Recomputed only from the opening consume `Original.request_bytes`, using the fields in §9.1. |
+| `StreamOrigin` | §9 | not hashed as a request | Recomputed only from the opening consume `Original.request_bytes`, using the fields in §9.1. The two domains are declarations, not a calibrated clock. |
+
+Receipt retention for every producing op. One row, one charge family. No second output.
+
+| Op | Retained bytes | Where | Ref | Original / global | Charge |
+|---|---|---|---|---|---|
+| `owner_grant` | `OwnerRecord` | response of one `Original` | `Hash(OwnerRecord)` | one / one | owner row in §6 |
+| `issue` | `Challenge` | response of one `Original` | `Hash(Challenge)` | one / one | issue row in §6 |
+| `consume` | `AckCore` | response of one `Original`. Not a `CheckpointRecord`. | `Hash(AckCore)` | one / one | consume row only. `stored_bytes` includes the canonical `AckCore` once, because it is the response. |
+| `checkpoint` | `CheckpointRecord` | that `Original`'s response. This is the only service receipt. | `Hash(CheckpointRecord)` | one / one | checkpoint row only |
+| `observe` | `ObservationRecord` | response of one `Original` | `Hash(ObservationRecord)` | one / one | observe row |
+| `hold` | `HoldRecord` | response of one `Original` | `Hash(HoldRecord)` | one / one | hold row |
+| `policy_update` | `PolicyRecord` | registry row | digest of `PolicyCore` | none | policy row |
+| `snapshot` | `Manifest` and its pages | side table | `Hash(Manifest)` | none | snapshot row. `retained_pages` counts stored pages. |
+| `archive_read`, `page`, `terminal`, `recover` | no new retained result | none | none new | none | the §6 row for that call only |
 
 Opening `Commitment` field order for the new members: `pins`, then `capture_domain`, then `source_domain`, then `source`. Later requests insert `pins`, `source_schema`, `capture_domain`, `source_domain` immediately after `source_bound`, in the positions §2.1 names. A later request that omits any of the four is `malformed`. It is not given a default domain.
 
@@ -414,8 +462,8 @@ Auth columns: "requested" is the caller's presented `AuthBinding`. "required" is
 | `issue` | `E(IssueRequest)` including `expected_id` | `ModelSigned<Challenge>` only after confirmed commit | `Op=issue`, scope, stream, owner gen, holder null | current owner role `active` for scope and stream; core registry agrees; caps set | required | required | null; non-null holder is `unauthorized` | `challenge` on `Challenge` | `Hash(Challenge)` | yes | `IssueRequest.idempotency` | ledger | `outstanding`, `inflight` or `concurrent` while prepared, `signer_calls`, `store_calls`, `records`, `stored_bytes`, retry counters if this is a retry, denial and audit and fault on refusal |
 | `consume` | `E(ConsumeRequest)` including `commitment.expected_id` | `ModelSigned<AckCore>` only. No `CheckpointRecord` in this commit. | `Op=consume`, `AuthSubject.arm=lineage`, scope, stream, owner gen, holder null | current owner role `active`; challenge unused and unexpired at post-sign admission; fence and revision unchanged at commit; admission label only `post_sign_admission_only` | required | required | null | `ack` on `AckCore` | `Hash(AckCore)` | yes, one row | `ConsumeRequest.idempotency` | ledger | the consume row in §6 only. No receipt charge. |
 | `archive_read` | `E(ReadOriginalRequest)` | stored `response_bytes` of the matching `Original`, not a new tag | `Op=archive_read`; `AuthSubject.arm=lineage`; `subject.scope` equals `ReadOriginalRequest.scope`; stream and owner gen and holder null | current `PolicyRecord.archive=allow` and historical decision `allow` for the target record's role through a resolvable cutoff; `request_hash` and `response_hash` and `operation` match one stored `Original`; ids alone do not authorize | null on the auth binding; the stored original's stream is whatever that original recorded | null on the auth binding | null; holder id is not read authority and not a substitute for archive | none minted; the historical object's existing kind is the one historical policy evaluates | the stored `Original.event` | no new original | none; do not invent one | read | `store_calls` or page counters only if a later accounting section assigns them; no stream advance; no consume |
-| `snapshot` | `E(SnapshotRequest)` | `ModelSigned<Manifest>` after the side table commit | `Op=snapshot`, scope, stream null (the view covers the lineage, not one caller-chosen stream), holder null, owner gen null | current role kind `snapshot`, state `active`, for that scope; observer basis complete; archive rules do not turn the manifest into write authority | null | null | null | `snapshot` on `Manifest` | `Hash(Manifest)` | no `Original` row; bytes live in `SnapshotStored` | `SnapshotRequest.idempotency` | side | `pages`, `page_items`, `proof_hashes`, `signer_calls`, `store_calls`, `records`, `stored_bytes` |
-| `page` | `E(PageRequest)` | `E(Page)` bytes already fixed by the manifest, no new tag | `Op=page`, scope equals the manifest scope, stream null, holder null, owner gen null | current archive `allow` for kind `snapshot` and the page's historical role; cursor and manifest id recompute; wrong scope is `unauthorized` without foreign bodies | null | null | null | none minted | none new; page id is `Hash(Page)` as an integrity id, not a new ledger `Ref` | no | none | read | `pages`, `page_items`, `proof_hashes`, `store_calls` |
+| `snapshot` | `E(SnapshotRequest)` | `ModelSigned<Manifest>` after the side table commit | `Op=snapshot`, scope, stream null (the view covers the lineage, not one caller-chosen stream), holder null, owner gen null | current role kind `snapshot`, state `active`, for that scope; observer basis complete; archive rules do not turn the manifest into write authority | null | null | null | `snapshot` on `Manifest` | `Hash(Manifest)` | no `Original` row; bytes live in `SnapshotStored` | `SnapshotRequest.idempotency` | side | `retained_pages`, `page_items`, `retained_proof_hashes`, `signer_calls`, `store_calls`, `records`, `stored_bytes` |
+| `page` | `E(PageRequest)` | `E(Page)` bytes already fixed by the manifest, no new tag | `Op=page`, scope equals the manifest scope, stream null, holder null, owner gen null | current archive `allow` for kind `snapshot` and the page's historical role; cursor and manifest id recompute; wrong scope is `unauthorized` without foreign bodies | null | null | null | none minted | none new; page id is `Hash(Page)` as an integrity id, not a new ledger `Ref` | no | none | read | `page_fetches`, `page_items`, `proof_compares`, `store_calls` |
 | `checkpoint` | `E(CheckpointRequest)` including the four context fields in §4.0 | `ModelSigned<CheckpointRecord>` only. This row is the service receipt. | `Op=checkpoint`, `AuthSubject.arm=lineage`, scope, stream, owner gen, holder null | current role kind `checkpoint`, `active` | required | required | null | `checkpoint` on `CheckpointRecord` | `Hash(CheckpointRecord)` | yes, one row | `CheckpointRequest.idempotency` | ledger | the checkpoint row in §6 only. Not a second consume charge. |
 | `observe` | `E(Observation)` as the request (r1 name; the request is the `Observation` record) | `ModelSigned<ObservationRecord>` | `Op=observe`, scope, stream, owner gen, holder null | current role kind `observe`, `active`; not kind `checkpoint` | required | required | null | `observe` | `Hash(ObservationRecord)` | yes | `Observation.idempotency` | ledger | same counter family as checkpoint |
 | `hold` | `E(HoldRequest)` | `ModelSigned<HoldRecord>` with `state=held` or, if uncertainty is committed, `quarantined` | `Op=hold`, scope, stream, owner gen, holder equal to `HoldRequest.holder` | current role kind `hold`, `active`, plus holder binding; principal match is not sufficient | required | required | required | `hold` | `Hash(HoldRecord)` | yes | `HoldRequest.idempotency` | ledger | `records`, `stored_bytes`, `store_calls`, `signer_calls`; outstanding hold is not a releasable reservation |
@@ -490,6 +538,8 @@ digest: see p2-vectors.json.
 | `V-F2-POL-CORE` | Policy request bytes and `ModelSigned` payload are `PolicyCore`. Stored row is `PolicyRecord`. | digest outside the core. `E(PolicyRecord)` is not the request. |
 | `V-F2-RECEIPT-CONSUME` | Successful consume. | one `AckCore` `Original` and one `GlobalEntry`. No `CheckpointRecord`. No receipt charge. `prior_service_receipt` is a lookup or null. |
 | `V-F2-RECEIPT-CKPT` | Successful checkpoint. | one `CheckpointRecord` row, id `Hash("CheckpointRecord", record)`. That row is the only service receipt. Checkpoint charge only. |
+| `V-F2-POL-CUR` | `policy_update` presents the new core's digest as `AuthBinding.policy_digest`. | `unauthorized`. The retained current policy stays the authorizer. |
+| `V-F2-DECL` | Opening domains stored as declared. | not treated as a measured clock mapping. Later ops and restore use §9. |
 
 ## 5. B3 — config, policy digests, minima, continuity
 
@@ -528,10 +578,12 @@ LimitSet={
   depth:U, tokens:U, string_bytes:U, list_items:U,
   output_bytes:U, workspace_bytes:U, recovery_image_bytes:U,
   records:U, stored_bytes:U, outstanding:U, inflight:U, concurrent:U,
-  retry_attempts:U, pages:U, page_items:U, proof_hashes:U,
+  retry_attempts:U, retained_pages:U, page_fetches:U, page_items:U,
+  retained_proof_hashes:U, proof_compares:U,
   signer_calls:U, store_calls:U, issue_lifetime_ns:U, operation_age_ns:U,
   denial_records:U, denial_bytes:U, fault_records:U, audit_records:U,
-  calls:U, call_bytes:U, minima_entries:U, accounting_basis_bytes:U
+  calls:U, call_bytes:U, minima_entries:U, accounting_basis_bytes:U,
+  stock_entries:U, expected_entries:U
 }
 ServerDomainPin={role:server_mono, source:model_counter, unit:ns,
                  process:Id, boot:Id, clock_epoch:Id, leader:Id}
@@ -549,15 +601,31 @@ ConfigRecord={core:ConfigCore, digest:H}
 ### 5.3 Minima and accounting basis, outside the image
 
 ```text
-MinimumKey={registry:RegistryScope, kind:RoleKind, scope_digest:H}
+ScopeTag={arm:lineage, scope:Scope}
+        |{arm:registry, registry:RegistryScope}
+MinimumKey={registry:RegistryScope, kind:RoleKind, subject:ScopeTag}
 Minimum={key:MinimumKey, generation:U, digest:H, basis:Id}
+StockKey={arm:principal, principal:Id}
+        |{arm:tenant, tenant:Id}
+        |{arm:model, model:Id}
+        |{arm:aggregate, aggregate:all}
+KeyedStock={key:StockKey, class:StockClass, metric:MetricName, value:U}
+Floor={key:StockKey, metric:MetricName, minimum:U}
+Accounting={stocks:List<KeyedStock>, floors:List<Floor>}
+ExpectedMember={class:ExpectedClass, identity:H}
+ExpectedSet={members:List<ExpectedMember>}
 ExternalBasis={config:ConfigRecord, minima:List<Minimum>,
-               continuity:Continuity, accounting:Usage}
+               expected:ExpectedSet, continuity:Continuity,
+               accounting:Accounting}
 Continuity={service_epoch:Id, writer_term:U, server_domain:ServerDomainPin,
             config_digest:H}
 ```
 
-`Usage` is the r1 counter record (all required `U`, extended in §6 with `calls` and `call_bytes`). `scope_digest` is `Hash("Scope", scope)` or `Hash("RegistryScope", registry)` as named on the key; it is not a hash of the image. `basis` is an id in the external fixture, not a row of the image being authorized.
+`expected_set_id = Hash("ExpectedSet", expected)`. That id is not a field of `ExpectedSet`. `identity` is the hash of the named object (`PolicyCore`, `Minimum`, observer record, `Scope`, `RegistryScope`, or role bytes) under its own type name. `ScopeTag.arm` says which object. There is no `scope_digest` and no "as named on the key" choice. Swapping lineage and registry arms is `binding`.
+
+`StockKey` has exactly one arm. `aggregate` is the literal `all`. For each `metric` and `class`, the aggregate `value` must equal the checked sum of the principal stocks of that metric and class, and must equal the checked sum of the tenant stocks of that metric and class. The model stock of that metric and class must equal the same aggregate. Inequality is `unavailable`. A list longer than `limits.stock_entries` or an `ExpectedSet` longer than `limits.expected_entries` is unusable, not truncated.
+
+`basis` on a `Minimum` is an id in the external fixture, not a row of the image being authorized. External roots are trusted synthetic inputs. They are not proof that a different party retained the bytes.
 
 Bounds, from the external config, applied to the basis itself:
 
@@ -573,11 +641,11 @@ Order is fixed. First failure stops grants. Committed original bytes, consumed n
 1. External `ConfigRecord`, `ExternalBasis`, and observer basis are present and inside their own caps. Else `unavailable` / `policy_unknown`. No seed from the image.
 2. `Continuity.config_digest` equals `ConfigRecord.digest` and `ServerDomainPin` equals `ConfigCore.server_domain`. Else `unavailable`.
 3. Image `config_hash` equals that same digest. Else deny changed caps or charges (`conflict` / `fork`). Do not adopt the image's limits.
-4. For every policy row the image still carries, a `Minimum` with the same registry, kind, and scope exists. Image generation lower than that minimum: `regression`. Same generation and different digest: `fork`. Missing minimum: `policy_unknown`.
+4. Bidirectional completeness against the external `ExpectedSet`, not against the rows the image still carries. Every expected `policy`, `minimum`, `observer`, `role`, `lineage_scope`, and `registry` member must be present. Every present policy row, minimum, and observer must be a member. Expected-but-missing and present-but-unexpected are both `policy_unknown` / `unknown`. Deleting a policy row and its minimum together still fails, because the expected set is outside the image. A matching `Minimum.subject` must equal the policy's registry or lineage tag. Image generation lower than that minimum: `regression`. Same generation and different digest: `fork`. Recomputing the image self-hash does not repair a missing or extra row. A complete expected set with agreeing minima restores.
 5. Historical decision `unknown`, or a cutoff that §7 calls unknown: `policy_unknown`. Not all-history.
 6. Image `writer_term` must equal `Continuity.writer_term`. Do not take the greater of the two. Disagreement: `commit_unknown`, no grant.
 7. On an accepted restore the model then uses a fixture-supplied new `service_epoch` and checked `writer_term+1`. The new term is not read from the image. Unused challenges in the old service epoch or in a server domain that is not the current pin become `invalidated` with `invalidated_by` equal to the new service-epoch `Id` (§7). Consumed challenges and committed originals are unchanged. Client deadlines are not rewritten.
-8. Image `usage` lower than external `accounting` on any cumulative field is undercharge: latch `unavailable`. Disposable reservations in the image (`inflight`, `concurrent`, `workspace` mirror) are dropped, not converted into grants (§6).
+8. Image `Accounting` is reconciled to the external `Accounting` by §6. A cumulative or inventory stock below its external floor, or an aggregate that does not match its keys, is undercharge: latch `unavailable`. A gauge may be lower than an older floor only when §6's explained release applies. Disposable meters are not image stocks.
 
 ### 5.5 Deny table
 
@@ -586,6 +654,14 @@ Order is fixed. First failure stops grants. Committed original bytes, consumed n
 | External config absent | `limit_unset`, no grant | `V-B3-CFG-MISS` |
 | Minima absent or shorter than the retained basis | `policy_unknown`, no grant | `V-B3-MIN-MISS` |
 | Basis filtered (one minimum removed, image otherwise intact) | `policy_unknown` | `V-B3-MIN-FILT` |
+| Expected member absent, including policy and minimum both deleted | `unknown` | `V-F3-EXP-MISS` |
+| Image row not in the expected set | `unknown` | `V-F3-EXP-EXTRA` |
+| `ScopeTag` arm swapped | `binding` | `V-F3-KEY-SWAP` |
+| Lineage subject on a registry minimum, or the reverse | `binding` | `V-F3-KEY-ARM` |
+| Complete expected set and minima | restore proceeds | `V-F3-EXP-OK` |
+| Image self-hash recomputed after a row delete | still `unknown` | `V-F3-HASH` |
+| Aggregate stock not equal to the principal sum or the tenant sum | `unavailable` | `V-F3-STOCK` |
+| Cumulative stock below its external floor | `unavailable` | `V-F3-FLOOR` |
 | Image generation < minimum generation | `regression` | `V-B3-GEN-LOW` |
 | Same generation, different policy digest | `fork` | `V-B3-GEN-FORK` |
 | Image caps, weights, or `charge_profile` differ from external config | deny; self-hash irrelevant | `V-B3-CAP-CHG` |
@@ -601,13 +677,37 @@ digest: see p2-vectors.json. No digest is written in this section.
 
 All figures that a later fixture puts in `LimitSet` are synthetic inputs. They are UNMEASURED. They are not live defaults. Unset means the external config is absent or a required `LimitSet` field is not a canonical `U`: deny `limit_unset`. Exhausted cumulative quota or uncertain accounting latches `status=unavailable` and `unknown`. That latch does not evict originals, does not reuse a consumed namespace, does not clear `first_break`, and does not unlock a hold. There is no admin, time, or quota release.
 
-### 6.1 Two stocks
+### 6.1 Four stock classes
 
-Cumulative retained charges commit only inside the atomic image swap and survive crash, expiry, and retry. They are: `records`, `stored_bytes`, `retry_attempts`, `signer_calls`, `store_calls`, `denial_records`, `denial_bytes`, `fault_records`, `audit_records`, `calls`, `call_bytes`, and `outstanding` while a challenge is still `unused`.
+Every metric has one class. A field does not serve two classes.
 
-Disposable reservations never become history. They are: `inflight`, `concurrent`, `workspace_bytes`, and the attempt-local parse scratch counted against `parse_bytes`. Release them when the attempt ends, including refuse, and on any crash before the swap commits. Do not release them by deleting a committed row. A crash after the swap leaves cumulative charges in place and releases only reservations that were not converted.
+| Class | Metrics | Rule |
+|---|---|---|
+| `gauge` | `outstanding`, `inflight`, `concurrent` | May decrease only by an explained release. `outstanding` decreases by one when a challenge moves from `unused` to `consumed` or `invalidated`, and never below zero. That release is a legitimate consume-to-zero. It is not a rollback. A decrease with no such transition is `unavailable`. `inflight` and `concurrent` are disposable gauges: they return to zero at attempt end and are not image stocks. |
+| `cumulative` | `records`, `stored_bytes`, `retry_attempts`, `signer_calls`, `store_calls`, `denial_records`, `denial_bytes`, `fault_records`, `audit_records`, `calls`, `call_bytes` | Never decrease. Image copies of these change only at the atomic swap, except the independently retained basis charges in §6.3. |
+| `inventory` | `retained_pages`, `retained_proof_hashes` | Count stored snapshot pages and stored proof hashes. Never decrease. Not a fetch counter. |
+| `meter` | `page_fetches`, `proof_compares`, plus ceilings `workspace_bytes` and `parse_bytes` | Disposable. Not an image stock. Reset at attempt end. Reset does not delete inventory. |
 
-`retry_attempts` increments once per retry class call and is never set back to zero at the start of an attempt. Winning-byte retries still pay this retained cost. They do not add a second `records` charge and do not advance the stream (§3 oracle).
+`retry_attempts` increments once per retry-class call in the external basis at receive (§6.3) and is never set back to zero at the start of an attempt. Winning-byte retries still pay this retained cost. They do not add a second `records` charge and do not advance the stream (§3 oracle).
+
+Nested retained artifacts, each charged once. `stored_bytes` is the canonical byte length of the retained encoding. `records` is one per `Original` or registry or side-table manifest.
+
+| Artifact | `records` | `stored_bytes` includes |
+|---|---|---|
+| `Original` response that is `AckCore` (consume) | 1 | request bytes and the `AckCore` response once. No second receipt row. |
+| `Original` response that is `Challenge`, `OwnerRecord`, `ObservationRecord`, or `HoldRecord` | 1 | request bytes and that response once |
+| `CheckpointRecord` | 1 | request bytes and the checkpoint record once |
+| `PolicyRecord` | 1 registry row, not an `Original` | canonical `PolicyRecord` once |
+| `Manifest` plus pages | 1 manifest | manifest bytes once. Each stored page adds one `retained_pages` and its byte length. Each stored proof hash adds one `retained_proof_hashes`. |
+| `Denial` | the denial counters, not an `Original` | canonical denial bytes |
+
+Attribution for a charge, including a malformed or unauthenticated receive:
+
+```text
+ChargeAttr={authn:Authn, principal:Id?, tenant:Id?, model:Id}
+```
+
+`authenticated` requires a resolved principal and tenant. `unauthenticated` requires both null. The model id is the receiving model from the external config. Unauthenticated charges update only the model stock and the aggregate. They do not invent a principal or a tenant. Empty attribution is `unavailable`.
 
 `audit_records` and `fault_records` are counter-only. They are not a retained trace, log, or export. `denial_records` is the r1 `Denial` list, bounded by `denial_records` and `denial_bytes`. Append only. If another denial would exceed either cap, do not drop the earliest denial and do not drop `first_break`; latch `unavailable`.
 
@@ -632,15 +732,28 @@ Per-request, per-principal, per-tenant, and per-model stocks are all enforced. A
 
 ### 6.3 Phases and witnesses
 
-Phases: receive, parse, auth, sign, prepare, atomic swap, confirmation, delivery. Cumulative charges appear in the image only at swap. Confirmation loss after a committed swap does not undo them. Delivery loss does not undo them. Ambiguity across swap and confirmation is `commit_unknown`: no provisional positive bytes, and if the accounting basis cannot be matched to exactly one image, latch `unavailable`.
+Phases: receive, reserve, work, prepare, atomic swap, confirmation, delivery. Image cumulative and inventory stocks change only at swap. Independently retained basis charges update `ExternalBasis.accounting` in their own basis commit, which is not the image swap: `calls` and `retry_attempts` at receive, `signer_calls` on a failed sign, `store_calls` on a completed read. A basis commit that the witness does not record is not assumed. Confirmation loss after a committed swap does not undo image stocks. Delivery loss does not undo them.
 
 ```text
 CommitWitness={before:H, after:H?, writer_term:U, revision:U,
-               phase:prepare|swap|confirm|deliver,
+               phase:receive|reserve|work|prepare|swap|confirm|deliver,
                outcome:committed|refused|unknown}
 ```
 
-`before` and `after` are image digests when an image exists (`after` null if no new image committed). The witness is external fixture state. It is not an idempotency id, not a caller request, and not a lineage. Restore must find a witness that agrees with the image bytes and the external term. Missing or contradictory witness: `commit_unknown`, no new grant. Crash before swap: image unchanged, reservations released, cumulative stocks unchanged, witness `refused` or absent. Crash after swap: image is the committed one, cumulative stocks stand, reservations are not still held, witness `committed`.
+`before` and `after` are image digests when an image exists (`after` null if no new image committed). The witness is external fixture state. It is not an idempotency id, not a caller request, and not a lineage.
+
+Resolved refusal: witness `outcome=refused`, image unchanged, and any basis charges the phase table says were already committed stay committed. Unknowable commit: no witness, or witness `unknown`, or witness and image disagree. That is `commit_unknown` / `unavailable`, not a clean refusal and not a success. Ambiguity fails closed. Originals, consumed namespaces, `first_break`, and holds are not evicted.
+
+| Crash crossing | Image | Basis charges already committed | Reservations | Outcome |
+|---|---|---|---|---|
+| Before reserve | unchanged | none | none | resolved refusal if the attempt is known not to have started. No witness required for "nothing happened." |
+| After reserve, before work | unchanged | none | released | resolved refusal. Witness `refused`. Absent witness here is still refusal only when no work and no swap could have started. If that is not known, unknowable. |
+| After work, before swap | unchanged | failed sign, completed read, receive `calls` / `retry_attempts` if those basis commits are witnessed | released | resolved refusal when the witness says `refused`. If the witness is absent, unknowable: do not treat the work as free and do not invent the image commit. |
+| After swap, before witness | the swapped image stands and is not rolled back | image stocks stand | disposable meters released | unknowable for new grants: `commit_unknown`. Not a resolved refusal. |
+| After witness `committed` | matches `after` | matches the image plus the basis | meters not held | committed. New grants may proceed only if §5 also passes. |
+| After witness `refused` | matches `before` | only the pre-swap basis charges | released | resolved refusal. |
+
+A missing witness is not a blanket refusal. It is refusal only in the two rows that say so. Everywhere else it is unknowable.
 
 ### 6.4 Metric × call rows
 
@@ -677,25 +790,26 @@ Shared restore cell `EXT`: read the ceiling from the external config; cumulative
 | `records` | count | `archive_read`, `page`, `read`, `page_call`, `malformed`, `auth_denied`, `terminal`, `recover`, `retry` | those scopes | none | no new record. `retry` keeps the winner's single record | never | EXT |
 | `stored_bytes` | byte | same commit set as `records` | per-principal, per-tenant, per-model | prepare | add canonical retained size at swap; release reservation if no commit | never | EXT; undercharge latches `unavailable` |
 | `stored_bytes` | byte | non-commit calls listed on the `records` NA row | those scopes | none | no add | never | EXT |
-| `outstanding` | count | `issue` | per-principal, per-tenant, per-model | issue prepare | +1 at swap while `unused`; release when that challenge becomes `consumed` or `invalidated` | not per attempt; release is that state change only | EXT; do not clear by eviction |
+| `outstanding` | count, gauge | `issue` | principal, tenant, model, aggregate | issue prepare | +1 at swap while `unused`. Decrease by one on `consumed` or `invalidated`, including to zero. No other decrease. | not per attempt | EXT. A consume-to-zero with that transition restores. A drop without the transition is `unavailable`. Do not clear by eviction. |
 | `outstanding` | count | every call except `issue` | those scopes | none | NA | none | EXT |
 | `inflight` | count | every caller call except `malformed` | per-principal, per-tenant, per-model | auth | +1 disposable; release at attempt end and on crash before or after swap (not a retained stock) | every attempt | drop |
 | `inflight` | count | `malformed` | those scopes | none | no reservation; parse failed first | every attempt | drop |
 | `inflight` | count | `recover` | per-model | prepare | +1 disposable; release at end | every attempt | drop |
 | `concurrent` | count | same calls as `inflight` | same as `inflight` | same point as `inflight` | same disposable rule, separate counter | every attempt | drop |
-| `retry_attempts` | count | `retry` | per-principal, per-tenant, per-model | receive | +1 retained immediately in the basis even if the attempt later conflicts; never give the winner's bytes a free retry | never, including not at attempt start | EXT |
+| `retry_attempts` | count, cumulative | `retry` | principal, tenant, model, aggregate | receive | +1 in the external basis at the witnessed receive commit, even if the attempt later conflicts; the image stock gains that +1 only if a later swap commits an image that includes it; never give the winner's bytes a free retry | never, including not at attempt start | EXT |
 | `retry_attempts` | count | the twelve ops, `malformed`, `auth_denied`, `read`, `page_call` | those scopes | none | unchanged unless the call is also class `retry` | never | EXT |
-| `pages` | count | `snapshot` | per-request at principal, tenant, model | prepare | compare page count; charge +count retained at swap for the side table | never for the retained count | EXT |
-| `pages` | count | `page`, `page_call` | per-request at principal, tenant, model | receive | +1 disposable attempt count against the cap; release does not delete stored pages | attempt counter resets; stored pages do not | EXT |
-| `pages` | count | every other call | none | none | NA | none | EXT |
+| `retained_pages` | count, inventory | `snapshot` | principal, tenant, model, aggregate | prepare | +count at swap for pages stored in the side table | never | EXT |
+| `page_fetches` | count, meter | `page`, `page_call` | per-request at principal, tenant, model | receive | +1 disposable fetch. Does not change `retained_pages` | meter resets; inventory does not | drop the meter |
+| `retained_pages` | count | every call except `snapshot` | none | none | NA | none | EXT |
 | `page_items` | count | `snapshot`, `page`, `page_call` | per-request | prepare or receive | compare items on the page; no stream advance | none | EXT |
 | `page_items` | count | every other call | none | none | NA | none | EXT |
-| `proof_hashes` | count | `snapshot`, `page`, `page_call` | per-request | prepare or receive | compare witness length; oversize denies the view | none | EXT |
-| `proof_hashes` | count | every other call | none | none | NA | none | EXT |
-| `signer_calls` | count | `owner_grant`, `issue`, `consume`, `snapshot`, `checkpoint`, `observe`, `hold`, `policy_update` | per-principal, per-tenant, per-model | sign | +1 retained at swap if a tag was produced; if sign fails, +1 still retained and no positive record | never | EXT |
+| `retained_proof_hashes` | count, inventory | `snapshot` | principal, tenant, model, aggregate | prepare | +count at swap for proof hashes stored with the manifest | never | EXT |
+| `proof_compares` | count, meter | `page`, `page_call` | per-request | receive | compare witness length; oversize denies the view; meter only | meter resets | drop the meter |
+| `retained_proof_hashes` | count | every call except `snapshot` | none | none | NA | none | EXT |
+| `signer_calls` | count, cumulative | `owner_grant`, `issue`, `consume`, `snapshot`, `checkpoint`, `observe`, `hold`, `policy_update` | principal, tenant, model, aggregate | sign | successful tag: +1 in the image at swap. Failed sign: +1 in the external basis at the witnessed work commit, and no positive record | never | EXT |
 | `signer_calls` | count | `recover` | per-model | sign of internal tag | +1 only if the optional internal tag is stored; else 0 | never | EXT |
 | `signer_calls` | count | `archive_read`, `read`, `page`, `page_call`, `terminal`, `malformed`, `auth_denied`, `retry` | those scopes | none | no new tag. `retry` must not re-sign | never | EXT |
-| `store_calls` | count | every call except `malformed` | per-principal, per-tenant, per-model; `recover` is per-model | prepare or the read | +1 retained at swap or at the completed read; crash before store: no +1 | never | EXT |
+| `store_calls` | count, cumulative | every call except `malformed` | principal, tenant, model, aggregate; `recover` is model and aggregate | prepare or the read | +1 in the image at swap, or +1 in the external basis when a read completes before any swap; crash before the store: no +1 | never | EXT |
 | `store_calls` | count | `malformed` | none | none | NA | never | EXT |
 | `issue_lifetime_ns` | ns, server domain | `issue` | per-request | sign | compare `expires_at - issued_at`; exceed denies issuance; retry does not extend | none | do not rewrite `issued_at` or `expires_at` |
 | `issue_lifetime_ns` | ns | every call except `issue` | none | none | NA | none | unchanged |
@@ -717,7 +831,19 @@ Shared restore cell `EXT`: read the ceiling from the external config; cumulative
 
 Positive commit of `terminal` is not a row: the normal path is refusal, so the denial and fault rows cover it. A fixture that needs a success `records` charge for terminal is BLOCKED.
 
-Required vectors, digest: see p2-vectors.json. `V-B4-UNSET` absent config denies. `V-B4-SPLIT` the supplied 61295-versus-16384 pairing is not a request-input success. `V-B4-RETRY` second identical attempt keeps `retry_attempts` and does not zero it. `V-B4-CRASH-PRE` reservations gone, cumulative unchanged, no positive bytes. `V-B4-CRASH-POST` cumulative remains, witness `committed`. `V-B4-AMBIG` missing witness latches `unavailable`. `V-B4-EXHAUST` denial overflow or exhausted `calls` latches `unavailable` and keeps `first_break`, originals, consumed namespaces, and hold fences. `V-B4-NOEVICT` filling `records` does not delete a hold or an original.
+### 6.5 Operational limit selection protocol (future)
+
+No operational cap is selected in this candidate. Every dependent grant, quota, and restore that needs a real cap stays DISABLED until the following exist, and the selected values stay UNKNOWN until then:
+
+1. Workload and context, named before any run: which operation mix, which principal, tenant, and model scopes, and which synthetic-versus-live boundary. This candidate does not name a live workload.
+2. Unit and scope: the `MetricName` or `LimitSet` field, and the `StockKey` arm the measurement applies to.
+3. Saturation, failure, and coverage criteria: what observation would show the stock exhausted, what observation would show a false deny, and what share of the named workload was covered. Those criteria are not evaluated here.
+4. Measurement record and provenance: who recorded the run, the artifact that holds the record, and the supplied-pin rule for that artifact. This file does not contain that record.
+5. Approval by Con, in a later review, before any number becomes an operating cap.
+
+Until that approval, a fixture may carry a `LimitSet` only as a synthetic fixture input. Each such input is one canonical `U` inside that fixture, labeled synthetic, bounded by that fixture's own field, and not a setting, not an observation, and not an approved cap. This document does not choose those integers.
+
+Required vectors, digest: see p2-vectors.json. `V-B4-UNSET` absent config denies. `V-B4-SPLIT` the supplied 61295-versus-16384 pairing is not a request-input success. `V-B4-RETRY` second identical attempt keeps `retry_attempts` and does not zero it. `V-B4-CRASH-PRE` reservations gone, image cumulative unchanged, no positive bytes. `V-B4-CRASH-POST` image cumulative remains, witness `committed`. `V-B4-AMBIG` unknowable witness latches `unavailable` and is not a resolved refusal. `V-B4-EXHAUST` denial overflow or exhausted `calls` latches `unavailable` and keeps `first_break`, originals, consumed namespaces, and hold fences. `V-B4-NOEVICT` filling `records` does not delete a hold or an original. `V-F4-GAUGE-ZERO` consume of the last unused challenge restores `outstanding` at zero. `V-F4-GAUGE-ROLL` outstanding drop without that transition is `unavailable`. `V-F4-PRE-RES`, `V-F4-POST-RES`, `V-F4-POST-WORK`, `V-F4-POST-SWAP`, `V-F4-POST-WIT` are the five crash crossings. `V-F4-REFUSE` is a witnessed resolved refusal. `V-F4-UNKNOWABLE` is a missing witness after work or after swap. `V-F4-SIGN` failed sign charges the basis and writes no positive record. `V-F4-READ` a completed read charges `store_calls` in the basis. `V-F4-NEST` consume `stored_bytes` includes `AckCore` once. `V-F4-ATTR` unauthenticated receive charges model and aggregate only.
 
 ## 7. B5 — conditional states
 
@@ -806,18 +932,29 @@ Fields stay the r1 set: `expected_id`, `attempt`, `dispatch`, `arrival`, `raw_re
 
 Domain and order, checked before any late or missing label. All present monos are `ClientMono` in the core's client domain (§3). If `dispatch` and `arrival` are both present, checked `arrival >= dispatch`. If `arrival` and `durable_resolution` are both present, checked `durable_resolution >= arrival`. If `dispatch` and `durable_resolution` are both present and `arrival` is null, checked `durable_resolution >= dispatch`. Failure is `invalid`. A null milestone is skipped, not compared, and not replaced by `Z` or by the deadline.
 
-One precedence, first match wins:
+Historical classification and present eligibility are different passes. The historical label and the historical bytes are immutable. Eligibility never rewrites them.
+
+Historical classification, first match. `dispatch` and `arrival` may stay null. This pass does not grant.
 
 1. Domain or order failure, as above → `invalid`.
-2. Stored `result = retained` while `durable_resolution` is null or `raw_response_hash` is null → inadmissible. `retained` is never eligible in that shape. Restore does not coerce it to `retained`. Twin of the bad shape: `V-B5-ATT-RET-NODUR`.
-3. Classification pass is restore or readback, and `arrival` is null, and `durable_resolution` is null → `missing`. The deadline is not consulted. A missing time is not a milestone and is not `>= deadline`, so this state is reachable. Twin `V-B5-ATT-MISSING`. Invalid mutation `V-B5-ATT-MISS-LATE` labels this shape `late`.
-4. Any present client milestone among `arrival` and `durable_resolution` is `>= original_deadline` → `late`. `dispatch` alone does not select `late`. Twin `V-B5-ATT-LATE`. Invalid `V-B5-ATT-LATE-EMPTY` (late with both of those milestones null).
-5. `durable_resolution` present, `raw_response_hash` present, hash equals the retained response, and every present time milestone is `< original_deadline` → `retained`. Twin `V-B5-ATT-RETAINED`. This is the only eligible `retained`.
+2. Stored `result = retained` while `durable_resolution` is null or `raw_response_hash` is null → inadmissible shape. Do not relabel it `retained`. Twin `V-B5-ATT-RET-NODUR`.
+3. Classification pass is restore or readback, and `arrival` is null, and `durable_resolution` is null → `missing`. The deadline is not consulted. Twin `V-B5-ATT-MISSING`. Invalid mutation `V-B5-ATT-MISS-LATE` labels this shape `late`.
+4. Any present client milestone among `arrival` and `durable_resolution` is `>= original_deadline` → `late`. `dispatch` alone does not select `late`. Twin `V-B5-ATT-LATE`. Invalid `V-B5-ATT-LATE-EMPTY`.
+5. `durable_resolution` present, `raw_response_hash` present, hash equals the retained response, and every present time milestone is `< original_deadline` → historical `retained`. `arrival` may be null. Under the trusted client fixture, that on-time durable milestone bounds chronology. It does not require every optional field to be nonnull. Twin `V-B5-ATT-RETAINED`.
 6. Pass is not restore or readback, `arrival` is null, and `durable_resolution` is null → `pending`. Twin `V-B5-ATT-PENDING`. The same bytes on a later readback are step 3 `missing`, not `pending` (`V-B5-ATT-PEND-READ`).
-7. Accounting, witness, or continuity uncertainty for this attempt → `unavailable`. Twin `V-B5-ATT-UNAVAIL`.
-8. Otherwise → `invalid` (`V-B5-ATT-INVALID`), including a response hash that does not match retained bytes.
+7. Otherwise → `invalid` (`V-B5-ATT-INVALID`), including a response hash that does not match retained bytes.
 
-No step uses "any milestone `>= deadline`" on a null. That reading is rejected because it makes step 3 unreachable. `missing` is not `late`. `retained` with a missing `durable_resolution` is not eligible.
+Present eligibility runs after the historical label exists and before any eligible observation. First failure means not eligible. The historical label stays.
+
+1. Witness, accounting, or continuity for this attempt is uncertain → not eligible. Label unchanged. Twin `V-F5-RET-WIT`, `V-F5-RET-ACCT`, `V-F5-RET-CONT`, one uncertainty each, same retained bytes.
+2. Original linkage for this attempt is missing → not eligible. Twin `V-F5-RET-LINK`.
+3. A sticky prior `missing`, `late`, `fork`, or other negative on this stream or attempt is set → not eligible. Twins `V-F5-RET-PRIOR-MISS`, `V-F5-RET-PRIOR-LATE`, `V-F5-RET-PRIOR-FORK`.
+4. Historical label is not `retained` → not eligible.
+5. Only then the historical `retained` observation is eligible as history. It is not a new server grant. Twin `V-F5-RET-OK`.
+
+Readback must not fill a null arrival, dispatch, or durable time, and must not upgrade `missing` or `late` to `retained`. Twin `V-F5-RET-READBACK`. Lost original timing stays lost.
+
+No step uses "any milestone `>= deadline`" on a null. `missing` is not `late`. Historical `retained` with uncertainty is still not eligible.
 
 | `result` | `dispatch` | `arrival` | `raw_response_hash` | `durable_resolution` | Eligible observation |
 |---|---|---|---|---|---|
@@ -825,7 +962,7 @@ No step uses "any milestone `>= deadline`" on a null. That reading is rejected b
 | `missing` | optional | null | null | null | no |
 | `invalid` | any | any | any | any | no |
 | `late` | optional | at least one of arrival, durable present and past the deadline | optional | see step 4 | no |
-| `retained` | optional | must not be past the deadline if present | required | required, not past the deadline | yes, historical client classification only; not a new server grant |
+| `retained` | optional, may be null | optional, may be null; if present, must not be past the deadline | required | required, not past the deadline | only after the eligibility pass. Uncertainty, missing linkage, or a sticky prior negative: historical label stays `retained`, observation is not eligible |
 | `unavailable` | any | any | any | any | no |
 
 `pending` and `missing` share a null shape and are split only by step 3 versus step 6. Restore of an open-looking attempt with no arrival and no durable resolution is `missing`, not a fabricated on-time `retained`.
@@ -947,7 +1084,7 @@ Restore reads only the opening consume `Original.request_bytes`. Decode that bod
 | `source_domain` | `ClockDomain` | `commitment.source_domain` |
 | `source_schema` | `H` | `commitment.source.source_schema` (carried r1 `Range` field; `Range` still has no source-domain field) |
 
-Every opening `CaptureRange.domain` must equal `capture_domain`. The source high-water domain is `commitment.source_domain`, not a field of `Range` and not a field of `SourceBound`. `SourceBound` stays `{last, head}`. Mixed capture domains at opening, or a missing `capture_domain` or `source_domain` on that commitment, are `domain` or `malformed` and do not store an origin. No default domain is filled in. `source_domain` and `capture_domain` are full `ClockDomain` values (every id), not a role name alone.
+Every opening `CaptureRange.domain` must equal `capture_domain`. The source high-water domain is `commitment.source_domain`, not a field of `Range` and not a field of `SourceBound`. `SourceBound` stays `{last, head}`. Mixed capture domains at opening, or a missing `capture_domain` or `source_domain` on that commitment, are `domain` or `malformed` and do not store an origin. No default domain is filled in. `source_domain` and `capture_domain` are full `ClockDomain` values (every id), not a role name alone. They are frozen declarations copied from the opening request. They are not a calibrated source clock and not a measured mapping between roles.
 
 r1 `StreamRow` gains `origin:StreamOrigin?` and `fork:ForkLatch`. `origin` is null only before the opening consume commits. After that it is required. Restore recomputes `origin` by the table above. Disagreement with the stored origin is `fork` / `unknown` and is not rewritten from the image's later rows or from current auth. If the opening bytes omit a listed field, restore stores nothing and the stream stays `unknown`.
 
@@ -992,7 +1129,7 @@ Status `RESOLVED` means this candidate states one rule and where it is written. 
 |---|---|---|---|
 | 1. Grammar, domains, public tags | RESOLVED as synthetic `E`/`J`/`F`/`Raw`, explicit null, r1 framing prefix | §2, §2.2 | QorData, then QorProof. Tags are not authentication |
 | 2. Full hash-only witness | RESOLVED by adopting r1 §7.1–7.2 unchanged | §2.2, §7.6 | QorData, then QorProof. Not a compact codec. O(n) leakage stays a limit |
-| 3. API, reservation, accounting (B2) | r3: addresses QorData F1/F2 — pending re-review | §4.0, §4.1 | Not self-RESOLVED. F3 and F4 accounting remain open. Caps are not live defaults |
+| 3. API, reservation, accounting (B2) | r3: addresses QorData F1/F2 — pending re-review | §4.0, §4.1 | Not self-RESOLVED. Accounting closure is the B3/B4 rows. Caps are not live defaults |
 | 4. Nonempty close | RESOLVED as the r3 split: opening `[0, MAX-2]`, close `[MAX-1, MAX-1]`, not a first close of `[0, MAX-1]` | §2 | QorData, then QorProof |
 | 5. Holder release and terminal oracle | RESOLVED as release DISABLED. Positive terminal path BLOCKED. No unlock in this candidate | §4, §7.2 | QorData, then QorProof. A future private test oracle is UNKNOWN and is not authorized here |
 | 6. Image, restore, retry (B1) | r3: addresses QorData F1/F2 — pending re-review | §3.4, §3.6, §8, §9 | Not self-RESOLVED. Two registries and the §3.4 schedule are written. F3–F5 remain open. Stable image is model-durable only |
@@ -1008,7 +1145,10 @@ Status `RESOLVED` means this candidate states one rule and where it is written. 
 | Stream origin equality and sticky equal-height fork (B7) | r3: addresses QorData F1/F2 — pending re-review | §2.1, §9 | Not self-RESOLVED |
 | Two registries: client pre-dispatch record and service `Original` (B1) | r3: addresses QorData F1/F2 — pending re-review | §3.4 | Not self-RESOLVED |
 | `AuthSubject` tagged union (B2) | r3: addresses QorData F1/F2 — pending re-review | §4.0 | Not self-RESOLVED |
-| Numeric `LimitSet` values, including any replacement for the supplied 61295-versus-16384 example | UNKNOWN | §5.2, §6.2 | No authority. Fixtures may supply inputs later. This candidate does not pick them |
+| B3 expected set, minima key, keyed stocks | r3: addresses QorData F3–F5 / QorProof F3–F5 — pending re-review | §5.3, §5.4 | Not self-RESOLVED |
+| B4 stock classes, crash crossings, limit-selection protocol | r3: addresses QorData F3–F5 / QorProof F3–F5 — pending re-review | §6 | Not self-RESOLVED. Operational values stay UNKNOWN. Dependents stay DISABLED |
+| B5 historical label versus present eligibility | r3: addresses QorData F3–F5 / QorProof F3–F5 — pending re-review | §7.9 | Not self-RESOLVED |
+| Numeric `LimitSet` values, including any replacement for the supplied 61295-versus-16384 example | UNKNOWN | §5.2, §6.2, §6.5 | No authority. Synthetic fixture inputs are not measurements. This candidate does not pick them |
 | Qualified C1 result on these bytes | UNKNOWN in this file | §13 | The operator runs the counts-only scan on the final committed bytes, commit message, and candidate PR text. Results are review evidence outside this file. Not stated here. Not zero |
 | Fresh git confirmation of the supplied base | UNKNOWN to this writer | §0 | Supplied pin only. Movement requires a stop |
 | Vector bytes and pin file contents | RESOLVED as generator output | §11, §12 | `gen_vectors.py` writes `p2-vectors.json` and `p2-pins.json`. Computed rows are encoding facts. Model outcomes are NOT EXECUTED. QorData, then QorProof |
