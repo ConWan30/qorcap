@@ -108,5 +108,27 @@ and span no more than `FRAME_CLOCK_GAP_US` (500 ms). Any extra shared values mus
 Missing legs, unknown coverage, expired windows, or mismatches record an explicit reason in
 `agreement`; none is guessed. Existing multi-frame consensus and seal/anchor gates still apply.
 A lone hitmarker, popup, generic killfeed icon, or standalone board comparison is advisory.
-The current generic-icon reader does not establish own-kill coverage, so this leg remains UNKNOWN
-and cannot release a Counted final. Stick remains Counted; rumble stays info-only.
+The generic-icon reader does not establish own-kill coverage. Stick remains Counted; rumble stays info-only.
+
+### CoD killfeed ownership by gamertag (practice build only)
+
+`sidecar/qorcap_cod_killfeed.py` reads each killfeed line on the left of the screen and
+checks the killer name against `OWNER_TAG` (Qortrola30). Each line gets `self`, `not_self`
+or `unreadable` with a confidence, for the killer and for the victim. A victim match is a
+death, not a kill. Teammates' and enemies' kills are `not_self`.
+
+- The matcher is built from a font, not from Con's frames: `packs/cod_killfeed_font.json`
+  is rendered by `prepare_cod_killfeed_font.py` from Roboto Mono (Apache-2.0), a stand-in
+  chosen on other players' names. Each character cell must match its own glyph.
+- Q/O and l/I are near twins in that font. A cell that only loses to its twin is settled by
+  colour: the game draws the local player's own name in gold. Without gold it stays unreadable.
+- `KillfeedTally` follows lines across frames on the frame clock (about 4 reads a second)
+  and counts each own line once. A frame-clock gap, an unplaced frame, a read fault, or any
+  lasting unreadable line makes coverage UNKNOWN, so the gate records
+  `killfeed_coverage_unknown` and the final is not Counted.
+- The runner's feed leg is this tally once it has read a frame; the end board moves its time.
+
+Measured on match-20261106-201029 (720p, 1423 frames at 4 per second): 31 own-kill lines
+against scoreboard KILLS 31, each line checked by eye; 1 lasting line stayed unreadable, so
+that match's coverage is UNKNOWN and its final is not Counted. Deaths read 17 of 23 (advisory).
+match 073204: UNMEASURED (only end-screen frames are on file). REAL MATCH stays on v0.3.38.
