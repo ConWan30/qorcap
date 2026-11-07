@@ -569,3 +569,166 @@ def test_owner_row_fails_closed_and_the_probe_keeps_the_last_five_frames(tmp_pat
     assert "Qortrola30" in blob
     tags = [row.get("owner_row", {}).get("tag") for row in saved["reads"] if row.get("owner_row")]
     assert tags and set(tags) == {"Qortrola30"}
+
+
+PRIV = Path(__file__).resolve().parents[1] / ".qor-grok-internal" / "private-inputs"
+NORMAL_INK = (235, 235, 235)
+HIGHLIGHT_INK = (30, 220, 240)
+LONGER_VALUES = ("1250", "1000", "2048", "9999", "100000", "123456")
+
+
+def _text_pack():
+    return json.loads(H.TEXT_PACK_PATH.read_text(encoding="utf-8"))
+
+
+def _mask(rows):
+    mask = np.zeros((len(rows), len(rows[0])), np.uint8)
+    for y, row in enumerate(rows):
+        for x, ch in enumerate(row):
+            if ch == "1":
+                mask[y, x] = 255
+    return mask
+
+
+def _canonical_masks():
+    masks = {}
+    for item in _text_pack()["digits"]:
+        if item.get("canonical"):
+            masks[item["label"]] = _mask(item["mask_rows"])
+    return masks
+
+
+def _paint(text, masks, color):
+    glyphs = [masks[ch] for ch in text]
+    gap = 2
+    height = max(g.shape[0] for g in glyphs)
+    width = sum(g.shape[1] for g in glyphs) + gap * (len(glyphs) - 1)
+    canvas = np.full((max(height + 8, 24), max(width + 8, 24), 3), 12, np.uint8)
+    x = 4
+    for glyph in glyphs:
+        view = canvas[4:4 + glyph.shape[0], x:x + glyph.shape[1]]
+        view[glyph > 0] = color
+        x += glyph.shape[1] + gap
+    return canvas
+
+
+def _read_painted(text, masks, color):
+    img = _paint(text, masks, color)
+    return H._row_digit_string(img, 0, img.shape[1], 0, img.shape[0], 130, 1.0)
+
+
+def test_row_digit_gates_and_consensus_stay_put():
+    assert H._ROW_DIGIT_MIN == 0.75 and H._ROW_DIGIT_MARGIN == 0.15
+    assert H._OWNER_MIN == 0.80 and H._ROW_HEADER_MIN == 0.70
+    assert H.CONSENSUS_FRAMES == 5
+    assert H._ROW_GLYPH_MAX == 6
+
+
+def test_synthetic_digits_are_labeled_and_the_bank_is_text():
+    data = _text_pack()
+    assert H.TEXT_PACK_PATH.suffix == ".json"
+    assert H.TEXT_PACK_PATH.read_bytes()[:1] == b"{"
+    shipped = np.load(H.PACK_PATH, allow_pickle=False)
+    assert "assists_header_mask" not in shipped.files
+    assert "deaths_column_header_mask" not in shipped.files
+    labels = {item["label"] for item in data["digits"]}
+    assert labels == set("0123456789")
+    synthetic = [item for item in data["digits"] if item["provenance"] == "synthetic"]
+    assert sorted(item["label"] for item in synthetic) == ["0", "6", "8"]
+    for item in synthetic:
+        assert item["note"] == "synthetic sample, real-match recall UNMEASURED"
+    pack = H._pack()
+    assert "assists_header_mask" in pack and "deaths_column_header_mask" in pack
+    assert set(H._labels(pack, "row_digit_labels")) >= set("0123456789")
+
+
+def test_each_stored_digit_reads_in_normal_and_highlighted_ink():
+    data = _text_pack()
+    for item in data["digits"]:
+        masks = {item["label"]: _mask(item["mask_rows"])}
+        for color in (NORMAL_INK, HIGHLIGHT_INK):
+            assert _read_painted(item["label"], masks, color) == item["label"]
+
+
+def test_synthetic_sweep_covers_0_to_100_and_every_three_digit_value():
+    masks = _canonical_masks()
+    assert set(masks) == set("0123456789")
+    for color in (NORMAL_INK, HIGHLIGHT_INK):
+        for number in range(0, 101):
+            assert _read_painted(str(number), masks, color) == str(number)
+        for number in range(100, 1000):
+            assert _read_painted(str(number), masks, color) == str(number)
+        for text in LONGER_VALUES:
+            assert _read_painted(text, masks, color) == text
+        assert _read_painted("1234567", masks, color) is None
+
+
+def test_headers_do_not_cross_map_and_old_row_stays_13():
+    board = frame("end_173922_019.jpg")
+    row = H.read_owner_row(board)
+    assert (row.kills, row.deaths, row.assists, row.confirms) == (13, 13, None, 7)
+    pack = H._pack()
+    assists = pack["assists_header_mask"]
+    deaths_col = pack["deaths_column_header_mask"]
+    others = (
+        pack["kills_header_mask"],
+        pack["confirms_header_mask"],
+        pack["deaths_header_mask"],
+        deaths_col,
+    )
+    for mask in others:
+        painted = np.zeros((48, 96), np.uint8)
+        painted[8:8 + mask.shape[0], 8:8 + mask.shape[1]] = mask
+        hit = H._best_mask(painted, assists, 1.0, 0.0)
+        score = 0.0 if hit is None else hit[0]
+        if mask is deaths_col:
+            assert score < H._ROW_HEADER_MIN
+        else:
+            assert score < H._ROW_HEADER_MIN
+    painted = np.zeros((48, 96), np.uint8)
+    painted[8:8 + assists.shape[0], 8:8 + assists.shape[1]] = assists
+    hit = H._best_mask(painted, pack["kills_header_mask"], 1.0, 0.0)
+    assert hit is None or hit[0] < H._ROW_HEADER_MIN
+    hit = H._best_mask(painted, pack["deaths_header_mask"], 1.0, 0.0)
+    assert hit is None or hit[0] < H._ROW_HEADER_MIN
+
+
+def test_tdm_owner_row_is_k9_a2_d21_and_not_the_other_columns():
+    path = PRIV / "f_0846.jpg"
+    assert path.is_file()
+    board = cv2.imread(str(path))
+    row = H.read_owner_row(board)
+    assert row.ok and row.player_tag == "Qortrola30"
+    assert (row.kills, row.assists, row.deaths) == (9, 2, 21)
+    assert row.confirms is None
+    assert row.kills != 11
+    wiped = board.copy()
+    wiped[528:556, 165:250] = 0
+    gone = H.read_owner_row(wiped)
+    assert gone.ok is False and gone.kills is None
+    no_kills = board.copy()
+    no_kills[530:556, 395:445] = 0
+    assert H.read_owner_row(no_kills).ok is False
+    no_assists = board.copy()
+    no_assists[530:556, 475:530] = 0
+    assert H.read_owner_row(no_assists).ok is False
+    no_deaths = board.copy()
+    no_deaths[530:556, 550:610] = 0
+    missed = H.read_owner_row(no_deaths)
+    assert missed.ok is False and missed.deaths is None
+    for name in (f"f_{i:04d}.jpg" for i in range(842, 855)):
+        img = cv2.imread(str(PRIV / name))
+        assert img is not None
+        read = H.read_owner_row(img)
+        if read.ok:
+            assert (read.kills, read.assists, read.deaths) == (9, 2, 21)
+
+
+def test_rebuild_writes_a_temporary_pack_only(tmp_path):
+    before = H.PACK_PATH.read_bytes()
+    dest = tmp_path / "cod_mw4_hud_v1.npz"
+    H.build_calibration_pack(out_path=dest)
+    assert dest.is_file()
+    assert H.PACK_PATH.read_bytes() == before
+    raw = np.load(dest, allow_pickle=False)
+    assert "assists_header_mask" not in raw.files
