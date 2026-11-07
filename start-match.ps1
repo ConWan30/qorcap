@@ -202,6 +202,7 @@ if (-not $hasChallengeFlag -and -not $isFinalize) { $fwd = @("--official-challen
 # Side pick (v0.3.26): your side is signed into the first checkpoint, so it is chosen before recording starts.
 # "Start Match.cmd --side away" (or home) skips the prompt; so does a one-shot next-side.txt in %LOCALAPPDATA%\QorCap
 # (renamed after use; ignored if older than 4 h). Otherwise qorcap_match.py shows the big H / A prompt and waits.
+# Madden only: for Call of Duty qorcap_match.py skips the H / A prompt (no home/away pick).
 $hasSide = $false
 foreach ($x in $fwd) { if ($x -eq "--side" -or $x -eq "--role" -or $x -like "--side=*" -or $x -like "--role=*") { $hasSide = $true } }
 if (-not $hasSide -and -not $isFinalize) { $fwd = @("--side", "ask") + $fwd }
