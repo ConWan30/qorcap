@@ -119,6 +119,7 @@ LINUX_FILES = (
     "sidecar/test_qorcap_glimpse_watch.py",
     "sidecar/test_qorcap_glimpse_witness.py",
     "sidecar/test_qorcap_submit.py",
+    "sidecar/test_qorcap_rlr_stage_a.py",
 )
 WINDOWS_FILES = (
     "sidecar/test_pairing.py",
@@ -174,6 +175,7 @@ WINDOWS_FILES = (
     "sidecar/test_qorcap_glimpse_watch.py",
     "sidecar/test_qorcap_glimpse_witness.py",
     "sidecar/test_qorcap_submit.py",
+    "sidecar/test_qorcap_rlr_stage_a.py",
 )
 # pytest --collect-only -q of each --list with QORTIME importable. Pin the same
 # numbers in tools/test_assert_pytest_skips.py. See README "Sidecar CI suite list".
@@ -183,8 +185,8 @@ WINDOWS_FILES = (
 # Collect-only of these lists after the tail tests in sidecar/test_post_final_tail.py.
 # Main e00d374, including the guard tests, collected 596 linux / 578 windows.
 # Re-collect after any list or test change.
-LINUX_MIN_COLLECTED = 735
-WINDOWS_MIN_COLLECTED = 717
+LINUX_MIN_COLLECTED = 824
+WINDOWS_MIN_COLLECTED = 806
 
 # Absent from both sidecar suites. A reason is required; whitespace does not count.
 EXCLUDED_TEST_FILES = {
