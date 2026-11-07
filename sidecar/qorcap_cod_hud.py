@@ -1119,14 +1119,46 @@ def _row_digit_string(img, x0: int, x1: int, y0: int, y1: int, thr: int, scale: 
     n, lab, st, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
     minh = max(5, int(round(6 * scale)))
     maxw = max(10, int(round(18 * scale)))
-    comps = []
+    kept = []
+    frags = []
     for i in range(1, n):
         x, y, ww, hh, area = (int(t) for t in st[i])
-        if area < 8 or hh < minh or ww < 2 or ww > maxw:
+        if ww < 2 or ww > maxw or hh < 1:
             continue
         g = (lab[y:y + hh, x:x + ww] == i).astype(np.uint8) * 255
-        comps.append((x, g))
-    comps.sort()
+        piece = {"x": x, "y": y, "w": ww, "h": hh, "area": area, "glyph": g}
+        if area >= 8 and hh >= minh:
+            kept.append(piece)
+        elif 3 <= area < 8 or (area >= 3 and hh < minh):
+            frags.append(piece)
+    # A bright cut can split one glyph. Join a short piece only when it sits
+    # on the same x span, within two pixels. A piece that is not there stays
+    # out, so a cut glyph is not completed with invented ink.
+    for frag in frags:
+        for host in kept:
+            overlap = min(host["x"] + host["w"], frag["x"] + frag["w"]) - max(host["x"], frag["x"])
+            if overlap < max(2, frag["w"] // 2):
+                continue
+            below = frag["y"] - (host["y"] + host["h"])
+            above = host["y"] - (frag["y"] + frag["h"])
+            if not (0 <= below <= 2 or 0 <= above <= 2):
+                continue
+            x0b = min(host["x"], frag["x"])
+            y0b = min(host["y"], frag["y"])
+            x1b = max(host["x"] + host["w"], frag["x"] + frag["w"])
+            y1b = max(host["y"] + host["h"], frag["y"] + frag["h"])
+            if x1b - x0b > maxw:
+                continue
+            canvas = np.zeros((y1b - y0b, x1b - x0b), np.uint8)
+            canvas[host["y"] - y0b:host["y"] - y0b + host["h"], host["x"] - x0b:host["x"] - x0b + host["w"]] = host["glyph"]
+            canvas[frag["y"] - y0b:frag["y"] - y0b + frag["h"], frag["x"] - x0b:frag["x"] - x0b + frag["w"]] = np.maximum(
+                canvas[frag["y"] - y0b:frag["y"] - y0b + frag["h"], frag["x"] - x0b:frag["x"] - x0b + frag["w"]],
+                frag["glyph"],
+            )
+            host["x"], host["y"], host["w"], host["h"] = x0b, y0b, x1b - x0b, y1b - y0b
+            host["glyph"] = canvas
+            break
+    comps = sorted(((piece["x"], piece["glyph"]) for piece in kept), key=lambda item: item[0])
     if not comps or len(comps) > _ROW_GLYPH_MAX:
         return None
     text = ""

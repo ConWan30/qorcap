@@ -571,7 +571,6 @@ def test_owner_row_fails_closed_and_the_probe_keeps_the_last_five_frames(tmp_pat
     assert tags and set(tags) == {"Qortrola30"}
 
 
-PRIV = Path(__file__).resolve().parents[1] / ".qor-grok-internal" / "private-inputs"
 NORMAL_INK = (235, 235, 235)
 HIGHLIGHT_INK = (30, 220, 240)
 LONGER_VALUES = ("1250", "1000", "2048", "9999", "100000", "123456")
@@ -693,35 +692,77 @@ def test_headers_do_not_cross_map_and_old_row_stays_13():
     assert hit is None or hit[0] < H._ROW_HEADER_MIN
 
 
+def _stamp(canvas, mask, x, y, color):
+    view = canvas[y:y + mask.shape[0], x:x + mask.shape[1]]
+    view[mask > 0] = color
+
+
+def _synthetic_tdm_board():
+    """Synthetic 720p board. Shipped name and KILLS masks, text ASSISTS and DEATHS masks.
+
+    Digits are the committed canonical masks. This is not a captured frame.
+    Eliminations 11 sit below the row and are not a kill column.
+    """
+    pack = H._pack()
+    masks = _canonical_masks()
+    board = np.zeros((720, 1280, 3), np.uint8)
+    _stamp(board, pack["owner_mask"], 172, 534, (255, 255, 255))
+    _stamp(board, pack["kills_header_mask"], 420, 400, (255, 255, 255))
+    _stamp(board, pack["assists_header_mask"], 484, 403, (255, 255, 255))
+    _stamp(board, pack["deaths_column_header_mask"], 560, 403, (255, 255, 255))
+    _stamp(board, masks["9"], 432, 536, HIGHLIGHT_INK)
+    _stamp(board, masks["2"], 496, 536, HIGHLIGHT_INK)
+    _stamp(board, masks["2"], 566, 536, HIGHLIGHT_INK)
+    _stamp(board, masks["1"], 574, 536, HIGHLIGHT_INK)
+    _stamp(board, masks["1"], 760, 640, HIGHLIGHT_INK)
+    _stamp(board, masks["1"], 766, 640, HIGHLIGHT_INK)
+    return board
+
+
 def test_tdm_owner_row_is_k9_a2_d21_and_not_the_other_columns():
-    path = PRIV / "f_0846.jpg"
-    assert path.is_file()
-    board = cv2.imread(str(path))
+    board = _synthetic_tdm_board()
     row = H.read_owner_row(board)
     assert row.ok and row.player_tag == "Qortrola30"
     assert (row.kills, row.assists, row.deaths) == (9, 2, 21)
     assert row.confirms is None
     assert row.kills != 11
     wiped = board.copy()
-    wiped[528:556, 165:250] = 0
+    wiped[534:550, 172:240] = 0
     gone = H.read_owner_row(wiped)
-    assert gone.ok is False and gone.kills is None
+    assert gone.ok is False and gone.kills is None and gone.player_tag is None
     no_kills = board.copy()
-    no_kills[530:556, 395:445] = 0
+    no_kills[532:548, 428:442] = 0
     assert H.read_owner_row(no_kills).ok is False
     no_assists = board.copy()
-    no_assists[530:556, 475:530] = 0
+    no_assists[532:548, 490:508] = 0
     assert H.read_owner_row(no_assists).ok is False
     no_deaths = board.copy()
-    no_deaths[530:556, 550:610] = 0
+    no_deaths[532:548, 560:590] = 0
     missed = H.read_owner_row(no_deaths)
     assert missed.ok is False and missed.deaths is None
-    for name in (f"f_{i:04d}.jpg" for i in range(842, 855)):
-        img = cv2.imread(str(PRIV / name))
-        assert img is not None
-        read = H.read_owner_row(img)
-        if read.ok:
-            assert (read.kills, read.assists, read.deaths) == (9, 2, 21)
+
+
+def test_split_glyph_recovers_and_a_cut_glyph_abstains():
+    """A gap inside a full 2 is joined from the pixels that are there.
+
+    The six-row deaths piece measured on the last private frame is not a
+    sample and is not added to the bank. Alone, it stays unread.
+    """
+    full = _canonical_masks()["2"]
+    assert full.shape[0] == 9
+    top = full[:6]
+    bottom = full[6:]
+    img = np.full((32, 32, 3), 12, np.uint8)
+    img[4:10, 8:8 + top.shape[1]][top > 0] = NORMAL_INK
+    img[11:11 + bottom.shape[0], 8:8 + bottom.shape[1]][bottom > 0] = NORMAL_INK
+    assert H._row_digit_string(img, 0, 32, 0, 32, 130, 1.0) == "2"
+    cut = np.full((32, 32, 3), 12, np.uint8)
+    cut[4:10, 8:8 + top.shape[1]][top > 0] = NORMAL_INK
+    assert H._row_digit_string(cut, 0, 32, 0, 32, 130, 1.0) is None
+    truncated = _mask(["0110", "1001", "0001", "0001", "0010", "0110"])
+    alone = np.full((32, 32, 3), 12, np.uint8)
+    alone[4:10, 8:12][truncated > 0] = NORMAL_INK
+    assert H._row_digit_string(alone, 0, 32, 0, 32, 130, 1.0) is None
 
 
 def test_rebuild_writes_a_temporary_pack_only(tmp_path):

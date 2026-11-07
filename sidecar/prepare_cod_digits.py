@@ -4,6 +4,7 @@
 Invocation from the repo root:
 
     python3 sidecar/prepare_cod_digits.py
+    python3 sidecar/prepare_cod_digits.py --validate-private
 
 Reads the shipped pack sidecar/packs/cod_mw4_hud_v1.npz (read-only), the
 committed fixture sidecar/fixtures/cod/end_173922_019.jpg, and the private
@@ -225,8 +226,14 @@ def _fixture_bank(end, pack_labels_note):
     return {"note": pack_labels_note, "samples": samples}
 
 
+def _pack_keys(pack):
+    if hasattr(pack, "files"):
+        return list(pack.files)
+    return list(pack.keys())
+
+
 def _pack_summary(pack):
-    files = list(pack.files)
+    files = _pack_keys(pack)
     labels = H._labels(pack, "row_digit_labels") if "row_digit_labels" in files else []
     return {
         "files": files,
@@ -296,8 +303,9 @@ def build_report() -> dict:
     owner = H._best_mask(owner_search, pack["owner_mask"], scale, H._OWNER_MIN) if scale else None
     header_search = H._value_mask(frame, H._HEADER_SEARCH_VALUE)
     kills_all = _peaks(header_search, pack["kills_header_mask"], H._ROW_HEADER_MIN)
-    deaths_all = _peaks(header_search, pack["deaths_header_mask"], H._ROW_HEADER_MIN) if "deaths_header_mask" in pack.files else []
-    confirms_all = _peaks(header_search, pack["confirms_header_mask"], H._ROW_HEADER_MIN) if "confirms_header_mask" in pack.files else []
+    keys = _pack_keys(pack)
+    deaths_all = _peaks(header_search, pack["deaths_header_mask"], H._ROW_HEADER_MIN) if "deaths_header_mask" in keys else []
+    confirms_all = _peaks(header_search, pack["confirms_header_mask"], H._ROW_HEADER_MIN) if "confirms_header_mask" in keys else []
     report = {
         "ok": True,
         "private_frame": "f_0846.jpg",
@@ -362,7 +370,7 @@ def build_report() -> dict:
             "note": "derived text mask from f_0846 header band at value>80; not a committed image",
         }
     bank = None
-    if "row_digit_vecs" in pack.files and "row_digit_labels" in pack.files:
+    if "row_digit_vecs" in _pack_keys(pack) and "row_digit_labels" in _pack_keys(pack):
         bank = (pack["row_digit_vecs"].astype(np.float32), H._labels(pack, "row_digit_labels"))
     columns = {}
     kills_box = (kills_for_row["score"], kills_for_row["x"], kills_for_row["y"], kills_for_row["w"], kills_for_row["h"])
@@ -439,7 +447,59 @@ def _ascii_from_rows(rows: list[str]) -> list[str]:
     return [row.replace("1", "#").replace("0", ".") for row in rows]
 
 
-def main() -> int:
+def validate_private() -> int:
+    """Print owner-row reads for the private frames. Does not write or train."""
+    cv2, _np = H._libs()
+    if cv2 is None:
+        print(json.dumps({"ok": False, "error": "opencv or numpy missing"}))
+        return 1
+    priv = _repo() / ".qor-grok-internal" / "private-inputs"
+    frames = []
+    read_ok = 0
+    for index in range(842, 855):
+        name = f"f_{index:04d}.jpg"
+        path = priv / name
+        img = cv2.imread(str(path)) if path.is_file() else None
+        if img is None:
+            frames.append({"frame": name, "present": False})
+            continue
+        row = H.read_owner_row(img)
+        item = {
+            "frame": name,
+            "present": True,
+            "ok": bool(row.ok),
+            "reason": row.reason,
+            "kills": row.kills,
+            "assists": row.assists,
+            "deaths": row.deaths,
+            "confirms": row.confirms,
+            "tag": row.player_tag,
+        }
+        frames.append(item)
+        if row.ok:
+            read_ok += 1
+    present = sum(1 for item in frames if item["present"])
+    print(json.dumps({
+        "ok": True,
+        "present_frames": present,
+        "read_frames": read_ok,
+        "frames": frames,
+        "note": "print only; no pack, image, or gate was changed",
+    }, indent=2, sort_keys=True))
+    return 0 if present else 1
+
+
+def main(argv: list[str] | None = None) -> int:
+    import argparse
+    parser = argparse.ArgumentParser(description="Inspect owner-row digits or print private-frame reads.")
+    parser.add_argument(
+        "--validate-private",
+        action="store_true",
+        help="Print read_owner_row for private f_0842.jpg through f_0854.jpg. Writes nothing.",
+    )
+    args = parser.parse_args(argv)
+    if args.validate_private:
+        return validate_private()
     report = build_report()
     # Vecs stay in the JSON. ASCII is a second view of the same masks.
     print(json.dumps(report, indent=2, sort_keys=True))
