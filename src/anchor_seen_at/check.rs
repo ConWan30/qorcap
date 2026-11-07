@@ -50,6 +50,11 @@ pub struct SeenAtFact {
     pub commitment_digest: String,
     pub server_boot_id: String,
     pub server_clock_epoch_id: String,
+    /// The checking client's own clock identity for this exchange, from its retained
+    /// samples. Carried on the fact so a stream can tell a client clock-domain change
+    /// between two exchanges from one continuous client clock.
+    pub client_boot_id: String,
+    pub client_clock_epoch_id: String,
     pub received_mono_ns: u64,
     pub received_wall_us: String,
     pub ledger_seq: u64,
@@ -161,6 +166,8 @@ fn check_ack_inner(challenge: &SignedChallenge, ack_bytes: &[u8], sent: &Commitm
         commitment_digest: u.commitment_digest.clone(),
         server_boot_id: u.server_boot_id.clone(),
         server_clock_epoch_id: u.server_clock_epoch_id.clone(),
+        client_boot_id: samples.send_clock.boot_id.clone(),
+        client_clock_epoch_id: samples.send_clock.clock_epoch_id.clone(),
         received_mono_ns: u.received(),
         received_wall_us: u.received_wall_us.clone(),
         ledger_seq: u.ledger(),

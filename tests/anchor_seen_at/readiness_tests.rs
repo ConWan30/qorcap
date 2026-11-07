@@ -179,6 +179,44 @@ fn rows_in_an_unknown_range_withhold_even_when_later_rows_are_seen_at() {
 }
 
 #[test]
+fn source_bound_regression_after_a_complete_stream_stays_withheld() {
+    let mut r = ready();
+    let frames = [frame(&r.s, 12, 1), frame(&r.s, 18, 2), frame(&r.s, 25, 3)];
+    assert_eq!(evaluate(&inputs(&r, &frames)), Readiness::PracticeReadyForward);
+    assert!(r.view.is_eligible(12) && r.view.is_eligible(18) && r.view.is_eligible(25));
+    // A duplicate of the accepted opening arrives with the source bound lowered
+    // from 29 to 9. The rows remain archivally present, but readiness must fall.
+    r.view.record(&r.opening.clone(), 9);
+    assert_eq!(r.view.break_reason(), Some(Reason::SourceBoundRegression));
+    assert!(!r.view.complete());
+    let why = withheld(evaluate(&inputs(&r, &frames)));
+    assert!(why.contains(&Reason::SourceBoundRegression), "{why:?}");
+}
+
+#[test]
+fn cross_exchange_client_clock_change_stays_withheld_in_readiness() {
+    use qorcap::anchor_seen_at::check::ClockRef;
+    let w = World::new();
+    let s = Session::new("ready-clock");
+    let opening = exchange(&w, &s, Purpose::Opening, 0, None, 0, 9);
+    let mut s_b = s.clone();
+    s_b.client_clock = ClockRef { boot_id: id("ready-clock-b-boot"), clock_epoch_id: id("ready-clock-b-epoch") };
+    let interval = exchange(&w, &s_b, Purpose::Interval, 1, Some(&opening.ack_id()), 10, 19);
+    let close = exchange(&w, &s, Purpose::Close, 2, Some(&interval.ack_id()), 20, 29);
+    let st_o = opening.state(&w.policy);
+    let st_i = interval.state(&w.policy);
+    let st_c = close.state(&w.policy);
+    assert!(st_o.retained().is_some() && st_i.retained().is_some() && st_c.retained().is_some());
+    let mut elig = StreamEligibility::new();
+    for st in [&st_o, &st_i, &st_c] { elig.record(st, 29); }
+    assert_eq!(elig.break_reason(), Some(Reason::ClientClockDomainChanged));
+    let r = Ready { opening: st_o, view: elig, w, s: s.clone() };
+    let frames = [frame(&s, 12, 1), frame(&s, 18, 2), frame(&s, 25, 3)];
+    let why = withheld(evaluate(&inputs(&r, &frames)));
+    assert!(why.contains(&Reason::ClientClockDomainChanged), "{why:?}");
+}
+
+#[test]
 fn loss_then_recovery_and_reversed_arrival_stay_withheld_in_readiness() {
     let w = World::new();
     let s = Session::new("ready-forward-only");

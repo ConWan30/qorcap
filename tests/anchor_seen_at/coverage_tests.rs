@@ -215,6 +215,56 @@ fn deadline_miss_then_valid_close_cannot_clear_the_break() {
 }
 
 #[test]
+fn source_bound_regression_is_rejected_before_dedup_and_latches_a_break() {
+    let w = World::new();
+    let v = full_stream(&w, &Session::new("cov-bound"));
+    let st = states(&w, &v);
+    let mut elig = coverage::StreamEligibility::from_arrival_order(&st, 29);
+    assert!(elig.complete());
+    assert_eq!(elig.break_reason(), None);
+    // The exact trace: a duplicate of an already-accepted ack arrives, this time
+    // carrying a lowered source bound. Dedup must not swallow it first.
+    elig.record(&st[0], 9);
+    assert_eq!(elig.break_reason(), Some(Reason::SourceBoundRegression));
+    assert!(!elig.complete());
+    // The break is sticky, the higher bound is kept, and a later well-formed
+    // observation at the correct bound does not clear it.
+    elig.record(&st[2], 29);
+    assert_eq!(elig.break_reason(), Some(Reason::SourceBoundRegression));
+    assert!(!elig.complete());
+    assert_eq!(elig.unknown_rows(), 0, "the recorded bound was not lowered to 9");
+    assert!(elig.segments().iter().all(|s| s.last_seq <= 29));
+}
+
+#[test]
+fn cross_exchange_client_clock_change_breaks_the_stream() {
+    use qorcap::anchor_seen_at::check::ClockRef;
+    let w = World::new();
+    let s = Session::new("cov-clock");
+    let opening = exchange(&w, &s, Purpose::Opening, 0, None, 0, 9);
+    // The same session, but the interval is checked under a different client clock.
+    let mut s_b = s.clone();
+    s_b.client_clock = ClockRef { boot_id: id("clock-b-boot"), clock_epoch_id: id("clock-b-epoch") };
+    let interval = exchange(&w, &s_b, Purpose::Interval, 1, Some(&opening.ack_id()), 10, 19);
+    let st_o = opening.state(&w.policy);
+    let st_i = interval.state(&w.policy);
+    assert!(st_o.retained().is_some() && st_i.retained().is_some(), "each exchange is retained under its own clock");
+    let mut elig = coverage::StreamEligibility::new();
+    elig.record(&st_o, 29);
+    elig.record(&st_i, 29);
+    assert_eq!(elig.break_reason(), Some(Reason::ClientClockDomainChanged));
+    assert!(!elig.complete());
+    assert!(elig.is_eligible(9));
+    assert!(!elig.is_eligible(15));
+    assert_eq!(elig.segments().last().unwrap(), &unknown(10, 29, Reason::ClientClockDomainChanged));
+    // A later close checked under the original clock does not clear the break.
+    let close = exchange(&w, &s, Purpose::Close, 2, Some(&interval.ack_id()), 20, 29);
+    elig.record(&close.state(&w.policy), 29);
+    assert_eq!(elig.break_reason(), Some(Reason::ClientClockDomainChanged));
+    assert!(!elig.is_eligible(25));
+}
+
+#[test]
 fn reordered_chain_range_is_a_fork_and_restart_invalidates_the_stream() {
     let w = World::new();
     let v = full_stream(&w, &Session::new("cov-reorder-restart"));

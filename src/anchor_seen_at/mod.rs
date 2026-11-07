@@ -95,6 +95,7 @@ pub enum Reason {
     DuplicateFrame,
     TooFewDistinctFrames,
     FrameBudgetUnset,
+    SourceBoundRegression,
 }
 
 impl Reason {

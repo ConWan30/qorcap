@@ -87,7 +87,11 @@ impl CoverageView {
 /// only state readiness may consume. Once [`StreamEligibility::record`] observes a break,
 /// the break (and the first ineligible sequence) is preserved permanently; later facts are
 /// still checkable archivally elsewhere, but they never clear it here.
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// Deliberately not `Clone`: a clone taken before a break could be carried forward and
+/// completed independently while the original stays broken, forking the break lineage.
+/// Eligibility has one owner and one history.
+#[derive(Debug, PartialEq, Eq)]
 pub struct StreamEligibility {
     eligible: Vec<Segment>,
     stream_context: Option<StreamContext>,
@@ -127,6 +131,14 @@ impl StreamEligibility {
     /// Record one observation in arrival order: a retained fact, a late fact (a deadline
     /// miss), or an unknown observation (including the observed loss of an expected ack).
     pub fn record(&mut self, state: &AnchorState, source_last_seq: u64) {
+        // A source-bound regression is rejected before anything else — in particular
+        // before duplicate-ack deduplication, so a duplicate arriving with a lowered
+        // bound cannot quietly shrink the stream. It latches a sticky break and the
+        // previously recorded (higher) bound is kept.
+        if source_last_seq < self.source_last_seq {
+            self.break_at(Reason::SourceBoundRegression);
+            return;
+        }
         self.source_last_seq = source_last_seq;
         if self.break_reason.is_some() { return; }
         match state {
@@ -216,6 +228,13 @@ fn link_reason(prev: &SeenAtFact, f: &SeenAtFact) -> Option<Reason> {
     // boots never form one coverage stream, and nothing after the break recovers it.
     if prev.server_boot_id != f.server_boot_id || prev.server_clock_epoch_id != f.server_clock_epoch_id {
         return Some(Reason::ServerEpochMismatch);
+    }
+    // Client clock continuity across exchanges: each fact was checked against its own
+    // samples, but a stream checked partly under one client clock domain and partly
+    // under another has a discontinuity at the join, even if every exchange is
+    // internally consistent.
+    if prev.client_boot_id != f.client_boot_id || prev.client_clock_epoch_id != f.client_clock_epoch_id {
+        return Some(Reason::ClientClockDomainChanged);
     }
     // Full stream context, not just session and seal.
     let same_stream = StreamContext::of(prev) == StreamContext::of(f)
