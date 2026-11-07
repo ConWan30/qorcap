@@ -20,3 +20,6 @@ pub mod credentials;
 pub mod clip;
 pub mod redteam;
 pub mod device_attest;
+/// Practice-only, off by default. Reachable only with `--features practice-anchor-seen-at`.
+#[cfg(feature = "practice-anchor-seen-at")]
+pub mod anchor_seen_at;
