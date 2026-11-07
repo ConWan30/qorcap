@@ -53,6 +53,16 @@ DISPOSITIONS = {"VERIFIED", "FAIL", "VOID", "NOT_VERIFIED", "MISMATCH", "UNKNOWN
 LATE = {"TIMELY", "LATE", "ADVERSE", "UNKNOWN"}
 MODES = {"practice", "real"}
 
+# Match 201029 stays VOID (owner decision). Matched on the declared id, or on the exact inputs.jsonl
+# bytes, so an inputs-only run without metadata still carries VOID. A date-qualified suffix is used so a
+# later session that happens to start at 20:10:29 is not marked VOID by mistake.
+KNOWN_VOID_SESSION_IDS = {"201029"}
+KNOWN_VOID_SESSION_SUFFIXES = ("20261106-201029",)
+KNOWN_VOID_INPUT_SHA256 = {
+    "2a467219c9989378487509e50db1ee3097945eab99dd3deda358eadb3fc96519": "201029",
+}
+HB_FIRST_VERSION = "0.3.39"
+
 CONFIG = {
     "procedure": PROCEDURE,
     "health_rule": HEALTH_RULE,
@@ -461,8 +471,18 @@ def build_metadata(meta, receipt_match, meta_source):
             return {"value": str(receipt_val), "state": "declared", "source": receipt_label}
         return {"value": "UNKNOWN", "state": "unknown"}
 
-    out = {"session_id": field(meta.get("session_id"), rm.get("match_id"), "receipt.json match.match_id (not checked)"),
-           "game": field(meta.get("game"), rm.get("game"), "receipt.json match.game (not checked)")}
+    out = {"session_id": field(meta.get("session_id"), rm.get("match_id"), "receipt.json match.match_id (not checked)")}
+    g = field(meta.get("game"), rm.get("game"), "receipt.json match.game (not checked)")
+    label = g.pop("value")
+    g["label"] = label if label is not None else "UNKNOWN"
+    evidence = meta.get("game_identity_evidence")
+    if isinstance(evidence, str) and evidence.strip() and g["state"] == "declared":
+        g["identity"] = {"value": g["label"], "state": "declared_with_supplied_evidence",
+                         "evidence": evidence, "checked_by_this_tool": False}
+    else:
+        g["identity"] = {"value": "UNKNOWN", "state": "unknown",
+                         "reason": "a game label is not identity; no independent evidence supplied"}
+    out["game"] = g
     mode = meta.get("mode")
     m = str(mode).strip().lower() if mode is not None else None
     out["mode"] = {"raw": mode, "value": m if m in MODES else "UNKNOWN",
@@ -480,7 +500,49 @@ def build_metadata(meta, receipt_match, meta_source):
     return out
 
 
-def eligibility(md):
+def disposition_block(md, input_sha256):
+    """Inherited disposition carried on every derived record. Never upgraded by this tool."""
+    sources = []
+    sid = md["session_id"]
+    ids = [v for v in (sid.get("value"), sid.get("declared"), sid.get("receipt_declared")) if isinstance(v, str)]
+    for v in ids:
+        if v in KNOWN_VOID_SESSION_IDS or v.endswith(KNOWN_VOID_SESSION_SUFFIXES):
+            sources.append("known VOID match 201029 (declared session id)")
+            break
+    if input_sha256 in KNOWN_VOID_INPUT_SHA256:
+        sources.append("known VOID match 201029 (inputs.jsonl sha256)")
+    declared = md["receipt_disposition"]["normalized"]
+    if "VOID" in (declared, md["verify_disposition"]["normalized"]):
+        sources.append("declared VOID disposition")
+    void = bool(sources)
+    conflict = void and declared not in ("VOID", "UNKNOWN")
+    return {"disposition": "VOID" if void else declared,
+            "void": void, "never_eligible": void,
+            "sources": sources if void else ["declared receipt disposition" if declared != "UNKNOWN" else "none"],
+            "declared_receipt_disposition": declared,
+            "declared_conflicts_with_void": conflict,
+            "note": "inherited only; derived values never change or upgrade it"}
+
+
+def game_label_trust(md, result):
+    """A receipt game label is declared, not identity. Before v0.3.39 Start Match defaulted to madden27."""
+    g = md["game"]
+    hb = result.get("source", {}).get("hb_rows") if isinstance(result, dict) else None
+    if hb:
+        era = f"hb rows present (capture v{HB_FIRST_VERSION}+)"
+        trust = "declared_only"
+    else:
+        era = f"UNKNOWN; no hb rows, so the capture may predate v{HB_FIRST_VERSION}"
+        trust = "untrusted_possible_pre_v0.3.39_default"
+    g["capture_era"] = era
+    g["label_trust"] = trust
+    g["label_conflict"] = ("possible_default_madden27" if trust != "declared_only" and g["label"] == "madden27"
+                           else ("metadata_receipt_mismatch" if g["state"] == "mismatch" else "none_detected"))
+    g["note"] = ("game is a declared label; before v0.3.39 madden27 was the default receipt game, so a label "
+                 "from an older receipt may not describe the game played")
+
+
+def eligibility(md, disp_block=None):
     disp = {md["receipt_disposition"]["normalized"], md["verify_disposition"]["normalized"]}
     reasons = []
     if md["mode"]["value"] != "real":
@@ -491,9 +553,8 @@ def eligibility(md):
         reasons.append("late_or_adverse_witness")
     if any(md[k]["state"] == "mismatch" for k in ("session_id", "game")):
         reasons.append("metadata_mismatch")
-    sid = md["session_id"]["value"]
-    if isinstance(sid, str) and (sid == "201029" or sid.endswith("-201029")):
-        reasons.append("match_201029_remains_void")
+    if disp_block and disp_block["void"]:
+        reasons.append("void_never_eligible")
     return {"evidence_tier": "private_descriptive",
             "formal_counting": "not_eligible" if reasons else "not_evaluated",
             "formal_counting_reasons": reasons,
@@ -555,12 +616,13 @@ def analyze(inputs, out, completion_evidence=None, metadata_path=None, receipt_p
     doc = {"schema": OUTPUT_SCHEMA,
            "tool": {"name": TOOL, "version": TOOL_VERSION, "procedure": PROCEDURE,
                     "source_sha256": tool_source_hash(), "config": CONFIG, "config_sha256": config_hash(),
-                    "source_pin": {"commit": SOURCE_PIN, "files": ["src/inputs.rs", "src/hid.rs"], "checkout_note": "Pin 061fa1b8fa80e96a368305767edff436e959d87e checked against this checkout src/inputs.rs and src/hid.rs. inputs.rs also changed in 2ed127a. Heartbeat sequence field is hb_seq. Unlisted hb fields are not interpreted. Chunk hashes are declared_only."}},
+                    "source_pin": {"commit": SOURCE_PIN, "files": ["src/inputs.rs", "src/hid.rs"], "checked_against": "main 2135fa7 (src/inputs.rs also changed in 2ed127a, #133; the fields used here are unchanged)",
+                                   "note": "hb sequence field is hb_seq; hb fields not listed in config are not interpreted; chunk hashes are declared_only"}},
            "claim": CLAIM, "run": run,
            "input": {"name": inputs.name, "sha256": None, "length": None},
            "completion_evidence": {"value": completion_evidence,
                                    "state": "declared" if completion_evidence else "unknown"},
-           "receipt_json": receipt_state, "metadata": md, "eligibility": eligibility(md),
+           "receipt_json": receipt_state, "metadata": md,
            "unmeasured": ["physical bit-edge latency and firmware threshold", "device clock mapping",
                           "hw units", "extraction agreement with an independent annotator on real recordings",
                           "chunk hash binding (declared only)"]}
@@ -583,6 +645,21 @@ def analyze(inputs, out, completion_evidence=None, metadata_path=None, receipt_p
     for p, h in hashes_before.items():
         if file_sha256(Path(p)) != h:
             raise Rejected("source_changed_during_analysis", "metadata or receipt")
+    disp = disposition_block(md, doc["input"]["sha256"])
+    game_label_trust(md, result)
+    doc["disposition"] = disp
+    doc["eligibility"] = eligibility(md, disp)
+    flag = {"disposition": disp["disposition"], "void": disp["void"], "never_eligible": disp["never_eligible"]}
+    result["disposition"] = dict(flag)
+    for m in result.get("moments", ()):
+        m.update(flag)
+    for kind in ("dwell", "interval"):
+        block = result.get(kind)
+        if isinstance(block, dict):
+            block.update(flag)
+            block["session_aggregate"].update(flag)
+            for row in block["per_epoch"].values():
+                row.update(flag)
     doc["result"] = result
     data = (json.dumps(doc, indent=1, sort_keys=True) + "\n").encode("utf-8")
     with open(out, "xb") as f:
@@ -593,9 +670,10 @@ def analyze(inputs, out, completion_evidence=None, metadata_path=None, receipt_p
 def summary_line(doc) -> str:
     r = doc["result"]
     if r.get("status") == "rejected":
-        return f"rejected: {r['reject_reason']}"
+        return f"rejected: {r['reject_reason']} disposition={doc['disposition']['disposition']}"
     d, i = r["dwell"]["session_aggregate"], r["interval"]["session_aggregate"]
-    return (f"status={r['status']} continuity={r['continuity']} game={doc['metadata']['game']['value']} "
+    return (f"status={r['status']} disposition={doc['disposition']['disposition']} continuity={r['continuity']} "
+            f"game_label={doc['metadata']['game']['label']}(declared, not identity) "
             f"dwell n={d['n']} median_ms={d['median_ms']} iqr_ms={d['iqr_ms']} "
             f"interval n={i['n']} median_ms={i['median_ms']} iqr_ms={i['iqr_ms']} "
             f"excluded={sum(r['denominators']['excluded_pairs_by_reason'].values())}")

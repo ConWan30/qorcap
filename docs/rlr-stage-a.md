@@ -22,7 +22,7 @@ Exit codes: 0 analysed, 3 input rejected (an output with the reason is written, 
 2 refused (nothing written: output collision, output inside the source folder, existing output).
 The inputs header has no game field. Game comes from supplied metadata or `receipt.json match.game`, else
 `UNKNOWN`. Practice/real and dispositions come only from supplied metadata, never from folder names or
-`verify.txt`. Optional metadata keys: `session_id`, `game`, `mode`, `receipt_disposition`,
+`verify.txt`. Optional metadata keys: `session_id`, `game`, `game_identity_evidence`, `mode`, `receipt_disposition`,
 `verify_disposition`, `late_disposition`, `provenance`, `external_check_refs`.
 
 There is no lower "continuity unknown" evidence tier: a session with no hb rows reports candidate counts
@@ -75,7 +75,8 @@ External derived JSON. It is not a receipt and it does not change `receipt.v0` o
 - `created_at_wall` is a wall-clock label and is not used in the math.
 - Metadata states are `declared`, `unknown`, or `mismatch`. `checked_by_this_tool` is false. The word VERIFIED in a supplied file stays declared. It does not make derived events or counting eligibility.
 - `evidence_tier` is `private_descriptive`. `formal_counting` is `not_eligible` or `not_evaluated`. Gold, referee submit, and upload are false. Practice stays off those flags.
-- Match id `201029` (session id `201029` or ending in `-201029`) stays ineligible. A supplied VOID disposition is echoed, not upgraded.
+- Disposition: top-level `disposition` carries `disposition`, `void`, `never_eligible`, `sources`, the declared receipt disposition and whether it conflicts with VOID. The same `disposition`/`void`/`never_eligible` flags are copied onto `result`, every moment, both stat blocks, each session aggregate and each per-epoch row, so a value cut out of the file keeps its status. VOID comes from a declared VOID disposition or from match 201029 (owner decision: it stays VOID). 201029 is recognised by declared session id `201029` or one ending in `20261106-201029`, or by the exact sha256 of its `inputs.jsonl`, so an inputs-only run without metadata is still VOID. A session on another date that merely ends in `-201029` is not marked. The declared receipt disposition is kept as supplied; VOID is never removed or upgraded.
+- Game: `metadata.game.label` is a declared label (`declared`, `unknown` or `mismatch`), never identity. `metadata.game.identity` is `UNKNOWN` unless metadata supplies `game_identity_evidence`, and even then it is `declared_with_supplied_evidence`, not checked. With no hb rows the capture may predate v0.3.39, when `madden27` was the default receipt game: `label_trust` is `untrusted_possible_pre_v0.3.39_default` and a `madden27` label gets `label_conflict: possible_default_madden27`.
 - Clock domain: actor `host`, units `us`, origin host-monotonic `t_us`. No wall, video, or device mapping.
 - Denominators for rises, falls, complete observed pairs, qualified pairs, exclusions, interruptions, and censoring.
 - Per-epoch coverage via qualified or excluded reasons.

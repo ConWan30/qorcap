@@ -374,7 +374,8 @@ def test_empty_input_header_status_chunk_only(tmp_path):
 
 def test_missing_input_file_is_a_clean_rejection(tmp_path):
     doc = run(tmp_path, None)
-    assert doc["result"] == {"status": "rejected", "reject_reason": "input_missing", "detail": ""}
+    assert doc["result"] == {"status": "rejected", "reject_reason": "input_missing", "detail": "",
+                             "disposition": {"disposition": "UNKNOWN", "void": False, "never_eligible": False}}
     assert (tmp_path / "out" / "out.json").is_file()
 
 
@@ -516,7 +517,8 @@ def test_void_201029_stays_void(tmp_path):
     real = run(tmp_path, healthy(EXAMPLE), name="real.json",
                meta={"session_id": "201029", "mode": "real", "receipt_disposition": "VERIFIED",
                      "verify_disposition": "VERIFIED"})
-    assert "match_201029_remains_void" in real["eligibility"]["formal_counting_reasons"]
+    assert "void_never_eligible" in real["eligibility"]["formal_counting_reasons"]
+    assert real["disposition"]["disposition"] == "VOID" and real["disposition"]["declared_conflicts_with_void"]
     assert real["eligibility"]["formal_counting"] == "not_eligible"
 
 
@@ -530,7 +532,7 @@ def test_verified_real_is_still_only_not_evaluated(tmp_path):
 
 def test_missing_metadata_is_unknown(tmp_path):
     md = run(tmp_path, healthy(EXAMPLE))["metadata"]
-    assert md["session_id"]["state"] == "unknown" and md["game"]["value"] == "UNKNOWN"
+    assert md["session_id"]["state"] == "unknown" and md["game"]["label"] == "UNKNOWN"
     assert md["mode"]["value"] == "UNKNOWN" and md["receipt_disposition"]["normalized"] == "UNKNOWN"
 
 
@@ -545,7 +547,9 @@ def test_session_dir_reads_game_from_receipt_only(tmp_path):
     assert rc == 0
     doc = json.loads(out.read_text())
     md = doc["metadata"]
-    assert md["game"] == {"value": "synthgame", "state": "declared", "source": "receipt.json match.game (not checked)"}
+    assert (md["game"]["label"], md["game"]["state"]) == ("synthgame", "declared")
+    assert md["game"]["source"] == "receipt.json match.game (not checked)"
+    assert md["game"]["identity"]["value"] == "UNKNOWN"
     assert md["mode"]["value"] == "UNKNOWN"
     assert md["receipt_disposition"]["normalized"] == "UNKNOWN"
     assert md["verify_disposition"]["normalized"] == "UNKNOWN"
@@ -558,7 +562,7 @@ def test_session_dir_without_receipt_game_is_unknown(tmp_path):
     out = tmp_path / "o.json"
     assert R.main(["--session-dir", str(d), "--out", str(out), "--completion-evidence", "synthetic"]) == 0
     doc = json.loads(out.read_text())
-    assert doc["metadata"]["game"]["value"] == "UNKNOWN" and doc["receipt_json"] == "absent"
+    assert doc["metadata"]["game"]["label"] == "UNKNOWN" and doc["receipt_json"] == "absent"
 
 
 def test_metadata_receipt_mismatch_is_kept(tmp_path):
@@ -738,3 +742,107 @@ def test_committed_fixture_results(tmp_path):
     assert ok["interval"]["session_aggregate"]["median_ms"] == 500
     assert ok["source"]["skipped_row_types"] == {"imu": 1, "haptic": 1}
     assert not (FIX / "missing_session").exists() or not (FIX / "missing_session" / "inputs.jsonl").exists()
+
+
+# ---------------------------------------------------------------- VOID propagation (201029)
+
+def _all_flags(doc):
+    r = doc["result"]
+    out = [doc["disposition"], r["disposition"]]
+    out += r.get("moments", [])
+    for kind in ("dwell", "interval"):
+        if kind in r:
+            out += [r[kind], r[kind]["session_aggregate"]] + list(r[kind]["per_epoch"].values())
+    return out
+
+
+def _void_everywhere(doc):
+    flags = _all_flags(doc)
+    assert len(flags) > 2
+    for f in flags:
+        assert f["disposition"] == "VOID" and f["void"] is True and f["never_eligible"] is True, f
+    assert doc["eligibility"]["formal_counting"] == "not_eligible"
+    assert "void_never_eligible" in doc["eligibility"]["formal_counting_reasons"]
+
+
+def test_201029_session_dir_without_metadata_is_void_on_every_derived_value(tmp_path):
+    d = tmp_path / "s"
+    d.mkdir()
+    healthy(EXAMPLE).write(d / "inputs.jsonl")
+    (d / "receipt.json").write_text(json.dumps({"match": {"game": "cod_mw4", "match_id": "local-20261106-201029"}}))
+    out = tmp_path / "o.json"
+    assert R.main(["--session-dir", str(d), "--out", str(out), "--completion-evidence", "synthetic"]) == 0
+    doc = json.loads(out.read_text())
+    _void_everywhere(doc)
+    assert doc["metadata"]["receipt_disposition"]["normalized"] == "UNKNOWN"  # declared value is not rewritten
+    assert doc["disposition"]["sources"] == ["known VOID match 201029 (declared session id)"]
+    assert doc["result"]["dwell"]["session_aggregate"]["median_ms"] == 250  # values kept, flagged VOID
+
+
+def test_201029_inputs_only_is_void_by_input_hash(tmp_path, monkeypatch):
+    s = healthy(EXAMPLE)
+    sha = hashlib.sha256(s.text().encode()).hexdigest()
+    monkeypatch.setitem(R.KNOWN_VOID_INPUT_SHA256, sha, "201029")
+    doc = run(tmp_path, s)
+    _void_everywhere(doc)
+    assert doc["metadata"]["session_id"]["state"] == "unknown"
+    assert doc["disposition"]["sources"] == ["known VOID match 201029 (inputs.jsonl sha256)"]
+
+
+def test_201029_cli_summary_says_void(tmp_path, capsys):
+    d = tmp_path / "s"
+    d.mkdir()
+    healthy(EXAMPLE).write(d / "inputs.jsonl")
+    (d / "receipt.json").write_text(json.dumps({"match": {"match_id": "local-20261106-201029"}}))
+    R.main(["--session-dir", str(d), "--out", str(tmp_path / "o.json"), "--completion-evidence", "x"])
+    assert "disposition=VOID" in capsys.readouterr().out
+
+
+def test_201029_multi_epoch_and_rejected_runs_stay_void(tmp_path):
+    s = Synth().status(10).inp(1, 0).presses([(100_000, 300_000)]).hbs_until(1_000_000, 1)
+    s.status(1_200_000, "unplugged").status(1_300_000, "connected")
+    s.inp(1_400_000, 0).presses([(1_500_000, 1_900_000)]).hbs_until(3_000_000, 2)
+    _void_everywhere(run(tmp_path, s, name="a.json", meta={"session_id": "201029"}))
+    nohb = run(tmp_path, Synth().status(10).inp(1, 0).presses(EXAMPLE), name="b.json",
+               meta={"session_id": "match-20261106-201029"})
+    _void_everywhere(nohb)
+    rej = run(tmp_path, "", name="c.json", meta={"session_id": "201029"})
+    assert rej["result"]["status"] == "rejected" and rej["result"]["disposition"]["disposition"] == "VOID"
+
+
+def test_declared_void_propagates_and_other_dates_are_not_void(tmp_path):
+    _void_everywhere(run(tmp_path, healthy(EXAMPLE), name="a.json", meta={"receipt_disposition": "VOID"}))
+    other = run(tmp_path, healthy(EXAMPLE), name="b.json", meta={"session_id": "local-20261205-201029"})
+    assert other["disposition"]["void"] is False
+    assert all(f["void"] is False for f in _all_flags(other))
+
+
+# ---------------------------------------------------------------- game label is not identity
+
+def test_game_label_is_declared_and_identity_unknown(tmp_path):
+    md = run(tmp_path, healthy(EXAMPLE), meta={"game": "cod_mw4"})["metadata"]["game"]
+    assert md["label"] == "cod_mw4" and md["state"] == "declared"
+    assert md["identity"] == {"value": "UNKNOWN", "state": "unknown",
+                              "reason": "a game label is not identity; no independent evidence supplied"}
+    assert md["label_trust"] == "declared_only" and md["label_conflict"] == "none_detected"
+
+
+def test_game_identity_needs_supplied_evidence(tmp_path):
+    md = run(tmp_path, healthy(EXAMPLE), meta={"game": "cod_mw4", "game_identity_evidence": "synthetic frame check ref"})
+    g = md["metadata"]["game"]
+    assert g["identity"]["state"] == "declared_with_supplied_evidence"
+    assert g["identity"]["checked_by_this_tool"] is False
+
+
+def test_pre_hb_receipt_madden_label_is_flagged_untrusted(tmp_path):
+    d = tmp_path / "s"
+    d.mkdir()
+    Synth().status(10).inp(1, 0).presses(EXAMPLE).write(d / "inputs.jsonl")
+    (d / "receipt.json").write_text(json.dumps({"match": {"game": "madden27"}}))
+    out = tmp_path / "o.json"
+    R.main(["--session-dir", str(d), "--out", str(out), "--completion-evidence", "x"])
+    g = json.loads(out.read_text())["metadata"]["game"]
+    assert g["label"] == "madden27" and g["identity"]["value"] == "UNKNOWN"
+    assert g["label_trust"] == "untrusted_possible_pre_v0.3.39_default"
+    assert g["label_conflict"] == "possible_default_madden27"
+    assert "v0.3.39" in g["note"]
