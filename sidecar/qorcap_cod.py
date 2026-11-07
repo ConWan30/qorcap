@@ -739,6 +739,9 @@ class CodSetRunner:
         self.lag_us_override = None
         self._last_gated_hit_us = None
         self._last_feed_us = None
+        # Own kills read by gamertag from the killfeed (qorcap_cod_killfeed).
+        self._kill_tally = None
+        self._kill_read_us = None
         self._lag = None
         self._pair = None
         self._n = 0
@@ -817,7 +820,10 @@ class CodSetRunner:
                 print(f"Call of Duty end-screen hook error: {type(e).__name__}: {e}", file=sys.stderr)
                 self._frame_end = {"status": "fault", "reason": "end_hook_error"}
                 self._clear_end_candidate()
+                self._kill_feed_fault()
                 return
+            if self.final is None:
+                self._read_kill_feed(img, bool(end.ok and end.calibrated))
             if self.final is not None:
                 self._frame_end = {"status": "already_final", "reason": None}
                 return
@@ -1083,7 +1089,8 @@ class CodSetRunner:
 
     def _final_agreement(self, end, owner) -> dict:
         feed = self.own_kill_coverage()
-        feed["t_us"] = self._last_feed_us
+        if not (self._kill_tally is not None and self._kill_tally.frames):
+            feed["t_us"] = self._last_feed_us
         board = None if owner is None else {
             "kills": _score(owner.kills), "deaths": _score(owner.deaths),
             "assists": _score(owner.assists), "calibrated": bool(owner.ok and owner.calibrated),
@@ -1188,8 +1195,50 @@ class CodSetRunner:
         frame_id = src.get("frame_id")
         return frame_id if isinstance(frame_id, str) and frame_id else None
 
+    def _kill_feed_fault(self) -> None:
+        if self._kill_tally is not None:
+            self._kill_tally.fault()
+
+    def _read_kill_feed(self, img, end_screen: bool) -> None:
+        """Own kills by gamertag from the killfeed, on the frame clock.
+
+        The end board shows no feed, so it only moves the tally's time on. Feed
+        frames are read about 4 times a second, the rate it was checked at.
+        """
+        try:
+            from qorcap_cod_killfeed import KillfeedTally, read_killfeed_lines, READ_EVERY_US
+        except Exception:
+            return
+        if self._kill_tally is None:
+            self._kill_tally = KillfeedTally()
+        tally = self._kill_tally
+        screen_us = self._screen_us()
+        if end_screen:
+            if tally.frames and (not isinstance(screen_us, int) or tally.last_us is None or screen_us > tally.last_us):
+                tally.hold(screen_us)
+            return
+        if isinstance(screen_us, int) and not isinstance(screen_us, bool) and isinstance(self._kill_read_us, int):
+            if 0 <= screen_us - self._kill_read_us < READ_EVERY_US:
+                return
+        try:
+            read = read_killfeed_lines(img)
+        except Exception as e:
+            print(f"Call of Duty killfeed hook error: {type(e).__name__}: {e}", file=sys.stderr)
+            tally.fault()
+            return
+        if not (isinstance(read, dict) and read.get("ok") is True) and tally.frames == 0:
+            # Nothing placed yet (no image or no layout): the legacy path stands.
+            return
+        self._kill_read_us = screen_us if isinstance(screen_us, int) else None
+        tally.update(screen_us, read)
+
     def own_kill_coverage(self) -> dict:
-        """Unknown unless every kill is ownership-qualified, deduplicated, and covered."""
+        """Unknown unless every kill is ownership-qualified, deduplicated, and covered.
+
+        Once the killfeed has been read by gamertag, its tally is the feed leg.
+        """
+        if self._kill_tally is not None and self._kill_tally.frames:
+            return self._kill_tally.coverage()
         events = list(self._own_kills)
         if not events:
             return {"coverage": "unknown", "kills": None, "ownership_qualified": False, "deduped": False}
