@@ -9,7 +9,7 @@ use serde_json::{json, Value};
 use std::sync::mpsc::Sender;
 use log::{error, info, warn};
 use serde::Serialize;
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -161,6 +161,18 @@ fn rollback_durable<W: SyncWrite>(w: &mut W, start_len: u64) -> Result<(), Strin
     Ok(())
 }
 
+/// Rewind an append that was written through a file handle. On Windows a handle opened
+/// with `append(true)` carries only `FILE_APPEND_DATA`, and truncating through it
+/// (`SetEndOfFile`, which needs `FILE_WRITE_DATA`) does not take effect: a failed append
+/// would stay in the file. If the handle rewind does not succeed, redo it through a
+/// writable handle for the same path, exactly as `restore_durable_len` does.
+fn rollback_append(f: &mut std::fs::File, path: &Path, start_len: u64) -> Result<(), String> {
+    match rollback_durable(f, start_len) {
+        Ok(()) => Ok(()),
+        Err(first) => restore_durable_len(path, start_len).map_err(|second| format!("{first}; {second}")),
+    }
+}
+
 fn stage_error<W: SyncWrite>(w: &mut W, start_len: u64, stage: &str, err: impl std::fmt::Display) -> String {
     match rollback_durable(w, start_len) {
         Ok(()) => format!("{stage}: {err}"),
@@ -250,8 +262,16 @@ fn append_jsonl_fault(path: &Path, v: &Value, mut fault: Option<&mut PersistFaul
             }
         }
     }
-    match OpenOptions::new().create(true).append(true).open(path) {
+    // Open read/write and seek to the end instead of `append(true)`: the append-mode
+    // handle cannot truncate on Windows (see `rollback_append`), so a failed append
+    // could not be rewound through it. The process-wide APPEND lock above serializes
+    // writers, so the seek-to-end position is the append position.
+    match OpenOptions::new().read(true).write(true).create(true).open(path) {
         Ok(mut f) => {
+            if let Err(e) = f.seek(SeekFrom::End(0)) {
+                error!("cannot append {}: {e}", path.display());
+                return Err(format!("append {}: {e}", path.display()));
+            }
             let start = f.metadata().map(|m| m.len()).unwrap_or(0);
             if let Some(hit) = fault.as_mut() {
                 if hit.remaining > 0 {
@@ -262,14 +282,14 @@ fn append_jsonl_fault(path: &Path, v: &Value, mut fault: Option<&mut PersistFaul
                         "write" => {
                             let n = partial.unwrap_or(0).min(bytes.len());
                             if n > 0 { let _ = Write::write_all(&mut f, &bytes[..n]); }
-                            match rollback_durable(&mut f, start) {
+                            match rollback_append(&mut f, path, start) {
                                 Ok(()) => "write: ENOSPC".to_string(),
                                 Err(rewind) => format!("write: ENOSPC; {rewind}"),
                             }
                         }
                         "flush" => {
                             let _ = Write::write_all(&mut f, bytes);
-                            match rollback_durable(&mut f, start) {
+                            match rollback_append(&mut f, path, start) {
                                 Ok(()) => "flush: EIO".to_string(),
                                 Err(rewind) => format!("flush: EIO; {rewind}"),
                             }
@@ -277,7 +297,7 @@ fn append_jsonl_fault(path: &Path, v: &Value, mut fault: Option<&mut PersistFaul
                         "sync" => {
                             let _ = Write::write_all(&mut f, bytes);
                             let _ = Write::flush(&mut f);
-                            match rollback_durable(&mut f, start) {
+                            match rollback_append(&mut f, path, start) {
                                 Ok(()) => "sync: EIO".to_string(),
                                 Err(rewind) => format!("sync: EIO; {rewind}"),
                             }
@@ -1014,6 +1034,29 @@ mod tests {
         let err = commit_durable(&mut RewindFails, b"{}\n", 4).unwrap_err();
         assert!(err.contains("write"), "{err}");
         assert!(err.contains("rewind"), "{err}");
+    }
+
+    #[test]
+    fn flush_and_partial_write_faults_rewind_the_file_to_its_prior_length() {
+        // The rewind must take effect through whatever handle the append used:
+        // a failed stage leaves the file at its prior length on every platform,
+        // and the retry then appends exactly one line.
+        let dir = std::env::temp_dir().join(format!("qorcap-rewind-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("checkpoints.jsonl");
+        let row = json!({"seq": 0});
+        for (stage, partial) in [("flush", None), ("write", Some(7)), ("sync", None)] {
+            let _ = std::fs::remove_file(&path);
+            let mut fault = PersistFault { stage, partial, remaining: 1 };
+            let err = append_jsonl_fault(&path, &row, Some(&mut fault)).unwrap_err();
+            assert!(err.contains(stage), "{stage}: {err}");
+            assert_eq!(std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0), 0, "{stage} failure rewinds the append");
+            assert!(append_jsonl_fault(&path, &row, None).is_ok(), "{stage} retry appends");
+            let text = std::fs::read_to_string(&path).unwrap();
+            assert_eq!(text.lines().count(), 1, "{stage} retry leaves one line");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
