@@ -2,13 +2,13 @@ P2 SCHEMA r3 CANDIDATE — NOT FROZEN — PENDING QorData acceptance then QorPro
 
 Private engineering schema candidate. Not a freeze, not schema PASS, not implementation acceptance, not permission to write model code. Feature `practice-anchor-transaction-model` is not added by this document and stays absent. No Rust, tests, or Cargo change belongs to this candidate.
 
-# P2 schema r2 candidate — anchor seen-at offline model
+# P2 schema r3 candidate — anchor seen-at offline model
 
 This file is the sole allowlisted P2 schema document for the first-run schema gate. Digests are not hand-typed here. They live in `p2-vectors.json`, written by `gen_vectors.py`. Each required vector is named by a stable ID. digest: see p2-vectors.json. Computed rows are encoding facts. Model outcomes are NOT EXECUTED.
 
 ## 0. Provenance
 
-`P2-SCHEMAS-r1-candidate.md` is a recipient-assembled chat-transfer copy, preserved separately from this candidate. It is not the missing writer-saved original, it is not authenticated by transfer markers, and it is an open proposal. Placeholders for vectors and pins in that copy stay unexpanded. Prospective "produced" or "created" wording in that copy is not execution evidence. This r2 candidate does not import any unsaved earlier worker proposal as schema.
+`P2-SCHEMAS-r1-candidate.md` is a recipient-assembled chat-transfer copy, preserved separately from this candidate. It is not the missing writer-saved original, it is not authenticated by transfer markers, and it is an open proposal. Placeholders for vectors and pins in that copy stay unexpanded. Prospective "produced" or "created" wording in that copy is not execution evidence. This r3 candidate does not import any unsaved earlier worker proposal as schema.
 
 Supplied pins below are copied from the architect handoff source table. They identify local bytes as supplied to this writer. They are not a fresh observation by this writer, not repository truth, not consent, and not a runtime result. This writer did not re-hash those files in this turn.
 
@@ -24,15 +24,17 @@ Supplied pins below are copied from the architect handoff source table. They ide
 | `ACCEPTANCE-AND-BUDGETS.md` | `b6818017965c2ff9a21d246d4f7fb7764eaf1eab53d7ec498bda63762ddafdd3` | 30596 |
 | `redteam-qorproof-r3.md` | `f3f021933a5f21bdce1ed67da21f3da5ab2577d905dc61365082245f4592f90f` | 12044 |
 | `redteam-qorproof-r2.md` | `8ad7b50473ef3e511c3a7ab03bed55928eadf06f7cfa1db497566314e4446f33` | 19104 |
-| Handoff `P2-GROK-HANDOFF.md` | `741d3aa11d849046e5620c1e9d13f2b5bbd2c94567e873418e869ea3e2d49ce6` | supplied in the task prompt; byte length not restated because this writer did not measure the file |
+| Handoff `P2-GROK-HANDOFF.md` | `741d3aa11d849046e5620c1e9d13f2b5bbd2c94567e873418e869ea3e2d49ce6` | UNKNOWN |
 
 Repository context, supplied and not re-verified by this writer: ConWan30/qorcap; required base `4d119020cec8c3b6ae55c30c8bb17f5c6ab845ad` (operator-supplied pin for this job; the handoff itself reported no fresh git-object verification). Supplied tree pin `9fe2160a9dea08b9a501a55eb21612469be10398`. Supplied parent pin `f007728a3f2b83b47e4a49b73a99b1b2d285da9b`. Older feature head `9abea1e33c406b1ca412832ad4f2b7764b4247d1` is a different commit and must not substitute for the base. Branch name in the governing brief: `anchor/track1-phase2-p2-model-20261107`. If main moves, stop for an approved repin. No silent rebase.
+
+Review inputs read for this r3 pass, named by file and SHA-256 only. They are not supplied pins, are not copied into the pins file, and are not acceptance: QorData `P2-PR138-qordata-acceptance.md` as reviewed, `5160bf3f8492327c2659fc6f3240d0e2d01bb0ec38402c446da20d67c4b28483`; QorProof `pr138-p2-schema-redteam.md`, `626e5b1424c56a943c1a0761b943a37ddeda251a7606241ce9ab1fbdabb947d0`.
 
 Precedence used here: latest Data and Proof schema reviews correct r1; `PHASE2-DESIGN-r3-addendum.md` overrides `PHASE2-DESIGN-r2.md` on holder release and publication timing. Normal holder release is DISABLED. Terminal-positive stays BLOCKED. This candidate does not self-certify PASS or freeze.
 
 ## 1. Scope, non-goals, rails
 
-In scope for the whole r2 candidate, which covers §2–§15: exact offline schema for a pure owned-memory model of auxiliary evidence. States are only `unknown`, `seen_at_late`, and `seen_at_retained`. There is no pass state. Match 201029 stays VOID. Practice does not submit to a referee, upload capture, or write practice gold. Controller output stays read-only: no HID, rumble, or lightbar writes. Grip stays off for practice. Rumble, if described at all, is information-only. `receipt.v0` and `contracts/` stay frozen. REAL MATCH stays v0.3.38 and unwired. P1 stays unchanged and default-off.
+In scope for the whole r3 candidate, which covers §2–§15: exact offline schema for a pure owned-memory model of auxiliary evidence. States are only `unknown`, `seen_at_late`, and `seen_at_retained`. There is no pass state. Match 201029 stays VOID. Practice does not submit to a referee, upload capture, or write practice gold. Controller output stays read-only: no HID, rumble, or lightbar writes. Grip stays off for practice. Rumble, if described at all, is information-only. `receipt.v0` and `contracts/` stay frozen. REAL MATCH stays v0.3.38 and unwired. P1 stays unchanged and default-off.
 
 Non-goals: model or test code; feature wiring; network, keys, deploy, hosting; live finals; a current-policy service; collection; exporter; compact transparency-proof codec; normal holder unlock; publication-time freshness. The r3 rule stands: a future coordinator, which is not P2, qualifies as of admission time. Publication-time freshness is not asserted. Unbounded downstream pause is possible. If a later policy needs currentness at publication, that final or pilot stays BLOCKED.
 
@@ -100,6 +102,8 @@ Hash dependency rule carried forward: no record's preimage contains its own id, 
 - `CommitWitness.phase` adds `receive`, `reserve`, and `work` (§6.3). `WitnessOutcome` is unchanged.
 - Opening `capture_domain` and `source_domain` are frozen declarations on the opening commitment. They are not a calibrated clock and not a measured mapping (§9.1).
 - r1 `JournalRef.checkpoint` and `prior_checkpoint` are deleted. §8 replaces them.
+- r1 `StableCore.usage:Usage` is replaced by `StableCore.accounting:Accounting`. No other `StableCore` field changes. `StreamRow` gains `origin` and `fork` (§9); nothing else in `StableImage` changes.
+- Vector fixtures carry these r1 records unchanged, with only the deltas above: `Close`, `Cursor`, `Page`, `PageLeaf`, `Manifest`, `SnapshotCore`, `HashPrefixWitness`, `LedgerHead`, `StableImage`, `HoldRecord`, `TerminalRecord`, `ObservationRecord`, `RecoveryRecord`, `Denial`, `Admission`, `GlobalEntry`, `Original`.
 
 Any field not listed here or in the r1 record it carries forward is not allowed (`schema`).
 
@@ -232,7 +236,7 @@ Projection, checked by the trusted client fixture. The server still sees only th
 |---|---|
 | `operation` | the request type, as above. Not a field read from the request body. |
 | `scope`, `stream`, `purpose`, `ack_ordinal`, `pins` | the same members on `IssueRequest`, or on `ConsumeRequest.commitment` |
-| `exchange` | `IssueRequest.exchange` or `ConsumeRequest.commitment.exchange` |
+| `exchange` | the core only. `IssueRequest` and `Commitment` have no `exchange` member. The fixture compares the core to `LogicalOpKey`. |
 | `owner_generation`, `prior_ack`, `client_nonce` | those members on the issue request bytes, or on the nested consume commitment bytes. They are not core fields (§3.2). |
 
 A mismatch is `binding` and stores no record. This is the meaning of "request matches its own core."
@@ -377,14 +381,14 @@ Registration boundary. These are required fixtures for the generator. digest: se
 | `V-F1-REST-NOCLIENT` | `Original` present, client fixture missing. Client state `unknown`. No rebuild. |
 | `V-F1-REST-NOORIG` | Client record present, no `Original`. Not service success. No invented `Original`. |
 | `V-F1-REST-DIVERGE` | Both present, request bytes differ. `conflict`. No replacement. |
-| `V-F1-PROJ-OK` | Request type, projected operation, and the equality rows above all match. | client record accepted. No wire `operation` field. |
-| `V-F1-PROJ-MIS` | One of scope, stream, purpose, ack ordinal, or pins differs from the core. | `binding`. No record. |
-| `V-F1-PROJ-OWN` | Owner generation, prior ack, or client nonce differs from the request or nested commitment bytes. | `binding`. No record. |
-| `V-F1-NO-WIRE` | Request body contains an `operation` member. | `schema`. |
-| `V-F1-LINK` | Consume names the issue `Raw` and challenge inside the same exchange group. | link resolves. Ids stay distinct. |
-| `V-F1-XGROUP` | Challenge bytes verify but belong to another exchange group. | `binding`. |
-| `V-F1-REFUSE` | Service returns a resolved refusal. | client record stands. No `Original`. No new deadline. |
-| `V-F1-RESTART` | Restart with a durable client record and no `Original`. | record unchanged. No replacement. |
+| `V-F1-PROJ-OK` | Request type, projected operation, and the equality rows above all match. Outcome: client record accepted. No wire `operation` field. |
+| `V-F1-PROJ-MIS` | One of scope, stream, purpose, ack ordinal, or pins differs from the core. Outcome: `binding`. No record. |
+| `V-F1-PROJ-OWN` | Owner generation, prior ack, or client nonce differs from the request or nested commitment bytes. Outcome: `binding`. No record. |
+| `V-F1-NO-WIRE` | Request body contains an `operation` member. Outcome: `schema`. |
+| `V-F1-LINK` | Consume names the issue `Raw` and challenge inside the same exchange group. Outcome: link resolves. Ids stay distinct. |
+| `V-F1-XGROUP` | Challenge bytes verify but belong to another exchange group. Outcome: `binding`. |
+| `V-F1-REFUSE` | Service returns a resolved refusal. Outcome: client record stands. No `Original`. No new deadline. |
+| `V-F1-RESTART` | Restart with a durable client record and no `Original`. Outcome: record unchanged. No replacement. |
 
 Scope, stream, and exchange mutations change the key, so they must not be implemented as in-place edits of the first record. Purpose, ordinal, pins, and times do not change the key and therefore cannot be "fixed" by publishing a new id.
 
@@ -532,14 +536,14 @@ digest: see p2-vectors.json.
 | `V-B2-INT-01` | Each internal row in §4.2 leaves request-byte and idempotency fields absent. |
 | `V-B2-NULL-HOLD` | Non-null holder on issue, consume, checkpoint, observe, snapshot, page, archive, or policy is `unauthorized`. |
 | `V-B2-NULL-OWNER` | Null stream or null owner generation on owner, issue, consume, checkpoint, observe, hold, or terminal is `unauthorized` or `malformed` as a missing required field, not a global event. |
-| `V-F2-AUTH-LIN` | Lineage op presents `AuthSubject.arm=lineage` and `subject.scope` equal to the request scope. | check uses that scope. No registry arm. |
-| `V-F2-AUTH-REG` | `policy_update` presents `arm=registry` and `subject.registry` equal to `PolicyCore.registry`. | registry check. No lineage `Scope` on the binding. |
-| `V-F2-AUTH-FAKE` | `policy_update` presents `arm=lineage`, or a lineage `Scope` built from registry fields. | `schema` or `unauthorized`. No fabricated lineage. |
-| `V-F2-POL-CORE` | Policy request bytes and `ModelSigned` payload are `PolicyCore`. Stored row is `PolicyRecord`. | digest outside the core. `E(PolicyRecord)` is not the request. |
-| `V-F2-RECEIPT-CONSUME` | Successful consume. | one `AckCore` `Original` and one `GlobalEntry`. No `CheckpointRecord`. No receipt charge. `prior_service_receipt` is a lookup or null. |
-| `V-F2-RECEIPT-CKPT` | Successful checkpoint. | one `CheckpointRecord` row, id `Hash("CheckpointRecord", record)`. That row is the only service receipt. Checkpoint charge only. |
-| `V-F2-POL-CUR` | `policy_update` presents the new core's digest as `AuthBinding.policy_digest`. | `unauthorized`. The retained current policy stays the authorizer. |
-| `V-F2-DECL` | Opening domains stored as declared. | not treated as a measured clock mapping. Later ops and restore use §9. |
+| `V-F2-AUTH-LIN` | Lineage op presents `AuthSubject.arm=lineage` and `subject.scope` equal to the request scope. Outcome: check uses that scope. No registry arm. |
+| `V-F2-AUTH-REG` | `policy_update` presents `arm=registry` and `subject.registry` equal to `PolicyCore.registry`. Outcome: registry check. No lineage `Scope` on the binding. |
+| `V-F2-AUTH-FAKE` | `policy_update` presents `arm=lineage`, or a lineage `Scope` built from registry fields. Outcome: `schema` or `unauthorized`. No fabricated lineage. |
+| `V-F2-POL-CORE` | Policy request bytes and `ModelSigned` payload are `PolicyCore`. Stored row is `PolicyRecord`. Outcome: digest outside the core. `E(PolicyRecord)` is not the request. |
+| `V-F2-RECEIPT-CONSUME` | Successful consume. Outcome: one `AckCore` `Original` and one `GlobalEntry`. No `CheckpointRecord`. No receipt charge. `prior_service_receipt` is a lookup or null. |
+| `V-F2-RECEIPT-CKPT` | Successful checkpoint. Outcome: one `CheckpointRecord` row, id `Hash("CheckpointRecord", record)`. That row is the only service receipt. Checkpoint charge only. |
+| `V-F2-POL-CUR` | `policy_update` presents the new core's digest as `AuthBinding.policy_digest`. Outcome: `unauthorized`. The retained current policy stays the authorizer. |
+| `V-F2-DECL` | Opening domains stored as declared. Outcome: not treated as a measured clock mapping. Later ops and restore use §9. |
 
 ## 5. B3 — config, policy digests, minima, continuity
 
@@ -746,7 +750,7 @@ Resolved refusal: witness `outcome=refused`, image unchanged, and any basis char
 
 | Crash crossing | Image | Basis charges already committed | Reservations | Outcome |
 |---|---|---|---|---|
-| Before reserve | unchanged | none | none | resolved refusal if the attempt is known not to have started. No witness required for "nothing happened." |
+| Before reserve | unchanged | receive `calls` / `retry_attempts`, if that receive basis commit is witnessed; nothing else | none | resolved refusal if the attempt is known not to have reached reserve. Witnessed receive charges stay committed and are not refunded. No witness is required for "nothing after receive happened"; if it is not known whether reserve started, unknowable. |
 | After reserve, before work | unchanged | none | released | resolved refusal. Witness `refused`. Absent witness here is still refusal only when no work and no swap could have started. If that is not known, unknowable. |
 | After work, before swap | unchanged | failed sign, completed read, receive `calls` / `retry_attempts` if those basis commits are witnessed | released | resolved refusal when the witness says `refused`. If the witness is absent, unknowable: do not treat the work as free and do not invent the image commit. |
 | After swap, before witness | the swapped image stands and is not rolled back | image stocks stand | disposable meters released | unknowable for new grants: `commit_unknown`. Not a resolved refusal. |
@@ -934,6 +938,8 @@ Domain and order, checked before any late or missing label. All present monos ar
 
 Historical classification and present eligibility are different passes. The historical label and the historical bytes are immutable. Eligibility never rewrites them.
 
+`unavailable` is assigned by one rule only, checked before step 1: the classification pass is restore or readback and the stored `ClientAttempt` bytes for this attempt are absent from the client fixture image or fail the §2 parse, so no milestone can be read. The result is `unavailable`, not `missing` (which needs a parsed record with null milestones) and not `invalid` (which needs parsed milestones that fail domain or order). It never grants and is never relabeled by a later pass. No step 1–7 below assigns `unavailable`.
+
 Historical classification, first match. `dispatch` and `arrival` may stay null. This pass does not grant.
 
 1. Domain or order failure, as above → `invalid`.
@@ -1052,7 +1058,7 @@ digest: see p2-vectors.json. `V-F2-RECEIPT-CONSUME` and `V-F2-RECEIPT-CKPT` in �
 | ID | Case | Outcome |
 |---|---|---|
 | `V-B6-BOOT` | Genesis, then issue, then first consume with `prior_service_receipt` null and `prior_client_checkpoint = genesis_id` | consume commits `AckCore` only. No `CheckpointRecord`. Request bytes do not contain a receipt id. |
-| `V-B6-EXT` | Next checkpoint names that client id and null prior receipt, then a later consume names the new checkpoint id | checkpoint commits one `CheckpointRecord`. Later consume does not write a second receipt. New id differs from the client id. |
+| `V-B6-EXT` | Next checkpoint names that client id and null prior receipt | checkpoint commits one `CheckpointRecord`. New id differs from the client id. The later consume that names the new receipt is `V-FAM-BOOT-LATER` (§11.1); it does not write a second receipt. |
 | `V-B6-WRONG-ROOT` | Same priors, `head` or source head swapped | `fork`, no commit |
 | `V-B6-SELF` | Prior client id set to this core's own id, or a core field added that copies the id | `binding` |
 | `V-B6-CURRENT` | Request field set to the checkpoint id this commit would produce, or to the latest receipt used as the client id | `binding` |
@@ -1132,7 +1138,7 @@ Status `RESOLVED` means this candidate states one rule and where it is written. 
 | 3. API, reservation, accounting (B2) | r3: addresses QorData F1/F2 — pending re-review | §4.0, §4.1 | Not self-RESOLVED. Accounting closure is the B3/B4 rows. Caps are not live defaults |
 | 4. Nonempty close | RESOLVED as the r3 split: opening `[0, MAX-2]`, close `[MAX-1, MAX-1]`, not a first close of `[0, MAX-1]` | §2 | QorData, then QorProof |
 | 5. Holder release and terminal oracle | RESOLVED as release DISABLED. Positive terminal path BLOCKED. No unlock in this candidate | §4, §7.2 | QorData, then QorProof. A future private test oracle is UNKNOWN and is not authorized here |
-| 6. Image, restore, retry (B1) | r3: addresses QorData F1/F2 — pending re-review | §3.4, §3.6, §8, §9 | Not self-RESOLVED. Two registries and the §3.4 schedule are written. F3–F5 remain open. Stable image is model-durable only |
+| 6. Image, restore, retry (B1) | r3: addresses QorData F1/F2 — pending re-review | §3.4, §3.6, §8, §9 | Not self-RESOLVED. Two registries and the §3.4 schedule are written. F3–F5 are the B3/B4/B5 rows below. Stable image is model-durable only |
 | 7. Real source, custody, current-policy freshness, hosting, cost, retention, collection | UNKNOWN | not selected | No authority in this candidate or in the schema reviews. Publication-time freshness is not asserted. Dependent final or pilot stays BLOCKED |
 | `enqueue_at` spelling, core without `original_request_hash` | RESOLVED | §3 | QorData, then QorProof |
 | Owner generation, prior ack, and client nonce outside the core and inside request bytes | RESOLVED | §3.2 | QorData, then QorProof |
@@ -1148,6 +1154,9 @@ Status `RESOLVED` means this candidate states one rule and where it is written. 
 | B3 expected set, minima key, keyed stocks | r3: addresses QorData F3–F5 / QorProof F3–F5 — pending re-review | §5.3, §5.4 | Not self-RESOLVED |
 | B4 stock classes, crash crossings, limit-selection protocol | r3: addresses QorData F3–F5 / QorProof F3–F5 — pending re-review | §6 | Not self-RESOLVED. Operational values stay UNKNOWN. Dependents stay DISABLED |
 | B5 historical label versus present eligibility | r3: addresses QorData F3–F5 / QorProof F3–F5 — pending re-review | §7.9 | Not self-RESOLVED |
+| Complete positive chains, mutation negatives, twelve families (QorData F6; QorProof F6 and family list) | r3: addressed — pending re-review | §11, §11.1 | Not self-RESOLVED. Every vector carries complete typed records; negatives are one-field mutations of a named twin; model outcomes NOT EXECUTED |
+| Pins file holds only the §0 source table and generator-observed file pins (QorData F7) | r3: addressed — pending re-review | §0, §12 | Not self-RESOLVED. Strict parse of the §0 table only |
+| Execution labels (QorProof F8) | r3: addressed — pending re-review | §11 | Authored negatives are labeled authored and NOT EXECUTED. Only generator-run checks are counted as executed, and they are not the model parser |
 | Numeric `LimitSet` values, including any replacement for the supplied 61295-versus-16384 example | UNKNOWN | §5.2, §6.2, §6.5 | No authority. Synthetic fixture inputs are not measurements. This candidate does not pick them |
 | Qualified C1 result on these bytes | UNKNOWN in this file | §13 | The operator runs the counts-only scan on the final committed bytes, commit message, and candidate PR text. Results are review evidence outside this file. Not stated here. Not zero |
 | Fresh git confirmation of the supplied base | UNKNOWN to this writer | §0 | Supplied pin only. Movement requires a stop |
@@ -1157,13 +1166,136 @@ Status `RESOLVED` means this candidate states one rule and where it is written. 
 
 Canonical bytes, lengths, and digests are not written in this document. digest: see p2-vectors.json.
 
-`tests/anchor_seen_at_p2/vectors/gen_vectors.py` is a Python 3 standard-library generator. It does not import repository code. It implements the §2 framing (`J`, `E`, `F`, `D`, `Hash`, `Raw`, `ModelSigned`) and emits one record per vector ID in §3–§9. The generator run reported 181 vector IDs; 141 kind computed, 40 kind behavioral. Each record has `outcome_status`. Kind `behavioral` is `NOT EXECUTED (no model code in this stage)`. Kind `computed` is either an encoding or digest fact whose `expected_outcome` is still a schema expectation for a future model, also NOT EXECUTED, or a schema-level validator result this generator evaluated. That validator result is not the model parser. A behavioral row is not a pass.
+`tests/anchor_seen_at_p2/vectors/gen_vectors.py` is a Python 3 standard-library generator. It does not import repository code. It implements the §2 framing (`J`, `E`, `F`, `D`, `Hash`, `Raw`, `ModelSigned`) and emits one record per vector ID in §3–§9 and §11.1. Every ID in this document has exactly one vector, and the generator has no ID that is not in this document.
 
-Regenerate with `python3 tests/anchor_seen_at_p2/vectors/gen_vectors.py --write`. The same command exits nonzero if a self-check fails or a doc vector ID is missing. `python3 tests/anchor_seen_at_p2/vectors/gen_vectors.py --check` rebuilds in memory and exits nonzero if either JSON file differs.
+Evidence classes, as written into each vector's `evidence_class`:
+
+- `authored_positive_fixture`: complete typed records built in dependency order (genesis, issue core, `IssueRequest`, `Challenge`, consume core, `ConsumeRequest`, `AckCore`, `Admission`, `GlobalEntry`, `Original`, `LedgerHead`, and onward). Encoding facts are computed. The future model outcome is NOT EXECUTED.
+- `authored_negative_expectation`: a one-field mutation of a named positive twin (`valid_twin`, `mutation.path`, `mutation.value`, mutated canonical bytes), or a complete stand-alone record where a mutation cannot express the case. The expected rejection is authored and NOT EXECUTED. No validator has run these. A count of these rows is a count of declarations, not of rejections.
+- `authored_schedule_fixture`: an ordered schedule over complete records (crash points, retries, restores). NOT EXECUTED.
+- `generator_computed_fixture`: encoding, digest, or arithmetic facts computed by the generator. NOT EXECUTED as model behavior.
+
+`self_checks` in `p2-vectors.json` separates what ran from what did not. `executed_primitive_assertions` and `generator_schema_checks` are checks this generator really runs (primitive bounds, canonical re-serialization, projection, completeness, stock arithmetic, range arithmetic, tree prefixes). They are not the model parser and not a model outcome. `authored_negative_expectations_not_executed` and `model_outcomes_not_executed` are counts of rows whose outcome nobody has executed. Counts are read from that file, not restated here. Any figure used as a cap in a quota family is a synthetic fixture cap, labeled as such in the row; it is not a setting, not a measurement, and not an approved limit.
+
+Regenerate with `python3 tests/anchor_seen_at_p2/vectors/gen_vectors.py --write`. The same command exits nonzero if a self-check fails or a doc vector ID is missing or extra. `python3 tests/anchor_seen_at_p2/vectors/gen_vectors.py --check` rebuilds in memory and exits nonzero if either JSON file differs.
+
+### 11.1 Required families
+
+The twelve families QorProof required. Each row is a complete record or a one-field mutation of the named positive in its family. Expected outcomes are schema expectations, NOT EXECUTED. The terminal row is BLOCKED and is not a success path.
+
+| ID | Family | Evidence class | Expected outcome (NOT EXECUTED) |
+|---|---|---|---|
+| `V-FAM-DAG-CHAIN` | 1 dependency DAG | authored_positive_fixture | complete issue, Challenge, consume, AckCore, Admission, GlobalEntry, Original chain |
+| `V-FAM-DAG-NESTED-SCOPE` | 1 dependency DAG | authored_negative_expectation | binding |
+| `V-FAM-DAG-NESTED-PINS` | 1 dependency DAG | authored_negative_expectation | binding |
+| `V-FAM-DAG-DOMAIN` | 1 dependency DAG | authored_negative_expectation | domain |
+| `V-FAM-DAG-STALE` | 1 dependency DAG | authored_negative_expectation | binding |
+| `V-FAM-ORIG-WINNER` | 2 Original registry | authored_positive_fixture | one Original; one advance |
+| `V-FAM-ORIG-LOSER` | 2 Original registry | authored_negative_expectation | conflict; never inherits winner success |
+| `V-FAM-ORIG-RETRY` | 2 Original registry | authored_schedule_fixture | byte-identical response; no re-sign, no new time, no advance |
+| `V-FAM-ORIG-OWNER` | 2 Original registry | authored_negative_expectation | conflict |
+| `V-FAM-ORIG-CHALLENGE` | 2 Original registry | authored_negative_expectation | binding |
+| `V-FAM-ORIG-TYPE` | 2 Original registry | authored_negative_expectation | binding |
+| `V-FAM-ALIAS-GROUP` | 3 issue/consume aliasing | authored_positive_fixture | issue and consume records in one exchange group; distinct ids |
+| `V-FAM-ALIAS-REDEADLINE` | 3 issue/consume aliasing | authored_negative_expectation | conflict; stored deadline unchanged |
+| `V-FAM-ALIAS-NEWID` | 3 issue/consume aliasing | authored_negative_expectation | conflict |
+| `V-FAM-ALIAS-WRONGOP` | 3 issue/consume aliasing | authored_negative_expectation | binding |
+| `V-FAM-ALIAS-RESTORE-LATE` | 3 issue/consume aliasing | authored_negative_expectation | late stays late after restore and archive |
+| `V-FAM-BOOT-FIRST` | 4 bootstrap and receipts | authored_positive_fixture | genesis, first client core, consume with null receipt prior |
+| `V-FAM-BOOT-NEXT` | 4 bootstrap and receipts | authored_positive_fixture | checkpoint commits CheckpointRecord; lookup tables resolve |
+| `V-FAM-BOOT-LATER` | 4 bootstrap and receipts | authored_positive_fixture | later consume names the committed receipt as prior; no second receipt |
+| `V-FAM-BOOT-HEAD` | 4 bootstrap and receipts | authored_negative_expectation | fork |
+| `V-FAM-BOOT-ARCHIVE` | 4 bootstrap and receipts | authored_positive_fixture | archive returns historical bytes; origin not replaced |
+| `V-FAM-GRAM-OK` | 5 grammar, roles, nulls | authored_positive_fixture | canonical |
+| `V-FAM-GRAM-NONCANON` | 5 grammar, roles, nulls | authored_negative_expectation | noncanonical |
+| `V-FAM-GRAM-DUP` | 5 grammar, roles, nulls | authored_negative_expectation | malformed |
+| `V-FAM-GRAM-NUMBER` | 5 grammar, roles, nulls | authored_negative_expectation | schema |
+| `V-FAM-GRAM-BOOL` | 5 grammar, roles, nulls | authored_negative_expectation | schema |
+| `V-FAM-GRAM-SPACE` | 5 grammar, roles, nulls | authored_negative_expectation | noncanonical |
+| `V-FAM-GRAM-ESCAPE` | 5 grammar, roles, nulls | authored_negative_expectation | noncanonical |
+| `V-FAM-GRAM-NONASCII` | 5 grammar, roles, nulls | authored_negative_expectation | noncanonical |
+| `V-FAM-GRAM-UNKNOWN` | 5 grammar, roles, nulls | authored_negative_expectation | schema |
+| `V-FAM-GRAM-MISSING` | 5 grammar, roles, nulls | authored_negative_expectation | schema |
+| `V-FAM-GRAM-U00` | 5 grammar, roles, nulls | authored_negative_expectation | noncanonical |
+| `V-FAM-GRAM-B64PAD` | 5 grammar, roles, nulls | authored_negative_expectation | noncanonical |
+| `V-FAM-GRAM-NULL-ABSENT` | 5 grammar, roles, nulls | authored_negative_expectation | malformed |
+| `V-FAM-GRAM-ROLE` | 5 grammar, roles, nulls | authored_negative_expectation | binding |
+| `V-FAM-GRAM-DOMAIN` | 5 grammar, roles, nulls | authored_negative_expectation | domain |
+| `V-FAM-POL-RESTORE` | 6 policy and minima | authored_positive_fixture | restore proceeds |
+| `V-FAM-POL-CAP-REHASH` | 6 policy and minima | authored_negative_expectation | conflict; image caps not adopted |
+| `V-FAM-POL-GEN-LOW` | 6 policy and minima | authored_negative_expectation | regression |
+| `V-FAM-POL-EQFORK` | 6 policy and minima | authored_negative_expectation | fork |
+| `V-FAM-POL-FILTER` | 6 policy and minima | authored_negative_expectation | policy_unknown |
+| `V-FAM-POL-WRONG-AUTH` | 6 policy and minima | authored_negative_expectation | unauthorized |
+| `V-FAM-OP-CONSUME` | 7 operation auth | authored_positive_fixture | op, auth, response, Original and GlobalEntry agree |
+| `V-FAM-OP-TENANT` | 7 operation auth | authored_negative_expectation | unauthorized; no body |
+| `V-FAM-OP-OWNER` | 7 operation auth | authored_negative_expectation | unauthorized |
+| `V-FAM-OP-HOLDER` | 7 operation auth | authored_negative_expectation | unauthorized |
+| `V-FAM-OP-READ-FOREIGN` | 7 operation auth | authored_negative_expectation | unauthorized; no body |
+| `V-FAM-PROOF-EMPTY` | 8 proofs | authored_positive_fixture | empty authenticated genesis head |
+| `V-FAM-PROOF-ONE` | 8 proofs | authored_positive_fixture | one-leaf root equals the leaf hash |
+| `V-FAM-PROOF-THREE` | 8 proofs | authored_positive_fixture | three-leaf root; every known prefix recomputes |
+| `V-FAM-PROOF-ABA` | 8 proofs | authored_positive_fixture | A positions 0 and 2 scoped-complete without adjacency; B body not returned |
+| `V-FAM-PROOF-REORDER` | 8 proofs | authored_negative_expectation | fork or incomplete |
+| `V-FAM-PROOF-COUNT` | 8 proofs | authored_negative_expectation | incomplete |
+| `V-FAM-PROOF-OFFSET` | 8 proofs | authored_negative_expectation | incomplete |
+| `V-FAM-PROOF-LAST` | 8 proofs | authored_negative_expectation | binding |
+| `V-FAM-PAGE-SET` | 9 pages | authored_positive_fixture | three pages chain; page root and manifest recompute |
+| `V-FAM-PAGE-OMIT-FIRST` | 9 pages | authored_negative_expectation | incomplete |
+| `V-FAM-PAGE-OMIT-MID` | 9 pages | authored_negative_expectation | incomplete |
+| `V-FAM-PAGE-OMIT-FINAL` | 9 pages | authored_negative_expectation | incomplete |
+| `V-FAM-PAGE-OMIT-NEG` | 9 pages | authored_negative_expectation | incomplete |
+| `V-FAM-PAGE-MIXED` | 9 pages | authored_negative_expectation | fork |
+| `V-FAM-TIME-109` | 10 time | authored_positive_fixture | admit |
+| `V-FAM-TIME-110` | 10 time | authored_negative_expectation | expired; no consume |
+| `V-FAM-TIME-111` | 10 time | authored_negative_expectation | expired; no consume |
+| `V-FAM-TIME-COMMIT200` | 10 time | authored_schedule_fixture | commit allowed under unchanged revision and term; label post_sign_admission_only; not freshness at 200 |
+| `V-FAM-TIME-WALL` | 10 time | authored_negative_expectation | same outcome as V-FAM-TIME-109 |
+| `V-FAM-TIME-XDOMAIN` | 10 time | authored_negative_expectation | domain |
+| `V-FAM-TIME-FENCE` | 10 time | authored_negative_expectation | stale_writer |
+| `V-FAM-TIME-LOST-CONFIRM` | 10 time | authored_schedule_fixture | commit_unknown; no provisional bytes; reconcile finds the winner |
+| `V-FAM-TIME-RESTORE` | 10 time | authored_schedule_fixture | exact original after restore; divergent loser conflict |
+| `V-FAM-QUOTA-RECORDS-CAP` | 11 quotas | authored_positive_fixture | charge reaches the synthetic cap |
+| `V-FAM-QUOTA-RECORDS-OVER` | 11 quotas | authored_negative_expectation | quota; latch unavailable for cumulative; no eviction |
+| `V-FAM-QUOTA-STOREDBYTES-CAP` | 11 quotas | authored_positive_fixture | charge reaches the synthetic cap |
+| `V-FAM-QUOTA-STOREDBYTES-OVER` | 11 quotas | authored_negative_expectation | quota; latch unavailable for cumulative; no eviction |
+| `V-FAM-QUOTA-OUTSTANDING-CAP` | 11 quotas | authored_positive_fixture | charge reaches the synthetic cap |
+| `V-FAM-QUOTA-OUTSTANDING-OVER` | 11 quotas | authored_negative_expectation | quota; latch unavailable for cumulative; no eviction |
+| `V-FAM-QUOTA-RETRYATTEMPTS-CAP` | 11 quotas | authored_positive_fixture | charge reaches the synthetic cap |
+| `V-FAM-QUOTA-RETRYATTEMPTS-OVER` | 11 quotas | authored_negative_expectation | quota; latch unavailable for cumulative; no eviction |
+| `V-FAM-QUOTA-SIGNERCALLS-CAP` | 11 quotas | authored_positive_fixture | charge reaches the synthetic cap |
+| `V-FAM-QUOTA-SIGNERCALLS-OVER` | 11 quotas | authored_negative_expectation | quota; latch unavailable for cumulative; no eviction |
+| `V-FAM-QUOTA-STORECALLS-CAP` | 11 quotas | authored_positive_fixture | charge reaches the synthetic cap |
+| `V-FAM-QUOTA-STORECALLS-OVER` | 11 quotas | authored_negative_expectation | quota; latch unavailable for cumulative; no eviction |
+| `V-FAM-QUOTA-DENIALRECORDS-CAP` | 11 quotas | authored_positive_fixture | charge reaches the synthetic cap |
+| `V-FAM-QUOTA-DENIALRECORDS-OVER` | 11 quotas | authored_negative_expectation | quota; latch unavailable for cumulative; no eviction |
+| `V-FAM-QUOTA-CALLS-CAP` | 11 quotas | authored_positive_fixture | charge reaches the synthetic cap |
+| `V-FAM-QUOTA-CALLS-OVER` | 11 quotas | authored_negative_expectation | quota; latch unavailable for cumulative; no eviction |
+| `V-FAM-QUOTA-RETAINEDPAGES-CAP` | 11 quotas | authored_positive_fixture | charge reaches the synthetic cap |
+| `V-FAM-QUOTA-RETAINEDPAGES-OVER` | 11 quotas | authored_negative_expectation | quota; latch unavailable for cumulative; no eviction |
+| `V-FAM-QUOTA-REQUESTINPUTBYTES-CAP` | 11 quotas | authored_positive_fixture | accepted at synthetic cap |
+| `V-FAM-QUOTA-REQUESTINPUTBYTES-OVER` | 11 quotas | authored_negative_expectation | oversize; no commit |
+| `V-FAM-QUOTA-NEG-RESERVE` | 11 quotas | authored_schedule_fixture | unavailable; first_break and earliest denial kept |
+| `V-FAM-QUOTA-RESTORE` | 11 quotas | authored_schedule_fixture | serialized restore with independent basis recovers; counters not reset |
+| `V-FAM-QUOTA-NOBASIS` | 11 quotas | authored_schedule_fixture | unavailable; no grant |
+| `V-FAM-CLOSE-SPLIT` | 12 close and holds | authored_positive_fixture | opening [0,MAX-2] then one-row close [MAX-1,MAX-1]; total_rows MAX |
+| `V-FAM-CLOSE-ZERO` | 12 close and holds | authored_negative_expectation | incomplete; zero-new-row close denied |
+| `V-FAM-CLOSE-ENDMAX` | 12 close and holds | authored_negative_expectation | overflow |
+| `V-FAM-CLOSE-SUCC` | 12 close and holds | authored_negative_expectation | binding |
+| `V-FAM-CLOSE-GROWTH` | 12 close and holds | authored_negative_expectation | closed |
+| `V-FAM-CLOSE-NEAR` | 12 close and holds | authored_positive_fixture | named near-limit genesis offset MAX-1 admits one leaf; next append exhausts |
+| `V-FAM-HOLD-TERM` | 12 close and holds | authored_negative_expectation | BLOCKED; no success path; retirement_disabled |
+| `V-FAM-HOLD-WRONG` | 12 close and holds | authored_negative_expectation | retirement_disabled or unauthorized; hold stays |
+| `V-FAM-HOLD-PAUSED` | 12 close and holds | authored_negative_expectation | retirement_disabled or unauthorized; hold stays |
+| `V-FAM-HOLD-UNKNOWN` | 12 close and holds | authored_negative_expectation | retirement_disabled or unauthorized; hold stays |
+| `V-FAM-HOLD-RESTORE` | 12 close and holds | authored_schedule_fixture | hold stays held or quarantined; no release |
+| `V-FAM-HOLD-TIME` | 12 close and holds | authored_schedule_fixture | hold stays held or quarantined; no release |
+| `V-FAM-HOLD-ADMIN` | 12 close and holds | authored_schedule_fixture | hold stays held or quarantined; no release |
+| `V-FAM-HOLD-QUOTA` | 12 close and holds | authored_schedule_fixture | hold stays held or quarantined; no release |
 
 ## 12. Pins
 
-`tests/anchor_seen_at_p2/vectors/p2-pins.json` is written only by that generator. It labels the base commit `4d119020cec8c3b6ae55c30c8bb17f5c6ab845ad` as supplied by the operator. It records SHA-256 and byte length of this document, of `gen_vectors.py`, and of `p2-vectors.json` as observed when the generator runs. Because those pins include this document's own SHA-256, any later edit to this document requires regenerating the pins. The §0 source table is copied through as supplied pins, not re-hashed. This section does not restate those digests.
+`tests/anchor_seen_at_p2/vectors/p2-pins.json` is written only by that generator. It has exactly three members: `base`, `observed_file_pins`, and `supplied_pin_assertions`. `supplied_pin_assertions` is a strict parse of the §0 source table only (three cells, unique file name, lowercase 64-hex digest, integer or `UNKNOWN` length); any other hex string in this document is not a pin. It labels the base commit `4d119020cec8c3b6ae55c30c8bb17f5c6ab845ad` as supplied by the operator. It records SHA-256 and byte length of this document, of `gen_vectors.py`, and of `p2-vectors.json` as observed when the generator runs. Because those pins include this document's own SHA-256, any later edit to this document requires regenerating the pins. The §0 source table is copied through as supplied pins, not re-hashed. This section does not restate those digests.
 
 ## 13. C1 scan status
 

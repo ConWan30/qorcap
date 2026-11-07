@@ -3,494 +3,92 @@
   "commit": "4d119020cec8c3b6ae55c30c8bb17f5c6ab845ad",
   "label": "supplied by operator"
  },
- "observed": [
+ "observed_file_pins": [
   {
-   "bytes": 105518,
+   "bytes": 151179,
    "label": "observed by generator",
    "path": "docs/anchor-seen-at-p2.md",
-   "sha256": "b187d4820546471c196a713a2655a3a18c36426f8854c8ce884c8d384ef8a599"
+   "sha256": "a198ebdcfc2e2d953bb8ce4d2d3ededab839d6c4e8269cc13761cc1b57c8c7fd"
   },
   {
-   "bytes": 52502,
+   "bytes": 141150,
    "label": "observed by generator",
    "path": "tests/anchor_seen_at_p2/vectors/gen_vectors.py",
-   "sha256": "712942184cd87ee9bfbe628294dcef2f2952869614fc47daa475b03149433069"
+   "sha256": "e85da44e84058c0e93302cc9a05f700cf42d687df70461aab9619887c985425d"
   },
   {
-   "bytes": 198800,
+   "bytes": 1715553,
    "label": "observed by generator",
    "path": "tests/anchor_seen_at_p2/vectors/p2-vectors.json",
-   "sha256": "0aa224e4d84c041336542e270d7088972992a06b3830ca98e952b7e148d5dffb"
+   "sha256": "985fac40f4d3a617c75c44ce06ebc805a5db553ac9926ed6ccafe5540adb64d1"
   }
  ],
- "supplied_sources": [
+ "supplied_pin_assertions": [
   {
    "bytes": "63841",
-   "label": "supplied pins, not re-hashed",
+   "label": "supplied pin assertion, not an observed file hash",
    "sha256": "21e9cc222d5a30ec6fa8fff1d1f0b69e29a121589560fc656a7963fc44159910",
    "source": "P2-SCHEMAS-r1-candidate.md"
   },
   {
    "bytes": "27712",
-   "label": "supplied pins, not re-hashed",
+   "label": "supplied pin assertion, not an observed file hash",
    "sha256": "ed189d630682ac72458374cfef34f296f0943f36159422b77aa148246b2575dd",
    "source": "P2-SCHEMAS-r1-qordata-review.md"
   },
   {
    "bytes": "28865",
-   "label": "supplied pins, not re-hashed",
+   "label": "supplied pin assertion, not an observed file hash",
    "sha256": "df2a60e8e28029ea4fcf8a9900ee383a0dc09e9acc6b7aa6b9ad57c03a9070df",
    "source": "p2-schemas-r1-redteam.md"
   },
   {
    "bytes": "28276",
-   "label": "supplied pins, not re-hashed",
+   "label": "supplied pin assertion, not an observed file hash",
    "sha256": "13ed0a76d386abe683d8c2cf36b215dd62c946f92daa3e856e5e287f2fca3389",
    "source": "P2-BRIEF-QORARCH.md"
   },
   {
    "bytes": "17767",
-   "label": "supplied pins, not re-hashed",
+   "label": "supplied pin assertion, not an observed file hash",
    "sha256": "57d5b42d551cf7a008e91859452109079701e0c41414f45e55372f2618f22bb1",
    "source": "P2-NOVELTY.md"
   },
   {
    "bytes": "68899",
-   "label": "supplied pins, not re-hashed",
+   "label": "supplied pin assertion, not an observed file hash",
    "sha256": "d4bf5fd56ca1770c0bbe723014dd4c00a4b5972645592b91d3b1c33f00ca1fd4",
    "source": "PHASE2-DESIGN-r2.md"
   },
   {
    "bytes": "10789",
-   "label": "supplied pins, not re-hashed",
+   "label": "supplied pin assertion, not an observed file hash",
    "sha256": "d4a2a28396fa2d2c1ea729f093c9b4f10d792296b54803e7c519ecfc3d3535ad",
    "source": "PHASE2-DESIGN-r3-addendum.md"
   },
   {
    "bytes": "30596",
-   "label": "supplied pins, not re-hashed",
+   "label": "supplied pin assertion, not an observed file hash",
    "sha256": "b6818017965c2ff9a21d246d4f7fb7764eaf1eab53d7ec498bda63762ddafdd3",
    "source": "ACCEPTANCE-AND-BUDGETS.md"
   },
   {
    "bytes": "12044",
-   "label": "supplied pins, not re-hashed",
+   "label": "supplied pin assertion, not an observed file hash",
    "sha256": "f3f021933a5f21bdce1ed67da21f3da5ab2577d905dc61365082245f4592f90f",
    "source": "redteam-qorproof-r3.md"
   },
   {
    "bytes": "19104",
-   "label": "supplied pins, not re-hashed",
+   "label": "supplied pin assertion, not an observed file hash",
    "sha256": "8ad7b50473ef3e511c3a7ab03bed55928eadf06f7cfa1db497566314e4446f33",
    "source": "redteam-qorproof-r2.md"
   },
   {
-   "bytes": "supplied in the task prompt; byte length not restated because this writer did not measure the file",
-   "label": "supplied pins, not re-hashed",
+   "bytes": "UNKNOWN",
+   "label": "supplied pin assertion, not an observed file hash",
    "sha256": "741d3aa11d849046e5620c1e9d13f2b5bbd2c94567e873418e869ea3e2d49ce6",
-   "source": "Handoff `P2-GROK-HANDOFF.md"
-  },
-  {
-   "bytes": "new id; same key impossible (key includes scope) so this is a different key and must not replace the old key",
-   "label": "supplied pins, not re-hashed",
-   "sha256": "scope.tenant",
-   "source": "V-B1-MUT-SCOPE-TENANT"
-  },
-  {
-   "bytes": "same as tenant: different key, old record unchanged",
-   "label": "supplied pins, not re-hashed",
-   "sha256": "scope.principal",
-   "source": "V-B1-MUT-SCOPE-PRINCIPAL"
-  },
-  {
-   "bytes": "different key, old unchanged",
-   "label": "supplied pins, not re-hashed",
-   "sha256": "scope.service",
-   "source": "V-B1-MUT-SCOPE-SERVICE"
-  },
-  {
-   "bytes": "different key, old unchanged",
-   "label": "supplied pins, not re-hashed",
-   "sha256": "scope.audience",
-   "source": "V-B1-MUT-SCOPE-AUDIENCE"
-  },
-  {
-   "bytes": "different key, old unchanged",
-   "label": "supplied pins, not re-hashed",
-   "sha256": "scope.session",
-   "source": "V-B1-MUT-SCOPE-SESSION"
-  },
-  {
-   "bytes": "different key, old unchanged",
-   "label": "supplied pins, not re-hashed",
-   "sha256": "scope.device_epoch",
-   "source": "V-B1-MUT-SCOPE-DEVICE"
-  },
-  {
-   "bytes": "different key, old unchanged",
-   "label": "supplied pins, not re-hashed",
-   "sha256": "scope.capture_epoch",
-   "source": "V-B1-MUT-SCOPE-CAPTURE"
-  },
-  {
-   "bytes": "different key, old unchanged",
-   "label": "supplied pins, not re-hashed",
-   "sha256": "scope.chain",
-   "source": "V-B1-MUT-SCOPE-CHAIN"
-  },
-  {
-   "bytes": "different key, old unchanged",
-   "label": "supplied pins, not re-hashed",
-   "sha256": "scope.lineage",
-   "source": "V-B1-MUT-SCOPE-LINEAGE"
-  },
-  {
-   "bytes": "different key, old unchanged",
-   "label": "supplied pins, not re-hashed",
-   "sha256": "stream",
-   "source": "V-B1-MUT-STREAM"
-  },
-  {
-   "bytes": "different key; must not be treated as a retry of the old exchange",
-   "label": "supplied pins, not re-hashed",
-   "sha256": "exchange",
-   "source": "V-B1-MUT-EXCHANGE"
-  },
-  {
-   "bytes": "different key; using the other operation's id on the wrong request type is `binding` (`V-B1-ATK-02`)",
-   "label": "supplied pins, not re-hashed",
-   "sha256": "operation` flipped issue/consume under the same exchange",
-   "source": "V-B1-MUT-OP"
-  },
-  {
-   "bytes": "same logical key if scope, stream, exchange, operation unchanged: `conflict`; first core stands",
-   "label": "supplied pins, not re-hashed",
-   "sha256": "purpose",
-   "source": "V-B1-MUT-PURPOSE"
-  },
-  {
-   "bytes": "same key: `conflict`",
-   "label": "supplied pins, not re-hashed",
-   "sha256": "ack_ordinal",
-   "source": "V-B1-MUT-ORD"
-  },
-  {
-   "bytes": "same key: `conflict`",
-   "label": "supplied pins, not re-hashed",
-   "sha256": "pins.protocol",
-   "source": "V-B1-MUT-PIN-PROTOCOL"
-  },
-  {
-   "bytes": "same key: `conflict`",
-   "label": "supplied pins, not re-hashed",
-   "sha256": "pins.eligibility",
-   "source": "V-B1-MUT-PIN-ELIG"
-  },
-  {
-   "bytes": "same key: `conflict`",
-   "label": "supplied pins, not re-hashed",
-   "sha256": "pins.trust",
-   "source": "V-B1-MUT-PIN-TRUST"
-  },
-  {
-   "bytes": "same key: `conflict`",
-   "label": "supplied pins, not re-hashed",
-   "sha256": "pins.data",
-   "source": "V-B1-MUT-PIN-DATA"
-  },
-  {
-   "bytes": "same key: `conflict`",
-   "label": "supplied pins, not re-hashed",
-   "sha256": "pins.checker",
-   "source": "V-B1-MUT-PIN-CHECKER"
-  },
-  {
-   "bytes": "`domain`",
-   "label": "supplied pins, not re-hashed",
-   "sha256": "enqueue_at.domain.role` not `client_mono",
-   "source": "V-B1-MUT-ENQ-ROLE"
-  },
-  {
-   "bytes": "`domain`",
-   "label": "supplied pins, not re-hashed",
-   "sha256": "enqueue_at.domain.source` not `client_declared",
-   "source": "V-B1-MUT-ENQ-SOURCE"
-  },
-  {
-   "bytes": "`domain`",
-   "label": "supplied pins, not re-hashed",
-   "sha256": "enqueue_at.domain.unit` not `ns",
-   "source": "V-B1-MUT-ENQ-UNIT"
-  },
-  {
-   "bytes": "`domain`",
-   "label": "supplied pins, not re-hashed",
-   "sha256": "enqueue_at.domain.process` differs from deadline",
-   "source": "V-B1-MUT-ENQ-PROCESS"
-  },
-  {
-   "bytes": "`domain`",
-   "label": "supplied pins, not re-hashed",
-   "sha256": "enqueue_at.domain.boot` differs from deadline",
-   "source": "V-B1-MUT-ENQ-BOOT"
-  },
-  {
-   "bytes": "`domain`",
-   "label": "supplied pins, not re-hashed",
-   "sha256": "enqueue_at.domain.clock_epoch` differs from deadline",
-   "source": "V-B1-MUT-ENQ-EPOCH"
-  },
-  {
-   "bytes": "`domain`",
-   "label": "supplied pins, not re-hashed",
-   "sha256": "enqueue_at.domain.leader` differs from deadline",
-   "source": "V-B1-MUT-ENQ-LEADER"
-  },
-  {
-   "bytes": "`conflict`; stored deadline unchanged",
-   "label": "supplied pins, not re-hashed",
-   "sha256": "later `enqueue_at.value` on same key",
-   "source": "V-B1-MUT-ENQ-VALUE"
-  },
-  {
-   "bytes": "`conflict`; stored deadline unchanged",
-   "label": "supplied pins, not re-hashed",
-   "sha256": "later `original_deadline.value` on same key",
-   "source": "V-B1-MUT-DL-VALUE"
-  },
-  {
-   "bytes": "`domain`",
-   "label": "supplied pins, not re-hashed",
-   "sha256": "deadline value < enqueue value, same domain",
-   "source": "V-B1-MUT-ORDER"
-  },
-  {
-   "bytes": "`binding`",
-   "label": "supplied pins, not re-hashed",
-   "sha256": "request carries an `expected_id` that is not the hash of the registered core",
-   "source": "V-B1-MUT-STALE-ID"
-  },
-  {
-   "bytes": "not a valid preimage; `binding`",
-   "label": "supplied pins, not re-hashed",
-   "sha256": "request hashed with `expected_id` omitted, null, or `Z`, then repaired",
-   "source": "V-B1-MUT-OMIT-ID"
-  },
-  {
-   "bytes": "A original wins; B `conflict`",
-   "label": "supplied pins, not re-hashed",
-   "sha256": "order A commits, B divergent",
-   "source": "V-B1-RACE-AB"
-  },
-  {
-   "bytes": "B original wins; A `conflict`",
-   "label": "supplied pins, not re-hashed",
-   "sha256": "order B commits, A divergent",
-   "source": "V-B1-RACE-BA"
-  },
-  {
-   "bytes": "oracle unchanged",
-   "label": "supplied pins, not re-hashed",
-   "sha256": "same as `V-B1-RACE-AB` after expiry",
-   "source": "V-B1-RACE-AB-EXP"
-  },
-  {
-   "bytes": "oracle unchanged",
-   "label": "supplied pins, not re-hashed",
-   "sha256": "same as `V-B1-RACE-BA` after expiry",
-   "source": "V-B1-RACE-BA-EXP"
-  },
-  {
-   "bytes": "oracle unchanged; missing client fixture stays `unknown` (`V-B1-ATK-04`)",
-   "label": "supplied pins, not re-hashed",
-   "sha256": "same as `V-B1-RACE-AB` after restart",
-   "source": "V-B1-RACE-AB-RST"
-  },
-  {
-   "bytes": "oracle unchanged",
-   "label": "supplied pins, not re-hashed",
-   "sha256": "same as `V-B1-RACE-BA` after restart",
-   "source": "V-B1-RACE-BA-RST"
-  },
-  {
-   "bytes": "`V-B3-TERM`",
-   "label": "supplied pins, not re-hashed",
-   "sha256": "commit_unknown`, no grant",
-   "source": "writer_term` or server domain disagrees with continuity"
-  },
-  {
-   "bytes": "Recovery image, response, workspace",
-   "label": "supplied pins, not re-hashed",
-   "sha256": "Caller request buffer length at receive",
-   "source": "request_input_bytes"
-  },
-  {
-   "bytes": "Image",
-   "label": "supplied pins, not re-hashed",
-   "sha256": "J(E(...))` length of that request",
-   "source": "canonical_bytes"
-  },
-  {
-   "bytes": "Image",
-   "label": "supplied pins, not re-hashed",
-   "sha256": "Decoded payload size",
-   "source": "decoded_bytes"
-  },
-  {
-   "bytes": "Retained store",
-   "label": "supplied pins, not re-hashed",
-   "sha256": "Parser scratch for this attempt",
-   "source": "parse_bytes"
-  },
-  {
-   "bytes": "Request input",
-   "label": "supplied pins, not re-hashed",
-   "sha256": "Response bytes at delivery",
-   "source": "output_bytes"
-  },
-  {
-   "bytes": "Committed originals",
-   "label": "supplied pins, not re-hashed",
-   "sha256": "Attempt scratch reservation",
-   "source": "workspace_bytes"
-  },
-  {
-   "bytes": "Caller request input",
-   "label": "supplied pins, not re-hashed",
-   "sha256": "Stable-image length at recover",
-   "source": "recovery_image_bytes"
-  },
-  {
-   "bytes": "Per-attempt scratch",
-   "label": "supplied pins, not re-hashed",
-   "sha256": "Retained model bytes after commit",
-   "source": "stored_bytes"
-  },
-  {
-   "bytes": "external trusted genesis fixture",
-   "label": "supplied pins, not re-hashed",
-   "sha256": "GenesisCore",
-   "source": "genesis_id"
-  },
-  {
-   "bytes": "retained next to the original request, outside the receipt preimage",
-   "label": "supplied pins, not re-hashed",
-   "sha256": "ClientCheckpointCore",
-   "source": "client_checkpoint_id"
-  },
-  {
-   "bytes": "committed checkpoint row",
-   "label": "supplied pins, not re-hashed",
-   "sha256": "ServiceReceipt",
-   "source": "service_receipt_id"
-  },
-  {
-   "bytes": "the core has no receipt field",
-   "label": "supplied pins, not re-hashed",
-   "sha256": "the core has no prior field",
-   "source": "GenesisCore"
-  },
-  {
-   "bytes": "commit. Request bytes do not contain the receipt id",
-   "label": "supplied pins, not re-hashed",
-   "sha256": "Genesis, then issue, then first consume with `prior_service_receipt` null and `prior_client_checkpoint = genesis_id`, then receipt hash",
-   "source": "V-B6-BOOT"
-  },
-  {
-   "bytes": "commit. New receipt id differs from both",
-   "label": "supplied pins, not re-hashed",
-   "sha256": "Next checkpoint names that client id and that receipt",
-   "source": "V-B6-EXT"
-  },
-  {
-   "bytes": "`fork`, no commit",
-   "label": "supplied pins, not re-hashed",
-   "sha256": "Same priors, `head` or source head swapped",
-   "source": "V-B6-WRONG-ROOT"
-  },
-  {
-   "bytes": "`binding`",
-   "label": "supplied pins, not re-hashed",
-   "sha256": "Prior client id set to this core's own id, or a core field added that copies the id",
-   "source": "V-B6-SELF"
-  },
-  {
-   "bytes": "`binding`",
-   "label": "supplied pins, not re-hashed",
-   "sha256": "Request field set to the receipt id this commit would produce, or to the latest receipt used as the client id",
-   "source": "V-B6-CURRENT"
-  },
-  {
-   "bytes": "`incomplete`, grant `unknown`",
-   "label": "supplied pins, not re-hashed",
-   "sha256": "Extension with null receipt prior after `V-B6-BOOT`, or prior id that does not resolve",
-   "source": "V-B6-MISSING"
-  },
-  {
-   "bytes": "`binding`",
-   "label": "supplied pins, not re-hashed",
-   "sha256": "Z` as genesis, client id, receipt, or either prior",
-   "source": "V-B6-Z"
-  },
-  {
-   "bytes": "`not_found`, no new history",
-   "label": "supplied pins, not re-hashed",
-   "sha256": "Random `H` as genesis or as first prior",
-   "source": "V-B6-ANY-H"
-  },
-  {
-   "bytes": "origin stored from that request",
-   "label": "supplied pins, not re-hashed",
-   "sha256": "Opening consume",
-   "source": "V-B7-OPEN"
-  },
-  {
-   "bytes": "other checks aside, not a context reject",
-   "label": "supplied pins, not re-hashed",
-   "sha256": "Later op, same pins, schema, and both domains",
-   "source": "V-B7-EQ"
-  },
-  {
-   "bytes": "`fork` or `binding`; origin unchanged",
-   "label": "supplied pins, not re-hashed",
-   "sha256": "One pin field, `source_schema`, or either domain differs",
-   "source": "V-B7-PIN"
-  },
-  {
-   "bytes": "origin unchanged; call denied",
-   "label": "supplied pins, not re-hashed",
-   "sha256": "Current archive allow with a different checker pin",
-   "source": "V-B7-AUTH"
-  },
-  {
-   "bytes": "`fork`; latch sticky; `unknown`",
-   "label": "supplied pins, not re-hashed",
-   "sha256": "Same endpoint and height, different source head",
-   "source": "V-B7-FORK-HEAD"
-  },
-  {
-   "bytes": "`fork`; latch sticky",
-   "label": "supplied pins, not re-hashed",
-   "sha256": "Same journal span, different head or client checkpoint id",
-   "source": "V-B7-FORK-JRN"
-  },
-  {
-   "bytes": "twin; no second commit; latch not cleared",
-   "label": "supplied pins, not re-hashed",
-   "sha256": "Byte-identical retry",
-   "source": "V-B7-DUP"
-  },
-  {
-   "bytes": "still `unknown`",
-   "label": "supplied pins, not re-hashed",
-   "sha256": "Later span after a latch",
-   "source": "V-B7-FWD"
-  },
-  {
-   "bytes": "`unknown`; no repair",
-   "label": "supplied pins, not re-hashed",
-   "sha256": "Image origin disagrees with opening bytes",
-   "source": "V-B7-RESTORE"
+   "source": "Handoff P2-GROK-HANDOFF.md"
   }
  ]
 }
