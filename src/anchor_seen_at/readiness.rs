@@ -6,7 +6,7 @@
 //! so re-reading an old snapshot cannot make it fresh, and relabeled copies of one image count as
 //! one frame. The only positive result is a practice-only forward readiness, not a verdict.
 
-use super::coverage::{CoverageView, StreamContext};
+use super::coverage::{StreamContext, StreamEligibility};
 use super::types::Purpose;
 use super::{AnchorState, Reason};
 use std::collections::{BTreeMap, BTreeSet};
@@ -32,7 +32,10 @@ pub struct FrameObservation {
 
 pub struct ReadinessInputs<'a> {
     pub opening: &'a AnchorState,
-    pub coverage: &'a CoverageView,
+    /// Forward-only eligibility state, recorded in arrival order. Never an archival
+    /// reconstruction: a reconstructed view can fill ranges whose eligibility was
+    /// already lost, and readiness must not see those as eligible.
+    pub eligibility: &'a StreamEligibility,
     pub capture_validity: CaptureValidity,
     pub frames: &'a [FrameObservation],
     pub min_distinct_frames: Option<usize>,
@@ -51,11 +54,16 @@ pub fn evaluate(i: &ReadinessInputs) -> Readiness {
     let mut why = BTreeSet::new();
     let opening = i.opening.retained().filter(|f| f.commitment.purpose == Purpose::Opening);
     if opening.is_none() { why.insert(Reason::AnchorNotRetained); }
-    // The coverage view must belong to the opening's full stream context. An opening from one
-    // stream paired with coverage from another (same ranges, different stream) is not readiness.
+    // The eligibility state must belong to the opening's full stream context. An opening
+    // from one stream paired with eligibility from another (same ranges, different
+    // stream) is not readiness.
     if let Some(o) = opening {
-        if i.coverage.stream_context.as_ref() != Some(&StreamContext::of(o)) { why.insert(Reason::BindingMismatch); }
+        if i.eligibility.stream_context() != Some(&StreamContext::of(o)) { why.insert(Reason::BindingMismatch); }
     }
+    // A preserved eligibility break withholds readiness even for frames in the eligible
+    // prefix: the stream's forward-only eligibility was broken, and no later
+    // reconstruction clears that.
+    if let Some(r) = i.eligibility.break_reason() { why.insert(r); }
     if i.capture_validity != CaptureValidity::SeparatelyEstablished { why.insert(Reason::CaptureValidityNotEstablished); }
     if i.exclusion_end_seq.is_none() { why.insert(Reason::ExclusionUnresolved); }
     if !i.hook_lag_measured { why.insert(Reason::LagUnmeasured); }
@@ -64,7 +72,7 @@ pub fn evaluate(i: &ReadinessInputs) -> Readiness {
     let mut seq_digests: BTreeMap<u64, BTreeSet<&str>> = BTreeMap::new();
     for f in i.frames {
         let fresh = opening.is_some_and(|o| o.commitment.capture_epoch_id == f.capture_epoch_id)
-            && i.coverage.is_seen_at(f.acquisition_seq)
+            && i.eligibility.is_eligible(f.acquisition_seq)
             && i.exclusion_end_seq.is_some_and(|x| f.acquisition_seq > x);
         if !fresh { why.insert(Reason::StaleFrame); }
         digest_seqs.entry(&f.frame_digest).or_default().insert(f.acquisition_seq);

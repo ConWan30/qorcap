@@ -12,7 +12,7 @@ fn unknown(first: u64, last: u64, r: Reason) -> Segment { Segment { first_seq: f
 fn complete_stream_with_close_is_fully_seen_at() {
     let w = World::new();
     let v = full_stream(&w, &Session::new("cov-full"));
-    let view = coverage::build(&states(&w, &v), 29);
+    let view = coverage::reconstruct_archival(&states(&w, &v), 29);
     assert!(view.complete);
     assert_eq!(view.unknown_rows(), 0);
     assert_eq!(view.segments.len(), 3);
@@ -22,7 +22,7 @@ fn complete_stream_with_close_is_fully_seen_at() {
 fn opening_never_clears_later_intervals() {
     let w = World::new();
     let v = full_stream(&w, &Session::new("cov-open"));
-    let view = coverage::build(&states(&w, &v[..1]), 29);
+    let view = coverage::reconstruct_archival(&states(&w, &v[..1]), 29);
     assert!(!view.complete);
     assert!(view.is_seen_at(9));
     assert_eq!(view.segments.last().unwrap(), &unknown(10, 29, Reason::MissingClose));
@@ -32,7 +32,7 @@ fn opening_never_clears_later_intervals() {
 fn missing_interval_stays_unknown_and_a_later_valid_close_does_not_clear_it() {
     let w = World::new();
     let v = full_stream(&w, &Session::new("cov-gap"));
-    let view = coverage::build(&states(&w, &[v[0].clone(), v[2].clone()]), 29);
+    let view = coverage::reconstruct_archival(&states(&w, &[v[0].clone(), v[2].clone()]), 29);
     assert!(!view.complete);
     assert_eq!(view.segments.last().unwrap(), &unknown(10, 29, Reason::Gap));
     assert!(!view.is_seen_at(25), "the close's own range is not rescued past the gap");
@@ -43,16 +43,31 @@ fn duplicate_ack_does_not_advance_coverage() {
     let w = World::new();
     let v = full_stream(&w, &Session::new("cov-dup"));
     let st = states(&w, &[v[0].clone(), v[0].clone(), v[0].clone()]);
-    assert_eq!(coverage::build(&st, 29), coverage::build(&states(&w, &v[..1]), 29));
+    assert_eq!(coverage::reconstruct_archival(&st, 29), coverage::reconstruct_archival(&states(&w, &v[..1]), 29));
 }
 
 #[test]
-fn arrival_order_does_not_change_the_view() {
+fn archival_reconstruction_sorts_but_reversed_arrival_breaks_eligibility() {
     let w = World::new();
     let v = full_stream(&w, &Session::new("cov-order"));
-    let fwd = coverage::build(&states(&w, &v), 29);
-    let rev = coverage::build(&states(&w, &[v[2].clone(), v[0].clone(), v[1].clone()]), 29);
+    // Archival reconstruction is arrival-order independent by design: it only rebuilds
+    // what the digests say, so forward and reversed sets reconstruct identically.
+    let fwd = coverage::reconstruct_archival(&states(&w, &v), 29);
+    let rev = coverage::reconstruct_archival(&states(&w, &[v[2].clone(), v[0].clone(), v[1].clone()]), 29);
     assert_eq!(fwd, rev);
+    assert!(fwd.complete);
+    // Eligibility is not: reversed arrival is a reorder, recorded permanently.
+    let st = states(&w, &v);
+    let in_order = coverage::StreamEligibility::from_arrival_order(&st, 29);
+    assert!(in_order.complete());
+    assert_eq!(in_order.break_reason(), None);
+    let reversed = coverage::StreamEligibility::from_arrival_order(&[st[2].clone(), st[0].clone(), st[1].clone()], 29);
+    assert_eq!(reversed.break_reason(), Some(Reason::Reordered));
+    assert!(!reversed.complete());
+    assert!(!reversed.is_eligible(0) && !reversed.is_eligible(15) && !reversed.is_eligible(25));
+    assert_eq!(reversed.segments(), vec![unknown(0, 29, Reason::Reordered)]);
+    // Even the later in-order facts in the same arrival sequence never cleared it.
+    assert_eq!(reversed.unknown_rows(), 30);
 }
 
 #[test]
@@ -63,7 +78,7 @@ fn two_distinct_acks_at_one_index_are_a_fork() {
     let mut twin = st[1].retained().unwrap().clone();
     twin.ack_id = hex64("twin");
     st.push(AnchorState::SeenAtRetained(twin));
-    let view = coverage::build(&st, 29);
+    let view = coverage::reconstruct_archival(&st, 29);
     assert!(!view.complete);
     assert_eq!(view.segments.last().unwrap(), &unknown(10, 29, Reason::Fork));
 }
@@ -84,7 +99,7 @@ fn reordered_or_relinked_interval_is_rejected() {
         let mut f = st[1].retained().unwrap().clone();
         edit(&mut f);
         st[1] = AnchorState::SeenAtRetained(f);
-        let view = coverage::build(&st, 29);
+        let view = coverage::reconstruct_archival(&st, 29);
         assert_eq!(view.segments.last().unwrap(), &unknown(10, 29, want));
         assert!(!view.complete);
     }
@@ -96,7 +111,7 @@ fn late_interval_leaves_its_range_and_everything_after_unknown() {
     let v = full_stream(&w, &Session::new("cov-late"));
     let mut st = states(&w, &v);
     st[1] = AnchorState::SeenAtLate(st[1].retained().unwrap().clone());
-    let view = coverage::build(&st, 29);
+    let view = coverage::reconstruct_archival(&st, 29);
     assert_eq!(view.segments.last().unwrap(), &unknown(10, 29, Reason::LateAck));
 }
 
@@ -104,7 +119,7 @@ fn late_interval_leaves_its_range_and_everything_after_unknown() {
 fn rows_after_close_stay_unknown_and_the_close_trailer_is_outside_its_prefix() {
     let w = World::new();
     let v = full_stream(&w, &Session::new("cov-after"));
-    let view = coverage::build(&states(&w, &v), 35);
+    let view = coverage::reconstruct_archival(&states(&w, &v), 35);
     assert!(!view.complete);
     assert_eq!(view.segments.last().unwrap(), &unknown(30, 35, Reason::RowsAfterClose));
     // the close commitment covers rows up to 29 and does not reference its own ack
@@ -117,14 +132,14 @@ fn rows_after_close_stay_unknown_and_the_close_trailer_is_outside_its_prefix() {
 fn missing_close_leaves_an_incomplete_tail() {
     let w = World::new();
     let v = full_stream(&w, &Session::new("cov-noclose"));
-    let view = coverage::build(&states(&w, &v[..2]), 29);
+    let view = coverage::reconstruct_archival(&states(&w, &v[..2]), 29);
     assert!(!view.complete);
     assert_eq!(view.segments.last().unwrap(), &unknown(20, 29, Reason::MissingClose));
 }
 
 #[test]
 fn no_ack_at_all_is_unknown_over_the_whole_prefix() {
-    let view = coverage::build(&[AnchorState::default()], 9);
+    let view = coverage::reconstruct_archival(&[AnchorState::default()], 9);
     assert_eq!(view.segments, vec![unknown(0, 9, Reason::NoAck)]);
     assert!(!view.complete);
 }
@@ -137,7 +152,7 @@ fn opening_that_starts_mid_chain_leaves_earlier_rows_unknown() {
     let mut f = o.state(&w.policy).retained().unwrap().clone();
     f.commitment.chain.predecessor_seq = Some("4".into());
     f.commitment.chain.first_seq = "5".into();
-    let view = coverage::build(&[AnchorState::SeenAtRetained(f)], 9);
+    let view = coverage::reconstruct_archival(&[AnchorState::SeenAtRetained(f)], 9);
     assert_eq!(view.segments[0], unknown(0, 4, Reason::Gap));
     assert!(view.is_seen_at(5));
 }
@@ -149,10 +164,54 @@ fn lost_ack_stays_unknown_and_recovery_is_forward_only() {
     let v = full_stream(&w, &Session::new("cov-loss"));
     let mut st = states(&w, &[v[0].clone(), v[2].clone()]);
     st.insert(1, AnchorState::default());
-    let view = coverage::build(&st, 29);
+    let view = coverage::reconstruct_archival(&st, 29);
     assert!(!view.complete);
     assert_eq!(view.segments.last().unwrap(), &unknown(10, 29, Reason::Gap));
     assert!(!view.is_seen_at(25), "a later close never recovers the lost range");
+}
+
+#[test]
+fn loss_then_recovery_cannot_clear_earlier_unknown_rows() {
+    let w = World::new();
+    let v = full_stream(&w, &Session::new("cov-loss-recovery"));
+    let st = states(&w, &v);
+    // The interval ack is lost when expected: that loss is recorded as an eligibility
+    // break before the interval and close ever arrive.
+    let mut elig = coverage::StreamEligibility::new();
+    elig.record(&st[0], 29);
+    elig.record(&AnchorState::unknown(Reason::Gap), 29);
+    assert_eq!(elig.break_reason(), Some(Reason::Gap));
+    assert!(elig.is_eligible(9));
+    let at_break = elig.segments();
+    assert_eq!(at_break.last().unwrap(), &unknown(10, 29, Reason::Gap));
+    // Recovery: the missing interval and the close now arrive, perfectly valid.
+    elig.record(&st[1], 29);
+    elig.record(&st[2], 29);
+    // Archival reconstruction now shows a complete stream...
+    assert!(coverage::reconstruct_archival(&st, 29).complete);
+    // ...but eligibility is unchanged: the break and the unknown rows are preserved,
+    // and nothing after the loss became eligible retroactively.
+    assert_eq!(elig.break_reason(), Some(Reason::Gap));
+    assert_eq!(elig.segments(), at_break);
+    assert!(!elig.complete());
+    assert!(elig.is_eligible(9));
+    assert!(!elig.is_eligible(15) && !elig.is_eligible(25), "recovered acks do not clear the lost range");
+}
+
+#[test]
+fn deadline_miss_then_valid_close_cannot_clear_the_break() {
+    let w = World::new();
+    let v = full_stream(&w, &Session::new("cov-late-recovery"));
+    let st = states(&w, &v);
+    let mut elig = coverage::StreamEligibility::new();
+    elig.record(&st[0], 29);
+    elig.record(&AnchorState::SeenAtLate(st[1].retained().unwrap().clone()), 29);
+    assert_eq!(elig.break_reason(), Some(Reason::LateAck));
+    elig.record(&st[2], 29);
+    assert_eq!(elig.break_reason(), Some(Reason::LateAck));
+    assert!(!elig.complete());
+    assert_eq!(elig.segments().last().unwrap(), &unknown(10, 29, Reason::LateAck));
+    assert!(!elig.is_eligible(25));
 }
 
 #[test]
@@ -165,7 +224,7 @@ fn reordered_chain_range_is_a_fork_and_restart_invalidates_the_stream() {
     let mut f = st[1].retained().unwrap().clone();
     f.commitment.chain.first_seq = "11".into();
     st[1] = AnchorState::SeenAtRetained(f);
-    let view = coverage::build(&st, 29);
+    let view = coverage::reconstruct_archival(&st, 29);
     assert_eq!(view.segments.last().unwrap(), &unknown(10, 29, Reason::Fork));
     assert!(!view.complete);
     // Restart: a new service boot/clock epoch mid-stream breaks the link, and the
@@ -175,7 +234,7 @@ fn reordered_chain_range_is_a_fork_and_restart_invalidates_the_stream() {
     f.server_boot_id = id("restarted-boot");
     f.server_clock_epoch_id = id("restarted-clock");
     st[1] = AnchorState::SeenAtRetained(f);
-    let view = coverage::build(&st, 29);
+    let view = coverage::reconstruct_archival(&st, 29);
     assert_eq!(view.segments.last().unwrap(), &unknown(10, 29, Reason::ServerEpochMismatch));
     assert!(!view.complete);
     assert!(!view.is_seen_at(25));
@@ -206,7 +265,7 @@ fn ledger_entries_recompute_and_link_the_stream() {
     let mut f = st[2].retained().unwrap().clone();
     f.prev_ledger_entry_digest = hex64("not-the-ledger-entry");
     st[2] = AnchorState::SeenAtRetained(f);
-    let view = coverage::build(&st, 29);
+    let view = coverage::reconstruct_archival(&st, 29);
     assert!(!view.complete);
     assert_eq!(view.segments.last().unwrap(), &unknown(20, 29, Reason::LedgerRollback));
 }

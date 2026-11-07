@@ -1,11 +1,23 @@
 //! Which source rows have a retained seen-at fact (design section 5).
 //!
-//! Acks must form one linked stream from the opening: exact next index, prior ack id, predecessor
-//! sequence and head, same session/epochs/chain/seal, strictly increasing service ledger. The first
-//! break (missing or late ack, fork, reorder, ledger rollback, rows after close) leaves everything
-//! from that point unknown; a later valid ack never clears it. Identical duplicates count once.
-//! Coverage is complete only with a retained close whose prefix ends at the source's last row.
-//! The close ack is a trailer outside its own coverage.
+//! Two different things live here, and they must not be confused:
+//!
+//! * [`reconstruct_archival`] rebuilds a coverage view from a set of facts, sorted by
+//!   commitment index. It is a digest/archival reconstruction only: it pays no attention to
+//!   the order facts arrived in, or to unknown observations seen along the way, so a fact
+//!   that arrives later can fill a range an earlier reconstruction left unknown. It must
+//!   never be used to decide eligibility.
+//! * [`StreamEligibility`] is the persistent, forward-only eligibility state. Facts and
+//!   unknown/late observations are recorded in arrival order; the first break (loss,
+//!   reorder, deadline miss, fork, ledger rollback, restart, rows after close) is kept
+//!   forever, and no later fact clears it or makes the rows after it eligible again.
+//!   Readiness consumes this state, never the archival reconstruction.
+//!
+//! In both, acks must form one linked stream from the opening: exact next index, prior ack
+//! id, predecessor sequence and head, same session/epochs/chain/seal, strictly increasing
+//! service ledger. Identical duplicates count once. Coverage is complete only with a
+//! retained close whose prefix ends at the source's last row. The close ack is a trailer
+//! outside its own coverage.
 
 use super::canon;
 use super::check::SeenAtFact;
@@ -71,6 +83,132 @@ impl CoverageView {
     }
 }
 
+/// Persistent, forward-only eligibility for one stream. See the module docs: this is the
+/// only state readiness may consume. Once [`StreamEligibility::record`] observes a break,
+/// the break (and the first ineligible sequence) is preserved permanently; later facts are
+/// still checkable archivally elsewhere, but they never clear it here.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StreamEligibility {
+    eligible: Vec<Segment>,
+    stream_context: Option<StreamContext>,
+    accepted_ids: BTreeSet<String>,
+    prev: Option<SeenAtFact>,
+    next_index: u64,
+    next_seq: u64,
+    source_last_seq: u64,
+    break_reason: Option<Reason>,
+    closed: bool,
+}
+
+impl Default for StreamEligibility {
+    fn default() -> Self { Self::new() }
+}
+
+impl StreamEligibility {
+    pub fn new() -> Self {
+        StreamEligibility {
+            eligible: vec![], stream_context: None, accepted_ids: BTreeSet::new(), prev: None,
+            next_index: 0, next_seq: 0, source_last_seq: 0, break_reason: None, closed: false,
+        }
+    }
+
+    /// Build eligibility by recording observations in the exact order they arrived.
+    /// This deliberately does not sort: arrival order is part of the evidence.
+    pub fn from_arrival_order(states: &[AnchorState], source_last_seq: u64) -> Self {
+        let mut e = Self::new();
+        for s in states { e.record(s, source_last_seq); }
+        e
+    }
+
+    fn break_at(&mut self, reason: Reason) {
+        if self.break_reason.is_none() { self.break_reason = Some(reason); }
+    }
+
+    /// Record one observation in arrival order: a retained fact, a late fact (a deadline
+    /// miss), or an unknown observation (including the observed loss of an expected ack).
+    pub fn record(&mut self, state: &AnchorState, source_last_seq: u64) {
+        self.source_last_seq = source_last_seq;
+        if self.break_reason.is_some() { return; }
+        match state {
+            AnchorState::Unknown { reasons } => {
+                self.break_at(reasons.first().copied().unwrap_or(Reason::Gap));
+            }
+            AnchorState::SeenAtLate(_) => self.break_at(Reason::LateAck),
+            AnchorState::SeenAtRetained(f) => {
+                if self.accepted_ids.contains(&f.ack_id) { return; }
+                if self.closed { self.break_at(Reason::RowsAfterClose); return; }
+                if f.commitment.index() != self.next_index {
+                    // A fact that is not the exact next one breaks eligibility in arrival
+                    // order: skipping the expected index is an observed loss, and any
+                    // other out-of-order arrival is a reorder. Neither is recoverable.
+                    let reason = if f.commitment.index() > self.next_index && self.prev.is_some() {
+                        Reason::Gap
+                    } else {
+                        Reason::Reordered
+                    };
+                    self.break_at(reason);
+                    return;
+                }
+                if let Some(r) = self.prev.as_ref().and_then(|p| link_reason(p, f)) { self.break_at(r); return; }
+                if f.chain_last() > source_last_seq { self.break_at(Reason::BindingMismatch); return; }
+                if let Some(c) = &f.commitment.close {
+                    if super::canon::dec_u64(&c.total_rows) != f.chain_last().checked_add(1) {
+                        self.break_at(Reason::SchemaViolation);
+                        return;
+                    }
+                }
+                if f.commitment.chain.first() > self.next_seq { self.break_at(Reason::Gap); return; }
+                if f.commitment.chain.first() < self.next_seq { self.break_at(Reason::Fork); return; }
+                self.eligible.push(Segment {
+                    first_seq: f.commitment.chain.first(), last_seq: f.chain_last(),
+                    status: RangeStatus::SeenAtRetained { ack_id: f.ack_id.clone() },
+                });
+                if self.stream_context.is_none() { self.stream_context = Some(StreamContext::of(f)); }
+                self.accepted_ids.insert(f.ack_id.clone());
+                self.closed = f.commitment.purpose == Purpose::Close;
+                self.next_index += 1;
+                self.next_seq = f.chain_last() + 1;
+                self.prev = Some(f.clone());
+            }
+        }
+    }
+
+    pub fn break_reason(&self) -> Option<Reason> { self.break_reason }
+    pub fn stream_context(&self) -> Option<&StreamContext> { self.stream_context.as_ref() }
+
+    /// Eligible prefix plus, when anything up to the source's last row is not eligible,
+    /// one trailing unknown segment carrying the preserved break (or the reason nothing
+    /// eligible follows yet).
+    pub fn segments(&self) -> Vec<Segment> {
+        let mut out = self.eligible.clone();
+        if self.next_seq <= self.source_last_seq {
+            let reason = self.break_reason.unwrap_or(if self.closed {
+                Reason::RowsAfterClose
+            } else if self.prev.is_none() {
+                Reason::NoAck
+            } else {
+                Reason::MissingClose
+            });
+            out.push(Segment { first_seq: self.next_seq, last_seq: self.source_last_seq, status: RangeStatus::Unknown(reason) });
+        }
+        out
+    }
+
+    pub fn status_at(&self, seq: u64) -> Option<RangeStatus> {
+        self.segments().iter().find(|s| s.first_seq <= seq && seq <= s.last_seq).map(|s| s.status.clone())
+    }
+    pub fn is_eligible(&self, seq: u64) -> bool {
+        matches!(self.status_at(seq), Some(RangeStatus::SeenAtRetained { .. }))
+    }
+    pub fn unknown_rows(&self) -> u64 {
+        self.segments().iter().filter(|s| matches!(s.status, RangeStatus::Unknown(_))).map(|s| s.last_seq - s.first_seq + 1).sum()
+    }
+    pub fn complete(&self) -> bool {
+        self.break_reason.is_none() && self.closed && self.next_seq == self.source_last_seq.checked_add(1).unwrap_or(u64::MAX)
+            && !self.eligible.is_empty()
+    }
+}
+
 fn link_reason(prev: &SeenAtFact, f: &SeenAtFact) -> Option<Reason> {
     let (p, c) = (&prev.commitment, &f.commitment);
     if p.purpose == Purpose::Close { return Some(Reason::RowsAfterClose); }
@@ -98,8 +236,14 @@ fn link_reason(prev: &SeenAtFact, f: &SeenAtFact) -> Option<Reason> {
     None
 }
 
+/// Archival reconstruction from a set of facts, sorted by commitment index.
 /// `source_last_seq` is the last durable local source row the caller holds.
-pub fn build(states: &[AnchorState], source_last_seq: u64) -> CoverageView {
+///
+/// This ignores arrival order and unknown observations, so it can show a range as
+/// seen-at even after eligibility for that range was lost and recovered. It is for
+/// digest/archival reporting only and must never feed readiness; use
+/// [`StreamEligibility`] for anything that decides eligibility.
+pub fn reconstruct_archival(states: &[AnchorState], source_last_seq: u64) -> CoverageView {
     let mut seen = BTreeSet::new();
     let mut by_index: BTreeMap<u64, Vec<&SeenAtFact>> = BTreeMap::new();
     let mut late_index = BTreeSet::new();
