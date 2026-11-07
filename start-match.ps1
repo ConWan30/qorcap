@@ -1,4 +1,4 @@
-# QorCap one-click match launcher (Windows). Started by "Start Match.cmd".
+﻿# QorCap one-click match launcher (Windows). Started by "Start Match.cmd".
 # Checks ffmpeg, Python 3.11+ and its packages, then runs sidecar\qorcap_match.py.
 $ErrorActionPreference = "Stop"
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
