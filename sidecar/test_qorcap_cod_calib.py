@@ -697,26 +697,110 @@ def _stamp(canvas, mask, x, y, color):
     view[mask > 0] = color
 
 
-def _synthetic_tdm_board():
+def _synthetic_tdm_board(
+    kills_header_x=420,
+    deaths_header_x=560,
+    kills_x=432,
+    deaths_digits=((566, "2"), (574, "1")),
+):
     """Synthetic 720p board. Shipped name and KILLS masks, text ASSISTS and DEATHS masks.
 
     Digits are the committed canonical masks. This is not a captured frame.
     Eliminations 11 sit below the row and are not a kill column.
+    Default placement is K9 under KILLS and D21 under the TDM DEATHS column.
     """
     pack = H._pack()
     masks = _canonical_masks()
     board = np.zeros((720, 1280, 3), np.uint8)
     _stamp(board, pack["owner_mask"], 172, 534, (255, 255, 255))
-    _stamp(board, pack["kills_header_mask"], 420, 400, (255, 255, 255))
+    _stamp(board, pack["kills_header_mask"], kills_header_x, 400, (255, 255, 255))
     _stamp(board, pack["assists_header_mask"], 484, 403, (255, 255, 255))
-    _stamp(board, pack["deaths_column_header_mask"], 560, 403, (255, 255, 255))
-    _stamp(board, masks["9"], 432, 536, HIGHLIGHT_INK)
+    _stamp(board, pack["deaths_column_header_mask"], deaths_header_x, 403, (255, 255, 255))
+    _stamp(board, masks["9"], kills_x, 536, HIGHLIGHT_INK)
     _stamp(board, masks["2"], 496, 536, HIGHLIGHT_INK)
-    _stamp(board, masks["2"], 566, 536, HIGHLIGHT_INK)
-    _stamp(board, masks["1"], 574, 536, HIGHLIGHT_INK)
+    for x, label in deaths_digits:
+        _stamp(board, masks[label], x, 536, HIGHLIGHT_INK)
     _stamp(board, masks["1"], 760, 640, HIGHLIGHT_INK)
     _stamp(board, masks["1"], 766, 640, HIGHLIGHT_INK)
     return board
+
+
+def _header_pair(board):
+    scale = H._board_scale(board)
+    pack = H._pack()
+    name = H._best_mask(
+        H._value_mask(board, H._OWNER_SEARCH_VALUE), pack["owner_mask"], scale, H._OWNER_MIN)
+    assert name is not None
+    _score, row_x, row_y, _row_w, row_h = name
+    kills_h, deaths_h, _assists_h, _confirms_h, _personal = H._owner_row_header_hits(
+        board, scale, pack, row_x, row_y, row_h)
+    return kills_h, deaths_h
+
+
+def _mask_on_region_score(region, templ, scale):
+    """NCC of ``templ`` on ``region`` after the reader's own scale. None is a miss."""
+    region_s = H._scaled_u8(region, scale)
+    templ_s = H._scaled_u8(templ, scale)
+    pad_y = max(4, int(templ_s.shape[0]))
+    pad_x = max(4, int(templ_s.shape[1]))
+    canvas = np.zeros((region_s.shape[0] + 2 * pad_y, region_s.shape[1] + 2 * pad_x), np.uint8)
+    canvas[pad_y:pad_y + region_s.shape[0], pad_x:pad_x + region_s.shape[1]] = region_s
+    hit = H._best_mask(canvas, templ_s, 1.0, 0.0)
+    return 0.0 if hit is None else hit[0]
+
+
+_HEADER_CROSS_MARGIN = 0.10
+
+
+def test_deaths_column_header_does_not_match_the_kills_header():
+    """DEATHS column ink is not the KILLS header. Same x is not both stats.
+
+    end_173922_019 is 13 and 13, so a column swap would still look right.
+    The cross score stays under the header gate by a margin, and the deaths
+    hit the reader keeps is never the kills hit.
+    """
+    pack = H._pack()
+    kills = pack["kills_header_mask"]
+    deaths = pack["deaths_column_header_mask"]
+    assert _mask_on_region_score(kills, kills, 1.0) >= H._ROW_HEADER_MIN
+    for scale in (1.0, 1.5):
+        onto_kills = _mask_on_region_score(kills, deaths, scale)
+        onto_deaths = _mask_on_region_score(deaths, kills, scale)
+        assert onto_kills < H._ROW_HEADER_MIN - _HEADER_CROSS_MARGIN
+        assert onto_deaths < H._ROW_HEADER_MIN - _HEADER_CROSS_MARGIN
+    real = frame("end_173922_019.jpg")
+    region = H._value_mask(real, H._HEADER_SEARCH_VALUE)[400:417, 427:456]
+    assert _mask_on_region_score(region, deaths, 1.0) < H._ROW_HEADER_MIN - _HEADER_CROSS_MARGIN
+    for board in (
+        real,
+        _synthetic_tdm_board(),
+        _synthetic_tdm_board(
+            kills_header_x=560,
+            deaths_header_x=420,
+            kills_x=572,
+            deaths_digits=((428, "2"), (436, "1")),
+        ),
+    ):
+        kills_h, deaths_h = _header_pair(board)
+        assert kills_h is not None
+        if deaths_h is not None:
+            assert not H._columns_share_x(deaths_h, kills_h, H._board_scale(board))
+            assert deaths_h[1] != kills_h[1]
+
+
+def test_swapped_tdm_columns_keep_k9_and_d21():
+    """Synthetic board with the two headers exchanged. Kills stay 9, deaths stay 21."""
+    board = _synthetic_tdm_board(
+        kills_header_x=560,
+        deaths_header_x=420,
+        kills_x=572,
+        deaths_digits=((428, "2"), (436, "1")),
+    )
+    row = H.read_owner_row(board)
+    assert row.ok and (row.kills, row.assists, row.deaths) == (9, 2, 21)
+    assert row.kills != row.deaths
+    kills_h, deaths_h = _header_pair(board)
+    assert deaths_h is not None and deaths_h[1] < kills_h[1]
 
 
 def test_tdm_owner_row_is_k9_a2_d21_and_not_the_other_columns():
@@ -740,6 +824,54 @@ def test_tdm_owner_row_is_k9_a2_d21_and_not_the_other_columns():
     no_deaths[532:548, 560:590] = 0
     missed = H.read_owner_row(no_deaths)
     assert missed.ok is False and missed.deaths is None
+
+
+def _glyph_boxes(text, masks):
+    gap = 2
+    x = 4
+    boxes = []
+    for ch in text:
+        glyph = masks[ch]
+        boxes.append((x, 4, int(glyph.shape[1]), int(glyph.shape[0])))
+        x += int(glyph.shape[1]) + gap
+    return boxes
+
+
+def _paint_speck(text, masks, color, x, y, width, height):
+    img = _paint(text, masks, color)
+    img[y:y + height, x:x + width] = color
+    return img
+
+
+def test_a_speck_does_not_change_a_multi_digit_row_value():
+    """A few pixels beside, between, or just above or below the glyphs.
+
+    Area stays in 3..7. The read is the real value, or it abstains.
+    A speck that only sits beside the ink still reads the real value.
+    """
+    masks = _canonical_masks()
+    for color in (NORMAL_INK, HIGHLIGHT_INK):
+        for text in ("13", "100", "1250"):
+            boxes = _glyph_boxes(text, masks)
+            x0, y0, w0, h0 = boxes[0]
+            wide = max(boxes, key=lambda box: box[2])
+            xw, yw, ww, hw = wide
+            x1, y1, w1, h1 = boxes[-1]
+            # Beside the value, one pixel clear of the ink so it is its own speck.
+            # Between: overlaps the first glyph and reaches the next one.
+            # Above and below: on a wide glyph, inside its x span, one pixel clear.
+            placements = (
+                (x0 - 3, y0 + 1, 2, 3),
+                (x1 + w1 + 1, y1 + 1, 2, 2),
+                (x0 + w0 - 2, y0 + h0 + 1, 5, 1),
+                (xw + 1, max(0, yw - 3), 2, 2),
+                (xw + 1, yw + hw + 1, 2, 2),
+            )
+            for sx, sy, sw, sh in placements:
+                assert 3 <= sw * sh <= 7
+                assert sx >= 0 and sy >= 0
+                img = _paint_speck(text, masks, color, sx, sy, sw, sh)
+                assert H._row_digit_string(img, 0, img.shape[1], 0, img.shape[0], 130, 1.0) == text
 
 
 def test_split_glyph_recovers_and_a_cut_glyph_abstains():
