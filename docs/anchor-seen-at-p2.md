@@ -71,7 +71,7 @@ Framing, unchanged from r1:
 - `D(T) = "QOR-AUX-P2-MODEL-R1/" + T`.
 - `Hash(T,x) = SHA-256(F(D(T), J(E(T,x))))`, written as lowercase hex.
 - `Raw(b) = SHA-256(b)`, lowercase hex. Typed `Hash` and `Raw` are different functions. Do not interchange them.
-- Binary tree node and empty payloads are raw bytes only where §7 of r1 specified them. Those tree rules are not re-closed in this turn (§5–§9). Lengths are checked as `u64` before framing. No truncation or saturation.
+- Binary tree node and empty payloads are raw bytes only as adopted in §2.2 from r1 §7.1. Lengths are checked as `u64` before framing. No truncation or saturation.
 
 `ModelSigned<T> = {alg:"synthetic_hash_only", payload:E(T,x), payload_id:H, role:RoleRef, tag:H}` with `payload_id = Hash(T,x)` and `tag = Hash(ModelTag, {alg, payload_id, role})`. The wrapper encodes as `E("ModelSigned", wrapper)`. The nested payload is already `E`. The tag is a public deterministic framing check under a trusted simulation. It is not a cryptographic signature and not authentication. No key material, host status flag, or normal-build signer exists in this schema.
 
@@ -89,11 +89,48 @@ Hash dependency rule carried forward: no record's preimage contains its own id, 
 - `RoleKind` gains `observe`, `hold`, and `recover` as distinct kinds. r1 kinds remain for the records that already had them.
 - Schema string prefix and `D(T)` prefix stay the r1 strings. The candidate revision is r2; the framing label is not forked. A new type name is a new `T` under that same framing.
 
-Records carried forward unchanged in name, except where a later closed section replaces a field, include `Scope`, `RegistryScope`, `Pins`, `ClockDomain`, `Mono`, `Wall`, `SourceBound`, `Range`, `CaptureRange`, `JournalRef`, `ParentBoundary`, and the request and record types named in §4. Their r1 field lists remain in force until a later section states a delta. Checkpoint identity (client commitment versus service receipt) is not closed here; it is §8 B6. Do not treat r1 `JournalRef.checkpoint` as already solved.
+Records carried forward unchanged in name, except where a later closed section replaces a field, include `Scope`, `RegistryScope`, `Pins`, `ClockDomain`, `Mono`, `Wall`, `SourceBound`, `Range`, `CaptureRange`, `ParentBoundary`, and the request and record types named in §4. Their r1 field lists remain in force until a later section states a delta. r1 `JournalRef.checkpoint` is not a solved identity. §8 replaces that field. The closed inventory is §2.2.
 
 Clock-role pairs carried forward: `server_mono` with `model_counter` and `ns`; `client_mono` with `client_declared` and `ns`; `capture_declared` with `capture_declared` and `ns`; `wall_audit` with `wall_declared` and `unix_us`. Every `process`, `boot`, `clock_epoch`, and `leader` stays explicit. No cross-role subtraction. Same-role elapsed requires equality of every domain field and nondecreasing samples, checked arithmetic only. `Wall` is audit, not a timing authority.
 
-`Range` rules carried forward: `first <= last`; checked `last+1`; checked `last-first+1 = count`; predecessor null if and only if `first = 0`, and then `predecessor_head = Z`, otherwise `predecessor+1 = first`. An endpoint equal to the `U` maximum rejects even if a one-row count could fit. Count equal to the `U` maximum is representable for `[0, MAX-1]`. That representation is not by itself a valid first close (close rule remains the r3 nonempty split: opening `[0, MAX-2]` then close `[MAX-1, MAX-1]`, `total_rows` MAX). Full close grammar stays with later sections; this sentence only stops the invalid reading of r1.
+`Range` rules carried forward: `first <= last`; checked `last+1`; checked `last-first+1 = count`; predecessor null if and only if `first = 0`, and then `predecessor_head = Z`, otherwise `predecessor+1 = first`. An endpoint equal to the `U` maximum rejects even if a one-row count could fit. Count equal to the `U` maximum is representable for `[0, MAX-1]`. That representation is not by itself a valid first close (close rule remains the r3 nonempty split: opening `[0, MAX-2]` then close `[MAX-1, MAX-1]`, `total_rows` MAX).
+
+### 2.2 Closed types and enums
+
+Every type and enum this candidate adds or narrows is listed here. A field or enumerator not in this list or in the r1 record it explicitly carries forward is `schema`. Details and invariants are in the cited section. No extra accounting field is implied.
+
+Enums:
+
+- `Purpose`, `State`, `HoldState`, `Outcome`, `Boundary`, `Op`, `ClientOp`, `RoleKind`: §2.
+- `RoleState`: `active` | `retired` | `revoked`.
+- `ArchiveDecision`: `allow` | `deny`.
+- `HistoricalDecision`: `allow` | `deny` | `unknown`.
+- `ChargeProfile`: `b4-r2` only.
+- `EventClass`: `ledger` | `side` | `read` | `registry` | `internal`.
+- `AttemptResult`: `pending` | `missing` | `invalid` | `late` | `retained` | `unavailable`.
+- `CheckpointKind`: `global` | `owner` | `journal` | `policy` | `terminal`.
+- `WitnessPhase`: `prepare` | `swap` | `confirm` | `deliver`.
+- `WitnessOutcome`: `committed` | `refused` | `unknown`.
+- `ForkLatch`: `open` | `latched`.
+- `StreamLife`: `open` | `closed`.
+- `ImageStatus`: `available` | `unavailable`.
+- `ModelAlg`: `synthetic_hash_only` only.
+- r1 `Error` is closed as carried: `malformed`, `noncanonical`, `schema`, `oversize`, `limit_unset`, `quota`, `unauthorized`, `policy_unknown`, `domain`, `regression`, `overflow`, `entropy`, `collision`, `expired`, `invalidated`, `binding`, `fork`, `conflict`, `closed`, `quarantined`, `stale_writer`, `commit_unknown`, `unavailable`, `not_found`, `incomplete`, `retirement_disabled`. No new error tag.
+- r1 `Observation.reason`: `source_change` | `negative_history` | `clock_change` | `unavailable` only.
+
+Types introduced or replaced:
+
+- `ClientExpectedCore`, `LogicalOpKey`, `LogicalOpRecord` (§3). `request_type` is `IssueRequest` | `ConsumeRequest` only.
+- `PolicyRole`, `PolicyCore`, `PolicyRecord`, `LimitSet`, `ServerDomainPin`, `ConfigCore`, `ConfigRecord`, `MinimumKey`, `Minimum`, `Continuity`, `ExternalBasis` (§5). r1 `RoleRule` is deleted. r1 `HistoricalRule` is replaced by the §5 record (no nested `RoleRef`).
+- `CommitWitness` (§6).
+- `ClientCheckpointCore`, `GenesisCore`, `ServiceReceipt` (§8). `JournalRef` is replaced by the §8 record. The r1 names `checkpoint` and `prior_checkpoint` are not fields.
+- `StreamOrigin` (§9). r1 `StreamRow` gains `origin:StreamOrigin?` and `fork:ForkLatch`.
+
+`Usage` is the r1 counter record plus exactly two fields, all required `U`: `records`, `stored_bytes`, `outstanding`, `inflight`, `concurrent`, `retry_attempts`, `pages`, `proof_hashes`, `signer_calls`, `store_calls`, `denial_records`, `denial_bytes`, `fault_records`, `audit_records`, `calls`, `call_bytes`. Disposable scratch (`workspace_bytes`, `parse_bytes`) is not a `Usage` field.
+
+`LimitSet` fields, each required `U`, and no others: `request_input_bytes`, `canonical_bytes`, `decoded_bytes`, `parse_bytes`, `depth`, `tokens`, `string_bytes`, `list_items`, `output_bytes`, `workspace_bytes`, `recovery_image_bytes`, `records`, `stored_bytes`, `outstanding`, `inflight`, `concurrent`, `retry_attempts`, `pages`, `page_items`, `proof_hashes`, `signer_calls`, `store_calls`, `issue_lifetime_ns`, `operation_age_ns`, `denial_records`, `denial_bytes`, `fault_records`, `audit_records`, `calls`, `call_bytes`, `minima_entries`, `accounting_basis_bytes`.
+
+Tree rules adopted unchanged from r1 §7.1–7.2, and thereby closed: leaf `Hash(TreeLeaf,{epoch,position,entry_digest})`; empty tree `SHA-256(F(D("tree.empty"), empty))`; single leaf is those 32 raw bytes; larger trees split at the largest power of two strictly below the length and hash `F(D("tree.node"), left || right)`. The witness carries every leaf hash, not foreign bodies. `LedgerHead` empty and nonempty conditions are §7.6. No compact omission codec is added.
 
 ## 3. B1 — constructible binding and immutable original history
 
@@ -727,17 +764,170 @@ No step uses "any milestone `>= deadline`" on a null. That reading is rejected b
 
 `pending` and `missing` share a null shape and are split only by step 3 versus step 6. Restore of an open-looking attempt with no arrival and no durable resolution is `missing`, not a fabricated on-time `retained`.
 
-## 8. B6
+## 8. B6 — client checkpoint identity and service receipt
 
-TODO (next turn)
+r1 `JournalRef.checkpoint` is one required `H`, while `CheckpointRequest` and `CheckpointRecord` both embed `JournalRef`. That single field cannot be both the client commitment and the service receipt: the receipt hash would contain itself, and the first request would need a receipt that does not exist yet. r2 splits them. `Z` and an arbitrary `H` are not a root.
 
-## 9. B7
+### 8.1 Two ids
 
-TODO (next turn)
+```text
+ClientCheckpointCore={
+  scope:Scope, stream:Id, owner_generation:U,
+  first:U, last:U, count:U, head:H, negative_count:U,
+  prior_client_checkpoint:H?
+}
+client_checkpoint_id = Hash("ClientCheckpointCore", core)
+
+GenesisCore={
+  scope:Scope, stream:Id, origin:StreamOrigin,
+  empty_head:H
+}
+genesis_id = Hash("GenesisCore", core)
+
+JournalRef={
+  first:U, last:U, count:U, head:H, negative_count:U,
+  prior_client_checkpoint:H?,
+  client_checkpoint:H,
+  prior_service_receipt:H?
+}
+
+ServiceReceipt={
+  request_hash:H, scope:Scope, stream:Id, owner_generation:U,
+  client_checkpoint_id:H, journal:JournalRef, source_bound:SourceBound
+}
+service_receipt_id = Hash("ServiceReceipt", receipt)
+```
+
+`ClientCheckpointCore` has no service-receipt field, no request hash, no tag, and no ledger root. `GenesisCore` has no receipt and no client-checkpoint id. `ServiceReceipt` has no `service_receipt_id` field. `JournalRef` inside a receipt names `prior_service_receipt` (a past id or null), never the receipt's own id.
+
+Lookup, and only that lookup:
+
+| Id | Preimage | Table |
+|---|---|---|
+| `genesis_id` | `GenesisCore` | external trusted genesis fixture |
+| `client_checkpoint_id` | `ClientCheckpointCore` | retained next to the original request, outside the receipt preimage |
+| `service_receipt_id` | `ServiceReceipt` | committed checkpoint row |
+
+A client id is not found in the receipt table. A receipt id is not found in the client-core table. Using one in the other's field is `binding`. `Z` is rejected in all three id positions and in both prior fields. An `H` that is not the hash of a retained core, genesis core, or receipt is `not_found` and does not create history.
+
+r1 names `checkpoint` and `prior_checkpoint` are deleted. `CheckpointRecord` in r1 is this `ServiceReceipt` (kind `checkpoint`, `Ref` target `service_receipt_id`). The request type stays `CheckpointRequest`, with its `journal` field using the `JournalRef` above. `Commitment.journal` uses the same `JournalRef`.
+
+`JournalRef` counters must match the `ClientCheckpointCore` with the same span and `head`. `client_checkpoint` must equal `Hash("ClientCheckpointCore", core)`. `ServiceReceipt.client_checkpoint_id` must equal `journal.client_checkpoint`.
+
+### 8.2 Null priors and genesis
+
+Trusted synthetic genesis is an external fixture row, same trust class as `ExternalBasis`. It is not caller-supplied and not read out of a restored image. `empty_head` must be the empty-tree digest of §2.2 for an empty journal, not `Z` and not a caller `H`. `origin` is the stream origin of §9 and is fixed here for the stream's first opening.
+
+| Situation | `prior_client_checkpoint` | `prior_service_receipt` |
+|---|---|---|
+| `GenesisCore` | the core has no prior field | the core has no receipt field |
+| First client checkpoint after that genesis | `genesis_id` | null |
+| Later client checkpoint while no receipt is committed yet | previous client id | null |
+| Any request after a receipt exists | previous client id | that `service_receipt_id` |
+
+Null `prior_client_checkpoint` does not start history. With no genesis fixture, the stream is `incomplete` and `unknown`. A null `prior_service_receipt` is legal only while that stream has no committed receipt. If a receipt exists and the prior is null, the outcome is `incomplete` and new grants on the stream are `unknown`. Self as prior (the prior client id equal to this core's own id, or the prior receipt equal to the receipt being hashed) is `binding`. The receipt id this commit will produce cannot appear in the request: the request is an input to that hash, and the id does not exist until the hash is computed.
+
+### 8.3 Constructive order
+
+None of these requests contains a future or current service receipt.
+
+1. Fixture stores `GenesisCore`. `genesis_id` is its hash. No receipt exists.
+2. First `issue`. `IssueRequest` has no `JournalRef` and no receipt field. Constructible immediately after genesis.
+3. First `consume` or first `checkpoint` op, whichever commits first. The caller builds `ClientCheckpointCore` with `prior_client_checkpoint = genesis_id` and with no receipt field. The request sets `prior_service_receipt` null and `client_checkpoint` to that core's hash. The server resolves `genesis_id` in the genesis table, then commits `ServiceReceipt`. The receipt id is `Hash("ServiceReceipt", receipt)` after the request bytes exist. It is not written back into the request.
+4. Linked extension. The next core's `prior_client_checkpoint` is the previous client id. The request's `prior_service_receipt` is the receipt from step 3. The new receipt hash covers that request and does not contain itself.
+
+The nullable prior fields exist so a missing link can be encoded and rejected. They are not an alternate root. `Z` is not that encoding.
+
+`empty_head` on genesis is the journal head the first core must extend under §9. It is not a service receipt.
+
+### 8.4 Vectors
+
+digest: see p2-vectors.json.
+
+| ID | Case | Outcome |
+|---|---|---|
+| `V-B6-BOOT` | Genesis, then issue, then first consume with `prior_service_receipt` null and `prior_client_checkpoint = genesis_id`, then receipt hash | commit. Request bytes do not contain the receipt id |
+| `V-B6-EXT` | Next checkpoint names that client id and that receipt | commit. New receipt id differs from both |
+| `V-B6-WRONG-ROOT` | Same priors, `head` or source head swapped | `fork`, no commit |
+| `V-B6-SELF` | Prior client id set to this core's own id, or a core field added that copies the id | `binding` |
+| `V-B6-CURRENT` | Request field set to the receipt id this commit would produce, or to the latest receipt used as the client id | `binding` |
+| `V-B6-MISSING` | Extension with null receipt prior after `V-B6-BOOT`, or prior id that does not resolve | `incomplete`, grant `unknown` |
+| `V-B6-Z` | `Z` as genesis, client id, receipt, or either prior | `binding` |
+| `V-B6-ANY-H` | Random `H` as genesis or as first prior | `not_found`, no new history |
+
+## 9. B7 — original stream context and equal-height forks
+
+### 9.1 What is retained
+
+At the committed opening consume, the stream stores one immutable origin, taken from that opening's retained request, not from current policy.
+
+```text
+StreamOrigin={
+  pins:Pins,
+  source_schema:H,
+  capture_domain:ClockDomain,
+  source_domain:ClockDomain
+}
+```
+
+`pins` are the opening commitment's `Pins`. `source_schema` is the opening `Range.source_schema`. Every opening `CaptureRange.domain` must equal `capture_domain`, and the source high-water domain declared on that opening must equal `source_domain`. Mixed domains at opening are `domain` and do not store an origin. `source_domain` and `capture_domain` are full `ClockDomain` values (every id), not a role name alone.
+
+r1 `StreamRow` gains `origin:StreamOrigin?` and `fork:ForkLatch`. `origin` is null only before the opening consume commits. After that it is required. Restore recomputes `origin` from the opening `Original` bytes. Disagreement with the stored origin is `fork` / `unknown` and is not rewritten from the image's later rows or from current auth.
+
+Genesis `GenesisCore.origin` must equal this opening origin. A mismatch is `binding` and does not open the stream.
+
+### 9.2 Later equality
+
+Interval, close, checkpoint, observe, hold, and later consume requests must present the same `pins`, the same `source_schema`, and the same two domains. Inequality is `binding` if the request is a new body under an existing key, and `fork` if it would otherwise commit a second context for the stream. Current role, archive allow, revocation, or a newer eligibility or checker digest does not replace `origin`. Those checks can still deny (`unauthorized`, `policy_unknown`). They cannot authorize a different pin. A revoked role denies the call and leaves `origin` as it was.
+
+Restore applies the same equality before any grant.
+
+### 9.3 Equal height is not progress
+
+Same source endpoint (`SourceBound.last` or the range end) and same height (`count` or `last` equal to the committed head's endpoint) with a different `SourceBound.head` or `end_head` is `fork`, not a nonregression success. Same journal `first`/`last`/`count` with a different `head` or a different `client_checkpoint` id is `fork`. The latch is `ForkLatch=latched` on that stream and is sticky. `first_break` is set if it was null and is not cleared. Grant state for new work on that stream is `unknown`.
+
+An exact duplicate of a committed winning request is the §3 retry twin, not a fork. It does not clear a latch that is already `latched`. A new exchange, a higher endpoint, or any later well-formed span does not clear `latched` and does not repair an older `unknown`.
+
+| ID | Case | Outcome |
+|---|---|---|
+| `V-B7-OPEN` | Opening consume | origin stored from that request | 
+| `V-B7-EQ` | Later op, same pins, schema, and both domains | other checks aside, not a context reject |
+| `V-B7-PIN` | One pin field, `source_schema`, or either domain differs | `fork` or `binding`; origin unchanged |
+| `V-B7-AUTH` | Current archive allow with a different checker pin | origin unchanged; call denied |
+| `V-B7-FORK-HEAD` | Same endpoint and height, different source head | `fork`; latch sticky; `unknown` |
+| `V-B7-FORK-JRN` | Same journal span, different head or client checkpoint id | `fork`; latch sticky |
+| `V-B7-DUP` | Byte-identical retry | twin; no second commit; latch not cleared |
+| `V-B7-FWD` | Later span after a latch | still `unknown` |
+| `V-B7-RESTORE` | Image origin disagrees with opening bytes | `unknown`; no repair |
+
+digest: see p2-vectors.json.
 
 ## 10. Open choices
 
-TODO (next turn)
+Status `RESOLVED` means this candidate states one rule and where it is written. It is not schema PASS. Status `UNKNOWN` means this candidate has no authority to pick a value. Reviewer is QorData for acceptance reconciliation, then QorProof for exact-schema PASS or freeze, unless the row says otherwise.
+
+| Choice | Status | Where | Review |
+|---|---|---|---|
+| 1. Grammar, domains, public tags | RESOLVED as synthetic `E`/`J`/`F`/`Raw`, explicit null, r1 framing prefix | §2, §2.2 | QorData, then QorProof. Tags are not authentication |
+| 2. Full hash-only witness | RESOLVED by adopting r1 §7.1–7.2 unchanged | §2.2, §7.6 | QorData, then QorProof. Not a compact codec. O(n) leakage stays a limit |
+| 3. API, reservation, accounting | RESOLVED | §4, §5, §6 | QorData, then QorProof. Caps are not live defaults |
+| 4. Nonempty close | RESOLVED as the r3 split: opening `[0, MAX-2]`, close `[MAX-1, MAX-1]`, not a first close of `[0, MAX-1]` | §2 | QorData, then QorProof |
+| 5. Holder release and terminal oracle | RESOLVED as release DISABLED. Positive terminal path BLOCKED. No unlock in this candidate | §4, §7.2 | QorData, then QorProof. A future private test oracle is UNKNOWN and is not authorized here |
+| 6. Image, restore, retry | RESOLVED | §3.6, §5.4, §6.3, §8, §9 | QorData, then QorProof. Stable image is model-durable only |
+| 7. Real source, custody, current-policy freshness, hosting, cost, retention, collection | UNKNOWN | not selected | No authority in this candidate or in the schema reviews. Publication-time freshness is not asserted. Dependent final or pilot stays BLOCKED |
+| `enqueue_at` spelling, core without `original_request_hash` | RESOLVED | §3 | QorData, then QorProof |
+| Owner generation, prior ack, and client nonce outside the core and inside request bytes | RESOLVED | §3.2 | QorData, then QorProof |
+| `RoleKind` adds `observe`, `hold`, `recover` | RESOLVED | §2, §4 | QorData, then QorProof |
+| Policy request is `PolicyCore`; digest outside the payload; `RoleRule` deleted | RESOLVED | §5.1 | QorData, then QorProof |
+| `invalidated_by` is a service-epoch `Id` | RESOLVED | §7.1 | QorData, then QorProof |
+| Audit and fault are counter-only; denial keeps the bounded `Denial` list | RESOLVED | §6.1 | QorData, then QorProof |
+| Client checkpoint id versus service receipt id | RESOLVED | §8 | QorData, then QorProof |
+| Null client prior does not start history; genesis id is the first prior | RESOLVED | §8.3 | QorData, then QorProof |
+| Stream origin equality and sticky equal-height fork | RESOLVED | §9 | QorData, then QorProof |
+| Numeric `LimitSet` values, including any replacement for the supplied 61295-versus-16384 example | UNKNOWN | §5.2, §6.2 | No authority. Fixtures may supply inputs later. This candidate does not pick them |
+| Qualified C1 result on these bytes | UNKNOWN | §13 still TODO | No scan in this candidate. Not zero |
+| Fresh git confirmation of the supplied base | UNKNOWN to this writer | §0 | Supplied pin only. Movement requires a stop |
+| Vector bytes and pin file contents | UNKNOWN until the generator writes them | §11, §12 still TODO | Do not invent digests |
 
 ## 11. Vectors
 
@@ -753,8 +943,61 @@ TODO (next turn)
 
 ## 14. UNMEASURED
 
-TODO (next turn)
+Nothing in this list was measured for this candidate. Synthetic `LimitSet` integers, clock samples, and fixture ids are inputs, not observations and not defaults. The supplied pair of a 61295-byte recovery image against a 16384-byte request-input ceiling is an invalid example from the handoff, not a measurement and not a chosen cap.
+
+- Round-trip time, enqueue-to-arrival delay, durable-resolution delay, deadline-miss and loss rates, and any full denominator of unsent or failed attempts.
+- Lifetimes, opening and close cadence, retry and backoff, fault windows, and any admission-to-commit or publication gap.
+- Capture, frame, hook, drop, exclusion, and acquisition timing.
+- CPU, memory, queue, signer, and store load.
+- Real parser, byte, rate, outstanding, inflight, concurrent, page, and proof capacity. The schema fields are not measured limits.
+- Stable-image commit, restore, reconciliation, RPO, and RTO. Model bytes are not database, WAL, fsync, filesystem, Windows, replica, or power-loss evidence.
+- Real entropy, auth, custody, holder separation, and clock continuity.
+- Current-policy response, use, and revocation freshness, and both final integrations.
+- Live feature and runtime matrices, practice submit, upload, gold, and controller-output denials as executed checks.
+- Cost, spend, retention, deletion, and backup behavior.
+- C1–C7 and M1–M17 runs, doctest counts, and scanner counts. No qualified C1 scan was run. §13 is still TODO. Absence of a count is not zero findings.
+- Fresh verification of the supplied base commit by this writer.
 
 ## 15. Review gate
 
-TODO (next turn)
+This candidate is not frozen and is not PASS. §11 vectors, §12 pins, and §13 C1 status are still TODO. Those writer steps come before review. Digests are not invented here. No model code, feature flag, or test target is added.
+
+Next gate, in order:
+
+1. Finish the remaining writer artifacts (computed vectors, pins, qualified counts-only C1 on the saved bytes).
+2. QorData acceptance reconciliation of this exact document.
+3. QorProof exact-schema PASS or freeze of that same artifact.
+4. Only after that gate, offline model code, still under the allowlist and a later review.
+
+Stop rather than self-certify. Terminal-positive stays BLOCKED. Holder release stays disabled. Publication-time freshness is not asserted. REAL MATCH stays v0.3.38. Practice does not submit, upload, or write gold. Match 201029 stays VOID.
+
+Acceptance ids are not renumbered. Each row is NOT EXECUTED. A section citation is where the schema rule lives, not evidence that the case ran.
+
+| ID | Schema rule in this candidate | Status |
+|---|---|---|
+| C1 | privacy and wording; scan not run (§13) | NOT EXECUTED |
+| C2 | REAL MATCH unwired (§1) | NOT EXECUTED |
+| C3 | no gold, submit, or upload; frozen receipt and contracts (§1) | NOT EXECUTED |
+| C4 | only `unknown`, `seen_at_late`, `seen_at_retained` (§1, §7) | NOT EXECUTED |
+| C5 | sticky break, 201029 VOID, controller read-only (§1, §9) | NOT EXECUTED |
+| C6 | original deadline and negative history (§3, §7, §9) | NOT EXECUTED |
+| C7 | feature not added; no enablement follows (§1, §15) | NOT EXECUTED |
+| M1 | canonical preimages and mutations (§2, §3) | NOT EXECUTED |
+| M2 | scope and archive denial (§4, §5) | NOT EXECUTED |
+| M3 | one winner, conflict loser (§3, §6) | NOT EXECUTED |
+| M4 | admission-only expiry (§1, §6) | NOT EXECUTED |
+| M5 | crash before and after commit (§6.3) | NOT EXECUTED |
+| M6 | no partial commit; database durability is out of scope (§6) | NOT EXECUTED |
+| M7 | new epoch invalidates unused challenges (§5.4) | NOT EXECUTED |
+| M8 | missing basis is `unknown` (§5, §7) | NOT EXECUTED |
+| M9 | archive does not grant new eligibility (§4, §9) | NOT EXECUTED |
+| M10 | holder denial; terminal success BLOCKED (§4, §7.2) | NOT EXECUTED |
+| M11 | fork and sticky unknown (§9); close split (§2) | NOT EXECUTED |
+| M12 | range and counter bounds (§2, §6) | NOT EXECUTED |
+| M13 | separate caps, no eviction (§6) | NOT EXECUTED |
+| M14 | lost client arrival stays missing (§3, §7.9) | NOT EXECUTED |
+| M15 | immutable origin (§9) | NOT EXECUTED |
+| M16 | policy generation and digest (§5) | NOT EXECUTED |
+| M17 | defaults off, frozen surface (§1, §15) | NOT EXECUTED |
+
+Live finals, a current-policy service, and platform suites are outside this cut and are not executed by naming them. M10's positive terminal case is BLOCKED, not passed.
