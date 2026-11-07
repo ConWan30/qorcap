@@ -21,6 +21,11 @@
 //! records), and `{"type":"imu"}` records commit whether IMU data was present and its measured rate. The same
 //! haptic records (with `chunk_index`) are also appended to `haptics.jsonl` next to `inputs.jsonl` for easy
 //! reading; `input_proof.json` records its SHA-256 and checks it against the committed records.
+//!
+//! Since 0.3.39 a `{"type":"hb"}` row is a heartbeat for pad-link continuity (skill-proof join), not
+//! identity/anti-cheat. The reader loop that receives HID reports writes one every 1000 ms
+//! of host monotonic time, including when buttons and sticks do not change. The row is sealed in the same
+//! chunk hash chain as the other input rows. `receipt.v0` is unchanged.
 use crate::evidence::{self as ev, GENESIS};
 use crate::haptics::{Detector, HapticLive};
 use crate::hid::{self, Pad, ReportSource};
@@ -35,6 +40,8 @@ use std::time::{Duration, Instant};
 pub const SCHEMA: &str = "qorcap-inputs/v0";
 /// Analog-only changes are logged at most this often (buttons are always logged).
 pub const ANALOG_MIN_GAP_US: u64 = 4_000;
+/// Host monotonic gap between `hb` rows. Independent of whether a button or stick changed.
+pub const HB_INTERVAL_US: u64 = 1_000_000;
 
 pub fn empty_hash() -> String { ev::jcs_sha(&json!([])) }
 
@@ -160,6 +167,16 @@ pub struct InputLog {
     haptic_path: Option<PathBuf>,
     wall_anchor_ms: u64,
     imu_committed: Option<(bool, u32)>,
+    /// Next `hb_seq` to write. Starts at 0. `u64` saturates; it does not wrap.
+    hb_seq: u64,
+    /// Connection epoch. Starts at 0 and increments on every transition into `connected`.
+    epoch: u64,
+    last_hb_t_us: Option<u64>,
+    rx_at_last_hb: u64,
+    last_rx_t_us: Option<u64>,
+    /// Report counter from the newest parsed USB/Bluetooth report. Null until one arrives.
+    dev_counter: Option<u64>,
+    faults_since_hb: u64,
 }
 
 impl InputLog {
@@ -167,7 +184,9 @@ impl InputLog {
         let haptic_path = path.as_ref().map(|p| p.with_file_name(haptics_file_name(p)));
         let mut l = InputLog { path, pending: vec![], head: GENESIS.into(), chunks: 0, total_records: 0, last_logged: None,
             live: Live { enabled, state: if enabled { "searching".into() } else { "off".into() }, ..Default::default() },
-            detector: Detector::new(wall_anchor_ms), haptic_path, wall_anchor_ms, imu_committed: None };
+            detector: Detector::new(wall_anchor_ms), haptic_path, wall_anchor_ms, imu_committed: None,
+            hb_seq: 0, epoch: 0, last_hb_t_us: None, rx_at_last_hb: 0, last_rx_t_us: None,
+            dev_counter: None, faults_since_hb: 0 };
         if enabled {
             l.pending.push(json!({"type": "header", "schema": SCHEMA, "t_us": 0,
                 "clock": "qorcap-mono-us (same Instant as manifest/checkpoint mono_ms)", "wall_anchor_ms": wall_anchor_ms,
@@ -178,9 +197,13 @@ impl InputLog {
         l
     }
 
-    /// Feed one parsed report received at `t_us`. Returns true if it was logged.
+    /// Feed one parsed report received at `t_us`. Returns true if the change-only logger stored an `in` row.
+    /// A heartbeat is considered here too, so identical reports still advance `hb`.
     pub fn on_report(&mut self, t_us: u64, p: &Pad) -> bool {
         self.live.reports += 1;
+        self.last_rx_t_us = Some(t_us);
+        // USB 0x01 and Bluetooth 0x31 both carry the report counter (byte 7, or +1 on BT).
+        self.dev_counter = Some(p.counter as u64);
         self.live.last_report_mono_ms = Some(t_us / 1000);
         self.live.l2 = p.l2; self.live.r2 = p.r2; self.live.sticks = [p.lx, p.ly, p.rx, p.ry];
         self.live.buttons = hid::names(p.buttons).into_iter().map(String::from).collect();
@@ -211,7 +234,40 @@ impl InputLog {
             self.last_logged = Some((t_us, *p));
             self.live.logged += 1;
         }
+        self.poll_heartbeat(t_us);
         log
+    }
+
+    /// A read timeout or a failed read in the HID loop. Does not invent a received report.
+    pub fn note_fault(&mut self, t_us: u64) {
+        self.faults_since_hb = self.faults_since_hb.saturating_add(1);
+        self.poll_heartbeat(t_us);
+    }
+
+    fn poll_heartbeat(&mut self, t_us: u64) {
+        if !self.live.enabled { return; }
+        let due = match self.last_hb_t_us {
+            None => t_us >= HB_INTERVAL_US,
+            Some(prev) => t_us.saturating_sub(prev) >= HB_INTERVAL_US,
+        };
+        if !due { return; }
+        let rx_total = self.live.reports;
+        let rx_delta = rx_total.saturating_sub(self.rx_at_last_hb);
+        self.pending.push(json!({
+            "type": "hb",
+            "t_us": t_us,
+            "hb_seq": self.hb_seq,
+            "epoch": self.epoch,
+            "rx_total": rx_total,
+            "rx_delta": rx_delta,
+            "last_rx_t_us": self.last_rx_t_us.map(Value::from).unwrap_or(Value::Null),
+            "dev_counter": self.dev_counter.map(Value::from).unwrap_or(Value::Null),
+            "faults": self.faults_since_hb,
+        }));
+        self.hb_seq = self.hb_seq.saturating_add(1);
+        self.rx_at_last_hb = rx_total;
+        self.faults_since_hb = 0;
+        self.last_hb_t_us = Some(t_us);
     }
 
     pub fn on_status(&mut self, t_us: u64, state: &str, detail: &str) {
@@ -228,6 +284,9 @@ impl InputLog {
             Some(new) => self.live.pad_id.as_ref() == Some(new),
         };
         if self.live.state == state && same_id { return; }
+        if state == "connected" && self.live.state != "connected" {
+            self.epoch = self.epoch.saturating_add(1);
+        }
         self.live.state = state.into();
         self.live.warning = match state {
             "connected" => None,
@@ -376,14 +435,20 @@ where F: Fn() -> Result<Box<dyn ReportSource>, String> + Send + 'static {
                                 }
                             }
                             Ok(None) => {
-                                if last_rx.elapsed() > Duration::from_secs(2) {
-                                    let mut l = log.lock().unwrap_or_else(|e| e.into_inner());
-                                    if l.live.state == "connected" { warn!("CONTROLLER: no HID reports for 2 s"); l.on_status(us(), "stalled", "no reports for 2 s"); }
+                                let t = us();
+                                let mut l = log.lock().unwrap_or_else(|e| e.into_inner());
+                                l.note_fault(t);
+                                if last_rx.elapsed() > Duration::from_secs(2) && l.live.state == "connected" {
+                                    warn!("CONTROLLER: no HID reports for 2 s");
+                                    l.on_status(t, "stalled", "no reports for 2 s");
                                 }
                             }
                             Err(e) => {
                                 warn!("CONTROLLER: USB HID read failed ({e}); retrying");
-                                log.lock().unwrap_or_else(|e| e.into_inner()).on_status(us(), "unplugged", &e);
+                                let t = us();
+                                let mut l = log.lock().unwrap_or_else(|e| e.into_inner());
+                                l.note_fault(t);
+                                l.on_status(t, "unplugged", &e);
                                 break;
                             }
                         }
@@ -567,5 +632,59 @@ mod tests {
         assert_eq!(connected["pad_id"], "serial:FAKE0001");
         assert!(connected["detail"].as_str().unwrap().contains("serial=FAKE0001"), "{}", connected["detail"]);
         assert!(l.pending.iter().any(|r| r["type"] == "header" && r["pad_identity"] == "required"));
+    }
+
+    #[test]
+    fn heartbeat_follows_received_reports_not_logged_changes() {
+        let dir = std::env::temp_dir().join(format!("qorcap-inputs-hb-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("inputs.jsonl");
+        let mut l = InputLog::new(Some(path.clone()), true, 0);
+        l.on_status_with_id(0, "connected", "DualSense Edge (USB)", Some("serial:EDGE1"));
+        let mut quiet = pad(0, 0);
+        quiet.counter = 9;
+        let mut t = 0u64;
+        while t <= 5 * HB_INTERVAL_US {
+            l.on_report(t, &quiet);
+            t += 4_000;
+        }
+        let hbs: Vec<Value> = l.pending().iter().filter(|r| r["type"] == "hb").cloned().collect();
+        assert_eq!(hbs.len(), 5, "five seconds of unchanged reports still write one hb per second: {hbs:?}");
+        assert!(hbs.iter().all(|h| h["rx_delta"].as_u64().unwrap_or(0) > 0));
+        assert_eq!((hbs[0]["hb_seq"].as_u64(), hbs[4]["hb_seq"].as_u64()), (Some(0), Some(4)));
+        assert_eq!(hbs[0]["epoch"], 1);
+        assert_eq!(hbs[0]["dev_counter"], 9);
+        assert_eq!(l.pending().iter().filter(|r| r["type"] == "in").count(), 1);
+        let last_rx = hbs[4]["last_rx_t_us"].as_u64().unwrap();
+        l.note_fault(last_rx + HB_INTERVAL_US);
+        l.note_fault(last_rx + 2 * HB_INTERVAL_US);
+        let stall = l.pending().iter().rev().find(|r| r["type"] == "hb").unwrap();
+        assert_eq!(stall["rx_delta"], 0);
+        assert_eq!(stall["last_rx_t_us"], last_rx);
+        assert!(stall["t_us"].as_u64().unwrap() > last_rx);
+        assert!(stall["faults"].as_u64().unwrap() >= 1);
+        let epoch_before = stall["epoch"].as_u64().unwrap();
+        let stall_t = stall["t_us"].as_u64().unwrap();
+        l.on_status(stall_t + 1_000, "unplugged", "usb disconnect");
+        l.on_status_with_id(stall_t + 2_000, "connected", "DualSense Edge (USB)", Some("serial:EDGE1"));
+        l.note_fault(stall_t + HB_INTERVAL_US);
+        let rejoined = l.pending().iter().rev().find(|r| r["type"] == "hb").unwrap();
+        assert!(rejoined["epoch"].as_u64().unwrap() > epoch_before, "reconnect bumps epoch");
+        let states: Vec<&str> = l.pending().iter().filter_map(|r| r["state"].as_str()).collect();
+        assert!(states.windows(2).any(|w| w == ["unplugged", "connected"]), "{states:?}");
+        let (sha, head, n) = l.seal(3, stall_t + HB_INTERVAL_US);
+        assert!(n > 5);
+        assert_ne!(sha, empty_hash());
+        let (recs, chunks) = read_file(&path).unwrap();
+        let sealed: Vec<&Value> = recs.iter().filter(|r| r["type"] == "hb").collect();
+        assert!(sealed.len() >= 5);
+        assert!(sealed.iter().all(|r| r["seg"] == 3));
+        let (_, chain, errs) = verify_chunks(&recs, &chunks);
+        assert!(errs.is_empty(), "{errs:?}");
+        assert_eq!(chain, head);
+        for row in sealed.iter().take(3) {
+            println!("{row}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
