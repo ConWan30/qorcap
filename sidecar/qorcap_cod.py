@@ -408,19 +408,26 @@ def _independent_anchor(token, seal_hash) -> bool:
     return False
 
 
-def producer_screen_us(source) -> int | None:
-    """Screen time from a measured monotonic sample.
+ENGINE_CLOCK_SOURCE = "engine_monotonic_ns"
 
-    Media PTS and wall-anchor subtraction are not that sample. An unmeasured
-    mapping stays unknown.
+
+def producer_screen_us(source, input_origin_ns=None) -> int | None:
+    """Screen time on the controller's ``t_us`` clock, or None.
+
+    The engine stamps snapshot ``mono_us`` and HID ``t_us`` from one Instant
+    and writes that Instant's origin on both. The sample is used only when
+    the snapshot origin is nonzero and equals the ``inputs.jsonl`` header
+    origin. Media PTS, a child-relative clock, a zero or legacy origin, and
+    wall-anchor subtraction stay unknown.
     """
     if not isinstance(source, dict):
         return None
-    clock = source.get("clock")
-    source_name = source.get("clock_source")
-    measured = clock in ("monotonic_ns", "perf_counter_ns") or source_name in (
-        "monotonic_ns", "perf_counter_ns")
-    if not measured:
+    if source.get("clock_source", source.get("clock")) != ENGINE_CLOCK_SOURCE:
+        return None
+    origin = source.get("mono_origin_ns")
+    if isinstance(origin, bool) or not isinstance(origin, int) or origin <= 0:
+        return None
+    if isinstance(input_origin_ns, bool) or not isinstance(input_origin_ns, int) or input_origin_ns != origin:
         return None
     sample = source.get("mono_us")
     if isinstance(sample, bool) or not isinstance(sample, int) or sample < 0:
@@ -429,14 +436,13 @@ def producer_screen_us(source) -> int | None:
 
 
 def _http_status_from_gap(reason: str):
-    text = str(reason)
-    for token in text.replace(":", " ").replace(",", " ").split():
-        if token.isdigit():
-            number = int(token)
-            if 100 <= number <= 599:
-                return number
-    lowered = text.lower()
-    if "httperror" in lowered or "http_error" in lowered or "snapshot_http" in lowered:
+    """A status only when the server answered.
+
+    ``/snapshot.jpg`` answers 200 or 503, so an ``HTTPError`` gap with no
+    code is that 503. A timeout, a refused connection, or a URLError got no
+    response and has no status.
+    """
+    if "httperror" in str(reason).lower():
         return 503
     return None
 
@@ -650,6 +656,7 @@ class CodSetRunner:
         self.haptics: list = []
         self.frame_stamps: list = []
         self.wall_anchor_ms = None
+        self.input_origin_ns = None
         self.stats = {
             "frames": 0, "agreed": 0, "errors": 0,
             "hud_not_read": 0, "end_screen_not_read": 0, "posted_final": 0,
@@ -683,6 +690,8 @@ class CodSetRunner:
         self._source = None
         self._signals_closed = False
         self._log_fault = False
+        # Signal log length before a failed append. The next write cuts back to it.
+        self._durable_len = None
         self.menu_exit_us = None
         self.lag_us_override = None
         self._last_gated_hit_us = None
@@ -701,6 +710,17 @@ class CodSetRunner:
         self.frame_stamps = list(frame_stamps or [])
         self.haptics = list(haptics or [])
         self.wall_anchor_ms = wall_anchor_ms
+        origin = None
+        for row in self.inputs:
+            if isinstance(row, dict) and row.get("type") == "header":
+                raw = row.get("mono_origin_ns")
+                if isinstance(raw, int) and not isinstance(raw, bool) and raw > 0:
+                    origin = raw
+                break
+        self.input_origin_ns = origin
+
+    def _screen_us(self):
+        return producer_screen_us(self._source, self.input_origin_ns)
 
     def on_frame(self, t_ms: int, img, source=None) -> None:
         self._source = source if isinstance(source, dict) else None
@@ -723,6 +743,14 @@ class CodSetRunner:
                 self.stats["errors"] += 1
                 print(f"Call of Duty HUD hook error: {type(e).__name__}: {e}", file=sys.stderr)
                 reads = []
+                self._write({
+                    "t_ms": int(t_ms),
+                    "kind": "hook_fault",
+                    "hook": "hud",
+                    "reason_code": "hud_hook_error",
+                    "error": type(e).__name__,
+                    "evaluated": True,
+                })
             by_name = {rd.region: rd for rd in reads}
             signals = self._signals(int(t_ms), by_name)
             for rd in reads:
@@ -782,7 +810,7 @@ class CodSetRunner:
             self._emit_frame(int(t_ms))
 
     def _signals(self, t_ms: int, by_name: dict) -> list[dict]:
-        screen_us = producer_screen_us(self._source)
+        screen_us = self._screen_us()
         stamps = self.frame_stamps
         edges = trigger_edges(self.inputs)
         trigger = nearest_us(edges, screen_us)
@@ -865,13 +893,7 @@ class CodSetRunner:
 
     def _capture_ref(self) -> dict:
         src = self._source if isinstance(self._source, dict) else {}
-        mono = None
-        if src.get("clock") in ("capture_pts", "monotonic_ns", "perf_counter_ns") or src.get("clock_source") in (
-            "monotonic_ns", "perf_counter_ns",
-        ):
-            raw = src.get("mono_us")
-            if isinstance(raw, int) and not isinstance(raw, bool) and raw >= 0:
-                mono = raw
+        mono = self._screen_us()
         capture_id = src.get("capture_id")
         if not isinstance(capture_id, str) or not capture_id:
             capture_id = src.get("frame_id") if isinstance(src.get("frame_id"), str) else None
@@ -1124,7 +1146,7 @@ class CodSetRunner:
         try:
             frame_id = self._source.get("frame_id") if isinstance(self._source, dict) else None
             self._lag.observe(
-                img, self.inputs, producer_screen_us(self._source),
+                img, self.inputs, self._screen_us(),
                 source_frame=frame_id if isinstance(frame_id, str) else None)
         except Exception:
             return
@@ -1195,18 +1217,8 @@ class CodSetRunner:
                 self.epoch_fault = True
 
     def _evidence_us(self):
-        """Capture-relative evidence time. A wall clock is not evidence."""
-        src = self._source if isinstance(self._source, dict) else {}
-        clock = src.get("clock")
-        if clock == "wall":
-            return None
-        if clock in ("capture_pts", "monotonic_ns", "perf_counter_ns"):
-            n = src.get("mono_us")
-            return n if isinstance(n, int) and not isinstance(n, bool) and n >= 0 else None
-        n = src.get("captured_us")
-        if isinstance(n, int) and not isinstance(n, bool):
-            return n
-        return None
+        """Evidence time on the controller clock. A wall clock or an unmatched origin is not evidence."""
+        return self._screen_us()
 
     def final_eligibility(self, *, visual_ok: bool, evidence_us) -> dict:
         """One gate for the scored path and the owner path.
@@ -1285,6 +1297,7 @@ class CodSetRunner:
             "reason": detail if detail is not None else reason_code,
             "attempt_seq": attempt_seq,
             "http_status": http_status,
+            "response": "http" if http_status is not None else "none",
             "capture_id": None,
             "capture_mono_us": None,
             "mono_us": None,
@@ -1416,9 +1429,9 @@ class CodSetRunner:
                     body[key] = source[key]
             if "mono_us" not in body:
                 src = self._source if isinstance(self._source, dict) else {}
-                measured = src.get("clock") in ("capture_pts", "monotonic_ns", "perf_counter_ns")
-                if measured and isinstance(src.get("mono_us"), int) and not isinstance(src.get("mono_us"), bool):
-                    body["mono_us"] = src["mono_us"]
+                screen_us = self._screen_us()
+                if screen_us is not None:
+                    body["mono_us"] = screen_us
                     body["clock"] = src.get("clock")
                     if isinstance(src.get("clock_id"), str):
                         body["clock_id"] = src["clock_id"]
@@ -1446,18 +1459,65 @@ class CodSetRunner:
         stored = dict(body)
         stored["prev"] = prev
         stored["hash"] = digest
+        terminal = body.get("kind") == "terminal"
+        if self._durable_len is not None and not self._restore_durable_len():
+            if not terminal:
+                self._log_fault = True
+            self.stats["signal_log_failures"] = self.stats.get("signal_log_failures", 0) + 1
+            print("Call of Duty signal log cannot restore its durable length", file=sys.stderr)
+            return False
         try:
-            with open(self.log_path, "a", encoding="utf-8") as fh:
-                fh.write(json.dumps(stored) + "\n")
+            fh = open(self.log_path, "ab")
+        except OSError as e:
+            if not terminal:
+                self._log_fault = True
+            self.stats["signal_log_failures"] = self.stats.get("signal_log_failures", 0) + 1
+            print(f"Call of Duty signal log failed: {type(e).__name__}: {e}", file=sys.stderr)
+            return False
+        start = None
+        try:
+            with fh:
+                start = os.fstat(fh.fileno()).st_size
+                fh.write((json.dumps(stored) + "\n").encode("utf-8"))
                 fh.flush()
                 os.fsync(fh.fileno())
         except OSError as e:
-            self._log_fault = True
+            # The line may be in the file without being durable. Cut back to
+            # the length before it now, or before the next write, so a retry
+            # at this seq leaves one row.
+            if start is not None:
+                self._durable_len = start
+                self._restore_durable_len()
+            if not terminal:
+                self._log_fault = True
             self.stats["signal_log_failures"] = self.stats.get("signal_log_failures", 0) + 1
             print(f"Call of Duty signal log failed: {type(e).__name__}: {e}", file=sys.stderr)
             return False
         self._chain_prev = digest
         self._chain_seq += 1
+        return True
+
+    def _restore_durable_len(self) -> bool:
+        length = self._durable_len
+        if length is None:
+            return True
+        try:
+            if not os.path.exists(self.log_path):
+                if length != 0:
+                    return False
+                self._durable_len = None
+                return True
+            with open(self.log_path, "r+b") as fh:
+                size = fh.seek(0, os.SEEK_END)
+                if size < length:
+                    return False
+                if size != length:
+                    fh.truncate(length)
+                fh.flush()
+                os.fsync(fh.fileno())
+        except OSError:
+            return False
+        self._durable_len = None
         return True
 
 

@@ -673,7 +673,10 @@ def start_reader(api: Api, stop: threading.Event, state: dict, bundle: Path | No
 
 SNAPSHOT_API_VERSION = 1
 SNAPSHOT_SCHEMA = "qorcap-snapshot/v1"
-CLOCK_SOURCES = {"monotonic_ns", "perf_counter_ns", "producer_instant"}
+# The engine stamps HID t_us and snapshot mono_us from one Instant. Its origin is
+# written on both the snapshot headers and the inputs.jsonl header.
+ENGINE_CLOCK_SOURCE = "engine_monotonic_ns"
+CLOCK_SOURCES = {ENGINE_CLOCK_SOURCE}
 
 
 def _plain_int(value):
@@ -745,6 +748,10 @@ def cod_capture_step(headers, body, seen, anchor_wall_ms, decoded):
     import hashlib
 
     del anchor_wall_ms  # wall subtraction is not capture mono
+    if _header_text(headers, "X-Qorcap-Snapshot-State") == "stale":
+        # The producer stopped completing frames. The bytes are the last frame
+        # and carry no capture id, so they are not a new observation.
+        return {"error": "stale_snapshot", "age_us": _header_int(headers, "X-Qorcap-Snapshot-Age-Us")}
     schema = _header_text(headers, "X-Qorcap-Snapshot-Schema")
     api_version = _header_int(headers, "X-Qorcap-Snapshot-Api")
     if api_version != SNAPSHOT_API_VERSION or schema != SNAPSHOT_SCHEMA:
@@ -756,12 +763,17 @@ def cod_capture_step(headers, body, seen, anchor_wall_ms, decoded):
     capture_id = _header_text(headers, "X-Qorcap-Snapshot-Capture-Id")
     generation = _header_int(headers, "X-Qorcap-Snapshot-Generation")
     mono_us = _header_int(headers, "X-Qorcap-Snapshot-Mono-Us")
+    producer_start_us = _header_int(headers, "X-Qorcap-Snapshot-Producer-Start-Us")
     if (
         not session_id or not clock_id or clock_source not in CLOCK_SOURCES or origin is None
-        or not capture_id or generation is None or mono_us is None
+        or origin <= 0 or not capture_id or generation is None or mono_us is None
     ):
         return {"error": "clock_binding_missing"}
     epoch = _header_int(headers, "X-Qorcap-Snapshot-Epoch")
+    if epoch is not None and generation != epoch:
+        # Generation is the producer epoch. A per-frame counter in this header
+        # would read as a new epoch on every frame.
+        return {"error": "provenance_generation_mismatch", "generation": generation, "epoch": epoch}
     seq = _header_int(headers, "X-Qorcap-Snapshot-Seq")
     pts_us = _header_int(headers, "X-Qorcap-Snapshot-Pts-Us")
     if isinstance(body, (bytes, bytearray)) and body:
@@ -792,7 +804,8 @@ def cod_capture_step(headers, body, seen, anchor_wall_ms, decoded):
             "mono_origin_ns": origin,
             "pts_us": sub["pts_us"],
             "mono_us": mono_us,
-            "clock": clock_source if clock_source in ("monotonic_ns", "perf_counter_ns") else "capture_pts",
+            "producer_start_us": producer_start_us,
+            "clock": clock_source,
             "captured_us": mono_us,
         },
     }

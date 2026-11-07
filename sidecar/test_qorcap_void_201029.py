@@ -331,8 +331,15 @@ def test_snapshot_api_version_is_required_and_madden_stays_on_its_clock():
         "X-Qorcap-Snapshot-Generation": "1",
         "X-Qorcap-Snapshot-Mono-Us": "40000",
     })
+    # A child-relative clock with a zero origin is not on the controller clock.
+    assert qm.cod_capture_step(bound_headers, b"jpeg-b", set(), 10, True)["error"] == "clock_binding_missing"
+    bound_headers.update({
+        "X-Qorcap-Snapshot-Clock": "engine:7000000000",
+        "X-Qorcap-Snapshot-Clock-Source": "engine_monotonic_ns",
+        "X-Qorcap-Snapshot-Mono-Origin-Ns": "7000000000",
+    })
     bound = qm.cod_capture_step(bound_headers, b"jpeg-b", set(), 10, True)
-    assert bound["source"]["clock"] == "capture_pts"
+    assert bound["source"]["clock"] == "engine_monotonic_ns"
     assert bound["source"]["mono_us"] == 40_000
     assert bound["source"]["mono_us"] != 10 * 1000
     assert bound["source"]["capture_id"] == "c1"

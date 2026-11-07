@@ -10,7 +10,7 @@ import json
 from pathlib import Path
 
 
-CLOCK_SOURCES = {"monotonic_ns", "perf_counter_ns", "producer_instant"}
+CLOCK_SOURCES = {"monotonic_ns", "perf_counter_ns", "engine_monotonic_ns"}
 SNAPSHOT_SCHEMA = "qorcap-snapshot/v1"
 
 
@@ -50,6 +50,9 @@ def order_captures(doc: dict) -> dict:
         if doc.get("clock_id") is None or doc.get("mono_origin_ns") is None:
             return {"verdict": "unknown_void", "reason": "clock_binding_missing"}
         if doc.get("clock_source") not in CLOCK_SOURCES:
+            return {"verdict": "unknown_void", "reason": "clock_binding_missing"}
+        origin = _int(doc.get("mono_origin_ns"))
+        if origin is None or origin <= 0:
             return {"verdict": "unknown_void", "reason": "clock_binding_missing"}
     ordered = sorted(frames, key=lambda frame: (_int(frame.get("mono_us")), str(frame.get("capture_id"))))
     return {
