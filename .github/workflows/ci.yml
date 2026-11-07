@@ -40,6 +40,10 @@ jobs:
       - run: cargo test --locked
         env:
           QORTIME: ${{ github.workspace }}/qortime
+      # Practice-only Track 1 seen-at module. Off by default, so the step above does not build it.
+      # Synthetic keys and an in-process service double only: no network, no player data.
+      - name: anchor_seen_at (practice-only feature)
+        run: cargo test --locked --features practice-anchor-seen-at --test anchor_seen_at
       # Headless sidecar tests, including the scorebug readers (standard bar, Thursday /
       # Sunday / Monday night, end menu, touchdown lock, play-call, PSN banner, and the
       # capture-pause fixtures). QORTIME is the pin above. A missing cv2/numpy/fixture
