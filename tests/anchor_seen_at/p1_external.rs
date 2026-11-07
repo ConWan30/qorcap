@@ -126,6 +126,8 @@ fn p1_external_api_rejects_forgery_for_the_right_reasons() {
         cases.push((format!("{name}_clone"),format!("use qorcap::anchor_seen_at::p1::{name}; fn c<T:Clone>(){{}} fn f(){{c::<{name}>();}}"),Some("E0277")));
     }
     cases.push(("nested_mutation".into(),"use qorcap::anchor_seen_at::p1::OriginalExchange; fn f(x:&OriginalExchange){x.commitment().session_id=String::new();}".into(),Some("E0594")));
+    cases.push(("diagnostic_enum_conversion".into(),"use qorcap::anchor_seen_at::{p1::DecisionTimeRecord,readiness::Readiness}; fn f(x:Readiness)->DecisionTimeRecord{x.into()}".into(),Some("E0277")));
+    cases.push(("decision_to_state_conversion".into(),"use qorcap::anchor_seen_at::{p1::DecisionTimeRecord,AnchorState}; fn f(x:DecisionTimeRecord)->AnchorState{x.into()}".into(),Some("E0277")));
     cases.push(("positive_getters".into(),r#"use qorcap::anchor_seen_at::p1::*;
 fn f(x:&OriginalExchange,o:&OpeningRecord,p:&PolicyObservation,d:&DecisionTimeRecord,l:&DurableLineage) {
  let copy=x.clone(); let _=(copy.event(),x.challenge(),x.commitment(),x.origin(),x.policy());

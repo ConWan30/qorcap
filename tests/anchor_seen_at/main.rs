@@ -1,6 +1,7 @@
 //! PRACTICE-ONLY synthetic adversarial tests for `qorcap::anchor_seen_at`.
 //! Built only with `--features practice-anchor-seen-at`. No network, no player data, no HID.
 
+use qorcap;
 mod fixtures;
 
 mod coverage_tests;

@@ -159,6 +159,8 @@ pub struct DurableLineage {
     opening: Option<OpeningRecord>,
     policy_generation: u64,
     source_last_seq: u64,
+    #[cfg(test)]
+    sync_schedule: Option<followup::SyncSchedule>,
 }
 
 impl DurableLineage {
@@ -195,6 +197,8 @@ impl DurableLineage {
             opening: None,
             policy_generation: 0,
             source_last_seq: 0,
+            #[cfg(test)]
+            sync_schedule: None,
         };
         s.append(json!({"kind":"new_local_lineage", "policy":s.policy_snapshot(),
             "total_deadline_ns":total_deadline_ns.map(|n|n.to_string()), "decision_use_age_ns":decision_use_age_ns.map(|n|n.to_string())}))?;
@@ -235,7 +239,15 @@ impl DurableLineage {
             self.file.write_all(&bytes)?;
             self.file.write_all(b"\n")?;
             self.file.flush()?;
+            #[cfg(test)]
+            if let Some(schedule) = &mut self.sync_schedule {
+                schedule.before_sync(record["payload"]["kind"].as_str().unwrap());
+            }
             self.file.sync_all()?;
+            #[cfg(test)]
+            if let Some(schedule) = &mut self.sync_schedule {
+                schedule.after_sync(record["payload"]["kind"].as_str().unwrap());
+            }
             Ok(head)
         })();
         match result {
@@ -359,6 +371,8 @@ impl DurableLineage {
             return self.fail(Reason::PersistFailed, source_last_seq);
         }
         let elapsed = original.enqueued.elapsed().as_nanos();
+        #[cfg(test)]
+        let elapsed = self.sync_schedule.as_ref().map_or(elapsed, |s| s.elapsed);
         match self.total_deadline_ns {
             None => {
                 state = AnchorState::unknown(Reason::TimingBudgetUnset);
@@ -378,10 +392,12 @@ impl DurableLineage {
             "classification":state.status_code(), "reasons":state.reasons()})).is_err() { return self.fail(Reason::PersistFailed, source_last_seq); }
         // Durability time includes the resolution append too. If it crosses the original
         // deadline, no retained result escapes; the late observation is appended instead.
-        if self
-            .total_deadline_ns
-            .is_some_and(|n| original.enqueued.elapsed().as_nanos() >= u128::from(n))
-        {
+        if self.total_deadline_ns.is_some_and(|n| {
+            let elapsed = original.enqueued.elapsed().as_nanos();
+            #[cfg(test)]
+            let elapsed = self.sync_schedule.as_ref().map_or(elapsed, |s| s.elapsed);
+            elapsed >= u128::from(n)
+        }) {
             if let AnchorState::SeenAtRetained(f) = state {
                 state = AnchorState::SeenAtLate(f.into_late());
             }
@@ -601,3 +617,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "p1_followup.rs"]
+mod followup;

@@ -386,3 +386,119 @@ fn p1_no_response_at_original_deadline_latches_missing_history() {
     );
     assert!(fs::read_to_string(p).unwrap().contains("missing_outcome"));
 }
+
+#[test]
+fn p1_source_max_minus_one_close_and_cardinality_are_representable() {
+    use qorcap::anchor_seen_at::coverage::StreamEligibility;
+    let w = World::new();
+    let session = Session::new("p1-representable-source");
+    let opening = exchange(&w, &session, Purpose::Opening, 0, None, 0, u64::MAX - 2);
+    let close = exchange(
+        &w,
+        &session,
+        Purpose::Close,
+        1,
+        Some(&opening.ack_id()),
+        u64::MAX - 1,
+        u64::MAX - 1,
+    );
+    assert_eq!(
+        close.commitment.close.as_ref().unwrap().total_rows,
+        u64::MAX.to_string()
+    );
+    let os = opening.state(&w.policy);
+    let cs = close.state(&w.policy);
+    assert!(os.retained().is_some());
+    assert!(cs.retained().is_some());
+    let mut coverage = StreamEligibility::new();
+    coverage.record(&AnchorState::default(), u64::MAX - 1);
+    assert_eq!(coverage.unknown_rows(), u64::MAX);
+    let mut valid = StreamEligibility::new();
+    valid.record(&os, u64::MAX - 1);
+    assert_eq!(valid.unknown_rows(), 1);
+    valid.record(&cs, u64::MAX - 1);
+    assert!(valid.complete());
+    assert_eq!(valid.unknown_rows(), 0);
+    assert!(valid.is_eligible(u64::MAX - 1));
+    valid.record(&cs, u64::MAX);
+    assert_eq!(valid.break_reason(), Some(Reason::RowsAfterClose));
+    assert_eq!(valid.unknown_rows(), 1);
+    assert!(!valid.complete());
+    let mut invalid = close.commitment.clone();
+    invalid.chain.last_seq = u64::MAX.to_string();
+    invalid.capture_ranges[0].last_seq = u64::MAX.to_string();
+    invalid.close.as_mut().unwrap().final_last_seq = u64::MAX.to_string();
+    assert_eq!(invalid.chain.validate(), Err(Reason::FieldFormat));
+    assert_eq!(invalid.validate(), Err(Reason::FieldFormat));
+    assert!(w
+        .svc
+        .post_commitments(&commit_body(&close.ch, &invalid))
+        .is_err());
+    let bad_count = checked_variant(&w, &close, |_, a| {
+        a.commitment.close.as_mut().unwrap().total_rows = (u64::MAX - 1).to_string()
+    });
+    assert!(bad_count.retained().is_some());
+    let mut count_guard = StreamEligibility::new();
+    count_guard.record(&os, u64::MAX - 1);
+    count_guard.record(&bad_count, u64::MAX - 1);
+    assert_eq!(count_guard.break_reason(), Some(Reason::SchemaViolation));
+    assert!(!count_guard.complete());
+    assert_eq!(count_guard.unknown_rows(), 1);
+    count_guard.record(&cs, u64::MAX - 1);
+    assert_eq!(count_guard.break_reason(), Some(Reason::SchemaViolation));
+}
+#[test]
+fn p1_fresh_public_replay_is_only_new_local_diagnostics_not_recovery() {
+    use qorcap::anchor_seen_at::readiness::{self, CaptureValidity, Readiness, ReadinessInputs};
+    let w = World::new();
+    let session = Session::new("p1-fresh-public-replay");
+    let stream = full_stream(&w, &session);
+    let (mut old, old_path) = lineage(&w);
+    observe(&mut old, &stream[0], 9);
+    let detached = old.opening().unwrap().original().clone();
+    let old_policy = old.note_policy(&hex64("policy")).unwrap();
+    let old_record = old.check_at_decision_time(&old_policy).unwrap();
+    old.record_failure(Reason::Gap, 29);
+    assert_eq!(
+        old.check_at_decision_time(&old_policy).unwrap_err(),
+        Reason::Gap
+    );
+    drop(old);
+    let (mut fresh, fresh_path) = lineage(&w);
+    assert_ne!(fresh_path, old_path);
+    for e in &stream {
+        assert!(observe(&mut fresh, e, 29).retained().is_some());
+    }
+    assert!(fresh.diagnostic_coverage().complete());
+    assert_eq!(fresh.diagnostic_coverage().break_reason(), None);
+    let fresh_policy = fresh.note_policy(&hex64("policy")).unwrap();
+    let fresh_record = fresh.check_at_decision_time(&fresh_policy).unwrap();
+    assert_eq!(fresh_record.label(), "checked at decision time");
+    assert!(!fresh_record.publication_time_freshness_asserted());
+    assert!(!old_record.publication_time_freshness_asserted());
+    // Expected success: a fresh owner cannot see the old lifetime's failure. This is not recovery.
+    assert!(fs::read_to_string(old_path).unwrap().contains("gap"));
+    let gate = readiness::evaluate(&ReadinessInputs {
+        opening: fresh.opening().unwrap().state(),
+        eligibility: fresh.diagnostic_coverage(),
+        capture_validity: CaptureValidity::NotEstablishedByAck,
+        frames: &[],
+        min_distinct_frames: None,
+        exclusion_end_seq: None,
+        hook_lag_measured: false,
+    });
+    assert!(matches!(gate, Readiness::Withheld { .. }));
+    let (mut rejected, _) = lineage(&w);
+    assert!(matches!(
+        rejected.observe(&detached, &stream[0].ack_bytes, &arrival(&stream[0]), 9),
+        AnchorState::Unknown { .. }
+    ));
+    assert_eq!(
+        rejected.diagnostic_coverage().break_reason(),
+        Some(Reason::BindingMismatch)
+    );
+    assert_eq!(
+        rejected.check_at_decision_time(&old_policy).unwrap_err(),
+        Reason::PolicyMismatch
+    );
+}
