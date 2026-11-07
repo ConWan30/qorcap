@@ -20,3 +20,6 @@ pub mod credentials;
 pub mod clip;
 pub mod redteam;
 pub mod device_attest;
+pub mod seal;
+pub mod pad_link;
+pub mod snap;

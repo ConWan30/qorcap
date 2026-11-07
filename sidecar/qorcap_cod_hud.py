@@ -1443,3 +1443,106 @@ def build_calibration_pack(fixture_dir: Path = FIXTURE_DIR, out_path: Path = PAC
         row_digit_labels=np.array([s.encode("ascii") for s in row_labels]),
         row_digit_vecs=row_digit_vecs,
     )
+
+
+# PROVISIONAL. A fade or a black frame is not a real end-board frame.
+REAL_MEAN_MIN = 18.0
+FADE_STD_MAX = 8.0
+FADE_MEAN_MAX = 40.0
+CONSENSUS_FRAMES = 5
+
+
+def frame_is_real(img) -> bool:
+    """False for a missing, black, or faded frame. A non-array does not raise."""
+    bgr = _as_bgr(img)
+    if bgr is None:
+        return False
+    mean = float(bgr.mean())
+    if mean < REAL_MEAN_MIN:
+        return False
+    if mean < FADE_MEAN_MAX and float(bgr.std()) < FADE_STD_MAX:
+        return False
+    return True
+
+
+def _frame_parts(item):
+    if isinstance(item, dict) and "img" in item:
+        return item.get("img"), item
+    return item, None
+
+
+def _pixel_id(img) -> str | None:
+    try:
+        import hashlib
+        import numpy as np
+        if not isinstance(img, np.ndarray):
+            return None
+        return hashlib.sha256(np.ascontiguousarray(img).tobytes()).hexdigest()
+    except Exception:
+        return None
+
+
+def _feed_check(feed, kills: int) -> str:
+    """The feed is a consistency check. An unknown tally does not decide the digits."""
+    if not isinstance(feed, dict):
+        return "unknown"
+    if feed.get("coverage") != "covered" or feed.get("ownership_qualified") is not True or feed.get("deduped") is not True:
+        return "unknown"
+    counted = feed.get("kills")
+    if isinstance(counted, bool) or not isinstance(counted, int):
+        return "unknown"
+    if counted != kills:
+        return "inconsistent"
+    return "consistent"
+
+
+def consensus_owner_row(frames, feed=None) -> dict:
+    """Five distinct captured frames must read the same kills and deaths.
+
+    A repeated image, a missing capture time, or a missing source id abstains.
+    The own-kill feed does not supply the digits. It can only disagree when it
+    is ownership-qualified, deduplicated, and covered. The single-frame reader
+    is unchanged.
+    """
+    real = []
+    for item in frames or []:
+        img, meta = _frame_parts(item)
+        if frame_is_real(img):
+            real.append((img, meta or {}))
+    tail = real[-CONSENSUS_FRAMES:]
+    empty = {"status": "abstain", "kills": None, "deaths": None, "feed_check": "unknown"}
+    if len(tail) < CONSENSUS_FRAMES:
+        return {**empty, "reason": "short_real_window"}
+    ident = []
+    for img, meta in tail:
+        pixel = meta.get("pixel_id") if isinstance(meta.get("pixel_id"), str) and meta.get("pixel_id") else _pixel_id(img)
+        source = meta.get("source_id") if isinstance(meta.get("source_id"), str) else meta.get("frame_id")
+        captured = meta.get("captured_us")
+        if not pixel or not isinstance(source, str) or not source:
+            return {**empty, "reason": "no_capture_provenance"}
+        if isinstance(captured, bool) or not isinstance(captured, int):
+            return {**empty, "reason": "no_capture_provenance"}
+        ident.append((pixel, source, captured))
+    if len({row[0] for row in ident}) < CONSENSUS_FRAMES or len({row[1] for row in ident}) < CONSENSUS_FRAMES:
+        return {**empty, "reason": "repeated_frame"}
+    times = [row[2] for row in ident]
+    if any(later <= earlier for earlier, later in zip(times, times[1:])):
+        return {**empty, "reason": "repeated_frame"}
+    reads = [read_owner_row(img) for img, _meta in tail]
+    if not all(r.ok and r.calibrated and r.kills is not None and r.deaths is not None for r in reads):
+        return {**empty, "reason": "row_not_read"}
+    kills = {r.kills for r in reads}
+    deaths = {r.deaths for r in reads}
+    if len(kills) != 1 or len(deaths) != 1:
+        return {**empty, "reason": "frames_disagree"}
+    k = next(iter(kills))
+    d = next(iter(deaths))
+    check = _feed_check(feed, int(k))
+    if check == "inconsistent":
+        return {"status": "abstain", "reason": "feed_inconsistent", "kills": k, "deaths": d, "feed_check": check}
+    last = reads[-1]
+    return {
+        "status": "accepted", "reason": "five_frame_consensus",
+        "kills": k, "deaths": d, "assists": last.assists, "confirms": last.confirms,
+        "player_tag": last.player_tag, "feed_check": check,
+    }

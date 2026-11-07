@@ -671,6 +671,166 @@ def start_reader(api: Api, stop: threading.Event, state: dict, bundle: Path | No
     return t
 
 
+SNAPSHOT_API_VERSION = 1
+SNAPSHOT_SCHEMA = "qorcap-snapshot/v1"
+# The engine stamps HID t_us and snapshot mono_us from one Instant. Its origin is
+# written on both the snapshot headers and the inputs.jsonl header.
+ENGINE_CLOCK_SOURCE = "engine_monotonic_ns"
+CLOCK_SOURCES = {ENGINE_CLOCK_SOURCE}
+
+
+def _plain_int(value):
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value
+
+
+def split_clocks(*, wall_ms, pts_us, anchor_wall_ms) -> dict:
+    """Wall time stays wall time. It is not a monotonic capture clock.
+
+    A wall anchor does not unlock ``mono_us``. Producer mono comes from a
+    bound snapshot header, not from ``wall_ms * 1000`` or wall subtraction.
+    """
+    return {
+        "wall_ms": _plain_int(wall_ms),
+        "pts_us": _plain_int(pts_us),
+        "mono_us": None,
+        "clock": "unbound",
+        "anchor_wall_ms": _plain_int(anchor_wall_ms),
+    }
+
+
+def order_captures(doc: dict) -> dict:
+    from qorcap_qordata import order_captures as _order
+    return _order(doc)
+
+
+def snapshot_submission(api_version, epoch, seq, pts_us, body_hash, seen):
+    """One capture generation. A missing API version is an incompatibility, not a skip.
+
+    Wall time is not an argument. A repeated epoch and sequence is not a new frame.
+    Media PTS may be absent. It is not the capture identity, so several completions
+    may share one PTS.
+    """
+    version = _plain_int(api_version)
+    if version != SNAPSHOT_API_VERSION:
+        return {"error": "snapshot_api_incompatible", "api_version": version}
+    epoch_n, seq_n = _plain_int(epoch), _plain_int(seq)
+    pts_n = _plain_int(pts_us)
+    if epoch_n is None or seq_n is None or epoch_n < 0 or seq_n < 0:
+        return {"error": "snapshot_provenance_missing"}
+    if pts_us is not None and (pts_n is None or pts_n < 0):
+        return {"error": "snapshot_provenance_missing"}
+    if not isinstance(body_hash, str) or not body_hash or not isinstance(seen, set):
+        return {"error": "snapshot_provenance_missing"}
+    for prev_epoch, prev_seq, _prev_pts, _prev_hash in seen:
+        # Media PTS can stay on one progress line while several JPEGs complete.
+        # The capture sequence is the frame identity. PTS is not.
+        if prev_epoch == epoch_n and seq_n <= prev_seq:
+            return {"error": "snapshot_repeated", "epoch": epoch_n, "seq": seq_n}
+    seen.add((epoch_n, seq_n, pts_n, body_hash))
+    return {
+        "ok": True,
+        "epoch": epoch_n,
+        "seq": seq_n,
+        "pts_us": pts_n,
+        "frame_id": body_hash,
+        "clock": "capture_pts",
+    }
+
+
+def cod_capture_step(headers, body, seen, anchor_wall_ms, decoded):
+    """Turn one CoD snapshot response into a frame or an explicit chain reason.
+
+    The API version and the schema have to match this sidecar. A missing clock
+    binding is a failure. ``anchor_wall_ms`` is not a substitute for that binding.
+    """
+    import hashlib
+
+    del anchor_wall_ms  # wall subtraction is not capture mono
+    if _header_text(headers, "X-Qorcap-Snapshot-State") == "stale":
+        # The producer stopped completing frames. The bytes are the last frame
+        # and carry no capture id, so they are not a new observation.
+        return {"error": "stale_snapshot", "age_us": _header_int(headers, "X-Qorcap-Snapshot-Age-Us")}
+    schema = _header_text(headers, "X-Qorcap-Snapshot-Schema")
+    api_version = _header_int(headers, "X-Qorcap-Snapshot-Api")
+    if api_version != SNAPSHOT_API_VERSION or schema != SNAPSHOT_SCHEMA:
+        return {"error": "version_mismatch", "api_version": api_version, "schema": schema}
+    session_id = _header_text(headers, "X-Qorcap-Snapshot-Session")
+    clock_id = _header_text(headers, "X-Qorcap-Snapshot-Clock")
+    clock_source = _header_text(headers, "X-Qorcap-Snapshot-Clock-Source")
+    origin = _header_int(headers, "X-Qorcap-Snapshot-Mono-Origin-Ns")
+    capture_id = _header_text(headers, "X-Qorcap-Snapshot-Capture-Id")
+    generation = _header_int(headers, "X-Qorcap-Snapshot-Generation")
+    mono_us = _header_int(headers, "X-Qorcap-Snapshot-Mono-Us")
+    producer_start_us = _header_int(headers, "X-Qorcap-Snapshot-Producer-Start-Us")
+    if (
+        not session_id or not clock_id or clock_source not in CLOCK_SOURCES or origin is None
+        or origin <= 0 or not capture_id or generation is None or mono_us is None
+    ):
+        return {"error": "clock_binding_missing"}
+    epoch = _header_int(headers, "X-Qorcap-Snapshot-Epoch")
+    if epoch is not None and generation != epoch:
+        # Generation is the producer epoch. A per-frame counter in this header
+        # would read as a new epoch on every frame.
+        return {"error": "provenance_generation_mismatch", "generation": generation, "epoch": epoch}
+    seq = _header_int(headers, "X-Qorcap-Snapshot-Seq")
+    pts_us = _header_int(headers, "X-Qorcap-Snapshot-Pts-Us")
+    if isinstance(body, (bytes, bytearray)) and body:
+        body_hash = hashlib.sha256(body).hexdigest()
+    else:
+        body_hash = ""
+    sub = snapshot_submission(api_version, epoch, seq, pts_us, body_hash, seen)
+    if sub.get("error"):
+        return sub
+    if not decoded:
+        return {"error": "snapshot_decode", "epoch": sub["epoch"], "seq": sub["seq"]}
+    if capture_id == body_hash:
+        # Pixel identity is not the capture id. A header that only echoes the
+        # body hash has not named a producer capture.
+        return {"error": "missing_provenance"}
+    return {
+        "ok": True,
+        "t_ms": mono_us // 1000,
+        "source": {
+            "frame_id": capture_id,
+            "capture_id": capture_id,
+            "seq": sub["seq"],
+            "epoch": sub["epoch"],
+            "capture_generation": generation,
+            "session_id": session_id,
+            "clock_id": clock_id,
+            "clock_source": clock_source,
+            "mono_origin_ns": origin,
+            "pts_us": sub["pts_us"],
+            "mono_us": mono_us,
+            "producer_start_us": producer_start_us,
+            "clock": clock_source,
+            "captured_us": mono_us,
+        },
+    }
+
+
+def _header_text(headers, name):
+    if headers is None or not hasattr(headers, "get"):
+        return None
+    raw = headers.get(name)
+    if not isinstance(raw, str) or not raw:
+        return None
+    return raw
+
+
+def _header_int(headers, name):
+    raw = _header_text(headers, name)
+    if raw is None:
+        return None
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return value
+
+
 def start_cod_reader(api: Api, stop: threading.Event, state: dict, bundle: Path | None = None) -> threading.Thread:
     """Call of Duty frame loop. Does not start the Madden scorebug reader.
 
@@ -678,8 +838,6 @@ def start_cod_reader(api: Api, stop: threading.Event, state: dict, bundle: Path 
     Controller and frame-clock rows are refreshed about once a second. No frame
     clock means those signals are not Counted.
     """
-    import hashlib
-
     sys.path.insert(0, str(HERE))
     from qorcap_cod import CodSetRunner, load_signal_files, side_from_bundle
 
@@ -717,33 +875,53 @@ def start_cod_reader(api: Api, stop: threading.Event, state: dict, bundle: Path 
         except Exception as e:
             state["reader_error"] = f"cod_reader_unavailable: {type(e).__name__}"
             return
-        last, last_t = None, 0.0
         last_refresh = 0.0
-        while not stop.is_set():
-            state["reader_tick"] = int(time.time() * 1000)
-            now = time.monotonic()
-            if now - last_refresh >= 1.0:
-                refresh()
-                last_refresh = now
-            try:
-                with urllib.request.urlopen(api.base + "/snapshot.jpg", timeout=3) as r:
-                    data = r.read()
-            except Exception:
-                if stop.wait(0.5):
-                    return
-                continue
-            t_ms = int(time.time() * 1000)
-            h = hashlib.sha256(data).digest()
-            if h != last or time.monotonic() - last_t >= 1.0:
-                last, last_t = h, time.monotonic()
-                img = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
-                if img is not None:
+        seen = set()
+        try:
+            while not stop.is_set():
+                state["reader_tick"] = int(time.time() * 1000)
+                now = time.monotonic()
+                if now - last_refresh >= 1.0:
+                    refresh()
+                    last_refresh = now
+                try:
+                    with urllib.request.urlopen(api.base + "/snapshot.jpg", timeout=3) as r:
+                        data = r.read()
+                        headers = r.headers
+                except Exception as e:
+                    status = getattr(e, "code", None)
+                    if isinstance(status, str) and status.isdigit():
+                        status = int(status)
+                    if isinstance(status, bool) or not isinstance(status, int):
+                        status = None
+                    runner.note_capture_gap(
+                        f"snapshot_http:{type(e).__name__}",
+                        http_status=status,
+                        observed_mono_us=time.monotonic_ns() // 1000,
+                    )
+                    if stop.wait(0.5):
+                        break
+                    continue
+                try:
+                    img = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
+                except Exception:
+                    img = None
+                step = cod_capture_step(headers, data, seen, runner.wall_anchor_ms, img is not None)
+                if step.get("error"):
+                    runner.note_capture_gap(step["error"])
+                else:
                     try:
-                        runner.on_frame(t_ms, img)
+                        runner.on_frame(step["t_ms"], img, source=step["source"])
                     except Exception as e:
                         state["reader_error"] = f"{type(e).__name__}: {e}"
-            if stop.wait(0.25):
-                return
+                        runner.note_capture_gap(f"frame_hook:{type(e).__name__}")
+                if stop.wait(0.25):
+                    break
+        finally:
+            try:
+                runner.close_signals()
+            except Exception:
+                pass
 
     t = threading.Thread(target=loop, name="qorcap-cod-reader", daemon=True)
     state["reader_thread"] = t
@@ -1043,7 +1221,15 @@ def status_line(st: dict, cps: dict, signed: int, *, game: str = "madden") -> st
     disk_bit = f" | disk {disk}MB" if isinstance(disk, int) else ""
     return (f"[{state}] {int(st.get('recording_secs') or 0) // 60:02d}:{int(st.get('recording_secs') or 0) % 60:02d}"
             f" | {score} | segments {cps.get('segments', 0)} | signed {signed} | clips {cps.get('clips', 0)}"
-            f"{disk_bit}{warn_bit}")
+            f"{disk_bit}{warn_bit}{_seal_suffix(st)}")
+
+
+def _seal_suffix(st: dict) -> str:
+    inp = st.get("input") if isinstance(st.get("input"), dict) else {}
+    line = str((inp or {}).get("seal_line") or "").strip()
+    if not line:
+        return ""
+    return " | " + line
 
 
 def run_cmd(cmd: list[str], env=None) -> tuple[int, str]:

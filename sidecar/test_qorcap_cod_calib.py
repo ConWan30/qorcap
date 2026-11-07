@@ -281,6 +281,8 @@ def test_info_only_timing_stays_not_counted():
         assert row["label"] == "INFO-ONLY"
         assert row["status"] == C.NOT_COUNTED
     assert C.INFO_ONLY["power_aware_timing"]["power"] == "unknown"
+    assert "stick_turn_vs_camera" not in C.INFO_ONLY
+    assert C.COUNTED_SIGNALS["stick_turn_vs_camera"]["status"] == "Counted"
 
 
 # Pastes that agreed before the location gate. None of these is the header box.
@@ -440,17 +442,27 @@ def test_owner_row_and_victory_reach_the_three_frame_bar(tmp_path):
     unknown. The row is logged and copied onto the session sidecar.
     """
     img = frame("end_173922_019.jpg")
+    repeated = []
+    same = C.CodSetRunner(repeated.append)
+    for t in (0, 1000, 2000, 3000, 4000):
+        same.on_frame(t, img)
+    assert repeated == []
     posted = []
     runner = C.CodSetRunner(posted.append, log_path=tmp_path / "cod_signals.jsonl")
-    runner.on_frame(0, img)
-    assert posted == []
-    runner.on_frame(1000, img)
-    assert posted == []
-    runner.on_frame(4000, img)
+
+    def variant(n):
+        out = img.copy()
+        out[0, n] = (n * 40) % 256
+        return out
+
+    for n, t in enumerate((0, 1000, 2000, 3000)):
+        runner.on_frame(t, variant(n), source={"frame_id": f"f{n}", "seq": n, "captured_us": t * 1000})
+        assert posted == []
+    runner.on_frame(4000, variant(4), source={"frame_id": "f4", "seq": 4, "captured_us": 4_000_000})
     assert len(posted) == 1
     event = posted[0]
     assert event["basis"] == "end_menu" and event["method"] == "end_menu_read"
-    assert event["final_confirmed"] is True
+    assert event["final_confirmed"] is False
     assert event["home"] is None and event["away"] is None
     assert event["quarter"] == 4
     assert event["owner_row"]["tag"] == "Qortrola30"
@@ -462,13 +474,38 @@ def test_owner_row_and_victory_reach_the_three_frame_bar(tmp_path):
     assert "verified" not in text and "cheat" not in text
     assert "not a home or away score" in text
     lines = (tmp_path / "cod_signals.jsonl").read_text(encoding="utf-8").splitlines()
+    assert json.loads(lines[0])["kind"] == "set"
     end_row = json.loads(lines[-1])
     assert end_row["kind"] == "end_screen" and end_row["owner_row"]["kills"] == 13
     from qorcap_match import apply_final
     result = apply_final({"notes": []}, event)
     assert result["home_score"] is None and result["away_score"] is None
     assert result["winner"] == "unknown"
-    assert result["final_confirmed"] is True
+    assert result["final_confirmed"] is False
+    confirmed = []
+    ready = C.CodSetRunner(confirmed.append)
+    ready.set_signals(
+        [{"type": "in", "t_us": 0, "b": 1 << 9}, {"type": "in", "t_us": 2_000_000, "b": 0}],
+        [], [], 0)
+    ready.menu_exit_us = 2_100_000
+    ready.lag_us_override = 100_000
+    ready.capture_epoch = 1
+    ready.capture_generation = 1
+    ready.session_id = "s1"
+    ready.seal_durable = True
+    ready.anchor_validated = True
+    ready.independent_anchor = "independent-v1:" + ("ab" * 32)
+    for n, t in enumerate((0, 1000, 2000, 3000, 4000)):
+        ready.on_frame(t, variant(n + 5), source={
+            "frame_id": f"g{n}",
+            "capture_id": f"g{n}",
+            "seq": n,
+            "epoch": 1,
+            "clock": "capture_pts",
+            "mono_us": 3_000_000 + n * 1_000,
+            "captured_us": 3_000_000 + n * 1_000,
+        })
+    assert confirmed[0]["final_confirmed"] is False
     assert result["method"] == "end_menu_read"
     assert "owner_row" not in result
     C.write_session(tmp_path)
@@ -509,13 +546,21 @@ def test_owner_row_fails_closed_and_the_probe_keeps_the_last_five_frames(tmp_pat
     assert probe["posted"] is False
     assert probe["reason"] == "the owner row was not read on the last frames"
     assert all(row["owner_row"] is None for row in probe["reads"])
-    held = [(0, splash), (1000, board), (2500, board), (4000, board)]
-    posted_probe = C.probe_end_frames(held)
+    held = [(i * 1000, board) for i in range(5)]
+    repeated_probe = C.probe_end_frames(held, own_kills=13)
+    assert repeated_probe["posted"] is False
+    assert repeated_probe["reason"] == "the last frames are not five distinct captures"
+    distinct = []
+    for i in range(5):
+        out = board.copy()
+        out[0, i] = (i * 40) % 256
+        distinct.append((i * 1000, out, {"frame_id": f"p{i}", "seq": i, "captured_us": i * 1_000_000}))
+    posted_probe = C.probe_end_frames(distinct, own_kills=13)
     assert posted_probe["posted"] is True
-    assert posted_probe["frames"] == 4
+    assert posted_probe["frames"] == 5
     assert posted_probe["reads"][-1]["result"] == "victory"
     assert posted_probe["reads"][-1]["owner_row"]["deaths"] == 13
-    C.record_end_probe(tmp_path, held)
+    C.record_end_probe(tmp_path, distinct, own_kills=13)
     saved = json.loads((tmp_path / "cod_end_probe.json").read_text(encoding="utf-8"))
     assert saved["schema"] == "qorcap-cod-end-probe/v0"
     assert saved["posted"] is True

@@ -173,6 +173,9 @@ pub enum Failure { AudioOpen, VideoNotFound, FormatUnsupported, Busy, Snapshot, 
 pub fn classify_failure(tail: &str) -> Failure {
     let t = tail.to_lowercase();
     // Snapshot/image2 path gone (TEMP cleared) — must not burn reopen budget when video is fine.
+    if t.contains("failed to rename") || t.contains("error renaming") || (t.contains("atomic") && t.contains("rename")) {
+        return Failure::Snapshot;
+    }
     if (t.contains("snapshot") || t.contains("image2") || t.contains(".jpg"))
         && (t.contains("no such file") || t.contains("error opening output") || t.contains("permission denied") || t.contains("failed to open"))
     {
@@ -286,8 +289,9 @@ pub fn capture_args_with(a: &RecordArgs, input_format: &str, audio: Option<&Audi
     push(&mut v, &["-b:v", &a.bitrate, "-maxrate", &a.bitrate, "-bufsize", &a.bitrate, "-g", &fps, "-bf", "0"]);
     if has_audio { push(&mut v, &["-c:a", "aac", "-b:a", "160k", "-ar", "48000", "-af", "aresample=async=1000:first_pts=0"]); }
     push(&mut v, &["-f", "mpegts", "-mpegts_flags", "+resend_headers", "-pat_period", "0.2", "-muxdelay", "0", "pipe:1"]);
-    // Snapshot output (4 fps, atomic rewrite so readers never see a partial JPEG)
-    push(&mut v, &["-map", "0:v", "-vf", "fps=4", "-q:v", "3", "-f", "image2", "-update", "1", "-atomic_writing", "1", "-y", snapshot]);
+    // Snapshot output (4 fps). No atomic rename: Windows fails that rename when the reader
+    // has snapshot.jpg open. QorCap publishes a complete JPEG itself (see snap.rs).
+    push(&mut v, &["-map", "0:v", "-vf", "fps=4", "-q:v", "3", "-f", "image2", "-update", "1", "-y", snapshot]);
     v
 }
 
@@ -391,6 +395,7 @@ dummy: Immediate exit requested"#;
         assert!(a.contains("-g 60"));
         assert!(a.contains(r"drawtext=textfile='C\:/t/s.txt':reload=1"), "{a}");
         assert!(a.contains("-f mpegts"));
+        assert!(!a.contains("atomic_writing"), "snapshot rename stays in QorCap, not ffmpeg: {a}");
         assert!(frag_mp4_args().join(" ").contains("+frag_keyframe+empty_moov"));
     }
 
@@ -425,6 +430,7 @@ video=USB3.0 Video: Immediate exit requested"#;
         assert_eq!(classify_failure("The device is busy"), Failure::Busy);
         assert_eq!(classify_failure("Could not run graph (sometimes caused by a device already in use by other application)"), Failure::Other);
         assert_eq!(classify_failure("Could not find video device with name [X] among source devices of type video."), Failure::VideoNotFound);
+        assert_eq!(classify_failure("Failed to rename 'snapshot.jpg.tmp' to 'snapshot.jpg'"), Failure::Snapshot);
         assert_eq!(classify_failure("Could not open file : C:\\Users\\x\\AppData\\Local\\Temp\\qorcap-1\\snapshot.jpg: No such file or directory"), Failure::Snapshot);
         assert_eq!(classify_failure("Error opening output file snapshot.jpg."), Failure::Snapshot);
         assert!(failure_hint(Failure::Busy, true).contains("Close OBS. It's using the capture card"));
