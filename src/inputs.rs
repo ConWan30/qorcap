@@ -246,6 +246,25 @@ impl InputLog {
         l
     }
 
+    /// Name the engine clock behind `t_us` on the header, before the header is written.
+    /// The snapshot publisher carries the same origin. Zero leaves the header without one.
+    pub fn set_mono_origin_ns(&mut self, origin_ns: u64) {
+        if origin_ns == 0 { return; }
+        if let Some(Value::Object(h)) = self.pending.first_mut() {
+            if h.get("type").and_then(|t| t.as_str()) == Some("header") {
+                h.insert("mono_origin_ns".into(), json!(origin_ns));
+            }
+        }
+    }
+
+    /// The origin on the header that has not been written yet. None after it is written or when absent.
+    pub fn header_mono_origin_ns(&self) -> Option<u64> {
+        self.pending.first()
+            .filter(|h| h.get("type").and_then(|t| t.as_str()) == Some("header"))
+            .and_then(|h| h.get("mono_origin_ns"))
+            .and_then(|v| v.as_u64())
+    }
+
     /// Call of Duty opening seal. Off for every other game. Console line only; no controller write.
     pub fn enable_seal(&mut self) {
         if self.seal.enabled() { return; }

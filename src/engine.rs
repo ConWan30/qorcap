@@ -98,8 +98,9 @@ pub struct Engine {
     bundle_finalized: AtomicBool,
     /// Test hook. A fault fails one append stage and rewinds a torn tail.
     pub persist_fault: Mutex<Option<PersistFault>>,
-    /// Set when a rewind could not be confirmed. The next append repairs the tail before it acks.
-    tail_needs_repair: AtomicBool,
+    /// Length of `checkpoints.jsonl` before a failed append. A line past it may or may not be
+    /// durable, so the next checkpoint restores this length and syncs before it writes.
+    ckpt_durable_len: Mutex<Option<u64>>,
 }
 
 /// QorTime evidence state for this run.
@@ -187,20 +188,28 @@ fn file_ends_with(path: &Path, line: &[u8]) -> bool {
     buf.len() == line.len() || buf[buf.len() - line.len() - 1] == b'\n'
 }
 
-/// Drop a torn trailing line and sync the kept prefix. An already-terminated file is synced as it stands.
-fn repair_jsonl_tail(path: &Path) -> Result<(), String> {
-    if !path.exists() { return Ok(()); }
-    let buf = std::fs::read(path).map_err(|e| format!("rewind: {e}"))?;
-    let keep = if buf.is_empty() || buf.last() == Some(&b'\n') {
-        buf.len()
-    } else {
-        buf.iter().rposition(|b| *b == b'\n').map(|i| i + 1).unwrap_or(0)
-    };
+/// Cut the file back to the last durable length and sync it. Bytes past that length belong to an
+/// append that was never acknowledged, whether or not they are complete lines.
+fn restore_durable_len(path: &Path, len: u64) -> Result<(), String> {
+    if !path.exists() {
+        return if len == 0 { Ok(()) } else { Err("rewind: durable prefix is missing".into()) };
+    }
     let f = std::fs::OpenOptions::new().write(true).open(path).map_err(|e| format!("rewind: {e}"))?;
-    if keep != buf.len() {
-        f.set_len(keep as u64).map_err(|e| format!("rewind: {e}"))?;
+    let cur = f.metadata().map_err(|e| format!("rewind: {e}"))?.len();
+    if cur < len { return Err(format!("rewind: file is {cur} bytes, shorter than the durable {len}")); }
+    if cur != len {
+        f.set_len(len).map_err(|e| format!("rewind: {e}"))?;
     }
     f.sync_all().map_err(|e| format!("rewind sync: {e}"))
+}
+
+/// Length to restore after a failed append. None when the path is not a regular file.
+fn durable_len_of(path: &Path) -> Option<u64> {
+    match std::fs::metadata(path) {
+        Ok(m) if m.is_file() => Some(m.len()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(0),
+        _ => None,
+    }
 }
 
 fn append_jsonl(path: &Path, v: &Value) -> Result<(), String> {
@@ -272,6 +281,13 @@ fn append_jsonl_fault(path: &Path, v: &Value, mut fault: Option<&mut PersistFaul
                                 Ok(()) => "sync: EIO".to_string(),
                                 Err(rewind) => format!("sync: EIO; {rewind}"),
                             }
+                        }
+                        "sync_keep" => {
+                            // The whole line is written, the sync fails, and the rewind fails too,
+                            // so the line stays in the file with unknown durability.
+                            let _ = Write::write_all(&mut f, bytes);
+                            let _ = Write::flush(&mut f);
+                            "sync: EIO; rewind: injected".to_string()
                         }
                         other => format!("fault: {other}"),
                     };
@@ -362,16 +378,22 @@ impl Engine {
         let frame_on = crate::frameclock::flag_enabled(args.frame_clock, std::env::var(crate::frameclock::ENV).ok().as_deref());
         let frame_clock = Arc::new(crate::frameclock::FrameClock::open(frame_on, args.bundle.as_deref().map(Path::new)));
         let st = Status { state: "starting".into(), device: args.device.clone(), res: format!("{}x{}", args.res.0, args.res.1), fps_target: args.fps, replay_window: args.replay.unwrap_or(0), role: args.role.clone(), side_source: args.side_source.clone(), ..Default::default() };
+        let started = Instant::now();
+        // One origin names the engine clock on both the snapshot and the input header, so the
+        // sidecar can join them only when they are the same clock.
+        let origin_ns = crate::snap::instant_origin_ns(started);
+        input.lock().unwrap_or_else(|e| e.into_inner()).set_mono_origin_ns(origin_ns);
         let mut snap = crate::snap::Publisher::new();
         snap.bind_session(&args.match_id);
+        snap.bind_engine_clock(started, origin_ns);
         Arc::new(Self { ffmpeg, ring: Mutex::new(ReplayRing::new(window, cap)), rec: Mutex::new(None), status: Mutex::new(st), shutdown: AtomicBool::new(false),
             ev: Mutex::new(MatchState { started_wall_ms: wall_ms(), score: Value::Null, ..Default::default() }), subs: Mutex::new(vec![]),
             stamp_file: dir.join("stamp.txt"),
-            snapshot: dir.join("snapshot.jpg"), snap_pub: Mutex::new(snap), tap: crate::glimpse::FrameTap::with_ring(args.glimpse_frame || crate::glimpse::env_enabled(), crate::glimpse::ring_enabled()), exit_when_recording_ends: AtomicBool::new(false), started: Instant::now(), last_data_ms: AtomicU64::new(0), input, frame_clock,
+            snapshot: dir.join("snapshot.jpg"), snap_pub: Mutex::new(snap), tap: crate::glimpse::FrameTap::with_ring(args.glimpse_frame || crate::glimpse::env_enabled(), crate::glimpse::ring_enabled()), exit_when_recording_ends: AtomicBool::new(false), started, last_data_ms: AtomicU64::new(0), input, frame_clock,
             running: AtomicBool::new(false), api_closed: AtomicBool::new(false), sealed: AtomicBool::new(false),
             countersigned: std::sync::atomic::AtomicI64::new(-1),
             stop_reason: Mutex::new(None), bundle_write: Mutex::new(()), bundle_finalized: AtomicBool::new(false),
-            persist_fault: Mutex::new(None), tail_needs_repair: AtomicBool::new(false), args })
+            persist_fault: Mutex::new(None), ckpt_durable_len: Mutex::new(None), args })
     }
     fn ms(&self) -> u64 { self.started.elapsed().as_millis() as u64 }
     /// The monotonic clock behind every mono_ms (manifest, checkpoints) and inputs.jsonl t_us.
@@ -803,12 +825,8 @@ impl Engine {
             let me = self.clone();
             std::thread::spawn(move || {
                 while !flag.load(Ordering::SeqCst) {
-                    if let Ok(bytes) = std::fs::read(&inc) {
-                        let modified = std::fs::metadata(&inc).ok().and_then(|m| m.modified().ok());
-                        let mut pub_ = me.snap_pub.lock().unwrap_or_else(|e| e.into_inner());
-                        pub_.observe_file(bytes.len() as u64, modified, &bytes);
-                        let prov = pub_.pending_provenance();
-                        pub_.consider(&bytes, &dest, prov);
+                    if let Some(read) = crate::snap::read_coherent(&inc) {
+                        me.snap_pub.lock().unwrap_or_else(|e| e.into_inner()).consider_read(&read, &dest);
                     }
                     std::thread::sleep(Duration::from_millis(40));
                 }
@@ -1578,17 +1596,21 @@ impl Engine {
             return Value::Null;
         }
         let path = self.ev_path("checkpoints.jsonl");
-        if self.tail_needs_repair.load(Ordering::SeqCst) {
-            match repair_jsonl_tail(&path) {
-                Ok(()) => self.tail_needs_repair.store(false, Ordering::SeqCst),
+        // The match-state lock serializes recovery with every other checkpoint append.
+        let mut st = self.ev.lock().unwrap_or_else(|e| e.into_inner());
+        let pending_len = *self.ckpt_durable_len.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(len) = pending_len {
+            match restore_durable_len(&path, len) {
+                Ok(()) => *self.ckpt_durable_len.lock().unwrap_or_else(|e| e.into_inner()) = None,
                 Err(e) => {
+                    drop(st);
                     self.status.lock().unwrap_or_else(|err| err.into_inner()).checkpoint_persist_error = Some(e.clone());
-                    error!("checkpoint '{trigger}' tail is not repaired: {e}");
+                    error!("checkpoint '{trigger}' cannot restore the durable length: {e}");
                     return json!({"persisted": false, "error": e, "trigger": trigger});
                 }
             }
         }
-        let mut st = self.ev.lock().unwrap_or_else(|e| e.into_inner());
+        let durable_len = durable_len_of(&path);
         let mut ext = json!({"trigger": trigger, "segment_seq": st.seg.seq, "segment_hash": st.last_seg_sha, "chain_head": st.seg.head,
             "score": st.score, "mono_ms": self.ms(), "match_id": self.args.match_id, "role": self.args.role});
         if let (Value::Object(e), Value::Object(x)) = (&mut ext, extra) { e.extend(x); }
@@ -1612,8 +1634,11 @@ impl Engine {
         if let Err(e) = persisted {
             st.cps.seq = position.0;
             st.cps.prev = position.1;
+            if durable_len.is_some() {
+                // The line may be in the file. The next checkpoint cuts back to this length first.
+                *self.ckpt_durable_len.lock().unwrap_or_else(|err| err.into_inner()) = durable_len;
+            }
             drop(st);
-            if e.contains("rewind") { self.tail_needs_repair.store(true, Ordering::SeqCst); }
             self.status.lock().unwrap_or_else(|err| err.into_inner()).checkpoint_persist_error = Some(e.clone());
             error!("checkpoint '{trigger}' not durable: {e}");
             return json!({"persisted": false, "error": e, "trigger": trigger});

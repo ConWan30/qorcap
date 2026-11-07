@@ -26,8 +26,8 @@ pub fn route(e: &Arc<Engine>, method: &str, url: &str, body: &str) -> Resp {
         ("GET", "/snapshot.jpg") => {
             match e.snap_pub.lock().unwrap_or_else(|err| err.into_inner()).serve() {
                 crate::snap::Serve::Fresh {
-                    bytes, epoch, seq, pts_us, mono_us, generation, api, capture_id,
-                    session_id, clock_id, clock_source, mono_origin_ns, schema,
+                    bytes, epoch, seq, pts_us, mono_us, generation, accepted, api, capture_id,
+                    session_id, clock_id, clock_source, mono_origin_ns, producer_start_us, schema,
                 } => {
                     // The glimpse tap keeps its own wall clock. Capture mono stays on the snapshot headers.
                     e.tap.offer(&bytes, crate::engine::wall_ms());
@@ -38,17 +38,30 @@ pub fn route(e: &Arc<Engine>, method: &str, url: &str, body: &str) -> Resp {
                         ("X-Qorcap-Snapshot-Clock", clock_id),
                         ("X-Qorcap-Snapshot-Clock-Source", clock_source),
                         ("X-Qorcap-Snapshot-Mono-Origin-Ns", mono_origin_ns.to_string()),
+                        ("X-Qorcap-Snapshot-Producer-Start-Us", producer_start_us.to_string()),
                         ("X-Qorcap-Snapshot-Epoch", epoch.to_string()),
-                        ("X-Qorcap-Snapshot-Generation", epoch.to_string()),
+                        ("X-Qorcap-Snapshot-Generation", generation.to_string()),
                         ("X-Qorcap-Snapshot-Seq", seq.to_string()),
                         ("X-Qorcap-Snapshot-Capture-Id", capture_id),
                         ("X-Qorcap-Snapshot-Mono-Us", mono_us.to_string()),
-                        ("X-Qorcap-Snapshot-Gen", generation.to_string()),
+                        ("X-Qorcap-Snapshot-Accepted", accepted.to_string()),
                         ("Cache-Control", "no-store".to_string()),
                     ];
                     if let Some(pts) = pts_us {
                         headers.push(("X-Qorcap-Snapshot-Pts-Us", pts.to_string()));
                     }
+                    return Resp { code: 200, ctype: "image/jpeg", body: bytes, headers };
+                }
+                crate::snap::Serve::Stale { bytes, epoch, age_us } => {
+                    // The last frame is still the file a Madden reader would have read. It carries
+                    // no capture id or clock, so a capture-bound reader cannot treat it as new.
+                    e.tap.offer(&bytes, crate::engine::wall_ms());
+                    let headers = vec![
+                        ("X-Qorcap-Snapshot-State", "stale".to_string()),
+                        ("X-Qorcap-Snapshot-Stale-Epoch", epoch.to_string()),
+                        ("X-Qorcap-Snapshot-Age-Us", age_us.to_string()),
+                        ("Cache-Control", "no-store".to_string()),
+                    ];
                     return Resp { code: 200, ctype: "image/jpeg", body: bytes, headers };
                 }
                 crate::snap::Serve::AwaitingProducer => {
@@ -305,9 +318,15 @@ mod tests {
         let mono = fresh.headers.iter().find(|(k, _)| *k == "X-Qorcap-Snapshot-Mono-Us").map(|(_, v)| v.as_str()).unwrap_or("");
         assert_ne!(mono, "80000", "media PTS is not the monotonic sample");
         assert!(mono.chars().all(|c| c.is_ascii_digit()) && !mono.is_empty());
-        assert!(fresh.headers.iter().any(|(k, v)| *k == "X-Qorcap-Snapshot-Clock-Source" && v == "monotonic_ns"));
+        assert!(fresh.headers.iter().any(|(k, v)| *k == "X-Qorcap-Snapshot-Clock-Source" && v == crate::snap::ENGINE_CLOCK_SOURCE));
         assert!(fresh.headers.iter().any(|(k, v)| *k == "X-Qorcap-Snapshot-Session" && v == "unassigned"));
-        assert!(fresh.headers.iter().any(|(k, v)| *k == "X-Qorcap-Snapshot-Mono-Origin-Ns" && v != "0"));
+        let origin = fresh.headers.iter().find(|(k, _)| *k == "X-Qorcap-Snapshot-Mono-Origin-Ns").map(|(_, v)| v.clone()).unwrap_or_default();
+        assert_ne!(origin, "0");
+        let header_origin = e.input.lock().unwrap_or_else(|err| err.into_inner()).header_mono_origin_ns();
+        assert_eq!(Some(origin.parse::<u64>().unwrap()), header_origin, "the input header names the same engine clock");
+        assert!(fresh.headers.iter().any(|(k, v)| *k == "X-Qorcap-Snapshot-Generation" && v == "1"));
+        assert!(fresh.headers.iter().any(|(k, v)| *k == "X-Qorcap-Snapshot-Accepted" && v == "1"));
+        assert!(fresh.headers.iter().any(|(k, _)| *k == "X-Qorcap-Snapshot-Producer-Start-Us"));
         let capture = fresh.headers.iter().find(|(k, _)| *k == "X-Qorcap-Snapshot-Capture-Id").map(|(_, v)| v.clone()).unwrap_or_default();
         assert!(capture.starts_with("1:1:"), "{capture}");
         assert!(fresh.headers.iter().all(|(k, _)| *k != "X-Qorcap-Snapshot-Source-Ms"));
@@ -415,6 +434,64 @@ mod tests {
             assert_eq!(row["seq"], i as u64);
         }
         assert!(e.input.lock().unwrap_or_else(|err| err.into_inner()).seal_binding().is_none());
+    }
+
+    #[test]
+    fn an_uncertain_checkpoint_is_cut_back_before_the_retry_and_one_line_remains() {
+        let e = engine(&["--game", "cod_mw4"]);
+        assert_eq!(seal_ready(&e), 1);
+        let path = e.bundle_dir().unwrap().join("checkpoints.jsonl");
+        *e.persist_fault.lock().unwrap_or_else(|err| err.into_inner()) = Some(crate::engine::PersistFault {
+            stage: "sync_keep", partial: None, remaining: 1,
+        });
+        let rx = listen(&e);
+        let failed = e.checkpoint("start", json!({}));
+        assert_eq!(failed["persisted"], false);
+        assert!(rx.try_recv().is_err(), "an uncertain line is not broadcast");
+        let kept = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(kept.lines().count(), 1, "the sync failed and the rewind failed, so the line is still there");
+        let uncertain: Value = serde_json::from_str(kept.lines().next().unwrap()).unwrap();
+        assert_eq!(uncertain["seq"], 0);
+        assert_eq!(e.input.lock().unwrap_or_else(|err| err.into_inner()).seal_binding().unwrap()["revision"], 1);
+        // The retry builds a new checkpoint at the same seq. The uncertain line is cut first.
+        std::thread::sleep(std::time::Duration::from_millis(3));
+        let ok = e.checkpoint("start", json!({}));
+        assert!(ok.get("hash").is_some(), "{ok}");
+        assert_eq!(ok["seq"], 0);
+        let text = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<_> = text.lines().filter(|l| !l.is_empty()).collect();
+        assert_eq!(lines.len(), 1, "exactly one checkpoint at seq 0: {lines:?}");
+        let row: Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(row, ok, "the line on disk is the one that was acknowledged");
+        assert!(rx.try_recv().is_ok());
+        assert!(rx.try_recv().is_err(), "one broadcast");
+        assert!(e.input.lock().unwrap_or_else(|err| err.into_inner()).seal_binding().is_none());
+        let next = e.checkpoint("segment", json!({}));
+        assert_eq!(next["seq"], 1);
+        let text = std::fs::read_to_string(&path).unwrap();
+        let mut prev = crate::evidence::GENESIS.to_string();
+        let rows: Vec<Value> = text.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+        assert_eq!(rows.len(), 2);
+        for (i, c) in rows.iter().enumerate() {
+            assert_eq!(c["seq"], i as u64);
+            prev = crate::evidence::check_checkpoint(c, &prev).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_restore_that_cannot_reach_the_durable_length_blocks_the_retry() {
+        let e = engine(&[]);
+        let path = e.bundle_dir().unwrap().join("checkpoints.jsonl");
+        assert!(e.checkpoint("start", json!({})).get("hash").is_some());
+        *e.persist_fault.lock().unwrap_or_else(|err| err.into_inner()) = Some(crate::engine::PersistFault {
+            stage: "sync_keep", partial: None, remaining: 1,
+        });
+        assert_eq!(e.checkpoint("segment", json!({}))["persisted"], false);
+        std::fs::write(&path, b"").unwrap();
+        let blocked = e.checkpoint("segment", json!({}));
+        assert_eq!(blocked["persisted"], false, "a file shorter than the durable prefix is not overwritten");
+        assert!(blocked["error"].as_str().unwrap_or("").contains("rewind"));
+        assert_eq!(std::fs::read(&path).unwrap().len(), 0);
     }
 
     #[test]

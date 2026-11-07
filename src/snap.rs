@@ -4,11 +4,16 @@
 //! file open. On Windows that rename fails and the live frame stops updating. Capture writes
 //! `snapshot.incoming.jpg` instead. This publisher accepts a complete JPEG when the producer
 //! for this epoch has started and the bytes are not the file left from the previous producer.
-//! Media PTS stays on its own field. The capture clock is CLOCK_MONOTONIC taken when this
-//! process accepts the completed JPEG, measured from this epoch's recorder origin.
+//!
+//! The capture clock is the engine's `started` Instant, the same zero as `inputs.jsonl` `t_us`.
+//! `mono_us` is that clock read when this process accepts the exact bytes it read. Each producer
+//! start records its own offset on that clock (`producer_start_us`), so a nonzero start and a
+//! reopen stay on one scale. `mono_origin_ns` names the domain and is written to the input header
+//! too. Media PTS stays on its own field. Without a bound engine clock nothing is published.
 //! With no open epoch, `/snapshot.jpg` keeps the file path the Madden reader already uses.
+use std::io::Read;
 use std::path::Path;
-use std::time::SystemTime;
+use std::time::{Instant, SystemTime};
 
 pub fn jpeg_complete(bytes: &[u8]) -> bool {
     bytes.len() >= 4 && bytes[0] == 0xFF && bytes[1] == 0xD8 && bytes[bytes.len() - 2] == 0xFF && bytes[bytes.len() - 1] == 0xD9
@@ -17,13 +22,20 @@ pub fn jpeg_complete(bytes: &[u8]) -> bool {
 /// Snapshot response the CoD reader requires. A response without this version is a different API.
 pub const SNAPSHOT_API: u64 = 1;
 pub const SNAPSHOT_SCHEMA: &str = "qorcap-snapshot/v1";
+/// Microseconds since the engine `started` Instant. Same zero as `inputs.jsonl` `t_us`.
+pub const ENGINE_CLOCK_SOURCE: &str = "engine_monotonic_ns";
+/// No new completed JPEG for this long and the last one is stale. ffmpeg writes 4 per second.
+pub const STALE_AFTER_US: u64 = 2_000_000;
 
 /// CLOCK_MONOTONIC as nanoseconds. Zero means the sample could not be taken.
 pub fn monotonic_ns() -> u64 {
     #[cfg(unix)]
     {
         #[repr(C)]
-        struct Timespec { tv_sec: i64, tv_nsec: i64 }
+        struct Timespec {
+            tv_sec: i64,
+            tv_nsec: i64,
+        }
         unsafe extern "C" {
             fn clock_gettime(clk: i32, tp: *mut Timespec) -> i32;
         }
@@ -37,11 +49,48 @@ pub fn monotonic_ns() -> u64 {
     #[cfg(not(unix))]
     {
         use std::sync::OnceLock;
-        use std::time::Instant;
         static BASE: OnceLock<Instant> = OnceLock::new();
         let base = BASE.get_or_init(Instant::now);
         3_600_000_000_000u64.saturating_add(base.elapsed().as_nanos() as u64)
     }
+}
+
+/// `at` expressed on `monotonic_ns`. Zero when the clock could not be read.
+pub fn instant_origin_ns(at: Instant) -> u64 {
+    let before = monotonic_ns();
+    let elapsed = at.elapsed().as_nanos() as u64;
+    let after = monotonic_ns();
+    if before == 0 || after < before { return 0; }
+    (before + (after - before) / 2).saturating_sub(elapsed)
+}
+
+/// One read of `snapshot.incoming.jpg` whose bytes and metadata come from the same handle.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileRead {
+    pub bytes: Vec<u8>,
+    pub len: u64,
+    pub modified: Option<SystemTime>,
+}
+
+/// Read the file once. If its length or mtime moved during the read, the bytes and the metadata
+/// may belong to different writes, so there is no read.
+pub fn read_coherent(path: &Path) -> Option<FileRead> {
+    read_coherent_with(path, || {})
+}
+
+/// `between` runs after the first stat and before the bytes are read. Tests use it to rewrite.
+pub fn read_coherent_with(path: &Path, mut between: impl FnMut()) -> Option<FileRead> {
+    let mut f = std::fs::File::open(path).ok()?;
+    let before = f.metadata().ok()?;
+    between();
+    let mut bytes = Vec::with_capacity(before.len() as usize);
+    f.read_to_end(&mut bytes).ok()?;
+    let after = f.metadata().ok()?;
+    let (t0, t1) = (before.modified().ok(), after.modified().ok());
+    if before.len() != after.len() || t0 != t1 || bytes.len() as u64 != after.len() {
+        return None;
+    }
+    Some(FileRead { bytes, len: after.len(), modified: t1 })
 }
 
 /// Optional media PTS carried beside a JPEG. It is not the capture clock.
@@ -79,15 +128,21 @@ pub enum Serve {
         seq: u64,
         pts_us: Option<u64>,
         mono_us: u64,
+        /// The capture generation. It is the epoch: it changes only when a producer is reopened.
         generation: u64,
+        /// Frames accepted by this publisher. A counter, not a generation.
+        accepted: u64,
         api: u64,
         capture_id: String,
         session_id: String,
         clock_id: String,
         clock_source: String,
         mono_origin_ns: u64,
+        producer_start_us: u64,
         schema: &'static str,
     },
+    /// The producer has not completed a frame for `STALE_AFTER_US`. The bytes carry no capture provenance.
+    Stale { bytes: Vec<u8>, epoch: u64, age_us: u64 },
     /// An epoch is open and the new producer has not published a frame.
     AwaitingProducer,
     /// No capture epoch. The caller may read the file.
@@ -98,7 +153,7 @@ pub struct Publisher {
     pub frames: u64,
     pub failures: u64,
     memory: Option<Vec<u8>>,
-    generation: u64,
+    accepted_count: u64,
     epoch: u64,
     epoch_open: Option<u64>,
     pending_seq: Option<u64>,
@@ -106,11 +161,9 @@ pub struct Publisher {
     completion_seq: u64,
     accepted: Option<Accepted>,
     producer_started: bool,
+    producer_start_us: Option<u64>,
     session_id: Option<String>,
-    clock_id: String,
-    clock_source: String,
-    mono_origin_ns: Option<u64>,
-    pending_origin_ns: Option<u64>,
+    engine_clock: Option<(Instant, u64)>,
     retained_hash: Option<String>,
     disk_seen: Option<DiskSeen>,
     rewrite_ready: bool,
@@ -121,12 +174,25 @@ pub struct Publisher {
 impl Publisher {
     pub fn new() -> Self {
         Self {
-            frames: 0, failures: 0, memory: None, generation: 0, epoch: 0, epoch_open: None,
-            pending_seq: None, pending_pts: None, completion_seq: 0, accepted: None,
-            producer_started: false, session_id: None, clock_id: String::new(),
-            clock_source: String::new(), mono_origin_ns: None, pending_origin_ns: None,
-            retained_hash: None, disk_seen: None, rewrite_ready: false,
-            file_matches: true, noted_fail: false,
+            frames: 0,
+            failures: 0,
+            memory: None,
+            accepted_count: 0,
+            epoch: 0,
+            epoch_open: None,
+            pending_seq: None,
+            pending_pts: None,
+            completion_seq: 0,
+            accepted: None,
+            producer_started: false,
+            producer_start_us: None,
+            session_id: None,
+            engine_clock: None,
+            retained_hash: None,
+            disk_seen: None,
+            rewrite_ready: false,
+            file_matches: true,
+            noted_fail: false,
         }
     }
     pub fn memory(&self) -> Option<Vec<u8>> { self.memory.clone() }
@@ -138,11 +204,16 @@ impl Publisher {
         self.session_id = Some(trimmed.to_string());
     }
 
-    /// Recorder origin for the next producer start, in CLOCK_MONOTONIC nanoseconds.
-    /// A later `begin_epoch` drops it so a reopen samples again unless the caller sets a new one.
-    pub fn set_recorder_origin_ns(&mut self, origin_ns: u64) {
+    /// The engine clock that also stamps `inputs.jsonl` `t_us`. A zero origin is not a binding.
+    pub fn bind_engine_clock(&mut self, started: Instant, origin_ns: u64) {
         if origin_ns == 0 { return; }
-        self.pending_origin_ns = Some(origin_ns);
+        self.engine_clock = Some((started, origin_ns));
+    }
+
+    pub fn mono_origin_ns(&self) -> Option<u64> { self.engine_clock.map(|(_, o)| o) }
+
+    fn now_us(&self) -> Option<u64> {
+        self.engine_clock.map(|(started, _)| started.elapsed().as_micros() as u64)
     }
 
     /// Open a capture epoch. Bytes already on disk stay unpublished until this producer rewrites them.
@@ -155,10 +226,7 @@ impl Publisher {
         self.pending_pts = None;
         self.completion_seq = 0;
         self.producer_started = false;
-        self.mono_origin_ns = None;
-        self.pending_origin_ns = None;
-        self.clock_id.clear();
-        self.clock_source.clear();
+        self.producer_start_us = None;
         self.disk_seen = None;
         self.rewrite_ready = false;
         self.retained_hash = if jpeg_complete(prior) {
@@ -170,18 +238,15 @@ impl Publisher {
         self.epoch
     }
 
-    /// The ffmpeg child for this epoch is running. The origin is this start, not the previous epoch.
+    /// The ffmpeg child for this epoch is running. Its start is recorded on the engine clock.
     pub fn mark_producer_started(&mut self) {
-        if self.epoch_open.is_none() { return; }
+        if let Some(now) = self.now_us() { self.mark_producer_started_at(now); }
+    }
+
+    pub fn mark_producer_started_at(&mut self, now_us: u64) {
+        if self.epoch_open.is_none() || self.engine_clock.is_none() { return; }
         self.producer_started = true;
-        let origin = self.pending_origin_ns.take().unwrap_or_else(monotonic_ns);
-        if origin == 0 {
-            self.mono_origin_ns = None;
-            return;
-        }
-        self.mono_origin_ns = Some(origin);
-        self.clock_source = "monotonic_ns".into();
-        self.clock_id = format!("epoch-{}:{origin}", self.epoch);
+        self.producer_start_us = Some(now_us);
     }
 
     /// Latest `frame` and `out_time_us` from ffmpeg progress. This is media PTS, not the capture clock.
@@ -195,10 +260,10 @@ impl Publisher {
         self.pending_pts = Some(pts_us);
     }
 
-    /// A poll of `snapshot.incoming.jpg`. The first sight is the baseline. A later change is a rewrite.
-    pub fn observe_file(&mut self, len: u64, modified: Option<SystemTime>, bytes: &[u8]) {
+    /// The first coherent read is the baseline. A later change of length, mtime, or bytes is a rewrite.
+    fn observe(&mut self, read: &FileRead, hash: &str) {
         if !self.producer_started { return; }
-        let seen = DiskSeen { len, modified, hash: crate::evidence::sha256_hex(bytes) };
+        let seen = DiskSeen { len: read.len, modified: read.modified, hash: hash.to_string() };
         match &self.disk_seen {
             None => self.disk_seen = Some(seen),
             Some(prev) if prev == &seen => {}
@@ -223,44 +288,53 @@ impl Publisher {
         })
     }
 
-    /// Store a new complete JPEG for this epoch.
-    ///
-    /// `provenance` may carry media PTS. It does not supply `mono_us`, and it does not
-    /// turn retained bytes into a new capture. Distinct JPEGs are accepted as they
-    /// complete, including several between one progress line. The same pixels are a
-    /// new capture only after this producer rewrites the file.
+    /// Production path. Identity, freshness, and the published bytes all come from this one read.
+    pub fn consider_read(&mut self, read: &FileRead, dest: &Path) -> bool {
+        let Some(now) = self.now_us() else { return false; };
+        self.consider_read_at(read, dest, now)
+    }
+
+    pub fn consider_read_at(&mut self, read: &FileRead, dest: &Path, now_us: u64) -> bool {
+        if read.len != read.bytes.len() as u64 { return false; }
+        let hash = crate::evidence::sha256_hex(&read.bytes);
+        self.observe(read, &hash);
+        let prov = self.pending_provenance();
+        self.accept(&read.bytes, hash, dest, prov, now_us)
+    }
+
+    /// Bytes with no file observation. A repeat of the same bytes is never a new capture here.
     pub fn consider(&mut self, incoming: &[u8], dest: &Path, provenance: Option<CaptureProvenance>) -> bool {
-        if !self.producer_started { return false; }
-        let Some(origin) = self.mono_origin_ns else { return false; };
-        let Some(session) = self.session_id.clone() else { return false; };
+        let Some(now) = self.now_us() else { return false; };
+        self.consider_at(incoming, dest, provenance, now)
+    }
+
+    pub fn consider_at(&mut self, incoming: &[u8], dest: &Path, provenance: Option<CaptureProvenance>, now_us: u64) -> bool {
+        let hash = crate::evidence::sha256_hex(incoming);
+        self.accept(incoming, hash, dest, provenance, now_us)
+    }
+
+    fn accept(&mut self, incoming: &[u8], hash: String, dest: &Path, provenance: Option<CaptureProvenance>, now_us: u64) -> bool {
+        if !self.producer_started || self.engine_clock.is_none() { return false; }
+        let Some(start) = self.producer_start_us else { return false; };
+        let Some(session) = self.session_id.as_deref() else { return false; };
         if session.is_empty() { return false; }
         let Some(epoch) = self.epoch_open else { return false; };
         if !jpeg_complete(incoming) { return false; }
-        let hash = crate::evidence::sha256_hex(incoming);
         let retained = self.retained_hash.as_deref() == Some(hash.as_str());
         let same = self.accepted.as_ref().is_some_and(|a| a.epoch == epoch && a.hash == hash);
         if (retained && self.accepted.is_none() && !self.rewrite_ready) || (same && !self.rewrite_ready) {
             if same && !self.file_matches { self.try_replace(dest, incoming); }
             return false;
         }
-        let sample = monotonic_ns();
-        if sample < origin { return false; }
-        let mono_us = (sample - origin) / 1_000;
+        if now_us < start { return false; }
         let pts_us = provenance.as_ref().map(|p| p.pts_us).or(self.pending_pts);
         self.completion_seq = self.completion_seq.saturating_add(1);
         let seq = self.completion_seq;
         let capture_id = format!("{epoch}:{seq}:{}", &hash[..16]);
         self.rewrite_ready = false;
         self.memory = Some(incoming.to_vec());
-        self.accepted = Some(Accepted {
-            epoch,
-            seq,
-            pts_us,
-            mono_us,
-            capture_id,
-            hash,
-        });
-        self.generation = self.generation.saturating_add(1);
+        self.accepted = Some(Accepted { epoch, seq, pts_us, mono_us: now_us, capture_id, hash });
+        self.accepted_count = self.accepted_count.saturating_add(1);
         self.frames = self.frames.saturating_add(1);
         self.file_matches = false;
         self.noted_fail = false;
@@ -270,7 +344,10 @@ impl Publisher {
 
     fn try_replace(&mut self, dest: &Path, incoming: &[u8]) {
         match replace_file(dest, incoming) {
-            Ok(()) => { self.file_matches = true; self.noted_fail = false; }
+            Ok(()) => {
+                self.file_matches = true;
+                self.noted_fail = false;
+            }
             Err(_) => {
                 if !self.noted_fail {
                     self.failures = self.failures.saturating_add(1);
@@ -281,22 +358,39 @@ impl Publisher {
     }
 
     pub fn serve(&self) -> Serve {
-        match (&self.memory, &self.accepted, &self.session_id, self.mono_origin_ns) {
-            (Some(bytes), Some(a), Some(session), Some(origin)) if !session.is_empty() && self.clock_source == "monotonic_ns" => Serve::Fresh {
-                bytes: bytes.clone(),
-                epoch: a.epoch,
-                seq: a.seq,
-                pts_us: a.pts_us,
-                mono_us: a.mono_us,
-                generation: self.generation,
-                api: SNAPSHOT_API,
-                capture_id: a.capture_id.clone(),
-                session_id: session.clone(),
-                clock_id: self.clock_id.clone(),
-                clock_source: self.clock_source.clone(),
-                mono_origin_ns: origin,
-                schema: SNAPSHOT_SCHEMA,
-            },
+        match self.now_us() {
+            Some(now) => self.serve_at(now),
+            None if self.epoch_open.is_some() => Serve::AwaitingProducer,
+            None => Serve::Absent,
+        }
+    }
+
+    pub fn serve_at(&self, now_us: u64) -> Serve {
+        let bound = (&self.memory, &self.accepted, &self.session_id, self.engine_clock, self.producer_start_us);
+        match bound {
+            (Some(bytes), Some(a), Some(session), Some((_, origin)), Some(start)) if !session.is_empty() && origin != 0 => {
+                let age_us = now_us.saturating_sub(a.mono_us);
+                if age_us > STALE_AFTER_US {
+                    return Serve::Stale { bytes: bytes.clone(), epoch: a.epoch, age_us };
+                }
+                Serve::Fresh {
+                    bytes: bytes.clone(),
+                    epoch: a.epoch,
+                    seq: a.seq,
+                    pts_us: a.pts_us,
+                    mono_us: a.mono_us,
+                    generation: a.epoch,
+                    accepted: self.accepted_count,
+                    api: SNAPSHOT_API,
+                    capture_id: a.capture_id.clone(),
+                    session_id: session.clone(),
+                    clock_id: format!("engine:{origin}"),
+                    clock_source: ENGINE_CLOCK_SOURCE.to_string(),
+                    mono_origin_ns: origin,
+                    producer_start_us: start,
+                    schema: SNAPSHOT_SCHEMA,
+                }
+            }
             _ if self.epoch_open.is_some() => Serve::AwaitingProducer,
             _ => Serve::Absent,
         }
@@ -334,11 +428,28 @@ pub fn replace_file(dest: &Path, bytes: &[u8]) -> std::io::Result<()> {
 mod tests {
     use super::*;
 
-    fn publish(p: &mut Publisher, dest: &Path, bytes: &[u8], seq: u64, pts_us: u64) -> bool {
-        p.mark_producer_started();
-        p.note_progress(seq, pts_us);
-        let prov = p.pending_provenance();
-        p.consider(bytes, dest, prov)
+    const ORIGIN: u64 = 7_000_000_000;
+
+    fn bound() -> Publisher {
+        let mut p = Publisher::new();
+        p.bind_session("match-session");
+        p.bind_engine_clock(Instant::now(), ORIGIN);
+        p
+    }
+
+    fn tmp(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("qorcap-snap-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn read(bytes: &[u8], secs: u64) -> FileRead {
+        FileRead {
+            bytes: bytes.to_vec(),
+            len: bytes.len() as u64,
+            modified: Some(SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs)),
+        }
     }
 
     #[test]
@@ -346,111 +457,114 @@ mod tests {
         assert!(!jpeg_complete(&[0xFF, 0xD8, 0x00]));
         assert!(!jpeg_complete(&[0xFF, 0xD8, 0x00, 0xD9]));
         assert!(jpeg_complete(&[0xFF, 0xD8, 0x11, 0xFF, 0xD9]));
-        let dir = std::env::temp_dir().join(format!("qorcap-snap-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = tmp("base");
         let dest = dir.join("snapshot.jpg");
-        let mut p = Publisher::new();
-        p.bind_session("match-session");
-        assert!(matches!(p.serve(), Serve::Absent));
-        assert!(!p.consider(&[0xFF, 0xD8, 0x01], &dest, None));
+        let mut p = bound();
+        assert!(matches!(p.serve_at(0), Serve::Absent));
         let jpeg = [0xFF, 0xD8, 0x22, 0xFF, 0xD9];
-        assert!(!p.consider(&jpeg, &dest, Some(CaptureProvenance {
-            epoch: 1, seq: 1, pts_us: 1_000, mono_us: 1_000, capture_id: "1:1".into(),
-        })), "no open epoch");
-        assert!(matches!(p.serve(), Serve::Absent), "no epoch stays on the file path");
+        assert!(!p.consider_at(&jpeg, &dest, None, 10), "no open epoch");
+        assert!(matches!(p.serve_at(10), Serve::Absent), "no epoch stays on the file path");
         p.begin_epoch(&jpeg);
-        assert!(matches!(p.serve(), Serve::AwaitingProducer), "an open epoch is not the old file");
-        assert!(!p.consider(&jpeg, &dest, None), "a poll with no provenance is not a capture");
+        assert!(matches!(p.serve_at(10), Serve::AwaitingProducer), "an open epoch is not the old file");
         p.note_progress(1, 10_000);
-        let early = p.pending_provenance();
-        assert!(!p.consider(&jpeg, &dest, early), "the producer has not started");
+        assert!(!p.consider_read_at(&read(&jpeg, 1), &dest, 20), "the producer has not started");
         assert!(p.memory().is_none());
-        assert!(matches!(p.serve(), Serve::AwaitingProducer));
+        p.mark_producer_started_at(100);
         let newer = [0xFF, 0xD8, 0x33, 0xFF, 0xD9];
-        assert!(publish(&mut p, &dest, &newer, 2, 20_000));
+        p.note_progress(2, 20_000);
+        assert!(p.consider_read_at(&read(&newer, 2), &dest, 150));
         assert_eq!(std::fs::read(&dest).unwrap(), newer);
-        match p.serve() {
-            Serve::Fresh { epoch, seq, pts_us, mono_us, generation, api, capture_id, bytes, session_id, clock_source, mono_origin_ns, .. } => {
-                assert_eq!((epoch, seq, generation, api), (1, 1, 1, SNAPSHOT_API));
+        match p.serve_at(160) {
+            Serve::Fresh { epoch, seq, pts_us, mono_us, generation, accepted, api, capture_id, bytes, session_id, clock_source, mono_origin_ns, producer_start_us, .. } => {
+                assert_eq!((epoch, seq, generation, accepted, api), (1, 1, 1, 1, SNAPSHOT_API));
                 assert_eq!(pts_us, Some(20_000));
-                assert_ne!(mono_us, 20_000, "media PTS is not the monotonic sample");
+                assert_eq!(mono_us, 150);
+                assert_eq!(producer_start_us, 100);
                 assert_eq!(session_id, "match-session");
-                assert_eq!(clock_source, "monotonic_ns");
-                assert_ne!(mono_origin_ns, 0);
+                assert_eq!(clock_source, ENGINE_CLOCK_SOURCE);
+                assert_eq!(mono_origin_ns, ORIGIN);
                 assert!(capture_id.starts_with("1:1:"));
                 assert_ne!(capture_id, crate::evidence::sha256_hex(&newer));
                 assert_eq!(bytes, newer);
             }
             other => panic!("a new generation is fresh, got {other:?}"),
         }
-        assert!(!publish(&mut p, &dest, &newer, 3, 30_000), "the same bytes are not a new id from a later progress line");
-        let later = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(50);
-        p.observe_file(newer.len() as u64, Some(SystemTime::UNIX_EPOCH), &newer);
-        p.observe_file(newer.len() as u64, Some(later), &newer);
-        assert!(p.consider(&newer, &dest, p.pending_provenance()), "a producer rewrite of the same pixels is a new capture");
-        match p.serve() {
-            Serve::Fresh { seq, capture_id, pts_us, mono_us, .. } => {
-                assert_eq!(seq, 2);
+        p.note_progress(3, 30_000);
+        assert!(!p.consider_read_at(&read(&newer, 2), &dest, 200), "the same read is not a new id from a later progress line");
+        assert!(p.consider_read_at(&read(&newer, 3), &dest, 250), "a producer rewrite of the same pixels is a new capture");
+        match p.serve_at(260) {
+            Serve::Fresh { seq, capture_id, pts_us, mono_us, generation, accepted, .. } => {
+                assert_eq!((seq, generation, accepted), (2, 1, 2));
                 assert!(capture_id.starts_with("1:2:"));
                 assert_eq!(pts_us, Some(30_000));
-                assert_ne!(mono_us, pts_us.unwrap_or(0));
+                assert_eq!(mono_us, 250);
             }
             other => panic!("the rewrite keeps its own capture id, got {other:?}"),
         }
         p.begin_epoch(&newer);
-        assert!(matches!(p.serve(), Serve::AwaitingProducer));
+        assert!(matches!(p.serve_at(300), Serve::AwaitingProducer));
         p.note_progress(4, 40_000);
-        let stale = p.pending_provenance();
-        assert!(!p.consider(&newer, &dest, stale), "reopen does not accept bytes before the new producer");
-        assert!(matches!(p.serve(), Serve::AwaitingProducer));
+        assert!(!p.consider_read_at(&read(&newer, 4), &dest, 310), "reopen does not accept bytes before the new producer");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_unbound_or_zero_clock_publishes_nothing() {
+        let dir = tmp("unbound");
+        let dest = dir.join("snapshot.jpg");
+        for origin in [None, Some(0u64)] {
+            let mut p = Publisher::new();
+            p.bind_session("match-session");
+            if let Some(o) = origin { p.bind_engine_clock(Instant::now(), o); }
+            assert_eq!(p.mono_origin_ns(), None);
+            p.begin_epoch(&[]);
+            p.mark_producer_started_at(5);
+            assert!(!p.consider_at(&[0xFF, 0xD8, 1, 0xFF, 0xD9], &dest, None, 10));
+            assert!(matches!(p.serve_at(10), Serve::AwaitingProducer));
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn retained_bytes_do_not_take_a_new_id_from_unrelated_progress() {
-        let dir = std::env::temp_dir().join(format!("qorcap-snap-stale-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = tmp("stale-id");
         let dest = dir.join("snapshot.jpg");
         let old = [0xFF, 0xD8, 0x44, 0xFF, 0xD9];
-        let mut p = Publisher::new();
-        p.bind_session("match-session");
+        let mut p = bound();
         p.begin_epoch(&old);
-        p.mark_producer_started();
+        p.mark_producer_started_at(1);
         p.note_progress(9, 90_000);
-        assert!(!p.consider(&old, &dest, p.pending_provenance()));
+        assert!(!p.consider_read_at(&read(&old, 1), &dest, 10));
+        p.note_progress(10, 100_000);
+        assert!(!p.consider_read_at(&read(&old, 1), &dest, 20));
         assert!(p.memory().is_none());
-        assert!(matches!(p.serve(), Serve::AwaitingProducer));
+        assert!(matches!(p.serve_at(30), Serve::AwaitingProducer));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn four_distinct_jpegs_publish_on_one_progress_line() {
-        let dir = std::env::temp_dir().join(format!("qorcap-snap-rate-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = tmp("rate");
         let dest = dir.join("snapshot.jpg");
-        let mut p = Publisher::new();
-        p.bind_session("match-session");
+        let mut p = bound();
         p.begin_epoch(&[]);
-        p.mark_producer_started();
+        p.mark_producer_started_at(1_000);
         p.note_progress(1, 40_000);
         let mut published = 0u64;
         for marker in 1u8..=4 {
             let jpeg = [0xFF, 0xD8, marker, 0xFF, 0xD9];
-            if p.consider(&jpeg, &dest, p.pending_provenance()) { published += 1; }
+            if p.consider_read_at(&read(&jpeg, marker as u64), &dest, 1_000 + 250_000 * marker as u64) { published += 1; }
         }
         assert_eq!(published, 4, "a 1 Hz progress line must not collapse 4 Hz snapshots");
         assert_eq!(p.frames, 4);
-        match p.serve() {
-            Serve::Fresh { seq, pts_us, mono_us, capture_id, clock_source, session_id, mono_origin_ns, .. } => {
-                assert_eq!(seq, 4);
+        match p.serve_at(1_000_010) {
+            Serve::Fresh { seq, pts_us, mono_us, capture_id, clock_source, session_id, mono_origin_ns, generation, accepted, .. } => {
+                assert_eq!((seq, generation, accepted), (4, 1, 4));
                 assert_eq!(pts_us, Some(40_000));
-                assert_ne!(mono_us, 40_000);
-                assert_eq!(clock_source, "monotonic_ns");
+                assert_eq!(mono_us, 1_001_000);
+                assert_eq!(clock_source, ENGINE_CLOCK_SOURCE);
                 assert_eq!(session_id, "match-session");
-                assert_ne!(mono_origin_ns, 0);
+                assert_eq!(mono_origin_ns, ORIGIN);
                 assert!(capture_id.starts_with("1:4:"));
             }
             other => panic!("the fourth snapshot is the one being served, got {other:?}"),
@@ -459,48 +573,127 @@ mod tests {
     }
 
     #[test]
-    fn a_nonzero_recorder_origin_survives_reopen_and_is_not_media_pts() {
-        let now = monotonic_ns();
-        assert!(now > 20_000_000_000, "CLOCK_MONOTONIC did not yield a usable origin: {now}");
-        let dir = std::env::temp_dir().join(format!("qorcap-snap-origin-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+    fn a_nonzero_producer_offset_and_a_reopen_stay_on_the_engine_clock() {
+        let dir = tmp("offset");
         let dest = dir.join("snapshot.jpg");
-        let mut p = Publisher::new();
-        p.bind_session("match-session");
+        let mut p = bound();
         let first = [0xFF, 0xD8, 0x61, 0xFF, 0xD9];
         let second = [0xFF, 0xD8, 0x62, 0xFF, 0xD9];
+        // The child starts 8 s after the engine. Its first frame has media PTS 40 ms.
         p.begin_epoch(&[]);
-        p.set_recorder_origin_ns(now - 8_000_000_000);
-        p.mark_producer_started();
+        p.mark_producer_started_at(8_000_000);
         p.note_progress(1, 40_000);
-        assert!(p.consider(&first, &dest, p.pending_provenance()));
-        let (mono_a, origin_a) = match p.serve() {
-            Serve::Fresh { mono_us, mono_origin_ns, pts_us, .. } => {
+        assert!(p.consider_read_at(&read(&first, 1), &dest, 8_040_000));
+        let a = match p.serve_at(8_050_000) {
+            Serve::Fresh { mono_us, mono_origin_ns, pts_us, producer_start_us, epoch, generation, clock_id, .. } => {
+                assert_eq!((epoch, generation), (1, 1));
                 assert_eq!(pts_us, Some(40_000));
-                assert_ne!(mono_us, 40_000);
-                assert_eq!(mono_origin_ns, now - 8_000_000_000);
-                (mono_us, mono_origin_ns)
+                assert_eq!(producer_start_us, 8_000_000);
+                assert_eq!(mono_us, 8_040_000, "mono is engine time, the same scale as inputs t_us");
+                assert_eq!(mono_us - producer_start_us, pts_us.unwrap());
+                assert_eq!(mono_origin_ns, ORIGIN);
+                (mono_origin_ns, clock_id)
             }
             other => panic!("first epoch did not publish, got {other:?}"),
         };
+        // Reopen 18 s after the engine. PTS restarts at 40 ms; engine time does not.
         p.begin_epoch(&first);
-        p.set_recorder_origin_ns(now - 1_000_000_000);
-        p.mark_producer_started();
+        p.mark_producer_started_at(18_000_000);
         p.note_progress(1, 40_000);
-        assert!(!p.consider(&first, &dest, p.pending_provenance()), "reopen still holds the previous JPEG");
-        assert!(p.consider(&second, &dest, p.pending_provenance()));
-        match p.serve() {
-            Serve::Fresh { mono_us, mono_origin_ns, pts_us, epoch, .. } => {
-                assert_eq!(epoch, 2);
+        assert!(!p.consider_read_at(&read(&first, 1), &dest, 18_010_000), "reopen still holds the previous JPEG");
+        assert!(p.consider_read_at(&read(&second, 2), &dest, 18_040_000));
+        match p.serve_at(18_050_000) {
+            Serve::Fresh { mono_us, mono_origin_ns, pts_us, producer_start_us, epoch, generation, clock_id, .. } => {
+                assert_eq!((epoch, generation), (2, 2));
                 assert_eq!(pts_us, Some(40_000));
-                assert_ne!(mono_us, 40_000);
-                assert_eq!(mono_origin_ns, now - 1_000_000_000);
-                assert_ne!(mono_origin_ns, origin_a);
-                assert_ne!(mono_us, mono_a);
+                assert_eq!(producer_start_us, 18_000_000);
+                assert_eq!(mono_us, 18_040_000);
+                assert_eq!((mono_origin_ns, clock_id), a, "a reopen keeps the engine clock domain");
             }
             other => panic!("reopened epoch did not publish the new JPEG, got {other:?}"),
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_stalled_producer_is_served_stale_without_provenance() {
+        let dir = tmp("stall");
+        let dest = dir.join("snapshot.jpg");
+        let mut p = bound();
+        p.begin_epoch(&[]);
+        p.mark_producer_started_at(0);
+        let jpeg = [0xFF, 0xD8, 0x71, 0xFF, 0xD9];
+        assert!(p.consider_read_at(&read(&jpeg, 1), &dest, 1_000_000));
+        assert!(matches!(p.serve_at(1_000_000 + STALE_AFTER_US), Serve::Fresh { .. }));
+        match p.serve_at(1_000_001 + STALE_AFTER_US) {
+            Serve::Stale { bytes, epoch, age_us } => {
+                assert_eq!(bytes, jpeg);
+                assert_eq!(epoch, 1);
+                assert_eq!(age_us, STALE_AFTER_US + 1);
+            }
+            other => panic!("a stalled producer must not be fresh, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn interleaved_rewrite_keeps_bytes_and_metadata_together() {
+        let dir = tmp("coherent");
+        let path = dir.join("snapshot.incoming.jpg");
+        let dest = dir.join("snapshot.jpg");
+        let old = [0xFF, 0xD8, 0x0A, 0xFF, 0xD9];
+        let new_same_len = [0xFF, 0xD8, 0x0B, 0xFF, 0xD9];
+        let new_longer = [0xFF, 0xD8, 0x0C, 0x0C, 0xFF, 0xD9];
+        let t1 = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000);
+        let t2 = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(2_000);
+        let write = |bytes: &[u8], t: SystemTime| {
+            std::fs::write(&path, bytes).unwrap();
+            std::fs::OpenOptions::new().write(true).open(&path).unwrap().set_modified(t).unwrap();
+        };
+        write(&old, t1);
+        let base = read_coherent(&path).unwrap();
+        assert_eq!((base.bytes.as_slice(), base.modified), (&old[..], Some(t1)));
+        // A rewrite lands between the first stat and the read: no read, so no mixed identity.
+        assert!(read_coherent_with(&path, || write(&new_same_len, t2)).is_none());
+        write(&old, t1);
+        assert!(read_coherent_with(&path, || write(&new_longer, t2)).is_none());
+
+        let mut p = bound();
+        p.begin_epoch(&[]);
+        p.mark_producer_started_at(0);
+        write(&old, t1);
+        assert!(p.consider_read_at(&read_coherent(&path).unwrap(), &dest, 100));
+        let first_id = match p.serve_at(100) { Serve::Fresh { capture_id, .. } => capture_id, other => panic!("{other:?}") };
+        // Interleaved rewrite: the torn poll is dropped, so the old bytes never take the new mtime.
+        write(&old, t1);
+        let torn = read_coherent_with(&path, || write(&new_same_len, t2));
+        assert!(torn.is_none());
+        assert_eq!(p.frames, 1, "a dropped poll publishes nothing");
+        let next = read_coherent(&path).unwrap();
+        assert_eq!((next.bytes.as_slice(), next.modified), (&new_same_len[..], Some(t2)));
+        assert!(p.consider_read_at(&next, &dest, 200));
+        match p.serve_at(200) {
+            Serve::Fresh { capture_id, bytes, seq, .. } => {
+                assert_eq!(seq, 2);
+                assert_ne!(capture_id, first_id);
+                assert_eq!(bytes, new_same_len);
+                let digest = crate::evidence::sha256_hex(&bytes);
+                assert!(capture_id.ends_with(&digest[..16]), "the id names the bytes that are served");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(!p.consider_read_at(&next, &dest, 250), "the same coherent read is one capture");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_engine_origin_is_nonzero_and_stable_for_one_instant() {
+        let started = Instant::now();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let a = instant_origin_ns(started);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let b = instant_origin_ns(started);
+        assert_ne!(a, 0);
+        assert!(a.abs_diff(b) < 2_000_000, "{a} vs {b}");
     }
 }
