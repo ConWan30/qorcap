@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -306,10 +307,15 @@ def _canon(obj) -> str:
 
 
 def verify_signal_chain(text: str) -> list[str]:
-    """Check prev/hash links. A changed row or a broken link is an error."""
+    """Check prev/hash links and a terminal commitment.
+
+    A matching prefix without a terminal row is incomplete. Local hash links
+    are not an anchor and are not completeness.
+    """
     prev = SIGNAL_GENESIS
     errs = []
     seq = 0
+    rows = []
     for i, line in enumerate(text.splitlines()):
         line = line.strip()
         if not line:
@@ -334,6 +340,21 @@ def verify_signal_chain(text: str) -> list[str]:
             errs.append(f"line {i} hash does not match")
         prev = row.get("hash") or prev
         seq += 1
+        rows.append(row)
+    if not rows or rows[-1].get("kind") != "terminal":
+        errs.append("no terminal commitment")
+        return errs
+    prior = rows[:-1]
+    last = rows[-1]
+    if last.get("count") != len(prior):
+        errs.append("terminal count does not match")
+    root = SIGNAL_GENESIS if not prior else prior[-1].get("hash")
+    if last.get("root") != root:
+        errs.append("terminal root does not match")
+    if last.get("complete") is not False:
+        errs.append("local hash links are not completeness")
+    if last.get("anchored") is not False:
+        errs.append("local hash links are not an anchor")
     return errs
 
 
@@ -555,7 +576,12 @@ class CodSetRunner:
         self._chain_seq = 0
         self._last_snap = None
         self._real_frames: list = []
-        self.own_kill_feed = None
+        self._own_kills: list = []
+        self._feed_present = False
+        self._source = None
+        self._signals_closed = False
+        self.menu_exit_us = None
+        self.lag_us_override = None
         self._last_gated_hit_us = None
         self._last_feed_us = None
         self._lag = None
@@ -573,7 +599,8 @@ class CodSetRunner:
         self.haptics = list(haptics or [])
         self.wall_anchor_ms = wall_anchor_ms
 
-    def on_frame(self, t_ms: int, img) -> None:
+    def on_frame(self, t_ms: int, img, source=None) -> None:
+        self._source = source if isinstance(source, dict) else None
         self.stats["frames"] += 1
         try:
             reads = list(self.hud.read(img))
@@ -670,10 +697,15 @@ class CodSetRunner:
                 calibrated=feed_visual, prior_status=popup_status,
                 this_us=screen_us, prior_us=popup_us)
             feed_status, feed_reason = self._hold_counts(feed_status, None, screen_us)
-        if feed_visual and near and isinstance(screen_us, int):
-            if self._last_feed_us is None or screen_us - self._last_feed_us > 100_000:
-                self.own_kill_feed = 0 if self.own_kill_feed is None else self.own_kill_feed + 1
-                self._last_feed_us = screen_us
+        if feed_visual and near and isinstance(screen_us, int) and not self._feed_present:
+            # A generic icon is one candidate. It is not ownership-qualified.
+            self._own_kills.append({
+                "t_us": screen_us,
+                "source_id": self._source_id(),
+                "ownership_qualified": False,
+            })
+            self._last_feed_us = screen_us
+        self._feed_present = bool(feed_visual and near)
         board = by_name.get("scoreboard")
         board_status = scoreboard_status(
             calibrated=bool(board and board.ok and board.calibrated),
@@ -779,7 +811,7 @@ class CodSetRunner:
         if agreed is None:
             return
         from qorcap_cod_hud import consensus_owner_row
-        verdict = consensus_owner_row(self._real_frames, self.own_kill_feed)
+        verdict = consensus_owner_row(self._real_frames, self.own_kill_coverage())
         if verdict["status"] != "accepted":
             self._write({
                 "t_ms": int(t_ms), "kind": "owner_row", "status": NOT_COUNTED,
@@ -811,7 +843,9 @@ class CodSetRunner:
             "confirms": confirms,
             "result": end.reason,
         }
-        self._commit_final(t_ms, agreed, end.reason, True, None, None, notes, owner=owner_doc)
+        window = self._seal_window()
+        confirmed = window.get("status") == "resolved" and window.get("releases_counts") is True
+        self._commit_final(t_ms, agreed, end.reason, confirmed, None, None, notes, owner=owner_doc)
 
     def _commit_final(self, t_ms, agreed, reason, confirmed, home, away, notes, owner) -> None:
         event = {
@@ -870,15 +904,46 @@ class CodSetRunner:
 
     def _keep_real(self, img) -> None:
         try:
-            from qorcap_cod_hud import frame_is_real
+            from qorcap_cod_hud import frame_is_real, _pixel_id
             if not frame_is_real(img):
                 return
         except Exception:
             return
         stored = img.copy() if hasattr(img, "copy") else img
-        self._real_frames.append(stored)
+        src = self._source if isinstance(self._source, dict) else {}
+        captured = src.get("captured_us")
+        if isinstance(captured, bool) or not isinstance(captured, int):
+            captured = None
+        self._real_frames.append({
+            "img": stored,
+            "source_id": src.get("frame_id") if isinstance(src.get("frame_id"), str) else None,
+            "seq": src.get("seq") if isinstance(src.get("seq"), int) and not isinstance(src.get("seq"), bool) else None,
+            "captured_us": captured,
+            "pixel_id": _pixel_id(stored),
+        })
         if len(self._real_frames) > 5:
             del self._real_frames[:-5]
+
+    def _source_id(self):
+        src = self._source if isinstance(self._source, dict) else {}
+        frame_id = src.get("frame_id")
+        return frame_id if isinstance(frame_id, str) and frame_id else None
+
+    def own_kill_coverage(self) -> dict:
+        """Unknown unless every kill is ownership-qualified, deduplicated, and covered."""
+        events = list(self._own_kills)
+        if not events:
+            return {"coverage": "unknown", "kills": None, "ownership_qualified": False, "deduped": False}
+        qualified = all(event.get("ownership_qualified") is True for event in events)
+        ids = [event.get("source_id") for event in events]
+        deduped = all(isinstance(item, str) and item for item in ids) and len(set(ids)) == len(ids)
+        covered = qualified and deduped and all(isinstance(event.get("t_us"), int) for event in events)
+        return {
+            "coverage": "covered" if covered else "unknown",
+            "kills": len(events) if covered else None,
+            "ownership_qualified": qualified,
+            "deduped": deduped,
+        }
 
     def _note_lag(self, t_ms: int, img) -> None:
         try:
@@ -888,7 +953,10 @@ class CodSetRunner:
         if self._lag is None:
             self._lag = LagProbe()
         try:
-            self._lag.observe(img, self.inputs, screen_mono_us(t_ms, self.wall_anchor_ms))
+            frame_id = self._source.get("frame_id") if isinstance(self._source, dict) else None
+            self._lag.observe(
+                img, self.inputs, screen_mono_us(t_ms, self.wall_anchor_ms),
+                source_frame=frame_id if isinstance(frame_id, str) else None)
         except Exception:
             return
         if self.log_path is None or not self._lag.samples:
@@ -918,12 +986,12 @@ class CodSetRunner:
 
     def _seal_window(self) -> dict:
         from qorcap_seal import seal_exclusion
-        lag = None
-        if self._lag is not None:
+        lag = self.lag_us_override
+        if lag is None and self._lag is not None:
             lag = self._lag.measured_us()
         # Pause-menu exit is not read. Missing it keeps the window unresolved.
         return seal_exclusion(
-            options_release_us=self._options_release_us(), menu_exit_us=None,
+            options_release_us=self._options_release_us(), menu_exit_us=self.menu_exit_us,
             lag_us=lag, frame_us=16_667)
 
     def _hold_counts(self, status, reason, t_us):
@@ -936,16 +1004,36 @@ class CodSetRunner:
             return status, reason
         return NOT_COUNTED, window.get("reason") or "seal_window_unresolved"
 
+    def _source_row(self) -> dict:
+        src = self._source if isinstance(self._source, dict) else {}
+        seq = src.get("seq")
+        if isinstance(seq, bool) or not isinstance(seq, int):
+            seq = None
+        captured = src.get("captured_us")
+        if isinstance(captured, bool) or not isinstance(captured, int):
+            captured = None
+        frame_id = src.get("frame_id") if isinstance(src.get("frame_id"), str) else None
+        return {"frame_id": frame_id, "seq": seq, "captured_us": captured, "anchored": False}
+
     def _stream_hud(self, t_ms: int, reads, signals) -> None:
-        frame_index = max(0, self.stats["frames"] - 1)
-        snap = tuple((s.get("signal"), s.get("status"), s.get("reason")) for s in signals)
+        regions = [_public(rd) for rd in reads]
+        snap = (
+            tuple((s.get("signal"), s.get("status"), s.get("reason")) for s in signals),
+            tuple((r.get("region"), r.get("status"), r.get("calibrated"), r.get("reason")) for r in regions),
+            self.stats["errors"],
+        )
+        source = self._source_row()
         if not self._logged:
             self._logged = True
             self._last_snap = snap
             self._write({
                 "t_ms": int(t_ms), "kind": "set",
-                "regions": [_public(rd) for rd in reads],
+                "regions": regions,
                 "signals": signals,
+                "source_frame": source,
+                "frame_index": source["seq"],
+                "anchored": False,
+                "poll_index": self.stats["frames"] - 1,
                 "frame_clock_gap_us": FRAME_CLOCK_GAP_US,
                 "note": (
                     "A signal is Counted only when the on-screen hook and the controller "
@@ -954,42 +1042,70 @@ class CodSetRunner:
             })
             return
         changed = snap != self._last_snap
-        fresh = frame_index > 0 and frame_index % 60 == 0
+        poll = self.stats["frames"] - 1
+        fresh = poll > 0 and poll % 60 == 0
         if not changed and not fresh:
             return
         self._last_snap = snap
         self._write({
             "t_ms": int(t_ms),
             "kind": "hud" if changed else "freshness",
-            "regions": [_public(rd) for rd in reads],
+            "regions": regions,
             "signals": signals,
+            "source_frame": source,
+            "frame_index": source["seq"],
+            "anchored": False,
+            "poll_index": poll,
         })
 
-    def _write(self, row: dict) -> None:
+    def close_signals(self) -> bool:
+        """Commit the terminal root. A prefix without this row is incomplete."""
+        if self._signals_closed:
+            return False
+        self._signals_closed = True
+        return self._write({
+            "t_ms": 0,
+            "kind": "terminal",
+            "count": self._chain_seq,
+            "root": self._chain_prev,
+            "complete": False,
+            "anchored": False,
+            "note": "Local hash links are not an anchor and are not completeness.",
+        })
+
+    def _write(self, row: dict) -> bool:
         if self.log_path is None:
-            return
+            return False
         body = {k: v for k, v in row.items() if k not in ("prev", "hash")}
         body.setdefault("schema", SIGNAL_SCHEMA)
-        body.setdefault("frame_index", max(0, self.stats["frames"] - 1))
+        source = self._source_row()
+        body.setdefault("frame_index", source["seq"])
+        body.setdefault("anchored", False)
+        body.setdefault("source_frame", source)
         if "mono_us" not in body:
-            body["mono_us"] = screen_mono_us(body.get("t_ms"), self.wall_anchor_ms)
+            captured = source.get("captured_us")
+            body["mono_us"] = captured if isinstance(captured, int) else screen_mono_us(body.get("t_ms"), self.wall_anchor_ms)
         prev = self._chain_prev
         seq = self._chain_seq
         try:
             digest = hashlib.sha256(_canon({"prev": prev, "seq": seq, "row": body}).encode("utf-8")).hexdigest()
         except TypeError as e:
             print(f"Call of Duty signal log skipped a non-integer row: {e}", file=sys.stderr)
-            return
+            return False
         stored = dict(body)
         stored["prev"] = prev
         stored["hash"] = digest
-        self._chain_prev = digest
-        self._chain_seq += 1
         try:
             with open(self.log_path, "a", encoding="utf-8") as fh:
                 fh.write(json.dumps(stored) + "\n")
+                fh.flush()
+                os.fsync(fh.fileno())
         except OSError as e:
             print(f"Call of Duty signal log failed: {type(e).__name__}: {e}", file=sys.stderr)
+            return False
+        self._chain_prev = digest
+        self._chain_seq += 1
+        return True
 
 
 def _nearest_haptic(rows, target_us):
@@ -1240,18 +1356,17 @@ def probe_end_frames(frames, own_kills=None) -> dict:
     tail = list(frames or [])[-END_PROBE_FRAMES:]
     posted: list = []
     runner = CodSetRunner(posted.append)
-    if own_kills is not None:
-        runner.own_kill_feed = own_kills
     summaries = []
     times = []
     for item in tail:
         if not isinstance(item, (tuple, list)) or len(item) < 2:
             continue
         t_ms, img = item[0], item[1]
+        source = item[2] if len(item) > 2 and isinstance(item[2], dict) else None
         if isinstance(t_ms, bool) or not isinstance(t_ms, int):
             continue
         times.append(t_ms)
-        runner.on_frame(t_ms, img)
+        runner.on_frame(t_ms, img, source=source)
         summaries.append(_summarize_end_frame(img))
     span = (times[-1] - times[0]) if len(times) >= 2 else 0
     final = posted[-1] if posted else None
@@ -1261,6 +1376,8 @@ def probe_end_frames(frames, own_kills=None) -> dict:
         reason = "the end word was not read on the last frames"
     elif not any(row.get("owner_row") for row in summaries):
         reason = "the owner row was not read on the last frames"
+    elif span >= END_AGREE_SPAN_MS and len(times) >= END_AGREE_FRAMES:
+        reason = "the last frames are not five distinct captures"
     else:
         reason = "the last frames do not meet 3 timestamps across 3 seconds"
     return {

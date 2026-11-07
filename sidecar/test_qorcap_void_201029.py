@@ -33,12 +33,16 @@ def test_seal_status_is_a_console_line_and_a_late_hash_does_not_open():
     assert "Seal: locked" in text
     late = {
         "seal_hash": "ab" * 32, "status": "failed", "opening_gate": False, "reason": "late",
+        "anchor_ack": "external-anchor",
     }
-    assert seal.dual_bind_passes(late, dict(late), late["seal_hash"]) is False
+    assert seal.dual_bind_passes(late, dict(late), late["seal_hash"], "external-anchor") is False
     locked = {"seal_hash": "cd" * 32, "status": "locked", "opening_gate": True}
-    assert seal.dual_bind_passes(locked, dict(locked), locked["seal_hash"]) is True
+    assert seal.dual_bind_passes(locked, dict(locked), locked["seal_hash"], "external-anchor") is False
+    acked = dict(locked, anchor_ack="external-anchor")
+    assert seal.dual_bind_passes(acked, dict(acked), acked["seal_hash"], "external-anchor") is True
+    assert seal.dual_bind_passes(acked, dict(acked), acked["seal_hash"], acked["seal_hash"]) is False
     assert seal.dual_bind_passes({"seal_hash": None, "status": "failed", "opening_gate": False},
-                                  {"seal_hash": None, "opening_gate": False}, None) is False
+                                  {"seal_hash": None, "opening_gate": False}, None, None) is False
 
 
 def test_one_options_hold_does_not_measure_lag_and_exclusion_fails_closed():
@@ -52,8 +56,30 @@ def test_one_options_hold_does_not_measure_lag_and_exclusion_fails_closed():
     assert two["status"] == "not_measured"
     samples = [{"method": "ads_zoom", "lag_us": 40_000, "t_us": i * 1_000_000} for i in range(29)]
     samples.append({"method": "options_pause", "lag_us": 40_000, "t_us": 29_000_000})
-    measured = lag.lag_band(samples)
-    assert measured["status"] == "measured" and measured["n"] == 30 and measured["provisional"] is True
+    pooled = lag.lag_band(samples)
+    assert pooled["status"] == "not_measured"
+    copies = [{
+        "method": "options_pause", "lag_us": 180_000, "t_us": 1_500_000,
+        "probe_id": "options:1", "source_frame": "frame-1", "outcome": "observed",
+    } for _ in range(30)]
+    assert lag.lag_band(copies)["status"] == "not_measured"
+    assert lag.lag_band(copies)["reason"] == "options_hold_alone"
+    unique_options = [{
+        "method": "options_pause", "lag_us": 180_000, "t_us": i * 1_000_000,
+        "probe_id": f"options:{i}", "source_frame": f"frame-{i}", "outcome": "observed",
+    } for i in range(30)]
+    refused = lag.lag_band(unique_options)
+    assert refused["status"] == "not_measured" and refused["reason"] == "not_a_causal_lag"
+    ads = [{
+        "method": "ads_zoom", "lag_us": 40_000, "t_us": i * 1_000_000,
+        "probe_id": f"ads:{i}", "source_frame": f"src-{i}", "outcome": "observed",
+    } for i in range(30)]
+    diagnostic = lag.lag_band(ads)
+    assert diagnostic["status"] == "diagnostic" and diagnostic["reason"] == "not_a_causal_lag"
+    assert diagnostic["n"] == 30 and diagnostic["provisional"] is True
+    assert lag.LagProbe().measured_us() is None
+    same_time = [dict(row, t_us=0) for row in ads]
+    assert lag.lag_band(same_time)["reason"] == "no_time_coverage"
     spread = [{"method": "ads_zoom", "lag_us": 10_000 if i < 20 else 80_000, "t_us": i} for i in range(30)]
     assert lag.lag_band(spread)["status"] == "not_measured"
     missing_menu = seal.seal_exclusion(
@@ -89,15 +115,17 @@ def test_hitmarker_outside_the_fire_window_is_not_counted_and_consensus_abstains
         [{"type": "in", "t_us": 0, "b": 0, "r2": 0},
          {"type": "in", "t_us": 100_000, "b": 0, "r2": 200}],
         [1_000_000], [], 0)
-    runner.on_frame(1000, object())
+    runner.on_frame(1000, object(), source={"frame_id": "frame-a", "seq": 12, "captured_us": 1_000_000})
     row = json.loads((tmp_path / "cod_signals.jsonl").read_text(encoding="utf-8").splitlines()[0])
     signals = {s["signal"]: s for s in row["signals"]}
     assert signals["hitmarker"]["status"] == C.NOT_COUNTED
     assert signals["hitmarker"]["reason"] == "outside_fire_window"
     assert signals["hitmarker"]["gated"] is False
     assert signals["killfeed"]["reason"] == "no_nearby_hitmarker"
-    assert row["kind"] == "set" and row["frame_index"] == 0 and row["mono_us"] == 1_000_000
+    assert row["kind"] == "set" and row["frame_index"] == 12 and row["mono_us"] == 1_000_000
+    assert row["anchored"] is False and row["source_frame"]["frame_id"] == "frame-a"
     assert row["prev"] == C.SIGNAL_GENESIS and len(row["hash"]) == 64
+    assert runner.own_kill_coverage()["coverage"] == "unknown"
 
     board = cv2.imread(str(FIX / "end_173922_019.jpg"))
     assert board is not None
@@ -107,12 +135,26 @@ def test_hitmarker_outside_the_fire_window_is_not_counted_and_consensus_abstains
     assert H.frame_is_real(object()) is False
     short = H.consensus_owner_row([board, board, board, board], 13)
     assert short["status"] == "abstain" and short["reason"] == "short_real_window"
-    unknown = H.consensus_owner_row([board] * 5, None)
-    assert unknown["reason"] == "no_own_kill_count"
-    mismatch = H.consensus_owner_row([board] * 5, 31)
-    assert mismatch["reason"] == "own_kill_mismatch"
-    agreed = H.consensus_owner_row([board] * 5, 13)
-    assert agreed["status"] == "accepted" and agreed["kills"] == 13 and agreed["deaths"] == 13
+    repeated = H.consensus_owner_row([board] * 5, None)
+    assert repeated["reason"] == "no_capture_provenance"
+    proven = []
+    for i in range(5):
+        frame = board.copy()
+        frame[0, i] = (i * 40) % 256
+        proven.append({
+            "img": frame, "source_id": f"src-{i}", "captured_us": i * 1_000_000, "pixel_id": f"pix-{i}",
+        })
+    unknown_feed = H.consensus_owner_row(proven, None)
+    assert unknown_feed["status"] == "accepted" and unknown_feed["kills"] == 13
+    assert unknown_feed["feed_check"] == "unknown"
+    mismatch = H.consensus_owner_row(proven, {
+        "coverage": "covered", "ownership_qualified": True, "deduped": True, "kills": 31,
+    })
+    assert mismatch["reason"] == "feed_inconsistent" and mismatch["kills"] == 13
+    agreed = H.consensus_owner_row(proven, {
+        "coverage": "covered", "ownership_qualified": True, "deduped": True, "kills": 13,
+    })
+    assert agreed["status"] == "accepted" and agreed["feed_check"] == "consistent"
 
 
 def test_signal_rows_chain_and_keep_moving(tmp_path):
@@ -132,14 +174,23 @@ def test_signal_rows_chain_and_keep_moving(tmp_path):
 
     path = tmp_path / "cod_signals.jsonl"
     runner = C.CodSetRunner(lambda _e: None, hud=Hud(), end=End(), log_path=path)
-    runner.on_frame(0, object())
-    runner.on_frame(100, object())
-    runner.on_frame(200, object())
+    runner.on_frame(0, object(), source={"frame_id": "a", "seq": 4, "captured_us": 10})
+    runner.on_frame(100, object(), source={"frame_id": "b", "seq": 5, "captured_us": 20})
+    runner.on_frame(200, object(), source={"frame_id": "c", "seq": 6, "captured_us": 30})
     lines = path.read_text(encoding="utf-8").splitlines()
     assert json.loads(lines[0])["kind"] == "set"
     assert json.loads(lines[1])["kind"] == "hud"
-    assert json.loads(lines[1])["frame_index"] == 1
+    assert json.loads(lines[1])["frame_index"] == 5
+    assert json.loads(lines[1])["anchored"] is False
+    assert C.verify_signal_chain("\n".join(lines))
+    assert runner.close_signals() is True
     assert C.verify_signal_chain(path.read_text(encoding="utf-8")) == []
+    terminal = json.loads(path.read_text(encoding="utf-8").splitlines()[-1])
+    assert terminal["kind"] == "terminal" and terminal["complete"] is False and terminal["count"] == len(lines)
+    stuck = runner._chain_seq
+    runner.log_path = tmp_path
+    assert runner._write({"t_ms": 1, "kind": "hud", "signals": []}) is False
+    assert runner._chain_seq == stuck
     tampered = path.read_text(encoding="utf-8").replace("hud", "nope", 1)
     assert C.verify_signal_chain(tampered)
 
@@ -153,3 +204,8 @@ def test_stick_stays_counted_grip_off_rumble_info_only():
     assert doc["grip"] == "off"
     assert doc["counted"]["stick_turn_vs_camera"]["label"] == "Counted"
     assert doc["info_only"]["rumble_vs_hit"]["status"] == C.NOT_COUNTED
+    seen = set()
+    fresh = qm.snapshot_submission(1_000, 3, "abc", 1_200, seen)
+    assert fresh["captured_ms"] == 1_000 and fresh["seq"] == 3
+    assert qm.snapshot_submission(1_000, 3, "abc", 1_500, seen) is None
+    assert qm.snapshot_submission(1_000, 3, "abc", 9_000, set()) is None

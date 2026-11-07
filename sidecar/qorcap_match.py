@@ -671,6 +671,42 @@ def start_reader(api: Api, stop: threading.Event, state: dict, bundle: Path | No
     return t
 
 
+def snapshot_submission(source_ms, generation, body_hash, now_ms, seen, max_age_ms=2000):
+    """A snapshot the capture already timed. A cached body with a new wall clock is not a new frame."""
+    nums = (source_ms, generation, now_ms)
+    if not all(isinstance(n, int) and not isinstance(n, bool) for n in nums):
+        return None
+    if not isinstance(body_hash, str) or not body_hash:
+        return None
+    if not isinstance(max_age_ms, int) or isinstance(max_age_ms, bool) or max_age_ms < 0:
+        return None
+    if source_ms > now_ms + 250 or now_ms - source_ms > max_age_ms:
+        return None
+    key = (generation, source_ms, body_hash)
+    if key in seen:
+        return None
+    seen.add(key)
+    return {
+        "captured_ms": source_ms,
+        "captured_us": source_ms * 1000,
+        "generation": generation,
+        "frame_id": body_hash,
+        "seq": generation,
+    }
+
+
+def _header_int(headers, name):
+    if headers is None:
+        return None
+    raw = headers.get(name) if hasattr(headers, "get") else None
+    if raw is None:
+        return None
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
+
+
 def start_cod_reader(api: Api, stop: threading.Event, state: dict, bundle: Path | None = None) -> threading.Thread:
     """Call of Duty frame loop. Does not start the Madden scorebug reader.
 
@@ -717,33 +753,40 @@ def start_cod_reader(api: Api, stop: threading.Event, state: dict, bundle: Path 
         except Exception as e:
             state["reader_error"] = f"cod_reader_unavailable: {type(e).__name__}"
             return
-        last, last_t = None, 0.0
         last_refresh = 0.0
-        while not stop.is_set():
-            state["reader_tick"] = int(time.time() * 1000)
-            now = time.monotonic()
-            if now - last_refresh >= 1.0:
-                refresh()
-                last_refresh = now
+        seen = set()
+        try:
+            while not stop.is_set():
+                state["reader_tick"] = int(time.time() * 1000)
+                now = time.monotonic()
+                if now - last_refresh >= 1.0:
+                    refresh()
+                    last_refresh = now
+                try:
+                    with urllib.request.urlopen(api.base + "/snapshot.jpg", timeout=3) as r:
+                        data = r.read()
+                        source_ms = _header_int(r.headers, "X-Qorcap-Snapshot-Source-Ms")
+                        generation = _header_int(r.headers, "X-Qorcap-Snapshot-Gen")
+                except Exception:
+                    if stop.wait(0.5):
+                        break
+                    continue
+                body_hash = hashlib.sha256(data).hexdigest()
+                submitted = snapshot_submission(source_ms, generation, body_hash, int(time.time() * 1000), seen)
+                if submitted is not None:
+                    img = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
+                    if img is not None:
+                        try:
+                            runner.on_frame(submitted["captured_ms"], img, source=submitted)
+                        except Exception as e:
+                            state["reader_error"] = f"{type(e).__name__}: {e}"
+                if stop.wait(0.25):
+                    break
+        finally:
             try:
-                with urllib.request.urlopen(api.base + "/snapshot.jpg", timeout=3) as r:
-                    data = r.read()
+                runner.close_signals()
             except Exception:
-                if stop.wait(0.5):
-                    return
-                continue
-            t_ms = int(time.time() * 1000)
-            h = hashlib.sha256(data).digest()
-            if h != last or time.monotonic() - last_t >= 1.0:
-                last, last_t = h, time.monotonic()
-                img = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
-                if img is not None:
-                    try:
-                        runner.on_frame(t_ms, img)
-                    except Exception as e:
-                        state["reader_error"] = f"{type(e).__name__}: {e}"
-            if stop.wait(0.25):
-                return
+                pass
 
     t = threading.Thread(target=loop, name="qorcap-cod-reader", daemon=True)
     state["reader_thread"] = t

@@ -125,7 +125,7 @@ fn football_step(prev_h: i64, prev_a: i64, h: i64, a: i64) -> bool {
     matches!(dh + da, 1 | 2 | 3 | 6 | 7 | 8)
 }
 
-fn append_jsonl(path: &Path, v: &Value) {
+fn append_jsonl(path: &Path, v: &Value) -> bool {
     use std::io::Write as _;
     use std::fs::OpenOptions;
     if let Some(d) = path.parent() { if !d.as_os_str().is_empty() { let _ = std::fs::create_dir_all(d); } }
@@ -137,11 +137,12 @@ fn append_jsonl(path: &Path, v: &Value) {
     let _g = APPEND.lock().unwrap_or_else(|e| e.into_inner());
     match OpenOptions::new().create(true).append(true).open(path) {
         Ok(mut f) => {
-            if let Err(e) = f.write_all(line.as_bytes()) { error!("cannot write {}: {e}", path.display()); return; }
+            if let Err(e) = f.write_all(line.as_bytes()) { error!("cannot write {}: {e}", path.display()); return false; }
             let _ = f.flush();
             let _ = f.sync_all(); // durable append: a crash leaves at most one torn line
+            true
         }
-        Err(e) => error!("cannot append {}: {e}", path.display()),
+        Err(e) => { error!("cannot append {}: {e}", path.display()); false }
     }
 }
 
@@ -639,6 +640,7 @@ impl Engine {
         // and replaces snapshot.jpg. ffmpeg does not atomic-rename over the file the reader opens.
         let incoming = self.snapshot.with_file_name("snapshot.incoming.jpg");
         let args = ffmpeg::capture_args_with(&self.args, input_format, audio, &incoming.to_string_lossy(), stamp.as_deref());
+        self.snap_pub.lock().unwrap_or_else(|e| e.into_inner()).invalidate();
         let stop_pub = Arc::new(AtomicBool::new(false));
         let publisher = {
             let flag = stop_pub.clone();
@@ -648,7 +650,8 @@ impl Engine {
             std::thread::spawn(move || {
                 while !flag.load(Ordering::SeqCst) {
                     if let Ok(bytes) = std::fs::read(&inc) {
-                        me.snap_pub.lock().unwrap_or_else(|e| e.into_inner()).consider(&bytes, &dest);
+                        let source_ms = wall_ms();
+                        me.snap_pub.lock().unwrap_or_else(|e| e.into_inner()).consider(&bytes, &dest, source_ms);
                     }
                     std::thread::sleep(Duration::from_millis(40));
                 }
@@ -1325,8 +1328,9 @@ impl Engine {
         let mut ext = json!({"trigger": trigger, "segment_seq": st.seg.seq, "segment_hash": st.last_seg_sha, "chain_head": st.seg.head,
             "score": st.score, "mono_ms": self.ms(), "match_id": self.args.match_id, "role": self.args.role});
         if let (Value::Object(e), Value::Object(x)) = (&mut ext, extra) { e.extend(x); }
-        if let Some(seal) = self.input.lock().unwrap_or_else(|e| e.into_inner()).take_seal_for_checkpoint() {
-            if let Value::Object(e) = &mut ext { e.insert("session_seal".into(), seal); }
+        let seal_bind = self.input.lock().unwrap_or_else(|e| e.into_inner()).seal_binding();
+        if let Some(seal) = &seal_bind {
+            if let Value::Object(e) = &mut ext { e.insert("session_seal".into(), seal.clone()); }
         }
         let cp = match st.cps.next_with_input(wall_ms(), ext, input_hash) {
             Ok(cp) => cp,
@@ -1339,7 +1343,10 @@ impl Engine {
         };
         st.checkpoints.push(cp.clone());
         drop(st);
-        append_jsonl(&self.ev_path("checkpoints.jsonl"), &cp);
+        let persisted = append_jsonl(&self.ev_path("checkpoints.jsonl"), &cp);
+        if persisted && seal_bind.is_some() {
+            self.input.lock().unwrap_or_else(|e| e.into_inner()).acknowledge_seal();
+        }
         self.broadcast("checkpoint", &cp);
         cp
     }

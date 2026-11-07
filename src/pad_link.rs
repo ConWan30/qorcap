@@ -1,18 +1,17 @@
 //! Read-only pad-link continuity.
 //!
-//! Each heartbeat already counts reports the host received. This module classifies a quiet
-//! stretch from those rows plus the report-counter and sensor-timestamp fields copied off
-//! the normal HID input report and sealed in the same chunk chain.
+//! Heartbeat rows already carry the interval safeguards from the reader: epoch, the largest
+//! receive gap, stale gaps, faults, short reads, parse faults, and how old the newest report
+//! is. Those gates stay unknown. A report count can add support only after every gate passes.
+//! It cannot turn a hole, a reconnect, or a fault into idle.
 //!
-//! * `idle_supported`: every covering heartbeat is present, each `rx_delta` is above zero,
-//!   the report sequence did not break, and the sensor timestamp advanced when more than
-//!   one report arrived.
-//! * `drop`: a covering row has `rx_delta == 0`, or a `hb_seq` hole says a row is missing.
-//! * `unknown`: no heartbeat covers the stretch, the anchor fields are absent, or the
-//!   sequence/timestamp does not support idle.
+//! `rx_bind` is a digest of bytes this process already read. It is not a trusted anchor.
+//! Idle also needs a neutral stick/button span and a trusted anchor supplied from outside
+//! this digest. Without that, the span stays unknown. A missing row or a zero count is
+//! unknown, not a drop.
 //!
 //! `unknown` is not idle. Counter-step and sensor-tick rules are PROVISIONAL.
-use crate::inputs::HB_INTERVAL_US;
+use crate::inputs::{HB_INTERVAL_US, STALE_RX_GAP_US};
 use serde_json::{json, Value};
 
 pub const SCHEMA: &str = "qorcap-pad-link/v0";
@@ -28,15 +27,12 @@ impl Verdict {
     pub fn is_idle(&self) -> bool { self.class == "idle_supported" }
 }
 
-/// One heartbeat's own mark. This is not a span verdict.
+/// One heartbeat's own mark. This is not a span verdict and it is not an anchor.
 pub fn row_mark(row: &Value) -> &'static str {
     match row.get("rx_delta").and_then(|v| v.as_u64()) {
-        None => "no_anchor",
+        None => "no_count",
         Some(0) => "zero",
         Some(n) => {
-            if row.get("rx_bind").and_then(|v| v.as_str()).map(|s| s.is_empty()).unwrap_or(true) {
-                return "no_anchor";
-            }
             if row.get("seq_breaks").and_then(|v| v.as_u64()).unwrap_or(1) > 0 { return "sequence_break"; }
             if n > 1 && (row.get("hw_stalls").and_then(|v| v.as_u64()).unwrap_or(1) > 0
                 || row.get("hw_advance").and_then(|v| v.as_u64()).unwrap_or(0) == 0)
@@ -45,6 +41,24 @@ pub fn row_mark(row: &Value) -> &'static str {
             }
             "ticking"
         }
+    }
+}
+
+fn u64_field(row: &Value, key: &str) -> Option<u64> {
+    row.get(key).and_then(|v| v.as_u64())
+}
+
+fn trusted_anchor(row: &Value) -> Option<String> {
+    let anchor = row.get("trusted_anchor").and_then(|v| v.as_str()).filter(|s| !s.is_empty())?;
+    let local = row.get("rx_bind").and_then(|v| v.as_str()).unwrap_or("");
+    if anchor == local { return None; }
+    Some(anchor.to_string())
+}
+
+fn counts_support(row: &Value) -> bool {
+    match row_mark(row) {
+        "ticking" => row.get("rx_delta").and_then(|v| v.as_u64()).unwrap_or(0) > 0,
+        _ => false,
     }
 }
 
@@ -73,30 +87,58 @@ pub fn classify_span(rows: &[Value], start_us: u64, end_us: u64) -> Verdict {
         let b = w[1].1;
         match (a.get("hb_seq").and_then(|v| v.as_u64()), b.get("hb_seq").and_then(|v| v.as_u64())) {
             (Some(sa), Some(sb)) if sb == sa.saturating_add(1) => {}
-            (Some(_), Some(_)) => return Verdict::new("drop", "missing_row"),
-            _ => return Verdict::new("unknown", "no_anchor"),
+            _ => return Verdict::new("unknown", "missing_row"),
         }
         let ta = a["t_us"].as_u64().unwrap();
         let tb = b["t_us"].as_u64().unwrap();
         if tb.saturating_sub(ta) > HB_INTERVAL_US + 500_000 {
             return Verdict::new("unknown", "heartbeat_gap");
         }
+        match (u64_field(a, "epoch"), u64_field(b, "epoch")) {
+            (Some(ea), Some(eb)) if ea == eb => {}
+            _ => return Verdict::new("unknown", "epoch_change"),
+        }
+    }
+    let mut anchor: Option<String> = None;
+    for (lo, row) in &selected {
+        if interval_blocked(row, *lo) { return Verdict::new("unknown", "interval_blocked"); }
+        if row.get("neutral") != Some(&json!(true)) { return Verdict::new("unknown", "not_neutral"); }
+        match trusted_anchor(row) {
+            None => return Verdict::new("unknown", "no_trusted_anchor"),
+            Some(a) => match &anchor {
+                None => anchor = Some(a),
+                Some(prev) if prev == &a => {}
+                Some(_) => return Verdict::new("unknown", "no_trusted_anchor"),
+            },
+        }
     }
     for (_, row) in &selected {
-        match row.get("rx_delta").and_then(|v| v.as_u64()) {
-            Some(0) => return Verdict::new("drop", "zero_count"),
-            None => return Verdict::new("unknown", "no_anchor"),
-            Some(_) => {}
-        }
-        match row_mark(row) {
-            "ticking" => {}
-            "zero" => return Verdict::new("drop", "zero_count"),
-            "sequence_break" => return Verdict::new("unknown", "report_sequence_break"),
-            "sensor_clock_stalled" => return Verdict::new("unknown", "sensor_clock_stalled"),
-            _ => return Verdict::new("unknown", "no_anchor"),
+        if !counts_support(row) { return Verdict::new("unknown", "counts_not_supporting"); }
+    }
+    Verdict::new("idle_supported", "counts_support")
+}
+
+fn interval_blocked(row: &Value, lo: u64) -> bool {
+    let t = match u64_field(row, "t_us") { Some(t) => t, None => return true };
+    for key in ["faults", "short_reads", "parse_faults", "stale_over_50ms"] {
+        match u64_field(row, key) {
+            Some(0) => {}
+            _ => return true,
         }
     }
-    Verdict::new("idle_supported", "heartbeat_ticked")
+    match u64_field(row, "max_rx_gap_us") {
+        Some(gap) if gap <= STALE_RX_GAP_US => {}
+        _ => return true,
+    }
+    match u64_field(row, "epoch") {
+        Some(_) => {}
+        None => return true,
+    }
+    let last = match u64_field(row, "last_rx_t_us") { Some(v) => v, None => return true };
+    if t.saturating_sub(last) > STALE_RX_GAP_US { return true; }
+    let first = match u64_field(row, "first_rx_t_us") { Some(v) => v, None => return true };
+    if first < lo || first > lo.saturating_add(STALE_RX_GAP_US) { return true; }
+    false
 }
 
 pub fn document(rows: &[Value]) -> Value {
@@ -110,8 +152,8 @@ pub fn document(rows: &[Value]) -> Value {
         "schema": SCHEMA,
         "unknown_is_not_idle": true,
         "label": "PROVISIONAL",
-        "anchor": "hid input report counter (usb offset 7) and sensor timestamp (usb offset 28), copied on the read path and sealed in the input chunk",
-        "rule": "a heartbeat that keeps ticking through a no-change stretch can support idle; a zero count or a missing hb_seq is a drop; no heartbeat, a missing anchor, or a sequence or sensor-timestamp break stays unknown",
+        "anchor": "a trusted anchor is not rx_bind. rx_bind is a local digest of the input reports and does not make a span idle",
+        "rule": "epoch, receive gap, stale, faults, short reads, parse faults, and receive age stay unknown when they fail. A report count can add support only after those gates, a neutral span, and one trusted anchor. A missing row or a zero count stays unknown",
         "rows": marks,
         "note": "This file is a reading of the sealed hb rows. It does not relabel unknown as idle. Editing an hb row breaks the input chunk hash."
     })
@@ -123,39 +165,57 @@ mod tests {
 
     fn ticking(t: u64, seq: u64) -> Value {
         json!({
-            "type": "hb", "t_us": t, "hb_seq": seq, "rx_delta": 250,
-            "rx_bind": "abc", "seq_breaks": 0, "hw_advance": 3_000_000, "hw_stalls": 0
+            "type": "hb", "t_us": t, "hb_seq": seq, "epoch": 1, "rx_delta": 250,
+            "rx_bind": "local-digest", "seq_breaks": 0, "hw_advance": 3_000_000, "hw_stalls": 0,
+            "faults": 0, "short_reads": 0, "parse_faults": 0, "stale_over_50ms": 0,
+            "max_rx_gap_us": 4_000, "last_rx_t_us": t, "first_rx_t_us": t - crate::inputs::HB_INTERVAL_US + 4_000,
+            "neutral": true, "trusted_anchor": "external-anchor"
         })
     }
 
     #[test]
-    fn ticking_span_is_idle_zero_is_drop_and_no_heartbeat_stays_unknown() {
+    fn counts_do_not_override_interval_gates_and_a_local_digest_is_not_an_anchor() {
         let rows = vec![ticking(1_000_000, 0), ticking(2_000_000, 1), ticking(3_000_000, 2), ticking(4_000_000, 3)];
         let idle = classify_span(&rows, 1_100_000, 3_900_000);
         assert!(idle.is_idle(), "{idle:?}");
-        assert_eq!(idle.reason, "heartbeat_ticked");
-        let mut dropped = rows.clone();
-        dropped[2]["rx_delta"] = json!(0);
-        dropped[2]["rx_bind"] = Value::Null;
-        let d = classify_span(&dropped, 1_100_000, 3_900_000);
-        assert_eq!(d.class, "drop");
-        assert_eq!(d.reason, "zero_count");
-        assert!(!d.is_idle());
+        assert_eq!(idle.reason, "counts_support");
+        let mut local = rows.clone();
+        for row in &mut local { row["trusted_anchor"] = json!("local-digest"); }
+        let no_anchor = classify_span(&local, 1_100_000, 3_900_000);
+        assert_eq!(no_anchor.class, "unknown");
+        assert_eq!(no_anchor.reason, "no_trusted_anchor");
+        assert!(!no_anchor.is_idle());
+        let mut bare = rows.clone();
+        for row in &mut bare { bare_fields(row); }
+        assert_eq!(classify_span(&bare, 1_100_000, 3_900_000).class, "unknown");
+        let mut faulted = rows.clone();
+        faulted[1]["faults"] = json!(1);
+        assert_eq!(classify_span(&faulted, 1_100_000, 3_900_000).reason, "interval_blocked");
+        let mut stale = rows.clone();
+        stale[1]["max_rx_gap_us"] = json!(300_000);
+        stale[1]["stale_over_50ms"] = json!(1);
+        assert_eq!(classify_span(&stale, 1_100_000, 3_900_000).reason, "interval_blocked");
+        let mut reopened = rows.clone();
+        reopened[2]["epoch"] = json!(2);
+        assert_eq!(classify_span(&reopened, 1_100_000, 3_900_000).reason, "epoch_change");
+        let mut held = rows.clone();
+        held[1]["neutral"] = json!(false);
+        assert_eq!(classify_span(&held, 1_100_000, 3_900_000).reason, "not_neutral");
+        let mut zero = rows.clone();
+        zero[2]["rx_delta"] = json!(0);
+        let z = classify_span(&zero, 1_100_000, 3_900_000);
+        assert_eq!(z.class, "unknown");
+        assert_ne!(z.reason, "zero_count");
+        assert!(!z.is_idle());
         let hole = vec![ticking(1_000_000, 0), ticking(2_000_000, 1), ticking(4_000_000, 3)];
         let missing = classify_span(&hole, 500_000, 3_500_000);
-        assert_eq!((missing.class, missing.reason), ("drop", "missing_row"));
-        let none = classify_span(&[], 0, 5_000_000);
-        assert_eq!(none.class, "unknown");
-        assert_eq!(none.reason, "no_heartbeat");
-        assert!(!none.is_idle());
-        let old = json!({"type": "hb", "t_us": 1_000_000, "hb_seq": 0, "rx_delta": 250});
-        let bare = classify_span(&[old], 100_000, 900_000);
-        assert_eq!(bare.class, "unknown");
-        assert!(!bare.is_idle(), "unknown is not relabeled idle");
-        let mut broken = rows.clone();
-        broken[1]["seq_breaks"] = json!(2);
-        let seq = classify_span(&broken, 1_100_000, 3_900_000);
-        assert_eq!(seq.class, "unknown");
-        assert_eq!(seq.reason, "report_sequence_break");
+        assert_eq!((missing.class, missing.reason), ("unknown", "missing_row"));
+        assert_eq!(classify_span(&[], 0, 5_000_000).reason, "no_heartbeat");
+    }
+
+    fn bare_fields(row: &mut Value) {
+        for key in ["trusted_anchor", "neutral", "epoch", "faults", "max_rx_gap_us", "last_rx_t_us", "first_rx_t_us"] {
+            row[key] = Value::Null;
+        }
     }
 }

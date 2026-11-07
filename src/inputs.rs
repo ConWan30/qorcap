@@ -32,7 +32,7 @@
 //! (`seq_breaks`), the sensor timestamp span (`hw0`/`hw1`/`hw_advance`/`hw_stalls`, USB offset 28),
 //! and `rx_bind` (SHA-256 of those counter and timestamp bytes in receive order). Sticks and
 //! triggers stay raw 0..255 with center 128 and no deadzone. The counter-step rule is PROVISIONAL.
-//! See `pad_link` for idle, drop, and unknown. Unknown is not idle.
+//! See `pad_link`. A count can support idle only after the interval gates, a neutral span, and a trusted anchor. `rx_bind` is not that anchor. Unknown is not idle.
 //!
 //! `dev_counter` is a diagnostic copy of one raw report byte (USB offset 7). Its semantics are unvalidated.
 //! `max_rx_gap_us` is the largest gap between consecutive received reports in the interval, including the
@@ -186,6 +186,7 @@ struct RxSpan {
     hw1: Option<u32>,
     stalls: u64,
     bytes: Vec<u8>,
+    neutral: bool,
 }
 
 pub struct InputLog {
@@ -249,6 +250,7 @@ impl InputLog {
     pub fn enable_seal(&mut self) {
         if self.seal.enabled() { return; }
         self.seal = crate::seal::SealWatch::new(true);
+        self.seal.set_session(&self.wall_anchor_ms.to_string());
         self.live.seal_line = self.seal.line.clone();
         info!("{}", self.live.seal_line);
     }
@@ -263,9 +265,11 @@ impl InputLog {
         }
     }
 
-    pub fn take_seal_for_checkpoint(&mut self) -> Option<Value> {
-        self.seal.take_for_checkpoint()
-    }
+    /// A finalized seal revision. Does not mark it bound.
+    pub fn seal_binding(&self) -> Option<Value> { self.seal.binding() }
+
+    /// After the checkpoint line is durable.
+    pub fn acknowledge_seal(&mut self) -> bool { self.seal.acknowledge() }
 
     fn persist_seal(&self) {
         let Some(dir) = self.path.as_ref().and_then(|p| p.parent()) else { return };
@@ -274,9 +278,17 @@ impl InputLog {
         }
     }
 
-    fn observe_seal(&mut self, t_us: u64, buttons: u32) {
+    fn observe_seal(&mut self, t_us: u64, buttons: u32, raw: &[u8]) {
         if !self.seal.enabled() { return; }
-        if self.seal.observe(t_us, buttons) {
+        if self.seal.observe(t_us, buttons, self.epoch, raw) {
+            self.live.seal_line = self.seal.line.clone();
+            info!("{}", self.live.seal_line);
+            self.persist_seal();
+        }
+    }
+
+    fn abort_seal(&mut self, reason: &str) {
+        if self.seal.abort_pending(reason) {
             self.live.seal_line = self.seal.line.clone();
             info!("{}", self.live.seal_line);
             self.persist_seal();
@@ -286,7 +298,9 @@ impl InputLog {
     fn note_span(&mut self, p: &Pad) {
         let c = p.counter;
         let hw = p.sensor_ts;
+        let quiet = p.buttons == 0 && p.lx == 128 && p.ly == 128 && p.rx == 128 && p.ry == 128;
         if self.span.n == 0 {
+            self.span.neutral = quiet;
             if let Some(prev) = self.prev_counter {
                 if c.wrapping_sub(prev) == 1 { self.span.steps = self.span.steps.saturating_add(1); }
                 else { self.span.breaks = self.span.breaks.saturating_add(1); }
@@ -302,6 +316,7 @@ impl InputLog {
             if c.wrapping_sub(prev) == 1 { self.span.steps = self.span.steps.saturating_add(1); }
             else { self.span.breaks = self.span.breaks.saturating_add(1); }
             if hw.wrapping_sub(prev_hw) == 0 { self.span.stalls = self.span.stalls.saturating_add(1); }
+            if !quiet { self.span.neutral = false; }
         }
         self.span.seq1 = Some(c);
         self.span.hw1 = Some(hw);
@@ -322,10 +337,15 @@ impl InputLog {
     /// Feed one parsed report received at `t_us`. Returns true if the change-only logger stored an `in` row.
     /// A heartbeat is considered here too, so identical reports still advance `hb`.
     pub fn on_report(&mut self, t_us: u64, p: &Pad) -> bool {
+        self.on_report_bytes(t_us, p, &[])
+    }
+
+    /// `raw` is the exact HID input buffer. An empty buffer cannot complete a seal hash.
+    pub fn on_report_bytes(&mut self, t_us: u64, p: &Pad, raw: &[u8]) -> bool {
         self.live.reports += 1;
         self.observe_rx(t_us);
         self.note_span(p);
-        self.observe_seal(t_us, p.buttons);
+        self.observe_seal(t_us, p.buttons, raw);
         // USB 0x01 and Bluetooth 0x31 both carry this byte (offset 7, or +1 on BT). Copied, not interpreted.
         self.dev_counter = Some(p.counter as u64);
         self.live.last_report_mono_ms = Some(t_us / 1000);
@@ -365,18 +385,21 @@ impl InputLog {
     /// A read timeout or a failed read in the HID loop. Does not invent a received report.
     pub fn note_fault(&mut self, t_us: u64) {
         self.faults_since_hb = self.faults_since_hb.saturating_add(1);
+        self.abort_seal("fault_ambiguous");
         self.poll_heartbeat(t_us);
     }
 
     /// `read` returned fewer bytes than a USB 0x01 report.
     pub fn note_short_read(&mut self, t_us: u64) {
         self.short_reads = self.short_reads.saturating_add(1);
+        self.abort_seal("fault_ambiguous");
         self.poll_heartbeat(t_us);
     }
 
     /// `read` returned a full-sized buffer that was not a DualSense input report.
     pub fn note_parse_fault(&mut self, t_us: u64) {
         self.parse_faults = self.parse_faults.saturating_add(1);
+        self.abort_seal("fault_ambiguous");
         self.poll_heartbeat(t_us);
     }
 
@@ -447,6 +470,7 @@ impl InputLog {
             "hw_advance": hw_advance,
             "hw_stalls": span.stalls,
             "rx_bind": rx_bind,
+            "neutral": span.neutral && span.n > 0,
         }));
         self.hb_seq = self.hb_seq.saturating_add(1);
         self.rx_at_last_hb = rx_total;
@@ -486,6 +510,7 @@ impl InputLog {
         if handle_open || identity {
             self.epoch = self.epoch.saturating_add(1);
             self.reset_stale_telemetry();
+            self.abort_seal("epoch_reset");
         }
         self.live.state = state.into();
         self.live.warning = match state {
@@ -632,7 +657,7 @@ where F: Fn() -> Result<Box<dyn ReportSource>, String> + Send + 'static {
                                 if let Some(p) = hid::parse(&buf[..n]) {
                                     let mut l = log.lock().unwrap_or_else(|e| e.into_inner());
                                     if l.live.state != "connected" { l.on_status_with_id(t, "connected", &detail, Some(&pad_id)); }
-                                    l.on_report(t, &p);
+                                    l.on_report_bytes(t, &p, &buf[..n]);
                                     last_rx = Instant::now();
                                 } else {
                                     let mut l = log.lock().unwrap_or_else(|e| e.into_inner());
@@ -994,12 +1019,15 @@ mod tests {
         assert!(hbs.iter().all(|h| h["rx_bind"].as_str().unwrap_or("").len() == 64));
         assert!(hbs.iter().all(|h| h["seq_breaks"] == 0), "{hbs:?}");
         assert!(hbs.iter().all(|h| h["hw_advance"].as_u64().unwrap_or(0) > 0));
+        assert!(hbs.iter().all(|h| h["neutral"] == true), "{hbs:?}");
         let idle = crate::pad_link::classify_span(&hbs, 1_100_000, 3_800_000);
-        assert!(idle.is_idle(), "{idle:?}");
+        assert_eq!(idle.class, "unknown", "{idle:?}");
+        assert_eq!(idle.reason, "no_trusted_anchor");
+        assert!(!idle.is_idle(), "a local digest is not a trusted anchor");
         l.note_fault(5 * HB_INTERVAL_US);
         let with_zero: Vec<Value> = l.pending().iter().filter(|r| r["type"] == "hb").cloned().collect();
         let dropped = crate::pad_link::classify_span(&with_zero, 4_100_000, 5 * HB_INTERVAL_US);
-        assert_eq!(dropped.class, "drop", "{dropped:?}");
+        assert_eq!(dropped.class, "unknown", "{dropped:?}");
         let unknown = crate::pad_link::classify_span(&hbs, 20 * HB_INTERVAL_US, 21 * HB_INTERVAL_US);
         assert_eq!(unknown.class, "unknown");
         assert!(!unknown.is_idle());
@@ -1024,10 +1052,13 @@ mod tests {
         let pad_doc: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("pad_session.v0.json")).unwrap()).unwrap();
         assert!(session["seal_hash"].is_null());
         assert_eq!(session["seal_hash"], pad_doc["seal_hash"]);
-        assert!(!crate::seal::dual_bind_passes(&session, &pad_doc, None));
-        let bound = l.take_seal_for_checkpoint().unwrap();
+        assert!(!crate::seal::dual_bind_passes(&session, &pad_doc, None, None));
+        assert!(l.seal_binding().is_none(), "a retryable failure is not a checkpoint binding");
+        l.close_seal();
+        let bound = l.seal_binding().unwrap();
         assert!(bound["hash"].is_null());
-        assert!(l.take_seal_for_checkpoint().is_none());
+        assert!(l.acknowledge_seal());
+        assert!(l.seal_binding().is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

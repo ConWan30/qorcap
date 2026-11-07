@@ -10,11 +10,8 @@ The row now also commits, for that second:
 
 Axes stay raw 0..255, center 128, no deadzone. The counter-step rule is PROVISIONAL.
 
-A quiet stretch is classified from those sealed rows:
+A quiet stretch stays unknown unless every covering heartbeat passes the interval gates already on the row: one epoch, no faults, no short reads, no parse faults, no stale gap, `max_rx_gap_us` at most 50 ms, and a fresh first and last report. The span also has to be neutral (buttons up, sticks at 128) and carry one trusted anchor. `rx_bind` is a local digest of bytes this process read. It is not that anchor.
 
-- a heartbeat that keeps ticking through the stretch can support idle
-- a zero `rx_delta`, or a missing `hb_seq`, is a drop
-- no covering heartbeat, a missing `rx_bind`, a sequence break, or a stalled sensor timestamp stays unknown
+A report count can add support only after those gates. A missing `hb_seq` or a zero `rx_delta` stays unknown. Unknown is not idle. The capture does not mint a trusted anchor, so a live gap stays unknown.
 
-Unknown is not idle. An older heartbeat without `rx_bind` stays unknown.
 `pad_link.v0.json` is a reading of those rows. Its SHA-256 is on the stop checkpoint. Editing an `hb` row breaks the chunk hash.

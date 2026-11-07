@@ -24,11 +24,20 @@ pub fn route(e: &Arc<Engine>, method: &str, url: &str, body: &str) -> Resp {
         ("POST", "/record/stop") => match e.stop_recording() { Some(p) => j(200, json!({"ok": true, "file": p})), None => j(409, json!({"ok": false, "error": "not recording"})) },
         ("POST", "/replay/save") => match e.save_replay(b["out"].as_str()) { Ok(p) => j(200, json!({"ok": true, "file": p})), Err(m) => j(409, json!({"ok": false, "error": m})) },
         ("GET", "/snapshot.jpg") => {
-            if let Some(d) = e.snap_pub.lock().unwrap_or_else(|err| err.into_inner()).memory() {
-                if d.len() > 2 && d[0] == 0xFF && d[1] == 0xD8 {
-                    e.tap.offer(&d, crate::engine::wall_ms());
-                    return Resp { code: 200, ctype: "image/jpeg", body: d, headers: vec![] };
+            let now = crate::engine::wall_ms();
+            match e.snap_pub.lock().unwrap_or_else(|err| err.into_inner()).serve(now) {
+                crate::snap::Serve::Fresh { bytes, source_ms, generation } => {
+                    e.tap.offer(&bytes, source_ms);
+                    return Resp { code: 200, ctype: "image/jpeg", body: bytes, headers: vec![
+                        ("X-Qorcap-Snapshot-Source-Ms", source_ms.to_string()),
+                        ("X-Qorcap-Snapshot-Gen", generation.to_string()),
+                        ("Cache-Control", "no-store".to_string()),
+                    ] };
                 }
+                crate::snap::Serve::Stale | crate::snap::Serve::Superseded => {
+                    return j(503, json!({"ok": false, "error": "stale frame"}));
+                }
+                crate::snap::Serve::Absent => {}
             }
             match std::fs::read(&e.snapshot) {
                 Ok(d) if d.len() > 2 && d[0] == 0xFF && d[1] == 0xD8 => {

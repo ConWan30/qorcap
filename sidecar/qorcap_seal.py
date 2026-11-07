@@ -53,13 +53,17 @@ def event_released(exclusion, t_us) -> bool:
     return isinstance(end, int) and isinstance(t_us, int) and t_us >= end
 
 
-def dual_bind_passes(session, pad, checkpoint_hash) -> bool:
-    """Opening gate. Matching hashes with opening_gate false do not pass."""
+def dual_bind_passes(session, pad, checkpoint_hash, anchor=None) -> bool:
+    """Opening gate. A late hash fails. The seal hash is not an anchor."""
     if not isinstance(session, dict) or not isinstance(pad, dict):
         return False
     digest = session.get("seal_hash")
     if not isinstance(digest, str) or not digest:
         return False
     if pad.get("seal_hash") != digest or checkpoint_hash != digest:
+        return False
+    if not isinstance(anchor, str) or not anchor or anchor == digest:
+        return False
+    if session.get("anchor_ack") != anchor or pad.get("anchor_ack") != anchor:
         return False
     return session.get("opening_gate") is True and session.get("status") == "locked" and pad.get("opening_gate") is True
