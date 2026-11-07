@@ -75,9 +75,9 @@ fn two_distinct_acks_at_one_index_are_a_fork() {
     let w = World::new();
     let v = full_stream(&w, &Session::new("cov-fork"));
     let mut st = states(&w, &v);
-    let mut twin = st[1].retained().unwrap().clone();
-    twin.ack_id = hex64("twin");
-    st.push(AnchorState::SeenAtRetained(twin));
+    let twin = checked_variant(&w, &v[1], |_, a| a.received_wall_us = "1".into());
+    assert!(twin.retained().is_some());
+    st.push(twin);
     let view = coverage::reconstruct_archival(&st, 29);
     assert!(!view.complete);
     assert_eq!(view.segments.last().unwrap(), &unknown(10, 29, Reason::Fork));
@@ -88,17 +88,16 @@ fn reordered_or_relinked_interval_is_rejected() {
     let w = World::new();
     let v = full_stream(&w, &Session::new("cov-relink"));
     let base = states(&w, &v);
-    let edits: Vec<(Reason, Box<dyn Fn(&mut qorcap::anchor_seen_at::check::SeenAtFact)>)> = vec![
-        (Reason::Fork, Box::new(|f| f.commitment.prior_ack_id = Some(hex64("other-prior")))),
-        (Reason::Fork, Box::new(|f| f.commitment.chain.predecessor_head = hex64("changed-predecessor"))),
-        (Reason::LedgerRollback, Box::new(|f| f.ledger_seq = 0)),
-        (Reason::BindingMismatch, Box::new(|f| f.commitment.capture_epoch_id = id("new-capture-epoch"))),
+    let edits: Vec<(Reason, Box<dyn Fn(&mut qorcap::anchor_seen_at::types::AckUnsigned)>)> = vec![
+        (Reason::Fork, Box::new(|a| a.commitment.prior_ack_id = Some(hex64("other-prior")))),
+        (Reason::Fork, Box::new(|a| a.commitment.chain.predecessor_head = hex64("changed-predecessor"))),
+        (Reason::LedgerRollback, Box::new(|a| a.ledger_seq = "0".into())),
+        (Reason::BindingMismatch, Box::new(|a| a.commitment.capture_epoch_id = id("new-capture-epoch"))),
     ];
     for (want, edit) in edits {
         let mut st = base.clone();
-        let mut f = st[1].retained().unwrap().clone();
-        edit(&mut f);
-        st[1] = AnchorState::SeenAtRetained(f);
+        st[1] = checked_variant(&w, &v[1], |_, a| edit(a));
+        assert!(st[1].retained().is_some());
         let view = coverage::reconstruct_archival(&st, 29);
         assert_eq!(view.segments.last().unwrap(), &unknown(10, 29, want));
         assert!(!view.complete);
@@ -149,10 +148,13 @@ fn opening_that_starts_mid_chain_leaves_earlier_rows_unknown() {
     let w = World::new();
     let s = Session::new("cov-mid");
     let o = exchange(&w, &s, Purpose::Opening, 0, None, 0, 9);
-    let mut f = o.state(&w.policy).retained().unwrap().clone();
-    f.commitment.chain.predecessor_seq = Some("4".into());
-    f.commitment.chain.first_seq = "5".into();
-    let view = coverage::reconstruct_archival(&[AnchorState::SeenAtRetained(f)], 9);
+    let mid = checked_variant(&w, &o, |_, a| {
+        a.commitment.chain.predecessor_seq = Some("4".into());
+        a.commitment.chain.predecessor_head = s.head(4);
+        a.commitment.chain.first_seq = "5".into();
+    });
+    assert!(mid.retained().is_some());
+    let view = coverage::reconstruct_archival(&[mid], 9);
     assert_eq!(view.segments[0], unknown(0, 4, Reason::Gap));
     assert!(view.is_seen_at(5));
 }
@@ -286,7 +288,7 @@ fn changed_clock_duplicate_latches_a_break_before_dedup() {
         assert!(elig.complete());
         let dup = rechecked_under_clock(&v[1], boot, epoch).state(&w.policy);
         let f = dup.retained().expect("rechecked under its own clock, the ack is retained");
-        assert_eq!(f.ack_id, st[1].retained().unwrap().ack_id, "same ack id as the accepted fact");
+        assert_eq!(f.ack_id(), st[1].retained().unwrap().ack_id(), "same ack id as the accepted fact");
         elig.record(&dup, 29);
         assert_eq!(elig.break_reason(), Some(Reason::ClientClockDomainChanged), "boot={boot} epoch={epoch}");
         assert!(!elig.complete());
@@ -341,23 +343,15 @@ fn range_ending_at_u64_max_is_rejected_and_fails_closed_without_overflow() {
     assert_eq!(c.chain.validate(), Err(Reason::FieldFormat));
     assert_eq!(c.validate(), Err(Reason::FieldFormat));
     assert!(w.svc.post_commitments(&commit_body(&ch, &c)).is_err());
-    // A hand-assembled fact carrying such a range (validation bypassed) still fails
-    // closed in coverage instead of panicking in debug or wrapping in release.
+    // Even signed synthetic material cannot mint an out-of-range checked fact.
+    // The internal malformed-token arithmetic regression is a cfg(test) unit test.
     let v = full_stream(&w, &Session::new("cov-max-fact"));
-    let mut f = v[0].state(&w.policy).retained().unwrap().clone();
-    f.commitment.chain.last_seq = u64::MAX.to_string();
-    let st = AnchorState::SeenAtRetained(f);
-    let mut elig = coverage::StreamEligibility::new();
-    elig.record(&st, u64::MAX);
-    assert_eq!(elig.break_reason(), Some(Reason::SchemaViolation));
+    let st = checked_variant(&w, &v[0], |_, a| a.commitment.chain.last_seq = u64::MAX.to_string());
+    assert_eq!(unknown_reasons(&st), [Reason::FieldFormat]);
+    let elig = coverage::StreamEligibility::from_arrival_order(&[st], u64::MAX);
     assert!(!elig.complete());
     assert!(!elig.is_eligible(0));
-    // The unknown count for 0..=MAX saturates at u64::MAX instead of wrapping to 0.
     assert_eq!(elig.unknown_rows(), u64::MAX);
-    let view = coverage::reconstruct_archival(&[st], u64::MAX);
-    assert!(!view.complete);
-    assert_eq!(view.segments, vec![unknown(0, u64::MAX, Reason::SchemaViolation)]);
-    assert_eq!(view.unknown_rows(), u64::MAX);
 }
 
 #[test]
@@ -367,19 +361,22 @@ fn reordered_chain_range_is_a_fork_and_restart_invalidates_the_stream() {
     let base = states(&w, &v);
     // Reorder: the interval claims a range that does not start where the opening ended.
     let mut st = base.clone();
-    let mut f = st[1].retained().unwrap().clone();
-    f.commitment.chain.first_seq = "11".into();
-    st[1] = AnchorState::SeenAtRetained(f);
+    st[1] = checked_variant(&w, &v[1], |_, a| {
+        a.commitment.chain.first_seq = "11".into();
+        a.commitment.chain.predecessor_seq = Some("10".into());
+    });
+    assert!(st[1].retained().is_some());
     let view = coverage::reconstruct_archival(&st, 29);
     assert_eq!(view.segments.last().unwrap(), &unknown(10, 29, Reason::Fork));
     assert!(!view.complete);
     // Restart: a new service boot/clock epoch mid-stream breaks the link, and the
     // otherwise-valid close after it does not clear the break.
     let mut st = base.clone();
-    let mut f = st[1].retained().unwrap().clone();
-    f.server_boot_id = id("restarted-boot");
-    f.server_clock_epoch_id = id("restarted-clock");
-    st[1] = AnchorState::SeenAtRetained(f);
+    st[1] = checked_variant(&w, &v[1], |_, a| {
+        a.server_boot_id = id("restarted-boot");
+        a.server_clock_epoch_id = id("restarted-clock");
+    });
+    assert!(st[1].retained().is_some());
     let view = coverage::reconstruct_archival(&st, 29);
     assert_eq!(view.segments.last().unwrap(), &unknown(10, 29, Reason::ServerEpochMismatch));
     assert!(!view.complete);
@@ -408,9 +405,8 @@ fn ledger_entries_recompute_and_link_the_stream() {
     assert_eq!(prev_head, w.svc.ledger_head(), "recomputed head matches the service ledger");
     // A fact whose ledger linkage does not recompute breaks coverage from that point.
     let mut st = states(&w, &v);
-    let mut f = st[2].retained().unwrap().clone();
-    f.prev_ledger_entry_digest = hex64("not-the-ledger-entry");
-    st[2] = AnchorState::SeenAtRetained(f);
+    st[2] = checked_variant(&w, &v[2], |_, a| a.prev_ledger_entry_digest = hex64("not-the-ledger-entry"));
+    assert!(st[2].retained().is_some());
     let view = coverage::reconstruct_archival(&st, 29);
     assert!(!view.complete);
     assert_eq!(view.segments.last().unwrap(), &unknown(20, 29, Reason::LedgerRollback));

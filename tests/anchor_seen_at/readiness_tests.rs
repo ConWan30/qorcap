@@ -80,7 +80,7 @@ fn fabricated_host_commitment_that_gets_acked_is_not_validated_capture() {
 fn stale_snapshot_with_a_fresh_valid_ack_stays_withheld() {
     let r = ready();
     let fresh_ack = r.opening.retained().unwrap();
-    assert!(r.view.complete() && fresh_ack.received_mono_ns > 0);
+    assert!(r.view.complete() && fresh_ack.received_mono_ns() > 0);
     // frame acquired before the exclusion endpoint, polled long after
     let frames = [frame(&r.s, 3, 9_000_000), frame(&r.s, 18, 2), frame(&r.s, 25, 3)];
     assert_eq!(withheld(evaluate(&inputs(&r, &frames))), [Reason::StaleFrame]);
@@ -139,10 +139,9 @@ fn late_unretained_or_non_opening_anchor_withholds() {
     let mut i = inputs(&r, &frames);
     i.opening = &late;
     assert!(withheld(evaluate(&i)).contains(&Reason::AnchorNotRetained));
-    let interval = exchange(&r.w, &Session::new("ready-interval-src"), Purpose::Opening, 0, None, 0, 1);
-    let mut f = interval.state(&r.w.policy).retained().unwrap().clone();
-    f.commitment.purpose = Purpose::Interval;
-    let not_opening = AnchorState::SeenAtRetained(f);
+    let stream = full_stream(&r.w, &Session::new("ready-interval-src"));
+    let not_opening = stream[1].state(&r.w.policy);
+    assert!(not_opening.retained().is_some());
     let mut i = inputs(&r, &frames);
     i.opening = &not_opening;
     assert!(withheld(evaluate(&i)).contains(&Reason::AnchorNotRetained));
@@ -284,18 +283,16 @@ fn substituted_opening_presented_directly_to_evaluate_withholds() {
     assert!(why.contains(&Reason::ClientClockDomainChanged), "{why:?}");
 
     // (b) A different ack id over the accepted opening's context.
-    let mut relabeled = st[0].retained().unwrap().clone();
-    relabeled.ack_id = hex64("substituted-opening-ack");
-    let relabeled = AnchorState::SeenAtRetained(relabeled);
+    let relabeled = checked_variant(&r.w, &v[0], |_, a| a.received_wall_us = "1".into());
+    assert!(relabeled.retained().is_some());
     let mut i = inputs(&r, &frames);
     i.opening = &relabeled;
     let why = withheld(evaluate(&i));
     assert!(why.contains(&Reason::BindingMismatch), "{why:?}");
 
-    // (c) A changed commitment (here the bound client nonce) under the accepted ack id.
-    let mut rebound = st[0].retained().unwrap().clone();
-    rebound.commitment.client_nonce = hex64("substituted-nonce");
-    let rebound = AnchorState::SeenAtRetained(rebound);
+    // (c) A separately checked changed commitment (here the bound client nonce).
+    let rebound = checked_variant(&r.w, &v[0], |_, a| a.commitment.client_nonce = hex64("substituted-nonce"));
+    assert!(rebound.retained().is_some());
     let mut i = inputs(&r, &frames);
     i.opening = &rebound;
     let why = withheld(evaluate(&i));
@@ -331,4 +328,110 @@ fn loss_then_recovery_and_reversed_arrival_stay_withheld_in_readiness() {
     let r = Ready { opening: st[0].clone(), view: rev, w: r.w, s };
     let why = withheld(evaluate(&inputs(&r, &frames)));
     assert!(why.contains(&Reason::Reordered), "{why:?}");
+}
+
+#[test]
+fn external_late_token_relabel_cannot_upgrade_any_stream_position() {
+    for position in 0..3 {
+        for age_late in [false, true] {
+            let w = World::new();
+            let s = Session::new("opaque-late");
+            let mut exchanges = full_stream(&w, &s);
+            let good: Vec<_> = exchanges.iter().map(|ex| ex.state(&w.policy)).collect();
+            let frames = [frame(&s, 12, 1), frame(&s, 18, 2), frame(&s, 25, 3)];
+            let mut r = Ready { opening: good[0].clone(), view: StreamEligibility::from_arrival_order(&good, 29), w, s };
+            assert_eq!(evaluate(&inputs(&r, &frames)), Readiness::PracticeReadyForward);
+            let ex = &mut exchanges[position];
+            if age_late {
+                // Purpose-specific challenge age is measured at echo (opening) or send.
+                ex.samples.echo_capture_mono_ns = (1001 + SYNTH_CHALLENGE_AGE_NS).to_string();
+                ex.samples.send_mono_ns = (1001 + SYNTH_CHALLENGE_AGE_NS).to_string();
+                ex.samples.receive_mono_ns = (2001 + SYNTH_CHALLENGE_AGE_NS).to_string();
+            } else {
+                ex.samples.receive_mono_ns = (3001 + SYNTH_RTT_BUDGET_NS).to_string();
+            }
+            let late = ex.state(&r.w.policy);
+            let fact = match late { AnchorState::SeenAtLate(f) => f, other => panic!("expected late, got {}", other.status_code()) };
+            assert!(fact.is_late());
+            let relabeled = AnchorState::SeenAtRetained(fact.clone());
+            assert_eq!(relabeled.status_code(), "seen_at_late");
+            assert_eq!(relabeled.reasons(), vec![Reason::LateAck]);
+            assert!(relabeled.retained().is_none());
+            let mut attempted = good.clone();
+            attempted[position] = relabeled.clone();
+            let rebuilt = StreamEligibility::from_arrival_order(&attempted, 29);
+            assert_eq!(rebuilt.break_reason(), Some(Reason::LateAck));
+            assert!(!rebuilt.complete());
+            // Explicit record follows the same immutable token classification.
+            let mut recorded = StreamEligibility::new();
+            for state in &attempted { recorded.record(state, 29); }
+            assert_eq!(recorded.break_reason(), Some(Reason::LateAck));
+            assert!(!coverage::reconstruct_archival(&attempted, 29).complete);
+            r.opening = attempted[0].clone();
+            r.view = rebuilt;
+            assert!(withheld(evaluate(&inputs(&r, &frames))).contains(&Reason::LateAck));
+            // An intact clone retains its original late classification too.
+            assert!(fact.clone().is_late());
+        }
+    }
+}
+
+#[test]
+fn external_rewrapped_late_opening_direct_to_evaluate_withholds() {
+    let w = World::new();
+    let s = Session::new("opaque-presentation");
+    let mut exchanges = full_stream(&w, &s);
+    let good: Vec<_> = exchanges.iter().map(|ex| ex.state(&w.policy)).collect();
+    let frames = [frame(&s, 12, 1), frame(&s, 18, 2), frame(&s, 25, 3)];
+    let mut r = Ready { opening: good[0].clone(), view: StreamEligibility::from_arrival_order(&good, 29), w, s };
+    exchanges[0].samples.receive_mono_ns = (3001 + SYNTH_RTT_BUDGET_NS).to_string();
+    let late = exchanges[0].state(&r.w.policy);
+    let fact = match late { AnchorState::SeenAtLate(f) => f, _ => panic!("expected late") };
+    r.opening = AnchorState::SeenAtRetained(fact);
+    assert!(withheld(evaluate(&inputs(&r, &frames))).contains(&Reason::AnchorNotRetained));
+    r.opening = good[0].clone();
+    assert_eq!(evaluate(&inputs(&r, &frames)), Readiness::PracticeReadyForward);
+    // Fail closed in the other direction as well: the outer late label is sufficient.
+    r.opening = AnchorState::SeenAtLate(good[0].retained().unwrap().clone());
+    assert_eq!(r.opening.status_code(), "seen_at_late");
+    assert!(withheld(evaluate(&inputs(&r, &frames))).contains(&Reason::AnchorNotRetained));
+}
+
+#[test]
+fn external_getter_snapshots_cannot_edit_the_checked_fact() {
+    let r = ready();
+    let fact = r.opening.retained().unwrap();
+    let mut snapshot = fact.commitment().clone();
+    snapshot.commitment_index = "999".into();
+    assert_ne!(&snapshot, fact.commitment());
+    assert_eq!(fact.commitment().index(), 0);
+    assert!(!fact.is_late());
+    let frames = [frame(&r.s, 12, 1), frame(&r.s, 18, 2), frame(&r.s, 25, 3)];
+    assert_eq!(evaluate(&inputs(&r, &frames)), Readiness::PracticeReadyForward);
+}
+
+#[test]
+fn external_late_recheck_duplicate_latches_before_dedup() {
+    for position in 0..3 {
+        let w = World::new();
+        let s = Session::new("opaque-late-duplicate");
+        let mut exchanges = full_stream(&w, &s);
+        let mut states: Vec<_> = exchanges.iter().map(|ex| ex.state(&w.policy)).collect();
+        let mut eligibility = StreamEligibility::from_arrival_order(&states, 29);
+        assert!(eligibility.complete());
+        exchanges[position].samples.receive_mono_ns = (3001 + SYNTH_RTT_BUDGET_NS).to_string();
+        let late = exchanges[position].state(&w.policy);
+        let fact = match late { AnchorState::SeenAtLate(f) => f, _ => panic!("expected late") };
+        assert_eq!(fact.ack_id(), states[position].retained().unwrap().ack_id());
+        let attempted = AnchorState::SeenAtRetained(fact);
+        eligibility.record(&attempted, 29);
+        assert_eq!(eligibility.break_reason(), Some(Reason::LateAck));
+        assert!(!eligibility.complete());
+        eligibility.record(&states[position], 29);
+        assert_eq!(eligibility.break_reason(), Some(Reason::LateAck));
+        states.push(attempted);
+        assert!(!coverage::reconstruct_archival(&states, 29).complete);
+        states.reverse();
+        assert!(!coverage::reconstruct_archival(&states, 29).complete);
+    }
 }

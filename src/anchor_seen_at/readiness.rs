@@ -62,7 +62,7 @@ pub fn evaluate(i: &ReadinessInputs) -> Readiness {
     // even when it shares the stream context.
     let accepted_opening = i.eligibility.accepted_opening();
     let opening = accepted_opening;
-    let supplied = i.opening.retained().filter(|f| f.commitment.purpose == Purpose::Opening);
+    let supplied = i.opening.retained().filter(|f| f.commitment().purpose == Purpose::Opening);
     if supplied.is_none() { why.insert(Reason::AnchorNotRetained); }
     match (supplied, accepted_opening) {
         (Some(s), Some(a)) => {
@@ -88,7 +88,7 @@ pub fn evaluate(i: &ReadinessInputs) -> Readiness {
     let mut digest_seqs: BTreeMap<&str, BTreeSet<u64>> = BTreeMap::new();
     let mut seq_digests: BTreeMap<u64, BTreeSet<&str>> = BTreeMap::new();
     for f in i.frames {
-        let fresh = opening.is_some_and(|o| o.commitment.capture_epoch_id == f.capture_epoch_id)
+        let fresh = opening.is_some_and(|o| o.commitment().capture_epoch_id == f.capture_epoch_id)
             && i.eligibility.is_eligible(f.acquisition_seq)
             && i.exclusion_end_seq.is_some_and(|x| f.acquisition_seq > x);
         if !fresh { why.insert(Reason::StaleFrame); }

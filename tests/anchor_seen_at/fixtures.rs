@@ -182,3 +182,26 @@ pub fn full_stream(w: &World, s: &Session) -> Vec<Exchange> {
 pub fn unknown_reasons(s: &AnchorState) -> Vec<qorcap::anchor_seen_at::Reason> {
     match s { AnchorState::Unknown { reasons } => reasons.clone(), other => panic!("expected unknown, got {}", other.status_code()) }
 }
+
+/// Synthetic signed variants for link/binding tests. All resulting facts still go
+/// through the public checker; this helper never constructs or edits a fact.
+pub fn checked_variant(w: &World, ex: &Exchange, edit: impl FnOnce(&mut SignedChallenge, &mut AckUnsigned)) -> AnchorState {
+    let mut ch = ex.ch.clone();
+    let mut ack = ex.ack().unsigned_payload;
+    edit(&mut ch, &mut ack);
+    ch.unsigned_payload.purpose = ack.commitment.purpose;
+    ch.unsigned_payload.session_id = ack.commitment.session_id.clone();
+    ch.unsigned_payload.device_epoch_id = ack.commitment.device_epoch_id.clone();
+    ch.unsigned_payload.capture_epoch_id = ack.commitment.capture_epoch_id.clone();
+    ch.unsigned_payload.client_nonce = ack.commitment.client_nonce.clone();
+    ch.unsigned_payload.server_nonce = ack.commitment.server_nonce.clone();
+    ch.unsigned_payload.server_boot_id = ack.server_boot_id.clone();
+    ch.unsigned_payload.server_clock_epoch_id = ack.server_clock_epoch_id.clone();
+    let ch = SignedChallenge::sign(ch.unsigned_payload, &w.ch_key).unwrap();
+    ack.commitment.challenge_digest = ch.unsigned_payload.digest().unwrap();
+    ack.commitment_digest = ack.commitment.digest().unwrap();
+    ack.purpose = ack.commitment.purpose;
+    let sent = ack.commitment.clone();
+    let bytes = enc(&SignedAck::sign(ack, &w.ack_key).unwrap());
+    check::check_ack(&ch, &bytes, &sent, &ex.samples, &w.policy)
+}

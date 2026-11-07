@@ -40,29 +40,52 @@ pub const TRANSPORT_OK: &str = "ok";
 
 /// What a checked acknowledgment establishes: the service saw `commitment` at `received_mono_ns`
 /// in its own clock domain. Nothing about whether the committed capture is genuine.
+#[doc = include_str!("../../tests/anchor_seen_at/fact_api.md")]
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SeenAtFact {
-    pub ack_id: String,
-    pub ack_key_id: String,
-    pub challenge_key_id: String,
-    pub trust_policy_id: String,
-    pub commitment: Commitment,
-    pub commitment_digest: String,
-    pub server_boot_id: String,
-    pub server_clock_epoch_id: String,
+pub struct CheckedSeenAt {
+    ack_id: String,
+    ack_key_id: String,
+    challenge_key_id: String,
+    trust_policy_id: String,
+    commitment: Commitment,
+    commitment_digest: String,
+    server_boot_id: String,
+    server_clock_epoch_id: String,
     /// The checking client's own clock identity for this exchange, from its retained
     /// samples. Carried on the fact so a stream can tell a client clock-domain change
     /// between two exchanges from one continuous client clock.
-    pub client_boot_id: String,
-    pub client_clock_epoch_id: String,
-    pub received_mono_ns: u64,
-    pub received_wall_us: String,
-    pub ledger_seq: u64,
-    pub prev_ledger_entry_digest: String,
-    pub rtt_ns: u64,
+    client_boot_id: String,
+    client_clock_epoch_id: String,
+    received_mono_ns: u64,
+    received_wall_us: String,
+    ledger_seq: u64,
+    prev_ledger_entry_digest: String,
+    rtt_ns: u64,
+    // Immutable checker classification; an outer enum label cannot upgrade it.
+    late: bool,
 }
 
-impl SeenAtFact {
+/// Compatibility name for the opaque checked token; there is no mutable raw fact API.
+pub type SeenAtFact = CheckedSeenAt;
+
+impl CheckedSeenAt {
+    /// The classification minted by `check_ack`, independent of any outer label.
+    pub fn is_late(&self) -> bool { self.late }
+    pub fn ack_id(&self) -> &String { &self.ack_id }
+    pub fn ack_key_id(&self) -> &String { &self.ack_key_id }
+    pub fn challenge_key_id(&self) -> &String { &self.challenge_key_id }
+    pub fn trust_policy_id(&self) -> &String { &self.trust_policy_id }
+    pub fn commitment(&self) -> &Commitment { &self.commitment }
+    pub fn commitment_digest(&self) -> &String { &self.commitment_digest }
+    pub fn server_boot_id(&self) -> &String { &self.server_boot_id }
+    pub fn server_clock_epoch_id(&self) -> &String { &self.server_clock_epoch_id }
+    pub fn client_boot_id(&self) -> &String { &self.client_boot_id }
+    pub fn client_clock_epoch_id(&self) -> &String { &self.client_clock_epoch_id }
+    pub fn received_mono_ns(&self) -> u64 { self.received_mono_ns }
+    pub fn received_wall_us(&self) -> &String { &self.received_wall_us }
+    pub fn ledger_seq(&self) -> u64 { self.ledger_seq }
+    pub fn prev_ledger_entry_digest(&self) -> &String { &self.prev_ledger_entry_digest }
+    pub fn rtt_ns(&self) -> u64 { self.rtt_ns }
     pub fn meaning(&self) -> &'static str { ACK_MEANING }
     pub fn capture_validity(&self) -> CaptureValidity { CaptureValidity::NotEstablishedByAck }
 }
@@ -99,13 +122,13 @@ pub fn check_challenge(bytes: &[u8], req: &ChallengeRequest, trust: &TrustPolicy
 /// `challenge` the challenge it consumed; an authentic ack for anything else is rejected.
 pub fn check_ack(challenge: &SignedChallenge, ack_bytes: &[u8], sent: &Commitment, samples: &LocalSamples, policy: &ClientPolicy) -> AnchorState {
     match check_ack_inner(challenge, ack_bytes, sent, samples, policy) {
-        Ok((fact, false)) => AnchorState::SeenAtRetained(fact),
-        Ok((fact, true)) => AnchorState::SeenAtLate(fact),
+        Ok(fact) if fact.is_late() => AnchorState::SeenAtLate(fact),
+        Ok(fact) => AnchorState::SeenAtRetained(fact),
         Err(r) => AnchorState::unknown(r),
     }
 }
 
-fn check_ack_inner(challenge: &SignedChallenge, ack_bytes: &[u8], sent: &Commitment, samples: &LocalSamples, policy: &ClientPolicy) -> Result<(SeenAtFact, bool), Reason> {
+fn check_ack_inner(challenge: &SignedChallenge, ack_bytes: &[u8], sent: &Commitment, samples: &LocalSamples, policy: &ClientPolicy) -> Result<CheckedSeenAt, Reason> {
     let ack: SignedAck = canon::parse_canonical(ack_bytes)?;
     let u = &ack.unsigned_payload;
     u.validate()?;
@@ -157,7 +180,7 @@ fn check_ack_inner(challenge: &SignedChallenge, ack_bytes: &[u8], sent: &Commitm
     let rtt = recv - send;
     let late = rtt > max_rtt || age > max_age;
 
-    Ok((SeenAtFact {
+    Ok(CheckedSeenAt {
         ack_id: ack.ack_id.clone(),
         ack_key_id: u.key_id.clone(),
         challenge_key_id: ch.key_id.clone(),
@@ -173,5 +196,45 @@ fn check_ack_inner(challenge: &SignedChallenge, ack_bytes: &[u8], sent: &Commitm
         ledger_seq: u.ledger(),
         prev_ledger_entry_digest: u.prev_ledger_entry_digest.clone(),
         rtt_ns: rtt,
-    }, late))
+        late,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use super::super::coverage::{self, RangeStatus, StreamEligibility};
+
+    #[test]
+    fn internal_malformed_max_range_remains_unknown_without_overflow() {
+        // Only this unit test can build a malformed token. Production construction
+        // remains inside check_ack_inner, after signature/binding/timing checks.
+        let commitment: Commitment = serde_json::from_value(serde_json::json!({
+            "schema": "synthetic", "purpose": "opening", "service": "synthetic",
+            "audience": "synthetic", "policy_id": "synthetic", "session_id": "synthetic",
+            "device_epoch_id": "synthetic", "capture_epoch_id": "synthetic",
+            "seal_hash": "synthetic", "challenge_id": "synthetic", "challenge_digest": "synthetic",
+            "client_nonce": "synthetic", "server_nonce": "synthetic", "commitment_index": "0",
+            "chain": { "chain_id": "synthetic", "chain_schema": "synthetic", "algorithm": "synthetic",
+                "predecessor_head": "synthetic", "first_seq": "0", "last_seq": u64::MAX.to_string(),
+                "end_head": "synthetic", "checkpoint_id": "synthetic" }, "capture_ranges": []
+        })).unwrap();
+        let fact = SeenAtFact {
+            ack_id: String::new(), ack_key_id: String::new(), challenge_key_id: String::new(),
+            trust_policy_id: String::new(), commitment, commitment_digest: String::new(),
+            server_boot_id: String::new(), server_clock_epoch_id: String::new(),
+            client_boot_id: String::new(), client_clock_epoch_id: String::new(),
+            received_mono_ns: 0, received_wall_us: String::new(), ledger_seq: 0,
+            prev_ledger_entry_digest: String::new(), rtt_ns: 0, late: false,
+        };
+        let state = AnchorState::SeenAtRetained(fact);
+        let eligibility = StreamEligibility::from_arrival_order(&[state.clone()], u64::MAX);
+        assert_eq!(eligibility.break_reason(), Some(Reason::SchemaViolation));
+        assert!(!eligibility.complete() && !eligibility.is_eligible(0));
+        assert_eq!(eligibility.unknown_rows(), u64::MAX);
+        let archival = coverage::reconstruct_archival(&[state], u64::MAX);
+        assert!(!archival.complete);
+        assert_eq!(archival.unknown_rows(), u64::MAX);
+        assert_eq!(archival.segments[0].status, RangeStatus::Unknown(Reason::SchemaViolation));
+    }
 }

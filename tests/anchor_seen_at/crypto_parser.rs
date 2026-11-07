@@ -33,7 +33,7 @@ fn genuine_ack_is_seen_at_retained_and_means_only_seen_at() {
     let f: &SeenAtFact = st.retained().expect("synthetic genuine ack is seen-at retained");
     assert_eq!(f.meaning(), ACK_MEANING);
     assert_eq!(f.capture_validity(), CaptureValidity::NotEstablishedByAck);
-    assert_eq!(f.commitment, ex.commitment);
+    assert_eq!(f.commitment(), &ex.commitment);
 }
 
 #[test]

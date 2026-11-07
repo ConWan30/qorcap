@@ -111,9 +111,10 @@ pub enum AnchorState {
     Unknown { reasons: Vec<Reason> },
     /// Cryptographically consistent but outside the timing budget: retained as late evidence,
     /// unusable for readiness, and it never clears earlier play.
-    SeenAtLate(check::SeenAtFact),
+    SeenAtLate(check::CheckedSeenAt),
     /// The service saw this commitment at this time. Says nothing about capture validity.
-    SeenAtRetained(check::SeenAtFact),
+    /// This label cannot upgrade a late token: consumers also check its private classification.
+    SeenAtRetained(check::CheckedSeenAt),
 }
 
 impl Default for AnchorState {
@@ -126,6 +127,7 @@ impl AnchorState {
         match self {
             AnchorState::Unknown { .. } => "unknown",
             AnchorState::SeenAtLate(_) => "seen_at_late",
+            AnchorState::SeenAtRetained(f) if f.is_late() => "seen_at_late",
             AnchorState::SeenAtRetained(_) => "seen_at_retained",
         }
     }
@@ -133,10 +135,11 @@ impl AnchorState {
         match self {
             AnchorState::Unknown { reasons } => reasons.clone(),
             AnchorState::SeenAtLate(_) => vec![Reason::LateAck],
+            AnchorState::SeenAtRetained(f) if f.is_late() => vec![Reason::LateAck],
             AnchorState::SeenAtRetained(_) => vec![],
         }
     }
-    pub fn retained(&self) -> Option<&check::SeenAtFact> {
-        match self { AnchorState::SeenAtRetained(f) => Some(f), _ => None }
+    pub fn retained(&self) -> Option<&check::CheckedSeenAt> {
+        match self { AnchorState::SeenAtRetained(f) if !f.is_late() => Some(f), _ => None }
     }
 }
