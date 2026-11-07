@@ -384,7 +384,7 @@ def _final_score_value(value: Any) -> dict | None:
 def _final_score_pair(proposed, independent) -> tuple[str, str]:
     actual = _final_score_value(independent)
     wanted = _final_score_value(proposed)
-    if actual is None or wanted is None:
+    if actual is None or wanted is None or proposed != wanted:
         return "unverifiable", "no_independent_value"
     if (actual.get("game") == "cod") != (wanted.get("game") == "cod"):
         return "contradicted", "value_mismatch"

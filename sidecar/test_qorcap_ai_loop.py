@@ -412,6 +412,8 @@ def test_optional_score_reads_are_not_false_mismatches():
     assert loop.join_outcomes([proposal], referee=view)[0]["outcome"] == "contradicted"
     view["checks"]["final_reread"]["value"].pop("quarter")
     assert loop.join_outcomes([proposal], referee=view)[0]["outcome"] == "unverifiable"
+    proposal["value"]["quarter"] = True
+    assert loop.join_outcomes([proposal], referee=view)[0]["outcome"] == "unverifiable"
 
 
 def test_review_adapter_rejects_model_verdict():
