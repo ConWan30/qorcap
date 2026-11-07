@@ -169,7 +169,10 @@ impl ChainRange {
         ensure(is_id(&self.chain_id) && short_text(&self.chain_schema) && self.algorithm == HASH_ALG, Reason::FieldFormat)?;
         ensure(is_hex64(&self.predecessor_head) && is_hex64(&self.end_head) && is_hex64(&self.checkpoint_id), Reason::FieldFormat)?;
         let (f, l) = (dec_u64(&self.first_seq).ok_or(Reason::FieldFormat)?, dec_u64(&self.last_seq).ok_or(Reason::FieldFormat)?);
-        ensure(f <= l, Reason::FieldFormat)?;
+        // A range ending at u64::MAX is unrepresentable downstream: its successor row
+        // and its row count do not fit in a u64. Reject it here instead of letting
+        // coverage arithmetic overflow or wrap.
+        ensure(f <= l && l.checked_add(1).is_some(), Reason::FieldFormat)?;
         match &self.predecessor_seq {
             None => ensure(f == 0 && self.predecessor_head == canon::ZERO_HEAD, Reason::FieldFormat),
             Some(p) => ensure(dec_u64(p).and_then(|p| p.checked_add(1)) == Some(f), Reason::FieldFormat),
@@ -228,7 +231,8 @@ impl Commitment {
         ensure(!self.capture_ranges.is_empty(), Reason::SchemaViolation)?;
         for r in &self.capture_ranges {
             let (f, l) = (dec_u64(&r.first_seq), dec_u64(&r.last_seq));
-            ensure(is_id(&r.capture_id) && is_id(&r.clock_domain_id) && f.is_some() && l.is_some() && f <= l, Reason::FieldFormat)?;
+            ensure(is_id(&r.capture_id) && is_id(&r.clock_domain_id) && f.is_some() && l.is_some() && f <= l
+                && l.and_then(|l| l.checked_add(1)).is_some(), Reason::FieldFormat)?;
         }
         match (&self.close, self.purpose) {
             (Some(c), Purpose::Close) => {

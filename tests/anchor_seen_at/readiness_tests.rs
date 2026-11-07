@@ -217,6 +217,48 @@ fn cross_exchange_client_clock_change_stays_withheld_in_readiness() {
 }
 
 #[test]
+fn changed_clock_duplicate_stays_withheld_and_identical_duplicate_is_harmless() {
+    use qorcap::anchor_seen_at::check::ClockRef;
+    let w = World::new();
+    let s = Session::new("ready-dup-clock");
+    let v = full_stream(&w, &s);
+    let st: Vec<AnchorState> = v.iter().map(|e| e.state(&w.policy)).collect();
+    let elig = StreamEligibility::from_arrival_order(&st, 29);
+    let mut r = Ready { opening: st[0].clone(), view: elig, w, s: s.clone() };
+    let frames = [frame(&s, 12, 1), frame(&s, 18, 2), frame(&s, 25, 3)];
+    assert_eq!(evaluate(&inputs(&r, &frames)), Readiness::PracticeReadyForward);
+    // An identical-context duplicate of the interval is a harmless retry.
+    r.view.record(&st[1], 29);
+    assert_eq!(r.view.break_reason(), None);
+    assert_eq!(evaluate(&inputs(&r, &frames)), Readiness::PracticeReadyForward);
+    // The same ack rechecked under a different client boot is not that retry: the
+    // duplicate latches a clock break before dedup and readiness falls.
+    let mut dup_ex = v[1].clone();
+    dup_ex.samples.send_clock = ClockRef { boot_id: id("ready-dup-other-boot"), clock_epoch_id: s.client_clock.clock_epoch_id.clone() };
+    dup_ex.samples.receive_clock = dup_ex.samples.send_clock.clone();
+    let dup = dup_ex.state(&r.w.policy);
+    assert!(dup.retained().is_some());
+    r.view.record(&dup, 29);
+    assert_eq!(r.view.break_reason(), Some(Reason::ClientClockDomainChanged));
+    let why = withheld(evaluate(&inputs(&r, &frames)));
+    assert!(why.contains(&Reason::ClientClockDomainChanged), "{why:?}");
+}
+
+#[test]
+fn post_close_duplicate_extension_stays_withheld_in_readiness() {
+    let mut r = ready();
+    let frames = [frame(&r.s, 12, 1), frame(&r.s, 18, 2), frame(&r.s, 25, 3)];
+    assert_eq!(evaluate(&inputs(&r, &frames)), Readiness::PracticeReadyForward);
+    // A duplicate of the accepted opening, after the close sealed row 29, carrying a
+    // source bound extended to 35.
+    r.view.record(&r.opening.clone(), 35);
+    assert_eq!(r.view.break_reason(), Some(Reason::RowsAfterClose));
+    assert!(!r.view.complete());
+    let why = withheld(evaluate(&inputs(&r, &frames)));
+    assert!(why.contains(&Reason::RowsAfterClose), "{why:?}");
+}
+
+#[test]
 fn loss_then_recovery_and_reversed_arrival_stay_withheld_in_readiness() {
     let w = World::new();
     let s = Session::new("ready-forward-only");

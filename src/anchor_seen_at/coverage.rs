@@ -64,6 +64,13 @@ pub fn ledger_entry_digest(f: &SeenAtFact) -> Option<String> {
     })).ok()
 }
 
+/// Number of rows in `first..=last`, saturated at `u64::MAX`: a range ending at
+/// `u64::MAX` has an unrepresentable true count, so it reports the largest
+/// representable count instead of wrapping to zero.
+fn row_count(first_seq: u64, last_seq: u64) -> u64 {
+    last_seq.saturating_sub(first_seq).saturating_add(1)
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RangeStatus { SeenAtRetained { ack_id: String }, Unknown(Reason) }
 
@@ -79,7 +86,8 @@ impl CoverageView {
     }
     pub fn is_seen_at(&self, seq: u64) -> bool { matches!(self.status_at(seq), Some(RangeStatus::SeenAtRetained { .. })) }
     pub fn unknown_rows(&self) -> u64 {
-        self.segments.iter().filter(|s| matches!(s.status, RangeStatus::Unknown(_))).map(|s| s.last_seq - s.first_seq + 1).sum()
+        self.segments.iter().filter(|s| matches!(s.status, RangeStatus::Unknown(_)))
+            .fold(0u64, |n, s| n.saturating_add(row_count(s.first_seq, s.last_seq)))
     }
 }
 
@@ -91,17 +99,29 @@ impl CoverageView {
 /// Deliberately not `Clone`: a clone taken before a break could be carried forward and
 /// completed independently while the original stays broken, forking the break lineage.
 /// Eligibility has one owner and one history.
+///
+/// Permanence holds only within a preserved object. [`StreamEligibility::new`] and
+/// [`StreamEligibility::from_arrival_order`] start with no history: they cannot know
+/// about unknown/late observations that were seen before they were created, and
+/// constructing a fresh object mid-stream does not resurrect eligibility. A caller
+/// that cannot present the preserved object for a stream must treat that stream's
+/// history as missing — and missing history reads UNKNOWN, never eligible.
 #[derive(Debug, PartialEq, Eq)]
 pub struct StreamEligibility {
     eligible: Vec<Segment>,
     stream_context: Option<StreamContext>,
-    accepted_ids: BTreeSet<String>,
+    /// Each accepted ack, with the source bound it was accepted under. Kept so a later
+    /// observation carrying the same ack id can be compared against the accepted fact's
+    /// full immutable context before it is treated as an idempotent retry.
+    accepted: BTreeMap<String, (SeenAtFact, u64)>,
     prev: Option<SeenAtFact>,
     next_index: u64,
     next_seq: u64,
     source_last_seq: u64,
     break_reason: Option<Reason>,
     closed: bool,
+    /// The last row sealed by the accepted close, once one is accepted.
+    sealed_last_seq: Option<u64>,
 }
 
 impl Default for StreamEligibility {
@@ -109,15 +129,23 @@ impl Default for StreamEligibility {
 }
 
 impl StreamEligibility {
+    /// A fresh eligibility state with no recorded history. See the type docs: this is
+    /// only a starting point for recording a stream from its first observation. It is
+    /// not a way to restart a stream whose earlier observations are unavailable — that
+    /// history is missing, and missing history reads UNKNOWN.
     pub fn new() -> Self {
         StreamEligibility {
-            eligible: vec![], stream_context: None, accepted_ids: BTreeSet::new(), prev: None,
+            eligible: vec![], stream_context: None, accepted: BTreeMap::new(), prev: None,
             next_index: 0, next_seq: 0, source_last_seq: 0, break_reason: None, closed: false,
+            sealed_last_seq: None,
         }
     }
 
     /// Build eligibility by recording observations in the exact order they arrived.
-    /// This deliberately does not sort: arrival order is part of the evidence.
+    /// This deliberately does not sort: arrival order is part of the evidence. Only the
+    /// observations passed here exist for the new object; any earlier observation the
+    /// caller failed to preserve is missing history and must be supplied as an explicit
+    /// unknown observation, not silently restarted over.
     pub fn from_arrival_order(states: &[AnchorState], source_last_seq: u64) -> Self {
         let mut e = Self::new();
         for s in states { e.record(s, source_last_seq); }
@@ -139,6 +167,17 @@ impl StreamEligibility {
             self.break_at(Reason::SourceBoundRegression);
             return;
         }
+        // Any extension of the bound past the sealed endpoint is rows after the close,
+        // whatever observation carries it — including a duplicate that deduplication
+        // would otherwise swallow. Checked before dedup; the grown bound is kept so
+        // the rows past the seal read unknown.
+        if let Some(sealed) = self.sealed_last_seq {
+            if source_last_seq > sealed {
+                self.source_last_seq = source_last_seq;
+                self.break_at(Reason::RowsAfterClose);
+                return;
+            }
+        }
         self.source_last_seq = source_last_seq;
         if self.break_reason.is_some() { return; }
         match state {
@@ -147,7 +186,18 @@ impl StreamEligibility {
             }
             AnchorState::SeenAtLate(_) => self.break_at(Reason::LateAck),
             AnchorState::SeenAtRetained(f) => {
-                if self.accepted_ids.contains(&f.ack_id) { return; }
+                // A same-ack-id observation is an idempotent retry only if its full
+                // immutable context is identical to the accepted fact's: client clock
+                // identity, the source bound it was accepted under, the stream and
+                // server epoch, and the chain/commitment/ledger it carries. Any
+                // difference is not a retry; it latches a sticky break. This runs
+                // before dedup, so a recheck under a changed clock cannot hide here.
+                if let Some((accepted, accepted_bound)) = self.accepted.get(&f.ack_id) {
+                    if let Some(r) = duplicate_context_reason(accepted, *accepted_bound, f, source_last_seq) {
+                        self.break_at(r);
+                    }
+                    return;
+                }
                 if self.closed { self.break_at(Reason::RowsAfterClose); return; }
                 if f.commitment.index() != self.next_index {
                     // A fact that is not the exact next one breaks eligibility in arrival
@@ -171,15 +221,29 @@ impl StreamEligibility {
                 }
                 if f.commitment.chain.first() > self.next_seq { self.break_at(Reason::Gap); return; }
                 if f.commitment.chain.first() < self.next_seq { self.break_at(Reason::Fork); return; }
+                // A range ending at u64::MAX has no representable successor row; it
+                // fails closed as unknown instead of overflowing into the next state.
+                // (Validation rejects such ranges, so a checked fact cannot carry one;
+                // this keeps hand-assembled facts from panicking or wrapping here.)
+                let Some(next_seq) = f.chain_last().checked_add(1) else {
+                    self.break_at(Reason::SchemaViolation);
+                    return;
+                };
                 self.eligible.push(Segment {
                     first_seq: f.commitment.chain.first(), last_seq: f.chain_last(),
                     status: RangeStatus::SeenAtRetained { ack_id: f.ack_id.clone() },
                 });
                 if self.stream_context.is_none() { self.stream_context = Some(StreamContext::of(f)); }
-                self.accepted_ids.insert(f.ack_id.clone());
+                self.accepted.insert(f.ack_id.clone(), (f.clone(), source_last_seq));
                 self.closed = f.commitment.purpose == Purpose::Close;
-                self.next_index += 1;
-                self.next_seq = f.chain_last() + 1;
+                if self.closed {
+                    self.sealed_last_seq = Some(f.chain_last());
+                    // The bound already extends past the endpoint this close seals:
+                    // those rows are after the close.
+                    if source_last_seq > f.chain_last() { self.break_at(Reason::RowsAfterClose); }
+                }
+                self.next_index = self.next_index.saturating_add(1);
+                self.next_seq = next_seq;
                 self.prev = Some(f.clone());
             }
         }
@@ -213,12 +277,43 @@ impl StreamEligibility {
         matches!(self.status_at(seq), Some(RangeStatus::SeenAtRetained { .. }))
     }
     pub fn unknown_rows(&self) -> u64 {
-        self.segments().iter().filter(|s| matches!(s.status, RangeStatus::Unknown(_))).map(|s| s.last_seq - s.first_seq + 1).sum()
+        self.segments().iter().filter(|s| matches!(s.status, RangeStatus::Unknown(_)))
+            .fold(0u64, |n, s| n.saturating_add(row_count(s.first_seq, s.last_seq)))
     }
     pub fn complete(&self) -> bool {
         self.break_reason.is_none() && self.closed && self.next_seq == self.source_last_seq.checked_add(1).unwrap_or(u64::MAX)
             && !self.eligible.is_empty()
     }
+}
+
+/// Why a same-ack-id observation is not an idempotent retry of the accepted fact, or
+/// `None` when it is one. Volatile receipt timing (`received_*`, `rtt_ns`) is not part
+/// of the immutable context; everything that identifies what was seen, by whom, under
+/// which clocks and epochs, and under what source bound, is.
+fn duplicate_context_reason(accepted: &SeenAtFact, accepted_bound: u64, f: &SeenAtFact, source_last_seq: u64) -> Option<Reason> {
+    if f.client_boot_id != accepted.client_boot_id || f.client_clock_epoch_id != accepted.client_clock_epoch_id {
+        return Some(Reason::ClientClockDomainChanged);
+    }
+    if f.server_boot_id != accepted.server_boot_id || f.server_clock_epoch_id != accepted.server_clock_epoch_id {
+        return Some(Reason::ServerEpochMismatch);
+    }
+    if StreamContext::of(f) != StreamContext::of(accepted) {
+        return Some(Reason::BindingMismatch);
+    }
+    if f.commitment.chain != accepted.commitment.chain {
+        return Some(Reason::Fork);
+    }
+    if f.commitment != accepted.commitment || f.commitment_digest != accepted.commitment_digest
+        || f.ack_key_id != accepted.ack_key_id || f.challenge_key_id != accepted.challenge_key_id
+        || f.ledger_seq != accepted.ledger_seq || f.prev_ledger_entry_digest != accepted.prev_ledger_entry_digest {
+        return Some(Reason::BindingMismatch);
+    }
+    if source_last_seq != accepted_bound {
+        // A lowered bound is caught earlier as a regression against the stream bound;
+        // reaching here with a different bound means it grew since acceptance.
+        return Some(Reason::BindingMismatch);
+    }
+    None
 }
 
 fn link_reason(prev: &SeenAtFact, f: &SeenAtFact) -> Option<Reason> {
@@ -243,12 +338,12 @@ fn link_reason(prev: &SeenAtFact, f: &SeenAtFact) -> Option<Reason> {
     if c.prior_ack_id.as_deref() != Some(prev.ack_id.as_str()) { return Some(Reason::Fork); }
     if c.chain.predecessor_head != p.chain.end_head || c.chain.predecessor() != Some(p.chain.last()) { return Some(Reason::Fork); }
     // Reorder/overlap at the chain level: the next range must start exactly where the prior ended.
-    if c.chain.first() != p.chain.last().checked_add(1).unwrap_or(u64::MAX) { return Some(Reason::Fork); }
+    if p.chain.last().checked_add(1) != Some(c.chain.first()) { return Some(Reason::Fork); }
     if f.ledger_seq <= prev.ledger_seq { return Some(Reason::LedgerRollback); }
     // Recomputed ledger linkage where it can be checked: when this fact is the very next
     // ledger entry, it must name the entry the prior fact actually appends. A larger jump
     // means other streams appended in between, whose entries this view does not hold.
-    if f.ledger_seq == prev.ledger_seq.checked_add(1).unwrap_or(u64::MAX)
+    if prev.ledger_seq.checked_add(1) == Some(f.ledger_seq)
         && ledger_entry_digest(prev).as_deref() != Some(f.prev_ledger_entry_digest.as_str()) {
         return Some(Reason::LedgerRollback);
     }
@@ -296,12 +391,15 @@ pub fn reconstruct_archival(states: &[AnchorState], source_last_seq: u64) -> Cov
         if let Some(c) = &f.commitment.close {
             if super::canon::dec_u64(&c.total_rows) != f.chain_last().checked_add(1) { stop = Some(Reason::SchemaViolation); break; }
         }
+        // No representable successor row: fail closed with the range left unknown
+        // rather than overflowing (validation rejects such ranges upstream).
+        let Some(next) = f.chain_last().checked_add(1) else { stop = Some(Reason::SchemaViolation); break; };
         if f.commitment.chain.first() > next_seq {
             segments.push(Segment { first_seq: next_seq, last_seq: f.commitment.chain.first() - 1, status: RangeStatus::Unknown(Reason::Gap) });
         }
         segments.push(Segment { first_seq: f.commitment.chain.first(), last_seq: f.chain_last(), status: RangeStatus::SeenAtRetained { ack_id: f.ack_id.clone() } });
         if stream_context.is_none() { stream_context = Some(StreamContext::of(f)); }
-        next_seq = f.chain_last() + 1;
+        next_seq = next;
         prev = Some(f);
     }
     if next_seq <= source_last_seq {

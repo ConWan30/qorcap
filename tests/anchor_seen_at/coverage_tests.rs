@@ -264,6 +264,102 @@ fn cross_exchange_client_clock_change_breaks_the_stream() {
     assert!(!elig.is_eligible(25));
 }
 
+/// The same exchange rechecked through the real checker, but with both local clocks
+/// moved to a different client clock identity. The ack bytes and commitment are
+/// untouched, so the resulting fact carries the same ack id under a new clock.
+fn rechecked_under_clock(e: &Exchange, boot: &str, epoch: &str) -> Exchange {
+    use qorcap::anchor_seen_at::check::ClockRef;
+    let mut e = e.clone();
+    e.samples.send_clock = ClockRef { boot_id: id(boot), clock_epoch_id: id(epoch) };
+    e.samples.receive_clock = e.samples.send_clock.clone();
+    e
+}
+
+#[test]
+fn changed_clock_duplicate_latches_a_break_before_dedup() {
+    let w = World::new();
+    let v = full_stream(&w, &Session::new("cov-dup-clock"));
+    let st = states(&w, &v);
+    // Boot-only and epoch-only changes are both a different clock context.
+    for (boot, epoch) in [("dup-other-boot", "cov-dup-clock-hostclock"), ("cov-dup-clock-hostboot", "dup-other-epoch")] {
+        let mut elig = coverage::StreamEligibility::from_arrival_order(&st, 29);
+        assert!(elig.complete());
+        let dup = rechecked_under_clock(&v[1], boot, epoch).state(&w.policy);
+        let f = dup.retained().expect("rechecked under its own clock, the ack is retained");
+        assert_eq!(f.ack_id, st[1].retained().unwrap().ack_id, "same ack id as the accepted fact");
+        elig.record(&dup, 29);
+        assert_eq!(elig.break_reason(), Some(Reason::ClientClockDomainChanged), "boot={boot} epoch={epoch}");
+        assert!(!elig.complete());
+        // Sticky: an identical-context duplicate afterwards does not clear it.
+        elig.record(&st[2], 29);
+        assert_eq!(elig.break_reason(), Some(Reason::ClientClockDomainChanged));
+    }
+}
+
+#[test]
+fn identical_context_duplicate_is_a_harmless_retry() {
+    let w = World::new();
+    let v = full_stream(&w, &Session::new("cov-dup-same"));
+    let st = states(&w, &v);
+    let mut elig = coverage::StreamEligibility::from_arrival_order(&st, 29);
+    assert!(elig.complete());
+    let before = elig.segments();
+    // Rechecking the very same exchanges and re-recording them changes nothing.
+    for e in &v { elig.record(&e.state(&w.policy), 29); }
+    for s in &st { elig.record(s, 29); }
+    assert_eq!(elig.break_reason(), None);
+    assert!(elig.complete());
+    assert_eq!(elig.segments(), before);
+    assert_eq!(elig.unknown_rows(), 0);
+}
+
+#[test]
+fn post_close_duplicate_with_extended_bound_latches_rows_after_close() {
+    let w = World::new();
+    let v = full_stream(&w, &Session::new("cov-after-dup"));
+    let st = states(&w, &v);
+    let mut elig = coverage::StreamEligibility::from_arrival_order(&st, 29);
+    assert!(elig.complete());
+    // A duplicate of the sealed close, now carrying source rows past the seal.
+    elig.record(&st[2], 35);
+    assert_eq!(elig.break_reason(), Some(Reason::RowsAfterClose));
+    assert!(!elig.complete());
+    assert_eq!(elig.segments().last().unwrap(), &unknown(30, 35, Reason::RowsAfterClose));
+    assert_eq!(elig.unknown_rows(), 6);
+    elig.record(&st[0], 35);
+    assert_eq!(elig.break_reason(), Some(Reason::RowsAfterClose));
+}
+
+#[test]
+fn range_ending_at_u64_max_is_rejected_and_fails_closed_without_overflow() {
+    let w = World::new();
+    let s = Session::new("cov-max");
+    // Validation, through the real service: an opening range ending at u64::MAX is
+    // unrepresentable (no successor row, no representable row count) and is refused.
+    let ch = challenge(&w, &s, Purpose::Opening);
+    let c = s.commitment(&ch, 0, None, 0, u64::MAX);
+    assert_eq!(c.chain.validate(), Err(Reason::FieldFormat));
+    assert_eq!(c.validate(), Err(Reason::FieldFormat));
+    assert!(w.svc.post_commitments(&commit_body(&ch, &c)).is_err());
+    // A hand-assembled fact carrying such a range (validation bypassed) still fails
+    // closed in coverage instead of panicking in debug or wrapping in release.
+    let v = full_stream(&w, &Session::new("cov-max-fact"));
+    let mut f = v[0].state(&w.policy).retained().unwrap().clone();
+    f.commitment.chain.last_seq = u64::MAX.to_string();
+    let st = AnchorState::SeenAtRetained(f);
+    let mut elig = coverage::StreamEligibility::new();
+    elig.record(&st, u64::MAX);
+    assert_eq!(elig.break_reason(), Some(Reason::SchemaViolation));
+    assert!(!elig.complete());
+    assert!(!elig.is_eligible(0));
+    // The unknown count for 0..=MAX saturates at u64::MAX instead of wrapping to 0.
+    assert_eq!(elig.unknown_rows(), u64::MAX);
+    let view = coverage::reconstruct_archival(&[st], u64::MAX);
+    assert!(!view.complete);
+    assert_eq!(view.segments, vec![unknown(0, u64::MAX, Reason::SchemaViolation)]);
+    assert_eq!(view.unknown_rows(), u64::MAX);
+}
+
 #[test]
 fn reordered_chain_range_is_a_fork_and_restart_invalidates_the_stream() {
     let w = World::new();
