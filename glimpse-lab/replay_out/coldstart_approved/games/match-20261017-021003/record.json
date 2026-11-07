@@ -1,0 +1,149 @@
+{
+ "match": "match-20261017-021003",
+ "layout": "primetime",
+ "chain": {
+  "verified": false,
+  "head": null,
+  "n": 9
+ },
+ "champion": "full_v0",
+ "frames_cached": 43,
+ "labelled": 11,
+ "grades": {
+  "B": 11
+ },
+ "bank_added": 6,
+ "tune": 5,
+ "bank_stats": {
+  "primetime:active": 7,
+  "thursday_night:active": 9
+ },
+ "candidates": [
+  {
+   "kind": "INV",
+   "harness": "full_v0+lockguard",
+   "verdict": "TUNE_FAIL",
+   "d_right": 0,
+   "d_wrong": 0,
+   "new_wrong": 0,
+   "cost_delta": 0.0,
+   "score": 0
+  },
+  {
+   "kind": "INV",
+   "harness": "full_v0+stats_never_score",
+   "verdict": "TUNE_FAIL",
+   "d_right": 0,
+   "d_wrong": 0,
+   "new_wrong": 0,
+   "cost_delta": 0.0,
+   "score": 0
+  },
+  {
+   "kind": "DOM",
+   "harness": "full_v0+primetime->crop_v0",
+   "verdict": "TUNE_PASS",
+   "d_right": 1,
+   "d_wrong": 0,
+   "new_wrong": 0,
+   "cost_delta": -0.000135,
+   "score": 1
+  },
+  {
+   "kind": "DOM",
+   "harness": "full_v0+primetime->crop_v1",
+   "verdict": "TUNE_PASS",
+   "d_right": 1,
+   "d_wrong": 0,
+   "new_wrong": 0,
+   "cost_delta": 0.00204,
+   "score": 1
+  },
+  {
+   "kind": "DOM",
+   "harness": "full_v0+primetime->watch_012",
+   "verdict": "TUNE_PASS",
+   "d_right": 1,
+   "d_wrong": 0,
+   "new_wrong": 0,
+   "cost_delta": 0.0027,
+   "score": 1
+  }
+ ],
+ "lesson": {
+  "key": {
+   "game": "madden27",
+   "layout": "primetime"
+  },
+  "cue": "primetime: champion unsure on 1 tune frame(s)",
+  "action": {
+   "routes": {
+    "primetime": "crop_v0"
+   },
+   "checks": []
+  },
+  "evidence": {
+   "tune": {
+    "verdict": "TUNE_PASS",
+    "d_right": 1,
+    "d_wrong": 0,
+    "new_wrong": 0,
+    "cost_delta": -0.000135,
+    "score": 1
+   },
+   "bank": "INSUFFICIENT_BANK",
+   "match": "match-20261017-021003"
+  },
+  "receipt_refs": {
+   "chain_head": null,
+   "label_basis": [
+    "reader-lock:match-20261017-021003:1792223233"
+   ],
+   "receipt_sha256": null
+  },
+  "replay_digest": "bfdd86aec80f81deb80b200803f656fce305f16e29c201f215b59d2a18736afd",
+  "harness_sha256": "f5df99ea04e171de58ddb35e75ac5d88533dc920ee6b9ebc762e030f4621ae46",
+  "status": "candidate",
+  "confidence": "low",
+  "tag": "ADVISORY_AI"
+ },
+ "pending": null,
+ "decision": null,
+ "champion_on_game": {
+  "right": 3,
+  "wrong": 0,
+  "abstain": 5,
+  "other": 0,
+  "missing": 9
+ },
+ "hard": {
+  "wrong": [],
+  "unsure": [
+   "m4-024729"
+  ],
+  "disagree_reader": []
+ },
+ "review_queue": [
+  "m4-021638",
+  "m4-021646",
+  "m4-022014",
+  "m4-022022",
+  "m4-022110",
+  "m4-022126",
+  "m4-022351",
+  "m4-022359",
+  "m4-023400",
+  "m4-024705",
+  "m4-024906",
+  "m4-025210"
+ ],
+ "bank_gate": {
+  "harness": "full_v0+primetime->crop_v0",
+  "verdict": "INSUFFICIENT_BANK",
+  "n": 5,
+  "need": 30
+ },
+ "spend_usd": 0.0,
+ "would_cost_live_usd": 0.0158,
+ "lab_version": "glimpse-lab/0.1.0-proposal"
+}
