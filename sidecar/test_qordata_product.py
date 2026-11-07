@@ -76,6 +76,55 @@ def test_real_final_gate_rejects_cross_binding(tmp_path, mismatch):
     assert expected in result["reason_codes"], result
 
 
+def _gate_kwargs(**over):
+    kwargs = {
+        "path": "shared", "end_us": 100, "frames": [], "seal_ready": True,
+        "anchor_ready": True, "epoch_valid": True, "lag_present": True,
+        "session_id": "s1", "capture_generation": 1, "binding_epoch": 1,
+    }
+    kwargs.update(over)
+    return kwargs
+
+
+def test_eligibility_requires_nonempty_supporting_frames():
+    empty = qd.eligibility_decision(**_gate_kwargs(frames=[]))
+    assert empty["eligible"] is False and empty["final_confirmed"] is False, empty
+    assert "supporting_frames_missing" in empty["reason_codes"], empty
+    frame = {"capture_id": "a", "mono_us": 101, "session_id": "s1", "capture_generation": 1, "epoch": 1}
+    ok = qd.eligibility_decision(**_gate_kwargs(frames=[frame]))
+    assert ok["eligible"] is True, ok
+
+
+def test_eligibility_requires_a_mandatory_epoch():
+    frame = {"capture_id": "a", "mono_us": 101, "session_id": "s1", "capture_generation": 1, "epoch": 1}
+    no_epoch = qd.eligibility_decision(**_gate_kwargs(frames=[frame], binding_epoch=None))
+    assert no_epoch["eligible"] is False, no_epoch
+    assert "epoch_missing" in no_epoch["reason_codes"], no_epoch
+    frameless_epoch = dict(frame)
+    del frameless_epoch["epoch"]
+    missing_frame_epoch = qd.eligibility_decision(**_gate_kwargs(frames=[frameless_epoch]))
+    assert missing_frame_epoch["eligible"] is False, missing_frame_epoch
+    assert "epoch_mismatch" in missing_frame_epoch["reason_codes"], missing_frame_epoch
+
+
+def test_final_gate_rejects_empty_support_and_missing_epoch(tmp_path):
+    log = runner(tmp_path)
+    log.session_id = "s1"
+    log.capture_generation = 1
+    log.capture_epoch = 1
+    log.seal_durable = True
+    log._seal_window = lambda: {"end_us": 100, "releases_counts": True, "status": "resolved"}
+    log._support = []
+    result = log.final_eligibility(visual_ok=True, evidence_us=102)
+    assert result["confirmed"] is False, result
+    assert "supporting_frames_missing" in result["reason_codes"], result
+    log.capture_epoch = None
+    log._support = [{"capture_id": "a", "mono_us": 101, "session_id": "s1", "capture_generation": 1, "epoch": 1}]
+    result = log.final_eligibility(visual_ok=True, evidence_us=102)
+    assert result["confirmed"] is False, result
+    assert "epoch_missing" in result["reason_codes"], result
+
+
 def test_failure_records_original_http_status_and_observation(tmp_path):
     log = runner(tmp_path)
     log.note_capture_gap("snapshot_http:HTTPError")
@@ -446,6 +495,69 @@ def test_terminal_fsync_failing_until_close_retry_leaves_one_terminal(tmp_path, 
         assert log.close_signals() is False
     assert log.close_signals() is True
     _one_terminal(log)
+
+
+def test_writes_after_close_are_rejected(tmp_path):
+    log = runner(tmp_path)
+    assert log._write({"kind": "hud"})
+    assert log.close_signals() is True
+    assert log._write({"kind": "hud"}) is False, "a write after close must be rejected"
+    assert log._write({"kind": "terminal"}) is False
+    assert log.close_signals() is False
+    rows = [json.loads(line) for line in log.log_path.read_text().splitlines()]
+    assert [row["kind"] for row in rows] == ["hud", "terminal"], rows
+    assert cod.verify_signal_chain(log.log_path.read_text()) == []
+    assert qd.chain_acceptance(log.log_path.read_text())["verdict"] == "accept_structure"
+
+
+def test_signal_append_and_close_are_serialized(tmp_path):
+    import threading
+
+    log = runner(tmp_path)
+    results = []
+
+    def write_many():
+        for _ in range(25):
+            results.append(log._write({"kind": "hud"}))
+
+    threads = [threading.Thread(target=write_many) for _ in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert all(results) and len(results) == 200, results
+    assert log.close_signals() is True
+    text = log.log_path.read_text()
+    rows = [json.loads(line) for line in text.splitlines()]
+    assert len(rows) == 201 and rows[-1]["kind"] == "terminal", rows[-3:]
+    assert rows[-1]["count"] == 200
+    assert cod.verify_signal_chain(text) == []
+    assert qd.chain_acceptance(text)["verdict"] == "accept_structure"
+
+
+def test_close_racing_writers_leaves_one_terminal_at_the_end(tmp_path):
+    import threading
+
+    log = runner(tmp_path)
+
+    def write_many():
+        for _ in range(50):
+            log._write({"kind": "hud"})
+
+    threads = [threading.Thread(target=write_many) for _ in range(4)]
+    for thread in threads:
+        thread.start()
+    assert log.close_signals() is True
+    for thread in threads:
+        thread.join()
+    # Every write attempted after close was rejected, so nothing follows the terminal.
+    assert log._write({"kind": "hud"}) is False
+    text = log.log_path.read_text()
+    rows = [json.loads(line) for line in text.splitlines()]
+    terminals = [row for row in rows if row.get("kind") == "terminal"]
+    assert len(terminals) == 1 and rows[-1] is terminals[0], rows[-3:]
+    assert cod.verify_signal_chain(text) == []
+    assert qd.chain_acceptance(text)["verdict"] == "accept_structure"
 
 
 def test_zero_origin_does_not_order_captures():

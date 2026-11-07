@@ -47,6 +47,7 @@ import hashlib
 import json
 import os
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -689,6 +690,9 @@ class CodSetRunner:
         self._feed_present = False
         self._source = None
         self._signals_closed = False
+        # One lock serializes signal append, durable-length recovery, and close.
+        # It is re-entrant because close commits its terminal through `_write`.
+        self._signal_lock = threading.RLock()
         self._log_fault = False
         # Signal log length before a failed append. The next write cuts back to it.
         self._durable_len = None
@@ -1380,6 +1384,10 @@ class CodSetRunner:
 
     def close_signals(self) -> bool:
         """Commit the terminal root. A failed write stays retryable."""
+        with self._signal_lock:
+            return self._close_signals_locked()
+
+    def _close_signals_locked(self) -> bool:
         if self._signals_closed:
             return False
         count = self._chain_seq
@@ -1403,6 +1411,16 @@ class CodSetRunner:
         return ok
 
     def _write(self, row: dict) -> bool:
+        # Serialized with close and with durable-length recovery (which runs
+        # inside this method). After close, every further write is rejected:
+        # nothing may be appended after the terminal row.
+        with self._signal_lock:
+            if self._signals_closed:
+                self.stats["signal_log_failures"] = self.stats.get("signal_log_failures", 0) + 1
+                return False
+            return self._write_locked(row)
+
+    def _write_locked(self, row: dict) -> bool:
         if self.log_path is None:
             return False
         body = {k: v for k, v in row.items() if k not in ("prev", "hash")}

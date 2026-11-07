@@ -150,12 +150,17 @@ def eligibility_decision(*, path, end_us, frames, seal_ready, anchor_ready, epoc
                          lag_present, session_id, capture_generation, binding_epoch=None) -> dict:
     """One gate for both final paths. Equality at ``end_us`` is not eligible.
 
-    Missing lag, seal, anchor, or epoch stays unknown. This function does not
-    fill those in.
+    Missing lag, seal, anchor, or epoch stays unknown. The epoch is mandatory
+    (``binding_epoch`` may not be ``None``) and at least one supporting frame
+    is required. This function does not fill any of those in.
     """
     reasons = []
     if not isinstance(session_id, str) or not session_id:
         reasons.append("session_missing")
+    if not frames:
+        reasons.append("supporting_frames_missing")
+    if _int(binding_epoch) is None:
+        reasons.append("epoch_missing")
     if _int(capture_generation) is None:
         reasons.append("generation_missing")
     if _int(end_us) is None or lag_present is not True:

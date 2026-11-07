@@ -815,8 +815,12 @@ impl Engine {
         // and replaces snapshot.jpg. ffmpeg does not atomic-rename over the file the reader opens.
         let incoming = self.snapshot.with_file_name("snapshot.incoming.jpg");
         let args = ffmpeg::capture_args_with(&self.args, input_format, audio, &incoming.to_string_lossy(), stamp.as_deref());
-        let prior = std::fs::read(&incoming).unwrap_or_default();
-        self.snap_pub.lock().unwrap_or_else(|e| e.into_inner()).begin_epoch(&prior);
+        // A read error is not an empty file: only a missing incoming file is a
+        // confirmed-absent baseline. Any other error leaves the baseline
+        // unknown, and the publisher then requires a positively observed
+        // rewrite before anything on disk earns a new epoch id.
+        let baseline = crate::snap::Baseline::from_read(std::fs::read(&incoming));
+        self.snap_pub.lock().unwrap_or_else(|e| e.into_inner()).begin_epoch(baseline);
         let stop_pub = Arc::new(AtomicBool::new(false));
         let publisher = {
             let flag = stop_pub.clone();

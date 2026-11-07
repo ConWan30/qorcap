@@ -290,7 +290,7 @@ mod tests {
         std::fs::write(&e.snapshot, &jpeg).unwrap();
         {
             let mut p = e.snap_pub.lock().unwrap_or_else(|err| err.into_inner());
-            p.begin_epoch(&jpeg);
+            p.begin_epoch(crate::snap::Baseline::Known(jpeg.to_vec()));
             p.note_progress(1, 10);
             let prov = p.pending_provenance();
             assert!(!p.consider(&jpeg, &e.snapshot, prov));

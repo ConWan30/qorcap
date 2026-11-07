@@ -149,6 +149,33 @@ pub enum Serve {
     Absent,
 }
 
+/// What was on disk for the incoming file when a capture epoch opened.
+///
+/// `Known` is a successful read of the prior bytes (held back until a rewrite).
+/// `ConfirmedAbsent` is positive evidence there were no prior bytes (a missing
+/// file). `Unknown` is any other read outcome: the prior bytes could not be
+/// read, so they are not known to be absent and nothing on disk may take a new
+/// identity until this producer is positively seen to rewrite it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Baseline {
+    ConfirmedAbsent,
+    Known(Vec<u8>),
+    Unknown,
+}
+
+impl Baseline {
+    /// A missing file is a confirmed-absent baseline. Every other read error is
+    /// unknown, never absent: swallowing it into empty bytes would let the old
+    /// JPEG be re-accepted under a new epoch id and a current timestamp.
+    pub fn from_read(read: std::io::Result<Vec<u8>>) -> Self {
+        match read {
+            Ok(bytes) => Baseline::Known(bytes),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Baseline::ConfirmedAbsent,
+            Err(_) => Baseline::Unknown,
+        }
+    }
+}
+
 pub struct Publisher {
     pub frames: u64,
     pub failures: u64,
@@ -165,6 +192,7 @@ pub struct Publisher {
     session_id: Option<String>,
     engine_clock: Option<(Instant, u64)>,
     retained_hash: Option<String>,
+    baseline_unknown: bool,
     disk_seen: Option<DiskSeen>,
     rewrite_ready: bool,
     file_matches: bool,
@@ -189,6 +217,7 @@ impl Publisher {
             session_id: None,
             engine_clock: None,
             retained_hash: None,
+            baseline_unknown: false,
             disk_seen: None,
             rewrite_ready: false,
             file_matches: true,
@@ -217,7 +246,7 @@ impl Publisher {
     }
 
     /// Open a capture epoch. Bytes already on disk stay unpublished until this producer rewrites them.
-    pub fn begin_epoch(&mut self, prior: &[u8]) -> u64 {
+    pub fn begin_epoch(&mut self, baseline: Baseline) -> u64 {
         self.epoch = self.epoch.saturating_add(1);
         self.epoch_open = Some(self.epoch);
         self.memory = None;
@@ -229,10 +258,10 @@ impl Publisher {
         self.producer_start_us = None;
         self.disk_seen = None;
         self.rewrite_ready = false;
-        self.retained_hash = if jpeg_complete(prior) {
-            Some(crate::evidence::sha256_hex(prior))
-        } else {
-            None
+        self.baseline_unknown = matches!(baseline, Baseline::Unknown);
+        self.retained_hash = match &baseline {
+            Baseline::Known(prior) if jpeg_complete(prior) => Some(crate::evidence::sha256_hex(prior)),
+            _ => None,
         };
         self.file_matches = false;
         self.epoch
@@ -320,6 +349,11 @@ impl Publisher {
         if session.is_empty() { return false; }
         let Some(epoch) = self.epoch_open else { return false; };
         if !jpeg_complete(incoming) { return false; }
+        // Unknown baseline: whatever was on disk may be the previous producer's
+        // bytes. Only a positively observed rewrite (disk state changing after
+        // the first coherent read established what was there) earns a new id;
+        // the first read itself never does, whatever bytes it holds.
+        if self.baseline_unknown && self.accepted.is_none() && !self.rewrite_ready { return false; }
         let retained = self.retained_hash.as_deref() == Some(hash.as_str());
         let same = self.accepted.as_ref().is_some_and(|a| a.epoch == epoch && a.hash == hash);
         if (retained && self.accepted.is_none() && !self.rewrite_ready) || (same && !self.rewrite_ready) {
@@ -464,7 +498,7 @@ mod tests {
         let jpeg = [0xFF, 0xD8, 0x22, 0xFF, 0xD9];
         assert!(!p.consider_at(&jpeg, &dest, None, 10), "no open epoch");
         assert!(matches!(p.serve_at(10), Serve::Absent), "no epoch stays on the file path");
-        p.begin_epoch(&jpeg);
+        p.begin_epoch(Baseline::Known(jpeg.to_vec()));
         assert!(matches!(p.serve_at(10), Serve::AwaitingProducer), "an open epoch is not the old file");
         p.note_progress(1, 10_000);
         assert!(!p.consider_read_at(&read(&jpeg, 1), &dest, 20), "the producer has not started");
@@ -501,10 +535,66 @@ mod tests {
             }
             other => panic!("the rewrite keeps its own capture id, got {other:?}"),
         }
-        p.begin_epoch(&newer);
+        p.begin_epoch(Baseline::Known(newer.to_vec()));
         assert!(matches!(p.serve_at(300), Serve::AwaitingProducer));
         p.note_progress(4, 40_000);
         assert!(!p.consider_read_at(&read(&newer, 4), &dest, 310), "reopen does not accept bytes before the new producer");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn baseline_read_outcomes_distinguish_absent_from_unknown() {
+        let missing = std::io::Error::from(std::io::ErrorKind::NotFound);
+        assert_eq!(Baseline::from_read(Err(missing)), Baseline::ConfirmedAbsent);
+        for kind in [std::io::ErrorKind::PermissionDenied, std::io::ErrorKind::Other] {
+            assert_eq!(Baseline::from_read(Err(std::io::Error::from(kind))), Baseline::Unknown, "{kind:?}");
+        }
+        assert_eq!(Baseline::from_read(Ok(vec![1, 2, 3])), Baseline::Known(vec![1, 2, 3]));
+    }
+
+    #[test]
+    fn error_then_recovery_after_reopen_does_not_reissue_the_old_jpeg() {
+        // Exact scenario: epoch 1 published a JPEG; on reopen the baseline read
+        // fails transiently (unknown, not confirmed-absent) while that old JPEG
+        // is still the incoming file. It must not get a new epoch id or a
+        // current timestamp. Only a positively observed producer rewrite may.
+        let dir = tmp("err-recovery");
+        let dest = dir.join("snapshot.jpg");
+        let old = [0xFF, 0xD8, 0x51, 0xFF, 0xD9];
+        let mut p = bound();
+        p.begin_epoch(Baseline::ConfirmedAbsent);
+        p.mark_producer_started_at(100);
+        assert!(p.consider_read_at(&read(&old, 1), &dest, 150));
+        let first = match p.serve_at(160) {
+            Serve::Fresh { capture_id, epoch, mono_us, .. } => { assert_eq!((epoch, mono_us), (1, 150)); capture_id }
+            other => panic!("{other:?}"),
+        };
+        // Reopen: baseline read errored, so the baseline is unknown.
+        p.begin_epoch(Baseline::Unknown);
+        p.mark_producer_started_at(1_000);
+        p.note_progress(7, 70_000);
+        assert!(!p.consider_read_at(&read(&old, 1), &dest, 1_100), "the old JPEG is not a new capture after an unknown baseline");
+        assert!(!p.consider_read_at(&read(&old, 1), &dest, 1_200), "re-polling the same disk state is not a rewrite");
+        assert!(p.memory().is_none());
+        assert!(matches!(p.serve_at(1_200), Serve::AwaitingProducer), "no new epoch id and no current timestamp for the old bytes");
+        // Recovery: the new producer rewrites the incoming file (same pixels,
+        // new disk state). That rewrite, at its own time, is the new capture.
+        assert!(p.consider_read_at(&read(&old, 2), &dest, 1_300), "a positively observed rewrite recovers the epoch");
+        match p.serve_at(1_310) {
+            Serve::Fresh { capture_id, epoch, generation, seq, mono_us, .. } => {
+                assert_eq!((epoch, generation, seq), (2, 2, 1));
+                assert_eq!(mono_us, 1_300, "the timestamp belongs to the rewrite, not the old bytes");
+                assert!(capture_id.starts_with("2:1:"));
+                assert_ne!(capture_id, first);
+            }
+            other => panic!("{other:?}"),
+        }
+        // And a confirmed-absent reopen (missing file, not an error) still
+        // accepts the producer's first frame without waiting for a second one.
+        let mut q = bound();
+        q.begin_epoch(Baseline::ConfirmedAbsent);
+        q.mark_producer_started_at(10);
+        assert!(q.consider_read_at(&read(&old, 1), &dest, 20));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -517,7 +607,7 @@ mod tests {
             p.bind_session("match-session");
             if let Some(o) = origin { p.bind_engine_clock(Instant::now(), o); }
             assert_eq!(p.mono_origin_ns(), None);
-            p.begin_epoch(&[]);
+            p.begin_epoch(Baseline::ConfirmedAbsent);
             p.mark_producer_started_at(5);
             assert!(!p.consider_at(&[0xFF, 0xD8, 1, 0xFF, 0xD9], &dest, None, 10));
             assert!(matches!(p.serve_at(10), Serve::AwaitingProducer));
@@ -531,7 +621,7 @@ mod tests {
         let dest = dir.join("snapshot.jpg");
         let old = [0xFF, 0xD8, 0x44, 0xFF, 0xD9];
         let mut p = bound();
-        p.begin_epoch(&old);
+        p.begin_epoch(Baseline::Known(old.to_vec()));
         p.mark_producer_started_at(1);
         p.note_progress(9, 90_000);
         assert!(!p.consider_read_at(&read(&old, 1), &dest, 10));
@@ -547,7 +637,7 @@ mod tests {
         let dir = tmp("rate");
         let dest = dir.join("snapshot.jpg");
         let mut p = bound();
-        p.begin_epoch(&[]);
+        p.begin_epoch(Baseline::ConfirmedAbsent);
         p.mark_producer_started_at(1_000);
         p.note_progress(1, 40_000);
         let mut published = 0u64;
@@ -580,7 +670,7 @@ mod tests {
         let first = [0xFF, 0xD8, 0x61, 0xFF, 0xD9];
         let second = [0xFF, 0xD8, 0x62, 0xFF, 0xD9];
         // The child starts 8 s after the engine. Its first frame has media PTS 40 ms.
-        p.begin_epoch(&[]);
+        p.begin_epoch(Baseline::ConfirmedAbsent);
         p.mark_producer_started_at(8_000_000);
         p.note_progress(1, 40_000);
         assert!(p.consider_read_at(&read(&first, 1), &dest, 8_040_000));
@@ -597,7 +687,7 @@ mod tests {
             other => panic!("first epoch did not publish, got {other:?}"),
         };
         // Reopen 18 s after the engine. PTS restarts at 40 ms; engine time does not.
-        p.begin_epoch(&first);
+        p.begin_epoch(Baseline::Known(first.to_vec()));
         p.mark_producer_started_at(18_000_000);
         p.note_progress(1, 40_000);
         assert!(!p.consider_read_at(&read(&first, 1), &dest, 18_010_000), "reopen still holds the previous JPEG");
@@ -620,7 +710,7 @@ mod tests {
         let dir = tmp("stall");
         let dest = dir.join("snapshot.jpg");
         let mut p = bound();
-        p.begin_epoch(&[]);
+        p.begin_epoch(Baseline::ConfirmedAbsent);
         p.mark_producer_started_at(0);
         let jpeg = [0xFF, 0xD8, 0x71, 0xFF, 0xD9];
         assert!(p.consider_read_at(&read(&jpeg, 1), &dest, 1_000_000));
@@ -659,7 +749,7 @@ mod tests {
         assert!(read_coherent_with(&path, || write(&new_longer, t2)).is_none());
 
         let mut p = bound();
-        p.begin_epoch(&[]);
+        p.begin_epoch(Baseline::ConfirmedAbsent);
         p.mark_producer_started_at(0);
         write(&old, t1);
         assert!(p.consider_read_at(&read_coherent(&path).unwrap(), &dest, 100));
