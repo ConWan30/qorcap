@@ -3,14 +3,14 @@
 //! Budgets below are synthetic test values, not calibrated numbers.
 
 use ed25519_dalek::SigningKey;
-use qorcap::anchor_seen_at::canon::{self, ZERO_HEAD};
-use qorcap::anchor_seen_at::check::{self, ClientPolicy, ClockRef, LocalSamples};
-use qorcap::anchor_seen_at::envelope::{self, RefereeSeenAtPayload};
-use qorcap::anchor_seen_at::keys::{KeyScope, KeyStatus, PinnedKey, TrustPolicy};
-use qorcap::anchor_seen_at::service_double::{ServiceConfig, ServiceDouble, PATH_CHALLENGES, PATH_COMMITMENTS};
-use qorcap::anchor_seen_at::types::*;
-use qorcap::anchor_seen_at::AnchorState;
-use qorcap::evidence;
+use super::qorcap::anchor_seen_at::canon::{self, ZERO_HEAD};
+use super::qorcap::anchor_seen_at::check::{self, ClientPolicy, ClockRef, LocalSamples};
+use super::qorcap::anchor_seen_at::envelope::{self, RefereeSeenAtPayload};
+use super::qorcap::anchor_seen_at::keys::{KeyScope, KeyStatus, PinnedKey, TrustPolicy};
+use super::qorcap::anchor_seen_at::service_double::{ServiceConfig, ServiceDouble, PATH_CHALLENGES, PATH_COMMITMENTS};
+use super::qorcap::anchor_seen_at::types::*;
+use super::qorcap::anchor_seen_at::AnchorState;
+use super::qorcap::evidence;
 use serde_json::Value;
 
 pub const SERVICE: &str = "synthetic.referee.aux";
@@ -179,7 +179,7 @@ pub fn full_stream(w: &World, s: &Session) -> Vec<Exchange> {
     vec![o, i, c]
 }
 
-pub fn unknown_reasons(s: &AnchorState) -> Vec<qorcap::anchor_seen_at::Reason> {
+pub fn unknown_reasons(s: &AnchorState) -> Vec<super::qorcap::anchor_seen_at::Reason> {
     match s { AnchorState::Unknown { reasons } => reasons.clone(), other => panic!("expected unknown, got {}", other.status_code()) }
 }
 

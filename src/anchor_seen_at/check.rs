@@ -69,6 +69,7 @@ pub struct CheckedSeenAt {
 pub type SeenAtFact = CheckedSeenAt;
 
 impl CheckedSeenAt {
+    pub(crate) fn into_late(mut self) -> Self { self.late = true; self }
     /// The classification minted by `check_ack`, independent of any outer label.
     pub fn is_late(&self) -> bool { self.late }
     pub fn ack_id(&self) -> &String { &self.ack_id }
