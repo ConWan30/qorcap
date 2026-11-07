@@ -4,7 +4,7 @@ Private engineering schema candidate. Not a freeze, not schema PASS, not impleme
 
 # P2 schema r2 candidate — anchor seen-at offline model
 
-This file is the sole allowlisted P2 schema document for the first-run schema gate. Digests, byte lengths, and vector counts are not stated here. Each required vector is named by a stable ID. digest: see p2-vectors.json. That file is not produced in this turn.
+This file is the sole allowlisted P2 schema document for the first-run schema gate. Digests are not hand-typed here. They live in `p2-vectors.json`, written by `gen_vectors.py`. Each required vector is named by a stable ID. digest: see p2-vectors.json. Computed rows are encoding facts. Model outcomes are NOT EXECUTED.
 
 ## 0. Provenance
 
@@ -32,7 +32,7 @@ Precedence used here: latest Data and Proof schema reviews correct r1; `PHASE2-D
 
 ## 1. Scope, non-goals, rails
 
-In scope for the whole r2 candidate, of which this turn closes §2–§4 only: exact offline schema for a pure owned-memory model of auxiliary evidence. States are only `unknown`, `seen_at_late`, and `seen_at_retained`. There is no pass state. Match 201029 stays VOID. Practice does not submit to a referee, upload capture, or write practice gold. Controller output stays read-only: no HID, rumble, or lightbar writes. Grip stays off for practice. Rumble, if described at all, is information-only. `receipt.v0` and `contracts/` stay frozen. REAL MATCH stays v0.3.38 and unwired. P1 stays unchanged and default-off.
+In scope for the whole r2 candidate, which covers §2–§15: exact offline schema for a pure owned-memory model of auxiliary evidence. States are only `unknown`, `seen_at_late`, and `seen_at_retained`. There is no pass state. Match 201029 stays VOID. Practice does not submit to a referee, upload capture, or write practice gold. Controller output stays read-only: no HID, rumble, or lightbar writes. Grip stays off for practice. Rumble, if described at all, is information-only. `receipt.v0` and `contracts/` stay frozen. REAL MATCH stays v0.3.38 and unwired. P1 stays unchanged and default-off.
 
 Non-goals: model or test code; feature wiring; network, keys, deploy, hosting; live finals; a current-policy service; collection; exporter; compact transparency-proof codec; normal holder unlock; publication-time freshness. The r3 rule stands: a future coordinator, which is not P2, qualifies as of admission time. Publication-time freshness is not asserted. Unbounded downstream pause is possible. If a later policy needs currentness at publication, that final or pilot stays BLOCKED.
 
@@ -925,9 +925,9 @@ Status `RESOLVED` means this candidate states one rule and where it is written. 
 | Null client prior does not start history; genesis id is the first prior | RESOLVED | §8.3 | QorData, then QorProof |
 | Stream origin equality and sticky equal-height fork | RESOLVED | §9 | QorData, then QorProof |
 | Numeric `LimitSet` values, including any replacement for the supplied 61295-versus-16384 example | UNKNOWN | §5.2, §6.2 | No authority. Fixtures may supply inputs later. This candidate does not pick them |
-| Qualified C1 result on these bytes | UNKNOWN | §13 still TODO | No scan in this candidate. Not zero |
+| Qualified C1 result on these bytes | UNKNOWN in this file | §13 | The operator runs the counts-only scan on the final committed bytes, commit message, and candidate PR text. Results are review evidence outside this file. Not stated here. Not zero |
 | Fresh git confirmation of the supplied base | UNKNOWN to this writer | §0 | Supplied pin only. Movement requires a stop |
-| Vector bytes and pin file contents | UNKNOWN until the generator writes them | §11, §12 still TODO | Do not invent digests |
+| Vector bytes and pin file contents | RESOLVED as generator output | §11, §12 | `gen_vectors.py` writes `p2-vectors.json` and `p2-pins.json`. Computed rows are encoding facts. Model outcomes are NOT EXECUTED. QorData, then QorProof |
 
 ## 11. Vectors
 
@@ -959,19 +959,18 @@ Nothing in this list was measured for this candidate. Synthetic `LimitSet` integ
 - Current-policy response, use, and revocation freshness, and both final integrations.
 - Live feature and runtime matrices, practice submit, upload, gold, and controller-output denials as executed checks.
 - Cost, spend, retention, deletion, and backup behavior.
-- C1–C7 and M1–M17 runs, doctest counts, and scanner counts. No qualified C1 scan was run. §13 is still TODO. Absence of a count is not zero findings.
+- C1–C7 and M1–M17 runs, doctest counts, and scanner counts. The C1 result is not stated in this file. It is review evidence from the operator's scan of the final committed bytes. Absence of a count here is not zero findings.
 - Fresh verification of the supplied base commit by this writer.
 
 ## 15. Review gate
 
-This candidate is not frozen and is not PASS. §11 vectors, §12 pins, and §13 C1 status are still TODO. Those writer steps come before review. Digests are not invented here. No model code, feature flag, or test target is added.
+This candidate is not frozen and is not PASS. Vectors and pins are written by `gen_vectors.py` into `p2-vectors.json` and `p2-pins.json`. Those computed rows are encoding facts only. Model outcomes are NOT EXECUTED. Digests are not hand-typed. The C1 scan is run by the operator on the final committed bytes and is reported in review evidence outside this file. It is not stated here, and this file does not claim zero findings. No model code, feature flag, or test target is added.
 
 Next gate, in order:
 
-1. Finish the remaining writer artifacts (computed vectors, pins, qualified counts-only C1 on the saved bytes).
-2. QorData acceptance reconciliation of this exact document.
-3. QorProof exact-schema PASS or freeze of that same artifact.
-4. Only after that gate, offline model code, still under the allowlist and a later review.
+1. QorData acceptance reconciliation of this exact document, the generated vectors, and the generated pins.
+2. QorProof exact-schema PASS or freeze of that same artifact.
+3. Only after that gate, offline model code, under the allowlist and a later review. The C1 evidence stays outside this file.
 
 Stop rather than self-certify. Terminal-positive stays BLOCKED. Holder release stays disabled. Publication-time freshness is not asserted. REAL MATCH stays v0.3.38. Practice does not submit, upload, or write gold. Match 201029 stays VOID.
 
@@ -979,7 +978,7 @@ Acceptance ids are not renumbered. Each row is NOT EXECUTED. A section citation 
 
 | ID | Schema rule in this candidate | Status |
 |---|---|---|
-| C1 | privacy and wording; scan not run (§13) | NOT EXECUTED |
+| C1 | privacy and wording; scan not stated here (§13) | NOT EXECUTED |
 | C2 | REAL MATCH unwired (§1) | NOT EXECUTED |
 | C3 | no gold, submit, or upload; frozen receipt and contracts (§1) | NOT EXECUTED |
 | C4 | only `unknown`, `seen_at_late`, `seen_at_retained` (§1, §7) | NOT EXECUTED |

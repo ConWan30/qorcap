@@ -5,10 +5,10 @@
  },
  "observed": [
   {
-   "bytes": 104916,
+   "bytes": 105518,
    "label": "observed by generator",
    "path": "docs/anchor-seen-at-p2.md",
-   "sha256": "a35d8a7691152275fbcf41d0311263046b01f4ae0361bfeef86806e7fa9a48cf"
+   "sha256": "b187d4820546471c196a713a2655a3a18c36426f8854c8ce884c8d384ef8a599"
   },
   {
    "bytes": 52502,
