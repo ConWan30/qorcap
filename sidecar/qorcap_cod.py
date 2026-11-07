@@ -21,8 +21,9 @@ How a Call of Duty match is played, and what this set lines up:
   row (kills and deaths, assists when that column is on the board). That row
   is not home or away. Another player's row is not used. A missing row or an
   unreadable digit is not Counted.
-- Stick turn against camera turn, and rumble against an on-screen hit, are
-  INFO-ONLY. They are not Counted.
+- Stick turn against camera turn stays Counted. The tag does not add a triple
+  by itself. Rumble against an on-screen hit stays INFO-ONLY. Grip is off for
+  practice.
 - The match ends when the end screen agrees, the way Madden's final screen
   ends a match. Stopping the recorder is not that read.
 
@@ -42,6 +43,7 @@ receipt. A local end-screen read is not a verification verdict.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import sys
 from dataclasses import dataclass
@@ -90,14 +92,18 @@ END_NAME = "end_screen"
 # Order a count follows. Crosshair is a crop, not a counted event.
 COUNT_SIGNALS = ("hitmarker", "kill_popup", "killfeed", "pause", "recoil", "scoreboard", "end_screen")
 
+# Stick stays Counted. The tag does not add a triple by itself.
+COUNTED_SIGNALS = {
+    "stick_turn_vs_camera": {
+        "label": "Counted",
+        "status": "Counted",
+        "note": "Stick turn against camera turn stays Counted. The tag does not add a triple by itself.",
+    },
+}
+
 # Optional later counts. They stay INFO-ONLY until a held-out match promotes them.
 # Power is unknown: this set does not read battery versus plugged.
 INFO_ONLY = {
-    "stick_turn_vs_camera": {
-        "label": "INFO-ONLY",
-        "status": NOT_COUNTED,
-        "note": "Stick turn against camera turn. Not Counted until a held-out match promotes it.",
-    },
     "rumble_vs_hit": {
         "label": "INFO-ONLY",
         "status": NOT_COUNTED,
@@ -118,6 +124,12 @@ END_AGREE_SPAN_MS = 3000
 END_AGREE_GAP_MS = END_AGREE_SPAN_MS
 # Offline video probe. The last few end frames, not a long end-window scan.
 END_PROBE_FRAMES = 5
+# A hitmarker counts only inside this window after an R2 edge. PROVISIONAL.
+FIRE_WINDOW_US = 250_000
+# An own-kill feed row needs a gated hitmarker this close. PROVISIONAL.
+KILLFEED_NEAR_US = 2_000_000
+SIGNAL_GENESIS = "0" * 64
+SIGNAL_SCHEMA = "qorcap-cod-signals/v0"
 # At 4 Hz this is about eight frames. The probe keeps the last five.
 END_PROBE_TAIL_S = 2
 
@@ -274,6 +286,69 @@ def side_from_bundle(bundle) -> str | None:
     if role in ("home", "away"):
         return role
     return None
+
+
+def _canon(obj) -> str:
+    """ASCII-key JSON canonical form for the signal hash. No floats."""
+    if obj is None:
+        return "null"
+    if isinstance(obj, bool):
+        return "true" if obj else "false"
+    if isinstance(obj, int):
+        return str(obj)
+    if isinstance(obj, str):
+        return json.dumps(obj, ensure_ascii=False)
+    if isinstance(obj, list):
+        return "[" + ",".join(_canon(x) for x in obj) + "]"
+    if isinstance(obj, dict):
+        return "{" + ",".join(_canon(k) + ":" + _canon(obj[k]) for k in sorted(obj)) + "}"
+    raise TypeError(type(obj).__name__)
+
+
+def verify_signal_chain(text: str) -> list[str]:
+    """Check prev/hash links. A changed row or a broken link is an error."""
+    prev = SIGNAL_GENESIS
+    errs = []
+    seq = 0
+    for i, line in enumerate(text.splitlines()):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            errs.append(f"line {i} is not json")
+            continue
+        if not isinstance(row, dict):
+            errs.append(f"line {i} is not an object")
+            continue
+        body = {k: v for k, v in row.items() if k not in ("prev", "hash")}
+        if row.get("prev") != prev:
+            errs.append(f"line {i} prev does not match")
+        try:
+            expect = hashlib.sha256(_canon({"prev": prev, "seq": seq, "row": body}).encode("utf-8")).hexdigest()
+        except TypeError:
+            errs.append(f"line {i} is not canonical")
+            expect = None
+        if expect is not None and row.get("hash") != expect:
+            errs.append(f"line {i} hash does not match")
+        prev = row.get("hash") or prev
+        seq += 1
+    return errs
+
+
+def _in_fire_window(edges, screen_us) -> bool:
+    """True when an R2 edge is at or before the screen and inside the fire window."""
+    if not isinstance(screen_us, int):
+        return False
+    for t in edges or []:
+        n = _as_int(t)
+        if n is None:
+            continue
+        dt = screen_us - n
+        if 0 <= dt <= FIRE_WINDOW_US:
+            return True
+    return False
 
 
 def screen_mono_us(screen_wall_ms, wall_anchor_ms) -> int | None:
@@ -476,6 +551,14 @@ class CodSetRunner:
             "end_direction_mismatch": 0,
         }
         self._logged = False
+        self._chain_prev = SIGNAL_GENESIS
+        self._chain_seq = 0
+        self._last_snap = None
+        self._real_frames: list = []
+        self.own_kill_feed = None
+        self._last_gated_hit_us = None
+        self._last_feed_us = None
+        self._lag = None
         self._pair = None
         self._n = 0
         self._t0 = None
@@ -510,18 +593,9 @@ class CodSetRunner:
                 self.stats["flagged_mismatch"] += 1
             else:
                 self.stats["not_counted"] += 1
-        if not self._logged:
-            self._logged = True
-            self._write({
-                "t_ms": int(t_ms), "kind": "set",
-                "regions": [_public(rd) for rd in reads],
-                "signals": signals,
-                "frame_clock_gap_us": FRAME_CLOCK_GAP_US,
-                "note": (
-                    "A signal is Counted only when the on-screen hook and the controller "
-                    "agree on the frame clock. Otherwise it is flagged a mismatch, or it is not Counted."
-                ),
-            })
+        self._keep_real(img)
+        self._note_lag(int(t_ms), img)
+        self._stream_hud(int(t_ms), reads, signals)
         try:
             end = self.end.read(img)
         except Exception as e:
@@ -563,20 +637,43 @@ class CodSetRunner:
         edges = trigger_edges(self.inputs)
         trigger = nearest_us(edges, screen_us)
         hit = by_name.get("hitmarker")
-        hit_status = correlate_pair(
-            calibrated=bool(hit and hit.ok and hit.calibrated),
-            screen_us=screen_us, input_us=trigger, frame_stamps=stamps)
+        visual = bool(hit and hit.ok and hit.calibrated)
+        fired = _in_fire_window(edges, screen_us)
+        if visual and not fired:
+            hit_status, hit_reason = NOT_COUNTED, "outside_fire_window"
+            gated = False
+        else:
+            hit_status = correlate_pair(
+                calibrated=visual, screen_us=screen_us, input_us=trigger, frame_stamps=stamps)
+            hit_status, hit_reason = self._hold_counts(hit_status, None, screen_us)
+            gated = visual and fired
+        if gated and isinstance(screen_us, int):
+            self._last_gated_hit_us = screen_us
         self.last_hitmarker = hit_status
         self.last_hitmarker_us = screen_us if hit_status == AGREED else None
         popup = by_name.get("kill_popup")
         popup_status = follows_status(
             calibrated=bool(popup and popup.ok and popup.calibrated),
             prior_status=hit_status, this_us=screen_us, prior_us=self.last_hitmarker_us)
+        popup_status, popup_reason = self._hold_counts(popup_status, None, screen_us)
         popup_us = screen_us if popup_status == AGREED else None
         feed = by_name.get("killfeed")
-        feed_status = follows_status(
-            calibrated=bool(feed and feed.ok and feed.calibrated),
-            prior_status=popup_status, this_us=screen_us, prior_us=popup_us)
+        feed_visual = bool(feed and feed.ok and feed.calibrated)
+        near = (
+            feed_visual and isinstance(screen_us, int) and isinstance(self._last_gated_hit_us, int)
+            and 0 <= screen_us - self._last_gated_hit_us <= KILLFEED_NEAR_US
+        )
+        if feed_visual and not near:
+            feed_status, feed_reason = NOT_COUNTED, "no_nearby_hitmarker"
+        else:
+            feed_status = follows_status(
+                calibrated=feed_visual, prior_status=popup_status,
+                this_us=screen_us, prior_us=popup_us)
+            feed_status, feed_reason = self._hold_counts(feed_status, None, screen_us)
+        if feed_visual and near and isinstance(screen_us, int):
+            if self._last_feed_us is None or screen_us - self._last_feed_us > 100_000:
+                self.own_kill_feed = 0 if self.own_kill_feed is None else self.own_kill_feed + 1
+                self._last_feed_us = screen_us
         board = by_name.get("scoreboard")
         board_status = scoreboard_status(
             calibrated=bool(board and board.ok and board.calibrated),
@@ -589,16 +686,19 @@ class CodSetRunner:
         pause_status = correlate_pair(
             calibrated=bool(pause and pause.ok and pause.calibrated),
             screen_us=screen_us, input_us=options, frame_stamps=stamps)
+        pause_status, pause_reason = self._hold_counts(pause_status, None, screen_us)
         motion = _nearest_haptic(self.haptics, trigger if trigger is not None else screen_us)
         motion_status = recoil_status(motion, trigger, stamps)
+        motion_status, motion_reason = self._hold_counts(motion_status, None, screen_us)
+        board_status, board_reason = self._hold_counts(board_status, None, screen_us)
         return [
-            {"signal": "hitmarker", "status": hit_status},
-            {"signal": "kill_popup", "status": popup_status},
-            {"signal": "killfeed", "status": feed_status},
-            {"signal": "pause", "status": pause_status},
-            {"signal": "recoil", "status": motion_status},
-            {"signal": "scoreboard", "status": board_status},
-            {"signal": "end_screen", "status": NOT_COUNTED},
+            {"signal": "hitmarker", "status": hit_status, "reason": hit_reason, "gated": gated},
+            {"signal": "kill_popup", "status": popup_status, "reason": popup_reason},
+            {"signal": "killfeed", "status": feed_status, "reason": feed_reason},
+            {"signal": "pause", "status": pause_status, "reason": pause_reason},
+            {"signal": "recoil", "status": motion_status, "reason": motion_reason},
+            {"signal": "scoreboard", "status": board_status, "reason": board_reason},
+            {"signal": "end_screen", "status": NOT_COUNTED, "reason": None},
         ]
 
     def _clear_end_candidate(self) -> None:
@@ -677,6 +777,16 @@ class CodSetRunner:
         extra = (OWNER_TAG.casefold(), kills, deaths, assists, confirms)
         agreed = self._offer(when, end.reason, True, None, None, extra=extra)
         if agreed is None:
+            return
+        from qorcap_cod_hud import consensus_owner_row
+        verdict = consensus_owner_row(self._real_frames, self.own_kill_feed)
+        if verdict["status"] != "accepted":
+            self._write({
+                "t_ms": int(t_ms), "kind": "owner_row", "status": NOT_COUNTED,
+                "reason": verdict["reason"], "consensus": "abstain",
+            })
+            if verdict["reason"] != "short_real_window":
+                self._clear_end_candidate()
             return
         notes = [
             "Call of Duty end screen agreed. This is the end of the match.",
@@ -758,12 +868,126 @@ class CodSetRunner:
             return {"home": home, "away": away, "frames": self._n, "t_ms": t0, "until_ms": t_ms}
         return None
 
+    def _keep_real(self, img) -> None:
+        try:
+            from qorcap_cod_hud import frame_is_real
+            if not frame_is_real(img):
+                return
+        except Exception:
+            return
+        stored = img.copy() if hasattr(img, "copy") else img
+        self._real_frames.append(stored)
+        if len(self._real_frames) > 5:
+            del self._real_frames[:-5]
+
+    def _note_lag(self, t_ms: int, img) -> None:
+        try:
+            from qorcap_lag import LagProbe
+        except Exception:
+            return
+        if self._lag is None:
+            self._lag = LagProbe()
+        try:
+            self._lag.observe(img, self.inputs, screen_mono_us(t_ms, self.wall_anchor_ms))
+        except Exception:
+            return
+        if self.log_path is None or not self._lag.samples:
+            return
+        try:
+            self._lag.write(Path(self.log_path).with_name("lag_band.v0.json"))
+        except OSError:
+            pass
+
+    def _options_release_us(self):
+        """Last OPTIONS release on the input log. None when OPTIONS is still down or absent."""
+        prev = 0
+        release = None
+        for row in self.inputs or []:
+            if not isinstance(row, dict) or row.get("type") != "in":
+                continue
+            b = _as_int(row.get("b"))
+            t = _as_int(row.get("t_us"))
+            if b is None or t is None:
+                continue
+            if prev & OPTIONS_BIT and not b & OPTIONS_BIT:
+                release = t
+            prev = b
+        if prev & OPTIONS_BIT:
+            return None
+        return release
+
+    def _seal_window(self) -> dict:
+        from qorcap_seal import seal_exclusion
+        lag = None
+        if self._lag is not None:
+            lag = self._lag.measured_us()
+        # Pause-menu exit is not read. Missing it keeps the window unresolved.
+        return seal_exclusion(
+            options_release_us=self._options_release_us(), menu_exit_us=None,
+            lag_us=lag, frame_us=16_667)
+
+    def _hold_counts(self, status, reason, t_us):
+        """An unresolved seal window does not release an agreed row into counts."""
+        if status != AGREED:
+            return status, reason
+        from qorcap_seal import event_released
+        window = self._seal_window()
+        if event_released(window, t_us if isinstance(t_us, int) else None):
+            return status, reason
+        return NOT_COUNTED, window.get("reason") or "seal_window_unresolved"
+
+    def _stream_hud(self, t_ms: int, reads, signals) -> None:
+        frame_index = max(0, self.stats["frames"] - 1)
+        snap = tuple((s.get("signal"), s.get("status"), s.get("reason")) for s in signals)
+        if not self._logged:
+            self._logged = True
+            self._last_snap = snap
+            self._write({
+                "t_ms": int(t_ms), "kind": "set",
+                "regions": [_public(rd) for rd in reads],
+                "signals": signals,
+                "frame_clock_gap_us": FRAME_CLOCK_GAP_US,
+                "note": (
+                    "A signal is Counted only when the on-screen hook and the controller "
+                    "agree on the frame clock. Otherwise it is flagged a mismatch, or it is not Counted."
+                ),
+            })
+            return
+        changed = snap != self._last_snap
+        fresh = frame_index > 0 and frame_index % 60 == 0
+        if not changed and not fresh:
+            return
+        self._last_snap = snap
+        self._write({
+            "t_ms": int(t_ms),
+            "kind": "hud" if changed else "freshness",
+            "regions": [_public(rd) for rd in reads],
+            "signals": signals,
+        })
+
     def _write(self, row: dict) -> None:
         if self.log_path is None:
             return
+        body = {k: v for k, v in row.items() if k not in ("prev", "hash")}
+        body.setdefault("schema", SIGNAL_SCHEMA)
+        body.setdefault("frame_index", max(0, self.stats["frames"] - 1))
+        if "mono_us" not in body:
+            body["mono_us"] = screen_mono_us(body.get("t_ms"), self.wall_anchor_ms)
+        prev = self._chain_prev
+        seq = self._chain_seq
+        try:
+            digest = hashlib.sha256(_canon({"prev": prev, "seq": seq, "row": body}).encode("utf-8")).hexdigest()
+        except TypeError as e:
+            print(f"Call of Duty signal log skipped a non-integer row: {e}", file=sys.stderr)
+            return
+        stored = dict(body)
+        stored["prev"] = prev
+        stored["hash"] = digest
+        self._chain_prev = digest
+        self._chain_seq += 1
         try:
             with open(self.log_path, "a", encoding="utf-8") as fh:
-                fh.write(json.dumps(row) + "\n")
+                fh.write(json.dumps(stored) + "\n")
         except OSError as e:
             print(f"Call of Duty signal log failed: {type(e).__name__}: {e}", file=sys.stderr)
 
@@ -956,6 +1180,8 @@ def session_document(*, frame_stamps=None, inputs=None, wall_anchor_ms=None, own
         "power": "unknown",
         "frame_clock": "present" if stamps else "absent",
         "clock_sync": clock_sync_status(stamps, inputs or [], wall_anchor_ms),
+        "counted": COUNTED_SIGNALS,
+        "grip": "off",
         "info_only": INFO_ONLY,
         "note": (
             "Session tags sit beside the match. Clock sync uses the frame clock's 500 ms window. "
@@ -1003,7 +1229,7 @@ def write_session(bundle: Path) -> dict:
     return doc
 
 
-def probe_end_frames(frames) -> dict:
+def probe_end_frames(frames, own_kills=None) -> dict:
     """Read the last ``END_PROBE_FRAMES`` end frames. Does not scan a longer window.
 
     ``frames`` is ``(t_ms, image)`` from the end of the match, oldest first.
@@ -1014,6 +1240,8 @@ def probe_end_frames(frames) -> dict:
     tail = list(frames or [])[-END_PROBE_FRAMES:]
     posted: list = []
     runner = CodSetRunner(posted.append)
+    if own_kills is not None:
+        runner.own_kill_feed = own_kills
     summaries = []
     times = []
     for item in tail:
@@ -1069,9 +1297,9 @@ def _summarize_end_frame(img) -> dict:
     return {"result": result, "owner_row": row}
 
 
-def record_end_probe(bundle: Path, frames) -> dict:
+def record_end_probe(bundle: Path, frames, own_kills=None) -> dict:
     """Write ``cod_end_probe.json``. Does not edit a receipt."""
-    doc = probe_end_frames(frames)
+    doc = probe_end_frames(frames, own_kills=own_kills)
     (Path(bundle) / "cod_end_probe.json").write_text(json.dumps(doc, indent=2) + "\n", encoding="utf-8")
     return doc
 

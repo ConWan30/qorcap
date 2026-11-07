@@ -1043,7 +1043,15 @@ def status_line(st: dict, cps: dict, signed: int, *, game: str = "madden") -> st
     disk_bit = f" | disk {disk}MB" if isinstance(disk, int) else ""
     return (f"[{state}] {int(st.get('recording_secs') or 0) // 60:02d}:{int(st.get('recording_secs') or 0) % 60:02d}"
             f" | {score} | segments {cps.get('segments', 0)} | signed {signed} | clips {cps.get('clips', 0)}"
-            f"{disk_bit}{warn_bit}")
+            f"{disk_bit}{warn_bit}{_seal_suffix(st)}")
+
+
+def _seal_suffix(st: dict) -> str:
+    inp = st.get("input") if isinstance(st.get("input"), dict) else {}
+    line = str((inp or {}).get("seal_line") or "").strip()
+    if not line:
+        return ""
+    return " | " + line
 
 
 def run_cmd(cmd: list[str], env=None) -> tuple[int, str]:

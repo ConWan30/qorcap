@@ -431,6 +431,7 @@ def console_snapshot(st: dict, info: dict, signed: int, live) -> dict:
         "anchors": anchors,
         "retries": failures if live is not None else 0,
         "res": st.get("res") or "",
+        "seal_line": str(inp.get("seal_line") or ""),
     }
 
 
@@ -699,6 +700,9 @@ def layout_dashboard(snap: dict, *, width: int = 78, height: int = 24, tick: int
     hid = _HID.get(str(snap.get("hid_state") or "off"), str(snap.get("hid_state") or "off"))
     dev = str(snap.get("hid_device") or "").strip()
     hid_line = f"HID     {hid}" + (f"    {dev}" if dev else "")
+    seal = str(snap.get("seal_line") or "").strip()
+    if seal:
+        hid_line += "    " + seal
     hid_color = "cyan" if hid == "connected" else "mute" if hid in {"off", "searching"} else "red"
     _put(grid, top + 6, 4, _clip(hid_line, width - 6), hid_color)
     _put(grid, top + 6, 4, "HID", "mute")

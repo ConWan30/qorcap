@@ -23,13 +23,21 @@ pub fn route(e: &Arc<Engine>, method: &str, url: &str, body: &str) -> Resp {
         }
         ("POST", "/record/stop") => match e.stop_recording() { Some(p) => j(200, json!({"ok": true, "file": p})), None => j(409, json!({"ok": false, "error": "not recording"})) },
         ("POST", "/replay/save") => match e.save_replay(b["out"].as_str()) { Ok(p) => j(200, json!({"ok": true, "file": p})), Err(m) => j(409, json!({"ok": false, "error": m})) },
-        ("GET", "/snapshot.jpg") => match std::fs::read(&e.snapshot) {
-            Ok(d) if d.len() > 2 && d[0] == 0xFF && d[1] == 0xD8 => {
-                e.tap.offer(&d, crate::engine::wall_ms()); // no-op unless --glimpse-frame; never blocks
-                Resp { code: 200, ctype: "image/jpeg", body: d, headers: vec![] }
+        ("GET", "/snapshot.jpg") => {
+            if let Some(d) = e.snap_pub.lock().unwrap_or_else(|err| err.into_inner()).memory() {
+                if d.len() > 2 && d[0] == 0xFF && d[1] == 0xD8 {
+                    e.tap.offer(&d, crate::engine::wall_ms());
+                    return Resp { code: 200, ctype: "image/jpeg", body: d, headers: vec![] };
+                }
             }
-            _ => j(503, json!({"ok": false, "error": "no frame yet"})),
-        },
+            match std::fs::read(&e.snapshot) {
+                Ok(d) if d.len() > 2 && d[0] == 0xFF && d[1] == 0xD8 => {
+                    e.tap.offer(&d, crate::engine::wall_ms()); // no-op unless --glimpse-frame; never blocks
+                    Resp { code: 200, ctype: "image/jpeg", body: d, headers: vec![] }
+                }
+                _ => j(503, json!({"ok": false, "error": "no frame yet"})),
+            }
+        }
         // Advisory Glimpse watcher: the newest frame the reader already pulled (no file read here).
         ("GET", "/frame/scorebug") => frame_scorebug(e),
         // Opt-in burst ring. Off (the default): 404, and /frame/scorebug is unchanged.

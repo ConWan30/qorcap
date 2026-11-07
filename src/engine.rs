@@ -40,6 +40,9 @@ pub struct Status {
     pub replay_window: u64,
     pub uptime_secs: f64,
     pub disk_free_mb: Option<u64>,
+    /// Complete JPEGs accepted by the snapshot publisher, and replace failures that stayed in memory.
+    pub snapshot_frames: u64,
+    pub snapshot_publish_failures: u64,
     /// Controller (USB HID) input logger state; None when --no-controller.
     pub input: Option<crate::inputs::Live>,
     /// v0.3.26: this console's QorTime side (home | away), fixed before the first checkpoint, and how it was chosen.
@@ -57,6 +60,7 @@ pub struct Engine {
     pub status: Mutex<Status>,
     pub shutdown: AtomicBool,
     pub snapshot: PathBuf,
+    pub snap_pub: Mutex<crate::snap::Publisher>,
     /// Opt-in read-only frame tap for the advisory Glimpse watcher (GET /frame/scorebug).
     pub tap: crate::glimpse::FrameTap,
     pub exit_when_recording_ends: AtomicBool,
@@ -205,7 +209,9 @@ impl Engine {
         let dir = run_dir(&args);
         let input_path = args.bundle.as_ref().map(|b| PathBuf::from(b).join("inputs.jsonl"))
             .or_else(|| args.out.as_ref().map(|o| PathBuf::from(format!("{o}.inputs.jsonl"))));
-        let input = Arc::new(Mutex::new(crate::inputs::InputLog::new(input_path, !args.no_controller, wall_ms())));
+        let mut log = crate::inputs::InputLog::new(input_path, !args.no_controller, wall_ms());
+        if args.game.as_deref() == Some("cod_mw4") { log.enable_seal(); }
+        let input = Arc::new(Mutex::new(log));
         // After the input logger's wall anchor, before `started`. Opening the file does not read the clock.
         let frame_on = crate::frameclock::flag_enabled(args.frame_clock, std::env::var(crate::frameclock::ENV).ok().as_deref());
         let frame_clock = Arc::new(crate::frameclock::FrameClock::open(frame_on, args.bundle.as_deref().map(Path::new)));
@@ -213,7 +219,7 @@ impl Engine {
         Arc::new(Self { ffmpeg, ring: Mutex::new(ReplayRing::new(window, cap)), rec: Mutex::new(None), status: Mutex::new(st), shutdown: AtomicBool::new(false),
             ev: Mutex::new(MatchState { started_wall_ms: wall_ms(), score: Value::Null, ..Default::default() }), subs: Mutex::new(vec![]),
             stamp_file: dir.join("stamp.txt"),
-            snapshot: dir.join("snapshot.jpg"), tap: crate::glimpse::FrameTap::with_ring(args.glimpse_frame || crate::glimpse::env_enabled(), crate::glimpse::ring_enabled()), exit_when_recording_ends: AtomicBool::new(false), started: Instant::now(), last_data_ms: AtomicU64::new(0), input, frame_clock,
+            snapshot: dir.join("snapshot.jpg"), snap_pub: Mutex::new(crate::snap::Publisher::new()), tap: crate::glimpse::FrameTap::with_ring(args.glimpse_frame || crate::glimpse::env_enabled(), crate::glimpse::ring_enabled()), exit_when_recording_ends: AtomicBool::new(false), started: Instant::now(), last_data_ms: AtomicU64::new(0), input, frame_clock,
             running: AtomicBool::new(false), api_closed: AtomicBool::new(false), sealed: AtomicBool::new(false),
             countersigned: std::sync::atomic::AtomicI64::new(-1),
             stop_reason: Mutex::new(None), bundle_write: Mutex::new(()), bundle_finalized: AtomicBool::new(false), args })
@@ -233,6 +239,11 @@ impl Engine {
         { let r = self.ring.lock().unwrap_or_else(|e| e.into_inner()); s.replay_bytes = r.len_bytes(); s.replay_secs_buffered = r.span_ms() as f64 / 1000.0; }
         if self.args.replay.is_none() { s.replay_bytes = 0; s.replay_secs_buffered = 0.0; }
         if !self.args.no_controller { s.input = Some(self.input.lock().unwrap_or_else(|e| e.into_inner()).live.clone()); }
+        {
+            let pub_ = self.snap_pub.lock().unwrap_or_else(|e| e.into_inner());
+            s.snapshot_frames = pub_.frames;
+            s.snapshot_publish_failures = pub_.failures;
+        }
         if let Some(r) = self.rec.lock().unwrap_or_else(|e| e.into_inner()).as_ref() { s.recording = Some(r.path.clone()); s.recording_secs = r.started.elapsed().as_secs_f64(); }
         s.uptime_secs = self.started.elapsed().as_secs_f64();
         let probe = self.args.out.as_deref().or(self.args.bundle.as_deref()).unwrap_or(".");
@@ -576,7 +587,13 @@ impl Engine {
     /// referee reports it countersigned through that seq. No referee attached -> no wait.
     pub fn seal_and_wait_countersign(&self, wait: Duration) -> Option<u64> {
         if self.sealed.load(Ordering::SeqCst) { return None; }
-        let cp = self.checkpoint("stop", json!({}));
+        self.input.lock().unwrap_or_else(|e| e.into_inner()).close_seal();
+        let mut extra = serde_json::Map::new();
+        if let Some(sha) = self.write_pad_link() {
+            extra.insert("pad_link_sha256".into(), json!(sha));
+            extra.insert("pad_link_file".into(), json!("pad_link.v0.json"));
+        }
+        let cp = self.checkpoint("stop", Value::Object(extra));
         self.sealed.store(true, Ordering::SeqCst);
         let last = cp["seq"].as_u64()?;
         self.status.lock().unwrap_or_else(|e| e.into_inner()).final_checkpoint_seq = Some(last);
@@ -592,6 +609,21 @@ impl Engine {
         Some(last)
     }
 
+    fn write_pad_link(&self) -> Option<String> {
+        let path = {
+            let input = self.input.lock().unwrap_or_else(|e| e.into_inner());
+            input.path().map(|p| p.to_path_buf())?
+        };
+        if !path.is_file() { return None; }
+        let (recs, _) = crate::inputs::read_file(&path).ok()?;
+        let hbs: Vec<Value> = recs.into_iter().filter(|r| r.get("type").and_then(|t| t.as_str()) == Some("hb")).collect();
+        if hbs.is_empty() { return None; }
+        let text = format!("{}\n", crate::pad_link::document(&hbs));
+        let file = path.with_file_name("pad_link.v0.json");
+        std::fs::write(&file, &text).ok()?;
+        Some(crate::evidence::sha256_hex(text.as_bytes()))
+    }
+
     fn sleep(&self, secs: u64) {
         let end = Instant::now() + Duration::from_secs(secs);
         while Instant::now() < end && !self.shutdown.load(Ordering::SeqCst) { std::thread::sleep(Duration::from_millis(100)); }
@@ -603,7 +635,26 @@ impl Engine {
         if let Some(d) = self.snapshot.parent() { let _ = std::fs::create_dir_all(d); }
         if self.args.stamp && !self.stamp_file.exists() { let _ = std::fs::write(&self.stamp_file, "QorCap  no referee nonce yet"); }
         let stamp = if self.args.stamp { Some(self.stamp_file.to_string_lossy().into_owned()) } else { None };
-        let args = ffmpeg::capture_args_with(&self.args, input_format, audio, &self.snapshot.to_string_lossy(), stamp.as_deref());
+        // Incoming file is overwritten in place. The publisher copies a complete JPEG into memory
+        // and replaces snapshot.jpg. ffmpeg does not atomic-rename over the file the reader opens.
+        let incoming = self.snapshot.with_file_name("snapshot.incoming.jpg");
+        let args = ffmpeg::capture_args_with(&self.args, input_format, audio, &incoming.to_string_lossy(), stamp.as_deref());
+        let stop_pub = Arc::new(AtomicBool::new(false));
+        let publisher = {
+            let flag = stop_pub.clone();
+            let dest = self.snapshot.clone();
+            let inc = incoming.clone();
+            let me = self.clone();
+            std::thread::spawn(move || {
+                while !flag.load(Ordering::SeqCst) {
+                    if let Ok(bytes) = std::fs::read(&inc) {
+                        me.snap_pub.lock().unwrap_or_else(|e| e.into_inner()).consider(&bytes, &dest);
+                    }
+                    std::thread::sleep(Duration::from_millis(40));
+                }
+            })
+        };
+        let _stop_publisher = StopPublisher { flag: stop_pub, handle: Some(publisher) };
         info!("opening \"{}\" format={input_format} audio={:?} ({:?}) {}x{}@{} enc={}", self.args.device, audio.map(|a| &a.name), audio.map(|a| a.strategy), self.args.res.0, self.args.res.1, self.args.fps, self.args.encoder);
         let child = ffmpeg::command(&self.ffmpeg).args(&args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn();
         let mut child = match child { Ok(c) => c, Err(e) => { let m = format!("cannot start ffmpeg `{}`: {e}", self.ffmpeg); error!("{m}"); self.set_state("reopening", Some(m)); return (false, ffmpeg::Failure::Other); } };
@@ -685,6 +736,14 @@ impl Engine {
             self.set_state("reopening", Some(format!("{m}{hint}")));
         }
         (got, why)
+    }
+}
+
+struct StopPublisher { flag: Arc<AtomicBool>, handle: Option<std::thread::JoinHandle<()>> }
+impl Drop for StopPublisher {
+    fn drop(&mut self) {
+        self.flag.store(true, Ordering::SeqCst);
+        if let Some(handle) = self.handle.take() { let _ = handle.join(); }
     }
 }
 
@@ -1266,6 +1325,9 @@ impl Engine {
         let mut ext = json!({"trigger": trigger, "segment_seq": st.seg.seq, "segment_hash": st.last_seg_sha, "chain_head": st.seg.head,
             "score": st.score, "mono_ms": self.ms(), "match_id": self.args.match_id, "role": self.args.role});
         if let (Value::Object(e), Value::Object(x)) = (&mut ext, extra) { e.extend(x); }
+        if let Some(seal) = self.input.lock().unwrap_or_else(|e| e.into_inner()).take_seal_for_checkpoint() {
+            if let Value::Object(e) = &mut ext { e.insert("session_seal".into(), seal); }
+        }
         let cp = match st.cps.next_with_input(wall_ms(), ext, input_hash) {
             Ok(cp) => cp,
             Err(e) => {

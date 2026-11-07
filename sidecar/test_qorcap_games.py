@@ -155,6 +155,9 @@ def test_info_only_and_session_tags(tmp_path):
         assert row["label"] == "INFO-ONLY"
         assert row["status"] == C.NOT_COUNTED
     assert C.INFO_ONLY["power_aware_timing"]["power"] == "unknown"
+    assert "stick_turn_vs_camera" not in C.INFO_ONLY
+    assert C.COUNTED_SIGNALS["stick_turn_vs_camera"]["label"] == "Counted"
+    assert C.session_document()["grip"] == "off"
     empty = C.session_document()
     assert empty["power"] == "unknown"
     assert empty["controller_path"] == "unknown"

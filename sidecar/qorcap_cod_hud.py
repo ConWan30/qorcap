@@ -1443,3 +1443,55 @@ def build_calibration_pack(fixture_dir: Path = FIXTURE_DIR, out_path: Path = PAC
         row_digit_labels=np.array([s.encode("ascii") for s in row_labels]),
         row_digit_vecs=row_digit_vecs,
     )
+
+
+# PROVISIONAL. A fade or a black frame is not a real end-board frame.
+REAL_MEAN_MIN = 18.0
+FADE_STD_MAX = 8.0
+FADE_MEAN_MAX = 40.0
+CONSENSUS_FRAMES = 5
+
+
+def frame_is_real(img) -> bool:
+    """False for a missing, black, or faded frame. A non-array does not raise."""
+    bgr = _as_bgr(img)
+    if bgr is None:
+        return False
+    mean = float(bgr.mean())
+    if mean < REAL_MEAN_MIN:
+        return False
+    if mean < FADE_MEAN_MAX and float(bgr.std()) < FADE_STD_MAX:
+        return False
+    return True
+
+
+def consensus_owner_row(frames, own_kills) -> dict:
+    """Five real frames must read the same kills and deaths, and match the own-kill feed.
+
+    Fewer than five real frames abstains and does not invent a row. An unknown
+    own-kill count abstains. A mismatch abstains. The single-frame reader is unchanged.
+    """
+    real = [f for f in frames or [] if frame_is_real(f)]
+    tail = real[-CONSENSUS_FRAMES:]
+    empty = {"status": "abstain", "kills": None, "deaths": None}
+    if len(tail) < CONSENSUS_FRAMES:
+        return {**empty, "reason": "short_real_window"}
+    reads = [read_owner_row(f) for f in tail]
+    if not all(r.ok and r.calibrated and r.kills is not None and r.deaths is not None for r in reads):
+        return {**empty, "reason": "row_not_read"}
+    kills = {r.kills for r in reads}
+    deaths = {r.deaths for r in reads}
+    if len(kills) != 1 or len(deaths) != 1:
+        return {**empty, "reason": "frames_disagree"}
+    if own_kills is None:
+        return {**empty, "reason": "no_own_kill_count"}
+    k = next(iter(kills))
+    d = next(iter(deaths))
+    if int(own_kills) != int(k):
+        return {"status": "abstain", "reason": "own_kill_mismatch", "kills": k, "deaths": d}
+    last = reads[-1]
+    return {
+        "status": "accepted", "reason": "five_frame_consensus",
+        "kills": k, "deaths": d, "assists": last.assists, "confirms": last.confirms,
+        "player_tag": last.player_tag,
+    }
