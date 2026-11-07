@@ -259,6 +259,54 @@ fn post_close_duplicate_extension_stays_withheld_in_readiness() {
 }
 
 #[test]
+fn substituted_opening_presented_directly_to_evaluate_withholds() {
+    use qorcap::anchor_seen_at::check::ClockRef;
+    let w = World::new();
+    let s = Session::new("ready-sub-opening");
+    let v = full_stream(&w, &s);
+    let st: Vec<AnchorState> = v.iter().map(|e| e.state(&w.policy)).collect();
+    let r = Ready { opening: st[0].clone(), view: StreamEligibility::from_arrival_order(&st, 29), w, s: s.clone() };
+    let frames = [frame(&s, 12, 1), frame(&s, 18, 2), frame(&s, 25, 3)];
+    // The valid original opening stays ready. None of the substitutes below is ever
+    // passed through `record`; each goes straight to `evaluate`.
+    assert_eq!(evaluate(&inputs(&r, &frames)), Readiness::PracticeReadyForward);
+
+    // (a) The opening rechecked under a different client clock: same ack, same
+    // commitment, same stream context — but not the accepted opening.
+    let mut clocked = v[0].clone();
+    clocked.samples.send_clock = ClockRef { boot_id: id("sub-other-boot"), clock_epoch_id: id("sub-other-epoch") };
+    clocked.samples.receive_clock = clocked.samples.send_clock.clone();
+    let clocked = clocked.state(&r.w.policy);
+    assert!(clocked.retained().is_some());
+    let mut i = inputs(&r, &frames);
+    i.opening = &clocked;
+    let why = withheld(evaluate(&i));
+    assert!(why.contains(&Reason::ClientClockDomainChanged), "{why:?}");
+
+    // (b) A different ack id over the accepted opening's context.
+    let mut relabeled = st[0].retained().unwrap().clone();
+    relabeled.ack_id = hex64("substituted-opening-ack");
+    let relabeled = AnchorState::SeenAtRetained(relabeled);
+    let mut i = inputs(&r, &frames);
+    i.opening = &relabeled;
+    let why = withheld(evaluate(&i));
+    assert!(why.contains(&Reason::BindingMismatch), "{why:?}");
+
+    // (c) A changed commitment (here the bound client nonce) under the accepted ack id.
+    let mut rebound = st[0].retained().unwrap().clone();
+    rebound.commitment.client_nonce = hex64("substituted-nonce");
+    let rebound = AnchorState::SeenAtRetained(rebound);
+    let mut i = inputs(&r, &frames);
+    i.opening = &rebound;
+    let why = withheld(evaluate(&i));
+    assert!(why.contains(&Reason::BindingMismatch), "{why:?}");
+
+    // The eligibility state was never touched by the substitutes, and the original
+    // opening is still ready afterwards.
+    assert_eq!(evaluate(&inputs(&r, &frames)), Readiness::PracticeReadyForward);
+}
+
+#[test]
 fn loss_then_recovery_and_reversed_arrival_stay_withheld_in_readiness() {
     let w = World::new();
     let s = Session::new("ready-forward-only");

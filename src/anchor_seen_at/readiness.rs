@@ -31,6 +31,8 @@ pub struct FrameObservation {
 }
 
 pub struct ReadinessInputs<'a> {
+    /// The caller's presentation of the opening. Readiness derives the authoritative
+    /// opening from `eligibility` and withholds unless this matches it exactly.
     pub opening: &'a AnchorState,
     /// Forward-only eligibility state, recorded in arrival order. Never an archival
     /// reconstruction: a reconstructed view can fill ranges whose eligibility was
@@ -52,8 +54,23 @@ pub enum Readiness {
 
 pub fn evaluate(i: &ReadinessInputs) -> Readiness {
     let mut why = BTreeSet::new();
-    let opening = i.opening.retained().filter(|f| f.commitment.purpose == Purpose::Opening);
-    if opening.is_none() { why.insert(Reason::AnchorNotRetained); }
+    // The opening is derived from the eligibility state: the opening it actually
+    // accepted, with the bound it was accepted under. A caller-supplied opening is
+    // only a presentation of that fact and must match its immutable context exactly
+    // (ack id, client clock identity, stream and server epoch, chain, commitment and
+    // ledger); a rechecked, relabeled, or otherwise substituted opening withholds,
+    // even when it shares the stream context.
+    let accepted_opening = i.eligibility.accepted_opening();
+    let opening = accepted_opening;
+    let supplied = i.opening.retained().filter(|f| f.commitment.purpose == Purpose::Opening);
+    if supplied.is_none() { why.insert(Reason::AnchorNotRetained); }
+    match (supplied, accepted_opening) {
+        (Some(s), Some(a)) => {
+            if let Some(r) = super::coverage::immutable_context_reason(a, s) { why.insert(r); }
+        }
+        (Some(_), None) => { why.insert(Reason::AnchorNotRetained); }
+        _ => {}
+    }
     // The eligibility state must belong to the opening's full stream context. An opening
     // from one stream paired with eligibility from another (same ranges, different
     // stream) is not readiness.

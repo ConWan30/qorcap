@@ -114,6 +114,9 @@ pub struct StreamEligibility {
     /// observation carrying the same ack id can be compared against the accepted fact's
     /// full immutable context before it is treated as an idempotent retry.
     accepted: BTreeMap<String, (SeenAtFact, u64)>,
+    /// The accepted opening fact and the source bound it was accepted under. Readiness
+    /// derives its opening from here, never from a caller-supplied substitute.
+    opening: Option<(SeenAtFact, u64)>,
     prev: Option<SeenAtFact>,
     next_index: u64,
     next_seq: u64,
@@ -135,7 +138,7 @@ impl StreamEligibility {
     /// history is missing, and missing history reads UNKNOWN.
     pub fn new() -> Self {
         StreamEligibility {
-            eligible: vec![], stream_context: None, accepted: BTreeMap::new(), prev: None,
+            eligible: vec![], stream_context: None, accepted: BTreeMap::new(), opening: None, prev: None,
             next_index: 0, next_seq: 0, source_last_seq: 0, break_reason: None, closed: false,
             sealed_last_seq: None,
         }
@@ -235,6 +238,7 @@ impl StreamEligibility {
                 });
                 if self.stream_context.is_none() { self.stream_context = Some(StreamContext::of(f)); }
                 self.accepted.insert(f.ack_id.clone(), (f.clone(), source_last_seq));
+                if f.commitment.index() == 0 { self.opening = Some((f.clone(), source_last_seq)); }
                 self.closed = f.commitment.purpose == Purpose::Close;
                 if self.closed {
                     self.sealed_last_seq = Some(f.chain_last());
@@ -251,6 +255,11 @@ impl StreamEligibility {
 
     pub fn break_reason(&self) -> Option<Reason> { self.break_reason }
     pub fn stream_context(&self) -> Option<&StreamContext> { self.stream_context.as_ref() }
+    /// The opening this state actually accepted (index 0), derived from the recorded
+    /// stream — the only opening readiness may anchor to.
+    pub fn accepted_opening(&self) -> Option<&SeenAtFact> { self.opening.as_ref().map(|(f, _)| f) }
+    /// The source bound the accepted opening was recorded under.
+    pub fn accepted_opening_bound(&self) -> Option<u64> { self.opening.as_ref().map(|(_, b)| *b) }
 
     /// Eligible prefix plus, when anything up to the source's last row is not eligible,
     /// one trailing unknown segment carrying the preserved break (or the reason nothing
@@ -290,7 +299,14 @@ impl StreamEligibility {
 /// `None` when it is one. Volatile receipt timing (`received_*`, `rtt_ns`) is not part
 /// of the immutable context; everything that identifies what was seen, by whom, under
 /// which clocks and epochs, and under what source bound, is.
-fn duplicate_context_reason(accepted: &SeenAtFact, accepted_bound: u64, f: &SeenAtFact, source_last_seq: u64) -> Option<Reason> {
+/// Why `f` does not carry the same immutable context as the accepted fact, or `None`
+/// when it does. This is the comparison any purported copy of an accepted fact must
+/// pass — a duplicate observation in [`StreamEligibility::record`], or the opening a
+/// caller presents to readiness. Volatile receipt timing is excluded (see above).
+pub(crate) fn immutable_context_reason(accepted: &SeenAtFact, f: &SeenAtFact) -> Option<Reason> {
+    if f.ack_id != accepted.ack_id {
+        return Some(Reason::BindingMismatch);
+    }
     if f.client_boot_id != accepted.client_boot_id || f.client_clock_epoch_id != accepted.client_clock_epoch_id {
         return Some(Reason::ClientClockDomainChanged);
     }
@@ -308,6 +324,11 @@ fn duplicate_context_reason(accepted: &SeenAtFact, accepted_bound: u64, f: &Seen
         || f.ledger_seq != accepted.ledger_seq || f.prev_ledger_entry_digest != accepted.prev_ledger_entry_digest {
         return Some(Reason::BindingMismatch);
     }
+    None
+}
+
+fn duplicate_context_reason(accepted: &SeenAtFact, accepted_bound: u64, f: &SeenAtFact, source_last_seq: u64) -> Option<Reason> {
+    if let Some(r) = immutable_context_reason(accepted, f) { return Some(r); }
     if source_last_seq != accepted_bound {
         // A lowered bound is caught earlier as a regression against the stream bound;
         // reaching here with a different bound means it grew since acceptance.
