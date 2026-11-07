@@ -155,6 +155,9 @@ def test_info_only_and_session_tags(tmp_path):
         assert row["label"] == "INFO-ONLY"
         assert row["status"] == C.NOT_COUNTED
     assert C.INFO_ONLY["power_aware_timing"]["power"] == "unknown"
+    assert "stick_turn_vs_camera" not in C.INFO_ONLY
+    assert C.COUNTED_SIGNALS["stick_turn_vs_camera"]["label"] == "Counted"
+    assert C.session_document()["grip"] == "off"
     empty = C.session_document()
     assert empty["power"] == "unknown"
     assert empty["controller_path"] == "unknown"
@@ -244,7 +247,7 @@ def test_end_screen_bar_needs_distinct_times_and_resets():
     assert _run_end([(0, same), (1000, same), (4001, same)]) == []
     held = _run_end([(0, same), (1000, same), (4000, same)])
     assert len(held) == 1 and held[0]["t_ms"] == 0 and held[0]["home"] == 3 and held[0]["away"] == 1
-    assert held[0]["final_confirmed"] is True
+    assert held[0]["visual_confirmed"] is True and held[0]["final_confirmed"] is False
 
     restarted = _run_end([
         (0, same),
@@ -264,7 +267,8 @@ def test_end_screen_bar_needs_distinct_times_and_resets():
     # Home is behind, so this DEFEAT matches the side and can still confirm.
     defeat = _scored("defeat", 1, 3, confirm=True)
     switched = _run_end([(0, same), (1000, same), (4000, defeat), (5000, defeat), (8000, defeat)])
-    assert len(switched) == 1 and switched[0]["t_ms"] == 4000 and switched[0]["final_confirmed"] is True
+    assert len(switched) == 1 and switched[0]["t_ms"] == 4000
+    assert switched[0]["visual_confirmed"] is True and switched[0]["final_confirmed"] is False
     assert switched[0]["home"] == 1 and switched[0]["away"] == 3
 
     other = _scored("victory", 4, 1, confirm=True)
@@ -314,7 +318,7 @@ def test_defeat_ahead_of_our_side_is_not_confirmed():
 
     matched = _scored("defeat", 3, 8, confirm=True)
     ok = _run_end([(0, matched), (1500, matched), (3000, matched)], side="home")
-    assert ok[0]["final_confirmed"] is True
+    assert ok[0]["visual_confirmed"] is True and ok[0]["final_confirmed"] is False
 
     away_ahead = _scored("defeat", 3, 8, confirm=True)
     away = _run_end([(0, away_ahead), (1500, away_ahead), (3000, away_ahead)], side="away")
@@ -322,7 +326,7 @@ def test_defeat_ahead_of_our_side_is_not_confirmed():
 
     away_behind = _scored("defeat", 8, 3, confirm=True)
     away_ok = _run_end([(0, away_behind), (1500, away_behind), (3000, away_behind)], side="away")
-    assert away_ok[0]["final_confirmed"] is True
+    assert away_ok[0]["visual_confirmed"] is True and away_ok[0]["final_confirmed"] is False
 
     tie = _scored("victory", 4, 4, confirm=True)
     tied = _run_end([(0, tie), (1500, tie), (3000, tie)], side="home")
@@ -375,10 +379,94 @@ def test_calibrated_end_screen_needs_three_frames(tmp_path):
                                                              home=3, away=1, confirm=True)))
     for t in (0, 1000, 3000):
         runner2.on_frame(t, _Img())
-    assert confirmed[0]["final_confirmed"] is True
+    assert confirmed[0]["visual_confirmed"] is True and confirmed[0]["final_confirmed"] is False
     quiet = []
     runner3 = C.CodSetRunner(quiet.append, hud=type("H", (), {"read": lambda self, img: []})(),
                              end=End(lambda img: C.RegionRead("end_screen", "read", True, "ok", False, home=9, away=9)))
     for t in (0, 1000, 5000):
         runner3.on_frame(t, _Img())
     assert quiet == []
+
+
+def test_scored_end_final_uses_the_eligibility_gate():
+    """The scored path posts the visual read and confirms only through the shared gate."""
+    same = _scored("victory", 3, 1, confirm=True)
+    visual = _run_end([(0, same), (1000, same), (4000, same)])
+    assert visual[0]["visual_confirmed"] is True
+    assert visual[0]["final_confirmed"] is False
+    anchor = "independent-v1:" + ("ab" * 32)
+
+    def feed(last_source, *, anchor_token=anchor, epoch=1):
+        posted = []
+        pending = [same, same, same]
+
+        class End:
+            def read(self, img):
+                return pending.pop(0)
+
+        runner = C.CodSetRunner(posted.append, hud=type("H", (), {"read": lambda self, img: []})(),
+                                end=End(), side="home")
+        runner.set_signals(
+            [{"type": "in", "t_us": 0, "b": 1 << 9}, {"type": "in", "t_us": 1_000, "b": 0}],
+            [], [], 0)
+        runner.menu_exit_us = 1_000
+        runner.lag_us_override = 1_000
+        runner.capture_epoch = epoch
+        runner.capture_generation = 1
+        runner.session_id = "s1"
+        runner.seal_durable = True
+        runner.anchor_validated = True
+        runner.independent_anchor = anchor_token
+        for i, t in enumerate((0, 1000, 4000)):
+            source = {
+                "capture_id": f"c{i}",
+                "frame_id": f"c{i}",
+                "seq": i,
+                "epoch": epoch,
+                "clock": "capture_pts",
+                "mono_us": 300_000 + i,
+            }
+            if i == 2:
+                source = last_source
+            runner.on_frame(t, _Img(), source=source)
+        return posted[0]
+
+    armed = feed({
+        "capture_id": "c2", "frame_id": "c2", "seq": 2, "epoch": 1,
+        "clock": "capture_pts", "mono_us": 4_000_000, "captured_us": 4_000_000,
+    })
+    assert armed["visual_confirmed"] is True and armed["final_confirmed"] is False
+    early = feed({
+        "capture_id": "c2", "frame_id": "c2", "seq": 2, "epoch": 1,
+        "clock": "capture_pts", "mono_us": 1, "captured_us": 1,
+    })
+    assert early["visual_confirmed"] is True and early["final_confirmed"] is False
+    bare = feed(
+        {"capture_id": "c2", "frame_id": "c2", "captured_us": 4_000_000, "mono_us": 4_000_000, "seq": 2, "epoch": 1, "clock": "capture_pts"},
+        anchor_token="x")
+    assert bare["final_confirmed"] is False
+    moved = feed({
+        "capture_id": "c2", "frame_id": "c2", "captured_us": 4_000_000, "mono_us": 4_000_000,
+        "seq": 2, "epoch": 2, "clock": "capture_pts",
+    })
+    assert moved["final_confirmed"] is False
+    mismatch = _scored("defeat", 8, 3, confirm=True)
+    posted = []
+    pending = [mismatch, mismatch, mismatch]
+
+    class End:
+        def read(self, img):
+            return pending.pop(0)
+
+    runner = C.CodSetRunner(posted.append, hud=type("H", (), {"read": lambda self, img: []})(),
+                            end=End(), side="home")
+    runner.set_signals(
+        [{"type": "in", "t_us": 0, "b": 1 << 9}, {"type": "in", "t_us": 1_000, "b": 0}],
+        [], [], 0)
+    runner.menu_exit_us = 1_000
+    runner.lag_us_override = 1_000
+    runner.capture_epoch = 1
+    runner.independent_anchor = anchor
+    for t in (0, 1000, 4000):
+        runner.on_frame(t, _Img(), source={"captured_us": 4_000_000, "mono_us": 4_000_000, "clock": "capture_pts", "epoch": 1})
+    assert posted[0]["visual_confirmed"] is False and posted[0]["final_confirmed"] is False

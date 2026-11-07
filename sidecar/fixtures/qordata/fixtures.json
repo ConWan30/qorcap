@@ -1,0 +1,548 @@
+{
+  "clock": [
+    {
+      "id": "wall_step_back_2s",
+      "input": {
+        "session_id": "s1",
+        "clock_id": "boot1:producer1",
+        "clock_source": "monotonic_ns",
+        "mono_origin_ns": 9000000000,
+        "frames": [
+          {
+            "capture_id": "a",
+            "mono_us": 1000000,
+            "wall_time_ms": 1700000003000
+          },
+          {
+            "capture_id": "b",
+            "mono_us": 1250000,
+            "wall_time_ms": 1700000001000
+          }
+        ]
+      },
+      "expected": {
+        "verdict": "accept_order",
+        "ordered_capture_ids": [
+          "a",
+          "b"
+        ],
+        "wall_time_used_for_order": false
+      }
+    },
+    {
+      "id": "missing_clock_binding",
+      "input": {
+        "session_id": "s1",
+        "clock_id": null,
+        "mono_origin_ns": null,
+        "frame": {
+          "capture_id": "a",
+          "mono_us": 1700000003000000,
+          "wall_time_ms": 1700000003000
+        }
+      },
+      "expected": {
+        "verdict": "unknown_void",
+        "reason": "clock_binding_missing"
+      }
+    },
+    {
+      "id": "cross_boot_epoch",
+      "input": {
+        "session_id": "s1",
+        "session_clock_id": "boot1:p1",
+        "frames": [
+          {
+            "capture_id": "a",
+            "clock_id": "boot1:p1",
+            "mono_us": 9000
+          },
+          {
+            "capture_id": "b",
+            "clock_id": "boot2:p2",
+            "mono_us": 10
+          }
+        ]
+      },
+      "expected": {
+        "verdict": "reject_clock_domain",
+        "reason": "clock_epoch_mismatch"
+      }
+    }
+  ],
+  "capture_evidence": [
+    {
+      "id": "http_503_frame_2",
+      "input": {
+        "attempts": [
+          {
+            "attempt_seq": 1,
+            "http_status": 200,
+            "capture_id": "a"
+          },
+          {
+            "attempt_seq": 2,
+            "http_status": 503
+          },
+          {
+            "attempt_seq": 3,
+            "http_status": 200,
+            "capture_id": "b"
+          }
+        ]
+      },
+      "expected": {
+        "verdict": "log_failure",
+        "failure": {
+          "attempt_seq": 2,
+          "kind": "capture_failure",
+          "reason_code": "http_error",
+          "http_status": 503
+        },
+        "chain_entry_required": true,
+        "final_candidate_reset": true
+      }
+    },
+    {
+      "id": "stale_or_missing_provenance",
+      "input": {
+        "variants": [
+          {
+            "attempt_seq": 2,
+            "source_wall_ms": 1000,
+            "now_wall_ms": 3001,
+            "max_age_ms": 2000
+          },
+          {
+            "attempt_seq": 2,
+            "source_wall_ms": null,
+            "capture_generation": null
+          }
+        ]
+      },
+      "expected": {
+        "verdict": "log_failure",
+        "reason_codes": [
+          "stale_snapshot",
+          "missing_provenance"
+        ],
+        "chain_entry_required_per_variant": true,
+        "candidate_reset": true
+      }
+    },
+    {
+      "id": "jpeg_decode_none",
+      "input": {
+        "attempt_seq": 2,
+        "http_status": 200,
+        "provenance_valid": true,
+        "jpeg_bytes_hex": "ffd8ffd9",
+        "decoder_result": null
+      },
+      "expected": {
+        "verdict": "log_failure",
+        "reason_code": "decode_error",
+        "chain_entry_required": true,
+        "no_on_frame": true
+      }
+    },
+    {
+      "id": "digit_and_candidates_change_same_status",
+      "input": {
+        "regions": [
+          {
+            "capture_id": "a",
+            "region": "scoreboard",
+            "status": "read",
+            "calibrated": true,
+            "reason": null,
+            "digits": {
+              "kills": 7
+            },
+            "candidates": [
+              {
+                "value": 7,
+                "score_milli": 900
+              }
+            ]
+          },
+          {
+            "capture_id": "b",
+            "region": "scoreboard",
+            "status": "read",
+            "calibrated": true,
+            "reason": null,
+            "digits": {
+              "kills": 1
+            },
+            "candidates": [
+              {
+                "value": 1,
+                "score_milli": 900
+              }
+            ]
+          }
+        ]
+      },
+      "expected": {
+        "verdict": "emit_both",
+        "evidence_hashes_must_differ": true
+      }
+    }
+  ],
+  "terminal": [
+    {
+      "id": "last_three_entries_missing",
+      "input": {
+        "valid_base_entries": [
+          {
+            "chain_seq": 0,
+            "kind": "set"
+          },
+          {
+            "chain_seq": 1,
+            "kind": "hud"
+          },
+          {
+            "chain_seq": 2,
+            "kind": "hud"
+          },
+          {
+            "chain_seq": 3,
+            "kind": "hud"
+          },
+          {
+            "chain_seq": 4,
+            "kind": "hud"
+          }
+        ],
+        "mutations": [
+          "drop last 3 data entries but retain original terminal",
+          "drop final 3 physical JSONL lines including terminal"
+        ]
+      },
+      "expected": {
+        "verdict": "reject_incomplete",
+        "reasons": [
+          "root_count_seq_mismatch",
+          "terminal_missing"
+        ]
+      }
+    },
+    {
+      "id": "inflated_count_rehashed_terminal",
+      "input": {
+        "valid_base_data_count": 2,
+        "terminal_patch": {
+          "entry_count": 9
+        },
+        "rehash_terminal": true
+      },
+      "expected": {
+        "verdict": "reject",
+        "reason": "terminal_count_mismatch"
+      }
+    },
+    {
+      "id": "wrong_root_rehashed_terminal",
+      "input": {
+        "valid_base_data_count": 2,
+        "terminal_patch": {
+          "chain_root_hash": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+        },
+        "rehash_terminal": true
+      },
+      "expected": {
+        "verdict": "reject",
+        "reason": "terminal_root_mismatch"
+      }
+    },
+    {
+      "id": "explicit_truncation_rehashed_terminal",
+      "input": {
+        "valid_base_data_count": 2,
+        "terminal_patch": {
+          "truncated": true
+        },
+        "rehash_terminal": true
+      },
+      "expected": {
+        "verdict": "unknown_void",
+        "reason": "chain_truncated",
+        "structural_integrity_may_pass": true
+      }
+    }
+  ],
+  "durable_append": [
+    {
+      "id": "flush_error",
+      "input": {
+        "binding_revision": 1,
+        "write_all": "ok",
+        "flush": "EIO",
+        "sync_all": "not_reached"
+      },
+      "expected": {
+        "verdict": "append_failed",
+        "seal_ack": false,
+        "pending_revision": 1,
+        "broadcast_success": false
+      }
+    },
+    {
+      "id": "sync_error_then_retry",
+      "input": {
+        "binding_revision": 1,
+        "attempts": [
+          {
+            "write_all": "ok",
+            "flush": "ok",
+            "sync_all": "EIO"
+          },
+          {
+            "write_all": "ok",
+            "flush": "ok",
+            "sync_all": "ok"
+          }
+        ]
+      },
+      "expected": {
+        "verdict": "retry_then_commit",
+        "seal_ack_by_attempt": [
+          false,
+          true
+        ],
+        "same_binding_revision": true,
+        "durable_duplicate_count": 0
+      }
+    },
+    {
+      "id": "partial_write_then_retry",
+      "input": {
+        "binding_revision": 1,
+        "attempts": [
+          {
+            "bytes_written": 7,
+            "write_all": "ENOSPC"
+          },
+          {
+            "write_all": "ok",
+            "flush": "ok",
+            "sync_all": "ok"
+          }
+        ]
+      },
+      "expected": {
+        "verdict": "retry_only_after_torn_tail_recovery",
+        "seal_ack_before_recovery": false,
+        "valid_jsonl_and_contiguous_chain_after_retry": true
+      }
+    }
+  ],
+  "reopen": [
+    {
+      "id": "old_incoming_before_new_process",
+      "input": {
+        "prior": {
+          "capture_generation": 1,
+          "capture_id": "old",
+          "incoming_hex": "ffd811ffd9"
+        },
+        "reopen": {
+          "capture_generation": 2,
+          "new_process_started": false,
+          "incoming_hex": "ffd811ffd9"
+        }
+      },
+      "expected": {
+        "verdict": "reject_stale_generation",
+        "http_status": 503,
+        "new_source_timestamp_assigned": false
+      }
+    },
+    {
+      "id": "new_generation_same_pixels",
+      "input": {
+        "prior": {
+          "capture_generation": 1,
+          "capture_id": "g1:1",
+          "pixels_sha256": "same"
+        },
+        "new": {
+          "capture_generation": 2,
+          "producer_sequence": 1,
+          "capture_id": "g2:1",
+          "producer_frame_completion": true,
+          "pixels_sha256": "same",
+          "mono_us": 3000000
+        }
+      },
+      "expected": {
+        "verdict": "accept_new_capture_provenance",
+        "frame_content_alone_is_not_capture_id": true,
+        "consensus_may_still_abstain_repeated_pixels": true,
+        "real_match_artifacts_changed": false
+      }
+    }
+  ],
+  "eligibility": [
+    {
+      "id": "both_final_paths_boundary",
+      "input": {
+        "paths": [
+          "consensus_owner",
+          "scored_end"
+        ],
+        "end_us": 100,
+        "seal_ready": true,
+        "anchor_ready": true,
+        "epoch_valid": true,
+        "frame_variants": [
+          [
+            {
+              "capture_id": "a",
+              "mono_us": 99
+            },
+            {
+              "capture_id": "b",
+              "mono_us": 101
+            }
+          ],
+          [
+            {
+              "capture_id": "a",
+              "mono_us": 100
+            },
+            {
+              "capture_id": "b",
+              "mono_us": 101
+            }
+          ],
+          [
+            {
+              "capture_id": "a",
+              "mono_us": 101
+            },
+            {
+              "capture_id": "a",
+              "mono_us": 102
+            }
+          ]
+        ]
+      },
+      "expected": {
+        "verdict": "unknown_void",
+        "final_confirmed": false,
+        "reason_by_variant": [
+          "pre_exclusion_frame",
+          "boundary_not_after_end",
+          "duplicate_capture_id"
+        ]
+      }
+    },
+    {
+      "id": "both_final_paths_missing_readiness",
+      "input": {
+        "paths": [
+          "consensus_owner",
+          "scored_end"
+        ],
+        "frames": [
+          {
+            "capture_id": "a",
+            "mono_us": 101
+          },
+          {
+            "capture_id": "b",
+            "mono_us": 102
+          }
+        ],
+        "readiness_variants": [
+          {
+            "end_us": null,
+            "lag_us": null
+          },
+          {
+            "end_us": 100,
+            "seal_ready": false
+          },
+          {
+            "end_us": 100,
+            "seal_ready": true,
+            "anchor_ready": false
+          },
+          {
+            "end_us": 100,
+            "seal_ready": true,
+            "anchor_ready": true,
+            "epoch_valid": false
+          }
+        ]
+      },
+      "expected": {
+        "verdict": "unknown_void",
+        "final_confirmed": false,
+        "fabricated_anchor_or_lag": false
+      }
+    },
+    {
+      "id": "naked_anchor_and_trigger_neutral",
+      "input": {
+        "hb": {
+          "type": "hb",
+          "t_us": 1000000,
+          "hb_seq": 1,
+          "epoch": 1,
+          "neutral": true,
+          "trusted_anchor": "made-up-external",
+          "rx_bind": "different-local",
+          "rx_delta": 10,
+          "seq_breaks": 0,
+          "hw_advance": 3000000,
+          "hw_stalls": 0,
+          "faults": 0,
+          "short_reads": 0,
+          "parse_faults": 0,
+          "stale_over_50ms": 0,
+          "max_rx_gap_us": 4000,
+          "first_rx_t_us": 4000,
+          "last_rx_t_us": 1000000
+        },
+        "anchor_validation": null,
+        "pad_variants": [
+          {
+            "buttons": 0,
+            "lx": 128,
+            "ly": 128,
+            "rx": 128,
+            "ry": 128,
+            "l2": 1,
+            "r2": 0
+          },
+          {
+            "buttons": 0,
+            "lx": 128,
+            "ly": 128,
+            "rx": 128,
+            "ry": 128,
+            "l2": 0,
+            "r2": 255
+          }
+        ],
+        "span": {
+          "start_us": 0,
+          "end_us": 1000000
+        }
+      },
+      "expected": {
+        "verdict": "unknown",
+        "reason": "no_trusted_anchor",
+        "neutral_by_pad_variant": [
+          false,
+          false
+        ],
+        "idle_supported": false
+      }
+    }
+  ]
+}

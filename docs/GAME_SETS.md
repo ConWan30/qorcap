@@ -45,7 +45,7 @@ The final uses a different read: Qortrola30's row on the end scoreboard (also ma
 
 ### INFO-ONLY timing
 
-`stick_turn_vs_camera`, `rumble_vs_hit`, and `power_aware_timing` are labeled INFO-ONLY in the set config. Each status is not Counted. They stay that way until a held-out match promotes them. Battery versus plugged is not read, so no timing band is applied.
+`stick_turn_vs_camera` stays Counted. The tag does not add a triple by itself. `rumble_vs_hit` and `power_aware_timing` stay INFO-ONLY. Battery versus plugged is not read, so no timing band is applied. Grip stays off for practice.
 
 ### Session tags
 

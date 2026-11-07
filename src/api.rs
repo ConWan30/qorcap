@@ -23,13 +23,60 @@ pub fn route(e: &Arc<Engine>, method: &str, url: &str, body: &str) -> Resp {
         }
         ("POST", "/record/stop") => match e.stop_recording() { Some(p) => j(200, json!({"ok": true, "file": p})), None => j(409, json!({"ok": false, "error": "not recording"})) },
         ("POST", "/replay/save") => match e.save_replay(b["out"].as_str()) { Ok(p) => j(200, json!({"ok": true, "file": p})), Err(m) => j(409, json!({"ok": false, "error": m})) },
-        ("GET", "/snapshot.jpg") => match std::fs::read(&e.snapshot) {
-            Ok(d) if d.len() > 2 && d[0] == 0xFF && d[1] == 0xD8 => {
-                e.tap.offer(&d, crate::engine::wall_ms()); // no-op unless --glimpse-frame; never blocks
-                Resp { code: 200, ctype: "image/jpeg", body: d, headers: vec![] }
+        ("GET", "/snapshot.jpg") => {
+            match e.snap_pub.lock().unwrap_or_else(|err| err.into_inner()).serve() {
+                crate::snap::Serve::Fresh {
+                    bytes, epoch, seq, pts_us, mono_us, generation, accepted, api, capture_id,
+                    session_id, clock_id, clock_source, mono_origin_ns, producer_start_us, schema,
+                } => {
+                    // The glimpse tap keeps its own wall clock. Capture mono stays on the snapshot headers.
+                    e.tap.offer(&bytes, crate::engine::wall_ms());
+                    let mut headers = vec![
+                        ("X-Qorcap-Snapshot-Api", api.to_string()),
+                        ("X-Qorcap-Snapshot-Schema", schema.to_string()),
+                        ("X-Qorcap-Snapshot-Session", session_id),
+                        ("X-Qorcap-Snapshot-Clock", clock_id),
+                        ("X-Qorcap-Snapshot-Clock-Source", clock_source),
+                        ("X-Qorcap-Snapshot-Mono-Origin-Ns", mono_origin_ns.to_string()),
+                        ("X-Qorcap-Snapshot-Producer-Start-Us", producer_start_us.to_string()),
+                        ("X-Qorcap-Snapshot-Epoch", epoch.to_string()),
+                        ("X-Qorcap-Snapshot-Generation", generation.to_string()),
+                        ("X-Qorcap-Snapshot-Seq", seq.to_string()),
+                        ("X-Qorcap-Snapshot-Capture-Id", capture_id),
+                        ("X-Qorcap-Snapshot-Mono-Us", mono_us.to_string()),
+                        ("X-Qorcap-Snapshot-Accepted", accepted.to_string()),
+                        ("Cache-Control", "no-store".to_string()),
+                    ];
+                    if let Some(pts) = pts_us {
+                        headers.push(("X-Qorcap-Snapshot-Pts-Us", pts.to_string()));
+                    }
+                    return Resp { code: 200, ctype: "image/jpeg", body: bytes, headers };
+                }
+                crate::snap::Serve::Stale { bytes, epoch, age_us } => {
+                    // The last frame is still the file a Madden reader would have read. It carries
+                    // no capture id or clock, so a capture-bound reader cannot treat it as new.
+                    e.tap.offer(&bytes, crate::engine::wall_ms());
+                    let headers = vec![
+                        ("X-Qorcap-Snapshot-State", "stale".to_string()),
+                        ("X-Qorcap-Snapshot-Stale-Epoch", epoch.to_string()),
+                        ("X-Qorcap-Snapshot-Age-Us", age_us.to_string()),
+                        ("Cache-Control", "no-store".to_string()),
+                    ];
+                    return Resp { code: 200, ctype: "image/jpeg", body: bytes, headers };
+                }
+                crate::snap::Serve::AwaitingProducer => {
+                    return j(503, json!({"ok": false, "error": "stale generation"}));
+                }
+                crate::snap::Serve::Absent => {}
             }
-            _ => j(503, json!({"ok": false, "error": "no frame yet"})),
-        },
+            match std::fs::read(&e.snapshot) {
+                Ok(d) if d.len() > 2 && d[0] == 0xFF && d[1] == 0xD8 => {
+                    e.tap.offer(&d, crate::engine::wall_ms()); // no-op unless --glimpse-frame; never blocks
+                    Resp { code: 200, ctype: "image/jpeg", body: d, headers: vec![] }
+                }
+                _ => j(503, json!({"ok": false, "error": "no frame yet"})),
+            }
+        }
         // Advisory Glimpse watcher: the newest frame the reader already pulled (no file read here).
         ("GET", "/frame/scorebug") => frame_scorebug(e),
         // Opt-in burst ring. Off (the default): 404, and /frame/scorebug is unchanged.
@@ -237,6 +284,217 @@ mod tests {
         for c in all["checkpoints"].as_array().unwrap() { prev = crate::evidence::check_checkpoint(c, &prev).unwrap(); }
     }
     #[test]
+    fn legacy_file_snapshot_stays_readable_without_capture_provenance() {
+        let e = engine(&[]);
+        let jpeg = [0xFF, 0xD8, 0x44, 0xFF, 0xD9];
+        std::fs::write(&e.snapshot, &jpeg).unwrap();
+        {
+            let mut p = e.snap_pub.lock().unwrap_or_else(|err| err.into_inner());
+            p.begin_epoch(crate::snap::Baseline::Known(jpeg.to_vec()));
+            p.note_progress(1, 10);
+            let prov = p.pending_provenance();
+            assert!(!p.consider(&jpeg, &e.snapshot, prov));
+            assert!(matches!(p.serve(), crate::snap::Serve::AwaitingProducer));
+        }
+        let r = route(&e, "GET", "/snapshot.jpg", "");
+        assert_eq!(r.code, 503, "old incoming bytes are not served before the producer starts");
+        assert!(r.headers.iter().all(|(k, _)| !k.to_ascii_lowercase().contains("source") && *k != "X-Qorcap-Snapshot-Mono-Us"));
+        let newer = [0xFF, 0xD8, 0x55, 0xFF, 0xD9];
+        {
+            let mut p = e.snap_pub.lock().unwrap_or_else(|err| err.into_inner());
+            p.mark_producer_started();
+            p.note_progress(2, 80_000);
+            let prov = p.pending_provenance();
+            assert!(p.consider(&newer, &e.snapshot, prov));
+        }
+        let fresh = route(&e, "GET", "/snapshot.jpg", "");
+        assert_eq!(fresh.code, 200);
+        assert_eq!(fresh.body, newer);
+        assert!(fresh.headers.iter().any(|(k, v)| *k == "X-Qorcap-Snapshot-Api" && v == "1"));
+        assert!(fresh.headers.iter().any(|(k, v)| *k == "X-Qorcap-Snapshot-Schema" && v == "qorcap-snapshot/v1"));
+        assert!(fresh.headers.iter().any(|(k, v)| *k == "X-Qorcap-Snapshot-Epoch" && v == "1"));
+        assert!(fresh.headers.iter().any(|(k, v)| *k == "X-Qorcap-Snapshot-Seq" && v == "1"));
+        assert!(fresh.headers.iter().any(|(k, v)| *k == "X-Qorcap-Snapshot-Pts-Us" && v == "80000"));
+        let mono = fresh.headers.iter().find(|(k, _)| *k == "X-Qorcap-Snapshot-Mono-Us").map(|(_, v)| v.as_str()).unwrap_or("");
+        assert_ne!(mono, "80000", "media PTS is not the monotonic sample");
+        assert!(mono.chars().all(|c| c.is_ascii_digit()) && !mono.is_empty());
+        assert!(fresh.headers.iter().any(|(k, v)| *k == "X-Qorcap-Snapshot-Clock-Source" && v == crate::snap::ENGINE_CLOCK_SOURCE));
+        assert!(fresh.headers.iter().any(|(k, v)| *k == "X-Qorcap-Snapshot-Session" && v == "unassigned"));
+        let origin = fresh.headers.iter().find(|(k, _)| *k == "X-Qorcap-Snapshot-Mono-Origin-Ns").map(|(_, v)| v.clone()).unwrap_or_default();
+        assert_ne!(origin, "0");
+        let header_origin = e.input.lock().unwrap_or_else(|err| err.into_inner()).header_mono_origin_ns();
+        assert_eq!(Some(origin.parse::<u64>().unwrap()), header_origin, "the input header names the same engine clock");
+        assert!(fresh.headers.iter().any(|(k, v)| *k == "X-Qorcap-Snapshot-Generation" && v == "1"));
+        assert!(fresh.headers.iter().any(|(k, v)| *k == "X-Qorcap-Snapshot-Accepted" && v == "1"));
+        assert!(fresh.headers.iter().any(|(k, _)| *k == "X-Qorcap-Snapshot-Producer-Start-Us"));
+        let capture = fresh.headers.iter().find(|(k, _)| *k == "X-Qorcap-Snapshot-Capture-Id").map(|(_, v)| v.clone()).unwrap_or_default();
+        assert!(capture.starts_with("1:1:"), "{capture}");
+        assert!(fresh.headers.iter().all(|(k, _)| *k != "X-Qorcap-Snapshot-Source-Ms"));
+    }
+
+    #[test]
+    fn a_checkpoint_that_cannot_be_synced_does_not_acknowledge_a_seal() {
+        let e = engine(&["--game", "cod_mw4"]);
+        {
+            let mut input = e.input.lock().unwrap_or_else(|err| err.into_inner());
+            input.close_seal();
+            assert!(input.seal_binding().is_some());
+        }
+        let path = e.bundle_dir().unwrap().join("checkpoints.jsonl");
+        if path.exists() { let _ = std::fs::remove_file(&path); }
+        std::fs::create_dir(&path).unwrap();
+        let failed = e.checkpoint("start", json!({}));
+        assert_eq!(failed["persisted"], false);
+        assert!(!failed["error"].as_str().unwrap_or("").is_empty());
+        assert!(e.input.lock().unwrap_or_else(|err| err.into_inner()).seal_binding().is_some());
+        assert!(e.status().checkpoint_persist_error.is_some());
+        std::fs::remove_dir(&path).unwrap();
+        let ok = e.checkpoint("start", json!({}));
+        assert!(ok.get("hash").is_some(), "{ok}");
+        assert_eq!(ok["seq"], 0);
+        assert!(e.input.lock().unwrap_or_else(|err| err.into_inner()).seal_binding().is_none());
+        assert!(e.status().checkpoint_persist_error.is_none());
+    }
+
+    fn seal_ready(e: &Engine) -> u64 {
+        let mut input = e.input.lock().unwrap_or_else(|err| err.into_inner());
+        input.close_seal();
+        input.seal_binding().unwrap()["revision"].as_u64().unwrap()
+    }
+
+    fn listen(e: &Engine) -> std::sync::mpsc::Receiver<String> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        e.subs.lock().unwrap_or_else(|err| err.into_inner()).push(tx);
+        rx
+    }
+
+    #[test]
+    fn qordata_flush_error_does_not_ack_or_broadcast() {
+        let e = engine(&["--game", "cod_mw4"]);
+        let revision = seal_ready(&e);
+        assert_eq!(revision, 1);
+        *e.persist_fault.lock().unwrap_or_else(|err| err.into_inner()) = Some(crate::engine::PersistFault {
+            stage: "flush", partial: None, remaining: 1,
+        });
+        let rx = listen(&e);
+        let failed = e.checkpoint("start", json!({}));
+        assert_eq!(failed["persisted"], false);
+        assert!(e.input.lock().unwrap_or_else(|err| err.into_inner()).seal_binding().unwrap()["revision"] == 1);
+        assert!(rx.try_recv().is_err(), "a flush error must not broadcast");
+        let path = e.bundle_dir().unwrap().join("checkpoints.jsonl");
+        let len = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        assert_eq!(len, 0, "flush failure rewinds the append");
+    }
+
+    #[test]
+    fn qordata_sync_error_retries_the_same_revision_once() {
+        let e = engine(&["--game", "cod_mw4"]);
+        assert_eq!(seal_ready(&e), 1);
+        *e.persist_fault.lock().unwrap_or_else(|err| err.into_inner()) = Some(crate::engine::PersistFault {
+            stage: "sync", partial: None, remaining: 1,
+        });
+        let rx = listen(&e);
+        let failed = e.checkpoint("start", json!({}));
+        assert_eq!(failed["persisted"], false);
+        assert!(rx.try_recv().is_err());
+        assert_eq!(e.input.lock().unwrap_or_else(|err| err.into_inner()).seal_binding().unwrap()["revision"], 1);
+        let ok = e.checkpoint("start", json!({}));
+        assert!(ok.get("hash").is_some(), "{ok}");
+        assert_eq!(ok["qorcap"]["session_seal"]["revision"], 1);
+        assert!(e.input.lock().unwrap_or_else(|err| err.into_inner()).seal_binding().is_none());
+        assert!(rx.try_recv().is_ok());
+        assert!(rx.try_recv().is_err(), "one broadcast");
+        let text = std::fs::read_to_string(e.bundle_dir().unwrap().join("checkpoints.jsonl")).unwrap();
+        let lines: Vec<_> = text.lines().filter(|l| !l.is_empty()).collect();
+        assert_eq!(lines.len(), 1, "retry does not duplicate the line");
+        let row: Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(row["seq"], 0);
+    }
+
+    #[test]
+    fn qordata_partial_write_rewinds_before_retry() {
+        let e = engine(&["--game", "cod_mw4"]);
+        seal_ready(&e);
+        *e.persist_fault.lock().unwrap_or_else(|err| err.into_inner()) = Some(crate::engine::PersistFault {
+            stage: "write", partial: Some(7), remaining: 1,
+        });
+        let failed = e.checkpoint("start", json!({}));
+        assert_eq!(failed["persisted"], false);
+        assert!(e.input.lock().unwrap_or_else(|err| err.into_inner()).seal_binding().is_some());
+        let path = e.bundle_dir().unwrap().join("checkpoints.jsonl");
+        assert_eq!(std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0), 0);
+        let ok = e.checkpoint("start", json!({}));
+        assert!(ok.get("hash").is_some(), "{ok}");
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.ends_with('\n'));
+        let lines: Vec<_> = text.lines().filter(|l| !l.is_empty()).collect();
+        assert_eq!(lines.len(), 1);
+        for (i, line) in lines.iter().enumerate() {
+            let row: Value = serde_json::from_str(line).unwrap();
+            assert_eq!(row["seq"], i as u64);
+        }
+        assert!(e.input.lock().unwrap_or_else(|err| err.into_inner()).seal_binding().is_none());
+    }
+
+    #[test]
+    fn an_uncertain_checkpoint_is_cut_back_before_the_retry_and_one_line_remains() {
+        let e = engine(&["--game", "cod_mw4"]);
+        assert_eq!(seal_ready(&e), 1);
+        let path = e.bundle_dir().unwrap().join("checkpoints.jsonl");
+        *e.persist_fault.lock().unwrap_or_else(|err| err.into_inner()) = Some(crate::engine::PersistFault {
+            stage: "sync_keep", partial: None, remaining: 1,
+        });
+        let rx = listen(&e);
+        let failed = e.checkpoint("start", json!({}));
+        assert_eq!(failed["persisted"], false);
+        assert!(rx.try_recv().is_err(), "an uncertain line is not broadcast");
+        let kept = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(kept.lines().count(), 1, "the sync failed and the rewind failed, so the line is still there");
+        let uncertain: Value = serde_json::from_str(kept.lines().next().unwrap()).unwrap();
+        assert_eq!(uncertain["seq"], 0);
+        assert_eq!(e.input.lock().unwrap_or_else(|err| err.into_inner()).seal_binding().unwrap()["revision"], 1);
+        // The retry builds a new checkpoint at the same seq. The uncertain line is cut first.
+        std::thread::sleep(std::time::Duration::from_millis(3));
+        let ok = e.checkpoint("start", json!({}));
+        assert!(ok.get("hash").is_some(), "{ok}");
+        assert_eq!(ok["seq"], 0);
+        let text = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<_> = text.lines().filter(|l| !l.is_empty()).collect();
+        assert_eq!(lines.len(), 1, "exactly one checkpoint at seq 0: {lines:?}");
+        let row: Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(row, ok, "the line on disk is the one that was acknowledged");
+        assert!(rx.try_recv().is_ok());
+        assert!(rx.try_recv().is_err(), "one broadcast");
+        assert!(e.input.lock().unwrap_or_else(|err| err.into_inner()).seal_binding().is_none());
+        let next = e.checkpoint("segment", json!({}));
+        assert_eq!(next["seq"], 1);
+        let text = std::fs::read_to_string(&path).unwrap();
+        let mut prev = crate::evidence::GENESIS.to_string();
+        let rows: Vec<Value> = text.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+        assert_eq!(rows.len(), 2);
+        for (i, c) in rows.iter().enumerate() {
+            assert_eq!(c["seq"], i as u64);
+            prev = crate::evidence::check_checkpoint(c, &prev).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_restore_that_cannot_reach_the_durable_length_blocks_the_retry() {
+        let e = engine(&[]);
+        let path = e.bundle_dir().unwrap().join("checkpoints.jsonl");
+        assert!(e.checkpoint("start", json!({})).get("hash").is_some());
+        *e.persist_fault.lock().unwrap_or_else(|err| err.into_inner()) = Some(crate::engine::PersistFault {
+            stage: "sync_keep", partial: None, remaining: 1,
+        });
+        assert_eq!(e.checkpoint("segment", json!({}))["persisted"], false);
+        std::fs::write(&path, b"").unwrap();
+        let blocked = e.checkpoint("segment", json!({}));
+        assert_eq!(blocked["persisted"], false, "a file shorter than the durable prefix is not overwritten");
+        assert!(blocked["error"].as_str().unwrap_or("").contains("rewind"));
+        assert_eq!(std::fs::read(&path).unwrap().len(), 0);
+    }
+
+    #[test]
     fn glimpse_frame_tap_is_opt_in_memory_only_and_rate_limited() {
         // Off by default: 404, and the reader's /snapshot.jpg path is unchanged.
         let off = engine(&[]);
@@ -273,6 +531,7 @@ mod tests {
         let e = engine(&[]);
         std::fs::write(&e.snapshot, [0xFF, 0xD8, 0xFF, 0xD9]).unwrap();
         let r = route(&e, "GET", "/snapshot.jpg", ""); assert_eq!((r.code, r.ctype), (200, "image/jpeg"));
+        assert!(r.headers.iter().all(|(k, _)| *k != "X-Qorcap-Snapshot-Api"));
         let port = 18000 + (std::process::id() % 2000) as u16;
         let h = serve(e.clone(), port).unwrap();
         let (c, b) = call(port, "GET", "/status", "").unwrap();
@@ -323,6 +582,24 @@ mod tests {
         assert!(waited >= std::time::Duration::from_millis(250) && waited < std::time::Duration::from_secs(5), "{waited:?}");
         assert_eq!(h.join().unwrap(), 200);
         assert_eq!(e.status().final_checkpoint_seq, Some(1));
+    }
+
+    #[test]
+    fn a_failed_stop_does_not_seal_and_the_same_revision_can_retry() {
+        let e = engine(&["--game", "cod_mw4"]);
+        *e.persist_fault.lock().unwrap_or_else(|err| err.into_inner()) = Some(crate::engine::PersistFault {
+            stage: "sync", partial: None, remaining: 1,
+        });
+        assert!(e.seal_and_wait_countersign(std::time::Duration::from_secs(1)).is_none());
+        assert!(!e.sealed.load(Ordering::SeqCst), "a failed stop checkpoint must not seal the chain");
+        assert!(e.status().checkpoint_persist_error.is_some());
+        let retried = e.seal_and_wait_countersign(std::time::Duration::from_secs(1));
+        assert!(retried.is_some(), "the stop can be written once the fault clears");
+        assert!(e.sealed.load(Ordering::SeqCst));
+        assert!(e.checkpoint("late", json!({})).is_null());
+        let text = std::fs::read_to_string(e.bundle_dir().unwrap().join("checkpoints.jsonl")).unwrap();
+        let lines: Vec<_> = text.lines().filter(|l| !l.is_empty()).collect();
+        assert_eq!(lines.len(), 1, "the failed stop does not leave a second line: {lines:?}");
     }
     #[test]
     fn recording_marker_guards_input_proof() {
