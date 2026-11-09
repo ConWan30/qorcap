@@ -1031,6 +1031,16 @@ def _best_mask(search, mask, scale: float, thr: float):
     return (score, int(x), int(y), int(templ.shape[1]), int(templ.shape[0]))
 
 
+def _columns_share_x(hit, other, scale: float) -> bool:
+    """True when two header boxes sit on the same column. A shared edge counts."""
+    if hit is None or other is None:
+        return False
+    _score, x, _y, w, _h = hit
+    _score2, ox, _y2, ow, _h2 = other
+    slack = max(1, int(round(scale)))
+    return x < ox + ow + slack and ox < x + w + slack
+
+
 def _column_header(hit, row_x: int, row_y: int, scale: float):
     """A header above this row and on its side of the board. Far columns are not this row."""
     if hit is None:
@@ -1132,8 +1142,10 @@ def _row_digit_string(img, x0: int, x1: int, y0: int, y1: int, thr: int, scale: 
         elif 3 <= area < 8 or (area >= 3 and hh < minh):
             frags.append(piece)
     # A bright cut can split one glyph. Join a short piece only when it sits
-    # on the same x span, within two pixels. A piece that is not there stays
-    # out, so a cut glyph is not completed with invented ink.
+    # on the same x span, within two pixels, and does not widen that span.
+    # A piece that is not there stays out, so a cut glyph is not completed
+    # with invented ink. A speck beside the glyph is not joined.
+    span_tol = max(1, int(round(scale)))
     for frag in frags:
         for host in kept:
             overlap = min(host["x"] + host["w"], frag["x"] + frag["w"]) - max(host["x"], frag["x"])
@@ -1143,11 +1155,21 @@ def _row_digit_string(img, x0: int, x1: int, y0: int, y1: int, thr: int, scale: 
             above = host["y"] - (frag["y"] + frag["h"])
             if not (0 <= below <= 2 or 0 <= above <= 2):
                 continue
+            if frag["x"] < host["x"] - span_tol or frag["x"] + frag["w"] > host["x"] + host["w"] + span_tol:
+                continue
+            # A cut piece covers the glyph. A narrower speck is not that piece.
+            if frag["w"] < host["w"] - span_tol:
+                continue
             x0b = min(host["x"], frag["x"])
             y0b = min(host["y"], frag["y"])
             x1b = max(host["x"] + host["w"], frag["x"] + frag["w"])
             y1b = max(host["y"] + host["h"], frag["y"] + frag["h"])
-            if x1b - x0b > maxw:
+            if x1b - x0b > host["w"] + span_tol or x1b - x0b > maxw:
+                continue
+            if any(
+                other is not host and x0b < other["x"] + other["w"] and other["x"] < x1b
+                for other in kept
+            ):
                 continue
             canvas = np.zeros((y1b - y0b, x1b - x0b), np.uint8)
             canvas[host["y"] - y0b:host["y"] - y0b + host["h"], host["x"] - x0b:host["x"] - x0b + host["w"]] = host["glyph"]
@@ -1203,6 +1225,49 @@ def _digits_under_label(img, hit, scale: float) -> int | None:
     return _stat_int(text)
 
 
+def _owner_row_header_hits(bgr, scale, pack, row_x, row_y, row_h):
+    """Column headers for this row.
+
+    The TDM deaths word is a column only when it does not sit on the kills
+    header. The same x is not a second stat. The personal-card deaths label
+    is separate and stays below the row.
+    """
+    header_search = _value_mask(bgr, _HEADER_SEARCH_VALUE)
+    found = {}
+    for key, label in (
+        ("kills_header_mask", "KILLS"),
+        ("deaths_header_mask", "DEATHS"),
+        ("confirms_header_mask", "CONFIRMS"),
+    ):
+        if key not in pack:
+            continue
+        hit = _best_mask(header_search, pack[key], scale, _ROW_HEADER_MIN)
+        if hit is not None:
+            found[label] = hit
+    kills_h = _column_header(found.get("KILLS"), row_x, row_y, scale)
+    assists_h = None
+    if "assists_header_mask" in pack:
+        assists_h = _best_column_hit(
+            _value_mask(bgr, _DERIVED_HEADER_VALUE), pack["assists_header_mask"],
+            scale, _ROW_HEADER_MIN, row_x, row_y)
+    confirms_h = _column_header(found.get("CONFIRMS"), row_x, row_y, scale)
+    deaths_h = None
+    if "deaths_column_header_mask" in pack:
+        deaths_h = _best_column_hit(
+            _value_mask(bgr, _DERIVED_HEADER_VALUE), pack["deaths_column_header_mask"],
+            scale, _ROW_HEADER_MIN, row_x, row_y)
+    if _columns_share_x(deaths_h, kills_h, scale):
+        deaths_h = None
+    if deaths_h is None:
+        deaths_h = _column_header(found.get("DEATHS"), row_x, row_y, scale)
+    if _columns_share_x(deaths_h, kills_h, scale):
+        deaths_h = None
+    personal = None
+    if deaths_h is None:
+        personal = _personal_header(found.get("DEATHS"), row_x, row_y, row_h, scale)
+    return kills_h, deaths_h, assists_h, confirms_h, personal
+
+
 def read_owner_row(img):
     """Qortrola30's end-scoreboard row.
 
@@ -1229,19 +1294,8 @@ def read_owner_row(img):
             "owner_row", "not_present",
             "Qortrola30's scoreboard row was not read. It is not Counted.")
     _name_score, row_x, row_y, _row_w, row_h = name_hit
-    header_search = _value_mask(bgr, _HEADER_SEARCH_VALUE)
-    found = {}
-    for key, label in (
-        ("kills_header_mask", "KILLS"),
-        ("deaths_header_mask", "DEATHS"),
-        ("confirms_header_mask", "CONFIRMS"),
-    ):
-        if key not in pack:
-            continue
-        hit = _best_mask(header_search, pack[key], scale, _ROW_HEADER_MIN)
-        if hit is not None:
-            found[label] = hit
-    kills_h = _column_header(found.get("KILLS"), row_x, row_y, scale)
+    kills_h, deaths_h, assists_h, confirms_h, personal = _owner_row_header_hits(
+        bgr, scale, pack, row_x, row_y, row_h)
     if kills_h is None:
         return _not_read(
             "owner_row", "not_present",
@@ -1252,11 +1306,6 @@ def read_owner_row(img):
             "owner_row", "not_present",
             "Kills were not read on Qortrola30's row. They are not Counted.")
     assists = None
-    assists_h = None
-    if "assists_header_mask" in pack:
-        assists_h = _best_column_hit(
-            _value_mask(bgr, _DERIVED_HEADER_VALUE), pack["assists_header_mask"],
-            scale, _ROW_HEADER_MIN, row_x, row_y)
     if assists_h is not None:
         assists = _digits_for_column(bgr, assists_h, row_y, row_h, scale)
         if assists is None:
@@ -1264,20 +1313,11 @@ def read_owner_row(img):
                 "owner_row", "not_present",
                 "Assists are on the board and were not read. They are not Counted.")
     confirms = None
-    confirms_h = _column_header(found.get("CONFIRMS"), row_x, row_y, scale)
     if confirms_h is not None:
         confirms = _digits_for_column(bgr, confirms_h, row_y, row_h, scale)
-    deaths_h = None
-    if "deaths_column_header_mask" in pack:
-        deaths_h = _best_column_hit(
-            _value_mask(bgr, _DERIVED_HEADER_VALUE), pack["deaths_column_header_mask"],
-            scale, _ROW_HEADER_MIN, row_x, row_y)
-    if deaths_h is None:
-        deaths_h = _column_header(found.get("DEATHS"), row_x, row_y, scale)
     if deaths_h is not None:
         deaths = _digits_for_column(bgr, deaths_h, row_y, row_h, scale)
     else:
-        personal = _personal_header(found.get("DEATHS"), row_x, row_y, row_h, scale)
         deaths = _digits_under_label(bgr, personal, scale) if personal is not None else None
     if deaths is None:
         return _not_read(
