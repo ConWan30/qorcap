@@ -569,3 +569,339 @@ def test_owner_row_fails_closed_and_the_probe_keeps_the_last_five_frames(tmp_pat
     assert "Qortrola30" in blob
     tags = [row.get("owner_row", {}).get("tag") for row in saved["reads"] if row.get("owner_row")]
     assert tags and set(tags) == {"Qortrola30"}
+
+
+NORMAL_INK = (235, 235, 235)
+HIGHLIGHT_INK = (30, 220, 240)
+LONGER_VALUES = ("1250", "1000", "2048", "9999", "100000", "123456")
+
+
+def _text_pack():
+    return json.loads(H.TEXT_PACK_PATH.read_text(encoding="utf-8"))
+
+
+def _mask(rows):
+    mask = np.zeros((len(rows), len(rows[0])), np.uint8)
+    for y, row in enumerate(rows):
+        for x, ch in enumerate(row):
+            if ch == "1":
+                mask[y, x] = 255
+    return mask
+
+
+def _canonical_masks():
+    masks = {}
+    for item in _text_pack()["digits"]:
+        if item.get("canonical"):
+            masks[item["label"]] = _mask(item["mask_rows"])
+    return masks
+
+
+def _paint(text, masks, color):
+    glyphs = [masks[ch] for ch in text]
+    gap = 2
+    height = max(g.shape[0] for g in glyphs)
+    width = sum(g.shape[1] for g in glyphs) + gap * (len(glyphs) - 1)
+    canvas = np.full((max(height + 8, 24), max(width + 8, 24), 3), 12, np.uint8)
+    x = 4
+    for glyph in glyphs:
+        view = canvas[4:4 + glyph.shape[0], x:x + glyph.shape[1]]
+        view[glyph > 0] = color
+        x += glyph.shape[1] + gap
+    return canvas
+
+
+def _read_painted(text, masks, color):
+    img = _paint(text, masks, color)
+    return H._row_digit_string(img, 0, img.shape[1], 0, img.shape[0], 130, 1.0)
+
+
+def test_row_digit_gates_and_consensus_stay_put():
+    assert H._ROW_DIGIT_MIN == 0.75 and H._ROW_DIGIT_MARGIN == 0.15
+    assert H._OWNER_MIN == 0.80 and H._ROW_HEADER_MIN == 0.70
+    assert H.CONSENSUS_FRAMES == 5
+    assert H._ROW_GLYPH_MAX == 6
+
+
+def test_synthetic_digits_are_labeled_and_the_bank_is_text():
+    data = _text_pack()
+    assert H.TEXT_PACK_PATH.suffix == ".json"
+    assert H.TEXT_PACK_PATH.read_bytes()[:1] == b"{"
+    shipped = np.load(H.PACK_PATH, allow_pickle=False)
+    assert "assists_header_mask" not in shipped.files
+    assert "deaths_column_header_mask" not in shipped.files
+    labels = {item["label"] for item in data["digits"]}
+    assert labels == set("0123456789")
+    synthetic = [item for item in data["digits"] if item["provenance"] == "synthetic"]
+    assert sorted(item["label"] for item in synthetic) == ["0", "6", "8"]
+    for item in synthetic:
+        assert item["note"] == "synthetic sample, real-match recall UNMEASURED"
+    pack = H._pack()
+    assert "assists_header_mask" in pack and "deaths_column_header_mask" in pack
+    assert set(H._labels(pack, "row_digit_labels")) >= set("0123456789")
+
+
+def test_each_stored_digit_reads_in_normal_and_highlighted_ink():
+    data = _text_pack()
+    for item in data["digits"]:
+        masks = {item["label"]: _mask(item["mask_rows"])}
+        for color in (NORMAL_INK, HIGHLIGHT_INK):
+            assert _read_painted(item["label"], masks, color) == item["label"]
+
+
+def test_synthetic_sweep_covers_0_to_100_and_every_three_digit_value():
+    masks = _canonical_masks()
+    assert set(masks) == set("0123456789")
+    for color in (NORMAL_INK, HIGHLIGHT_INK):
+        for number in range(0, 101):
+            assert _read_painted(str(number), masks, color) == str(number)
+        for number in range(100, 1000):
+            assert _read_painted(str(number), masks, color) == str(number)
+        for text in LONGER_VALUES:
+            assert _read_painted(text, masks, color) == text
+        assert _read_painted("1234567", masks, color) is None
+
+
+def test_headers_do_not_cross_map_and_old_row_stays_13():
+    board = frame("end_173922_019.jpg")
+    row = H.read_owner_row(board)
+    assert (row.kills, row.deaths, row.assists, row.confirms) == (13, 13, None, 7)
+    pack = H._pack()
+    assists = pack["assists_header_mask"]
+    deaths_col = pack["deaths_column_header_mask"]
+    others = (
+        pack["kills_header_mask"],
+        pack["confirms_header_mask"],
+        pack["deaths_header_mask"],
+        deaths_col,
+    )
+    for mask in others:
+        painted = np.zeros((48, 96), np.uint8)
+        painted[8:8 + mask.shape[0], 8:8 + mask.shape[1]] = mask
+        hit = H._best_mask(painted, assists, 1.0, 0.0)
+        score = 0.0 if hit is None else hit[0]
+        if mask is deaths_col:
+            assert score < H._ROW_HEADER_MIN
+        else:
+            assert score < H._ROW_HEADER_MIN
+    painted = np.zeros((48, 96), np.uint8)
+    painted[8:8 + assists.shape[0], 8:8 + assists.shape[1]] = assists
+    hit = H._best_mask(painted, pack["kills_header_mask"], 1.0, 0.0)
+    assert hit is None or hit[0] < H._ROW_HEADER_MIN
+    hit = H._best_mask(painted, pack["deaths_header_mask"], 1.0, 0.0)
+    assert hit is None or hit[0] < H._ROW_HEADER_MIN
+
+
+def _stamp(canvas, mask, x, y, color):
+    view = canvas[y:y + mask.shape[0], x:x + mask.shape[1]]
+    view[mask > 0] = color
+
+
+def _synthetic_tdm_board(
+    kills_header_x=420,
+    deaths_header_x=560,
+    kills_x=432,
+    deaths_digits=((566, "2"), (574, "1")),
+):
+    """Synthetic 720p board. Shipped name and KILLS masks, text ASSISTS and DEATHS masks.
+
+    Digits are the committed canonical masks. This is not a captured frame.
+    Eliminations 11 sit below the row and are not a kill column.
+    Default placement is K9 under KILLS and D21 under the TDM DEATHS column.
+    """
+    pack = H._pack()
+    masks = _canonical_masks()
+    board = np.zeros((720, 1280, 3), np.uint8)
+    _stamp(board, pack["owner_mask"], 172, 534, (255, 255, 255))
+    _stamp(board, pack["kills_header_mask"], kills_header_x, 400, (255, 255, 255))
+    _stamp(board, pack["assists_header_mask"], 484, 403, (255, 255, 255))
+    _stamp(board, pack["deaths_column_header_mask"], deaths_header_x, 403, (255, 255, 255))
+    _stamp(board, masks["9"], kills_x, 536, HIGHLIGHT_INK)
+    _stamp(board, masks["2"], 496, 536, HIGHLIGHT_INK)
+    for x, label in deaths_digits:
+        _stamp(board, masks[label], x, 536, HIGHLIGHT_INK)
+    _stamp(board, masks["1"], 760, 640, HIGHLIGHT_INK)
+    _stamp(board, masks["1"], 766, 640, HIGHLIGHT_INK)
+    return board
+
+
+def _header_pair(board):
+    scale = H._board_scale(board)
+    pack = H._pack()
+    name = H._best_mask(
+        H._value_mask(board, H._OWNER_SEARCH_VALUE), pack["owner_mask"], scale, H._OWNER_MIN)
+    assert name is not None
+    _score, row_x, row_y, _row_w, row_h = name
+    kills_h, deaths_h, _assists_h, _confirms_h, _personal = H._owner_row_header_hits(
+        board, scale, pack, row_x, row_y, row_h)
+    return kills_h, deaths_h
+
+
+def _mask_on_region_score(region, templ, scale):
+    """NCC of ``templ`` on ``region`` after the reader's own scale. None is a miss."""
+    region_s = H._scaled_u8(region, scale)
+    templ_s = H._scaled_u8(templ, scale)
+    pad_y = max(4, int(templ_s.shape[0]))
+    pad_x = max(4, int(templ_s.shape[1]))
+    canvas = np.zeros((region_s.shape[0] + 2 * pad_y, region_s.shape[1] + 2 * pad_x), np.uint8)
+    canvas[pad_y:pad_y + region_s.shape[0], pad_x:pad_x + region_s.shape[1]] = region_s
+    hit = H._best_mask(canvas, templ_s, 1.0, 0.0)
+    return 0.0 if hit is None else hit[0]
+
+
+_HEADER_CROSS_MARGIN = 0.10
+
+
+def test_deaths_column_header_does_not_match_the_kills_header():
+    """DEATHS column ink is not the KILLS header. Same x is not both stats.
+
+    end_173922_019 is 13 and 13, so a column swap would still look right.
+    The cross score stays under the header gate by a margin, and the deaths
+    hit the reader keeps is never the kills hit.
+    """
+    pack = H._pack()
+    kills = pack["kills_header_mask"]
+    deaths = pack["deaths_column_header_mask"]
+    assert _mask_on_region_score(kills, kills, 1.0) >= H._ROW_HEADER_MIN
+    for scale in (1.0, 1.5):
+        onto_kills = _mask_on_region_score(kills, deaths, scale)
+        onto_deaths = _mask_on_region_score(deaths, kills, scale)
+        assert onto_kills < H._ROW_HEADER_MIN - _HEADER_CROSS_MARGIN
+        assert onto_deaths < H._ROW_HEADER_MIN - _HEADER_CROSS_MARGIN
+    real = frame("end_173922_019.jpg")
+    region = H._value_mask(real, H._HEADER_SEARCH_VALUE)[400:417, 427:456]
+    assert _mask_on_region_score(region, deaths, 1.0) < H._ROW_HEADER_MIN - _HEADER_CROSS_MARGIN
+    for board in (
+        real,
+        _synthetic_tdm_board(),
+        _synthetic_tdm_board(
+            kills_header_x=560,
+            deaths_header_x=420,
+            kills_x=572,
+            deaths_digits=((428, "2"), (436, "1")),
+        ),
+    ):
+        kills_h, deaths_h = _header_pair(board)
+        assert kills_h is not None
+        if deaths_h is not None:
+            assert not H._columns_share_x(deaths_h, kills_h, H._board_scale(board))
+            assert deaths_h[1] != kills_h[1]
+
+
+def test_swapped_tdm_columns_keep_k9_and_d21():
+    """Synthetic board with the two headers exchanged. Kills stay 9, deaths stay 21."""
+    board = _synthetic_tdm_board(
+        kills_header_x=560,
+        deaths_header_x=420,
+        kills_x=572,
+        deaths_digits=((428, "2"), (436, "1")),
+    )
+    row = H.read_owner_row(board)
+    assert row.ok and (row.kills, row.assists, row.deaths) == (9, 2, 21)
+    assert row.kills != row.deaths
+    kills_h, deaths_h = _header_pair(board)
+    assert deaths_h is not None and deaths_h[1] < kills_h[1]
+
+
+def test_tdm_owner_row_is_k9_a2_d21_and_not_the_other_columns():
+    board = _synthetic_tdm_board()
+    row = H.read_owner_row(board)
+    assert row.ok and row.player_tag == "Qortrola30"
+    assert (row.kills, row.assists, row.deaths) == (9, 2, 21)
+    assert row.confirms is None
+    assert row.kills != 11
+    wiped = board.copy()
+    wiped[534:550, 172:240] = 0
+    gone = H.read_owner_row(wiped)
+    assert gone.ok is False and gone.kills is None and gone.player_tag is None
+    no_kills = board.copy()
+    no_kills[532:548, 428:442] = 0
+    assert H.read_owner_row(no_kills).ok is False
+    no_assists = board.copy()
+    no_assists[532:548, 490:508] = 0
+    assert H.read_owner_row(no_assists).ok is False
+    no_deaths = board.copy()
+    no_deaths[532:548, 560:590] = 0
+    missed = H.read_owner_row(no_deaths)
+    assert missed.ok is False and missed.deaths is None
+
+
+def _glyph_boxes(text, masks):
+    gap = 2
+    x = 4
+    boxes = []
+    for ch in text:
+        glyph = masks[ch]
+        boxes.append((x, 4, int(glyph.shape[1]), int(glyph.shape[0])))
+        x += int(glyph.shape[1]) + gap
+    return boxes
+
+
+def _paint_speck(text, masks, color, x, y, width, height):
+    img = _paint(text, masks, color)
+    img[y:y + height, x:x + width] = color
+    return img
+
+
+def test_a_speck_does_not_change_a_multi_digit_row_value():
+    """A few pixels beside, between, or just above or below the glyphs.
+
+    Area stays in 3..7. The read is the real value, or it abstains.
+    A speck that only sits beside the ink still reads the real value.
+    """
+    masks = _canonical_masks()
+    for color in (NORMAL_INK, HIGHLIGHT_INK):
+        for text in ("13", "100", "1250"):
+            boxes = _glyph_boxes(text, masks)
+            x0, y0, w0, h0 = boxes[0]
+            wide = max(boxes, key=lambda box: box[2])
+            xw, yw, ww, hw = wide
+            x1, y1, w1, h1 = boxes[-1]
+            # Beside the value, one pixel clear of the ink so it is its own speck.
+            # Between: overlaps the first glyph and reaches the next one.
+            # Above and below: on a wide glyph, inside its x span, one pixel clear.
+            placements = (
+                (x0 - 3, y0 + 1, 2, 3),
+                (x1 + w1 + 1, y1 + 1, 2, 2),
+                (x0 + w0 - 2, y0 + h0 + 1, 5, 1),
+                (xw + 1, max(0, yw - 3), 2, 2),
+                (xw + 1, yw + hw + 1, 2, 2),
+            )
+            for sx, sy, sw, sh in placements:
+                assert 3 <= sw * sh <= 7
+                assert sx >= 0 and sy >= 0
+                img = _paint_speck(text, masks, color, sx, sy, sw, sh)
+                assert H._row_digit_string(img, 0, img.shape[1], 0, img.shape[0], 130, 1.0) == text
+
+
+def test_split_glyph_recovers_and_a_cut_glyph_abstains():
+    """A gap inside a full 2 is joined from the pixels that are there.
+
+    The six-row deaths piece measured on the last private frame is not a
+    sample and is not added to the bank. Alone, it stays unread.
+    """
+    full = _canonical_masks()["2"]
+    assert full.shape[0] == 9
+    top = full[:6]
+    bottom = full[6:]
+    img = np.full((32, 32, 3), 12, np.uint8)
+    img[4:10, 8:8 + top.shape[1]][top > 0] = NORMAL_INK
+    img[11:11 + bottom.shape[0], 8:8 + bottom.shape[1]][bottom > 0] = NORMAL_INK
+    assert H._row_digit_string(img, 0, 32, 0, 32, 130, 1.0) == "2"
+    cut = np.full((32, 32, 3), 12, np.uint8)
+    cut[4:10, 8:8 + top.shape[1]][top > 0] = NORMAL_INK
+    assert H._row_digit_string(cut, 0, 32, 0, 32, 130, 1.0) is None
+    truncated = _mask(["0110", "1001", "0001", "0001", "0010", "0110"])
+    alone = np.full((32, 32, 3), 12, np.uint8)
+    alone[4:10, 8:12][truncated > 0] = NORMAL_INK
+    assert H._row_digit_string(alone, 0, 32, 0, 32, 130, 1.0) is None
+
+
+def test_rebuild_writes_a_temporary_pack_only(tmp_path):
+    before = H.PACK_PATH.read_bytes()
+    dest = tmp_path / "cod_mw4_hud_v1.npz"
+    H.build_calibration_pack(out_path=dest)
+    assert dest.is_file()
+    assert H.PACK_PATH.read_bytes() == before
+    raw = np.load(dest, allow_pickle=False)
+    assert "assists_header_mask" not in raw.files

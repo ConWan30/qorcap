@@ -79,7 +79,7 @@ Calibrated from Con's private practice frames (Kill Confirmed match-20261105-173
 - VICTORY and DEFEAT share one letter gate: each letter at least 0.85, mean at least 0.90, margin at least 0.08. They share one sharpness floor, 0.26, and one field-color share, 0.20. DEFEAT's field is red. VICTORY's field is the teal measured on the splash and the match-complete header (OpenCV hue about 88, band 70-105). A grayscale frame and a 60 degree hue shift do not agree for either word. JPEG quality 25 still agrees for both.
 - The wide end-screen crop is only the search window. The letter box has to sit inside the word's box, measured on the 1280x720 practice frames. DEFEAT letters pasted at (980, 8) sit about x 0.81-0.96, y 0.07-0.16, inside x 0.78-0.98, y 0.03-0.20. VICTORY splash letters on end_173922_017 sit about x 0.29-0.71, y 0.40-0.62. VICTORY header letters on end_173922_019 sit about x 0.05-0.21, y 0.07-0.16. The letter box also has to match that word's measured size within 25 percent, so a header-sized word sitting inside the splash rectangle does not agree. A word pasted elsewhere in that crop, including on a mid-match frame outside the box, is not read.
 - If VICTORY and DEFEAT both agree on one frame, the read is `ambiguous_result` and confirm stays false. Both words are evaluated on every frame.
-- When home and away are both present, the runner confirms DEFEAT only when the side chosen at the start is strictly behind, and VICTORY only when that side is strictly ahead. A tie confirms neither. A missing side does not confirm either word. That check runs only on a read that already has both scores. The owner-row path does not invent those scores, so this check does not apply to it.
+- When home and away are both present, the runner confirms DEFEAT only when the side chosen at the start is strictly behind, and VICTORY only when that side is strictly ahead. A tie confirms neither. A missing side does not confirm either word. That check runs only on a read that already has both scores. The owner-row path does not invent those scores, so this check does not apply to it. Start Match has no home/away pick for Call of Duty, so it passes no side to the runner: this check never confirms VICTORY or DEFEAT there, even when a `side_choice.json` from an earlier run is in the match folder (that file is not read and is left in place). The receipt role is still `home`, because receipt.v0 requires home or away. That `home` is the legacy signing-role slot, not a not-applicable value, and an explicit `--side away` is ignored for Call of Duty. How later readers treat that slot is a separate plan.
 - Hitmarker strokes, the red kill marker (presence only, not a kill count), the XP plate (presence only; a 25 or a 50 is not an assist), and killfeed weapon-icon presence.
 - Scoreboard K and A when that digit row is visible. Missing digits stay not Counted. That comparison is not the final.
 - Qortrola30's end-scoreboard row on match-20261105-173922 frame 019, with the VICTORY header on that same frame. Kills 13 from the KILLS column, deaths 13 from the personal-card DEATHS label, confirms 7. Assists are not a column on this Kill Confirmed board. The same frame shifted, saved as JPEG quality 40, or scaled from 720p to 1080p still reads that row. A blurred frame does not. Wiping the gamertag or the kill digits does not. The splash, a mid-match frame, and a K/A strip with no gamertag do not.
@@ -98,3 +98,37 @@ Still open:
 - Stick turn against camera turn, rumble against an on-screen hit, and power stay INFO-ONLY and not Counted.
 - Read battery versus plugged only after a report map exists. Do not guess bytes. Power stays `unknown`.
 - Record the console link (wired or wireless) only when the log actually has it. `usb` today means the laptop read path.
+
+### CoD three-leg Counted gate
+
+A visual final may remain advisory. Counted additionally requires an ownership-qualified,
+covered, deduplicated killfeed tally to match scoreboard kills, readable scoreboard deaths,
+and a calibrated VICTORY/DEFEAT end screen. All three leg times must be frame-clock stamped
+and span no more than `FRAME_CLOCK_GAP_US` (500 ms). Any extra shared values must agree.
+Missing legs, unknown coverage, expired windows, or mismatches record an explicit reason in
+`agreement`; none is guessed. Existing multi-frame consensus and seal/anchor gates still apply.
+A lone hitmarker, popup, generic killfeed icon, or standalone board comparison is advisory.
+The generic-icon reader does not establish own-kill coverage. Stick remains Counted; rumble stays info-only.
+
+### CoD killfeed ownership by gamertag (practice build only)
+
+`sidecar/qorcap_cod_killfeed.py` reads each killfeed line on the left of the screen and
+checks the killer name against `OWNER_TAG` (Qortrola30). Each line gets `self`, `not_self`
+or `unreadable` with a confidence, for the killer and for the victim. A victim match is a
+death, not a kill. Teammates' and enemies' kills are `not_self`.
+
+- The matcher is built from a font, not from Con's frames: `packs/cod_killfeed_font.json`
+  is rendered by `prepare_cod_killfeed_font.py` from Roboto Mono (Apache-2.0), a stand-in
+  chosen on other players' names. Each character cell must match its own glyph.
+- Q/O and l/I are near twins in that font. A cell that only loses to its twin is settled by
+  colour: the game draws the local player's own name in gold. Without gold it stays unreadable.
+- `KillfeedTally` follows lines across frames on the frame clock (about 4 reads a second)
+  and counts each own line once. A frame-clock gap, an unplaced frame, a read fault, or any
+  lasting unreadable line makes coverage UNKNOWN, so the gate records
+  `killfeed_coverage_unknown` and the final is not Counted.
+- The runner's feed leg is this tally once it has read a frame; the end board moves its time.
+
+Measured on match-20261106-201029 (720p, 1423 frames at 4 per second): 31 own-kill lines
+against scoreboard KILLS 31, each line checked by eye; 1 lasting line stayed unreadable, so
+that match's coverage is UNKNOWN and its final is not Counted. Deaths read 17 of 23 (advisory).
+match 073204: UNMEASURED (only end-screen frames are on file). REAL MATCH stays on v0.3.38.

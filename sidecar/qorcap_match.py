@@ -915,12 +915,22 @@ def _header_int(headers, name):
     return value
 
 
-def start_cod_reader(api: Api, stop: threading.Event, state: dict, bundle: Path | None = None) -> threading.Thread:
+_SIDE_FROM_BUNDLE = object()  # legacy: read the side from side_choice.json in the bundle
+
+
+def start_cod_reader(api: Api, stop: threading.Event, state: dict, bundle: Path | None = None,
+                     side=_SIDE_FROM_BUNDLE) -> threading.Thread:
     """Call of Duty frame loop. Does not start the Madden scorebug reader.
 
     The end word plus Qortrola30's scoreboard row can post a final. Home and away stay unread on that path.
     Controller and frame-clock rows are refreshed about once a second. No frame
     clock means those signals are not Counted.
+
+    ``side`` is the side chosen at the start for the scored-end check (a read that already has home and away).
+    ``main()`` passes ``side=None`` for Call of Duty, because Call of Duty has no home/away pick. A
+    ``side_choice.json`` or ``next-side.txt`` already sitting in a reused match folder is then not read, so it
+    cannot turn the scored-end side check back on. The file is left in place (prior evidence is not deleted).
+    Leaving ``side`` out keeps the older behavior of reading ``side_choice.json`` from the bundle.
     """
     sys.path.insert(0, str(HERE))
     from qorcap_cod import CodSetRunner, load_signal_files, side_from_bundle
@@ -937,7 +947,7 @@ def start_cod_reader(api: Api, stop: threading.Event, state: dict, bundle: Path 
     runner = CodSetRunner(
         post,
         log_path=(bundle / "cod_signals.jsonl") if bundle is not None else None,
-        side=side_from_bundle(bundle),
+        side=side_from_bundle(bundle) if side is _SIDE_FROM_BUNDLE else side,
     )
     state["core"] = runner
     # Leave the Madden pause gate unset. Official challenges stay closed.
@@ -1588,7 +1598,20 @@ def resolve_game(a, *, game_file: Path, read_key=None, out=None) -> tuple[str | 
 
 def resolve_side(a, *, side_file: Path, read_key=None, out=None, game: str = "madden") -> tuple[str | None, str | None]:
     """(side, source). source: flag | file | prompt; (home, None) is the legacy default for direct CLI runs without
-    --side (tests); (None, None) = no answer possible (no console)."""
+    --side (tests); (None, None) = no answer possible (no console).
+
+    Call of Duty has no home/away pick: no prompt, no next-side.txt, no flag. It returns the same (home, None)
+    as the default path above, so this run writes no side_choice.json and passes no --side-source.
+
+    "home" is not a typed N/A. receipt.v0 requires the player role and allows only home or away, so "home" is
+    the legacy signing-role bucket that the receipt and the recorder (--role home) need. An explicit Call of
+    Duty --side away or --role away is ignored and ends up as home. main() also passes side=None to the Call
+    of Duty reader, so a side_choice.json or next-side.txt left from an earlier run is not read and the
+    scored-end side check (a read that already has home and away) stays off: VICTORY and DEFEAT on that path
+    are not confirmed by a side. The owner-row final agreement is a separate path with its own gates and is
+    not changed here. How later consumers should read this "home" is a separate, later plan."""
+    if game == "cod":
+        return "home", None
     if a.side in ("home", "away"):
         return a.side, "flag"
     if a.role in ("home", "away"):
@@ -1720,12 +1743,17 @@ def main(argv=None) -> int:
     a.role = side
     say(f"Game: {'CALL OF DUTY' if game == 'cod' else 'MADDEN'}"
         + (f"  (from {game_source})" if game_source else "  (default; pass --game madden|cod)"))
-    say(f"Side: {side.upper()}" + (f"  (from {side_source})" if side_source else "  (default; pass --side home|away)"))
+    if game == "cod":
+        say("Side: not used for Call of Duty (no home/away pick).")
+    else:
+        say(f"Side: {side.upper()}" + (f"  (from {side_source})" if side_source else "  (default; pass --side home|away)"))
 
     root = Path(a.out) if a.out else Path.home() / "Documents" / "QorCap Matches"
     stamp = time.strftime("%Y%m%d-%H%M%S")
     bundle = (root / f"match-{stamp}").resolve()
     bundle.mkdir(parents=True, exist_ok=True)
+    if game == "cod" and (bundle / "side_choice.json").exists():
+        say(f"Note: {bundle / 'side_choice.json'} is from an earlier run. Call of Duty does not read it; it is left in place.")
     match_id = f"local-{stamp}"
     api = Api(a.port)
     try:
@@ -1835,8 +1863,9 @@ def main(argv=None) -> int:
     say("(Ctrl+C also stops it; if Windows then asks 'Terminate batch job (Y/N)?', answer N.)\n")
     stop, state = threading.Event(), {}
     cs = Countersigner(referee, match_id, a.role, sink=bundle / "countersigned.jsonl")
+    # No home/away pick for Call of Duty: pass no side, so an old side_choice.json in this folder is not read.
     if game == "cod":
-        start_cod_reader(api, stop, state, bundle=bundle)
+        start_cod_reader(api, stop, state, bundle=bundle, side=None)
     elif a.test_pattern:
         start_fake_scores(api, stop, state, a.test_secs)
     else:

@@ -620,6 +620,45 @@ def killfeed_status(*, calibrated: bool, hitmarker_status: str, killfeed_us, hit
                           this_us=killfeed_us, prior_us=hitmarker_us)
 
 
+def cod_final_agreement(*, feed, scoreboard, end_screen, frame_stamps) -> dict:
+    """Intersect independent legs on the frame clock; presence alone is advisory.
+
+    The feed contributes an ownership-qualified covered tally, not generic icons.
+    The board supplies K/D and the calibrated end screen supplies the outcome.
+    Existing multi-frame visual and seal/anchor gates remain additional requirements.
+    """
+    def abstain(reason):
+        return {"counted": False, "status": NOT_COUNTED, "reason": reason}
+
+    legs = {"killfeed": feed, "scoreboard": scoreboard, "end_screen": end_screen}
+    for name, leg in legs.items():
+        if not isinstance(leg, dict):
+            return abstain(f"missing_{name}")
+    if (feed.get("coverage") != "covered" or feed.get("ownership_qualified") is not True
+            or feed.get("deduped") is not True or _score(feed.get("kills")) is None):
+        return abstain("killfeed_coverage_unknown")
+    if (scoreboard.get("calibrated") is not True or _score(scoreboard.get("kills")) is None
+            or _score(scoreboard.get("deaths")) is None):
+        return abstain("scoreboard_not_read")
+    if end_screen.get("calibrated") is not True or end_screen.get("outcome") not in ("victory", "defeat"):
+        return abstain("end_screen_not_read")
+    times = [leg.get("t_us") for leg in legs.values()]
+    if any(isinstance(t, bool) or not isinstance(t, int) or t < 0 for t in times):
+        return abstain("frame_clock_unknown")
+    if max(times) - min(times) > FRAME_CLOCK_GAP_US:
+        return abstain("agreement_window_expired")
+    if not all(_stamp_covers(t, t, frame_stamps) for t in times):
+        return abstain("frame_clock_unmatched")
+    if feed["kills"] != scoreboard["kills"]:
+        return abstain("killfeed_scoreboard_mismatch")
+    # Extra structured values, if actually read by another leg, must also agree.
+    for key in ("kills", "deaths", "assists", "outcome"):
+        values = [leg[key] for leg in legs.values() if key in leg and leg[key] is not None]
+        if any(v != values[0] for v in values[1:]):
+            return abstain(f"{key}_mismatch")
+    return {"counted": True, "status": AGREED, "reason": "three_leg_agreement"}
+
+
 def scoreboard_status(*, calibrated: bool, kills, assists, board_kills, board_assists) -> str:
     """Offline kills and assists against the end scoreboard.
 
@@ -728,6 +767,9 @@ class CodSetRunner:
         self.lag_us_override = None
         self._last_gated_hit_us = None
         self._last_feed_us = None
+        # Own kills read by gamertag from the killfeed (qorcap_cod_killfeed).
+        self._kill_tally = None
+        self._kill_read_us = None
         self._lag = None
         self._pair = None
         self._n = 0
@@ -855,6 +897,7 @@ class CodSetRunner:
                 print(f"Call of Duty end-screen hook error: {type(e).__name__}: {e}", file=sys.stderr)
                 self._frame_end = {"status": "fault", "reason": "end_hook_error"}
                 self._clear_end_candidate()
+                self._kill_feed_fault()
                 return
             when = t_ms if isinstance(t_ms, int) and not isinstance(t_ms, bool) else None
             if (
@@ -863,6 +906,8 @@ class CodSetRunner:
                 and isinstance(end.reason, str) and end.reason in ("victory", "defeat")
             ):
                 self._note_end_word(when)
+            if self.final is None:
+                self._read_kill_feed(img, bool(end.ok and end.calibrated))
             if self.final is not None:
                 self._frame_end = {"status": "already_final", "reason": None}
                 return
@@ -962,12 +1007,12 @@ class CodSetRunner:
         motion_status, motion_reason = self._hold_counts(motion_status, None, screen_us)
         board_status, board_reason = self._hold_counts(board_status, None, screen_us)
         return [
-            {"signal": "hitmarker", "status": hit_status, "reason": hit_reason, "gated": gated},
-            {"signal": "kill_popup", "status": popup_status, "reason": popup_reason},
-            {"signal": "killfeed", "status": feed_status, "reason": feed_reason},
+            {"signal": "hitmarker", "status": hit_status, "reason": hit_reason, "gated": gated, "counted": False, "advisory": True},
+            {"signal": "kill_popup", "status": popup_status, "reason": popup_reason, "counted": False, "advisory": True},
+            {"signal": "killfeed", "status": feed_status, "reason": feed_reason, "counted": False, "advisory": True},
             {"signal": "pause", "status": pause_status, "reason": pause_reason},
             {"signal": "recoil", "status": motion_status, "reason": motion_reason},
-            {"signal": "scoreboard", "status": board_status, "reason": board_reason},
+            {"signal": "scoreboard", "status": board_status, "reason": board_reason, "counted": False, "advisory": True},
             {"signal": "end_screen", "status": NOT_COUNTED, "reason": None},
         ]
 
@@ -1027,7 +1072,8 @@ class CodSetRunner:
             self._frame_end = {"status": "not_ready", "reason": end.reason, "visual_ok": confirm}
             return
         gate = self.final_eligibility(visual_ok=confirm, evidence_us=self._evidence_us())
-        confirmed = gate["confirmed"]
+        agreement = self._final_agreement(end, None)
+        confirmed = gate["confirmed"] and agreement["counted"]
         self._frame_end = {
             "status": "scored", "reason": end.reason, "visual_ok": confirm, "eligible": confirmed,
         }
@@ -1037,10 +1083,13 @@ class CodSetRunner:
         ]
         if direction_note:
             notes.append(direction_note)
+        self._frame_end["agreement"] = agreement
+        if not agreement["counted"]:
+            notes.append("CoD agreement: " + agreement["reason"] + ".")
         if not confirmed:
             notes.append("The end-screen score is not Counted as confirmed.")
         self._emit_frame(t_ms)
-        self._commit_final(t_ms, agreed, end.reason, confirmed, home, away, notes, owner=None, visual=confirm)
+        self._commit_final(t_ms, agreed, end.reason, confirmed, home, away, notes, owner=None, visual=confirm, agreement=agreement)
 
     def _post_owner_end(self, t_ms: int, when: int, end: RegionRead, owner: RegionRead) -> None:
         """End word plus Qortrola30's row. Home and away stay unread.
@@ -1109,16 +1158,36 @@ class CodSetRunner:
             "result": end.reason,
         }
         gate = self.final_eligibility(visual_ok=True, evidence_us=self._evidence_us())
-        confirmed = gate["confirmed"]
+        agreement = self._final_agreement(end, owner)
+        confirmed = gate["confirmed"] and agreement["counted"]
         self._frame_end = {
             "status": "accepted", "reason": end.reason, "visual_ok": True, "eligible": confirmed,
         }
+        self._frame_end["agreement"] = agreement
+        if not agreement["counted"]:
+            notes.append("CoD agreement: " + agreement["reason"] + ".")
         if not confirmed:
             notes.append("The end-screen score is not Counted as confirmed.")
         self._emit_frame(t_ms)
-        self._commit_final(t_ms, agreed, end.reason, confirmed, None, None, notes, owner=owner_doc, visual=True)
+        self._commit_final(t_ms, agreed, end.reason, confirmed, None, None, notes, owner=owner_doc, visual=True, agreement=agreement)
 
-    def _commit_final(self, t_ms, agreed, reason, confirmed, home, away, notes, owner, visual=False) -> None:
+    def _final_agreement(self, end, owner) -> dict:
+        feed = self.own_kill_coverage()
+        if not (self._kill_tally is not None and self._kill_tally.frames):
+            feed["t_us"] = self._last_feed_us
+        board = None if owner is None else {
+            "kills": _score(owner.kills), "deaths": _score(owner.deaths),
+            "assists": _score(owner.assists), "calibrated": bool(owner.ok and owner.calibrated),
+            "t_us": self._screen_us(),
+        }
+        return cod_final_agreement(
+            feed=feed, scoreboard=board,
+            end_screen={"calibrated": bool(end.ok and end.calibrated and end.confirm),
+                        "outcome": end.reason, "t_us": self._screen_us()},
+            frame_stamps=self.frame_stamps)
+
+    def _commit_final(self, t_ms, agreed, reason, confirmed, home, away, notes, owner, visual=False, agreement=None) -> None:
+        confirmed = bool(confirmed and agreement and agreement.get("counted") is True)
         event = {
             "type": "final",
             "basis": "end_menu",
@@ -1127,6 +1196,8 @@ class CodSetRunner:
             "away": away,
             "quarter": 4,
             "t_ms": agreed["t_ms"],
+            "agreement": agreement,
+            "counted": bool(confirmed and agreement and agreement.get("counted")),
             "visual_confirmed": bool(visual),
             "final_confirmed": bool(confirmed),
             "notes": notes,
@@ -1143,7 +1214,7 @@ class CodSetRunner:
         self.stats["posted_final"] += 1
         logged = {
             "t_ms": int(t_ms), "kind": "end_screen", "status": AGREED,
-            "final_confirmed": confirmed, "home": home, "away": away,
+            "final_confirmed": confirmed, "counted": bool(confirmed), "agreement": agreement, "home": home, "away": away,
             "result": reason, "frames": agreed["frames"],
         }
         if owner is not None:
@@ -1208,8 +1279,50 @@ class CodSetRunner:
         frame_id = src.get("frame_id")
         return frame_id if isinstance(frame_id, str) and frame_id else None
 
+    def _kill_feed_fault(self) -> None:
+        if self._kill_tally is not None:
+            self._kill_tally.fault()
+
+    def _read_kill_feed(self, img, end_screen: bool) -> None:
+        """Own kills by gamertag from the killfeed, on the frame clock.
+
+        The end board shows no feed, so it only moves the tally's time on. Feed
+        frames are read about 4 times a second, the rate it was checked at.
+        """
+        try:
+            from qorcap_cod_killfeed import KillfeedTally, read_killfeed_lines, READ_EVERY_US
+        except Exception:
+            return
+        if self._kill_tally is None:
+            self._kill_tally = KillfeedTally()
+        tally = self._kill_tally
+        screen_us = self._screen_us()
+        if end_screen:
+            if tally.frames and (not isinstance(screen_us, int) or tally.last_us is None or screen_us > tally.last_us):
+                tally.hold(screen_us)
+            return
+        if isinstance(screen_us, int) and not isinstance(screen_us, bool) and isinstance(self._kill_read_us, int):
+            if 0 <= screen_us - self._kill_read_us < READ_EVERY_US:
+                return
+        try:
+            read = read_killfeed_lines(img)
+        except Exception as e:
+            print(f"Call of Duty killfeed hook error: {type(e).__name__}: {e}", file=sys.stderr)
+            tally.fault()
+            return
+        if not (isinstance(read, dict) and read.get("ok") is True) and tally.frames == 0:
+            # Nothing placed yet (no image or no layout): the legacy path stands.
+            return
+        self._kill_read_us = screen_us if isinstance(screen_us, int) else None
+        tally.update(screen_us, read)
+
     def own_kill_coverage(self) -> dict:
-        """Unknown unless every kill is ownership-qualified, deduplicated, and covered."""
+        """Unknown unless every kill is ownership-qualified, deduplicated, and covered.
+
+        Once the killfeed has been read by gamertag, its tally is the feed leg.
+        """
+        if self._kill_tally is not None and self._kill_tally.frames:
+            return self._kill_tally.coverage()
         events = list(self._own_kills)
         if not events:
             return {"coverage": "unknown", "kills": None, "ownership_qualified": False, "deduped": False}
