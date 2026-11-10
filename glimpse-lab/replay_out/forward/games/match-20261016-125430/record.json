@@ -1,0 +1,37 @@
+{
+ "match": "match-20261016-125430",
+ "layout": "regular",
+ "chain": {
+  "verified": true,
+  "head": "fd211615b70197d6f77ea10b66552448cb3a484ff7073debfa2ba75183891d09",
+  "n": 593
+ },
+ "champion": "watch_012",
+ "frames_cached": 0,
+ "labelled": 0,
+ "grades": {},
+ "bank_added": 0,
+ "tune": 0,
+ "bank_stats": {},
+ "candidates": [],
+ "lesson": null,
+ "pending": null,
+ "decision": null,
+ "champion_on_game": {
+  "right": 0,
+  "wrong": 0,
+  "abstain": 0,
+  "other": 0,
+  "missing": 0
+ },
+ "note": "no cached Glimpse reads for this game: labels only (they wait for reads)",
+ "hard": {
+  "wrong": [],
+  "unsure": [],
+  "disagree_reader": []
+ },
+ "review_queue": [],
+ "spend_usd": 0.0,
+ "would_cost_live_usd": 0.0,
+ "lab_version": "glimpse-lab/0.1.0-proposal"
+}
