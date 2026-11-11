@@ -284,6 +284,17 @@ impl InputLog {
         }
     }
 
+    /// Read-only view for the practice live tap (src/livetap.rs). Nothing here touches the controller.
+    pub fn weave_ctx(&self) -> crate::livetap::WeaveCtx {
+        crate::livetap::WeaveCtx {
+            wall_anchor_ms: self.wall_anchor_ms,
+            pad: self.live.state.clone(),
+            seal: if self.seal.enabled() { self.seal.status.clone() } else { "off".into() },
+            seal_hash: self.seal.hash.as_ref().map(|h| h.chars().take(12).collect()),
+            last_press: self.live.recent_presses.last().map(|p| (p.seq, p.t_ms, p.button.clone())),
+        }
+    }
+
     /// A finalized seal revision. Does not mark it bound.
     pub fn seal_binding(&self) -> Option<Value> { self.seal.binding() }
 

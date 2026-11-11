@@ -409,6 +409,19 @@ pub struct RecordArgs {
     /// (`qorcap align-ab`, docs/FRAME_CLOCK_AB.md).
     #[arg(long)]
     pub frame_clock: bool,
+    /// PRACTICE lane only, default off. Also send the recorded MPEG-TS bytes to a loopback UDP port
+    /// (e.g. udp://127.0.0.1:1937, QorStream's live ingest) with timed ID3 weave cues carrying QorCap's
+    /// frame clock, the session seal state and the newest controller press. Also QORCAP_LIVE_TAP=URL.
+    /// Refused unless --practice-lane (or QORCAP_LANE=practice). The recording, the hash chain and the
+    /// receipt are unchanged. See docs/LIVE_TAP.md.
+    #[arg(long)]
+    pub live_tap: Option<String>,
+    /// Marks this run as the practice lane (no referee submit). Required by --live-tap. Also QORCAP_LANE=practice.
+    #[arg(long)]
+    pub practice_lane: bool,
+    /// Live tap: one weave cue every N recorded frames (1..=600, default 15). Also QORCAP_LIVE_TAP_EVERY.
+    #[arg(long)]
+    pub live_tap_every: Option<u32>,
 }
 
 impl RecordArgs {
@@ -473,7 +486,8 @@ mod tests {
         assert!(matches!(Cli::try_parse_from(["qorcap", "pair", "join", "qorpair1.abc", "--bundle", "b"]).unwrap().cmd, Cmd::Pair { action: PairCmd::Join { .. }, .. }));
         assert!(matches!(Cli::try_parse_from(["qorcap", "input-proof", "b", "--frames", "10"]).unwrap().cmd, Cmd::InputProof { frames: 10, .. }));
         if let Cmd::Record(r) = Cli::try_parse_from(["qorcap", "record", "--no-controller"]).unwrap().cmd { assert!(r.no_controller); assert!(!r.frame_clock); } else { panic!() }
-        if let Cmd::Record(r) = Cli::try_parse_from(["qorcap", "record", "--frame-clock"]).unwrap().cmd { assert!(r.frame_clock); } else { panic!() }
+        if let Cmd::Record(r) = Cli::try_parse_from(["qorcap", "record", "--frame-clock"]).unwrap().cmd { assert!(r.frame_clock); assert!(r.live_tap.is_none() && !r.practice_lane); } else { panic!() }
+        if let Cmd::Record(r) = Cli::try_parse_from(["qorcap", "record", "--live-tap", "udp://127.0.0.1:1937", "--practice-lane", "--live-tap-every", "5"]).unwrap().cmd { assert_eq!(r.live_tap.as_deref(), Some("udp://127.0.0.1:1937")); assert!(r.practice_lane); assert_eq!(r.live_tap_every, Some(5)); } else { panic!() }
         assert!(matches!(Cli::try_parse_from(["qorcap", "align-ab", "b", "--no-video"]).unwrap().cmd, Cmd::AlignAb { no_video: true, frames: 15, rumble_echo: false, .. }));
         assert!(matches!(Cli::try_parse_from(["qorcap", "align-ab", "b", "--rumble-echo"]).unwrap().cmd, Cmd::AlignAb { rumble_echo: true, .. }));
         match Cli::try_parse_from(["qorcap", "align-ab", "b", "--rumble-echo"]).unwrap().cmd {

@@ -50,6 +50,9 @@ pub struct Status {
     pub side_source: Option<String>,
     /// Set when a checkpoint line could not be flushed and synced. The seal stays unbound.
     pub checkpoint_persist_error: Option<String>,
+    /// Practice live tap counters. Absent (not serialized) when the tap is off.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub live_tap: Option<crate::livetap::TapStats>,
 }
 
 /// One injected append failure. Remaining counts down so a retry can succeed.
@@ -82,6 +85,8 @@ pub struct Engine {
     pub input: Arc<Mutex<crate::inputs::InputLog>>,
     /// Opt-in per-frame capture clock. Off unless `--frame-clock` or `QORCAP_FRAME_CLOCK`. No file when off.
     pub frame_clock: Arc<crate::frameclock::FrameClock>,
+    /// Opt-in practice live tap (src/livetap.rs). Off: every call is a no-op.
+    pub live_tap: Arc<crate::livetap::LiveTap>,
     /// The supervisor loop (`run`) is active; the API keeps serving until it has finished the bundle.
     pub running: AtomicBool,
     /// Set when `run` has returned (or /shutdown arrives while not running): the API thread exits.
@@ -397,6 +402,14 @@ impl Engine {
         // After the input logger's wall anchor, before `started`. Opening the file does not read the clock.
         let frame_on = crate::frameclock::flag_enabled(args.frame_clock, std::env::var(crate::frameclock::ENV).ok().as_deref());
         let frame_clock = Arc::new(crate::frameclock::FrameClock::open(frame_on, args.bundle.as_deref().map(Path::new)));
+        let tap_dest = match crate::livetap::resolve(args.live_tap.as_deref(), std::env::var(crate::livetap::ENV_URL).ok().as_deref(),
+            args.practice_lane, std::env::var(crate::livetap::ENV_LANE).ok().as_deref()) {
+            Ok(d) => d,
+            Err(e) => { warn!("{e}"); None }
+        };
+        let tap_every = args.live_tap_every.filter(|n| (1..=600).contains(n))
+            .unwrap_or_else(|| crate::livetap::every_from_env(std::env::var(crate::livetap::ENV_EVERY).ok().as_deref()));
+        let live_tap = Arc::new(crate::livetap::LiveTap::open(tap_dest, tap_every, &input.lock().unwrap_or_else(|e| e.into_inner()).weave_ctx().wall_anchor_ms.to_string(), args.fps, args.bundle.as_deref().map(Path::new)));
         let st = Status { state: "starting".into(), device: args.device.clone(), res: format!("{}x{}", args.res.0, args.res.1), fps_target: args.fps, replay_window: args.replay.unwrap_or(0), role: args.role.clone(), side_source: args.side_source.clone(), ..Default::default() };
         let started = Instant::now();
         // One origin names the engine clock on both the snapshot and the input header, so the
@@ -409,7 +422,7 @@ impl Engine {
         Arc::new(Self { ffmpeg, ring: Mutex::new(ReplayRing::new(window, cap)), rec: Mutex::new(None), status: Mutex::new(st), shutdown: AtomicBool::new(false),
             ev: Mutex::new(MatchState { started_wall_ms: wall_ms(), score: Value::Null, ..Default::default() }), subs: Mutex::new(vec![]),
             stamp_file: dir.join("stamp.txt"),
-            snapshot: dir.join("snapshot.jpg"), snap_pub: Mutex::new(snap), tap: crate::glimpse::FrameTap::with_ring(args.glimpse_frame || crate::glimpse::env_enabled(), crate::glimpse::ring_enabled()), exit_when_recording_ends: AtomicBool::new(false), started, last_data_ms: AtomicU64::new(0), input, frame_clock,
+            snapshot: dir.join("snapshot.jpg"), snap_pub: Mutex::new(snap), tap: crate::glimpse::FrameTap::with_ring(args.glimpse_frame || crate::glimpse::env_enabled(), crate::glimpse::ring_enabled()), exit_when_recording_ends: AtomicBool::new(false), started, last_data_ms: AtomicU64::new(0), input, frame_clock, live_tap,
             running: AtomicBool::new(false), api_closed: AtomicBool::new(false), sealed: AtomicBool::new(false),
             countersigned: std::sync::atomic::AtomicI64::new(-1),
             stop_reason: Mutex::new(None), bundle_write: Mutex::new(()), bundle_finalized: AtomicBool::new(false),
@@ -430,6 +443,7 @@ impl Engine {
         { let r = self.ring.lock().unwrap_or_else(|e| e.into_inner()); s.replay_bytes = r.len_bytes(); s.replay_secs_buffered = r.span_ms() as f64 / 1000.0; }
         if self.args.replay.is_none() { s.replay_bytes = 0; s.replay_secs_buffered = 0.0; }
         if !self.args.no_controller { s.input = Some(self.input.lock().unwrap_or_else(|e| e.into_inner()).live.clone()); }
+        s.live_tap = self.live_tap.stats();
         {
             let pub_ = self.snap_pub.lock().unwrap_or_else(|e| e.into_inner());
             s.snapshot_frames = pub_.frames;
@@ -579,7 +593,7 @@ impl Engine {
             if r.wait_key {
                 match data.chunks_exact(TS).position(ring::is_random_access) {
                     Some(k) => { slice = &data[k * TS..]; r.wait_key = false;
-                        if let Some(w) = r.stdin.as_mut() { for t in [pat, pmt].into_iter().flatten() { let _ = w.write_all(&t); } } }
+                        if let Some(w) = r.stdin.as_mut() { for t in [&pat, &pmt].into_iter().flatten() { let _ = w.write_all(t); } } }
                     None => slice = &[],
                 }
             }
@@ -596,6 +610,13 @@ impl Engine {
                 if written && frame_clock.enabled() {
                     let file = Path::new(&r.path).file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
                     frame_clock.observe(slice, t_us, &file);
+                }
+                // Practice live tap: the same bytes that reached the recording, never anything else.
+                if written && self.live_tap.enabled() {
+                    let file = Path::new(&r.path).file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+                    let input = Arc::clone(&self.input);
+                    self.live_tap.observe(slice, t_us, &file, pat.as_deref(), pmt.as_deref(),
+                        &move || input.lock().unwrap_or_else(|e| e.into_inner()).weave_ctx());
                 }
             }
             if r.deadline.map(|d| Instant::now() >= d).unwrap_or(false) {
