@@ -252,3 +252,64 @@ jobs:
           .\target\release\qorcap.exe input-test --secs 2
           if ($LASTEXITCODE -ne 1) { throw "expected exit 1 with no controller" }
           exit 0
+      # Downloadable Windows x64 build for practice installs. Packaged like the release zip,
+      # but no tag, no release, no publish: release.yml stays the only release path.
+      # Named by the commit under test (the PR head, not the merge ref).
+      - name: Package Windows x64 CI build
+        shell: pwsh
+        env:
+          QORCAP_CI_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $false
+          $short = $env:QORCAP_CI_SHA.Substring(0, 7)
+          $name = "qorcap-$short-windows-x64"
+          $stage = Join-Path $env:RUNNER_TEMP "qorcap-ci-stage"
+          $root = Join-Path $stage $name
+          New-Item -ItemType Directory -Force -Path $root | Out-Null
+
+          Copy-Item target\release\qorcap.exe $root
+          $exeHash = (Get-FileHash (Join-Path $root "qorcap.exe") -Algorithm SHA256).Hash.ToLower()
+          [System.IO.File]::WriteAllText((Join-Path $root "qorcap.exe.sha256"), "$exeHash  qorcap.exe`n")
+
+          foreach ($f in @(
+            "Start Match.cmd", "Finalize Last Match.cmd", "Make Highlights.cmd",
+            "Input Test.cmd", "Submit for Verification.cmd", "Test Without Card.cmd",
+            "Glimpse Watch.cmd", "LICENSE", "README.md", "get-ffmpeg.ps1", "start-match.ps1"
+          )) { Copy-Item $f $root }
+          New-Item -ItemType Directory -Force -Path (Join-Path $root "docs") | Out-Null
+          foreach ($d in @("GLIMPSE_WATCH.md", "GLIMPSE_WITNESS.md", "CONTENT_CREDENTIALS.md", "FRAME_CLOCK_AB.md", "GAME_SETS.md")) {
+            Copy-Item (Join-Path docs $d) (Join-Path $root "docs")
+          }
+          Copy-Item sidecar (Join-Path $root "sidecar") -Recurse
+          Get-ChildItem (Join-Path $root "sidecar") -Recurse -Directory -Filter __pycache__ | Remove-Item -Recurse -Force
+          Copy-Item contracts (Join-Path $root "contracts") -Recurse
+          python sidecar\qorcap_release.py --install-root $root
+          if ($LASTEXITCODE -ne 0) { throw "CI build is missing a file the sidecar reads" }
+
+          Push-Location $root
+          try { & .\get-ffmpeg.ps1 } finally { Pop-Location }
+          if (-not (Test-Path (Join-Path $root "ffmpeg.exe"))) { throw "ffmpeg.exe was not installed" }
+
+          $pin = (Select-String -Path sidecar\qorcap_match.py -Pattern 'QORTIME_PIN = "([0-9a-f]+)"').Matches[0].Groups[1].Value
+          $qt = Join-Path $env:RUNNER_TEMP "qortime-ci-src"
+          git init $qt
+          git -C $qt remote add origin https://github.com/ConWan30/qortime.git
+          git -C $qt fetch --depth 1 origin $pin
+          if ($LASTEXITCODE -ne 0) { throw "could not fetch QorTime $pin" }
+          git -C $qt checkout --detach FETCH_HEAD
+          if (Test-Path (Join-Path $qt ".git")) { Remove-Item (Join-Path $qt ".git") -Recurse -Force }
+          Move-Item $qt (Join-Path $root "qortime")
+
+          $info = "CI build, not a release. commit $($env:QORCAP_CI_SHA)`nrun $($env:GITHUB_SERVER_URL)/$($env:GITHUB_REPOSITORY)/actions/runs/$($env:GITHUB_RUN_ID)`nqorcap.exe sha256 $exeHash`n"
+          [System.IO.File]::WriteAllText((Join-Path $root "CI-BUILD.txt"), $info)
+          "QORCAP_CI_ARTIFACT=$name" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "QORCAP_CI_STAGE=$stage" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "staged $name exe $exeHash"
+      - name: Upload Windows x64 CI build
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.QORCAP_CI_ARTIFACT }}
+          path: ${{ env.QORCAP_CI_STAGE }}
+          retention-days: 14
+          if-no-files-found: error
