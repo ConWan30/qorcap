@@ -784,7 +784,7 @@ class CodSetRunner:
         self._observe_lock = threading.Lock()
         self._published = None
         # Optional practice auto-stop watcher (qorcap_cod_endstop). Sees the reads this loop already
-        # made; it cannot change what a frame posts or logs.
+        # made and the frame; it cannot change what a frame posts or logs.
         self.end_watch = None
 
     def set_signals(self, inputs, frame_stamps, haptics, wall_anchor_ms) -> None:
@@ -862,10 +862,11 @@ class CodSetRunner:
         self._pending_reads = []
         self._pending_signals = []
         self._note_capture_epoch()
-        end_rd = owner_rd = None
+        end_rd = owner_rd = hud_rd = None
         try:
             try:
                 reads = list(self.hud.read(img))
+                hud_rd = reads
             except Exception as e:
                 self.stats["errors"] += 1
                 print(f"Call of Duty HUD hook error: {type(e).__name__}: {e}", file=sys.stderr)
@@ -949,7 +950,7 @@ class CodSetRunner:
             watch = self.end_watch
             if watch is not None:
                 try:
-                    watch(t_ms, end_rd, owner_rd, self._source)
+                    watch(t_ms, end_rd, owner_rd, self._source, hud_rd, img)
                 except Exception:
                     pass
 
