@@ -6,6 +6,8 @@ on:
 jobs:
   linux:
     runs-on: ubuntu-latest
+    # A healthy run takes 11-14 min. A stuck step must not hold the runner for an hour.
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -28,7 +30,46 @@ jobs:
           PY
       # ffmpeg and the pinned QorTime verifier run inside `cargo test` (clip credentials).
       # The receipt check is the real `python -m qor_receipt.cli verify`, not a stub.
-      - run: sudo apt-get update && sudo apt-get install -y ffmpeg
+      # ffmpeg + ffprobe for the steps below (found on PATH). Pinned static build from BtbN/FFmpeg-Builds
+      # (a month-end autobuild; those are kept long-term), checked against its published sha256.
+      # No Ubuntu mirror is needed. On 2026-11-11 the runner could not resolve archive.ubuntu.com,
+      # and `apt-get install ffmpeg` waited 20 s per package per mirror for ~60 min before failing.
+      # apt is only a bounded fallback when the pinned download fails or does not match.
+      - name: ffmpeg (pinned static build, bounded apt fallback)
+        timeout-minutes: 15
+        shell: bash
+        env:
+          FFMPEG_URL: https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-10-31-12-59/ffmpeg-n8.1.3-27-g8dca1586f4-linux64-gpl-8.1.tar.xz
+          FFMPEG_SHA256: 41e9c565594c390622cf968d82fa4135d9e9a11d06c1515644288cbc844e3380
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          set -euo pipefail
+          tarball="$RUNNER_TEMP/ffmpeg-static.tar.xz"
+          dest="$RUNNER_TEMP/ffmpeg-static"
+          got=0
+          for attempt in 1 2; do
+            if curl -fsSL --retry 2 --connect-timeout 20 --max-time 150 -o "$tarball" "$FFMPEG_URL" \
+               && echo "$FFMPEG_SHA256  $tarball" | sha256sum -c -; then
+              got=1
+              break
+            fi
+            echo "pinned static ffmpeg: attempt $attempt failed"
+            sleep 5
+          done
+          if [ "$got" = 1 ]; then
+            mkdir -p "$dest"
+            tar -xJf "$tarball" -C "$dest" --strip-components=1
+            echo "$dest/bin" >> "$GITHUB_PATH"
+            export PATH="$dest/bin:$PATH"
+          else
+            echo "::warning::pinned static ffmpeg unavailable or checksum mismatch; trying apt (bounded)"
+            apt_opts=(-o Acquire::Retries=2 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 -o Dpkg::Lock::Timeout=60)
+            timeout 180 sudo -E apt-get "${apt_opts[@]}" update
+            timeout 300 sudo -E apt-get "${apt_opts[@]}" install -y --no-install-recommends ffmpeg
+          fi
+          command -v ffmpeg
+          command -v ffprobe
+          ffmpeg -hide_banner -version | sed -n 1p
       # opencv-python-headless: CPU scorebug reads. No GPU, no capture card, no HID.
       - run: pip install cryptography pytest numpy opencv-python-headless fastapi httpx
       - name: QorTime pin
@@ -102,6 +143,7 @@ jobs:
   contracts:
     name: contracts (qortime main)
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -136,6 +178,7 @@ jobs:
         run: python -m pytest -q sidecar/test_contracts.py
   windows:
     runs-on: windows-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - name: Shipped PowerShell is ASCII or UTF-8 BOM and parses on 5.1
