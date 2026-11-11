@@ -24,6 +24,33 @@ The guard. A frame counts only when the end reader returns a calibrated, confirm
 - the whole run must start at least ``QORCAP_AUTOCLOSE_ARM_S`` (default 120 s) after the first
   frame this watcher saw, so a lobby or pre-match screen cannot stop the recording.
 
+That is the ``sustained`` path. In practice match-20261111-165658 the confirmed word was on screen
+for about 0.74 s (2 reads) before the board and menu replaced it, so that path cannot fire on a
+normal match end. The ``splash`` path covers it:
+
+- CANDIDATE: at least 2 confirmed reads of the same word within 1.5 s (strictly later timestamps,
+  armed, the other word not read in between).
+- While a candidate is open (at most 30 s), the watcher also reads Qortrola30's end-scoreboard row on
+  every frame. The frame loop reads that row only on frames that show the word, which is why the
+  row was never read in that match.
+- CONFIRMED by the first of: Qortrola30's row read (``splash+owner_row``); the same word read again
+  at least 2 s after the candidate formed (``splash+word_again``); or 8 s of frames with no gameplay
+  HUD event (``splash+quiet``). A gameplay HUD event is a calibrated hitmarker, kill popup or
+  killfeed icon read; one restarts the 8 s count.
+- CANCELLED by the other word, or by 30 s without a confirmation (gameplay that keeps producing HUD
+  events never reaches the 8 s). A new candidate can form afterwards.
+
+Killcam: a killcam does not show VICTORY or DEFEAT, so it cannot open a candidate. A killcam right
+after the splash replays HUD-like overlays; any hitmarker / popup / feed read there only restarts the
+quiet count. Honest limit: on the real match above only 2 HUD regions read across 639 frames, so the
+quiet count mostly measures time. The splash path then rests on the end reader's precision (2
+integrity-checked reads of one word within 1.5 s, after arming). There is no killcam footage in the
+repo or on the build box to measure that.
+
+The tail is measured from confirmation, not from the splash. On the splash path the stop is then at
+least 8 + 12 s after the word unless the row or a second word read confirms sooner, so the end
+scoreboard that follows the splash is in the recording.
+
 What it is not. The trigger is a recording-control decision. It is not a final, not a score, not a
 receipt field, and not a verification input. What happened is written to qorcap.log (one
 ``stop note:`` line) and to ``cod_end_stop.json`` beside the bundle. That file is not bundle.json,
@@ -57,6 +84,12 @@ ARM_DEFAULT_S = 120.0
 ARM_MAX_S = 1800.0
 SPAN_MS = 3000
 GAP_MS = 3000
+SPLASH_READS = 2
+SPLASH_PAIR_MS = 1500
+CANDIDATE_WINDOW_MS = 30_000
+QUIET_MS = 8000
+RESIGHT_MS = 2000
+GAMEPLAY_HUD = ("hitmarker", "kill_popup", "killfeed")
 END_WORDS = ("victory", "defeat")
 
 
@@ -94,6 +127,12 @@ class Config:
     gap_ms: int = GAP_MS
     arm_ms: int = int(ARM_DEFAULT_S * 1000)
     tail_s: float = TAIL_DEFAULT_S
+    splash_reads: int = SPLASH_READS
+    splash_pair_ms: int = SPLASH_PAIR_MS
+    window_ms: int = CANDIDATE_WINDOW_MS
+    quiet_ms: int = QUIET_MS
+    resight_ms: int = RESIGHT_MS
+    splash: bool = True  # False keeps only the sustained path (tests)
 
     @property
     def solo_frames(self) -> int:
@@ -134,6 +173,23 @@ def owner_row_seen(owner) -> bool:
     return bool(same_owner_tag(getattr(owner, "player_tag", None) or ""))
 
 
+def gameplay_hud_event(hud) -> bool:
+    """A calibrated hitmarker, kill popup or killfeed icon on this frame.
+
+    Crosshair and pause are stubs that are never read, and the K/A scoreboard hook is not used
+    here (it is a board read, not gameplay).
+    """
+    for rd in hud or ():
+        if getattr(rd, "region", None) in GAMEPLAY_HUD and getattr(rd, "ok", False) and getattr(rd, "calibrated", False):
+            return True
+    return False
+
+
+def _default_owner_reader(img):
+    from qorcap_cod_hud import read_owner_row
+    return read_owner_row(img)
+
+
 def _int(v):
     return v if isinstance(v, int) and not isinstance(v, bool) else None
 
@@ -145,8 +201,15 @@ class EndStop:
     ``stop_due`` runs on the main loop. ``clock`` is injectable for tests.
     """
 
-    def __init__(self, cfg: Config | None = None, clock=time.monotonic, wall=lambda: int(time.time() * 1000)):
+    def __init__(self, cfg: Config | None = None, clock=time.monotonic, wall=lambda: int(time.time() * 1000),
+                 owner_reader=_default_owner_reader):
         self.cfg = cfg or Config()
+        self._owner_reader = owner_reader
+        self._pend = None
+        self._cand = None
+        self.candidates = 0
+        self.candidates_cancelled: dict = {}
+        self.owner_reads_attempted = 0
         self._clock = clock
         self._wall = wall
         self._lock = threading.Lock()
@@ -173,7 +236,7 @@ class EndStop:
         self._owner = False
         self._start_src = None
 
-    def observe(self, t_ms, end, owner=None, source=None) -> bool:
+    def observe(self, t_ms, end, owner=None, source=None, hud=None, img=None) -> bool:
         """One sampled frame. True only on the frame that confirms."""
         t = _int(t_ms)
         with self._lock:
@@ -182,53 +245,147 @@ class EndStop:
             self.frames_seen += 1
             if self._first_t is None:
                 self._first_t = t
+            armed = t - self._first_t >= self.cfg.arm_ms
             word = end_word(end)
-            if word is None:
-                self._reset()
+            if word is not None:
+                self.positives += 1
+            if self._cand is not None and owner is None and img is not None and self._owner_reader is not None:
+                self.owner_reads_attempted += 1
+                try:
+                    owner = self._owner_reader(img)
+                except Exception:
+                    owner = None
+            owner_ok = owner_row_seen(owner)
+            src = source if isinstance(source, dict) else None
+            if self._sustain_step(t, word, owner_ok, armed, src):
+                return self._confirm_sustained(t, src)
+            if not self.cfg.splash:
                 return False
-            self.positives += 1
-            if t - self._first_t < self.cfg.arm_ms:
-                # Not armed yet: a lobby or pre-match screen. Do not start a run.
-                self._reset()
-                return False
-            same_run = (
-                self._n > 0 and word == self._word and isinstance(self._last_t, int)
-                and t > self._last_t and t - self._last_t <= self.cfg.gap_ms
-            )
-            if not same_run:
-                self._reset()
-                self._word, self._n, self._t0, self._last_t = word, 1, t, t
-                self._start_src = source if isinstance(source, dict) else None
-            else:
-                self._n += 1
-                self._last_t = t
-            if owner_row_seen(owner):
-                self._owner = True
-            span = t - self._t0
-            if self._owner:
-                ok = self._n >= self.cfg.frames and span >= self.cfg.span_ms
-            else:
-                ok = self._n >= self.cfg.solo_frames and span >= self.cfg.solo_span_ms
-            if not ok:
-                return False
-            src = source if isinstance(source, dict) else {}
-            start = self._start_src or {}
-            self._confirm_mono = float(self._clock())
-            self.confirmed = {
-                "result": self._word.upper(),
-                "reader": "cod_end_screen" + ("+owner_row" if self._owner else ""),
-                "owner_row_seen": self._owner,
-                "consecutive": self._n,
-                "span_ms": span,
-                "first_t_ms": self._t0,
-                "confirm_t_ms": t,
-                "confirm_frame_seq": _int(src.get("seq")),
-                "confirm_pts_us": _int(src.get("pts_us")),
-                "first_frame_seq": _int(start.get("seq")),
-                "elapsed_ms": t - self._first_t,
-                "confirm_wall_ms": self._wall(),
-            }
-            return True
+            path = self._splash_step(t, word, owner_ok, gameplay_hud_event(hud), armed, src)
+            if path is not None:
+                return self._confirm_splash(t, path, src)
+            return False
+
+    def _sustain_step(self, t, word, owner_ok, armed, src) -> bool:
+        if word is None or not armed:
+            # Not an end word, or not armed yet (a lobby or pre-match screen): no run.
+            self._reset()
+            return False
+        same_run = (
+            self._n > 0 and word == self._word and isinstance(self._last_t, int)
+            and t > self._last_t and t - self._last_t <= self.cfg.gap_ms
+        )
+        if not same_run:
+            self._reset()
+            self._word, self._n, self._t0, self._last_t = word, 1, t, t
+            self._start_src = src
+        else:
+            self._n += 1
+            self._last_t = t
+        if owner_ok:
+            self._owner = True
+        span = t - self._t0
+        if self._owner:
+            return self._n >= self.cfg.frames and span >= self.cfg.span_ms
+        return self._n >= self.cfg.solo_frames and span >= self.cfg.solo_span_ms
+
+    def _cancel(self, why: str) -> None:
+        self.candidates_cancelled[why] = self.candidates_cancelled.get(why, 0) + 1
+        self._cand = None
+
+    def _splash_step(self, t, word, owner_ok, hud_event, armed, src):
+        c = self._cand
+        if c is not None:
+            if word is not None and word != c["word"]:
+                self._cancel("other_word")
+                self._pend = {"word": word, "first": t, "last": t, "n": 1, "src": src} if armed else None
+                return None
+            if t <= c["last_t"]:
+                return None
+            c["last_t"] = t
+            c["frames"] += 1
+            if hud_event:
+                c["hud_events"] += 1
+                c["quiet_from"] = t
+            if owner_ok:
+                return "splash+owner_row"
+            if word == c["word"] and t - c["formed_t"] >= self.cfg.resight_ms:
+                return "splash+word_again"
+            if t - c["quiet_from"] >= self.cfg.quiet_ms:
+                return "splash+quiet"
+            if t - c["t0"] > self.cfg.window_ms:
+                self._cancel("window_expired")
+            return None
+        if word is None:
+            if self._pend is not None and t - self._pend["first"] > self.cfg.splash_pair_ms:
+                self._pend = None
+            return None
+        if not armed:
+            self._pend = None
+            return None
+        p = self._pend
+        if p is not None and p["word"] == word and t > p["last"] and t - p["first"] <= self.cfg.splash_pair_ms:
+            p["n"] += 1
+            p["last"] = t
+        else:
+            p = self._pend = {"word": word, "first": t, "last": t, "n": 1, "src": src}
+        if p["n"] < self.cfg.splash_reads:
+            return None
+        self._pend = None
+        self.candidates += 1
+        self._cand = {"word": word, "t0": p["first"], "formed_t": t, "last_t": t, "quiet_from": t,
+                      "reads": p["n"], "frames": 0, "hud_events": 0, "src": p["src"]}
+        if owner_ok:
+            return "splash+owner_row"
+        return None
+
+    def _stamp(self, doc: dict, t: int, src) -> bool:
+        src = src or {}
+        doc.update({
+            "confirm_t_ms": t,
+            "confirm_frame_seq": _int(src.get("seq")),
+            "confirm_pts_us": _int(src.get("pts_us")),
+            "elapsed_ms": t - self._first_t,
+            "confirm_wall_ms": self._wall(),
+        })
+        self._confirm_mono = float(self._clock())
+        self.confirmed = doc
+        return True
+
+    def _confirm_sustained(self, t, src) -> bool:
+        start = self._start_src or {}
+        return self._stamp({
+            "path": "sustained",
+            "result": self._word.upper(),
+            "reader": "cod_end_screen" + ("+owner_row" if self._owner else ""),
+            "owner_row_seen": self._owner,
+            "consecutive": self._n,
+            "span_ms": t - self._t0,
+            "first_t_ms": self._t0,
+            "first_frame_seq": _int(start.get("seq")),
+        }, t, src)
+
+    def _confirm_splash(self, t, path, src) -> bool:
+        c = self._cand
+        start = c["src"] or {}
+        follow = {"owner_row": "owner_row", "word_again": "word_again", "quiet": "quiet"}[path.split("+", 1)[1]]
+        doc = {
+            "path": path,
+            "result": c["word"].upper(),
+            "reader": "cod_end_screen" + ("+owner_row" if follow == "owner_row" else ""),
+            "owner_row_seen": follow == "owner_row",
+            "consecutive": c["reads"],
+            "span_ms": c["formed_t"] - c["t0"],
+            "first_t_ms": c["t0"],
+            "first_frame_seq": _int(start.get("seq")),
+            "follow_up": follow,
+            "follow_up_ms": t - c["formed_t"],
+            "follow_up_frames": c["frames"],
+            "hud_events_in_candidate": c["hud_events"],
+            "quiet_ms": t - c["quiet_from"],
+        }
+        self._cand = None
+        return self._stamp(doc, t, src)
 
     def stop_due(self, now: float | None = None) -> bool:
         with self._lock:
@@ -248,8 +405,13 @@ class EndStop:
         c = self.confirmed
         if c is None:
             return "Call of Duty end screen not confirmed."
-        return (f"Call of Duty {c['result']} end screen confirmed ({c['consecutive']} reads in a row over "
-                f"{c['span_ms'] / 1000:.1f} s, {'owner row read' if c['owner_row_seen'] else 'owner row not read'}).")
+        if c.get("path") == "sustained":
+            return (f"Call of Duty {c['result']} end screen confirmed ({c['consecutive']} reads in a row over "
+                    f"{c['span_ms'] / 1000:.1f} s, {'owner row read' if c['owner_row_seen'] else 'owner row not read'}).")
+        why = {"owner_row": "Qortrola30's row read", "word_again": "the word read again",
+               "quiet": f"{c.get('quiet_ms', 0) / 1000:.1f} s without gameplay HUD"}.get(c.get("follow_up"), "")
+        return (f"Call of Duty {c['result']} end screen confirmed ({c['consecutive']} splash reads, then {why} "
+                f"{c.get('follow_up_ms', 0) / 1000:.1f} s later).")
 
     def log_note(self, stop_reason: str) -> str:
         """One printable-ASCII line for qorcap.log. Practice only, info only."""
@@ -257,9 +419,11 @@ class EndStop:
         parts = [
             "practice autoclose",
             f"cod end screen {c.get('result')}",
+            f"path {c.get('path')}",
             f"reader {c.get('reader')}",
-            f"consecutive {c.get('consecutive')}",
+            f"reads {c.get('consecutive')}",
             f"span_ms {c.get('span_ms')}",
+            f"follow_up {c.get('follow_up')} after {c.get('follow_up_ms')} ms",
             f"frame_seq {c.get('confirm_frame_seq')}",
             f"t_ms {c.get('confirm_t_ms')}",
             f"tail_s {self.cfg.tail_s:g}",
@@ -281,7 +445,10 @@ class EndStop:
                          "bundle.json field, and not read by verification."),
                 "config": {"frames": self.cfg.frames, "solo_frames": self.cfg.solo_frames,
                            "span_ms": self.cfg.span_ms, "solo_span_ms": self.cfg.solo_span_ms,
-                           "gap_ms": self.cfg.gap_ms, "arm_ms": self.cfg.arm_ms, "tail_s": self.cfg.tail_s},
+                           "gap_ms": self.cfg.gap_ms, "arm_ms": self.cfg.arm_ms, "tail_s": self.cfg.tail_s,
+                           "splash_reads": self.cfg.splash_reads, "splash_pair_ms": self.cfg.splash_pair_ms,
+                           "window_ms": self.cfg.window_ms, "quiet_ms": self.cfg.quiet_ms,
+                           "resight_ms": self.cfg.resight_ms},
                 "confirmed": self.confirmed,
                 "auto_stopped": bool(fired),
                 "stop_reason": stop_reason,
@@ -289,5 +456,8 @@ class EndStop:
                 "frames_seen": self.frames_seen,
                 "end_word_frames": self.positives,
                 "runs_broken": self.runs_broken,
+                "splash_candidates": self.candidates,
+                "splash_candidates_cancelled": dict(self.candidates_cancelled),
+                "owner_reads_in_candidate": self.owner_reads_attempted,
             }
         (bundle / FILE_NAME).write_text(json.dumps(doc, indent=2) + "\n", encoding="utf-8")
