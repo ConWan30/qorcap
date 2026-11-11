@@ -106,6 +106,7 @@ LINUX_FILES = (
     "sidecar/test_qorcap_cod_agreement.py",
     "sidecar/test_qorcap_cod_killfeed.py",
     "sidecar/test_qorcap_cod_calib.py",
+    "sidecar/test_qorcap_cod_endstop.py",
     "sidecar/test_qorcap_void_201029.py",
     "sidecar/test_qordata_fixtures.py",
     "sidecar/test_qordata_product.py",
@@ -165,6 +166,7 @@ WINDOWS_FILES = (
     "sidecar/test_qorcap_cod_agreement.py",
     "sidecar/test_qorcap_cod_killfeed.py",
     "sidecar/test_qorcap_cod_calib.py",
+    "sidecar/test_qorcap_cod_endstop.py",
     "sidecar/test_qorcap_void_201029.py",
     "sidecar/test_qordata_fixtures.py",
     "sidecar/test_qordata_product.py",
@@ -189,13 +191,16 @@ WINDOWS_FILES = (
 # Collect-only of these lists after the tail tests in sidecar/test_post_final_tail.py.
 # Main e00d374, including the guard tests, collected 596 linux / 578 windows.
 # Re-collect after any list or test change.
-LINUX_MIN_COLLECTED = 869
-WINDOWS_MIN_COLLECTED = 851
+LINUX_MIN_COLLECTED = 905
+WINDOWS_MIN_COLLECTED = 887
 
 # Absent from both sidecar suites. A reason is required; whitespace does not count.
 EXCLUDED_TEST_FILES = {
     "sidecar/test_contracts.py": (
         "the contracts job runs this against unpinned qortime main, not the sidecar suite"
+    ),
+    "sidecar/test_qorcap_cod_endstop_box.py": (
+        "build-box-only sampled CoD frames that show other players' gamertags; not committed, run locally"
     ),
 }
 

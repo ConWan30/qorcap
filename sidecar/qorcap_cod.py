@@ -783,6 +783,9 @@ class CodSetRunner:
         self.owner_row_ever_read = False
         self._observe_lock = threading.Lock()
         self._published = None
+        # Optional practice auto-stop watcher (qorcap_cod_endstop). Sees the reads this loop already
+        # made; it cannot change what a frame posts or logs.
+        self.end_watch = None
 
     def set_signals(self, inputs, frame_stamps, haptics, wall_anchor_ms) -> None:
         """Replace the clocks used on the next frame. Empty lists count nothing."""
@@ -859,6 +862,7 @@ class CodSetRunner:
         self._pending_reads = []
         self._pending_signals = []
         self._note_capture_epoch()
+        end_rd = owner_rd = None
         try:
             try:
                 reads = list(self.hud.read(img))
@@ -892,6 +896,7 @@ class CodSetRunner:
             self._note_lag(int(t_ms), img)
             try:
                 end = self.end.read(img)
+                end_rd = end
             except Exception as e:
                 self.stats["errors"] += 1
                 print(f"Call of Duty end-screen hook error: {type(e).__name__}: {e}", file=sys.stderr)
@@ -930,6 +935,7 @@ class CodSetRunner:
             try:
                 from qorcap_cod_hud import read_owner_row
                 owner = read_owner_row(img)
+                owner_rd = owner
             except Exception as e:
                 self.stats["errors"] += 1
                 print(f"Call of Duty owner-row hook error: {type(e).__name__}: {e}", file=sys.stderr)
@@ -940,6 +946,12 @@ class CodSetRunner:
             self._post_owner_end(int(t_ms), when, end, owner)
         finally:
             self._emit_frame(int(t_ms))
+            watch = self.end_watch
+            if watch is not None:
+                try:
+                    watch(t_ms, end_rd, owner_rd, self._source)
+                except Exception:
+                    pass
 
     def _signals(self, t_ms: int, by_name: dict) -> list[dict]:
         screen_us = self._screen_us()
