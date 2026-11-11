@@ -935,7 +935,7 @@ impl Engine {
                 let now = me.ms();
                 let last = me.last_data_ms.load(Ordering::Relaxed).max(start);
                 let grace = if last == start { 15_000 } else { wd };
-                if me.shutdown.load(Ordering::SeqCst) || now - last > grace {
+                if me.shutdown.load(Ordering::SeqCst) || watchdog_stalled(now, last, grace) {
                     if !me.shutdown.load(Ordering::SeqCst) { let m = format!("no data from device for {}s: treating as frozen/unplugged, restarting", grace / 1000); error!("{m}"); me.set_state("reopening", Some(m)); }
                     let _ = child.lock().unwrap_or_else(|e| e.into_inner()).kill();
                     break;
@@ -985,6 +985,11 @@ impl Engine {
     }
 }
 
+/// Watchdog stall test on the engine's u64 ms clock. `last` is stored by the reader thread and can be
+/// read after `now` was taken, so `last > now` happens when a frame lands between the two reads; that
+/// means data just arrived, never a stall. A plain `now - last` wraps there in release builds.
+fn watchdog_stalled(now: u64, last: u64, grace: u64) -> bool { now.saturating_sub(last) > grace }
+
 struct StopPublisher { flag: Arc<AtomicBool>, handle: Option<std::thread::JoinHandle<()>> }
 impl Drop for StopPublisher {
     fn drop(&mut self) {
@@ -1031,6 +1036,24 @@ pub fn parse_bitrate(s: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn watchdog_last_after_now_is_not_a_stall() {
+        // A frame stored last_data_ms 7 ms after the watchdog read `now` (match-20261111-081216).
+        assert!(!watchdog_stalled(100_000, 100_007, 4_000));
+        assert!(!watchdog_stalled(0, u64::MAX, 4_000));
+    }
+    #[test]
+    fn watchdog_gap_under_grace_is_not_a_stall() {
+        assert!(!watchdog_stalled(100_000, 100_000, 4_000));
+        assert!(!watchdog_stalled(103_999, 100_000, 4_000));
+        assert!(!watchdog_stalled(104_000, 100_000, 4_000));
+    }
+    #[test]
+    fn watchdog_gap_over_grace_is_a_stall() {
+        assert!(watchdog_stalled(104_001, 100_000, 4_000));
+        assert!(watchdog_stalled(200_000, 100_000, 4_000));
+        assert!(watchdog_stalled(15_001, 0, 15_000));
+    }
     struct Boom { fail: &'static str }
     impl SyncWrite for Boom {
         fn write_all_buf(&mut self, _: &[u8]) -> std::io::Result<()> { Ok(()) }
