@@ -87,6 +87,9 @@ pub struct Engine {
     pub frame_clock: Arc<crate::frameclock::FrameClock>,
     /// Opt-in practice live tap (src/livetap.rs). Off: every call is a no-op.
     pub live_tap: Arc<crate::livetap::LiveTap>,
+    /// WeaveCtx snapshot for the live tap, kept current by the input log only while the tap is on.
+    /// The capture thread reads this short mutex, never `input`.
+    weave_snap: Arc<Mutex<crate::livetap::WeaveCtx>>,
     /// The supervisor loop (`run`) is active; the API keeps serving until it has finished the bundle.
     pub running: AtomicBool,
     /// Set when `run` has returned (or /shutdown arrives while not running): the API thread exits.
@@ -398,6 +401,7 @@ impl Engine {
             .or_else(|| args.out.as_ref().map(|o| PathBuf::from(format!("{o}.inputs.jsonl"))));
         let mut log = crate::inputs::InputLog::new(input_path, !args.no_controller, wall_ms());
         if args.game.as_deref() == Some("cod_mw4") { log.enable_seal(); }
+        let weave_snap = Arc::new(Mutex::new(log.weave_ctx()));
         let input = Arc::new(Mutex::new(log));
         // After the input logger's wall anchor, before `started`. Opening the file does not read the clock.
         let frame_on = crate::frameclock::flag_enabled(args.frame_clock, std::env::var(crate::frameclock::ENV).ok().as_deref());
@@ -410,6 +414,8 @@ impl Engine {
         let tap_every = args.live_tap_every.filter(|n| (1..=600).contains(n))
             .unwrap_or_else(|| crate::livetap::every_from_env(std::env::var(crate::livetap::ENV_EVERY).ok().as_deref()));
         let live_tap = Arc::new(crate::livetap::LiveTap::open(tap_dest, tap_every, &input.lock().unwrap_or_else(|e| e.into_inner()).weave_ctx().wall_anchor_ms.to_string(), args.fps, args.bundle.as_deref().map(Path::new)));
+        // Only a tap that is on gets the snapshot; with the tap off the input log does no extra work.
+        if live_tap.enabled() { input.lock().unwrap_or_else(|e| e.into_inner()).set_weave_snap(weave_snap.clone()); }
         let st = Status { state: "starting".into(), device: args.device.clone(), res: format!("{}x{}", args.res.0, args.res.1), fps_target: args.fps, replay_window: args.replay.unwrap_or(0), role: args.role.clone(), side_source: args.side_source.clone(), ..Default::default() };
         let started = Instant::now();
         // One origin names the engine clock on both the snapshot and the input header, so the
@@ -422,7 +428,7 @@ impl Engine {
         Arc::new(Self { ffmpeg, ring: Mutex::new(ReplayRing::new(window, cap)), rec: Mutex::new(None), status: Mutex::new(st), shutdown: AtomicBool::new(false),
             ev: Mutex::new(MatchState { started_wall_ms: wall_ms(), score: Value::Null, ..Default::default() }), subs: Mutex::new(vec![]),
             stamp_file: dir.join("stamp.txt"),
-            snapshot: dir.join("snapshot.jpg"), snap_pub: Mutex::new(snap), tap: crate::glimpse::FrameTap::with_ring(args.glimpse_frame || crate::glimpse::env_enabled(), crate::glimpse::ring_enabled()), exit_when_recording_ends: AtomicBool::new(false), started, last_data_ms: AtomicU64::new(0), input, frame_clock, live_tap,
+            snapshot: dir.join("snapshot.jpg"), snap_pub: Mutex::new(snap), tap: crate::glimpse::FrameTap::with_ring(args.glimpse_frame || crate::glimpse::env_enabled(), crate::glimpse::ring_enabled()), exit_when_recording_ends: AtomicBool::new(false), started, last_data_ms: AtomicU64::new(0), input, frame_clock, live_tap, weave_snap,
             running: AtomicBool::new(false), api_closed: AtomicBool::new(false), sealed: AtomicBool::new(false),
             countersigned: std::sync::atomic::AtomicI64::new(-1),
             stop_reason: Mutex::new(None), bundle_write: Mutex::new(()), bundle_finalized: AtomicBool::new(false),
@@ -614,9 +620,11 @@ impl Engine {
                 // Practice live tap: the same bytes that reached the recording, never anything else.
                 if written && self.live_tap.enabled() {
                     let file = Path::new(&r.path).file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-                    let input = Arc::clone(&self.input);
-                    self.live_tap.observe(slice, t_us, &file, pat.as_deref(), pmt.as_deref(),
-                        &move || input.lock().unwrap_or_else(|e| e.into_inner()).weave_ctx());
+                    // Read the short snapshot only. Never take the input-log mutex on this thread: the HID
+                    // logger and segment sealing hold it, and waiting on it stalled the capture pipe.
+                    // `submit` hands the slice to the tap worker and never waits on UDP or disk.
+                    let ctx = self.weave_snap.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                    self.live_tap.submit(slice, t_us, &file, pat.as_deref(), pmt.as_deref(), ctx);
                 }
             }
             if r.deadline.map(|d| Instant::now() >= d).unwrap_or(false) {
@@ -1572,6 +1580,47 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// v0.3.43 stall: with the practice tap on, `ingest` (capture stdout thread) must not wait on the
+    /// input-log mutex, which the HID logger and segment sealing hold.
+    #[cfg(unix)]
+    #[test]
+    fn live_tap_ingest_does_not_wait_on_the_input_log() {
+        use clap::Parser;
+        let rx = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let url = format!("udp://{}", rx.local_addr().unwrap());
+        let dir = std::env::temp_dir().join(format!("qorcap-livetap-eng-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let d = dir.to_string_lossy().into_owned();
+        let crate::cli::Cmd::Record(r) = crate::cli::Cli::try_parse_from(["q", "record", "--device", "testpattern", "--bundle", &d,
+            "--live-tap", &url, "--practice-lane", "--live-tap-every", "1"]).unwrap().cmd else { panic!() };
+        let e = Engine::new(r, "ffmpeg-x".into());
+        assert!(e.live_tap.enabled());
+        // A stand-in recorder that just swallows stdin, so `ingest` reaches the tap.
+        let mut child = std::process::Command::new("cat").stdin(Stdio::piped()).stdout(Stdio::null()).spawn().unwrap();
+        let stdin = child.stdin.take();
+        *e.rec.lock().unwrap() = Some(Recorder { reader: None, child, stdin, path: dir.join("video.mp4").to_string_lossy().into_owned(),
+            started: Instant::now(), deadline: None, wait_key: false, base: d.clone(), part: 1 });
+        e.input.lock().unwrap().on_status(1, "connected", "DualSense");
+        let held = e.input.lock().unwrap();
+        let (tx, done) = std::sync::mpsc::channel();
+        let e2 = e.clone();
+        std::thread::spawn(move || {
+            for k in 0..30u64 { e2.ingest(&crate::frameclock::video_ts_packet(0x100, 900 + 1500 * k)); }
+            let _ = tx.send(());
+        });
+        done.recv_timeout(Duration::from_secs(3)).expect("ingest waited on the input-log mutex");
+        drop(held);
+        let end = Instant::now() + Duration::from_secs(5);
+        while e.live_tap.stats().map(|s| s.frames + s.queue_drops).unwrap_or(0) < 30 && Instant::now() < end { std::thread::sleep(Duration::from_millis(10)); }
+        let s = e.live_tap.stats().unwrap();
+        assert_eq!(s.frames + s.queue_drops, 30);
+        let first: Value = serde_json::from_str(std::fs::read_to_string(dir.join(crate::livetap::FILE_NAME)).unwrap().lines().nth(1).unwrap()).unwrap();
+        assert_eq!(first["pad"], "connected", "cue reads the snapshot the input log published");
+        if let Some(r) = e.rec.lock().unwrap().take() { finish(r); }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn frame_clock_off_leaves_the_bundle_unchanged_and_on_records_only_when_asked() {
         use clap::Parser;
@@ -1651,7 +1700,9 @@ impl Engine {
         crate::inputproof::touch_recording_marker(self.bundle_dir().as_deref());
         self.broadcast("segment", &m);
         // Seal controller inputs received up to now into this segment's chunk (same clock, same checkpoint).
-        let (ih, ihead, n) = self.input.lock().unwrap_or_else(|e| e.into_inner()).seal(seq, self.started.elapsed().as_micros() as u64);
+        // The fsync runs outside the input-log mutex (HID logger and /status keep going); this still returns
+        // only once the chunk is durable, so the checkpoint below is written after it.
+        let (ih, ihead, n) = crate::inputs::seal_shared(&self.input, seq, || self.started.elapsed().as_micros() as u64);
         if self.args.no_controller { self.checkpoint("segment", json!({})); }
         else { self.checkpoint_with("segment", json!({"input_seg": seq, "input_n": n, "input_head": ihead}), Some(ih)); }
     }

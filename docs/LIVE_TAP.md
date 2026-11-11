@@ -38,13 +38,18 @@ or `qorcap record ... --live-tap udp://127.0.0.1:1937 --practice-lane [--live-ta
 
 Refused (logged, tap stays off) when the lane is not practice, when the target is not `udp://` or not a
 loopback address, or when it has no port. `/status` gains a `live_tap` object (frames, cues, datagrams,
-send errors) only while the tap is on.
+send errors, queue drops) only while the tap is on.
 
 ## What it does not change
 
 - The recording, `manifest.jsonl`, the checkpoint chain, `receipt.draft.json`, `receipt.v0` and `contracts/`
   are untouched. `verify-bundle` passes with the tap on (box end-to-end test).
 - Sending is non-blocking UDP on loopback. If nothing listens, datagrams are dropped and counted.
+- The capture thread never does tap work itself (since the v0.3.43 stall fix). It copies the recorded
+  slice to a small queue (8 slices) and a tap worker sends the UDP and writes `live_weave.jsonl`. If the
+  worker falls behind, tap slices are dropped and counted in `queue_drops`; the recording is not affected
+  and later cues keep the recording's frame index. The cue's controller/seal fields come from a snapshot
+  the input log keeps, so the capture thread never waits on the input-log mutex.
 - Nothing is sent to the controller. Nothing leaves the machine.
 - REAL MATCH builds are not changed by this file; the tap is not in v0.3.38.
 
