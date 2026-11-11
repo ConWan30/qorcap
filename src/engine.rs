@@ -899,6 +899,9 @@ impl Engine {
         { let me = self.clone(); let last_err = last_err.clone(); std::thread::spawn(move || {
             use std::io::BufRead;
             let mut cursor = ProgressCursor::default();
+            // Logging only: one encoder progress line per 5 s from the -progress blocks read here.
+            let mut plog = crate::encprog::ProgressLog::new(crate::encprog::INTERVAL_MS);
+            let t0 = Instant::now();
             for line in std::io::BufReader::new(stderr).lines().map_while(Result::ok) {
                 let l = line.trim();
                 if let Some((k, v)) = l.split_once('=') {
@@ -915,6 +918,7 @@ impl Engine {
                         if let Some((seq, pts_us)) = cursor.observe(k, v) {
                             me.snap_pub.lock().unwrap_or_else(|e| e.into_inner()).note_progress(seq, pts_us);
                         }
+                        if let Some(m) = plog.observe(k, v, t0.elapsed().as_millis() as u64) { info!("{m}"); }
                         continue;
                     }
                 }
