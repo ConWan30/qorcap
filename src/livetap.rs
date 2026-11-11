@@ -21,7 +21,9 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs, UdpSocket};
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
+use std::thread;
 
 pub const SCHEMA: &str = "qorweave/v0";
 pub const ENV_URL: &str = "QORCAP_LIVE_TAP";
@@ -84,6 +86,8 @@ pub struct TapStats {
     pub cues: u64,
     pub datagrams: u64,
     pub send_errors: u64,
+    /// TS slices dropped because the tap worker was behind. Not dshow drops; the recording is unchanged.
+    pub queue_drops: u64,
     pub last_hash: Option<String>,
 }
 
@@ -105,10 +109,38 @@ struct State {
     stats: TapStats,
 }
 
-pub struct LiveTap { every: u32, state: Option<Mutex<State>> }
+pub struct LiveTap {
+    every: u32,
+    state: Option<Arc<Mutex<State>>>,
+    tx: Option<mpsc::SyncSender<TapWork>>,
+    /// Frame numbering kept on the submitting (capture) thread. Only that thread locks it, so it never
+    /// waits on the worker. A dropped slice still advances it, so later cue `f` values keep the
+    /// frame_clock.jsonl rule instead of shifting by the frames that were dropped.
+    count: Mutex<FrameCount>,
+    /// TS slices dropped because the worker was behind. Atomic: the capture thread never takes `state`.
+    queue_drops: AtomicU64,
+}
+
+#[derive(Default)]
+struct FrameCount { file: Option<String>, frame: i64, last_pts: Option<u64> }
+
+/// Work item for the tap worker. The capture thread only try_sends this; it never waits on disk or UDP.
+struct TapWork {
+    data: Vec<u8>,
+    t_mono_us: u64,
+    file: String,
+    pat: Option<Vec<u8>>,
+    pmt: Option<Vec<u8>>,
+    ctx: WeaveCtx,
+    /// Frame index and last video PTS at the start of this slice, from `FrameCount`.
+    start: (i64, Option<u64>),
+}
+
+/// A few queued slices is enough; if the worker falls behind we drop tap data, never the recording.
+const TAP_QUEUE: usize = 8;
 
 impl LiveTap {
-    pub fn off() -> Self { Self { every: DEFAULT_EVERY, state: None } }
+    pub fn off() -> Self { Self { every: DEFAULT_EVERY, state: None, tx: None, count: Mutex::new(FrameCount::default()), queue_drops: AtomicU64::new(0) } }
 
     pub fn open(dest: Option<SocketAddr>, every: u32, session: &str, fps: u32, bundle: Option<&Path>) -> Self {
         let Some(dest) = dest else { return Self::off() };
@@ -126,58 +158,124 @@ impl LiveTap {
                 "note": "Practice-lane live tap. Each cue is also sent in-band as timed ID3 on the live stream. Not in the hash chain or the receipt."});
             let _ = writeln!(f, "{h}");
         }
+        let state = Arc::new(Mutex::new(st));
+        let (tx, rx) = mpsc::sync_channel::<TapWork>(TAP_QUEUE);
+        let state_w = state.clone();
+        let spawned = thread::Builder::new().name("qorcap-livetap".into()).spawn(move || {
+            while let Ok(w) = rx.recv() {
+                let mut g = state_w.lock().unwrap_or_else(|e| e.into_inner());
+                let ctx = w.ctx;
+                ingest(&mut g, every, &w.data, w.t_mono_us, &w.file, w.pat.as_deref(), w.pmt.as_deref(), &|| ctx.clone(), Some(w.start));
+            }
+        });
+        if let Err(e) = spawned {
+            log::error!("live tap: cannot start the tap worker: {e}; tap stays off (recording unchanged)");
+            return Self::off();
+        }
         log::info!("live tap ON -> udp://{dest} (practice lane, weave cue every {every} frames, recording unchanged)");
-        Self { every, state: Some(Mutex::new(st)) }
+        Self { every, state: Some(state), tx: Some(tx), count: Mutex::new(FrameCount::default()), queue_drops: AtomicU64::new(0) }
     }
 
     pub fn enabled(&self) -> bool { self.state.is_some() }
 
     pub fn stats(&self) -> Option<TapStats> {
-        self.state.as_ref().map(|m| m.lock().unwrap_or_else(|e| e.into_inner()).stats.clone())
+        self.state.as_ref().map(|m| {
+            let mut s = m.lock().unwrap_or_else(|e| e.into_inner()).stats.clone();
+            s.queue_drops = self.queue_drops.load(Ordering::Relaxed);
+            s
+        })
     }
 
     /// `data` is exactly the TS bytes that just reached the recording. `pat`/`pmt` are the cached tables
     /// (sent first whenever a new part file starts). `ctx` is called only when a cue is due.
+    /// Synchronous; used by unit tests. The capture loop calls `submit` so this work cannot stall ffmpeg.
     pub fn observe(&self, data: &[u8], t_mono_us: u64, file: &str, pat: Option<&[u8]>, pmt: Option<&[u8]>, ctx: &dyn Fn() -> WeaveCtx) {
         let Some(m) = &self.state else { return };
         let mut g = m.lock().unwrap_or_else(|e| e.into_inner());
-        let st = &mut *g;
-        if st.file.as_deref() != Some(file) {
-            st.file = Some(file.to_string());
-            st.frame = 0;
-            st.last_pts = None;
-            if let Some(p) = pat { if p.len() == TS { st.pmt_pid = ring::pat_pmt_pid(p); push(st, p); } }
-            if let Some(p) = pmt { if p.len() == TS { let q = rewrite_or_pass(st, p); push(st, &q); } }
-        }
-        let mut cached_ctx: Option<WeaveCtx> = None;
-        for pkt in data.chunks_exact(TS) {
-            let pid = ring::pid(pkt);
-            if pid == 0 && pkt[1] & 0x40 != 0 { if let Some(pp) = ring::pat_pmt_pid(pkt) { st.pmt_pid = Some(pp); } }
-            if Some(pid) == st.pmt_pid && pkt[1] & 0x40 != 0 {
-                let q = rewrite_or_pass(st, pkt);
-                push(st, &q);
-                continue;
-            }
-            if pid == ID3_PID { continue; } // never forward a foreign packet on our PID
-            push(st, pkt);
-            let Some(pts) = crate::frameclock::video_pes_pts(pkt) else { continue };
-            if st.last_pts == Some(pts) { continue; }
-            st.last_pts = Some(pts);
-            let frame = st.frame;
-            st.frame += 1;
-            st.stats.frames += 1;
-            if !st.weave_ok || frame % self.every as i64 != 0 { continue; }
-            let c = cached_ctx.get_or_insert_with(ctx).clone();
-            let (line, h) = cue_json(st, &c, file, frame, pts, t_mono_us);
-            for p in id3_pes_packets(&mut st.cc, &id3_txxx(CUE_KEY, &line), pts) { push(st, &p); }
-            st.prev = h.clone();
-            st.n += 1;
-            st.stats.cues += 1;
-            st.stats.last_hash = Some(h);
-            if let Some(f) = st.log.as_mut() { let _ = writeln!(f, "{line}"); }
-        }
-        flush(st);
+        ingest(&mut g, self.every, data, t_mono_us, file, pat, pmt, ctx, None);
     }
+
+    /// Non-blocking enqueue for the capture thread. `ctx` must already be a snapshot: the caller must not
+    /// take the input-log mutex. Never locks `state` and never waits on the worker, UDP or disk. If the
+    /// worker is behind, the slice is dropped and counted in `queue_drops`; the recording is unchanged.
+    pub fn submit(&self, data: &[u8], t_mono_us: u64, file: &str, pat: Option<&[u8]>, pmt: Option<&[u8]>, ctx: WeaveCtx) {
+        let Some(tx) = &self.tx else { return };
+        let start = self.count.lock().unwrap_or_else(|e| e.into_inner()).advance(data, file);
+        let work = TapWork {
+            data: data.to_vec(),
+            t_mono_us,
+            file: file.to_string(),
+            pat: pat.map(|p| p.to_vec()),
+            pmt: pmt.map(|p| p.to_vec()),
+            ctx,
+            start,
+        };
+        if tx.try_send(work).is_err() {
+            self.queue_drops.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+impl FrameCount {
+    /// Same frame rule as `ingest` (new part file restarts at 0; one frame per new video PES PTS;
+    /// our own ID3 PID is skipped). Returns the position at the start of `data`.
+    fn advance(&mut self, data: &[u8], file: &str) -> (i64, Option<u64>) {
+        if self.file.as_deref() != Some(file) {
+            self.file = Some(file.to_string());
+            self.frame = 0;
+            self.last_pts = None;
+        }
+        let start = (self.frame, self.last_pts);
+        for pkt in data.chunks_exact(TS) {
+            if ring::pid(pkt) == ID3_PID { continue; }
+            let Some(pts) = crate::frameclock::video_pes_pts(pkt) else { continue };
+            if self.last_pts == Some(pts) { continue; }
+            self.last_pts = Some(pts);
+            self.frame += 1;
+        }
+        start
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ingest(st: &mut State, every: u32, data: &[u8], t_mono_us: u64, file: &str, pat: Option<&[u8]>, pmt: Option<&[u8]>, ctx: &dyn Fn() -> WeaveCtx, start: Option<(i64, Option<u64>)>) {
+    if st.file.as_deref() != Some(file) {
+        st.file = Some(file.to_string());
+        st.frame = 0;
+        st.last_pts = None;
+        if let Some(p) = pat { if p.len() == TS { st.pmt_pid = ring::pat_pmt_pid(p); push(st, p); } }
+        if let Some(p) = pmt { if p.len() == TS { let q = rewrite_or_pass(st, p); push(st, &q); } }
+    }
+    // Worker path: the submitting thread's count, so slices dropped before this one do not shift `f`.
+    if let Some((frame, last_pts)) = start { st.frame = frame; st.last_pts = last_pts; }
+    let mut cached_ctx: Option<WeaveCtx> = None;
+    for pkt in data.chunks_exact(TS) {
+        let pid = ring::pid(pkt);
+        if pid == 0 && pkt[1] & 0x40 != 0 { if let Some(pp) = ring::pat_pmt_pid(pkt) { st.pmt_pid = Some(pp); } }
+        if Some(pid) == st.pmt_pid && pkt[1] & 0x40 != 0 {
+            let q = rewrite_or_pass(st, pkt);
+            push(st, &q);
+            continue;
+        }
+        if pid == ID3_PID { continue; } // never forward a foreign packet on our PID
+        push(st, pkt);
+        let Some(pts) = crate::frameclock::video_pes_pts(pkt) else { continue };
+        if st.last_pts == Some(pts) { continue; }
+        st.last_pts = Some(pts);
+        let frame = st.frame;
+        st.frame += 1;
+        st.stats.frames += 1;
+        if !st.weave_ok || frame % every as i64 != 0 { continue; }
+        let c = cached_ctx.get_or_insert_with(ctx).clone();
+        let (line, h) = cue_json(st, &c, file, frame, pts, t_mono_us);
+        for p in id3_pes_packets(&mut st.cc, &id3_txxx(CUE_KEY, &line), pts) { push(st, &p); }
+        st.prev = h.clone();
+        st.n += 1;
+        st.stats.cues += 1;
+        st.stats.last_hash = Some(h);
+        if let Some(f) = st.log.as_mut() { let _ = writeln!(f, "{line}"); }
+    }
+    flush(st);
 }
 
 fn rewrite_or_pass(st: &mut State, pkt: &[u8]) -> Vec<u8> {
@@ -439,5 +537,84 @@ mod tests {
         let pre = preimage(cues[1]["ph"].as_str().unwrap(), 1, "1700", "video.mp4", 2, 3900, 500_000, 1_700_000_000_500, "locked", Some(7));
         assert_eq!(cues[1]["h"].as_str().unwrap(), chain_hash(&pre));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn frame_pkt(k: u64) -> [u8; TS] { crate::frameclock::video_ts_packet(0x100, 900 + 1500 * k) }
+
+    fn wait_for(mut done: impl FnMut() -> bool) {
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !done() {
+            assert!(std::time::Instant::now() < end, "tap worker did not catch up");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn submit_never_waits_on_a_busy_worker_and_counts_queue_drops() {
+        let rx = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let dir = std::env::temp_dir().join(format!("qorcap-livetap-q-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let tap = std::sync::Arc::new(LiveTap::open(Some(rx.local_addr().unwrap()), 1, "1700", 60, Some(&dir)));
+        const N: u64 = 40;
+        // Stand in for a worker stuck on UDP / disk: hold its state lock.
+        let busy = tap.state.as_ref().unwrap().lock().unwrap();
+        let (done_tx, done_rx) = mpsc::channel();
+        let t2 = tap.clone();
+        std::thread::spawn(move || {
+            for k in 0..N { t2.submit(&frame_pkt(k), 1_000 + k, "video.mp4", None, None, WeaveCtx::default()); }
+            let _ = done_tx.send(());
+        });
+        done_rx.recv_timeout(std::time::Duration::from_secs(2)).expect("submit blocked on the tap worker");
+        let drops = tap.queue_drops.load(Ordering::Relaxed);
+        assert!(drops >= N - TAP_QUEUE as u64 - 1, "queue holds at most {TAP_QUEUE} (+1 in the worker); dropped {drops}");
+        drop(busy);
+        wait_for(|| { let s = tap.stats().unwrap(); s.frames + s.queue_drops == N });
+        // Slices after the gap: their cues must still carry the recording's frame index.
+        for k in N..N + 5 {
+            tap.submit(&frame_pkt(k), 1_000 + k, "video.mp4", None, None, WeaveCtx::default());
+            wait_for(|| { let s = tap.stats().unwrap(); s.frames + s.queue_drops == k + 1 });
+        }
+        let s = tap.stats().unwrap();
+        assert_eq!(s.queue_drops, drops);
+        assert!(drops > 0);
+        // Every cue that was cut still names its true frame: dropped slices did not shift `f`.
+        let log = std::fs::read_to_string(dir.join(FILE_NAME)).unwrap();
+        let cues: Vec<serde_json::Value> = log.lines().skip(1).map(|l| serde_json::from_str(l).unwrap()).collect();
+        assert_eq!(cues.len() as u64, N + 5 - drops);
+        assert_eq!(cues.last().unwrap()["f"], N + 4);
+        for c in &cues {
+            let k = (c["pts"].as_u64().unwrap() - 900) / 1500;
+            assert_eq!(c["f"].as_u64().unwrap(), k, "{c}");
+            assert_eq!(c["t"].as_u64().unwrap(), 1_000 + k);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn submit_matches_observe_when_nothing_is_dropped() {
+        let rx = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let base = std::env::temp_dir().join(format!("qorcap-livetap-eq-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let ctx = WeaveCtx { wall_anchor_ms: 1_700_000_000_000, pad: "connected".into(), seal: "off".into(), seal_hash: None, last_press: Some((1, 1_700_000_000_100, "CROSS".into())) };
+        let mut logs = vec![];
+        for (name, async_) in [("sync", false), ("async", true)] {
+            let dir = base.join(name);
+            let tap = LiveTap::open(Some(rx.local_addr().unwrap()), 3, "1700", 60, Some(&dir));
+            for k in 0..20u64 {
+                let file = if k < 12 { "video.mp4" } else { "video_part2.mp4" };
+                let data: Vec<u8> = [frame_pkt(k), frame_pkt(k)].concat(); // repeated PTS counts once
+                if async_ {
+                    tap.submit(&data, 10 * k, file, None, Some(&pmt_packet()), ctx.clone());
+                    wait_for(|| tap.stats().unwrap().frames == k + 1);
+                } else {
+                    tap.observe(&data, 10 * k, file, None, Some(&pmt_packet()), &|| ctx.clone());
+                }
+            }
+            assert_eq!(tap.stats().unwrap().queue_drops, 0);
+            logs.push(std::fs::read_to_string(dir.join(FILE_NAME)).unwrap());
+        }
+        assert_eq!(logs[0], logs[1]);
+        assert!(logs[0].lines().count() > 5);
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

@@ -220,6 +220,72 @@ pub struct InputLog {
     prev_counter: Option<u8>,
     prev_hw: Option<u32>,
     seal: crate::seal::SealWatch,
+    /// Short mutex, written by the HID/logger thread, read by the capture thread. Never the input-log lock.
+    weave_snap: Option<std::sync::Arc<std::sync::Mutex<crate::livetap::WeaveCtx>>>,
+    /// Serializes `seal_shared` from prepare to finish, so chunks reach the file in chain order.
+    /// Never held together with a blocking wait on the input-log mutex by anyone else.
+    seal_io: std::sync::Arc<std::sync::Mutex<()>>,
+    /// A chunk was prepared and its bytes are being written outside the input-log lock.
+    seal_in_flight: bool,
+}
+
+/// One input chunk, fixed under the input-log lock and written to disk outside it.
+/// `body` is exactly the bytes `seal` appends; nothing added to the log later can change it.
+pub struct SealJob {
+    sha: String,
+    head: String,
+    n: usize,
+    recs: Vec<Value>,
+    body: String,
+    haptic: String,
+    path: Option<PathBuf>,
+    haptic_path: Option<PathBuf>,
+}
+
+impl SealJob {
+    /// The blocking part: open, append, fsync. Takes no lock. Same calls and bytes as before.
+    pub fn write(&self) -> std::io::Result<()> {
+        if self.n == 0 { return Ok(()); }
+        if let Some(p) = &self.path {
+            if let Some(d) = p.parent() { let _ = std::fs::create_dir_all(d); }
+            if let Err(e) = append_bytes(p, self.body.as_bytes()) {
+                warn!("cannot write {}: {e}; input chunk not sealed (chain unchanged)", p.display());
+                return Err(e);
+            }
+        }
+        if let Some(hp) = &self.haptic_path {
+            if !self.haptic.is_empty() {
+                if let Err(e) = append_bytes(hp, self.haptic.as_bytes()) {
+                    warn!("cannot write {}: {e}", hp.display());
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Seal into chunk `seg` without holding the input-log mutex across disk I/O.
+///
+/// 1. `seal_io` is taken first (never while holding `log`), so two seals cannot interleave.
+/// 2. Under `log`: the pending records are taken and the chunk (bytes, sha256, prev, head) is fixed.
+/// 3. `log` is released; the chunk is appended and fsynced (`append_bytes`, unchanged).
+/// 4. Under `log` again: the chain moves only if step 3 succeeded; otherwise the records go back in
+///    front of anything that arrived meanwhile, exactly where a blocked writer would have put them.
+///
+/// Returns only after the fsync, so the caller's checkpoint is still written after the chunk is durable.
+/// `now_us` is read under the input-log lock, right before the records are taken (as the old
+/// `input.lock().seal(seg, now)` call did), so the chunk `t_us` keeps its meaning.
+pub fn seal_shared(log: &std::sync::Mutex<InputLog>, seg: u64, now_us: impl FnOnce() -> u64) -> (String, String, usize) {
+    seal_shared_with(log, seg, now_us, |job| job.write())
+}
+
+/// `seal_shared` with the disk step injectable (tests).
+pub fn seal_shared_with(log: &std::sync::Mutex<InputLog>, seg: u64, now_us: impl FnOnce() -> u64, write: impl FnOnce(&SealJob) -> std::io::Result<()>) -> (String, String, usize) {
+    let io = log.lock().unwrap_or_else(|e| e.into_inner()).seal_io.clone();
+    let _serial = io.lock().unwrap_or_else(|e| e.into_inner());
+    let job = { let mut g = log.lock().unwrap_or_else(|e| e.into_inner()); let t_us = now_us(); g.seal_prepare(seg, t_us) };
+    let res = write(&job);
+    log.lock().unwrap_or_else(|e| e.into_inner()).seal_finish(job, res)
 }
 
 impl InputLog {
@@ -232,7 +298,8 @@ impl InputLog {
             dev_counter: None, faults_since_hb: 0, max_rx_gap_us: 0, stale_over_50ms: 0,
             short_reads: 0, parse_faults: 0, first_rx_t_us: None,
             span: RxSpan::default(), prev_counter: None, prev_hw: None,
-            seal: crate::seal::SealWatch::new(false) };
+            seal: crate::seal::SealWatch::new(false), weave_snap: None,
+            seal_io: std::sync::Arc::new(std::sync::Mutex::new(())), seal_in_flight: false };
         if enabled {
             l.pending.push(json!({"type": "header", "schema": SCHEMA, "t_us": 0,
                 "clock": "qorcap-mono-us (same Instant as manifest/checkpoint mono_ms)", "wall_anchor_ms": wall_anchor_ms,
@@ -272,6 +339,7 @@ impl InputLog {
         self.seal.set_session(&self.wall_anchor_ms.to_string());
         self.live.seal_line = self.seal.line.clone();
         info!("{}", self.live.seal_line);
+        self.publish_weave();
     }
 
     pub fn close_seal(&mut self) {
@@ -282,6 +350,7 @@ impl InputLog {
             info!("{}", self.live.seal_line);
             self.persist_seal();
         }
+        self.publish_weave();
     }
 
     /// Read-only view for the practice live tap (src/livetap.rs). Nothing here touches the controller.
@@ -292,6 +361,18 @@ impl InputLog {
             seal: if self.seal.enabled() { self.seal.status.clone() } else { "off".into() },
             seal_hash: self.seal.hash.as_ref().map(|h| h.chars().take(12).collect()),
             last_press: self.live.recent_presses.last().map(|p| (p.seq, p.t_ms, p.button.clone())),
+        }
+    }
+
+    /// Live tap only. The capture thread reads this snapshot, never `InputLog`'s own mutex.
+    pub fn set_weave_snap(&mut self, snap: std::sync::Arc<std::sync::Mutex<crate::livetap::WeaveCtx>>) {
+        self.weave_snap = Some(snap);
+        self.publish_weave();
+    }
+
+    fn publish_weave(&self) {
+        if let Some(s) = &self.weave_snap {
+            *s.lock().unwrap_or_else(|e| e.into_inner()) = self.weave_ctx();
         }
     }
 
@@ -314,6 +395,7 @@ impl InputLog {
             self.live.seal_line = self.seal.line.clone();
             info!("{}", self.live.seal_line);
             self.persist_seal();
+            self.publish_weave();
         }
     }
 
@@ -322,6 +404,7 @@ impl InputLog {
             self.live.seal_line = self.seal.line.clone();
             info!("{}", self.live.seal_line);
             self.persist_seal();
+            self.publish_weave();
         }
     }
 
@@ -409,6 +492,7 @@ impl InputLog {
             self.live.logged += 1;
         }
         self.poll_heartbeat(t_us);
+        self.publish_weave();
         log
     }
 
@@ -566,6 +650,7 @@ impl InputLog {
         }
         self.pending.push(rec);
         if state != "connected" { self.last_logged = None; }
+        self.publish_weave();
     }
 
     /// Human-readable connect line. The structured `pad_id` is what the proof compares.
@@ -592,7 +677,23 @@ impl InputLog {
     pub fn path(&self) -> Option<&Path> { self.path.as_deref() }
 
     /// Seal everything pending into chunk `seg`. Returns (chunk_sha256, chain_head, n_records).
+    /// Single-threaded form (tests, red team, offline tools). The engine uses `seal_shared`, which writes
+    /// the same bytes without holding the input-log mutex across the fsync.
     pub fn seal(&mut self, seg: u64, t_us: u64) -> (String, String, usize) {
+        let job = self.seal_prepare(seg, t_us);
+        let res = job.write();
+        self.seal_finish(job, res)
+    }
+
+    /// Fix the next chunk: take every pending record and compute its bytes and chain link. Moves nothing
+    /// on the chain; `seal_finish` does that once the bytes are durable.
+    pub fn seal_prepare(&mut self, seg: u64, t_us: u64) -> SealJob {
+        let empty = |head: String| SealJob { sha: empty_hash(), head, n: 0, recs: vec![], body: String::new(), haptic: String::new(), path: None, haptic_path: None };
+        if self.seal_in_flight {
+            // Only reachable if a caller skips `seal_io`. Leave everything pending; the next seal takes it.
+            warn!("input seal for segment {seg} skipped: another chunk is still being written (chain unchanged)");
+            return empty(self.head.clone());
+        }
         if self.live.reports > 0 {
             let now = (self.detector.live.imu_present, self.detector.live.imu_rate_hz);
             let changed = match self.imu_committed {
@@ -611,32 +712,34 @@ impl InputLog {
         }
         let sha = ev::jcs_sha(&Value::Array(recs.clone()));
         let n = recs.len();
-        if n == 0 { return (sha, self.head.clone(), 0); }
+        if n == 0 { return SealJob { sha, ..empty(self.head.clone()) }; }
         let prev = self.head.clone();
         let head = ev::link(&prev, self.chunks, &sha);
         let chunk = json!({"type": "chunk", "seq": self.chunks, "seg": seg, "n": n, "sha256": sha, "prev": prev, "head": head, "t_us": t_us});
         let mut body = String::new();
         for r in recs.iter().chain(std::iter::once(&chunk)) { body.push_str(&r.to_string()); body.push('\n'); }
-        if let Some(p) = &self.path {
-            if let Some(d) = p.parent() { let _ = std::fs::create_dir_all(d); }
-            if let Err(e) = append_bytes(p, body.as_bytes()) {
-                // The chunk is not on disk, so the chain must not move. The records stay pending and
-                // the next segment seals them. A checkpoint for this segment then commits the empty hash.
-                warn!("cannot write {}: {e}; input chunk not sealed (chain unchanged)", p.display());
-                self.pending = recs;
-                return (empty_hash(), self.head.clone(), 0);
-            }
+        let haptic: String = if self.haptic_path.is_some() {
+            recs.iter().filter(|r| r["type"] == "haptic").map(|r| format!("{r}\n")).collect()
+        } else { String::new() };
+        self.seal_in_flight = true;
+        SealJob { sha, head, n, recs, body, haptic, path: self.path.clone(), haptic_path: self.haptic_path.clone() }
+    }
+
+    /// Commit a prepared chunk after `SealJob::write`. On a failed write the chain does not move and the
+    /// records go back in front of any record that arrived during the write (same order as before).
+    pub fn seal_finish(&mut self, job: SealJob, written: std::io::Result<()>) -> (String, String, usize) {
+        if job.n == 0 { return (job.sha, job.head, 0); }
+        self.seal_in_flight = false;
+        if written.is_err() {
+            // The chunk is not on disk, so the chain must not move. The records stay pending and
+            // the next segment seals them. A checkpoint for this segment then commits the empty hash.
+            let mut recs = job.recs;
+            recs.append(&mut self.pending);
+            self.pending = recs;
+            return (empty_hash(), self.head.clone(), 0);
         }
-        if let Some(hp) = &self.haptic_path {
-            let hs: String = recs.iter().filter(|r| r["type"] == "haptic").map(|r| format!("{r}\n")).collect();
-            if !hs.is_empty() {
-                if let Err(e) = append_bytes(hp, hs.as_bytes()) {
-                    warn!("cannot write {}: {e}", hp.display());
-                }
-            }
-        }
-        self.head = head.clone(); self.chunks += 1; self.total_records += n as u64;
-        (sha, head, n)
+        self.head = job.head.clone(); self.chunks += 1; self.total_records += job.n as u64;
+        (job.sha, job.head, job.n)
     }
 }
 
@@ -763,6 +866,129 @@ pub fn verify_chunks(recs: &[Value], chunks: &[Value]) -> (std::collections::Has
 mod tests {
     use super::*;
     fn pad(b: u32, l2: u8) -> Pad { Pad { buttons: b, l2, ..Pad::neutral() } }
+    /// Fixed input stream for the seal byte-equality checks. Only uses API that exists at v0.3.43.
+    fn seal_scenario_feed(l: &mut InputLog, from_us: u64, to_us: u64) {
+        let mut t = from_us;
+        let mut k = 0u32;
+        while t < to_us {
+            let b = if (k / 40) & 1 == 0 { 0 } else { hid::CROSS };
+            let mut p = pad(b, ((k * 7) % 200) as u8);
+            p.counter = (k & 0xff) as u8;
+            p.sensor_ts = k.wrapping_mul(12_000);
+            l.on_report(t, &p);
+            t += 4_000;
+            k += 1;
+        }
+    }
+
+    /// v0.3.43 `seal()` on `seal_scenario_feed`: inputs.jsonl sha256 / length and the last chunk's
+    /// (sha, head, n). Captured from the 36debdd tree before the seal was split.
+    const GOLDEN_FILE_SHA: &str = "e577d5af1762d2a21b4fb9102a64b9ce270f76dfa2ee346dbaa9a4859a5d7fc2";
+    const GOLDEN_FILE_LEN: usize = 234_476;
+    const GOLDEN_LAST: (&str, &str, usize) = ("a28c108d1bab80f66a8acccbab3a0bb1ac13f577456e1118b50d1be4b56351f9",
+        "c75e33207c2f632b7f48570258c4ac92c93063fd9f20d63def2f2bcf86392518", 502);
+
+    fn golden_run(tag: &str, shared: bool) -> (Vec<u8>, Vec<(String, String, usize)>) {
+        let dir = std::env::temp_dir().join(format!("qorcap-inputs-golden-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let p = dir.join("inputs.jsonl");
+        let mut l = InputLog::new(Some(p.clone()), true, 1_700_000_000_000);
+        l.set_mono_origin_ns(42);
+        l.on_handle_open(10, "DualSense (USB) serial=T1", "serial:T1");
+        let log = Mutex::new(l);
+        let mut outs = vec![];
+        for seg in 0..4u64 {
+            seal_scenario_feed(&mut log.lock().unwrap(), seg * 2_000_000 + 20, (seg + 1) * 2_000_000);
+            let t = (seg + 1) * 2_000_000 + 5;
+            outs.push(if shared { seal_shared(&log, seg + 1, || t) } else { log.lock().unwrap().seal(seg + 1, t) });
+        }
+        let bytes = std::fs::read(&p).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        (bytes, outs)
+    }
+
+    #[test]
+    fn seal_and_seal_shared_write_the_v0343_bytes() {
+        for shared in [false, true] {
+            let (bytes, outs) = golden_run(if shared { "shared" } else { "direct" }, shared);
+            assert_eq!((ev::sha256_hex(&bytes).as_str(), bytes.len()), (GOLDEN_FILE_SHA, GOLDEN_FILE_LEN), "shared={shared}");
+            let last = outs.last().unwrap();
+            assert_eq!((last.0.as_str(), last.1.as_str(), last.2), GOLDEN_LAST, "shared={shared}");
+        }
+    }
+
+    #[test]
+    fn seal_shared_fsyncs_without_the_input_lock_and_later_records_wait_for_the_next_chunk() {
+        let dir = std::env::temp_dir().join(format!("qorcap-inputs-shared-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let p = dir.join("inputs.jsonl");
+        let log = Mutex::new(InputLog::new(Some(p.clone()), true, 0));
+        log.lock().unwrap().on_status(1, "connected", "DualSense");
+        log.lock().unwrap().on_report(1_000, &pad(0, 0));
+        let mut on_disk_during = 0usize;
+        let (sha, head, n) = seal_shared_with(&log, 1, || 2_000, |job| {
+            // The HID logger can take the lock while the chunk is being written and fsynced...
+            let mut g = log.try_lock().expect("input-log mutex must be free during the disk write");
+            assert_eq!(g.chunks, 0, "chain does not move before the chunk is durable");
+            g.on_report(1_500, &pad(hid::CROSS, 0));
+            drop(g);
+            let r = job.write();
+            on_disk_during = read_file(&p).map(|(recs, _)| recs.len()).unwrap_or(0);
+            r
+        });
+        // ...and what it adds is not in this chunk: header, status, 1 report, imu.
+        assert_eq!((n, on_disk_during), (4, 4));
+        let l = log.lock().unwrap();
+        assert_eq!((l.chunks, l.head.as_str()), (1, head.as_str()));
+        assert_eq!(l.pending().len(), 1);
+        assert_eq!(l.pending()[0]["t_us"], 1_500);
+        drop(l);
+        let (recs, chunks) = read_file(&p).unwrap();
+        let (m, h2, errs) = verify_chunks(&recs, &chunks);
+        assert!(errs.is_empty(), "{errs:?}");
+        assert_eq!((m[&1].as_str(), h2.as_str()), (sha.as_str(), head.as_str()));
+        let (_, _, n2) = seal_shared(&log, 2, || 3_000);
+        assert_eq!(n2, 1, "the record added during the write is sealed next");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn seal_shared_failed_write_keeps_the_chain_and_the_order() {
+        let log = Mutex::new(InputLog::new(Some(std::env::temp_dir().join("unused-qorcap-inputs.jsonl")), true, 0));
+        log.lock().unwrap().on_status(1, "connected", "DualSense");
+        let before: Vec<Value> = log.lock().unwrap().pending().to_vec();
+        let (sha, head, n) = seal_shared_with(&log, 1, || 10, |_| {
+            log.lock().unwrap().on_status(20, "unplugged", "gone");
+            Err(std::io::Error::other("disk full"))
+        });
+        assert_eq!((n, sha.as_str(), head.as_str()), (0, empty_hash().as_str(), GENESIS));
+        let l = log.lock().unwrap();
+        assert_eq!(l.chunks, 0);
+        let types: Vec<(String, u64)> = l.pending().iter().map(|r| (r["type"].as_str().unwrap().to_string(), r["t_us"].as_u64().unwrap())).collect();
+        let want: Vec<(String, u64)> = before.iter().map(|r| (r["type"].as_str().unwrap().to_string(), r["t_us"].as_u64().unwrap()))
+            .chain(std::iter::once(("status".to_string(), 20))).collect();
+        assert_eq!(types, want, "failed chunk first, then what arrived during the write");
+        assert!(!l.seal_in_flight);
+    }
+
+    #[test]
+    fn weave_snapshot_follows_pad_state_and_presses_only_when_attached() {
+        let snap = std::sync::Arc::new(Mutex::new(crate::livetap::WeaveCtx::default()));
+        let mut off = InputLog::new(None, true, 5);
+        off.on_status(1, "connected", "DualSense");
+        assert_eq!(*snap.lock().unwrap(), crate::livetap::WeaveCtx::default(), "no snapshot attached: nothing published");
+        let mut l = InputLog::new(None, true, 5);
+        l.set_weave_snap(snap.clone());
+        assert_eq!(snap.lock().unwrap().pad, "searching");
+        l.on_status(1, "connected", "DualSense");
+        assert_eq!(snap.lock().unwrap().pad, "connected");
+        l.on_report(1_000, &pad(0, 0));
+        l.on_report(9_000, &pad(hid::CROSS, 0));
+        assert_eq!(snap.lock().unwrap().last_press.as_ref().map(|p| p.2.clone()), Some("CROSS".into()));
+        l.on_status(20_000, "unplugged", "gone");
+        assert_eq!(*snap.lock().unwrap(), l.weave_ctx());
+        assert_eq!(snap.lock().unwrap().pad, "unplugged");
+    }
     #[test]
     fn recent_presses_keep_short_taps_for_the_console() {
         let mut l = InputLog::new(None, true, 1_700_000_000_000);
