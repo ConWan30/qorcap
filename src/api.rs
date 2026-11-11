@@ -95,6 +95,7 @@ pub fn route(e: &Arc<Engine>, method: &str, url: &str, body: &str) -> Resp {
             let reason = b["reason"].as_str().map(str::trim).filter(|s| {
                 !s.is_empty() && s.len() <= 64 && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
             }).unwrap_or("shutdown");
+            if let Some(note) = shutdown_note(&b) { info!("stop note: {note}"); }
             e.request_stop(reason);
             j(200, json!({"ok": true, "reason": e.stop_reason.lock().unwrap_or_else(|e| e.into_inner()).clone()}))
         }
@@ -106,6 +107,12 @@ pub fn route(e: &Arc<Engine>, method: &str, url: &str, body: &str) -> Resp {
         },
         _ => j(404, json!({"ok": false, "error": format!("no route {method} {path}")})),
     }
+}
+
+/// Optional info-only line from the sidecar (practice auto stop). Logged to qorcap.log, never stored
+/// in the receipt or bundle. Printable ASCII only, at most 240 bytes; anything else is dropped.
+fn shutdown_note(b: &Value) -> Option<&str> {
+    b["note"].as_str().map(str::trim).filter(|s| !s.is_empty() && s.len() <= 240 && s.bytes().all(|c| (0x20..0x7f).contains(&c)))
 }
 
 fn frame_scorebug(e: &Arc<Engine>) -> Resp {
@@ -218,6 +225,22 @@ mod tests {
         let mut a = vec!["q", "record", "--device", "testpattern", "--bundle", &dir]; a.extend_from_slice(extra);
         let crate::cli::Cmd::Record(r) = crate::cli::Cli::try_parse_from(a).unwrap().cmd else { panic!() };
         Engine::new(r, "ffmpeg-does-not-exist".into())
+    }
+    #[test]
+    fn shutdown_note_is_logged_only_and_filtered() {
+        assert_eq!(shutdown_note(&json!({"note": " practice autoclose; cod end screen DEFEAT "})), Some("practice autoclose; cod end screen DEFEAT"));
+        assert_eq!(shutdown_note(&json!({"reason": "enter"})), None);
+        assert_eq!(shutdown_note(&json!({"note": ""})), None);
+        assert_eq!(shutdown_note(&json!({"note": "line\nbreak"})), None);
+        assert_eq!(shutdown_note(&json!({"note": "x".repeat(241)})), None);
+        assert_eq!(shutdown_note(&json!({"note": 7})), None);
+        let e = engine(&[]);
+        let shut = route(&e, "POST", "/shutdown", r#"{"reason":"post_final_tail","note":"practice autoclose; info only"}"#);
+        assert_eq!(shut.code, 200);
+        assert_eq!(e.stop_reason.lock().unwrap_or_else(|e| e.into_inner()).as_deref(), Some("post_final_tail"));
+        let draft = std::fs::read_to_string(e.bundle_dir().unwrap().join("receipt.draft.json")).unwrap();
+        let bundle = std::fs::read_to_string(e.bundle_dir().unwrap().join("bundle.json")).unwrap();
+        assert!(!draft.contains("practice autoclose") && !bundle.contains("practice autoclose"));
     }
     #[test]
     fn status_and_404() {

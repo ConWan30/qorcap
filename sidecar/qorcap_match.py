@@ -918,6 +918,28 @@ def _header_int(headers, name):
 _SIDE_FROM_BUNDLE = object()  # legacy: read the side from side_choice.json in the bundle
 
 
+def attach_cod_end_stop(state: dict, game, *, environ=None, say=None):
+    """Create the practice CoD auto-stop watcher when its gate is on. Returns it, or None."""
+    if game != "cod":
+        return None
+    try:
+        sys.path.insert(0, str(HERE))
+        import qorcap_cod_endstop as es_mod
+        if not es_mod.enabled(game, environ):
+            return None
+        es = es_mod.EndStop(es_mod.config_from_env(environ))
+    except Exception as e:
+        if say is not None:
+            say(f"Practice auto stop is off ({type(e).__name__}). Press ENTER after the match.")
+        return None
+    state["cod_end_stop"] = es
+    if say is not None:
+        c = es.cfg
+        say(f"Practice auto stop is on: after a confirmed VICTORY or DEFEAT end screen, capture runs "
+            f"{c.tail_s:g} s more and then stops the same way as Enter (armed after {c.arm_ms // 1000} s).")
+    return es
+
+
 def start_cod_reader(api: Api, stop: threading.Event, state: dict, bundle: Path | None = None,
                      side=_SIDE_FROM_BUNDLE) -> threading.Thread:
     """Call of Duty frame loop. Does not start the Madden scorebug reader.
@@ -931,6 +953,8 @@ def start_cod_reader(api: Api, stop: threading.Event, state: dict, bundle: Path 
     ``side_choice.json`` or ``next-side.txt`` already sitting in a reused match folder is then not read, so it
     cannot turn the scored-end side check back on. The file is left in place (prior evidence is not deleted).
     Leaving ``side`` out keeps the older behavior of reading ``side_choice.json`` from the bundle.
+    ``state["cod_end_stop"]`` (practice auto stop, ``qorcap_cod_endstop``), when set, sees each frame's
+    end and owner-row reads.
     """
     sys.path.insert(0, str(HERE))
     from qorcap_cod import CodSetRunner, load_signal_files, side_from_bundle
@@ -949,6 +973,8 @@ def start_cod_reader(api: Api, stop: threading.Event, state: dict, bundle: Path 
         log_path=(bundle / "cod_signals.jsonl") if bundle is not None else None,
         side=side_from_bundle(bundle) if side is _SIDE_FROM_BUNDLE else side,
     )
+    es = state.get("cod_end_stop")
+    runner.end_watch = getattr(es, "observe", None) if es is not None else None
     state["core"] = runner
     # Leave the Madden pause gate unset. Official challenges stay closed.
     state["gate"] = None
@@ -1286,8 +1312,12 @@ def spawn_qorcap(cmd: list[str], stdout):
         return subprocess.Popen(cmd, stdout=stdout, stderr=subprocess.STDOUT, creationflags=flags)
 
 
-def shutdown_body(reason: str) -> dict:
-    return {"reason": reason}
+def shutdown_body(reason: str, note: str | None = None) -> dict:
+    """``/shutdown`` body. ``note`` is one info-only line QorCap writes to qorcap.log; it is not stored."""
+    body = {"reason": reason}
+    if isinstance(note, str) and note:
+        body["note"] = note
+    return body
 
 
 def key_watcher(stop: threading.Event, state: dict) -> None:
@@ -1864,6 +1894,9 @@ def main(argv=None) -> int:
     stop, state = threading.Event(), {}
     cs = Countersigner(referee, match_id, a.role, sink=bundle / "countersigned.jsonl")
     # No home/away pick for Call of Duty: pass no side, so an old side_choice.json in this folder is not read.
+    # Practice lane + QORCAP_AUTOCLOSE=1 + Call of Duty only: stop after a confirmed VICTORY / DEFEAT
+    # end screen. Sets state["cod_end_stop"]; start_cod_reader hands it the frame loop's reads.
+    attach_cod_end_stop(state, game, say=say)
     if game == "cod":
         start_cod_reader(api, stop, state, bundle=bundle, side=None)
     elif a.test_pattern:
@@ -1999,6 +2032,7 @@ def main(argv=None) -> int:
                 state["source_error"] = "disk_full"
             now_mono = time.monotonic()
             reason = capture_stop_reason(state, now_mono, tail_s=tail_s)
+            reason = cod_end_stop_reason(state, reason, say=say)
             if reason == "enter":
                 stop_reason = "enter"
                 _remember_tail_stop(state, now_mono, int(time.time() * 1000))
@@ -2072,8 +2106,15 @@ def main(argv=None) -> int:
             sweep()
         except Exception:
             pass
+        end_stop = state.get("cod_end_stop")
+        note = None
+        if end_stop is not None and state.get("cod_end_stop_fired"):
+            try:
+                note = end_stop.log_note(stop_reason)
+            except Exception:
+                note = None
         try:
-            api.post("/shutdown", shutdown_body(stop_reason))
+            api.post("/shutdown", shutdown_body(stop_reason, note))
         except Exception:
             pass
         # Countersign the stop checkpoints over the API while QorCap is still up; QorCap waits for our report
@@ -2110,6 +2151,13 @@ def main(argv=None) -> int:
                 start_t_ms=state.get("final_screen_wall_ms"),
                 stop_t_ms=state.get("tail_stop_wall_ms"),
                 actual_s=state.get("tail_actual_s"))
+        except Exception:
+            pass
+        # Practice CoD auto stop: sidecar file only, same rule as post_final_tail.json.
+        try:
+            if end_stop is not None:
+                end_stop.record(bundle, stop_reason=stop_reason, stop_wall_ms=state.get("tail_stop_wall_ms"),
+                                fired=bool(state.get("cod_end_stop_fired")))
         except Exception:
             pass
 
@@ -3138,6 +3186,37 @@ def capture_stop_reason(state: dict, now: float, *, tail_s: float) -> str | None
     if not _final_was_posted(state):
         return "post_final_tail"
     return "final"
+
+
+def cod_end_stop_reason(state: dict, reason: str | None, *, now: float | None = None, say=None) -> str | None:
+    """Apply the practice CoD auto stop (``qorcap_cod_endstop``) on top of ``capture_stop_reason``.
+
+    Off (no watcher in ``state``): ``reason`` is returned unchanged. On:
+
+    - Enter/Q and capture errors are unchanged and still stop at once.
+    - A confirmed end screen whose tail has run out stops with ``final`` when a final was posted,
+      otherwise ``post_final_tail`` (both existing stop reasons; no new receipt value).
+    - The tail only adds time: an older ``final`` stop that is due before the tail ends waits for it.
+    """
+    es = state.get("cod_end_stop")
+    if es is None:
+        return reason
+    if es.confirmed is not None and not state.get("cod_end_stop_said"):
+        state["cod_end_stop_said"] = True
+        if say is not None:
+            try:
+                say(f"\n\n{es.describe()} Capture continues {es.cfg.tail_s:g} s, then stops the same way as Enter.")
+            except Exception:
+                pass
+    due = es.stop_due(now)
+    if reason in ("final", "post_final_tail") and es.confirmed is not None and not due:
+        return None
+    if reason is None and due:
+        state["cod_end_stop_fired"] = True
+        return "final" if _final_was_posted(state) else "post_final_tail"
+    if reason in ("final", "post_final_tail") and due:
+        state["cod_end_stop_fired"] = True
+    return reason
 
 
 def died_during_post_final_tail(state: dict, now: float, tail_s: float) -> bool:
