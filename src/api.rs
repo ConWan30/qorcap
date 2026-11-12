@@ -95,7 +95,11 @@ pub fn route(e: &Arc<Engine>, method: &str, url: &str, body: &str) -> Resp {
             let reason = b["reason"].as_str().map(str::trim).filter(|s| {
                 !s.is_empty() && s.len() <= 64 && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
             }).unwrap_or("shutdown");
-            if let Some(note) = shutdown_note(&b) { info!("stop note: {note}"); }
+            if let Some(note) = shutdown_note(&b) {
+                info!("stop note: {note}");
+                // Practice live tap end cue only (VICTORY/DEFEAT word); not stored in the bundle or receipt.
+                e.note_end_screen(reason, note);
+            }
             e.request_stop(reason);
             j(200, json!({"ok": true, "reason": e.stop_reason.lock().unwrap_or_else(|e| e.into_inner()).clone()}))
         }
@@ -241,6 +245,22 @@ mod tests {
         let draft = std::fs::read_to_string(e.bundle_dir().unwrap().join("receipt.draft.json")).unwrap();
         let bundle = std::fs::read_to_string(e.bundle_dir().unwrap().join("bundle.json")).unwrap();
         assert!(!draft.contains("practice autoclose") && !bundle.contains("practice autoclose"));
+    }
+    #[test]
+    fn shutdown_note_word_reaches_only_the_practice_live_tap_end_cue() {
+        let rx = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let url = format!("udp://{}", rx.local_addr().unwrap());
+        let e = engine(&["--no-controller", "--live-tap", &url, "--practice-lane"]);
+        let shut = route(&e, "POST", "/shutdown", r#"{"reason":"post_final_tail","note":"practice autoclose; cod end screen DEFEAT; then post_final_tail; info only, not a final"}"#);
+        assert_eq!(shut.code, 200);
+        e.end_live_tap();
+        let dir = e.bundle_dir().unwrap();
+        let log = std::fs::read_to_string(dir.join(crate::livetap::FILE_NAME)).unwrap();
+        let end: Value = serde_json::from_str(log.lines().last().unwrap()).unwrap();
+        assert_eq!((end["type"].as_str(), end["reason"].as_str(), end["stop_reason"].as_str()), (Some("end_of_session"), Some("auto_stop_defeat"), Some("post_final_tail")));
+        assert!(end["f"].is_null(), "no frame was sent");
+        let draft = std::fs::read_to_string(dir.join("receipt.draft.json")).unwrap();
+        assert!(!draft.contains("DEFEAT") && !draft.contains("practice autoclose"));
     }
     #[test]
     fn status_and_404() {

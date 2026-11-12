@@ -100,6 +100,9 @@ pub struct Engine {
     pub countersigned: std::sync::atomic::AtomicI64,
     /// Why recording stopped. The first reason wins (a later Ctrl+C must not overwrite a broken pipe).
     pub stop_reason: Mutex<Option<String>>,
+    /// Practice live tap only: (stop reason, VICTORY/DEFEAT) from the CoD end-stop watcher's `/shutdown` note.
+    /// Read only for the end-of-session cue; never written to the bundle, the draft or the receipt.
+    end_screen: Mutex<Option<(String, &'static str)>>,
     /// Serializes receipt.draft.json / bundle.json writes.
     bundle_write: Mutex<()>,
     /// Set once the full stop write (including the input proof) has finished, so a late fast write cannot replace it.
@@ -431,7 +434,7 @@ impl Engine {
             snapshot: dir.join("snapshot.jpg"), snap_pub: Mutex::new(snap), tap: crate::glimpse::FrameTap::with_ring(args.glimpse_frame || crate::glimpse::env_enabled(), crate::glimpse::ring_enabled()), exit_when_recording_ends: AtomicBool::new(false), started, last_data_ms: AtomicU64::new(0), input, frame_clock, live_tap, weave_snap,
             running: AtomicBool::new(false), api_closed: AtomicBool::new(false), sealed: AtomicBool::new(false),
             countersigned: std::sync::atomic::AtomicI64::new(-1),
-            stop_reason: Mutex::new(None), bundle_write: Mutex::new(()), bundle_finalized: AtomicBool::new(false),
+            stop_reason: Mutex::new(None), end_screen: Mutex::new(None), bundle_write: Mutex::new(()), bundle_finalized: AtomicBool::new(false),
             persist_fault: Mutex::new(None), ckpt_durable_len: Mutex::new(None), args })
     }
     fn ms(&self) -> u64 { self.started.elapsed().as_millis() as u64 }
@@ -792,6 +795,8 @@ impl Engine {
     fn finish_stop(self: &Arc<Self>) {
         if self.stop_reason.lock().unwrap_or_else(|e| e.into_inner()).is_none() { self.note_stop("shutdown"); }
         if let Some(p) = self.stop_recording() { info!("finalised {p}"); }
+        // Practice live tap: the recorder is gone, so no slice can follow; send the end cue and close the tap.
+        self.end_live_tap();
         crate::inputproof::clear_recording_marker(self.bundle_dir().as_deref());
         // Draft and bundle exist before the countersign wait and the slow input proof, so a kill
         // during either still leaves receipt.draft.json for finalize.
@@ -1659,6 +1664,69 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Practice live tap end-of-session cue: one cue, last, reason mapped from the real stop path.
+    #[test]
+    fn live_tap_end_cue_reason_follows_the_real_stop_paths() {
+        use clap::Parser;
+        let rx = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let url = format!("udp://{}", rx.local_addr().unwrap());
+        let note_d = "practice autoclose; cod end screen DEFEAT; path splash; reader cod_end_screen; then post_final_tail; info only, not a final";
+        let note_v = "practice autoclose; cod end screen VICTORY; path sustained; then final; info only, not a final";
+        // (label, stop reason, /shutdown note, an earlier stop reason, expected cue reason)
+        let cases: [(&str, &str, Option<&str>, Option<&str>, &str); 8] = [
+            ("cod defeat auto stop", "post_final_tail", Some(note_d), None, "auto_stop_defeat"),
+            ("cod victory auto stop", "final", Some(note_v), None, "auto_stop_victory"),
+            ("final without the cod word", "final", None, None, "unknown"),
+            ("enter", "enter", None, None, "user_stop"),
+            ("plain /shutdown", "shutdown", None, None, "user_stop"),
+            ("enter before the auto stop", "post_final_tail", Some(note_d), Some("enter"), "user_stop"),
+            ("recorder pipe broke", "pipe_broken", None, None, "error"),
+            ("--duration", "duration", None, None, "unknown"),
+        ];
+        let base = std::env::temp_dir().join(format!("qorcap-livetap-endeng-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        for (i, (label, reason, note, earlier, want)) in cases.iter().enumerate() {
+            let dir = base.join(i.to_string());
+            std::fs::create_dir_all(&dir).unwrap();
+            let d = dir.to_string_lossy().into_owned();
+            let crate::cli::Cmd::Record(r) = crate::cli::Cli::try_parse_from(["q", "record", "--device", "testpattern", "--bundle", &d, "--no-controller",
+                "--match-id", "m-eos", "--live-tap", &url, "--practice-lane"]).unwrap().cmd else { panic!() };
+            let e = Engine::new(r, "ffmpeg-x".into());
+            e.live_tap.submit(&crate::frameclock::video_ts_packet(0x100, 900), 1, "video.mp4", None, None, crate::livetap::WeaveCtx::default());
+            if let Some(r0) = earlier { e.note_stop(r0); }
+            if let Some(n) = note { e.note_end_screen(reason, n); }
+            e.request_stop(reason);
+            e.end_live_tap();
+            e.end_live_tap();
+            let log = std::fs::read_to_string(dir.join(crate::livetap::FILE_NAME)).unwrap();
+            let ends: Vec<Value> = log.lines().filter(|l| l.contains("\"type\":\"end_of_session\"")).map(|l| serde_json::from_str(l).unwrap()).collect();
+            assert_eq!(ends.len(), 1, "{label}: sent once");
+            assert!(log.lines().last().unwrap().contains("\"type\":\"end_of_session\""), "{label}: last line");
+            assert_eq!(ends[0]["reason"], *want, "{label}");
+            assert_eq!(ends[0]["stop_reason"], earlier.unwrap_or(reason), "{label}");
+            assert_eq!(ends[0]["f"], 0, "{label}");
+            for f in ["receipt.draft.json", "bundle.json"] {
+                let t = std::fs::read_to_string(dir.join(f)).unwrap();
+                assert!(!t.contains("end_of_session") && !t.contains("DEFEAT") && !t.contains("VICTORY") && !t.contains("auto_stop_"), "{label}: {f}");
+            }
+            assert_eq!(e.live_tap.stats().unwrap().end_cue.as_deref(), Some("sent"), "{label}");
+        }
+        // Tap off (REAL MATCH never turns it on): no cue, no file, no word kept.
+        let dir = base.join("off");
+        std::fs::create_dir_all(&dir).unwrap();
+        let d = dir.to_string_lossy().into_owned();
+        let crate::cli::Cmd::Record(r) = crate::cli::Cli::try_parse_from(["q", "record", "--device", "testpattern", "--bundle", &d, "--no-controller",
+            "--match-id", "m-eos-off"]).unwrap().cmd else { panic!() };
+        let e = Engine::new(r, "ffmpeg-x".into());
+        assert!(!e.live_tap.enabled());
+        e.note_end_screen("post_final_tail", note_d);
+        e.request_stop("post_final_tail");
+        e.end_live_tap();
+        assert!(e.end_screen.lock().unwrap().is_none());
+        assert!(!dir.join(crate::livetap::FILE_NAME).exists());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     #[test]
     fn frame_clock_off_leaves_the_bundle_unchanged_and_on_records_only_when_asked() {
         use clap::Parser;
@@ -1977,6 +2045,34 @@ impl Engine {
             }
             Err(e) => warn!("auto clip {name} failed: {e}"),
         });
+    }
+
+    /// Practice live tap: remember the CoD end-screen word from a `/shutdown` note that came with `reason`,
+    /// for the end-of-session cue only. No-op when the tap is off (REAL MATCH: the tap is never on).
+    pub fn note_end_screen(&self, reason: &str, note: &str) {
+        if !self.live_tap.enabled() || !matches!(reason, "final" | "post_final_tail") { return; }
+        let Some(word) = crate::livetap::cod_end_screen_word(note) else { return };
+        if self.stop_reason.lock().unwrap_or_else(|e| e.into_inner()).is_some() { return; }
+        let mut g = self.end_screen.lock().unwrap_or_else(|e| e.into_inner());
+        if g.is_none() { *g = Some((reason.to_string(), word)); }
+    }
+
+    /// Practice live tap: one end-of-session cue (bounded wait, best effort), then the final counters.
+    /// Tap off: nothing happens.
+    pub(crate) fn end_live_tap(&self) {
+        if !self.live_tap.enabled() { return; }
+        let stop = self.stop_reason.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let screen = self.end_screen.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let reason = crate::livetap::EndReason::from_stop(stop.as_deref(), screen.as_ref().map(|(r, w)| (r.as_str(), *w)));
+        let t_us = self.started.elapsed().as_micros() as u64;
+        let anchor = self.weave_snap.lock().unwrap_or_else(|e| e.into_inner()).wall_anchor_ms;
+        let out = self.live_tap.end_session(reason, stop.as_deref(), t_us, anchor, crate::livetap::END_WAIT_MAX);
+        match out {
+            crate::livetap::EndOutcome::Sent => info!("live tap: end_of_session cue sent (reason {}, stop reason {}); tap closed", reason.as_str(), stop.as_deref().unwrap_or("none")),
+            crate::livetap::EndOutcome::AlreadyEnded | crate::livetap::EndOutcome::NotEnabled => {}
+            o => warn!("live tap: end_of_session cue not confirmed ({o:?}, reason {}); the stop continues", reason.as_str()),
+        }
+        self.live_tap.log_summary("end_of_session");
     }
 
     /// Record why the match stopped. The first call wins.
