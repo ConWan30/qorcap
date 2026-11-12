@@ -199,11 +199,109 @@ def test_referee_verified_challenge_card_emits_no_gold_escape(level):
 @pytest.mark.parametrize("level,env", [("truecolor", {"COLORTERM": "truecolor"}), ("256", {"TERM": "xterm-256color"}),
                                        ("16", {"QORCAP_COLOR": "16"})])
 def test_verified_match_banner_is_still_gold(level, env):
-    """Gold stays only where it marks a referee VERIFIED match."""
+    """Gold stays only where it marks a referee VERIFIED match, byte-identical to the previous paint."""
     assert qc._color_level(env) == level
     for msg in ("RESULT: VERIFIED", "  OFFICIAL RESULT: VERIFIED"):
-        assert _GOLD_ESC[level] in qc.tint_verified_banner(msg, env, Tty())
-    assert _GOLD_ESC[level] not in qc.tint_verified_banner("Challenge kickoff PASSED", env, Tty())
+        painted = qc.tint_verified_banner(msg, env, Tty(), verdict="VERIFIED")
+        assert painted == qc.paint_inline(msg, "gold", level)
+        assert _GOLD_ESC[level] in painted
+    # An unrelated line is not gold even when the typed verdict is VERIFIED.
+    assert _GOLD_ESC[level] not in qc.tint_verified_banner("Challenge kickoff PASSED", env, Tty(), verdict="VERIFIED")
+
+
+_BANNER_LEVELS = (("truecolor", {"COLORTERM": "truecolor"}), ("256", {"TERM": "xterm-256color"}),
+                  ("16", {"QORCAP_COLOR": "16"}))
+
+
+def _prefix_only_tint(msg, env, stream):
+    """The prefix-only gate from main 19992a2 (#165). Used to show where the new tests would fail on it."""
+    if qc._color_level(env) == "none" or not qc._isatty(stream):
+        return msg
+    stripped = msg.strip()
+    if stripped.startswith("RESULT: VERIFIED") or stripped.startswith("OFFICIAL RESULT: VERIFIED"):
+        return qc.paint_inline(msg, "gold", qc._color_level(env))
+    return msg
+
+
+@pytest.mark.parametrize("level,env", _BANNER_LEVELS)
+@pytest.mark.parametrize(
+    "msg,verdict",
+    [
+        ("RESULT: SELF_ATTESTED", "SELF_ATTESTED"),
+        ("  RESULT: SELF_ATTESTED", "SELF_ATTESTED"),  # practice / local-self-attested finalize
+        ("RESULT: PARTIAL", "PARTIAL"),
+        ("  RESULT: PARTIAL", "PARTIAL"),
+        ("RESULT: FAIL", "FAIL"),
+        ("  RESULT: FAIL", "FAIL"),
+        ("  OFFICIAL RESULT: SELF_ATTESTED", "SELF_ATTESTED"),
+        ("  OFFICIAL RESULT: PARTIAL", "PARTIAL"),
+        ("  OFFICIAL RESULT: FAIL", "FAIL"),
+    ],
+)
+def test_self_attested_partial_fail_and_practice_banners_are_never_gold(level, env, msg, verdict):
+    """QorProof N3: SELF_ATTESTED (including practice), PARTIAL and FAIL stay plain at every colour level."""
+    assert qc._color_level(env) == level
+    gold = _GOLD_ESC[level]
+    assert gold in qc.paint_inline("x", "gold", level)
+    assert gold not in qc.tint_verified_banner(msg, env, Tty(), verdict=verdict)
+    assert gold not in qc.tint_verified_banner(msg, env, Tty())
+    # Practice finalize uses the local self-attested key, so its result is SELF_ATTESTED, never gold.
+    if verdict == "SELF_ATTESTED":
+        assert qm.REFEREE_KIND == "local-self-attested"
+
+
+@pytest.mark.parametrize("level,env", _BANNER_LEVELS)
+def test_gold_is_gated_on_the_typed_verdict_not_a_text_prefix(level, env):
+    """QorProof N2: a missing or unknown verdict is not gold, even when the line looks like a VERIFIED banner.
+
+    The prefix-only gate from #165 would paint several of these cases gold; the typed gate must not.
+    """
+    assert qc._color_level(env) == level
+    gold = _GOLD_ESC[level]
+    tty = Tty()
+    lookalike = "RESULT: VERIFIED-LOOKING"
+    assert gold in _prefix_only_tint(lookalike, env, tty)
+    assert gold not in qc.tint_verified_banner(lookalike, env, tty, verdict="SELF_ATTESTED")
+    assert gold not in qc.tint_verified_banner(lookalike, env, tty)
+    banner = "RESULT: VERIFIED"
+    official = "  OFFICIAL RESULT: VERIFIED"
+    for msg in (banner, official):
+        assert gold in _prefix_only_tint(msg, env, tty)
+        assert gold not in qc.tint_verified_banner(msg, env, tty)  # missing verdict, fail closed
+        assert gold not in qc.tint_verified_banner(msg, env, tty, verdict=None)
+        assert gold not in qc.tint_verified_banner(msg, env, tty, verdict="")
+        assert gold not in qc.tint_verified_banner(msg, env, tty, verdict="FAIL")
+        assert gold not in qc.tint_verified_banner(msg, env, tty, verdict="PARTIAL")
+        assert gold not in qc.tint_verified_banner(msg, env, tty, verdict="SELF_ATTESTED")
+        assert gold not in qc.tint_verified_banner(msg, env, tty, verdict="verified")
+        assert gold not in qc.tint_verified_banner(msg, env, tty, verdict="VERIFIED ")
+        assert gold not in qc.tint_verified_banner(msg, env, tty, verdict="UNKNOWN")
+    # Existing VERIFIED-banner output stays byte-identical to the previous paint.
+    assert qc.tint_verified_banner(banner, env, tty, verdict="VERIFIED") == qc.paint_inline(banner, "gold", level)
+    assert qc.tint_verified_banner(official, env, tty, verdict="VERIFIED") == qc.paint_inline(official, "gold", level)
+
+
+def test_match_and_submit_result_lines_pass_the_typed_verdict(capsys):
+    """The RESULT / OFFICIAL RESULT callers pass the typed status into tint_verified_banner."""
+    seen = []
+
+    def fake_tint(msg, env=None, stream=None, *, verdict=None):
+        seen.append((msg, verdict))
+        return msg
+
+    orig = qc.tint_verified_banner
+    qc.tint_verified_banner = fake_tint
+    try:
+        qc.emit("  RESULT: SELF_ATTESTED", verdict="SELF_ATTESTED")
+        assert seen[-1] == ("  RESULT: SELF_ATTESTED", "SELF_ATTESTED")
+        qm.say("  RESULT: PARTIAL", verdict="PARTIAL")
+        assert seen[-1] == ("  RESULT: PARTIAL", "PARTIAL")
+        qs.say("  OFFICIAL RESULT: FAIL", verdict="FAIL")
+        assert seen[-1] == ("  OFFICIAL RESULT: FAIL", "FAIL")
+        qc.emit("hello")
+        assert seen[-1] == ("hello", None)
+    finally:
+        qc.tint_verified_banner = orig
 
 
 def test_color_and_plain_policy():
@@ -233,12 +331,15 @@ def test_color_and_plain_policy():
 
 def test_tint_only_a_verified_banner():
     env = {"COLORTERM": "truecolor"}
-    assert GOLD in qc.tint_verified_banner("RESULT: VERIFIED\n", env, Tty())
-    assert GOLD in qc.tint_verified_banner("  OFFICIAL RESULT: VERIFIED", env, Tty())
+    assert GOLD in qc.tint_verified_banner("RESULT: VERIFIED\n", env, Tty(), verdict="VERIFIED")
+    assert GOLD in qc.tint_verified_banner("  OFFICIAL RESULT: VERIFIED", env, Tty(), verdict="VERIFIED")
     for msg in ("RESULT: SELF_ATTESTED", "Challenge kickoff PASSED", "RESULT: FAIL", "SELF-ATTESTED"):
+        assert GOLD not in qc.tint_verified_banner(msg, env, Tty(), verdict="VERIFIED")
         assert GOLD not in qc.tint_verified_banner(msg, env, Tty())
-    assert GOLD not in qc.tint_verified_banner("RESULT: VERIFIED", {"NO_COLOR": "1"}, Tty())
-    assert GOLD not in qc.tint_verified_banner("RESULT: VERIFIED", env, io.StringIO())
+    # Fail closed: the same banner text without a typed VERIFIED verdict is not gold.
+    assert GOLD not in qc.tint_verified_banner("RESULT: VERIFIED", env, Tty())
+    assert GOLD not in qc.tint_verified_banner("RESULT: VERIFIED", {"NO_COLOR": "1"}, Tty(), verdict="VERIFIED")
+    assert GOLD not in qc.tint_verified_banner("RESULT: VERIFIED", env, io.StringIO(), verdict="VERIFIED")
 
 
 def test_snapshot_maps_status_without_inventing_a_device_claim():

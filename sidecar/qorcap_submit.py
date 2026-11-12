@@ -62,9 +62,9 @@ POW_PREFIX = "qortime-pow/v1|"      # = compat.json submit_auth.pow_prefix
 OFFLINE_KEY_KIND = "local-self-attested-offline"
 
 
-def say(msg: str = "") -> None:
+def say(msg: str = "", *, verdict: str | None = None) -> None:
     from qorcap_console import emit
-    emit(msg)
+    emit(msg, verdict=verdict)
 
 
 def _alert_warn(backend: str, detail: object) -> None:
@@ -442,7 +442,8 @@ def submit(bundle: Path, *, base: str, full: bool = False, key_path: Path | None
     save({"state": "complete", "verify": v})
     res = final["result"]
     say("\n" + "=" * 64)
-    say(f"  OFFICIAL RESULT: {v['status']}   (QorTime referee {v.get('referee_id') or final['referee']['pubkey'][:16]})")
+    say(f"  OFFICIAL RESULT: {v['status']}   (QorTime referee {v.get('referee_id') or final['referee']['pubkey'][:16]})",
+        verdict=v['status'])
     say("=" * 64)
     sc = "not read" if res.get("home_score") is None else f"AWAY {res['away_score']} - HOME {res['home_score']}"
     say(f"  Score:     {sc}  ({res.get('method')})")

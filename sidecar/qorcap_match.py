@@ -65,9 +65,9 @@ HERE = Path(__file__).resolve().parent
 WIN = sys.platform == "win32"
 
 
-def say(msg: str = "") -> None:
+def say(msg: str = "", *, verdict: str | None = None) -> None:
     from qorcap_console import emit
-    emit(msg)
+    emit(msg, verdict=verdict)
 
 
 def data_dir() -> Path:
@@ -2525,7 +2525,7 @@ def sign_and_report(bundle: Path, draft: dict, cps: list[dict], device, referee,
 
     r = rec["result"]
     say("\n" + "=" * 64)
-    say(f"  RESULT: {result}")
+    say(f"  RESULT: {result}", verdict=result)
     say("=" * 64)
     unconfirmed = no_final or draft["result"].get("final_confirmed") is not True
     score_txt = ("not read (no scorebug read during the match)" if r.get("home_score") is None else
