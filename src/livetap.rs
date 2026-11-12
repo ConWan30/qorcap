@@ -12,6 +12,13 @@
 //! short sha256 chain so a watch page can tell a missing or reordered cue from a clean run.
 //! The cues ride inside the HLS segments, so the live page and the replay read the same timing.
 //!
+//! End of session: just before the tap closes (the stop path, after the recording is finalised) the
+//! worker flushes the last media datagram and then sends one end cue (timed ID3 TXXX `qorweave`, same PID,
+//! JSON `kind: "end"`, the QorStream docs/STREAM_END.md shape) 3 times about 50 ms apart, so a receiver can
+//! end the stream at once. It is not a chain cue. It carries the last frame the tap sent and QorCap's own
+//! stop reason. Best effort and bounded (`END_WAIT_MAX`): a failed send is logged and never holds the stop,
+//! seal or countersign. Information only; it is not a score, a final or a result.
+//!
 //! What this is not: it is not in the hash chain, not in the receipt, not checked by `verify-bundle`
 //! and not a referee submission. It shows timing line-up (skill-proof / fair-proof context only).
 //! It does not say who holds the controller. The recording is byte-identical with the tap on or off.
@@ -21,7 +28,7 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs, UdpSocket};
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
@@ -45,6 +52,13 @@ pub const PKT_SIZE: usize = TS * DGRAM_PKTS;
 const PARTIAL_HOLD: Duration = Duration::from_millis(50);
 /// Requested UDP send buffer. The OS may grant less (or, on Linux, report double); the granted size is logged.
 pub const SNDBUF_WANT: usize = 8 << 20;
+/// `kind` of the end cue (QorStream docs/STREAM_END.md, qorstream 65a34e3). Same TXXX `qorweave` as every cue.
+pub const END_KIND: &str = "end";
+/// The end cue goes out this many times, `END_REPEAT_GAP` apart, byte-identical JSON (UDP loss).
+pub const END_REPEATS: usize = 3;
+pub const END_REPEAT_GAP: Duration = Duration::from_millis(50);
+/// Longest the stop path waits for the end cue (queue + 3 sends + ack). Never more.
+pub const END_WAIT_MAX: Duration = Duration::from_millis(300);
 /// Tap counters go to qorcap.log this often while the tap is on, and once more when the recording ends.
 const STATS_LOG_EVERY: Duration = Duration::from_secs(30);
 
@@ -113,10 +127,19 @@ pub struct TapStats {
     /// UDP send buffer the OS reports after asking for `SNDBUF_WANT`. None: could not be read.
     pub sndbuf_bytes: Option<usize>,
     pub last_hash: Option<String>,
+    /// End cue: None until the stop path asks; then `sent` or `send_failed`.
+    pub end_cue: Option<String>,
+    /// Copies of the end cue the socket accepted (of `END_REPEATS`).
+    pub end_cue_copies: u64,
 }
 
+/// What `LiveTap::end_session` did. `Sent`: at least one full copy of the end cue was accepted by the socket.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EndOutcome { NotEnabled, AlreadyEnded, Sent, SendFailed, WorkerBusy, NoAck }
+
 struct State {
-    sock: UdpSocket,
+    /// None once the end-of-session cue went out: the tap socket is closed.
+    sock: Option<UdpSocket>,
     dest: SocketAddr,
     out: Vec<u8>,
     pmt_pid: Option<u16>,
@@ -138,12 +161,16 @@ struct State {
     logged: (u64, u64, u64),
     queue_drops: Arc<AtomicU64>,
     queue_drop_pkts: Arc<AtomicU64>,
+    /// (file, frame, pts) of the last recorded frame whose packets this worker forwarded to the socket.
+    last_sent: Option<(String, i64, u64)>,
 }
 
 pub struct LiveTap {
     every: u32,
     state: Option<Arc<Mutex<State>>>,
-    tx: Option<mpsc::SyncSender<TapWork>>,
+    tx: Option<mpsc::SyncSender<Msg>>,
+    /// Set by `end_session`: later slices are ignored so the end cue stays last.
+    ended: AtomicBool,
     /// Frame numbering kept on the submitting (capture) thread. Only that thread locks it, so it never
     /// waits on the worker. A dropped slice still advances it, so later cue `f` values keep the
     /// frame_clock.jsonl rule instead of shifting by the frames that were dropped.
@@ -156,6 +183,19 @@ pub struct LiveTap {
 
 #[derive(Default)]
 struct FrameCount { file: Option<String>, frame: i64, last_pts: Option<u64> }
+
+enum Msg { Slice(TapWork), End(EndReq) }
+
+struct EndReq {
+    stop_reason: Option<String>,
+    t_mono_us: u64,
+    wall_anchor_ms: u64,
+    /// Submit-side frame count (file, next frame): frames past the worker's own count were dropped.
+    recorded: (Option<String>, i64),
+    /// Last moment the worker may still be sending the cue.
+    send_by: Instant,
+    done: mpsc::Sender<EndOutcome>,
+}
 
 /// Work item for the tap worker. The capture thread only try_sends this; it never waits on disk or UDP.
 struct TapWork {
@@ -175,7 +215,7 @@ struct TapWork {
 const TAP_QUEUE: usize = 32;
 
 impl LiveTap {
-    pub fn off() -> Self { Self { every: DEFAULT_EVERY, state: None, tx: None, count: Mutex::new(FrameCount::default()), queue_drops: Arc::new(AtomicU64::new(0)), queue_drop_pkts: Arc::new(AtomicU64::new(0)) } }
+    pub fn off() -> Self { Self { every: DEFAULT_EVERY, state: None, tx: None, ended: AtomicBool::new(false), count: Mutex::new(FrameCount::default()), queue_drops: Arc::new(AtomicU64::new(0)), queue_drop_pkts: Arc::new(AtomicU64::new(0)) } }
 
     pub fn open(dest: Option<SocketAddr>, every: u32, session: &str, fps: u32, bundle: Option<&Path>) -> Self {
         let Some(dest) = dest else { return Self::off() };
@@ -193,22 +233,28 @@ impl LiveTap {
             let _ = std::fs::create_dir_all(d);
             OpenOptions::new().create(true).append(true).open(d.join(FILE_NAME)).ok()
         });
-        let mut st = State { sock, dest, out: Vec::with_capacity(TS * DGRAM_PKTS), pmt_pid: None, file: None, frame: 0, last_pts: None, cc: 0, n: 0,
+        let mut st = State { sock: Some(sock), dest, out: Vec::with_capacity(TS * DGRAM_PKTS), pmt_pid: None, file: None, frame: 0, last_pts: None, cc: 0, n: 0,
             prev: "0".repeat(16), session: session.to_string(), fps, weave_ok: true, log,
             stats: TapStats { enabled: true, target: format!("udp://{dest}"), every, weave: true, pkt_size: PKT_SIZE, sndbuf_bytes: sndbuf, ..Default::default() },
-            out_since: None, last_log: Instant::now(), logged: (0, 0, 0), queue_drops: queue_drops.clone(), queue_drop_pkts: queue_drop_pkts.clone() };
+            out_since: None, last_log: Instant::now(), logged: (0, 0, 0), queue_drops: queue_drops.clone(), queue_drop_pkts: queue_drop_pkts.clone(), last_sent: None };
         if let Some(f) = st.log.as_mut() {
             let h = serde_json::json!({"type": "header", "schema": SCHEMA, "every": every, "id3_pid": ID3_PID, "target": format!("udp://{dest}"),
                 "note": "Practice-lane live tap. Each cue is also sent in-band as timed ID3 on the live stream. Not in the hash chain or the receipt."});
             let _ = writeln!(f, "{h}");
         }
         let state = Arc::new(Mutex::new(st));
-        let (tx, rx) = mpsc::sync_channel::<TapWork>(TAP_QUEUE);
+        let (tx, rx) = mpsc::sync_channel::<Msg>(TAP_QUEUE);
         let state_w = state.clone();
         let spawned = thread::Builder::new().name("qorcap-livetap".into()).spawn(move || {
             loop {
                 match rx.recv_timeout(PARTIAL_HOLD) {
-                    Ok(w) => {
+                    Ok(Msg::End(req)) => {
+                        let mut g = state_w.lock().unwrap_or_else(|e| e.into_inner());
+                        let out = end_cue(&mut g, every, &req);
+                        let _ = req.done.send(out);
+                        break; // the tap is closed; nothing is sent after the end cue
+                    }
+                    Ok(Msg::Slice(w)) => {
                         let mut g = state_w.lock().unwrap_or_else(|e| e.into_inner());
                         let ctx = w.ctx;
                         ingest(&mut g, every, &w.data, w.t_mono_us, &w.file, w.pat.as_deref(), w.pmt.as_deref(), &|| ctx.clone(), Some(w.start));
@@ -228,7 +274,34 @@ impl LiveTap {
             return Self::off();
         }
         log::info!("live tap ON -> udp://{dest} (practice lane, weave cue every {every} frames, recording unchanged)");
-        Self { every, state: Some(state), tx: Some(tx), count: Mutex::new(FrameCount::default()), queue_drops, queue_drop_pkts }
+        Self { every, state: Some(state), tx: Some(tx), ended: AtomicBool::new(false), count: Mutex::new(FrameCount::default()), queue_drops, queue_drop_pkts }
+    }
+
+    /// Stop path, after the recording is finalised: send the end cue (3 copies), then close the tap.
+    /// Queued slices go out first, then the last partial media datagram, then the cue. Bounded by
+    /// `wait` (at most `END_WAIT_MAX`); never blocks the stop longer and never fails it. Second call: no-op.
+    /// `t_mono_us` is on the engine's monotonic clock (same Instant as cue `t` and inputs.jsonl `t_us`).
+    pub fn end_session(&self, stop_reason: Option<&str>, t_mono_us: u64, wall_anchor_ms: u64, wait: Duration) -> EndOutcome {
+        let Some(tx) = &self.tx else { return EndOutcome::NotEnabled };
+        if self.ended.swap(true, Ordering::SeqCst) { return EndOutcome::AlreadyEnded; }
+        let start = Instant::now();
+        let deadline = start + wait.min(END_WAIT_MAX);
+        let recorded = { let c = self.count.lock().unwrap_or_else(|e| e.into_inner()); (c.file.clone(), c.frame) };
+        let (dtx, drx) = mpsc::channel();
+        let send_by = deadline.checked_sub(Duration::from_millis(25)).unwrap_or(deadline).max(start);
+        let mut msg = Msg::End(EndReq { stop_reason: stop_reason.map(str::to_string), t_mono_us, wall_anchor_ms, recorded, send_by, done: dtx });
+        loop {
+            match tx.try_send(msg) {
+                Ok(()) => break,
+                Err(mpsc::TrySendError::Full(m)) => {
+                    if Instant::now() >= deadline { return EndOutcome::WorkerBusy; }
+                    msg = m;
+                    thread::sleep(Duration::from_millis(2));
+                }
+                Err(mpsc::TrySendError::Disconnected(_)) => return EndOutcome::WorkerBusy,
+            }
+        }
+        drx.recv_timeout(deadline.saturating_duration_since(Instant::now())).unwrap_or(EndOutcome::NoAck)
     }
 
     /// End of a recording: send any partial datagram and write the tap counters to qorcap.log.
@@ -256,6 +329,7 @@ impl LiveTap {
     /// Synchronous; used by unit tests. The capture loop calls `submit` so this work cannot stall ffmpeg.
     pub fn observe(&self, data: &[u8], t_mono_us: u64, file: &str, pat: Option<&[u8]>, pmt: Option<&[u8]>, ctx: &dyn Fn() -> WeaveCtx) {
         let Some(m) = &self.state else { return };
+        if self.ended.load(Ordering::SeqCst) { return; }
         let mut g = m.lock().unwrap_or_else(|e| e.into_inner());
         ingest(&mut g, self.every, data, t_mono_us, file, pat, pmt, ctx, None);
     }
@@ -265,6 +339,7 @@ impl LiveTap {
     /// worker is behind, the slice is dropped and counted in `queue_drops`; the recording is unchanged.
     pub fn submit(&self, data: &[u8], t_mono_us: u64, file: &str, pat: Option<&[u8]>, pmt: Option<&[u8]>, ctx: WeaveCtx) {
         let Some(tx) = &self.tx else { return };
+        if self.ended.load(Ordering::SeqCst) { return; }
         let start = self.count.lock().unwrap_or_else(|e| e.into_inner()).advance(data, file);
         let work = TapWork {
             data: data.to_vec(),
@@ -275,7 +350,7 @@ impl LiveTap {
             ctx,
             start,
         };
-        if tx.try_send(work).is_err() {
+        if tx.try_send(Msg::Slice(work)).is_err() {
             self.queue_drops.fetch_add(1, Ordering::Relaxed);
             self.queue_drop_pkts.fetch_add((data.len() / TS) as u64, Ordering::Relaxed);
         }
@@ -340,6 +415,7 @@ fn ingest(st: &mut State, every: u32, data: &[u8], t_mono_us: u64, file: &str, p
         let frame = st.frame;
         st.frame += 1;
         st.stats.frames += 1;
+        st.last_sent = Some((file.to_string(), frame, pts));
         if !st.weave_ok || frame % every as i64 != 0 { continue; }
         let c = cached_ctx.get_or_insert_with(ctx).clone();
         let (line, h) = cue_json(st, &c, file, frame, pts, t_mono_us);
@@ -406,7 +482,11 @@ fn push(st: &mut State, pkt: &[u8]) {
 fn flush(st: &mut State) {
     st.out_since = None;
     if st.out.is_empty() { return; }
-    match st.sock.send_to(&st.out, st.dest) {
+    let sent = match st.sock.as_ref() {
+        Some(s) => s.send_to(&st.out, st.dest),
+        None => Err(std::io::Error::new(std::io::ErrorKind::NotConnected, "live tap closed")),
+    };
+    match sent {
         Ok(_) => st.stats.datagrams += 1,
         Err(e) => {
             st.stats.send_errors += 1;
@@ -478,6 +558,79 @@ fn cue_json(st: &State, c: &WeaveCtx, file: &str, frame: i64, pts: u64, t: u64) 
     let v = serde_json::json!({"v": SCHEMA, "n": st.n, "sid": st.session, "file": file, "f": frame, "pts": pts, "t": t, "w": w, "fps": st.fps,
         "every": st.stats.every, "seal": c.seal, "sh": c.seal_hash, "pad": c.pad, "lp": lp, "ph": st.prev, "h": h});
     (v.to_string(), h)
+}
+
+/// The text the end cue's optional `h` covers. Missing values are empty. The end cue is not a chain cue:
+/// `h` only lets a receiver check the cue it got; nothing links on from it.
+#[allow(clippy::too_many_arguments)]
+pub fn end_preimage(prev: &str, n: u64, sid: &str, file: Option<&str>, f: Option<i64>, pts: Option<u64>, t: u64, w: u64, stop_reason: Option<&str>) -> String {
+    format!("{SCHEMA}|{END_KIND}|{n}|{sid}|{}|{}|{}|{t}|{w}|{}|{prev}", file.unwrap_or(""),
+        f.map(|x| x.to_string()).unwrap_or_default(), pts.map(|x| x.to_string()).unwrap_or_default(), stop_reason.unwrap_or(""))
+}
+
+/// The end cue JSON (docs/LIVE_TAP.md). Keys in this order; the same string for all copies and the log.
+pub fn end_cue_json(n: u64, sid: &str, file: Option<&str>, f: Option<i64>, pts: Option<u64>, t: u64, w: u64, stop_reason: Option<&str>, prev: &str) -> String {
+    let h = chain_hash(&end_preimage(prev, n, sid, file, f, pts, t, w, stop_reason));
+    serde_json::json!({"v": SCHEMA, "kind": END_KIND, "n": n, "sid": sid, "file": file, "f": f, "pts": pts, "t": t, "w": w,
+        "stop_reason": stop_reason, "ph": prev, "h": h}).to_string()
+}
+
+/// Worker side of `end_session`: last media datagram, then 3 copies of the end cue, then close the socket.
+fn end_cue(st: &mut State, every: u32, req: &EndReq) -> EndOutcome {
+    // Frames the submit side counted that this worker never saw were in dropped slices at the very end.
+    if let Some(rf) = req.recorded.0.as_deref() {
+        let from = if st.file.as_deref() == Some(rf) { st.frame } else { 0 };
+        if req.recorded.1 > from {
+            st.stats.skipped_frames += (req.recorded.1 - from) as u64;
+            st.stats.skipped_cue_slots += cue_slots(from, req.recorded.1, every);
+        }
+    }
+    flush(st); // the last media datagram goes out before the cue
+    st.stats.queue_drops = st.queue_drops.load(Ordering::Relaxed);
+    st.stats.queue_dropped_packets = st.queue_drop_pkts.load(Ordering::Relaxed);
+    let t = req.t_mono_us;
+    let anchor = if req.wall_anchor_ms > 0 { req.wall_anchor_ms } else { st.session.parse().unwrap_or(0) };
+    let w = anchor + t / 1000;
+    let (file, f, pts) = match &st.last_sent { Some((a, b, c)) => (Some(a.clone()), Some(*b), Some(*c)), None => (None, None, None) };
+    // n = last cue n + 1 (st.n is the next cue number), ph = last cue h. Not counted as a cue: st.n,
+    // st.prev and `cues` stay as they are.
+    let line = end_cue_json(st.n, &st.session, file.as_deref(), f, pts, t, w, req.stop_reason.as_deref(), &st.prev);
+    let tag = id3_txxx(CUE_KEY, &line);
+    let mut copies = 0u64;
+    for k in 0..END_REPEATS {
+        if k > 0 {
+            if Instant::now() + END_REPEAT_GAP > req.send_by { break; }
+            thread::sleep(END_REPEAT_GAP);
+        }
+        // Same JSON each time; a fresh PES so the ID3 PID's continuity counter keeps counting.
+        let bytes: Vec<u8> = id3_pes_packets(&mut st.cc, &tag, pts.unwrap_or(0)).concat();
+        // Stop a copy at its first refused datagram: the rest of a broken PES is of no use to a receiver.
+        if bytes.chunks(PKT_SIZE).all(|dg| send_bounded(st, dg, req.send_by)) { copies += 1; }
+    }
+    st.stats.end_cue_copies = copies;
+    st.stats.end_cue = Some(if copies > 0 { "sent" } else { "send_failed" }.into());
+    // One non-chain end record in the weave log: the exact JSON that went out.
+    if let Some(fh) = st.log.as_mut() { let _ = writeln!(fh, "{line}"); let _ = fh.flush(); }
+    st.sock = None; // the tap is closed
+    if copies > 0 { EndOutcome::Sent } else { EndOutcome::SendFailed }
+}
+
+/// One datagram of the end cue. WouldBlock is retried until `by`; any other error, or `by`, gives up.
+fn send_bounded(st: &mut State, dg: &[u8], by: Instant) -> bool {
+    loop {
+        let r = match st.sock.as_ref() { Some(s) => s.send_to(dg, st.dest), None => return false };
+        match r {
+            Ok(_) => { st.stats.datagrams += 1; return true; }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock && Instant::now() < by => thread::sleep(Duration::from_millis(1)),
+            Err(e) => {
+                st.stats.send_errors += 1;
+                st.stats.send_dropped_packets += (dg.len() / TS) as u64;
+                if e.kind() == std::io::ErrorKind::WouldBlock { st.stats.send_would_block += 1; }
+                log::warn!("live tap: end cue datagram not sent ({e}); the stop continues");
+                return false;
+            }
+        }
+    }
 }
 
 /// MPEG-2 CRC-32 (poly 0x04C11DB7, no reflection), as used by PSI sections.
@@ -823,5 +976,185 @@ mod tests {
         assert_eq!((s.datagrams, s.send_errors, s.queue_drops), (3, 0, 0));
         tap.log_summary("test");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Complete ID3 PES on `ID3_PID` in wire order: (first packet index, last packet index, TXXX description, value).
+    pub(crate) fn wire_id3(bytes: &[u8]) -> Vec<(usize, usize, String, String)> {
+        let mut out = vec![];
+        let mut cur: Option<(usize, Vec<u8>)> = None;
+        let pkts: Vec<&[u8]> = bytes.chunks_exact(TS).collect();
+        let close = |cur: &mut Option<(usize, Vec<u8>)>, end: usize, out: &mut Vec<(usize, usize, String, String)>| {
+            let Some((start, b)) = cur.take() else { return };
+            let tag = &b[9 + b[8] as usize..];
+            assert_eq!(&tag[..3], b"ID3");
+            let fr = &tag[10..];
+            assert_eq!(&fr[..4], b"TXXX");
+            let n = ((fr[4] as usize) << 21) | ((fr[5] as usize) << 14) | ((fr[6] as usize) << 7) | fr[7] as usize;
+            let body = &fr[10..10 + n];
+            let z = body[1..].iter().position(|&c| c == 0).unwrap() + 1;
+            out.push((start, end, String::from_utf8(body[1..z].to_vec()).unwrap(), String::from_utf8(body[z + 1..].to_vec()).unwrap()));
+        };
+        for (i, p) in pkts.iter().enumerate() {
+            if ring::pid(p) != ID3_PID { continue; }
+            let mut k = 4;
+            if p[3] & 0x20 != 0 { k += 1 + p[4] as usize; }
+            if p[1] & 0x40 != 0 { close(&mut cur, i.saturating_sub(1), &mut out); cur = Some((i, vec![])); }
+            if let Some((_, b)) = cur.as_mut() {
+                b.extend_from_slice(&p[k..]);
+                let plen = if b.len() >= 6 { ((b[4] as usize) << 8) | b[5] as usize } else { 0 };
+                if plen > 0 && b.len() >= 6 + plen { b.truncate(6 + plen); close(&mut cur, i, &mut out); }
+            }
+        }
+        out
+    }
+
+    fn recv_all(rx: &UdpSocket) -> Vec<u8> {
+        rx.set_read_timeout(Some(std::time::Duration::from_millis(300))).unwrap();
+        let mut got = vec![];
+        let mut buf = [0u8; 65536];
+        while let Ok(n) = rx.recv(&mut buf) { got.extend_from_slice(&buf[..n]); }
+        got
+    }
+
+    #[test]
+    fn end_cue_goes_out_3_identical_times_last_after_the_media_and_is_not_a_chain_cue() {
+        let rx = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let dir = std::env::temp_dir().join(format!("qorcap-livetap-end-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let tap = LiveTap::open(Some(rx.local_addr().unwrap()), 2, "1700000000000", 60, Some(&dir));
+        for k in 0..5u64 {
+            let data: Vec<u8> = [frame_pkt(2 * k), frame_pkt(2 * k + 1)].concat();
+            tap.submit(&data, 1_000 * k, "video.mp4", None, Some(&pmt_packet()), WeaveCtx { wall_anchor_ms: 1_700_000_000_000, seal: "locked".into(), ..Default::default() });
+        }
+        wait_for(|| tap.stats().unwrap().frames == 10);
+        // Right away, inside the 50 ms partial hold: the held media tail must still go out before the cue.
+        let t0 = Instant::now();
+        assert_eq!(tap.end_session(Some("post_final_tail"), 9_000_000, 1_700_000_000_000, END_WAIT_MAX), EndOutcome::Sent);
+        let took = t0.elapsed();
+        assert!(took <= END_WAIT_MAX && took >= END_REPEAT_GAP * 2, "{took:?}");
+        assert_eq!(tap.end_session(None, 1, 1, END_WAIT_MAX), EndOutcome::AlreadyEnded, "one end per session");
+        tap.submit(&frame_pkt(10), 2, "video.mp4", None, None, WeaveCtx::default());
+        tap.observe(&frame_pkt(11), 2, "video.mp4", None, None, &WeaveCtx::default);
+        let got = recv_all(&rx);
+        assert_eq!(got.len() % TS, 0);
+        let pkts: Vec<&[u8]> = got.chunks_exact(TS).collect();
+        let media: Vec<usize> = (0..pkts.len()).filter(|&i| ring::pid(pkts[i]) == 0x100).collect();
+        assert_eq!(media.len(), 10, "frames after end_session are not sent");
+        let id3 = wire_id3(&got);
+        assert!(id3.iter().all(|x| x.2 == CUE_KEY), "every cue, end included, is TXXX qorweave");
+        let parsed: Vec<serde_json::Value> = id3.iter().map(|x| serde_json::from_str(&x.3).unwrap()).collect();
+        let ends: Vec<usize> = (0..id3.len()).filter(|&i| parsed[i]["kind"] == END_KIND).collect();
+        assert_eq!(ends.len(), END_REPEATS, "3 copies");
+        assert_eq!(ends, (id3.len() - END_REPEATS..id3.len()).collect::<Vec<_>>(), "the copies are the last cues");
+        assert!(ends.iter().all(|&i| id3[i].3 == id3[ends[0]].3), "byte-identical JSON");
+        assert_eq!(id3.last().unwrap().1, pkts.len() - 1, "the end cue is the last thing on the wire");
+        assert!(media.iter().all(|&i| i < id3[ends[0]].0), "after the final media packet");
+        // Continuity counter on the ID3 PID keeps counting across the copies.
+        let ccs: Vec<u8> = pkts.iter().filter(|p| ring::pid(p) == ID3_PID).map(|p| p[3] & 0x0f).collect();
+        assert!(ccs.windows(2).all(|w| w[1] == (w[0] + 1) & 0x0f), "{ccs:?}");
+        let c = &parsed[ends[0]];
+        let keys: Vec<&str> = c.as_object().unwrap().keys().map(|k| k.as_str()).collect();
+        assert_eq!(keys, ["v", "kind", "n", "sid", "file", "f", "pts", "t", "w", "stop_reason", "ph", "h"], "STREAM_END.md shape, nothing else");
+        assert_eq!((c["v"].as_str(), c["kind"].as_str(), c["stop_reason"].as_str()), (Some(SCHEMA), Some("end"), Some("post_final_tail")));
+        assert_eq!((c["file"].as_str(), c["f"].as_i64(), c["pts"].as_u64()), (Some("video.mp4"), Some(9), Some(900 + 1500 * 9)));
+        assert_eq!((c["t"].as_u64(), c["w"].as_u64(), c["sid"].as_str()), (Some(9_000_000), Some(1_700_000_009_000), Some("1700000000000")));
+        let b = &pkts[id3[ends[0]].0][13..18];
+        let pts = (((b[0] as u64) & 0x0e) << 29) | ((b[1] as u64) << 22) | (((b[2] as u64) & 0xfe) << 14) | ((b[3] as u64) << 7) | (((b[4] as u64) & 0xfe) >> 1);
+        assert_eq!(pts, 900 + 1500 * 9, "ID3 PTS = last sent frame");
+        // n = last cue n + 1, ph = last cue h; not a chain cue.
+        let frames: Vec<&serde_json::Value> = parsed.iter().filter(|c| c.get("kind").is_none()).collect();
+        assert_eq!(frames.len(), 5);
+        assert_eq!(c["n"], 5);
+        assert_eq!(c["ph"], frames[4]["h"]);
+        let pre = end_preimage(c["ph"].as_str().unwrap(), 5, "1700000000000", Some("video.mp4"), Some(9), Some(900 + 1500 * 9), 9_000_000, 1_700_000_009_000, Some("post_final_tail"));
+        assert_eq!(c["h"].as_str().unwrap(), chain_hash(&pre));
+        let s = tap.stats().unwrap();
+        assert_eq!((s.cues, s.end_cue.as_deref(), s.end_cue_copies), (5, Some("sent"), 3), "cue count unchanged by the end cue");
+        // Weave log: the chain cues as before, then one non-chain end record = the exact JSON on the wire.
+        let log = std::fs::read_to_string(dir.join(FILE_NAME)).unwrap();
+        let lines: Vec<&str> = log.lines().skip(1).collect();
+        let mut wire: Vec<&str> = id3.iter().map(|x| x.3.as_str()).collect();
+        wire.dedup();
+        assert_eq!(lines, wire);
+        if let Ok(p) = std::env::var("QORCAP_LIVETAP_DUMP") { std::fs::write(p, &got).unwrap(); }
+        tap.log_summary("test");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn end_cue_names_the_last_frame_sent_and_the_summary_counts_trailing_drops() {
+        let rx = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let dir = std::env::temp_dir().join(format!("qorcap-livetap-endq-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let tap = LiveTap::open(Some(rx.local_addr().unwrap()), 1, "1700", 60, Some(&dir));
+        for k in 0..3u64 { tap.submit(&frame_pkt(k), k, "video.mp4", None, None, WeaveCtx::default()); }
+        wait_for(|| tap.stats().unwrap().frames == 3);
+        {
+            let _busy = tap.state.as_ref().unwrap().lock().unwrap();
+            // Let the worker settle on the lock (holding this slice or not), so every later drop is trailing.
+            tap.submit(&frame_pkt(3), 3, "video.mp4", None, None, WeaveCtx::default());
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            for k in 4..(3 + TAP_QUEUE as u64 + 8) { tap.submit(&frame_pkt(k), k, "video.mp4", None, None, WeaveCtx::default()); }
+        }
+        let drops = tap.queue_drops.load(Ordering::Relaxed);
+        assert!(drops >= 4);
+        assert_eq!(tap.end_session(Some("pipe_broken"), 5, 1_700, END_WAIT_MAX), EndOutcome::Sent);
+        let id3 = wire_id3(&recv_all(&rx));
+        let c: serde_json::Value = serde_json::from_str(&id3.last().unwrap().3).unwrap();
+        let sent = 3 + TAP_QUEUE as u64 + 8 - drops;
+        assert_eq!(c["f"].as_u64(), Some(sent - 1), "last frame the tap actually sent, not the last recorded");
+        assert_eq!(c["stop_reason"], "pipe_broken");
+        let s = tap.stats().unwrap();
+        assert_eq!((s.skipped_frames, s.skipped_cue_slots), (drops, drops), "trailing drops are counted for the summary");
+        assert_eq!(s.cues + drops, 3 + TAP_QUEUE as u64 + 8, "every cue slot is a cue or a skip");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn end_cue_send_failure_or_a_stuck_worker_never_holds_the_stop() {
+        let rx = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let dir = std::env::temp_dir().join(format!("qorcap-livetap-endf-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // Refused send: an IPv4 socket cannot send to an IPv6 address.
+        let tap = LiveTap::open(Some(rx.local_addr().unwrap()), 1, "1700", 60, Some(&dir));
+        tap.submit(&frame_pkt(0), 0, "video.mp4", None, None, WeaveCtx::default());
+        wait_for(|| tap.stats().unwrap().frames == 1);
+        tap.state.as_ref().unwrap().lock().unwrap().dest = "[::1]:9".parse().unwrap();
+        let t0 = Instant::now();
+        assert_eq!(tap.end_session(Some("enter"), 1, 1, END_WAIT_MAX), EndOutcome::SendFailed);
+        assert!(t0.elapsed() <= END_WAIT_MAX + Duration::from_millis(50), "{:?}", t0.elapsed());
+        let s = tap.stats().unwrap();
+        assert_eq!((s.end_cue.as_deref(), s.end_cue_copies), (Some("send_failed"), 0));
+        assert!(s.send_errors >= 1);
+        let log = std::fs::read_to_string(dir.join(FILE_NAME)).unwrap();
+        assert!(log.lines().last().unwrap().contains("\"kind\":\"end\""), "QorCap's log still records the cue it cut");
+        tap.log_summary("test");
+        // Stuck worker: the stop path gives up at the bound.
+        let tap2 = LiveTap::open(Some(rx.local_addr().unwrap()), 1, "1700", 60, None);
+        let busy = tap2.state.as_ref().unwrap().lock().unwrap();
+        let t1 = Instant::now();
+        assert_eq!(tap2.end_session(None, 1, 1, END_WAIT_MAX), EndOutcome::NoAck);
+        assert!(t1.elapsed() <= END_WAIT_MAX + Duration::from_millis(50), "{:?}", t1.elapsed());
+        drop(busy);
+        // The late cue still goes out once the worker is free (to the same live receiver, not a reused port).
+        wait_for(|| tap2.stats().unwrap().end_cue.is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn off_tap_end_session_sends_and_writes_nothing() {
+        let off = LiveTap::off();
+        assert_eq!(off.end_session(Some("enter"), 1, 1, END_WAIT_MAX), EndOutcome::NotEnabled);
+        assert!(off.stats().is_none());
+    }
+
+    #[test]
+    fn end_cue_json_matches_the_stream_end_shape() {
+        let j = end_cue_json(2852, "1794447645238", Some("video.mp4"), Some(42767), Some(64152420), 713950000, 1794448359140, Some("post_final_tail"), "2c0035f0b7fb89f9");
+        let pre = end_preimage("2c0035f0b7fb89f9", 2852, "1794447645238", Some("video.mp4"), Some(42767), Some(64152420), 713950000, 1794448359140, Some("post_final_tail"));
+        assert_eq!(pre, "qorweave/v0|end|2852|1794447645238|video.mp4|42767|64152420|713950000|1794448359140|post_final_tail|2c0035f0b7fb89f9");
+        assert_eq!(j, format!(r#"{{"v":"qorweave/v0","kind":"end","n":2852,"sid":"1794447645238","file":"video.mp4","f":42767,"pts":64152420,"t":713950000,"w":1794448359140,"stop_reason":"post_final_tail","ph":"2c0035f0b7fb89f9","h":"{}"}}"#, chain_hash(&pre)));
+        let none = end_cue_json(0, "1700", None, None, None, 5, 1705, None, "0000000000000000");
+        assert!(none.contains(r#""file":null,"f":null,"pts":null"#) && none.contains(r#""stop_reason":null"#), "{none}");
     }
 }
