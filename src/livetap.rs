@@ -22,6 +22,7 @@ use std::io::Write;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs, UdpSocket};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 
@@ -35,8 +36,17 @@ pub const ID3_PID: u16 = 0x01E0;
 /// ID3 TXXX description that names a weave cue.
 pub const CUE_KEY: &str = "qorweave";
 pub const DEFAULT_EVERY: u32 = 15;
-/// 7 TS packets per datagram (1316 bytes), the usual MPEG-TS-over-UDP size.
+/// 7 TS packets per datagram (1316 bytes, `pkt_size=1316`), the usual MPEG-TS-over-UDP size.
+/// The worker sends only full 1316-byte datagrams; a partial tail waits for the next slice and is
+/// flushed after `PARTIAL_HOLD` with no new slice, or at the end of the recording.
 const DGRAM_PKTS: usize = 7;
+pub const PKT_SIZE: usize = TS * DGRAM_PKTS;
+/// Longest a partial datagram waits for the next slice before it is sent short.
+const PARTIAL_HOLD: Duration = Duration::from_millis(50);
+/// Requested UDP send buffer. The OS may grant less (or, on Linux, report double); the granted size is logged.
+pub const SNDBUF_WANT: usize = 8 << 20;
+/// Tap counters go to qorcap.log this often while the tap is on, and once more when the recording ends.
+const STATS_LOG_EVERY: Duration = Duration::from_secs(30);
 
 /// Resolve the tap target. `Ok(None)`: tap off. `Err`: asked for but refused (logged by the caller).
 /// Only `udp://` to a loopback address is accepted, and only on the practice lane.
@@ -88,6 +98,20 @@ pub struct TapStats {
     pub send_errors: u64,
     /// TS slices dropped because the tap worker was behind. Not dshow drops; the recording is unchanged.
     pub queue_drops: u64,
+    /// TS packets inside those dropped slices (188 bytes each).
+    pub queue_dropped_packets: u64,
+    /// Recorded frames the worker never saw because their slice was dropped.
+    pub skipped_frames: u64,
+    /// Cue slots (every `every` frames) that got no cue because their frame was in a dropped slice.
+    pub skipped_cue_slots: u64,
+    /// TS packets in datagrams the socket refused (`send_errors` counts the datagrams).
+    pub send_dropped_packets: u64,
+    /// Of `send_errors`, how many were WouldBlock (send buffer full).
+    pub send_would_block: u64,
+    /// Bytes per full datagram (7 x 188).
+    pub pkt_size: usize,
+    /// UDP send buffer the OS reports after asking for `SNDBUF_WANT`. None: could not be read.
+    pub sndbuf_bytes: Option<usize>,
     pub last_hash: Option<String>,
 }
 
@@ -107,6 +131,13 @@ struct State {
     weave_ok: bool,
     log: Option<std::fs::File>,
     stats: TapStats,
+    /// When the current partial datagram in `out` started waiting.
+    out_since: Option<Instant>,
+    last_log: Instant,
+    /// Counters at the previous stats line, for the per-interval deltas.
+    logged: (u64, u64, u64),
+    queue_drops: Arc<AtomicU64>,
+    queue_drop_pkts: Arc<AtomicU64>,
 }
 
 pub struct LiveTap {
@@ -118,7 +149,9 @@ pub struct LiveTap {
     /// frame_clock.jsonl rule instead of shifting by the frames that were dropped.
     count: Mutex<FrameCount>,
     /// TS slices dropped because the worker was behind. Atomic: the capture thread never takes `state`.
-    queue_drops: AtomicU64,
+    queue_drops: Arc<AtomicU64>,
+    /// TS packets in those dropped slices.
+    queue_drop_pkts: Arc<AtomicU64>,
 }
 
 #[derive(Default)]
@@ -136,23 +169,34 @@ struct TapWork {
     start: (i64, Option<u64>),
 }
 
-/// A few queued slices is enough; if the worker falls behind we drop tap data, never the recording.
-const TAP_QUEUE: usize = 8;
+/// Queued slices (each at most one 96 KB capture read). 8 was too few on a loaded PC: on
+/// 2026-11-11 practice match-20261111-183311, 15.6% of cue slots were skipped. 32 bounds the queue at
+/// about 3 MB. If the worker still falls behind we drop tap data, never the recording.
+const TAP_QUEUE: usize = 32;
 
 impl LiveTap {
-    pub fn off() -> Self { Self { every: DEFAULT_EVERY, state: None, tx: None, count: Mutex::new(FrameCount::default()), queue_drops: AtomicU64::new(0) } }
+    pub fn off() -> Self { Self { every: DEFAULT_EVERY, state: None, tx: None, count: Mutex::new(FrameCount::default()), queue_drops: Arc::new(AtomicU64::new(0)), queue_drop_pkts: Arc::new(AtomicU64::new(0)) } }
 
     pub fn open(dest: Option<SocketAddr>, every: u32, session: &str, fps: u32, bundle: Option<&Path>) -> Self {
         let Some(dest) = dest else { return Self::off() };
         let bind: SocketAddr = if dest.is_ipv4() { SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0) } else { "[::1]:0".parse().unwrap() };
         let sock = match UdpSocket::bind(bind) { Ok(s) => s, Err(e) => { log::error!("live tap: cannot bind {bind}: {e}"); return Self::off(); } };
         let _ = sock.set_nonblocking(true);
+        let sndbuf = set_send_buffer(&sock, SNDBUF_WANT);
+        match sndbuf {
+            Some(n) => log::info!("live tap: UDP send buffer asked {} bytes, OS reports {n} bytes; datagrams {PKT_SIZE} bytes (pkt_size, 7 TS packets)", SNDBUF_WANT),
+            None => log::warn!("live tap: could not set or read the UDP send buffer (asked {} bytes); using the OS default", SNDBUF_WANT),
+        }
+        let queue_drops = Arc::new(AtomicU64::new(0));
+        let queue_drop_pkts = Arc::new(AtomicU64::new(0));
         let log = bundle.and_then(|d| {
             let _ = std::fs::create_dir_all(d);
             OpenOptions::new().create(true).append(true).open(d.join(FILE_NAME)).ok()
         });
         let mut st = State { sock, dest, out: Vec::with_capacity(TS * DGRAM_PKTS), pmt_pid: None, file: None, frame: 0, last_pts: None, cc: 0, n: 0,
-            prev: "0".repeat(16), session: session.to_string(), fps, weave_ok: true, log, stats: TapStats { enabled: true, target: format!("udp://{dest}"), every, weave: true, ..Default::default() } };
+            prev: "0".repeat(16), session: session.to_string(), fps, weave_ok: true, log,
+            stats: TapStats { enabled: true, target: format!("udp://{dest}"), every, weave: true, pkt_size: PKT_SIZE, sndbuf_bytes: sndbuf, ..Default::default() },
+            out_since: None, last_log: Instant::now(), logged: (0, 0, 0), queue_drops: queue_drops.clone(), queue_drop_pkts: queue_drop_pkts.clone() };
         if let Some(f) = st.log.as_mut() {
             let h = serde_json::json!({"type": "header", "schema": SCHEMA, "every": every, "id3_pid": ID3_PID, "target": format!("udp://{dest}"),
                 "note": "Practice-lane live tap. Each cue is also sent in-band as timed ID3 on the live stream. Not in the hash chain or the receipt."});
@@ -162,10 +206,21 @@ impl LiveTap {
         let (tx, rx) = mpsc::sync_channel::<TapWork>(TAP_QUEUE);
         let state_w = state.clone();
         let spawned = thread::Builder::new().name("qorcap-livetap".into()).spawn(move || {
-            while let Ok(w) = rx.recv() {
-                let mut g = state_w.lock().unwrap_or_else(|e| e.into_inner());
-                let ctx = w.ctx;
-                ingest(&mut g, every, &w.data, w.t_mono_us, &w.file, w.pat.as_deref(), w.pmt.as_deref(), &|| ctx.clone(), Some(w.start));
+            loop {
+                match rx.recv_timeout(PARTIAL_HOLD) {
+                    Ok(w) => {
+                        let mut g = state_w.lock().unwrap_or_else(|e| e.into_inner());
+                        let ctx = w.ctx;
+                        ingest(&mut g, every, &w.data, w.t_mono_us, &w.file, w.pat.as_deref(), w.pmt.as_deref(), &|| ctx.clone(), Some(w.start));
+                        maybe_log_stats(&mut g, Instant::now());
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        let mut g = state_w.lock().unwrap_or_else(|e| e.into_inner());
+                        if g.out_since.map(|t| t.elapsed() >= PARTIAL_HOLD).unwrap_or(false) { flush(&mut g); }
+                        maybe_log_stats(&mut g, Instant::now());
+                    }
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                }
             }
         });
         if let Err(e) = spawned {
@@ -173,7 +228,16 @@ impl LiveTap {
             return Self::off();
         }
         log::info!("live tap ON -> udp://{dest} (practice lane, weave cue every {every} frames, recording unchanged)");
-        Self { every, state: Some(state), tx: Some(tx), count: Mutex::new(FrameCount::default()), queue_drops: AtomicU64::new(0) }
+        Self { every, state: Some(state), tx: Some(tx), count: Mutex::new(FrameCount::default()), queue_drops, queue_drop_pkts }
+    }
+
+    /// End of a recording: send any partial datagram and write the tap counters to qorcap.log.
+    pub fn log_summary(&self, why: &str) {
+        let Some(m) = &self.state else { return };
+        let mut g = m.lock().unwrap_or_else(|e| e.into_inner());
+        flush(&mut g);
+        let line = stats_line(&g);
+        log::info!("live tap summary ({why}): {line}");
     }
 
     pub fn enabled(&self) -> bool { self.state.is_some() }
@@ -182,6 +246,7 @@ impl LiveTap {
         self.state.as_ref().map(|m| {
             let mut s = m.lock().unwrap_or_else(|e| e.into_inner()).stats.clone();
             s.queue_drops = self.queue_drops.load(Ordering::Relaxed);
+            s.queue_dropped_packets = self.queue_drop_pkts.load(Ordering::Relaxed);
             s
         })
     }
@@ -212,6 +277,7 @@ impl LiveTap {
         };
         if tx.try_send(work).is_err() {
             self.queue_drops.fetch_add(1, Ordering::Relaxed);
+            self.queue_drop_pkts.fetch_add((data.len() / TS) as u64, Ordering::Relaxed);
         }
     }
 }
@@ -247,7 +313,16 @@ fn ingest(st: &mut State, every: u32, data: &[u8], t_mono_us: u64, file: &str, p
         if let Some(p) = pmt { if p.len() == TS { let q = rewrite_or_pass(st, p); push(st, &q); } }
     }
     // Worker path: the submitting thread's count, so slices dropped before this one do not shift `f`.
-    if let Some((frame, last_pts)) = start { st.frame = frame; st.last_pts = last_pts; }
+    // Frames the count moved past without this worker seeing them were in dropped slices; count
+    // them and the cue slots they held.
+    if let Some((frame, last_pts)) = start {
+        if frame > st.frame {
+            st.stats.skipped_frames += (frame - st.frame) as u64;
+            st.stats.skipped_cue_slots += cue_slots(st.frame, frame, every);
+        }
+        st.frame = frame;
+        st.last_pts = last_pts;
+    }
     let mut cached_ctx: Option<WeaveCtx> = None;
     for pkt in data.chunks_exact(TS) {
         let pid = ring::pid(pkt);
@@ -275,7 +350,43 @@ fn ingest(st: &mut State, every: u32, data: &[u8], t_mono_us: u64, file: &str, p
         st.stats.last_hash = Some(h);
         if let Some(f) = st.log.as_mut() { let _ = writeln!(f, "{line}"); }
     }
-    flush(st);
+    // Worker path (`start` set): keep a partial datagram for the next slice so datagrams stay
+    // PKT_SIZE; the worker flushes it after PARTIAL_HOLD. Synchronous `observe` sends it now.
+    if start.is_none() { flush(st); }
+}
+
+/// Cue slots (frame indexes divisible by `every`) in `[from, to)`.
+pub fn cue_slots(from: i64, to: i64, every: u32) -> u64 {
+    let e = every.max(1) as i64;
+    let (a, b) = (from.max(0), to.max(0));
+    if b <= a { return 0; }
+    ((b + e - 1) / e - (a + e - 1) / e) as u64
+}
+
+fn stats_line(st: &State) -> String {
+    let s = &st.stats;
+    let qd = st.queue_drops.load(Ordering::Relaxed);
+    let qp = st.queue_drop_pkts.load(Ordering::Relaxed);
+    let slots = s.cues + s.skipped_cue_slots;
+    let pct = if slots > 0 { 100.0 * s.skipped_cue_slots as f64 / slots as f64 } else { 0.0 };
+    format!("frames {} cues {} skipped_cue_slots {} ({pct:.1}% of {slots}) skipped_frames {} queue_drops {qd} slices / {qp} TS packets \
+             send_errors {} datagrams / {} TS packets (would_block {}) datagrams_sent {} pkt_size {} sndbuf {}",
+        s.frames, s.cues, s.skipped_cue_slots, s.skipped_frames, s.send_errors, s.send_dropped_packets, s.send_would_block,
+        s.datagrams, s.pkt_size, s.sndbuf_bytes.map(|n| n.to_string()).unwrap_or_else(|| "unknown".into()))
+}
+
+fn maybe_log_stats(st: &mut State, now: Instant) {
+    if now.duration_since(st.last_log) < STATS_LOG_EVERY { return; }
+    st.last_log = now;
+    let cur = (st.stats.skipped_cue_slots, st.queue_drops.load(Ordering::Relaxed), st.stats.send_errors);
+    let d = (cur.0 - st.logged.0.min(cur.0), cur.1 - st.logged.1.min(cur.1), cur.2 - st.logged.2.min(cur.2));
+    st.logged = cur;
+    let line = stats_line(st);
+    if d == (0, 0, 0) {
+        log::info!("live tap stats: {line}");
+    } else {
+        log::warn!("live tap stats: last {}s +{} skipped cue slots, +{} queue drops, +{} send errors; {line}", STATS_LOG_EVERY.as_secs(), d.0, d.1, d.2);
+    }
 }
 
 fn rewrite_or_pass(st: &mut State, pkt: &[u8]) -> Vec<u8> {
@@ -287,15 +398,67 @@ fn rewrite_or_pass(st: &mut State, pkt: &[u8]) -> Vec<u8> {
 }
 
 fn push(st: &mut State, pkt: &[u8]) {
+    if st.out.is_empty() { st.out_since = Some(Instant::now()); }
     st.out.extend_from_slice(pkt);
-    if st.out.len() >= TS * DGRAM_PKTS { flush(st); }
+    if st.out.len() >= PKT_SIZE { flush(st); }
 }
 
 fn flush(st: &mut State) {
+    st.out_since = None;
     if st.out.is_empty() { return; }
-    match st.sock.send_to(&st.out, st.dest) { Ok(_) => st.stats.datagrams += 1, Err(_) => st.stats.send_errors += 1 }
+    match st.sock.send_to(&st.out, st.dest) {
+        Ok(_) => st.stats.datagrams += 1,
+        Err(e) => {
+            st.stats.send_errors += 1;
+            st.stats.send_dropped_packets += (st.out.len() / TS) as u64;
+            if e.kind() == std::io::ErrorKind::WouldBlock { st.stats.send_would_block += 1; }
+        }
+    }
     st.out.clear();
 }
+
+/// Ask for a `want`-byte UDP send buffer (SO_SNDBUF) and return what the OS then reports.
+/// Failure is logged by the caller and never turns the tap off.
+#[cfg(unix)]
+fn set_send_buffer(sock: &UdpSocket, want: usize) -> Option<usize> {
+    use std::os::unix::io::AsRawFd;
+    let fd = sock.as_raw_fd();
+    let v: libc::c_int = want.min(libc::c_int::MAX as usize) as libc::c_int;
+    // SAFETY: fd is a live socket owned by `sock`; the option buffers are local and sized correctly.
+    unsafe {
+        let _ = libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_SNDBUF, &v as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t);
+        let mut got: libc::c_int = 0;
+        let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        if libc::getsockopt(fd, libc::SOL_SOCKET, libc::SO_SNDBUF, &mut got as *mut _ as *mut libc::c_void, &mut len) != 0 { return None; }
+        usize::try_from(got).ok()
+    }
+}
+
+#[cfg(windows)]
+fn set_send_buffer(sock: &UdpSocket, want: usize) -> Option<usize> {
+    use std::os::windows::io::AsRawSocket;
+    const SOL_SOCKET: i32 = 0xffff;
+    const SO_SNDBUF: i32 = 0x1001;
+    #[link(name = "ws2_32")]
+    extern "system" {
+        fn setsockopt(s: usize, level: i32, optname: i32, optval: *const u8, optlen: i32) -> i32;
+        fn getsockopt(s: usize, level: i32, optname: i32, optval: *mut u8, optlen: *mut i32) -> i32;
+    }
+    let s = sock.as_raw_socket() as usize;
+    let v: i32 = want.min(i32::MAX as usize) as i32;
+    // SAFETY: `s` is a live socket owned by `sock`; the option buffers are local and sized correctly.
+    unsafe {
+        let _ = setsockopt(s, SOL_SOCKET, SO_SNDBUF, &v as *const i32 as *const u8, 4);
+        let mut got: i32 = 0;
+        let mut len: i32 = 4;
+        if getsockopt(s, SOL_SOCKET, SO_SNDBUF, &mut got as *mut i32 as *mut u8, &mut len) != 0 { return None; }
+        usize::try_from(got).ok()
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn set_send_buffer(_sock: &UdpSocket, _want: usize) -> Option<usize> { None }
 
 /// The text the chain hash covers. A watch page recomputes the same string.
 pub fn preimage(prev: &str, n: u64, sid: &str, file: &str, f: i64, pts: u64, t: u64, w: u64, seal: &str, lp_seq: Option<u64>) -> String {
@@ -577,6 +740,10 @@ mod tests {
         let s = tap.stats().unwrap();
         assert_eq!(s.queue_drops, drops);
         assert!(drops > 0);
+        // One frame (one TS packet) per slice and a cue every frame: each dropped slice is one
+        // skipped frame, one skipped cue slot and one dropped TS packet.
+        assert_eq!((s.skipped_frames, s.skipped_cue_slots, s.queue_dropped_packets), (drops, drops, drops));
+        assert_eq!(s.cues + s.skipped_cue_slots, N + 5);
         // Every cue that was cut still names its true frame: dropped slices did not shift `f`.
         let log = std::fs::read_to_string(dir.join(FILE_NAME)).unwrap();
         let cues: Vec<serde_json::Value> = log.lines().skip(1).map(|l| serde_json::from_str(l).unwrap()).collect();
@@ -616,5 +783,45 @@ mod tests {
         assert_eq!(logs[0], logs[1]);
         assert!(logs[0].lines().count() > 5);
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn cue_slots_counts_multiples_of_every_in_the_gap() {
+        assert_eq!(cue_slots(0, 15, 15), 1);  // frame 0
+        assert_eq!(cue_slots(1, 15, 15), 0);
+        assert_eq!(cue_slots(1, 16, 15), 1);  // frame 15
+        assert_eq!(cue_slots(16, 46, 15), 2); // 30, 45
+        assert_eq!(cue_slots(10, 10, 15), 0);
+        assert_eq!(cue_slots(12, 3, 15), 0);
+        assert_eq!(cue_slots(0, 5, 1), 5);
+    }
+
+    #[test]
+    fn worker_sends_full_1316_byte_datagrams_and_reports_the_send_buffer() {
+        let rx = UdpSocket::bind("127.0.0.1:0").unwrap();
+        rx.set_read_timeout(Some(std::time::Duration::from_secs(2))).unwrap();
+        let dir = std::env::temp_dir().join(format!("qorcap-livetap-pk-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let tap = LiveTap::open(Some(rx.local_addr().unwrap()), 1000, "1700", 60, Some(&dir));
+        let s0 = tap.stats().unwrap();
+        assert_eq!(s0.pkt_size, 1316);
+        assert!(s0.sndbuf_bytes.map(|n| n > 0).unwrap_or(false), "{:?}", s0.sndbuf_bytes);
+        // 3 slices of 5 packets = 15 packets, plus the frame-0 cue (2 ID3 packets) = 17:
+        // two full datagrams of 7, and 3 packets held.
+        for k in 0..3u64 {
+            let data: Vec<u8> = (0..5).flat_map(|i| frame_pkt(5 * k + i)).collect();
+            tap.submit(&data, k, "video.mp4", None, None, WeaveCtx::default());
+        }
+        let mut sizes = vec![];
+        let mut buf = [0u8; 65536];
+        while sizes.iter().sum::<usize>() < 17 * TS { let n = rx.recv(&mut buf).unwrap(); sizes.push(n); }
+        assert_eq!(&sizes[..2], &[PKT_SIZE, PKT_SIZE], "{sizes:?}");
+        // The held tail goes out short only after the hold time with no new slice.
+        assert_eq!(sizes.len(), 3, "{sizes:?}");
+        assert_eq!(sizes[2], 3 * TS);
+        let s = tap.stats().unwrap();
+        assert_eq!((s.datagrams, s.send_errors, s.queue_drops), (3, 0, 0));
+        tap.log_summary("test");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

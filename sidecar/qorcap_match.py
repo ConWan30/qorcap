@@ -488,7 +488,12 @@ def wait_and_countersign(proc, path: Path, cs: "Countersigner", timeout: float =
             except Exception:
                 pass
         if on_tick is not None:
-            on_tick()
+            # Progress messages only. An error here must not end the wait before the
+            # stop checkpoints are countersigned or skip what save_tail does after it.
+            try:
+                on_tick()
+            except Exception:
+                pass
         if time.monotonic() > deadline:
             proc.kill()
             break
@@ -2107,14 +2112,12 @@ def main(argv=None) -> int:
         except Exception:
             pass
         end_stop = state.get("cod_end_stop")
-        note = None
-        if end_stop is not None and state.get("cod_end_stop_fired"):
-            try:
-                note = end_stop.log_note(stop_reason)
-            except Exception:
-                note = None
+        # Named stop_note, not note: rebinding note here made tick() call a string (or None) and
+        # raise out of wait_and_countersign, so cod_end_stop.json was never written (#153 match
+        # 20261111-183311). The file is written before /shutdown whenever the stop note fires.
+        stop_note = cod_end_stop_before_shutdown(state, bundle, stop_reason, say=note)
         try:
-            api.post("/shutdown", shutdown_body(stop_reason, note))
+            api.post("/shutdown", shutdown_body(stop_reason, stop_note))
         except Exception:
             pass
         # Countersign the stop checkpoints over the API while QorCap is still up; QorCap waits for our report
@@ -3186,6 +3189,31 @@ def capture_stop_reason(state: dict, now: float, *, tail_s: float) -> str | None
     if not _final_was_posted(state):
         return "post_final_tail"
     return "final"
+
+
+def cod_end_stop_before_shutdown(state: dict, bundle, stop_reason: str | None, *, say=None) -> str | None:
+    """When the practice CoD auto stop fired: write ``cod_end_stop.json`` now, then return the stop note.
+
+    Runs before ``/shutdown``, so the file exists even if anything later in the save fails. The file
+    is info only (not bundle.json, not the receipt). It is written again after the countersign with the
+    same fields. Returns None (no note, nothing written) when the auto stop did not fire.
+    """
+    end_stop = state.get("cod_end_stop")
+    if end_stop is None or not state.get("cod_end_stop_fired"):
+        return None
+    try:
+        stop_note = end_stop.log_note(stop_reason)
+    except Exception:
+        stop_note = None
+    try:
+        end_stop.record(bundle, stop_reason=stop_reason, stop_wall_ms=state.get("tail_stop_wall_ms"), fired=True)
+    except Exception as e:  # noqa: BLE001
+        if say is not None:
+            try:
+                say(f"  cod_end_stop.json was not written: {type(e).__name__}: {e}")
+            except Exception:
+                pass
+    return stop_note
 
 
 def cod_end_stop_reason(state: dict, reason: str | None, *, now: float | None = None, say=None) -> str | None:
