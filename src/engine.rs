@@ -792,6 +792,8 @@ impl Engine {
     fn finish_stop(self: &Arc<Self>) {
         if self.stop_reason.lock().unwrap_or_else(|e| e.into_inner()).is_none() { self.note_stop("shutdown"); }
         if let Some(p) = self.stop_recording() { info!("finalised {p}"); }
+        // Practice live tap: the recorder is gone, so no slice can follow; send the end cue and close the tap.
+        self.end_live_tap();
         crate::inputproof::clear_recording_marker(self.bundle_dir().as_deref());
         // Draft and bundle exist before the countersign wait and the slow input proof, so a kill
         // during either still leaves receipt.draft.json for finalize.
@@ -1659,6 +1661,62 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Practice live tap end cue: sent on every stop path with the engine's own first stop reason.
+    #[test]
+    fn live_tap_end_cue_carries_the_real_stop_reason() {
+        use clap::Parser;
+        let rx = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let url = format!("udp://{}", rx.local_addr().unwrap());
+        // (label, stop reason, an earlier stop reason that wins)
+        let cases: [(&str, &str, Option<&str>); 6] = [
+            ("cod auto stop", "post_final_tail", None),
+            ("final", "final", None),
+            ("enter", "enter", None),
+            ("enter before the auto stop", "post_final_tail", Some("enter")),
+            ("recorder pipe broke", "pipe_broken", None),
+            ("--duration", "duration", None),
+        ];
+        let base = std::env::temp_dir().join(format!("qorcap-livetap-endeng-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        for (i, (label, reason, earlier)) in cases.iter().enumerate() {
+            let dir = base.join(i.to_string());
+            std::fs::create_dir_all(&dir).unwrap();
+            let d = dir.to_string_lossy().into_owned();
+            let crate::cli::Cmd::Record(r) = crate::cli::Cli::try_parse_from(["q", "record", "--device", "testpattern", "--bundle", &d, "--no-controller",
+                "--match-id", "m-eos", "--live-tap", &url, "--practice-lane"]).unwrap().cmd else { panic!() };
+            let e = Engine::new(r, "ffmpeg-x".into());
+            e.live_tap.submit(&crate::frameclock::video_ts_packet(0x100, 900), 1, "video.mp4", None, None, crate::livetap::WeaveCtx::default());
+            if let Some(r0) = earlier { e.note_stop(r0); }
+            e.request_stop(reason);
+            e.end_live_tap();
+            e.end_live_tap();
+            let log = std::fs::read_to_string(dir.join(crate::livetap::FILE_NAME)).unwrap();
+            let ends: Vec<Value> = log.lines().filter(|l| l.contains("\"kind\":\"end\"")).map(|l| serde_json::from_str(l).unwrap()).collect();
+            assert_eq!(ends.len(), 1, "{label}: one end record");
+            assert!(log.lines().last().unwrap().contains("\"kind\":\"end\""), "{label}: last line");
+            assert_eq!(ends[0]["stop_reason"], earlier.unwrap_or(reason), "{label}");
+            assert_eq!(ends[0]["f"], 0, "{label}");
+            for f in ["receipt.draft.json", "bundle.json"] {
+                let t = std::fs::read_to_string(dir.join(f)).unwrap();
+                assert!(!t.contains("\"kind\":\"end\"") && !t.contains("qorweave"), "{label}: {f}");
+            }
+            let s = e.live_tap.stats().unwrap();
+            assert_eq!((s.end_cue.as_deref(), s.end_cue_copies), (Some("sent"), crate::livetap::END_REPEATS as u64), "{label}");
+        }
+        // Tap off (REAL MATCH never turns it on): no cue, no file.
+        let dir = base.join("off");
+        std::fs::create_dir_all(&dir).unwrap();
+        let d = dir.to_string_lossy().into_owned();
+        let crate::cli::Cmd::Record(r) = crate::cli::Cli::try_parse_from(["q", "record", "--device", "testpattern", "--bundle", &d, "--no-controller",
+            "--match-id", "m-eos-off"]).unwrap().cmd else { panic!() };
+        let e = Engine::new(r, "ffmpeg-x".into());
+        assert!(!e.live_tap.enabled());
+        e.request_stop("post_final_tail");
+        e.end_live_tap();
+        assert!(!dir.join(crate::livetap::FILE_NAME).exists());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     #[test]
     fn frame_clock_off_leaves_the_bundle_unchanged_and_on_records_only_when_asked() {
         use clap::Parser;
@@ -1977,6 +2035,23 @@ impl Engine {
             }
             Err(e) => warn!("auto clip {name} failed: {e}"),
         });
+    }
+
+    /// Practice live tap: the end cue (QorStream docs/STREAM_END.md shape; bounded wait, best effort), then
+    /// the final counters. It carries the engine's own first stop reason unchanged. Tap off: nothing happens.
+    pub(crate) fn end_live_tap(&self) {
+        if !self.live_tap.enabled() { return; }
+        let stop = self.stop_reason.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let t_us = self.started.elapsed().as_micros() as u64;
+        let anchor = self.weave_snap.lock().unwrap_or_else(|e| e.into_inner()).wall_anchor_ms;
+        let out = self.live_tap.end_session(stop.as_deref(), t_us, anchor, crate::livetap::END_WAIT_MAX);
+        let copies = self.live_tap.stats().map(|s| s.end_cue_copies).unwrap_or(0);
+        match out {
+            crate::livetap::EndOutcome::Sent => info!("live tap: end cue sent ({copies}/{} copies, stop reason {}); tap closed", crate::livetap::END_REPEATS, stop.as_deref().unwrap_or("none")),
+            crate::livetap::EndOutcome::AlreadyEnded | crate::livetap::EndOutcome::NotEnabled => {}
+            o => warn!("live tap: end cue not confirmed ({o:?}, stop reason {}); the stop continues", stop.as_deref().unwrap_or("none")),
+        }
+        self.live_tap.log_summary("end_of_session");
     }
 
     /// Record why the match stopped. The first call wins.
