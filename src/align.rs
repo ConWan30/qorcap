@@ -180,11 +180,22 @@ pub fn parse_probe_rates(stdout: &str) -> (Option<Rate>, Option<Rate>) {
     (r, avg)
 }
 
-/// Note when the stream's average rate differs from `r_frame_rate` (for example a 29.97 stream that
-/// reports 30/1). Note only; the scoring rate is unchanged.
+/// Relative gap between avg_frame_rate and r_frame_rate below which no note is written: 1/2000 (0.05%).
+/// The note is for a stream whose real rate is not its nominal one, the common case being NTSC
+/// 30000/1001 or 60000/1001 labelled 30/1 or 60/1, a gap of 1/1001 (0.0999%); that stays flagged with
+/// 2x margin. avg_frame_rate is frames / duration, so container duration rounding, edit lists and a
+/// start offset move it slightly on genuine 30/1 and 60/1 files (one frame of duration error is
+/// 1/frames, under 0.05% for any part longer than 2000 frames, 33 s at 60 fps); those are not flagged.
+pub const AVG_RATE_NOTE_TOLERANCE: (u128, u128) = (1, 2000);
+
+/// Note when the stream's average rate differs from `r_frame_rate` by more than
+/// [`AVG_RATE_NOTE_TOLERANCE`] (for example a 29.97 stream that reports 30/1). Note only; the scoring
+/// rate is unchanged.
 pub fn avg_rate_note(file: &str, r: Rate, avg: Option<Rate>) -> Option<String> {
     let a = avg?;
-    (a.num as u128 * r.den as u128 != r.num as u128 * a.den as u128)
+    let (lhs, rhs) = (a.num as u128 * r.den as u128, r.num as u128 * a.den as u128);
+    let (tn, td) = AVG_RATE_NOTE_TOLERANCE;
+    (lhs.abs_diff(rhs) * td > rhs * tn)
         .then(|| format!("{file}: avg_frame_rate {} differs from r_frame_rate {} (note only; analysed at r_frame_rate)", a.filter(), r.filter()))
 }
 
@@ -1082,6 +1093,26 @@ mod tests {
         assert_eq!(parse_probe_rates("avg_frame_rate=0/0\nr_frame_rate=60/1\n"), (Some(Rate { num: 60, den: 1 }), None));
         assert!(avg_rate_note("v", Rate { num: 60, den: 1 }, Some(Rate { num: 120, den: 2 })).is_none(), "equal rationals are not flagged");
         assert!(avg_rate_note("v", Rate { num: 60, den: 1 }, None).is_none());
+    }
+
+    /// QorProof r2 L-r2-1: tiny avg_frame_rate drift on a genuine 60/1 or 30/1 file is not flagged;
+    /// an NTSC rate under a whole-number label still is.
+    #[test]
+    fn avg_frame_rate_note_has_a_tolerance() {
+        let r60 = Rate { num: 60, den: 1 };
+        let r30 = Rate { num: 30, den: 1 };
+        let note = |r: Rate, avg: &str| avg_rate_note("v", r, parse_rational(avg));
+        // within 0.05%: duration rounding on real recordings (59.99x, 29.99x, either side)
+        for (r, avg) in [(r60, "5999/100"), (r60, "59994/1000"), (r60, "36001/600"), (r60, "35999/600"), (r30, "2999/100"), (r30, "29997/1000")] {
+            assert!(note(r, avg).is_none(), "{avg} vs {}", r.filter());
+        }
+        // NTSC (1/1001 = 0.0999%) and anything larger are still noted
+        for (r, avg) in [(r60, "60000/1001"), (r30, "30000/1001"), (r60, "5994/100"), (r60, "30/1"), (r30, "3003/100")] {
+            assert!(note(r, avg).is_some(), "{avg} vs {}", r.filter());
+        }
+        // the boundary itself (exactly 1/2000) is not noted; one step past it is
+        assert!(note(r60, "6003/100").is_none() && note(r60, "5997/100").is_none());
+        assert!(note(r60, "60031/1000").is_some() && note(r60, "59969/1000").is_some());
     }
 
     /// The same press/response session at 60 fps: the track has twice the frames, the picture reacts

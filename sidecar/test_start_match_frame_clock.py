@@ -80,10 +80,13 @@ def test_practice_frame_clock_function(args, env_val, lane, expected):
     assert out.stdout.strip() == expected
 
 
+STRIP = '$fwd = @($fwd | Where-Object { $_ -ne "--no-frame-clock" -and $_ -notlike "--no-frame-clock=*" })'
+
+
 def _block():
     start = PS.index("$practiceClock = Get-QorCapPracticeFrameClock")
-    end = PS.index('$fwd = @($fwd | Where-Object { $_ -ne "--no-frame-clock" })', start)
-    return PS[start:end] + '$fwd = @($fwd | Where-Object { $_ -ne "--no-frame-clock" })\n'
+    end = PS.index(STRIP, start)
+    return PS[start:end] + STRIP + "\n"
 
 
 def test_no_frame_clock_is_stripped_in_every_lane():
@@ -101,6 +104,10 @@ LANE_CASES = [
     (["--test-pattern", "--no-frame-clock"], None, None, "0", ["--official-challenges", "--test-pattern"]),
     (["finalize", "--no-frame-clock"], None, None, "UNSET", ["finalize"]),
     (["--test-pattern"], None, None, "1", ["--official-challenges", "--test-pattern"]),
+    # the "=" form is stripped too (any value, any case); it is not a way to turn the clock off
+    (["--no-frame-clock=1", "--side", "home"], None, None, "UNSET", ["--official-challenges", "--side", "home"]),
+    (["--test-pattern", "--No-Frame-Clock=off"], None, None, "1", ["--official-challenges", "--test-pattern"]),
+    (["finalize", "--no-frame-clock="], None, None, "UNSET", ["finalize"]),
 ]
 
 
@@ -108,7 +115,7 @@ LANE_CASES = [
 def test_launcher_block_strips_no_frame_clock(args, env_val, lane, env_after, args_after):
     if _shell() is None:
         # No skip (CI skip guard). Without PowerShell only the block text is checked.
-        assert "$fwd = @($fwd | Where-Object { $_ -ne \"--no-frame-clock\" })" in _block()
+        assert STRIP in _block()
         return
 
     def lit(v):
