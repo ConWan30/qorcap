@@ -39,6 +39,8 @@ from pathlib import Path
 
 SCHEMA = "qorcap-highlights/v0"
 VERSION = "0.1.0"
+# Legacy rate: only for highlight manifests cut before the rate fix (no ``source.frame_rate``), which were cut at
+# 30 fps, so their clip-signing bounds stay consistent. New cuts use the measured stream rate (``file_rate``).
 FPS = 30.0
 PRE_S, POST_S = 8.0, 4.0
 MARKER = Path(".qorcap-run") / "recording.lock"
@@ -103,22 +105,142 @@ def recorder_running(bundle: Path, now: float | None = None) -> bool:
     return age < MARKER_FRESH_S
 
 
+# ------------------------------------------------------------------ frame rate (same logic as src/align.rs file_rate)
+class RateUnknown(Exception):
+    """The stream's frame rate is UNMEASURED or the probe and the frame clock disagree. Highlights fail closed."""
+
+
+def _valid(r: tuple[int, int] | None) -> tuple[int, int] | None:
+    return r if r and r[0] > 0 and r[1] > 0 and 1.0 <= r[0] / r[1] <= 1000.0 else None
+
+
+def parse_rational(s: str) -> tuple[int, int] | None:
+    """``60/1``, ``30000/1001`` -> (num, den). Same bounds as align::parse_rational."""
+    a, sep, b = s.partition("/")
+    try:
+        return _valid((int(a.strip()), int(b.strip()))) if sep else None
+    except ValueError:
+        return None
+
+
+def parse_probe_rate(stdout: str) -> tuple[int, int] | None:
+    """``r_frame_rate=`` from ffprobe ``default=nw=1`` output (first valid one)."""
+    for line in stdout.splitlines():
+        v = line.strip()
+        if v.startswith("r_frame_rate="):
+            r = parse_rational(v[len("r_frame_rate="):])
+            if r:
+                return r
+    return None
+
+
+def parse_banner_rate(stderr: str) -> tuple[int, int] | None:
+    """First video stream line of ``ffmpeg -i``: ``60 tbr`` -> 60/1, ``29.97 tbr`` -> 30000/1001 (align::parse_banner_rate)."""
+    line = next((l for l in stderr.splitlines() if "Stream #" in l and "Video:" in l), None)
+    if line is None:
+        return None
+    toks = [t for t in line.replace(",", " ").split(" ") if t]
+    i = toks.index("tbr") if "tbr" in toks else toks.index("fps") if "fps" in toks else None
+    if not i:
+        return None
+    raw = toks[i - 1]
+    try:
+        v = float(raw[:-1]) * 1000.0 if raw.endswith("k") else float(raw)
+    except ValueError:
+        return None
+    if v <= 0:
+        return None
+    if abs(v - round(v)) < 1e-6:
+        r = (round(v), 1)
+    elif abs(v * 1.001 - round(v * 1.001)) < 0.01:
+        r = (round(v * 1.001) * 1000, 1001)
+    else:
+        r = (round(v * 100.0), 100)
+    return _valid(r)
+
+
+def load_frame_clock(path: Path) -> list[dict]:
+    """``frame_clock.jsonl`` frame rows, sorted by t_mono_us (frameclock::load)."""
+    rows = []
+    for v in read_jsonl(path):
+        if v.get("type") != "frame":
+            continue
+        f, t, file = v.get("frame"), v.get("t_mono_us"), v.get("file")
+        if isinstance(f, int) and not isinstance(f, bool) and isinstance(t, int) and t >= 0 and isinstance(file, str):
+            pts = v.get("pts_90k")
+            rows.append({"file": file, "frame": f, "t": t, "pts": pts if isinstance(pts, int) and pts >= 0 else 0})
+    rows.sort(key=lambda r: r["t"])
+    return rows
+
+
+def frame_clock_rate(stamps: list[dict], file: str) -> tuple[int, int] | None:
+    """Most common 90 kHz PTS step between consecutive frames of ``file`` (>= 10 steps), as a rate (align::frame_clock_rate)."""
+    mine = [s for s in stamps if s["file"] == file]
+    counts: dict[int, int] = {}
+    for a, b in zip(mine, mine[1:]):
+        if b["frame"] == a["frame"] + 1 and b["pts"] > a["pts"]:
+            counts[b["pts"] - a["pts"]] = counts.get(b["pts"] - a["pts"], 0) + 1
+    if sum(counts.values()) < 10:
+        return None
+    step = max(counts.items(), key=lambda kv: (kv[1], -kv[0]))[0]
+    from math import gcd
+    g = gcd(90_000, step)
+    return _valid((90_000 // g, step // g))
+
+
+def _probe_run(cmd: list[str]) -> tuple[int, str, str]:
+    try:
+        p = subprocess.run(cmd, check=False, capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError) as e:
+        return -1, "", str(e)
+    return p.returncode, p.stdout or "", p.stderr or ""
+
+
+def probe_rate(ffmpeg: str, src: Path) -> tuple[int, int] | None:
+    """ffprobe r_frame_rate, else the ``ffmpeg -i`` tbr (align::probe_rates)."""
+    fp = Path(ffmpeg)
+    probe = str(fp.with_name(fp.name.replace("ffmpeg", "ffprobe"))) if fp.name else "ffprobe"
+    code, out, _ = _probe_run([probe, "-v", "error", "-select_streams", "v:0", "-show_entries",
+                               "stream=r_frame_rate,avg_frame_rate", "-of", "default=nw=1", str(src)])
+    r = parse_probe_rate(out) if code == 0 else None
+    if r:
+        return r
+    _, _, err = _probe_run([ffmpeg, "-hide_banner", "-i", str(src)])
+    return parse_banner_rate(err)
+
+
+def file_rate(ffmpeg: str, src: Path, file: str, stamps: list[dict]) -> tuple[int, int]:
+    """The rate ``file`` is cut at. Probe first, frame clock second; both present must agree within 1 %.
+
+    Raises RateUnknown (fail closed) when neither is known or they disagree. Same rule as align::file_rate."""
+    p = probe_rate(ffmpeg, src)
+    f = frame_clock_rate(stamps, file)
+    if p and f and abs((p[0] / p[1]) / (f[0] / f[1]) - 1.0) > 0.01:
+        raise RateUnknown(f"frame rate UNMEASURED: stream says {p[0]}/{p[1]} but frame_clock PTS step says {f[0]}/{f[1]}")
+    if p or f:
+        return p or f
+    raise RateUnknown("frame rate UNMEASURED: no ffprobe r_frame_rate, no ffmpeg tbr and no frame_clock rows for this file")
+
+
 # ------------------------------------------------------------------ time: wall ms -> (video file, seconds)
 class VideoClock:
-    """Per video part: wall_ms -> seconds into that file, from manifest segments (ffmpeg frame counter / 30 fps).
+    """Per video part: wall_ms -> seconds into that file, from manifest segments (ffmpeg frame counter / the file's rate).
 
-    ffmpeg restarts (a new ``video.partN.mp4``) reset the frame counter, so every file gets its own curve."""
+    ffmpeg restarts (a new ``video.partN.mp4``) reset the frame counter, so every file gets its own curve. ``fps_of``
+    gives a file's measured rate (it may raise RateUnknown); without it the legacy 30 fps is used."""
 
-    def __init__(self, manifest: list[dict]):
-        self.files: dict[str, list[tuple[int, float]]] = {}
+    def __init__(self, manifest: list[dict], fps_of=None):
+        self.files: dict[str, list[tuple[int, float]]] = {}  # wall_ms -> manifest frame counter
+        self.fps_of = fps_of
         self.segs: list[dict] = [m for m in manifest if m.get("type") == "segment"]
         for m in self.segs:
             if isinstance(m.get("frames"), (int, float)) and "wall_ms" in m:
-                self.files.setdefault(m.get("file") or "video.mp4", []).append((int(m["wall_ms"]), m["frames"] / FPS))
+                self.files.setdefault(m.get("file") or "video.mp4", []).append((int(m["wall_ms"]), m["frames"]))
         for v in self.files.values():
             v.sort()
 
     def locate(self, wall_ms: int) -> tuple[str, float] | None:
+        """(file, seconds into it), or None outside the video. Raises RateUnknown when that file's rate is unknown."""
         best = None
         for f, pts in self.files.items():
             if len(pts) < 2:
@@ -130,7 +252,9 @@ class VideoClock:
                     best = (d, f, pts)
         if not best:
             return None
-        _, f, pts = best
+        _, f, frames = best
+        fps = FPS if self.fps_of is None else self.fps_of(f)
+        pts = [(w, n / fps) for w, n in frames]
         xs = [p[0] for p in pts]
         i = min(max(bisect.bisect_left(xs, wall_ms), 1), len(xs) - 1)
         (x0, y0), (x1, y1) = pts[i - 1], pts[i]
@@ -308,7 +432,29 @@ def make_highlights(bundle: Path, out: Path | None = None, pre: float = PRE_S, p
         raise Refuse(4, "no signed receipt.json in this bundle. Finish the match (or run `qorcap finalize`) first.")
     receipt = json.loads(rp.read_text(encoding="utf-8"))
     manifest = read_jsonl(bundle / "manifest.jsonl")
-    clock = VideoClock(manifest)
+    rates: dict[str, tuple[int, int] | str] = {}  # file -> (num, den) or the UNMEASURED reason
+    stamps: list[dict] | None = None
+
+    def fps_of(vfile: str) -> float:
+        nonlocal stamps
+        if vfile not in rates:
+            from qorcap_paths import bundle_child
+            src = bundle_child(bundle, vfile)
+            if src is None or not src.exists():
+                return FPS  # nothing to cut: the lock is skipped below as "not in the bundle folder", as before
+            if stamps is None:
+                stamps = load_frame_clock(bundle / "frame_clock.jsonl")
+            try:
+                rates[vfile] = file_rate(ffmpeg, src, vfile, stamps)
+            except RateUnknown as e:
+                rates[vfile] = str(e)
+                say(f"  highlights for {vfile} skipped: {e} (fail closed; finalize and submit are unaffected)")
+        r = rates[vfile]
+        if isinstance(r, str):
+            raise RateUnknown(r)
+        return r[0] / r[1]
+
+    clock = VideoClock(manifest, fps_of)
     locks, skipped, source = find_locks(bundle, receipt)
     if max_clips is not None:
         locks = locks[:max_clips]
@@ -322,8 +468,13 @@ def make_highlights(bundle: Path, out: Path | None = None, pre: float = PRE_S, p
     match_id = m.get("match_id")
     clips, heights = [], {}
     for n, lk in enumerate(locks):
-        loc = clock.locate(int(lk["t_ms"]))
         sa = lk["score_after"]
+        try:
+            loc = clock.locate(int(lk["t_ms"]))
+        except RateUnknown as e:
+            skipped.append({"seq": lk["seq"], "t_ms": lk["t_ms"], "hash": lk["hash"], "score_after": sa,
+                            "reason": f"{e}; highlight not cut (fail closed)"})
+            continue
         stem = f"hl{n:02d}-q{lk.get('quarter') or 0}-a{sa['away']}-h{sa['home']}"
         if loc is None:
             skipped.append({"seq": lk["seq"], "t_ms": lk["t_ms"], "hash": lk["hash"], "score_after": sa,
@@ -353,11 +504,15 @@ def make_highlights(bundle: Path, out: Path | None = None, pre: float = PRE_S, p
         lock_at = round(at - a, 3)
         (out / f"{stem}.vtt").write_text(clip_caption(score_txt, meta_txt, dur, lock_at), encoding="utf-8")
         wall_a, wall_b = int(lk["t_ms"] - pre * 1000), int(lk["t_ms"] + post * 1000)
+        rate = rates.get(vfile)
+        source_rec = {"file": vfile, "start_s": round(a, 3), "end_s": round(at + post, 3),
+                      "segments": clock.segments_between(vfile, wall_a, wall_b)}
+        if isinstance(rate, tuple) and rate != (30, 1):  # 30/1 manifests stay byte-identical to the pre-fix cutter
+            source_rec["frame_rate"] = f"{rate[0]}/{rate[1]}"
         clips.append({
             "id": stem, "file": f.name, "sha256": sha256_file(f), "bytes": f.stat().st_size, "vtt": f"{stem}.vtt",
             "duration_s": round(dur, 3), "lock_at_s": lock_at, "overlay": overlay, "overlay_text": [score_txt, meta_txt],
-            "source": {"file": vfile, "start_s": round(a, 3), "end_s": round(at + post, 3),
-                       "segments": clock.segments_between(vfile, wall_a, wall_b)},
+            "source": source_rec,
             "lock": {k: v for k, v in lk.items() if k != "evidence"} | {"evidence": lk["evidence"]},
         })
         say(f"  clip {stem}: {lk['play']} -> AWAY {sa['away']} - HOME {sa['home']} (lock #{lk['seq']}, {overlay})")
@@ -455,8 +610,10 @@ def credential_problems(clip_id: str, cred, file_bytes: bytes) -> list[str]:
     return errs
 
 
-def mono_bounds(manifest_rows: list[dict], source_file: str, start_s: float, end_s: float) -> tuple[int, int] | None:
-    """Map seconds-into-file onto the match mono clock. None when that clock is not in the manifest."""
+def mono_bounds(manifest_rows: list[dict], source_file: str, start_s: float, end_s: float,
+                fps: float = FPS) -> tuple[int, int] | None:
+    """Map seconds-into-file onto the match mono clock at the file's rate ``fps``. None when that clock is not in
+    the manifest."""
     pts = []
     for m in manifest_rows:
         if m.get("type") != "segment":
@@ -468,7 +625,7 @@ def mono_bounds(manifest_rows: list[dict], source_file: str, start_s: float, end
             continue
         if not isinstance(mono, (int, float)) or not isinstance(frames, (int, float)):
             continue
-        pts.append((float(frames) / FPS, int(mono)))
+        pts.append((float(frames) / fps, int(mono)))
     pts.sort()
     if len(pts) < 1 or end_s <= start_s:
         return None
@@ -545,8 +702,12 @@ def attach_credentials(bundle: Path, manifest_path: Path, *, qorcap: str | None 
             continue
         src = c.get("source") or {}
         bounds = None
-        if isinstance(src.get("start_s"), (int, float)) and isinstance(src.get("end_s"), (int, float)):
-            bounds = mono_bounds(rows, src.get("file") or "video.mp4", float(src["start_s"]), float(src["end_s"]))
+        # A clip cut by the rate-aware cutter records its rate unless it is 30/1; an older manifest was cut at 30.
+        fr = src.get("frame_rate")
+        rate = (30, 1) if fr is None else parse_rational(fr) if isinstance(fr, str) else None
+        if rate and isinstance(src.get("start_s"), (int, float)) and isinstance(src.get("end_s"), (int, float)):
+            bounds = mono_bounds(rows, src.get("file") or "video.mp4", float(src["start_s"]), float(src["end_s"]),
+                                 rate[0] / rate[1])
         from qorcap_paths import bundle_child
         f = bundle_child(mp.parent, c.get("file"))
         if bounds is None or f is None or not f.exists() or not exe:
