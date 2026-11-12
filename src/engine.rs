@@ -369,6 +369,19 @@ pub fn next_free_part(base: &str, start: u32) -> (u32, String) {
     }
 }
 
+/// Practice/match start: the sidecar's `audio_precheck.json` (a short read of the card's audio taken
+/// before the recorder opens the card). When it reads silent, one non-fatal WARN line for qorcap.log.
+/// Recording continues either way, and audio is not used by the proof.
+pub(crate) fn audio_precheck_warning(bundle: &Path) -> Option<String> {
+    let v: Value = serde_json::from_slice(&std::fs::read(bundle.join("audio_precheck.json")).ok()?).ok()?;
+    if v.get("silent").and_then(Value::as_bool) != Some(true) { return None; }
+    let db = |k: &str| v.get(k).and_then(Value::as_f64).map(|x| format!("{x:.1} dB")).unwrap_or_else(|| "unknown".into());
+    let dev = v.get("device").and_then(Value::as_str).unwrap_or("the card's audio device");
+    Some(format!(
+        "audio precheck: recording audio is silent (max {}, mean {} on \"{dev}\"); check that console audio goes to HDMI, \
+not only the headset. Recording continues; audio is not used by the proof.", db("max_db"), db("mean_db")))
+}
+
 /// Stable run directory for snapshot/stamp (never %TEMP% — Windows clears it and ffmpeg image2 then storms).
 fn run_dir(args: &RecordArgs) -> PathBuf {
     if let Some(b) = args.bundle.as_ref() {
@@ -475,6 +488,9 @@ impl Engine {
         }
         let r = self.spawn_recorder(path, part, duration.map(|d| Instant::now() + Duration::from_secs(d)))?;
         info!("recording started -> {}", r.path);
+        if part == 1 {
+            if let Some(m) = self.args.bundle.as_deref().and_then(|d| audio_precheck_warning(Path::new(d))) { warn!("{m}"); }
+        }
         let p = r.path.clone();
         *g = Some(r);
         drop(g);
@@ -891,6 +907,8 @@ impl Engine {
         };
         let _stop_publisher = StopPublisher { flag: stop_pub, handle: Some(publisher) };
         info!("opening \"{}\" format={input_format} audio={:?} ({:?}) {}x{}@{} enc={}", self.args.device, audio.map(|a| &a.name), audio.map(|a| a.strategy), self.args.res.0, self.args.res.1, self.args.fps, self.args.encoder);
+        // The exact argv, redacted, so a capture can be compared run to run (device, per-input options, maps).
+        info!("capture ffmpeg argv: {}", ffmpeg::argv_for_log(&self.ffmpeg, &args));
         // AboveNormal priority on Windows (no-op elsewhere). If that spawn fails, log it and start at
         // normal priority with the same arguments: priority is never a reason not to record.
         let child = match ffmpeg::capture_command(&self.ffmpeg).args(&args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn() {
@@ -1049,6 +1067,26 @@ pub fn parse_bitrate(s: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn audio_precheck_warning_only_when_silent() {
+        let d = std::env::temp_dir().join(format!("qorcap-precheck-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&d);
+        let f = d.join("audio_precheck.json");
+        let _ = std::fs::remove_file(&f);
+        assert_eq!(audio_precheck_warning(&d), None, "no file, no warning");
+        std::fs::write(&f, r#"{"mean_db": -91.0, "max_db": -90.3, "silent": true, "device": "Elgato Game Capture Neo (Elgato Game Capture Neo)"}"#).unwrap();
+        let m = audio_precheck_warning(&d).unwrap();
+        assert!(m.starts_with("audio precheck: recording audio is silent (max -90.3 dB, mean -91.0 dB on \"Elgato Game Capture Neo (Elgato Game Capture Neo)\")"), "{m}");
+        assert!(m.contains("check that console audio goes to HDMI, not only the headset"), "{m}");
+        assert!(m.contains("Recording continues; audio is not used by the proof."), "{m}");
+        std::fs::write(&f, r#"{"mean_db": -24.1, "max_db": -1.2, "silent": false, "device": "x"}"#).unwrap();
+        assert_eq!(audio_precheck_warning(&d), None);
+        std::fs::write(&f, r#"{"error": "boom"}"#).unwrap();
+        assert_eq!(audio_precheck_warning(&d), None, "an error is not a silent read");
+        std::fs::write(&f, "not json").unwrap();
+        assert_eq!(audio_precheck_warning(&d), None);
+        let _ = std::fs::remove_dir_all(&d);
+    }
     #[test]
     fn watchdog_last_after_now_is_not_a_stall() {
         // A frame stored last_data_ms 7 ms after the watchdog read `now` (match-20261111-081216).
