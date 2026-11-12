@@ -889,6 +889,8 @@ impl Engine {
         };
         let _stop_publisher = StopPublisher { flag: stop_pub, handle: Some(publisher) };
         info!("opening \"{}\" format={input_format} audio={:?} ({:?}) {}x{}@{} enc={}", self.args.device, audio.map(|a| &a.name), audio.map(|a| a.strategy), self.args.res.0, self.args.res.1, self.args.fps, self.args.encoder);
+        // The exact argv, redacted, so a capture can be compared run to run (device, per-input options, maps).
+        info!("capture ffmpeg argv: {}", ffmpeg::argv_for_log(&self.ffmpeg, &args));
         // AboveNormal priority on Windows (no-op elsewhere). If that spawn fails, log it and start at
         // normal priority with the same arguments: priority is never a reason not to record.
         let child = match ffmpeg::capture_command(&self.ffmpeg).args(&args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn() {
