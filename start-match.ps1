@@ -210,11 +210,12 @@ $isFinalize = $fwd -contains "finalize"
 # QORCAP_FRAME_CLOCK). A REAL MATCH run gets no change here. --no-frame-clock is a launcher flag only:
 # it is removed in every lane (REAL MATCH, practice, offline) so qorcap_match.py never sees it. On a
 # REAL MATCH it changes nothing (the clock is already off unless QORCAP_FRAME_CLOCK was set by hand).
+# The "--no-frame-clock=<value>" form is stripped as well (any value, any case) and is otherwise ignored.
 $practiceClock = Get-QorCapPracticeFrameClock $fwd $env:QORCAP_FRAME_CLOCK $env:QORCAP_LANE
 if ($null -ne $practiceClock) {
   $env:QORCAP_FRAME_CLOCK = $practiceClock
 }
-$fwd = @($fwd | Where-Object { $_ -ne "--no-frame-clock" })
+$fwd = @($fwd | Where-Object { $_ -ne "--no-frame-clock" -and $_ -notlike "--no-frame-clock=*" })
 $hasChallengeFlag = $false
 foreach ($x in $fwd) {
   if ($x -eq "--official-challenges" -or $x -eq "--no-official-challenges") { $hasChallengeFlag = $true }
