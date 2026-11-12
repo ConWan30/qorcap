@@ -10,7 +10,8 @@ One record per capture writer (the capture ffmpeg that reads the card and encode
 
 - **writer**: `ended_by` (`self_exit`, `qorcap_kill`, `spawn_failed`, or `UNKNOWN`), the OS
   `exit_code` (Windows reports ENOSPC as -28; `UNKNOWN` when there is no code), `kill_sent`
-  (`stop`, `watchdog_no_data`, `stdout_closed`, or null), and `stderr_drained`.
+  (`stop`, `watchdog_no_data`, `stdout_closed`, or null), and `stderr_drained`. A writer that closes
+  stdout on its own gets up to 2 s to exit before QorCap kills it, so its own exit code is kept.
 - **encoder**: the last `-progress` block's `frame`, `dup` and `drop`, `end_seen` (ffmpeg's closing
   `progress=end` block arrived), and `counters_basis` (`end_block`, `last_progress_block`, `none`).
   QorCap ends the writer with a kill on a normal stop, so `end_seen` is usually false there and the

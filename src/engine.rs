@@ -1075,7 +1075,18 @@ impl Engine {
         }
         alive.store(false, Ordering::SeqCst);
         let st = { let mut c = child.lock().unwrap_or_else(|e| e.into_inner());
-            if tally.is_some() && matches!(c.try_wait(), Ok(None)) { kill_sent.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(|| "stdout_closed".to_string()); }
+            // Practice lane only: a writer that closed stdout on its own gets up to 2 s to exit, so its own
+            // exit code is recorded rather than the kill's. Output bytes are unaffected (stdout is closed).
+            if tally.is_some() && kill_sent.lock().unwrap_or_else(|e| e.into_inner()).is_none() {
+                let until = Instant::now() + Duration::from_secs(2);
+                loop {
+                    match c.try_wait() {
+                        Ok(Some(_)) => break,
+                        Ok(None) if Instant::now() < until => std::thread::sleep(Duration::from_millis(20)),
+                        _ => { kill_sent.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(|| "stdout_closed".to_string()); break; }
+                    }
+                }
+            }
             let _ = c.kill(); c.wait() };
         if let Some(t) = &tally {
             // Bounded: the writer has exited, so its stderr reaches EOF. A reader still busy after 2 s leaves the counts UNKNOWN.
