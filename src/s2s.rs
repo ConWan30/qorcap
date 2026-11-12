@@ -125,9 +125,39 @@ pub struct Config {
     /// Held-out sessions named before freeze (R8-3). Hashed into threshold_id.
     pub heldout_sessions: Vec<String>,
     pub code_pins: CodePins,
-    /// Sessions this tool refuses to compute (073204, VOID/FAIL). Not part of threshold_id.
+    /// Extra sessions to refuse. Add-only: the effective list is [`builtin_exclusions`] plus these
+    /// ([`Config::effective_exclusions`]), so an empty or missing list removes nothing. The effective
+    /// list is hashed into threshold_id.
     #[serde(default)]
     pub excluded_sessions: Vec<Excluded>,
+}
+
+/// Sessions this build always refuses to compute, whatever the config says (QorProof r2 R-M1b).
+/// A config can add exclusions but never remove these. `inputs_sha256` is UNKNOWN (None) for all of
+/// them: filling it needs read-only hashes of the real files, which this change does not read.
+pub fn builtin_exclusions() -> Vec<Excluded> {
+    vec![
+            Excluded {
+                session: "073204".into(),
+                reason: "EXCLUDED per PLAN-r11 R11-3 (agent-relayed instruction, QorProof-unverified; excluding is the safe direction)".into(),
+                inputs_sha256: None,
+            },
+            Excluded {
+                session: "201029".into(),
+                reason: "VOID".into(),
+                inputs_sha256: None,
+            },
+            Excluded {
+                session: "153536".into(),
+                reason: "VOID".into(),
+                inputs_sha256: None,
+            },
+            Excluded {
+                session: "112342".into(),
+                reason: "FAIL".into(),
+                inputs_sha256: None,
+            },
+    ]
 }
 
 impl Config {
@@ -199,37 +229,17 @@ impl Config {
                 ],
                 drift: "none: re-pinned at main 4888a63; same lines as the PLAN-r9 refs".into(),
             },
-            excluded_sessions: vec![
-                Excluded {
-                    session: "073204".into(),
-                    reason: "EXCLUDED per PLAN-r11 R11-3 (agent-relayed instruction, QorProof-unverified; excluding is the safe direction)".into(),
-                    inputs_sha256: None,
-                },
-                Excluded {
-                    session: "201029".into(),
-                    reason: "VOID".into(),
-                    inputs_sha256: None,
-                },
-                Excluded {
-                    session: "153536".into(),
-                    reason: "VOID".into(),
-                    inputs_sha256: None,
-                },
-                Excluded {
-                    session: "112342".into(),
-                    reason: "FAIL".into(),
-                    inputs_sha256: None,
-                },
-            ],
+            excluded_sessions: builtin_exclusions(),
         }
     }
 
     /// sha256(JCS) of the rule, freeze status, tuning sessions (with seal status and inputs sha256),
-    /// held-out names and the code pins (main SHA). The exclude list is not part of it.
+    /// held-out names, the code pins (main SHA) and the effective exclusion list.
     pub fn threshold_id(&self) -> String {
         let v = json!({
             "schema": "qorcap-s2s-threshold/v0", "source": self.source, "status": self.status, "params": self.params,
             "tuning_sessions": self.tuning_sessions, "heldout_sessions": self.heldout_sessions, "code_pins": self.code_pins,
+            "excluded_sessions": self.effective_exclusions(),
         });
         ev::try_jcs_sha(&v).expect("threshold config is integers and strings only")
     }
@@ -244,8 +254,19 @@ impl Config {
         })
     }
 
-    fn excluded(&self, session_id: &str, inputs_sha256: &str) -> Option<&Excluded> {
-        self.excluded_sessions.iter().find(|e| {
+    /// [`builtin_exclusions`] first, then config entries that are not exact duplicates of an earlier one.
+    pub fn effective_exclusions(&self) -> Vec<Excluded> {
+        let mut out = builtin_exclusions();
+        for e in &self.excluded_sessions {
+            if !out.contains(e) {
+                out.push(e.clone());
+            }
+        }
+        out
+    }
+
+    fn excluded(&self, session_id: &str, inputs_sha256: &str) -> Option<Excluded> {
+        self.effective_exclusions().into_iter().find(|e| {
             session_id == e.session
                 || session_id.ends_with(&format!("-{}", e.session))
                 || e.inputs_sha256.as_deref() == Some(inputs_sha256)
@@ -922,19 +943,45 @@ fn check_out(bundle: &Path, out: &Path) -> Result<(), String> {
                 out.display()
             ));
         }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            if md.nlink() > 1 {
-                return Err(format!(
-                    "refusing to write {}: it is a hard link ({} links)",
-                    out.display(),
-                    md.nlink()
-                ));
-            }
+        let links = link_count(out, &md)?;
+        if links > 1 {
+            return Err(format!(
+                "refusing to write {}: it is a hard link ({links} links)",
+                out.display()
+            ));
         }
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn link_count(_out: &Path, md: &std::fs::Metadata) -> Result<u64, String> {
+    use std::os::unix::fs::MetadataExt;
+    Ok(md.nlink())
+}
+
+/// `nNumberOfLinks` from GetFileInformationByHandle (std's `number_of_links` is unstable). Fails
+/// closed: a file whose link count cannot be read is refused.
+#[cfg(windows)]
+fn link_count(out: &Path, _md: &std::fs::Metadata) -> Result<u64, String> {
+    use std::os::windows::io::AsRawHandle;
+    #[link(name = "kernel32")]
+    extern "system" {
+        // BY_HANDLE_FILE_INFORMATION is 13 DWORDs; nNumberOfLinks is the 11th.
+        fn GetFileInformationByHandle(h: *mut core::ffi::c_void, info: *mut [u32; 13]) -> i32;
+    }
+    let refuse = |why: String| format!("refusing to write {}: cannot read its link count ({why})", out.display());
+    let f = std::fs::File::open(out).map_err(|e| refuse(e.to_string()))?;
+    let mut info = [0u32; 13];
+    if unsafe { GetFileInformationByHandle(f.as_raw_handle() as _, &mut info) } == 0 {
+        return Err(refuse(std::io::Error::last_os_error().to_string()));
+    }
+    Ok(info[10] as u64)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn link_count(out: &Path, _md: &std::fs::Metadata) -> Result<u64, String> {
+    Err(format!("refusing to write {}: link count UNKNOWN on this platform", out.display()))
 }
 
 /// Checks [`check_out`], writes a temp file beside `out`, then renames it over `out`. The rename

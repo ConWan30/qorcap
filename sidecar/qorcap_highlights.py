@@ -141,8 +141,8 @@ def parse_probe_rate(stdout: str) -> tuple[int, int] | None:
     return parse_probe_rates(stdout)[0]
 
 
-# Same rule and wording as align::avg_rate_note in qorcap #163 (relative gap above 1/2000 = 0.05%; NTSC 1/1001
-# stays noted). Main's align.rs before #163 notes any exact inequality; #163 moves Rust to this tolerance.
+# Same rule and wording as align::avg_rate_note / AVG_RATE_NOTE_TOLERANCE in src/align.rs (merged in #163, 147b615):
+# relative gap above 1/2000 = 0.05%, exclusive; NTSC 1/1001 stays noted.
 AVG_RATE_NOTE_TOLERANCE = (1, 2000)
 
 

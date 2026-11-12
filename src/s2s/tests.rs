@@ -474,9 +474,19 @@ fn threshold_id_is_deterministic_and_hashes_rule_sessions_and_pins() {
         a.threshold_id(),
         "freeze status is hashed: a hand-edited \"frozen\" file has a different id than the ledgered one would need"
     );
+    // exclusions are add-only (QorProof r2 R-M1b): emptying the config list leaves the built-ins in
+    // force, so the effective list and the id are unchanged; adding one changes the id
     let mut x = a.clone();
     x.excluded_sessions.clear();
+    assert_eq!(x.effective_exclusions(), builtin_exclusions());
     assert_eq!(x.threshold_id(), a.threshold_id());
+    let mut y = a.clone();
+    y.excluded_sessions.push(Excluded {
+        session: "999999".into(),
+        reason: "test".into(),
+        inputs_sha256: None,
+    });
+    assert_ne!(y.threshold_id(), a.threshold_id(), "the effective exclusion list is hashed");
     for change in 0..5 {
         let mut c = a.clone();
         match change {
@@ -830,6 +840,91 @@ fn exclusion_is_bound_to_the_bundle_and_a_rename_fails_closed() {
     let _ = std::fs::remove_dir_all(&base);
 }
 
+/// QorProof r2 R-M1b: a config can add exclusions but never remove the built-in ones.
+#[test]
+fn exclusions_are_add_only() {
+    let base = scratch("m1b");
+    let rows = one_onset().done();
+    let out = base.join("out.json");
+    let mut empty = serde_json::to_value(Config::standby_a()).unwrap();
+    empty["excluded_sessions"] = json!([]);
+    let mut omitted = serde_json::to_value(Config::standby_a()).unwrap();
+    omitted.as_object_mut().unwrap().remove("excluded_sessions");
+    for (what, j) in [("empty list", empty), ("field omitted", omitted)] {
+        let cfg: Config = serde_json::from_value(j).unwrap();
+        assert!(cfg.excluded_sessions.is_empty(), "{what}");
+        assert_eq!(cfg.effective_exclusions(), builtin_exclusions(), "{what}");
+        assert_eq!(cfg.threshold_id(), Config::standby_a().threshold_id(), "{what}");
+        for stamp in ["073204", "201029", "153536", "112342"] {
+            let b = fixture_bundle(
+                &base,
+                &format!("match-20261110-{stamp}"),
+                Some(&format!("local-20261110-{stamp}")),
+                &rows,
+            );
+            let v = run(&b, &out, &meta_for(""), &cfg).unwrap();
+            assert_eq!(v["status"], "excluded", "{what} {stamp}");
+            let _ = std::fs::remove_dir_all(&b);
+        }
+    }
+    // an added entry is honoured and shows in the effective list
+    let mut more = Config::standby_a();
+    more.excluded_sessions.push(Excluded {
+        session: "000777".into(),
+        reason: "test".into(),
+        inputs_sha256: None,
+    });
+    assert_eq!(more.effective_exclusions().len(), builtin_exclusions().len() + 1);
+    let b = fixture_bundle(
+        &base,
+        "match-20990101-000777",
+        Some("local-20990101-000777"),
+        &rows,
+    );
+    assert_eq!(run(&b, &out, &meta_for(""), &more).unwrap()["status"], "excluded");
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// QorProof r2 R-M1a, KNOWN RESIDUAL: a copy of a listed bundle with BOTH the folder name and
+/// bundle.json match_id re-stamped to a new consistent id is not caught by id. The content key
+/// (`inputs_sha256`) would catch it, but it is None for every built-in entry (filling it needs the
+/// real files, which this tool does not read). Acceptable only while every output is INFO_ONLY.
+#[test]
+fn restamped_copy_is_a_known_residual_while_info_only() {
+    let base = scratch("m1a");
+    let rows = one_onset().done();
+    let out = base.join("out.json");
+    let orig = fixture_bundle(
+        &base,
+        "match-20261110-073204",
+        Some("local-20261110-073204"),
+        &rows,
+    );
+    let v = run(&orig, &out, &meta_for(""), &frozen()).unwrap();
+    assert_eq!(v["status"], "excluded");
+    let copy = fixture_bundle(
+        &base,
+        "match-20261110-424242",
+        Some("local-20261110-424242"),
+        &rows,
+    );
+    let rep = run(&copy, &out, &meta_for(""), &frozen()).unwrap();
+    assert_eq!(rep["status"], "ok", "residual: id-only exclusion misses a consistent re-stamp");
+    assert_eq!(rep["tier"], "INFO_ONLY");
+    no_counted_anywhere(&rep);
+    assert!(builtin_exclusions().iter().all(|e| e.inputs_sha256.is_none()));
+    // once a content hash is filled in, the same re-stamped copy is excluded
+    let sha = rep["session"]["inputs_sha256"].as_str().unwrap().to_string();
+    let mut cfg = frozen();
+    cfg.excluded_sessions.push(Excluded {
+        session: "073204".into(),
+        reason: "synthetic: hash of the fixture's inputs.jsonl".into(),
+        inputs_sha256: Some(sha),
+    });
+    assert_eq!(run(&copy, &out, &meta_for(""), &cfg).unwrap()["status"], "excluded");
+    let _ = std::fs::remove_dir_all(&base);
+}
+
 /// QorProof M2: temp + rename, links at `out` refused, and every bundle folder protected.
 #[test]
 fn output_path_hardening() {
@@ -875,6 +970,17 @@ fn output_path_hardening() {
             .unwrap_err()
             .contains("hard link"));
         // even past the checks, the rename replaces the entry instead of writing through it
+        let rep = analyze(&rows, "sha", &m, &frozen());
+        assert!(write_report(&b, &hard, &rep).is_err());
+    }
+    #[cfg(windows)]
+    {
+        // QorProof r2: Windows hard links are refused too (nNumberOfLinks)
+        let hard = base.join("hard.json");
+        std::fs::hard_link(other.join("inputs.jsonl"), &hard).unwrap();
+        assert!(run(&b, &hard, &m, &frozen())
+            .unwrap_err()
+            .contains("hard link (2 links)"));
         let rep = analyze(&rows, "sha", &m, &frozen());
         assert!(write_report(&b, &hard, &rep).is_err());
     }
