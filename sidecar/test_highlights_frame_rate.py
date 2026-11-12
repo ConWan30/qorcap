@@ -12,6 +12,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
+import pytest  # noqa: E402
 import qorcap_highlights as hl  # noqa: E402
 
 GOLDEN_FILE = HERE / "fixtures" / "highlights_golden_30fps_b0d5ad9.txt"
@@ -283,3 +284,53 @@ def test_unknown_rate_never_blocks_finalize_or_touches_the_receipt(tmp_path, mon
     assert (b / "receipt.json").read_bytes() == before
     man = json.loads((b / "highlights" / "manifest.json").read_text())
     assert man["clips"] == [] and any("UNMEASURED" in x["reason"] for x in man["skipped"])
+
+
+# ---------------------------------------------------------------- QorProof r164 LOWs (F2, F3, F4)
+@pytest.mark.parametrize("tbr", ["nan", "inf"])
+def test_nan_or_inf_banner_rate_is_unmeasured_not_a_crash(tmp_path, monkeypatch, tbr):
+    banner = f"  Stream #0:0: Video: h264 (High), yuv420p, 1280x720, {tbr} fps, {tbr} tbr, 90k tbn\n"
+    assert hl.parse_banner_rate(banner) is None, "Rust maps a non-finite tbr to None"
+    s = _Stub(monkeypatch, probe_stdout=None, banner=banner)
+    b = _golden_bundle(tmp_path, _regular(120), SCORES)
+    man = hl.make_highlights(b)  # must not raise
+    assert s.cuts == [] and man["clips"] == []
+    unmeasured = [x for x in man["skipped"] if "frame rate UNMEASURED" in x["reason"]]
+    assert len(unmeasured) == 6 and len(man["skipped"]) == 7  # + the lock outside the recorded video
+    assert (b / "highlights" / "manifest.json").exists()
+
+
+def test_unreadable_frame_clock_skips_the_file_and_still_writes_the_manifest(tmp_path, monkeypatch):
+    s = _Stub(monkeypatch, "r_frame_rate=60/1\navg_frame_rate=60/1\n")
+    b = _golden_bundle(tmp_path, _regular(120), SCORES)
+    (b / "frame_clock.jsonl").mkdir()  # exists but cannot be read as a file
+    man = hl.make_highlights(b)  # must not raise
+    assert s.cuts == [] and man["clips"] == [], "a rejected file is never cut"
+    rejected = [x for x in man["skipped"] if "frame_clock.jsonl is unreadable" in x["reason"]]
+    assert len(rejected) == 6 and len(man["skipped"]) == 7  # + the lock outside the recorded video
+    assert all(x["reason"].endswith("(fail closed)") for x in rejected)
+    assert json.loads((b / "highlights" / "manifest.json").read_text())["clips"] == []
+    assert not list((b / "highlights").glob("*.mp4"))
+
+
+def test_avg_frame_rate_note_matches_rust(tmp_path, monkeypatch):
+    s = _Stub(monkeypatch, "r_frame_rate=60/1\navg_frame_rate=60000/1001\n")
+    man = hl.make_highlights(_bundle_in(tmp_path, "ntsc", _regular(120)))
+    assert man["notes"] == ["video.mp4: avg_frame_rate 60000/1001 differs from r_frame_rate 60/1 "
+                            "(note only; analysed at r_frame_rate)"]
+    assert len(man["clips"]) == 6 and {c["source"]["frame_rate"] for c in man["clips"]} == {"60/1"}, "cut at r_frame_rate"
+    cuts = list(s.cuts)
+    s2 = _Stub(monkeypatch, "r_frame_rate=60/1\navg_frame_rate=5999/100\n")  # duration-rounding drift: no note
+    man2 = hl.make_highlights(_bundle_in(tmp_path, "drift", _regular(120)))
+    assert "notes" not in man2 and s2.cuts == cuts
+
+
+def test_avg_rate_note_tolerance_is_the_rust_one():
+    r60, r30 = (60, 1), (30, 1)
+    rat = hl.parse_rational
+    for r, avg in [(r60, "6003/100"), (r60, "5997/100"), (r60, "5999/100"), (r30, "29997/1000"), (r60, "120/2")]:
+        assert hl.avg_rate_note("v", r, rat(avg)) is None, avg
+    for r, avg in [(r60, "60031/1000"), (r60, "59969/1000"), (r60, "60000/1001"), (r30, "30000/1001"), (r60, "30/1")]:
+        assert hl.avg_rate_note("v", r, rat(avg)) is not None, avg
+    assert hl.avg_rate_note("v", r60, None) is None
+    assert hl.parse_probe_rates("avg_frame_rate=0/0\nr_frame_rate=60/1\n") == ((60, 1), None)

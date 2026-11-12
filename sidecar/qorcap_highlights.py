@@ -30,6 +30,7 @@ import argparse
 import bisect
 import hashlib
 import json
+import math
 import os
 import shutil
 import subprocess
@@ -123,14 +124,37 @@ def parse_rational(s: str) -> tuple[int, int] | None:
         return None
 
 
-def parse_probe_rate(stdout: str) -> tuple[int, int] | None:
-    """``r_frame_rate=`` from ffprobe ``default=nw=1`` output (first valid one)."""
+def parse_probe_rates(stdout: str) -> tuple[tuple[int, int] | None, tuple[int, int] | None]:
+    """(r_frame_rate, avg_frame_rate) from ffprobe ``default=nw=1`` output, first valid of each (align::parse_probe_rates)."""
+    r = avg = None
     for line in stdout.splitlines():
         v = line.strip()
         if v.startswith("r_frame_rate="):
-            r = parse_rational(v[len("r_frame_rate="):])
-            if r:
-                return r
+            r = r or parse_rational(v[len("r_frame_rate="):])
+        if v.startswith("avg_frame_rate="):
+            avg = avg or parse_rational(v[len("avg_frame_rate="):])
+    return r, avg
+
+
+def parse_probe_rate(stdout: str) -> tuple[int, int] | None:
+    """``r_frame_rate=`` from ffprobe ``default=nw=1`` output (first valid one)."""
+    return parse_probe_rates(stdout)[0]
+
+
+# Same rule and wording as align::avg_rate_note in qorcap #163 (relative gap above 1/2000 = 0.05%; NTSC 1/1001
+# stays noted). Main's align.rs before #163 notes any exact inequality; #163 moves Rust to this tolerance.
+AVG_RATE_NOTE_TOLERANCE = (1, 2000)
+
+
+def avg_rate_note(file: str, r: tuple[int, int], avg: tuple[int, int] | None) -> str | None:
+    """Note when ffprobe's avg_frame_rate differs from r_frame_rate beyond the tolerance. Note only; cut at r."""
+    if avg is None:
+        return None
+    lhs, rhs = avg[0] * r[1], r[0] * avg[1]
+    tn, td = AVG_RATE_NOTE_TOLERANCE
+    if abs(lhs - rhs) * td > rhs * tn:
+        return (f"{file}: avg_frame_rate {avg[0]}/{avg[1]} differs from r_frame_rate {r[0]}/{r[1]} "
+                "(note only; analysed at r_frame_rate)")
     return None
 
 
@@ -148,8 +172,8 @@ def parse_banner_rate(stderr: str) -> tuple[int, int] | None:
         v = float(raw[:-1]) * 1000.0 if raw.endswith("k") else float(raw)
     except ValueError:
         return None
-    if v <= 0:
-        return None
+    if not math.isfinite(v) or v <= 0:
+        return None  # nan / inf tbr: UNMEASURED, as in Rust (QorProof F2)
     if abs(v - round(v)) < 1e-6:
         r = (round(v), 1)
     elif abs(v * 1.001 - round(v * 1.001)) < 0.01:
@@ -196,24 +220,34 @@ def _probe_run(cmd: list[str]) -> tuple[int, str, str]:
     return p.returncode, p.stdout or "", p.stderr or ""
 
 
-def probe_rate(ffmpeg: str, src: Path) -> tuple[int, int] | None:
-    """ffprobe r_frame_rate, else the ``ffmpeg -i`` tbr (align::probe_rates)."""
+def probe_rates(ffmpeg: str, src: Path) -> tuple[tuple[int, int] | None, tuple[int, int] | None]:
+    """(rate, avg): ffprobe r_frame_rate (+ avg_frame_rate), else the ``ffmpeg -i`` tbr with no avg (align::probe_rates)."""
     fp = Path(ffmpeg)
     probe = str(fp.with_name(fp.name.replace("ffmpeg", "ffprobe"))) if fp.name else "ffprobe"
     code, out, _ = _probe_run([probe, "-v", "error", "-select_streams", "v:0", "-show_entries",
                                "stream=r_frame_rate,avg_frame_rate", "-of", "default=nw=1", str(src)])
-    r = parse_probe_rate(out) if code == 0 else None
+    r, avg = parse_probe_rates(out) if code == 0 else (None, None)
     if r:
-        return r
+        return r, avg
     _, _, err = _probe_run([ffmpeg, "-hide_banner", "-i", str(src)])
-    return parse_banner_rate(err)
+    return parse_banner_rate(err), None
 
 
-def file_rate(ffmpeg: str, src: Path, file: str, stamps: list[dict]) -> tuple[int, int]:
+def probe_rate(ffmpeg: str, src: Path) -> tuple[int, int] | None:
+    """ffprobe r_frame_rate, else the ``ffmpeg -i`` tbr."""
+    return probe_rates(ffmpeg, src)[0]
+
+
+def file_rate(ffmpeg: str, src: Path, file: str, stamps: list[dict], notes: list[str] | None = None) -> tuple[int, int]:
     """The rate ``file`` is cut at. Probe first, frame clock second; both present must agree within 1 %.
 
-    Raises RateUnknown (fail closed) when neither is known or they disagree. Same rule as align::file_rate."""
-    p = probe_rate(ffmpeg, src)
+    Raises RateUnknown (fail closed) when neither is known or they disagree. Same rule as align::file_rate_noted:
+    an avg_frame_rate note is appended to ``notes`` when the probe's average differs from r_frame_rate."""
+    p, avg = probe_rates(ffmpeg, src)
+    if p and notes is not None:
+        n = avg_rate_note(file, p, avg)
+        if n:
+            notes.append(n)
     f = frame_clock_rate(stamps, file)
     if p and f and abs((p[0] / p[1]) / (f[0] / f[1]) - 1.0) > 0.01:
         raise RateUnknown(f"frame rate UNMEASURED: stream says {p[0]}/{p[1]} but frame_clock PTS step says {f[0]}/{f[1]}")
@@ -433,20 +467,24 @@ def make_highlights(bundle: Path, out: Path | None = None, pre: float = PRE_S, p
     receipt = json.loads(rp.read_text(encoding="utf-8"))
     manifest = read_jsonl(bundle / "manifest.jsonl")
     rates: dict[str, tuple[int, int] | str] = {}  # file -> (num, den) or the UNMEASURED reason
-    stamps: list[dict] | None = None
+    rate_notes: list[str] = []
 
     def fps_of(vfile: str) -> float:
-        nonlocal stamps
+        # The rate is settled before the first cut of a file, so a rejected file never has a clip on disk.
         if vfile not in rates:
             from qorcap_paths import bundle_child
             src = bundle_child(bundle, vfile)
             if src is None or not src.exists():
                 return FPS  # nothing to cut: the lock is skipped below as "not in the bundle folder", as before
-            if stamps is None:
-                stamps = load_frame_clock(bundle / "frame_clock.jsonl")
             try:
-                rates[vfile] = file_rate(ffmpeg, src, vfile, stamps)
-            except RateUnknown as e:
+                try:
+                    stamps = load_frame_clock(bundle / "frame_clock.jsonl")
+                except Exception as e:  # noqa: BLE001 - unreadable file, a folder of that name, ...
+                    raise RateUnknown(f"frame rate UNMEASURED: frame_clock.jsonl is unreadable ({type(e).__name__})")
+                rates[vfile] = file_rate(ffmpeg, src, vfile, stamps, rate_notes)
+            except Exception as e:  # noqa: BLE001 - never abort the run: any rate failure is UNMEASURED for this file
+                if not isinstance(e, RateUnknown):
+                    e = RateUnknown(f"frame rate UNMEASURED: rate check failed ({type(e).__name__})")
                 rates[vfile] = str(e)
                 say(f"  highlights for {vfile} skipped: {e} (fail closed; finalize and submit are unaffected)")
         r = rates[vfile]
@@ -540,6 +578,10 @@ def make_highlights(bundle: Path, out: Path | None = None, pre: float = PRE_S, p
         ],
         "clips": clips, "skipped": skipped,
     }
+    if rate_notes:  # only when ffprobe's avg_frame_rate differs from r_frame_rate (30/1 manifests keep their shape)
+        man["notes"] = rate_notes
+        for n in rate_notes:
+            say(f"  note: {n}")
     (out / "manifest.json").write_text(json.dumps(man, indent=2), encoding="utf-8")
     return man
 
