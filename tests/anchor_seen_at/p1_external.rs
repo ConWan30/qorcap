@@ -4,22 +4,112 @@ use std::{
     path::{Path, PathBuf},
     process::Command,
 };
-// Cargo's fingerprint layout is a test-only dependency. Unknown layouts fail closed;
-// never select a possibly stale feature-off library by modification time.
-fn artifact(deps: &Path, name: &str) -> PathBuf {
-    let exe = std::env::current_exe().unwrap();
-    let stem = exe.file_stem().unwrap().to_str().unwrap();
-    let consumer = stem
-        .strip_prefix("anchor_seen_at-")
-        .expect("integration artifact");
-    let fingerprints = deps.parent().unwrap().join(".fingerprint");
-    let metadata: serde_json::Value = serde_json::from_slice(
-        &fs::read(fingerprints.join(format!(
-            "qorcap-{consumer}/test-integration-test-anchor_seen_at.json"
-        )))
-        .unwrap(),
-    )
-    .unwrap();
+// Cargo's fingerprint layout is a test-only dependency. Two known layouts are accepted; any other
+// layout fails closed. Never select a possibly stale feature-off library by modification time.
+//
+// * Flat (Cargo before 1.100): `<profile>/deps/<artifact>` with fingerprints in
+//   `<profile>/.fingerprint/<pkg>-<hash>/`.
+// * Build-dir (Cargo 1.100+): `<build>/<pkg>/<hash>/out/<artifact>` with fingerprints in
+//   `<build>/<pkg>/<hash>/fingerprint/`.
+//
+// In both, the dependency is bound exactly: the hash this test binary's own fingerprint records for
+// `name` must equal the contents of exactly one `lib-<name>` marker, and that unit's rlib must exist.
+enum Layout {
+    Flat { deps: PathBuf, fingerprints: PathBuf },
+    BuildDir { build: PathBuf },
+}
+impl Layout {
+    fn detect() -> (Layout, String) {
+        let exe = std::env::current_exe().unwrap();
+        let stem = exe.file_stem().unwrap().to_str().unwrap();
+        let consumer = stem
+            .strip_prefix("anchor_seen_at-")
+            .expect("integration artifact")
+            .to_string();
+        let dir = exe.parent().unwrap();
+        let name = |p: &Path| p.file_name().and_then(|n| n.to_str()).map(str::to_owned);
+        if name(dir).as_deref() == Some("deps") && dir.parent().unwrap().join(".fingerprint").is_dir() {
+            let fingerprints = dir.parent().unwrap().join(".fingerprint");
+            return (Layout::Flat { deps: dir.to_path_buf(), fingerprints }, consumer);
+        }
+        // <build>/qorcap/<consumer>/out/anchor_seen_at-<consumer>
+        let unit = dir.parent().unwrap();
+        let pkg = unit.parent().unwrap();
+        if name(dir).as_deref() == Some("out")
+            && name(unit).as_deref() == Some(consumer.as_str())
+            && name(pkg).as_deref() == Some("qorcap")
+            && unit.join("fingerprint").is_dir()
+        {
+            return (Layout::BuildDir { build: pkg.parent().unwrap().to_path_buf() }, consumer);
+        }
+        panic!("unknown Cargo target layout at {}; failing closed", exe.display());
+    }
+    /// This test binary's own fingerprint metadata.
+    fn consumer_metadata(&self, consumer: &str) -> PathBuf {
+        match self {
+            Layout::Flat { fingerprints, .. } => fingerprints
+                .join(format!("qorcap-{consumer}"))
+                .join("test-integration-test-anchor_seen_at.json"),
+            Layout::BuildDir { build } => build
+                .join("qorcap")
+                .join(consumer)
+                .join("fingerprint")
+                .join("test-integration-test-anchor_seen_at.json"),
+        }
+    }
+    /// Every (lib-<name> marker, rlib) pair Cargo could have built for `name`.
+    fn candidates(&self, name: &str) -> Vec<(PathBuf, PathBuf)> {
+        let mut out = vec![];
+        match self {
+            Layout::Flat { deps, fingerprints } => {
+                for entry in fs::read_dir(fingerprints).unwrap() {
+                    let path = entry.unwrap().path();
+                    let directory = path.file_name().unwrap().to_str().unwrap().to_owned();
+                    let Some(suffix) = directory.strip_prefix(&format!("{name}-")) else { continue };
+                    out.push((path.join(format!("lib-{name}")), deps.join(format!("lib{name}-{suffix}.rlib"))));
+                }
+            }
+            Layout::BuildDir { build } => {
+                let Ok(units) = fs::read_dir(build.join(name)) else { return out };
+                for entry in units {
+                    let path = entry.unwrap().path();
+                    let suffix = path.file_name().unwrap().to_str().unwrap().to_owned();
+                    out.push((
+                        path.join("fingerprint").join(format!("lib-{name}")),
+                        path.join("out").join(format!("lib{name}-{suffix}.rlib")),
+                    ));
+                }
+            }
+        }
+        out
+    }
+    /// `-L dependency=` search paths for transitive dependencies (rustc picks them by SVH).
+    fn search_paths(&self) -> Vec<PathBuf> {
+        match self {
+            Layout::Flat { deps, .. } => vec![deps.clone()],
+            Layout::BuildDir { build } => {
+                let mut v = vec![];
+                for pkg in fs::read_dir(build).unwrap() {
+                    let pkg = pkg.unwrap().path();
+                    if !pkg.is_dir() {
+                        continue;
+                    }
+                    for unit in fs::read_dir(&pkg).unwrap() {
+                        let out = unit.unwrap().path().join("out");
+                        if out.is_dir() {
+                            v.push(out);
+                        }
+                    }
+                }
+                v.sort();
+                v
+            }
+        }
+    }
+}
+fn artifact(layout: &Layout, consumer: &str, name: &str) -> PathBuf {
+    let metadata: serde_json::Value =
+        serde_json::from_slice(&fs::read(layout.consumer_metadata(consumer)).unwrap()).unwrap();
     let dependency = metadata["deps"]
         .as_array()
         .unwrap()
@@ -39,18 +129,13 @@ fn artifact(deps: &Path, name: &str) -> PathBuf {
         .map(|b| format!("{b:02x}"))
         .collect();
     let mut matches = vec![];
-    for entry in fs::read_dir(&fingerprints).unwrap() {
-        let path = entry.unwrap().path();
-        let marker = path.join(format!("lib-{name}"));
+    for (marker, artifact) in layout.candidates(name) {
         if !marker.exists() {
             continue;
         }
         if fs::read_to_string(marker).unwrap().trim() != expected {
             continue;
         }
-        let directory = path.file_name().unwrap().to_str().unwrap();
-        let suffix = directory.strip_prefix(&format!("{name}-")).unwrap();
-        let artifact = deps.join(format!("lib{name}-{suffix}.rlib"));
         assert!(artifact.is_file(), "bound compiler artifact missing");
         matches.push(artifact);
     }
@@ -59,15 +144,13 @@ fn artifact(deps: &Path, name: &str) -> PathBuf {
 }
 #[test]
 fn p1_external_api_rejects_forgery_for_the_right_reasons() {
-    let deps = std::env::current_exe()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .to_path_buf();
+    let (layout, consumer) = Layout::detect();
+    let search = layout.search_paths();
+    assert!(!search.is_empty(), "no dependency search path");
     let dir = std::env::temp_dir().join(format!("qorcap-p1-compile-{}", std::process::id()));
     fs::create_dir(&dir).unwrap();
-    let lib = artifact(&deps, "qorcap");
-    let json = artifact(&deps, "serde_json");
+    let lib = artifact(&layout, &consumer, "qorcap");
+    let json = artifact(&layout, &consumer, "serde_json");
     let mut cases: Vec<(String, String, Option<&str>)> = vec![];
     let types = [
         "OriginalExchange",
@@ -146,8 +229,7 @@ fn f(x:&OriginalExchange,o:&OpeningRecord,p:&PolicyObservation,d:&DecisionTimeRe
                 "p1_probe",
             ])
             .arg(&source)
-            .arg("-L")
-            .arg(format!("dependency={}", deps.display()))
+            .args(search.iter().flat_map(|d| ["-L".into(), format!("dependency={}", d.display())]))
             .arg("--extern")
             .arg(format!("qorcap={}", lib.display()))
             .arg("--extern")
