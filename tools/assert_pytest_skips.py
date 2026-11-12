@@ -93,6 +93,11 @@ LINUX_FILES = (
     "sidecar/test_qorcap_match.py::test_hung_on_frame_is_noticed_from_the_status_loop",
     "sidecar/test_qorcap_match.py::test_hung_refresh_shows_refresh_age_ms",
     "sidecar/test_qorcap_match.py::test_reader_timing_log_names_the_three_clocks",
+    "sidecar/test_qorcap_match.py::test_late_sign_with_live_countersignatures_adds_a_signed_note_and_json",
+    "sidecar/test_qorcap_match.py::test_late_sign_with_offline_countersignatures_names_the_recording_clock",
+    "sidecar/test_qorcap_match.py::test_late_sign_note_is_covered_by_both_signatures",
+    "sidecar/test_qorcap_match.py::test_not_late_leaves_the_draft_unchanged_and_writes_nothing",
+    "sidecar/test_qorcap_match.py::test_live_save_tail_never_adds_the_late_sign_note",
     "sidecar/test_qorcap_standard.py",
     "sidecar/test_qorcap_score_grammar.py",
     "sidecar/test_qorcap_hl170123.py",
@@ -155,6 +160,11 @@ WINDOWS_FILES = (
     "sidecar/test_qorcap_match.py::test_hung_on_frame_is_noticed_from_the_status_loop",
     "sidecar/test_qorcap_match.py::test_hung_refresh_shows_refresh_age_ms",
     "sidecar/test_qorcap_match.py::test_reader_timing_log_names_the_three_clocks",
+    "sidecar/test_qorcap_match.py::test_late_sign_with_live_countersignatures_adds_a_signed_note_and_json",
+    "sidecar/test_qorcap_match.py::test_late_sign_with_offline_countersignatures_names_the_recording_clock",
+    "sidecar/test_qorcap_match.py::test_late_sign_note_is_covered_by_both_signatures",
+    "sidecar/test_qorcap_match.py::test_not_late_leaves_the_draft_unchanged_and_writes_nothing",
+    "sidecar/test_qorcap_match.py::test_live_save_tail_never_adds_the_late_sign_note",
     "sidecar/test_qorcap_standard.py",
     "sidecar/test_qorcap_score_grammar.py",
     "sidecar/test_qorcap_tnp.py",
@@ -191,8 +201,8 @@ WINDOWS_FILES = (
 # Collect-only of these lists after the tail tests in sidecar/test_post_final_tail.py.
 # Main e00d374, including the guard tests, collected 596 linux / 578 windows.
 # Re-collect after any list or test change.
-LINUX_MIN_COLLECTED = 925
-WINDOWS_MIN_COLLECTED = 907
+LINUX_MIN_COLLECTED = 930
+WINDOWS_MIN_COLLECTED = 912
 
 # Absent from both sidecar suites. A reason is required; whitespace does not count.
 EXCLUDED_TEST_FILES = {

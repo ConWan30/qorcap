@@ -30,6 +30,14 @@ QorCap's own recording time, and the referee ``key_kind`` says ``local-self-atte
 recorder was killed before it could write them. Bytes after the last hashed segment are excluded.
 ``post_final_tail.json`` is left as it was.
 
+Late finalize: when the bundle has no receipt.json yet (the live save stopped before signing), finalize adds
+one ``result.notes`` line before signing, so both signatures cover it: when the receipt was signed offline
+(local time with zone, and UTC ms), the gap after the recording ended (``ended_ms``), the reason, and whether
+the checkpoint countersignatures are the live ones or were re-signed offline on the recording clock. The same
+facts go to ``late_finalize.json`` (info only). A receipt signed late must never read as signed at match time.
+Live-only files (``post_final_tail.json``, ``cod_end_stop.json``) are not rebuilt; any reconstruction would
+have to cite the qorcap.log lines it used and must never take the live file names.
+
 Trust: both keys live on this PC, so the result is SELF-ATTESTED. The receipt's computed QorTime tier is
 ``single-attested`` and ``referee.key_kind`` is ``local-self-attested`` so any reader can see that the
 "referee" is this machine, not an independent server. Keys are never printed.
@@ -543,13 +551,18 @@ def closed_match(match: dict) -> dict:
     return {k: match[k] for k in match if k in allowed}
 
 
+def receipt_ended_ms(cps: list[dict], started_ms: int) -> int:
+    """``match.ended_ms`` of the receipt: the last checkpoint countersign time, never before the start."""
+    return max(cps[-1]["referee_ts_ms"] if cps else started_ms, started_ms)
+
+
 def build_receipt(draft: dict, cps: list[dict], device, referee, *, match_id: str, role: str, started_ms: int,
                   referee_kind: str = REFEREE_KIND) -> dict:
     """QorTime's receipt.build + sign_referee + sign_player on what QorCap observed."""
     from qor_receipt import receipt as R
 
     m = dict(closed_match(draft["match"]), match_id=match_id, started_ms=started_ms,
-             ended_ms=max(cps[-1]["referee_ts_ms"] if cps else started_ms, started_ms))
+             ended_ms=receipt_ended_ms(cps, started_ms))
     player = dict(draft["players"][0], role=role, pubkey=device.pubkey_hex, key_kind=device.kind)
     rec = R.build(match=m, result=closed_result(draft["result"]), players=[player],
                   referee={"pubkey": referee.pubkey_hex, "key_id": referee.key_id, "key_kind": referee_kind},
@@ -3892,10 +3905,87 @@ def correct_role(bundle: Path, meta: dict, *, recorded: str, role: str, reason: 
     return meta
 
 
+LATE_FINALIZE_NAME = "late_finalize.json"
+LATE_FINALIZE_SCHEMA = "qorcap-late-finalize/v0"
+LATE_REASON = "the live save stopped before the receipt was signed"
+
+
+def _local_time(ms: int) -> str:
+    """Local wall time with its zone and UTC offset, e.g. ``2026-11-11 19:40:00 CST (UTC-0600)``."""
+    from datetime import datetime
+    dt = datetime.fromtimestamp(ms / 1000).astimezone()
+    return dt.strftime("%Y-%m-%d %H:%M:%S %Z (UTC%z)")
+
+
+def late_finalize_note(*, signed_ms: int, ended_ms: int, countersignatures: str) -> str:
+    """The ``result.notes`` line a late finalize adds. Both receipt signatures cover it.
+
+    It says the receipt was signed offline after the fact, when, how long after the recording ended,
+    why, and what the checkpoint countersignatures are. It never reads as a live signature.
+    """
+    gap_s = max(0, int(signed_ms) - int(ended_ms)) // 1000
+    h, rem = divmod(gap_s, 3600)
+    m, sec = divmod(rem, 60)
+    if countersignatures == "live":
+        cs = "checkpoint countersignatures are the live ones recorded during the match"
+    else:
+        cs = ("checkpoint countersignatures were re-signed offline; their times are the recording clock, "
+              "not observed live")
+    return (f"late sign: receipt signed offline at {_local_time(signed_ms)} (UTC ms {int(signed_ms)}), "
+            f"{h}h {m:02d}m {sec:02d}s after the recording ended (ended_ms {int(ended_ms)}); "
+            f"reason: {LATE_REASON}; {cs}. Not signed at match time.")
+
+
+def late_sign(draft: dict, cps: list[dict], started_ms: int, kind: str, *, late: bool, meta: dict | None = None,
+              now_ms: int | None = None) -> tuple[dict, dict | None]:
+    """Late finalize only: add the late-sign note to ``result.notes`` before signing.
+
+    Returns the draft and the ``late_finalize.json`` document, or the draft unchanged and None when the
+    bundle already had a receipt (a normal re-finalize). Live Start Match signing never calls this.
+    """
+    if not late:
+        return draft, None
+    from qorcap_submit import CLIENT_VERSION
+    signed_ms = int(time.time() * 1000) if now_ms is None else int(now_ms)
+    ended_ms = int(receipt_ended_ms(cps, started_ms))
+    countersignatures = "live" if kind == REFEREE_KIND else "offline"
+    note = late_finalize_note(signed_ms=signed_ms, ended_ms=ended_ms, countersignatures=countersignatures)
+    res = dict(draft.get("result") or {})
+    res["notes"] = list(res.get("notes") or []) + [note]
+    doc = {
+        "schema": LATE_FINALIZE_SCHEMA,
+        "info_only": True,
+        "signed_ms": signed_ms,
+        "signed_local": _local_time(signed_ms),
+        "ended_ms": ended_ms,
+        "gap_s": round(max(0, signed_ms - ended_ms) / 1000, 3),
+        "reason": LATE_REASON,
+        "countersignatures": countersignatures,
+        "referee_key_kind": kind,
+        "qorcap_version": CLIENT_VERSION,
+        "recorded_with": (meta or {}).get("qorcap_version"),
+        "note": note,
+    }
+    return dict(draft, result=res), doc
+
+
+def record_late_finalize(bundle: Path, doc: dict | None) -> None:
+    """Write ``late_finalize.json`` beside the bundle (tmp + rename) once receipt.json exists."""
+    if doc is None or not (Path(bundle) / "receipt.json").exists():
+        return
+    path = Path(bundle) / LATE_FINALIZE_NAME
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(doc, indent=2) + "\n", encoding="utf-8")
+    os.replace(tmp, path)
+    say(f"  Late sign:    {doc['note']}")
+
+
 def finalize(bundle: Path, *, qt: Path, qorcap: str, ffmpeg: str, key_dir: Path, no_open: bool = True,
              core_factory=None, hz: float = FIN_HZ, recover: bool = False, role: str | None = None,
              role_reason: str | None = None) -> int:
     bundle = bundle.resolve()
+    # Late finalize: no receipt was signed when the match was saved. The receipt then says so (late_sign).
+    late = not (bundle / "receipt.json").exists()
     vids = video_files(bundle)
     if not vids:
         say(f"No video.mp4 in {bundle}")
@@ -3965,9 +4055,11 @@ def finalize(bundle: Path, *, qt: Path, qorcap: str, ffmpeg: str, key_dir: Path,
         if side_changed:
             say("NOT SUBMITTABLE")
         say("\nSigning the receipt ...")
+        draft, late_doc = late_sign(draft, cps, started_ms, kind, late=late, meta=meta)
         code = sign_and_report(bundle, draft, cps, device, referee, match_id=match_id, role=role,
                                started_ms=started_ms, qt=qt, qorcap=qorcap, no_open=no_open,
                                referee_kind=kind, note=note, submittable=not side_changed)
+        record_late_finalize(bundle, late_doc)
         set_bundle_submittable(bundle, not side_changed)
         if spec.set_id == "cod":
             try:
@@ -4089,9 +4181,11 @@ def finalize(bundle: Path, *, qt: Path, qorcap: str, ffmpeg: str, key_dir: Path,
         say("NOT SUBMITTABLE")
     report_recording_audio(bundle, ffmpeg)
     say("\nSigning the receipt ...")
+    draft, late_doc = late_sign(draft, cps, started_ms, kind, late=late, meta=meta)
     code = sign_and_report(bundle, draft, cps, device, referee, match_id=match_id, role=role, started_ms=started_ms,
                            qt=qt, qorcap=qorcap, no_open=no_open, referee_kind=kind, note=note,
                            submittable=not side_changed)
+    record_late_finalize(bundle, late_doc)
     # After sign_and_report: it may rewrite bundle.json (challenge rule). The mark is the last write.
     # Restoring the recorded side clears it and reuses the live signatures already on disk.
     set_bundle_submittable(bundle, not side_changed)
