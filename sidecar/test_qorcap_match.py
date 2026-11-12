@@ -243,6 +243,10 @@ def test_finalize_offline_scripted_game(tmp_path):
     assert rec["referee"]["key_kind"] == qm.REFEREE_KIND_OFFLINE
     v = verify_receipt(rec, referee_pub=(b / "referee.pub").read_text().strip())
     assert v["errors"] == [], v
+    # No receipt before: a late finalize. Countersigs re-signed offline, so the note names the recording clock.
+    late = [n for n in rec["result"]["notes"] if n.startswith("late sign:")]
+    assert len(late) == 1 and "recording clock, not observed live" in late[0], rec["result"]["notes"]
+    assert json.loads((b / qm.LATE_FINALIZE_NAME).read_text())["countersignatures"] == "offline"
     scps = [json.loads(x) for x in (b / "score_checkpoints.jsonl").read_text().splitlines()]
     assert [c["qorcap"]["trigger"] for c in scps] == ["score_change", "score_change", "score_change", "final"]
     from qor_receipt.checkpoints import body_of
@@ -284,12 +288,33 @@ def test_finalize_reuses_live_countersignatures(tmp_path):
     b = next((tmp_path / "m").iterdir())
     live = (b / "countersigned.jsonl").read_text().splitlines()
     assert live
+    # Live Start Match signing: no late-sign note, no late_finalize.json.
+    live_rec = json.loads((b / "receipt.json").read_text())
+    assert not any("late sign" in n for n in live_rec["result"].get("notes") or [])
+    assert not (b / qm.LATE_FINALIZE_NAME).exists()
     code = qm.finalize(b, qt=QT, qorcap=str(_qorcap_bin()), ffmpeg=shutil.which("ffmpeg"), key_dir=tmp_path / "home" / "keys",
                        core_factory=_ScriptCore)
     assert code == 0
     rec = json.loads((b / "receipt.json").read_text())
     assert rec["referee"]["key_kind"] == qm.REFEREE_KIND
     assert rec["checkpoints"]["home"][0]["referee_sig"] == json.loads(live[0])["referee_sig"]
+    # Re-finalize of a bundle that already had a receipt is not a late sign.
+    assert not any("late sign" in n for n in rec["result"].get("notes") or [])
+    assert not (b / qm.LATE_FINALIZE_NAME).exists()
+    # The live save stopped before signing (match-20261111-183311): no receipt.json, live countersigs on disk.
+    (b / "receipt.json").unlink()
+    code = qm.finalize(b, qt=QT, qorcap=str(_qorcap_bin()), ffmpeg=shutil.which("ffmpeg"), key_dir=tmp_path / "home" / "keys",
+                       core_factory=_ScriptCore)
+    assert code == 0
+    rec = json.loads((b / "receipt.json").read_text())
+    assert rec["referee"]["key_kind"] == qm.REFEREE_KIND  # unchanged: the countersignatures are the live ones
+    assert rec["checkpoints"]["home"][0]["referee_sig"] == json.loads(live[0])["referee_sig"]
+    late = [n for n in rec["result"]["notes"] if n.startswith("late sign:")]
+    assert len(late) == 1 and "live ones" in late[0] and "Not signed at match time" in late[0]
+    doc = json.loads((b / qm.LATE_FINALIZE_NAME).read_text())
+    assert doc["countersignatures"] == "live" and doc["note"] == late[0] and doc["ended_ms"] == rec["match"]["ended_ms"]
+    from qor_receipt.receipt import verify_receipt
+    assert verify_receipt(rec, referee_pub=(b / "referee.pub").read_text().strip())["errors"] == []
 
 
 def test_obs_offer_noop_off_windows(monkeypatch):
@@ -1994,3 +2019,114 @@ def test_hung_refresh_shows_refresh_age_ms(tmp_path, monkeypatch):
         gate.set()
         stop.set()
         thread.join(5)
+
+
+# --- late finalize disclosure (match-20261111-183311 / -165658: receipt.draft.json only) -------------
+
+def _late_chain(tmp_path, offline: bool, n=3):
+    from qor_receipt.checkpoints import Chain
+    dev, ref = qm.load_keys(tmp_path / "keys")
+    t = [1_762_908_000_000]
+    cs = qm.Countersigner(ref, "local-1", "home", clock=lambda: t[0] + 40)
+    if offline:
+        cs.ts_of = lambda cp: int(cp["t_ms"])
+    ch = Chain()
+    for _ in range(n):
+        assert cs.offer(ch.next(t[0], "a" * 64, "b" * 64))
+        t[0] += 2000
+    return dev, ref, cs.signed
+
+
+def _late_receipt(tmp_path, offline: bool, now_ms: int):
+    dev, ref, cps = _late_chain(tmp_path, offline)
+    kind = qm.REFEREE_KIND_OFFLINE if offline else qm.REFEREE_KIND
+    draft = _draft("local-1")
+    draft["match"]["started_ms"] = 1_762_907_999_000
+    draft["result"]["notes"] = ["earlier note"]
+    draft, doc = qm.late_sign(draft, cps, 1_762_907_999_000, kind, late=True, meta={"qorcap_version": "0.3.43"},
+                              now_ms=now_ms)
+    rec = qm.build_receipt(draft, cps, dev, ref, match_id="local-1", role="home", started_ms=1_762_907_999_000,
+                           referee_kind=kind)
+    return rec, ref, doc
+
+
+def test_late_sign_with_live_countersignatures_adds_a_signed_note_and_json(tmp_path):
+    from qor_receipt.receipt import verify_receipt
+    now = 1_762_918_800_000  # about 3 h after the chain
+    rec, ref, doc = _late_receipt(tmp_path, offline=False, now_ms=now)
+    assert rec["referee"]["key_kind"] == qm.REFEREE_KIND
+    notes = rec["result"]["notes"]
+    assert notes[0] == "earlier note" and len(notes) == 2
+    note = notes[1]
+    ended = rec["match"]["ended_ms"]
+    assert ended == 1_762_908_004_040
+    assert note.startswith("late sign: receipt signed offline at ") and f"(UTC ms {now})" in note
+    assert f"(ended_ms {ended})" in note and "2h 59m" in note
+    assert "the live save stopped before the receipt was signed" in note
+    assert "checkpoint countersignatures are the live ones" in note and "Not signed at match time." in note
+    assert "UTC" in note and "recording clock" not in note
+    v = verify_receipt(rec, referee_pub=ref.pubkey_hex)
+    assert v["errors"] == [] and v["status"] == "SELF_ATTESTED", v
+    # receipt.v0 allows result.notes; nothing outside the schema was added.
+    schema = json.loads((HERE.parent / "contracts" / "receipt.v0.json").read_text())
+    assert schema["properties"]["result"]["properties"]["notes"]["items"]["type"] == "string"
+    assert set(rec["result"]) <= set(schema["properties"]["result"]["properties"])
+    # late_finalize.json: written only once receipt.json exists, atomically.
+    b = tmp_path / "match"
+    b.mkdir()
+    qm.record_late_finalize(b, doc)
+    assert not (b / qm.LATE_FINALIZE_NAME).exists()
+    (b / "receipt.json").write_text(json.dumps(rec))
+    qm.record_late_finalize(b, doc)
+    got = json.loads((b / qm.LATE_FINALIZE_NAME).read_text())
+    assert not list(b.glob("*.tmp"))
+    assert (got["signed_ms"], got["ended_ms"], got["countersignatures"]) == (now, ended, "live")
+    assert got["gap_s"] == round((now - ended) / 1000, 3) and got["reason"] == qm.LATE_REASON
+    assert got["note"] == note and got["recorded_with"] == "0.3.43" and got["qorcap_version"]
+    assert got["referee_key_kind"] == qm.REFEREE_KIND and got["info_only"] is True
+
+
+def test_late_sign_with_offline_countersignatures_names_the_recording_clock(tmp_path):
+    from qor_receipt.receipt import verify_receipt
+    rec, ref, doc = _late_receipt(tmp_path, offline=True, now_ms=1_762_908_065_000)
+    assert rec["referee"]["key_kind"] == qm.REFEREE_KIND_OFFLINE
+    note = rec["result"]["notes"][-1]
+    assert "re-signed offline" in note and "recording clock, not observed live" in note and "0h 01m" in note
+    assert doc["countersignatures"] == "offline"
+    v = verify_receipt(rec, referee_pub=ref.pubkey_hex)
+    assert v["errors"] == [], v
+    assert "referee_local_self_attested" in v["partial"]
+
+
+def test_late_sign_note_is_covered_by_both_signatures(tmp_path):
+    from qor_receipt.receipt import verify_receipt
+    rec, ref, _ = _late_receipt(tmp_path, offline=False, now_ms=1_762_918_800_000)
+    for tamper in (lambda r: r["result"]["notes"].pop(),
+                   lambda r: r["result"]["notes"].__setitem__(-1, r["result"]["notes"][-1].replace("2h 59m", "0h 00m"))):
+        bad = json.loads(json.dumps(rec))
+        tamper(bad)
+        errs = verify_receipt(bad, referee_pub=ref.pubkey_hex)["errors"]
+        assert "bad_referee_signature" in errs and "bad_player_signature:home" in errs, errs
+
+
+def test_not_late_leaves_the_draft_unchanged_and_writes_nothing(tmp_path):
+    _, _, cps = _late_chain(tmp_path, offline=False)
+    draft = _draft("local-1")
+    out, doc = qm.late_sign(draft, cps, 0, qm.REFEREE_KIND, late=False)
+    assert out is draft and doc is None
+    (tmp_path / "receipt.json").write_text("{}")
+    qm.record_late_finalize(tmp_path, None)
+    assert not (tmp_path / qm.LATE_FINALIZE_NAME).exists()
+
+
+def test_live_save_tail_never_adds_the_late_sign_note():
+    import ast
+    src = (HERE / "qorcap_match.py").read_text(encoding="utf-8")
+    tree = ast.parse(src)
+    fns = {n.name: n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)}
+    save_tail = ast.get_source_segment(src, fns["save_tail"])
+    assert "late_sign(" not in save_tail and "record_late_finalize(" not in save_tail
+    fin = ast.get_source_segment(src, fns["finalize"])
+    # The late flag is read before anything in finalize can write receipt.json.
+    assert fin.index('late = not (bundle / "receipt.json").exists()') < fin.index("sign_and_report(")
+    assert fin.count("late_sign(") == 2 and fin.count("record_late_finalize(") == 2
