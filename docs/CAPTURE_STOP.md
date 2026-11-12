@@ -24,7 +24,9 @@ One record per capture writer (the capture ffmpeg that reads the card and encode
   the encoder counters (those frames never reach the encoder). Video and audio lines are split, and
   `Last message repeated N times` in a run that started at a warning is summed into
   `repeated_after_warning_lower_bound`. `-progress` keys are written outside ffmpeg's log, so they do
-  not end the run; a stats line does. It is a **lower bound**: ffmpeg prints a pending repeat count
+  not end the run. A stats line is treated as ending it; whether ffmpeg prints that line through its
+  log at the capture's `-loglevel` is UNKNOWN for the pinned build, and if not, this can only
+  under-count. It is a **lower bound**: ffmpeg prints a pending repeat count
   only when its next different log message arrives, so a run still pending when the writer ends is
   never printed. `dropped_frames` stays `UNMEASURED`: one line per frame was not checked.
 
@@ -51,6 +53,9 @@ writers that already ended. At stop it is rewritten with `state: stop` and its S
 chain links it. `qorcap verify-bundle` re-hashes the file when the stop checkpoint names it. A record
 file that no checkpoint binds (the stop write failed, a crash, a stale `state: open` file) is printed
 as `WARN: ... UNBOUND, not evidence`; it is not an error, so bundles without a record still pass.
+The unbound file is untrusted: only `state` `open` or `stop` is echoed, anything else prints as
+`UNKNOWN`, so its text cannot add lines to the output. A leftover `capture_stop.v0.json.tmp` (an
+interrupted write) is also a `WARN`.
 Readers should use the record only when `state` is `stop` and the stop checkpoint binds its SHA-256.
 
 The referee countersigns the stop checkpoint **only when a referee is attached**. Practice runs

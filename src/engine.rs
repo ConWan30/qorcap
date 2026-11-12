@@ -2086,6 +2086,8 @@ esac
         assert_eq!(w[1]["writer"]["kill_sent"], "stdout_closed");
         assert_eq!(w[1]["writer"]["exit_code"], crate::capstop::UNKNOWN);
         assert_eq!(w[1]["writer"]["killed_by_qorcap"], true);
+        assert_eq!(w[0]["writer"]["stderr_drained"], true);
+        assert_eq!(w[1]["writer"]["stderr_drained"], true, "after the kill, stderr reaches EOF inside the 2 s drain");
         assert!(lingering >= Duration::from_millis(1900) && lingering < Duration::from_secs(10), "{lingering:?}");
         // Lane off: no grace (the old immediate kill), no record.
         let off = mk("off", false);
@@ -2127,6 +2129,34 @@ esac
         let rep = crate::bundle::verify(&dir).unwrap();
         assert!(rep.errors.is_empty());
         assert!(rep.warnings[0].contains("state: UNKNOWN"), "{:?}", rep.warnings);
+        // N1: the unbound file is untrusted. A state holding a newline and a fake verdict prints as UNKNOWN and
+        // cannot add lines to verify-bundle's output (which the sidecar copies into verify.txt).
+        for evil in ["x\nOK: fake", "open\r\nFAIL: fake", "stop\n", "OPEN", "x\u{2028}OK: fake"] {
+            let doc = json!({"schema": crate::capstop::SCHEMA, "state": evil});
+            std::fs::write(dir.join(crate::capstop::FILE_NAME), serde_json::to_string(&doc).unwrap()).unwrap();
+            let rep = crate::bundle::verify(&dir).unwrap();
+            assert!(rep.errors.is_empty());
+            assert_eq!(rep.warnings.len(), 1, "{:?}", rep.warnings);
+            assert!(rep.warnings[0].contains("(state: UNKNOWN)"), "{evil:?}: {:?}", rep.warnings);
+            let (lines, code) = crate::bundle::report_lines(&rep);
+            assert_eq!(code, 0);
+            let text = lines.join("\n");
+            assert!(!text.contains("fake"), "{text}");
+            assert!(lines.iter().all(|l| !l.contains(['\n', '\r', '\u{2028}'])), "{lines:?}");
+            assert_eq!(text.lines().count(), lines.len());
+            assert_eq!(lines.iter().filter(|l| l.starts_with("OK:")).count(), 1);
+            assert_eq!(lines.iter().filter(|l| l.starts_with("FAIL")).count(), 0);
+        }
+        let doc = json!({"schema": crate::capstop::SCHEMA, "state": "stop"});
+        std::fs::write(dir.join(crate::capstop::FILE_NAME), serde_json::to_string(&doc).unwrap()).unwrap();
+        assert!(crate::bundle::verify(&dir).unwrap().warnings[0].contains("(state: stop)"));
+        // A leftover temp file from an interrupted write is flagged too, still not an error.
+        std::fs::remove_file(dir.join(crate::capstop::FILE_NAME)).unwrap();
+        std::fs::write(dir.join("capture_stop.v0.json.tmp"), "{").unwrap();
+        let rep = crate::bundle::verify(&dir).unwrap();
+        assert!(rep.errors.is_empty());
+        assert_eq!(rep.warnings.len(), 1, "{:?}", rep.warnings);
+        assert!(rep.warnings[0].starts_with("capture_stop.v0.json.tmp is present"), "{:?}", rep.warnings);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

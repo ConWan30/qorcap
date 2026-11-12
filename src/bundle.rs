@@ -133,12 +133,31 @@ fn check_capture_stop(dir: &Path, cps: &[Value], errors: &mut Vec<String>, warni
             Err(e) => errors.push(format!("checkpoint {i}: capture stop record: {e}")),
         }
     }
+    // A temp file left by an interrupted write (capstop::write_file renames it into place).
+    let tmp = format!("{}.tmp", crate::capstop::FILE_NAME);
+    if std::fs::symlink_metadata(dir.join(&tmp)).is_ok() {
+        warnings.push(format!("{tmp} is present (an interrupted capture stop record write): not evidence"));
+    }
     if bound { return; }
     let name = crate::capstop::FILE_NAME;
     let Ok(p) = contained_file(dir, name) else { return };
     let Ok(text) = std::fs::read_to_string(&p) else { return };
-    let state = serde_json::from_str::<Value>(&text).ok().and_then(|v| v["state"].as_str().map(str::to_owned)).unwrap_or_else(|| crate::capstop::UNKNOWN.into());
+    // The file is unbound, so untrusted: only `open` or `stop` is echoed, anything else prints as UNKNOWN,
+    // so its text can never add lines to verify-bundle output (or the verify.txt made from it).
+    let state = serde_json::from_str::<Value>(&text).ok()
+        .and_then(|v| v["state"].as_str().filter(|s| matches!(*s, "open" | "stop")).map(str::to_owned))
+        .unwrap_or_else(|| crate::capstop::UNKNOWN.into());
     warnings.push(format!("{name} is present but no checkpoint binds it (state: {state}): UNBOUND, not evidence"));
+}
+
+/// The text `qorcap verify-bundle` prints for a report, one entry per line, and its exit code.
+pub fn report_lines(r: &Report) -> (Vec<String>, i32) {
+    let mut out = vec![format!("segments={} bytes={} checkpoints={} chain_head={}", r.segments, r.bytes, r.checkpoints, r.chain_head)];
+    if let Some(h) = &r.input_head { out.push(format!("controller input chunks={} inputs_chain_head={h}", r.input_chunks)); }
+    for e in &r.errors { out.push(format!("FAIL: {e}")); }
+    for w in &r.warnings { out.push(format!("WARN: {w}")); }
+    out.push(if r.errors.is_empty() { "OK: video bytes match the hash chain; checkpoints link. (Integrity + timing only; does not prove who played.)".into() } else { "FAILED".into() });
+    (out, if r.errors.is_empty() { 0 } else { 1 })
 }
 
 pub fn verify(dir: &Path) -> Result<Report, String> {

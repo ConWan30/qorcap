@@ -87,7 +87,9 @@ pub fn repeat_count(line: &str) -> Option<Option<u64>> {
 impl WriterTally {
     /// One `-progress` key from the capture ffmpeg's stderr. A `frame` value holding `=` is a whole stats line.
     /// `-progress` keys go to stderr outside ffmpeg's log, so they leave a drop-warning repeat run open.
-    /// A stats line is a log message, so it ends the run.
+    /// A stats line is treated as ending the run. Whether ffmpeg prints it through its log (which would flush
+    /// a pending repeat) at the capture's -loglevel is UNKNOWN for the pinned build; if it does not, this
+    /// can only under-count, which the lower-bound label covers.
     pub fn observe_kv(&mut self, key: &str, value: &str) {
         if key == "frame" && value.contains('=') {
             self.last_was_drop = false;
@@ -450,7 +452,7 @@ mod tests {
         // C2: -progress keys are written outside ffmpeg's log, so the repeat run stays open across them.
         feed_block(&mut t, 500, 0, 0, "continue");
         t.observe_line("Last message repeated 7 times"); // after progress keys: still the drop warning's run
-        // A stats line is a log message: it ends the run.
+        // A stats line is treated as ending the run (whether ffmpeg logs it through av_log is UNKNOWN; under-count only).
         t.observe_line(v);
         let (k, sv) = "frame= 1234 fps= 30 q=23.0 size=1kB time=00:00:41.13 bitrate=1kbits/s dup=3 drop=1 speed=1.00x".split_once('=').unwrap();
         t.observe_kv(k, sv);
