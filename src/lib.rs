@@ -12,6 +12,7 @@ pub mod hid;
 pub mod inputs;
 pub mod humanlike;
 pub mod align;
+pub mod s2s;
 pub mod frameclock;
 pub mod livetap;
 pub mod rumble_echo;

@@ -1,0 +1,92 @@
+{
+  "notes": {
+    "what": "Sight-to-shot Stage S1 standby (A) rule, PLAN-r10 R9-3 as relabelled by R10-2. Chosen a priori from code and encoding facts, no session data. PROVISIONAL and NOT FROZEN (status standby_unfrozen): nothing computed with it is COUNTED. COUNTED is also hard-disabled in this build (src/s2s.rs COUNTED_ENABLED = false): a hand-edited \"status\": \"frozen\" is recorded as a caller claim only (and changes threshold_id). This 'notes' block is ignored by the parser and is not part of threshold_id.",
+    "deflection": "SHARED (A)/(E). Right-stick Chebyshev deflection from centre 128, clipped 127; same encoding as defl() in src/humanlike.rs:56.",
+    "onset_d": "(A) only; (E) tunes it. 26 (~20% of 127) is a design choice, not a measured CoD deadzone (CoD's deadzone is UNKNOWN and not used).",
+    "release_d": "(A) only; (E) tunes it. 13 (~10% of 127) is a design choice; also the quiet level.",
+    "quiet_us": "(A) only; (E) tunes it. Q = 100 ms is a design choice.",
+    "window_us": "SHARED (A)/(E). W = 1.5 s is a design choice (r1's example value).",
+    "edge_delta": "SHARED (A)/(E). R2 edge = analog jump > 60 between consecutive in rows, exactly sidecar trigger_edges() (sidecar/qorcap_cod.py:526-540) with TRIGGER_DELTA = 60 (:62), the same trigger step src/haptics.rs:149 treats as a change. The R2 digital bit is a diagnostic only and never makes an edge; a slow squeeze makes no edge.",
+    "burst_gap_us": "SHARED (A)/(E). B = 250 ms is a design choice.",
+    "onset_rule": "SHARED (A)/(E). Rule (ii): the first onset after a quiet span >= Q inside the window.",
+    "max_rx_gap_us": "hb gate from PLAN section 2.3 (50,000 us).",
+    "min_bursts_for_headline": "M4 floor, borrowed (LAG_MIN_SAMPLES = 30), not statistically derived.",
+    "code_pins": "Re-pinned at main 4888a63 (R10-2 freeze gate); a test fails if any pinned line drifts."
+  },
+  "source": "A_standby",
+  "status": "standby_unfrozen",
+  "params": {
+    "deflection": "max(|rx-128|,|ry-128|) clipped 127",
+    "onset_d": 26,
+    "release_d": 13,
+    "quiet_us": 100000,
+    "window_us": 1500000,
+    "edge_delta": 60,
+    "burst_gap_us": 250000,
+    "onset_rule": "ii",
+    "max_rx_gap_us": 50000,
+    "min_bursts_for_headline": 30
+  },
+  "tuning_sessions": [],
+  "heldout_sessions": [],
+  "code_pins": {
+    "main_sha": "4888a6319a31885aad388c38001cb4b0adc8c4b5",
+    "refs": [
+      {
+        "path": "src/humanlike.rs",
+        "line": "56",
+        "symbol": "defl",
+        "expect": "fn defl(x: u8, y: u8) -> u8"
+      },
+      {
+        "path": "sidecar/qorcap_cod.py",
+        "line": "62",
+        "symbol": "TRIGGER_DELTA",
+        "expect": "TRIGGER_DELTA = 60"
+      },
+      {
+        "path": "sidecar/qorcap_cod.py",
+        "line": "526",
+        "symbol": "trigger_edges",
+        "expect": "def trigger_edges(rows)"
+      },
+      {
+        "path": "sidecar/qorcap_cod.py",
+        "line": "537",
+        "symbol": "trigger_edges step",
+        "expect": "if prev is not None and r2 - prev > TRIGGER_DELTA:"
+      },
+      {
+        "path": "src/haptics.rs",
+        "line": "149",
+        "symbol": "trigger step",
+        "expect": "(r2 as i32 - p.r2 as i32).abs() > 60"
+      },
+      {
+        "path": "src/inputs.rs",
+        "line": "56",
+        "symbol": "ANALOG_MIN_GAP_US",
+        "expect": "pub const ANALOG_MIN_GAP_US: u64 = 4_000;"
+      }
+    ],
+    "drift": "none: re-pinned at main 4888a63; same lines as the PLAN-r9 refs"
+  },
+  "excluded_sessions": [
+    {
+      "session": "073204",
+      "reason": "EXCLUDED per PLAN-r11 R11-3 (agent-relayed instruction, QorProof-unverified; excluding is the safe direction)"
+    },
+    {
+      "session": "201029",
+      "reason": "VOID"
+    },
+    {
+      "session": "153536",
+      "reason": "VOID"
+    },
+    {
+      "session": "112342",
+      "reason": "FAIL"
+    }
+  ]
+}

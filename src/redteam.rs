@@ -615,8 +615,8 @@ fn fail_layer(name: &str, detail: impl Into<String>) -> Layer {
 /// `attack` is true for a relay row: a recovered offset is a weak signal, because the aligner does not reject it.
 fn alignment_layer(delay_ms: i64, attack: bool) -> Layer {
     let frames: Vec<usize> = (0..100).map(|i| 200 + i * 41).collect();
-    let presses: Vec<u64> = frames.iter().map(|&f| (f as f64 * 1000.0 / align::FPS * 1000.0).round() as u64).collect();
-    let delay_frames = (delay_ms as f64 / (1000.0 / align::FPS)).round() as usize;
+    let presses: Vec<u64> = frames.iter().map(|&f| (f as f64 * 1000.0 / align::REFERENCE_FPS * 1000.0).round() as u64).collect();
+    let delay_frames = (delay_ms as f64 / (1000.0 / align::REFERENCE_FPS)).round() as usize;
     alignment_for_presses(&presses, delay_frames + 6, attack).into_named(delay_ms)
 }
 
@@ -633,10 +633,10 @@ fn alignment_for_presses(presses: &[u64], lag_frames: usize, attack: bool) -> Al
     if presses.len() < 8 {
         return AlignRaw { result: "pass".into(), detail: "too few key presses to score alignment".into() };
     }
-    let frames: Vec<usize> = presses.iter().map(|t| ((*t as f64 / 1000.0) / (1000.0 / align::FPS)).round() as usize).collect();
+    let frames: Vec<usize> = presses.iter().map(|t| ((*t as f64 / 1000.0) / (1000.0 / align::REFERENCE_FPS)).round() as usize).collect();
     let last = frames.iter().copied().max().unwrap_or(0) + lag_frames + 40;
     let track = spike_track(last + 8, &frames, lag_frames);
-    let clock = align::FileClock { file: "video.mp4".into(), start_ms: 0.0, ms_per_frame: 1000.0 / align::FPS, end_ms: 1e12, fitted: true };
+    let clock = align::FileClock { file: "video.mp4".into(), start_ms: 0.0, ms_per_frame: 1000.0 / align::REFERENCE_FPS, end_ms: 1e12, fitted: true, fps: align::REFERENCE_FPS };
     let scored = align::align_tracks(&[track], &[clock], presses, align::DEFAULT_N_FRAMES);
     let detail = format!(
         "match_permille {} chance_permille {} offset_ms {} presses_tested {}",
@@ -659,7 +659,7 @@ fn spike_track(len: usize, spikes: &[usize], lag: usize) -> align::Energy {
             if k < e.len() { e[k] = 40.0; }
         }
     }
-    align::Energy { e }
+    align::Energy::new(e, align::REFERENCE_FPS)
 }
 
 fn key_presses_us(recs: &[Value]) -> Vec<u64> { align::key_presses(recs) }
