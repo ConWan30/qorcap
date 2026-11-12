@@ -26,6 +26,9 @@ PACK_PATH = Path(__file__).resolve().parent / "packs" / "cod_mw4_hud_v1.npz"
 # Text supplement. Masks and labels only. The shipped npz is not rewritten.
 TEXT_PACK_PATH = Path(__file__).resolve().parent / "packs" / "cod_owner_row_digits.json"
 FIXTURE_DIR = Path(__file__).resolve().parent / "fixtures" / "cod"
+# Multi-sample scoreboard digit bank (plain rows, highlighted owner rows, personal card), with
+# per-sample provenance. Built by build_cod_row_digits.py from private end boards.
+ROW_BANK_PATH = Path(__file__).resolve().parent / "packs" / "cod_row_digits_v2.json"
 SYNTHETIC_SAMPLE_NOTE = "synthetic sample, real-match recall UNMEASURED"
 
 # One letter gate for both words. The practice frames clear it:
@@ -105,6 +108,13 @@ _ROW_DIGIT_MIN = 0.75
 _ROW_DIGIT_MARGIN = 0.15
 # One column may be a score such as 1250, or a longer stat. Seven glyphs are not read.
 _ROW_GLYPH_MAX = 6
+_ROW_MIN_CONTRAST = 60  # V max minus median: below this a cell has no ink to read
+# Lower look for a faded digit: lift over local background (floor, share of glyph lift), min area.
+_ROW_LOW_MIN = 12.0
+_ROW_LOW_FRAC = 0.12
+_ROW_LOW_AREA = 6
+# Dimmest glyph contrast over the brightest in one value; below it the value is not read.
+_ROW_INK_RATIO = 0.75
 # Derived ASSISTS and TDM DEATHS masks were cut at this value. The match gate is unchanged.
 _DERIVED_HEADER_VALUE = 80
 # Bright letters of the gamertag. Header words are dimmer, so they use their own mask.
@@ -1103,43 +1113,157 @@ def _personal_header(hit, row_x: int, row_y: int, row_h: int, scale: float):
     return hit
 
 
-def _row_digit_bank():
-    pack = _pack()
+_ROW_GRAY_WEIGHT = 0.5  # share of the glyph's own gray patch in the feature; the rest is its ink mask
+_ROW_BANK_CACHE: dict = {}
+
+
+def _hex_rows(rows):
+    """Hex text rows (two characters per pixel) to a uint8 array. None when empty or ragged."""
     np = _libs()[1]
-    if pack is None or np is None or "row_digit_vecs" not in pack or "row_digit_labels" not in pack:
+    if np is None or not rows or any(len(r) != len(rows[0]) or len(r) % 2 for r in rows):
         return None
-    return pack["row_digit_vecs"].astype(np.float32), _labels(pack, "row_digit_labels")
+    try:
+        return np.array([[int(r[i:i + 2], 16) for i in range(0, len(r), 2)] for r in rows], np.uint8)
+    except ValueError:
+        return None
 
 
-def _row_digit_string(img, x0: int, x1: int, y0: int, y1: int, thr: int, scale: float) -> str | None:
-    """Digits in one column. None when a glyph is missing or too close to another digit."""
+def _row_feature(glyph, gray=None):
+    """One glyph as a unit vector: its ink mask and its own gray patch (min-max), both 12x18.
+
+    The gray half keeps the anti-aliased edge pixels that a single ink cut drops on a 9-pixel
+    720p digit. Without a gray patch (a painted mask) the mask stands in for it.
+    """
+    np = _libs()[1]
+    b = _vec(np, glyph, (12, 18))
+    if b is None:
+        return None
+    # A painted mask has no gray patch: pad it by the same 1 pixel the reader keeps around a glyph.
+    g = np.pad(glyph, 1) if gray is None else gray
+    g = g.astype(np.float32)
+    lo, hi = float(g.min()), float(g.max())
+    if hi - lo < 1.0:
+        return None
+    gv = _vec(np, (g - lo) / (hi - lo), (12, 18))
+    if gv is None:
+        return None
+    v = np.concatenate([b * np.sqrt(1.0 - _ROW_GRAY_WEIGHT), gv * np.sqrt(_ROW_GRAY_WEIGHT)])
+    n = float(np.linalg.norm(v))
+    return None if n < 1e-6 else (v / n).astype(np.float32)
+
+
+def _row_bank_samples(path=None):
+    """(label, mask, gray, provenance) from the v1 text masks and the v2 multi-sample bank."""
+    out = []
+    if TEXT_PACK_PATH.is_file():
+        for item in json.loads(TEXT_PACK_PATH.read_text(encoding="utf-8")).get("digits", []):
+            m = _mask_from_rows(item.get("mask_rows"))
+            if m is not None:
+                out.append((str(item["label"]), m, None, "v1:" + str(item.get("provenance"))))
+    path = ROW_BANK_PATH if path is None else Path(path)
+    if path.is_file():
+        for item in json.loads(path.read_text(encoding="utf-8")).get("samples", []):
+            m = _mask_from_rows(item.get("mask_rows"))
+            g = _hex_rows(item.get("gray_rows"))
+            if m is not None and str(item.get("label", "")) in "0123456789" and len(str(item.get("label", ""))) == 1:
+                out.append((str(item["label"]), m, g, str(item.get("provenance"))))
+    return out
+
+
+def _row_digit_bank(path=None):
+    """Feature vectors and labels for the scoreboard digits (cached per bank file and mtime)."""
+    np = _libs()[1]
+    if np is None:
+        return None
+    p = ROW_BANK_PATH if path is None else Path(path)
+    key = (str(p), p.stat().st_mtime_ns if p.is_file() else None,
+           TEXT_PACK_PATH.stat().st_mtime_ns if TEXT_PACK_PATH.is_file() else None)
+    if key in _ROW_BANK_CACHE:
+        return _ROW_BANK_CACHE[key]
+    labels, vecs = [], []
+    for label, mask, gray, _prov in _row_bank_samples(p):
+        v = _row_feature(mask, gray)
+        if v is not None:
+            labels.append(label)
+            vecs.append(v)
+    bank = (np.stack(vecs), labels) if vecs else None
+    _ROW_BANK_CACHE.clear()
+    _ROW_BANK_CACHE[key] = bank
+    return bank
+
+
+def _row_classify(vecs, labels, glyph, gray=None):
+    """(label, top, second) for one glyph. label is None unless both gates pass."""
+    v = _row_feature(glyph, gray)
+    if v is None:
+        return None, 0.0, 0.0
+    scores = vecs @ v
+    by: dict[str, float] = {}
+    for i, name in enumerate(labels):
+        score = float(scores[i])
+        if name not in by or score > by[name]:
+            by[name] = score
+    ranked = sorted(by.items(), key=lambda kv: -kv[1])
+    best, top = ranked[0]
+    second = ranked[1][1] if len(ranked) > 1 else -1.0
+    if top < _ROW_DIGIT_MIN or top - second < _ROW_DIGIT_MARGIN:
+        return None, top, second
+    return best, top, second
+
+
+def _row_cell_thr(v, thr: int) -> int | None:
+    """Ink cut for one cell: Otsu on the cell's value channel, kept within ``thr`` -40..+30.
+
+    A fixed cut thinned the 3 on a highlighted 720p row (practice 194037) until it no longer
+    matched. None when the cell has no ink contrast (nothing to read).
+    """
+    cv2, np = _libs()
+    if v.size == 0 or int(v.max()) - int(np.median(v)) < _ROW_MIN_CONTRAST:
+        return None
+    t, _ = cv2.threshold(v, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    return int(min(thr + 30, max(thr - 40, int(t))))
+
+
+def _row_glyph_pieces(img, x0: int, x1: int, y0: int, y1: int, thr: int, scale: float):
+    """Glyph masks in one cell, left to right, or None.
+
+    None when there is no ink, too many glyphs, or ink that is not a glyph and not a speck:
+    a piece of 8+ pixels or 4+ rows (or loose pieces of 8+ pixels together) that could not be joined to a glyph, or a glyph-height
+    piece wider than one digit. Dropping such a piece silently turned a 13 into a 1 (practice
+    194037), and a faded 1 left a 21 reading as 2.
+    """
     cv2, np = _libs()
     bgr = _as_bgr(img)
-    bank = _row_digit_bank()
-    if cv2 is None or bgr is None or bank is None:
+    if cv2 is None or bgr is None:
         return None
-    vecs, labels = bank
     h, w = bgr.shape[:2]
     x0, x1 = max(0, int(x0)), min(w, int(x1))
     y0, y1 = max(0, int(y0)), min(h, int(y1))
     if x1 - x0 < 3 or y1 - y0 < 3:
         return None
     hsv = cv2.cvtColor(bgr[y0:y1, x0:x1], cv2.COLOR_BGR2HSV)
-    mask = (hsv[:, :, 2] > thr).astype(np.uint8) * 255
+    cut = _row_cell_thr(hsv[:, :, 2], thr)
+    if cut is None:
+        return None
+    mask = (hsv[:, :, 2] > cut).astype(np.uint8) * 255
     n, lab, st, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
     minh = max(5, int(round(6 * scale)))
     maxw = max(10, int(round(18 * scale)))
+    tallh = max(4, int(round(4 * scale)))
     kept = []
     frags = []
     for i in range(1, n):
         x, y, ww, hh, area = (int(t) for t in st[i])
-        if ww < 2 or ww > maxw or hh < 1:
+        if ww > maxw and hh >= minh and area >= 8:
+            return None  # wider than one digit at glyph height: merged or not a digit
+        if ww > maxw or hh < 1:
             continue
         g = (lab[y:y + hh, x:x + ww] == i).astype(np.uint8) * 255
         piece = {"x": x, "y": y, "w": ww, "h": hh, "area": area, "glyph": g}
-        if area >= 8 and hh >= minh:
+        if ww >= 2 and area >= 8 and hh >= minh:
             kept.append(piece)
-        elif 3 <= area < 8 or (area >= 3 and hh < minh):
+        elif 3 <= area < 8 or (area >= 3 and hh < minh) or hh >= tallh:
+            # Half a faint 1 is one or two pixels wide but half a glyph tall: it is ink, not a speck.
             frags.append(piece)
     # A bright cut can split one glyph. Join a short piece only when it sits
     # on the same x span, within two pixels, and does not widen that span.
@@ -1147,6 +1271,7 @@ def _row_digit_string(img, x0: int, x1: int, y0: int, y1: int, thr: int, scale: 
     # with invented ink. A speck beside the glyph is not joined.
     span_tol = max(1, int(round(scale)))
     for frag in frags:
+        frag["joined"] = False
         for host in kept:
             overlap = min(host["x"] + host["w"], frag["x"] + frag["w"]) - max(host["x"], frag["x"])
             if overlap < max(2, frag["w"] // 2):
@@ -1179,25 +1304,74 @@ def _row_digit_string(img, x0: int, x1: int, y0: int, y1: int, thr: int, scale: 
             )
             host["x"], host["y"], host["w"], host["h"] = x0b, y0b, x1b - x0b, y1b - y0b
             host["glyph"] = canvas
+            frag["joined"] = True
             break
-    comps = sorted(((piece["x"], piece["glyph"]) for piece in kept), key=lambda item: item[0])
-    if not comps or len(comps) > _ROW_GLYPH_MAX:
+    loose = [frag for frag in frags if not frag["joined"]]
+    if any(frag["area"] >= 8 or frag["h"] >= tallh for frag in loose):
+        return None
+    if not kept or len(kept) > _ROW_GLYPH_MAX:
+        return None
+    # Several small pieces together are a faded glyph, not one speck (practice 162225 '13'
+    # with its 3 faded). The bar grows with the glyph size so a large card glyph's fringe is not one.
+    if sum(frag["area"] for frag in loose) >= max(8, 0.35 * max(piece["area"] for piece in kept)):
+        return None
+    # Every digit of this font is the same height. A shorter glyph is a digit that lost ink.
+    tall = max(piece["h"] for piece in kept)
+    if any(tall - piece["h"] > max(2, int(round(0.2 * tall))) for piece in kept):
+        return None
+    v = hsv[:, :, 2]
+    bgv = float(np.median(v))
+    # Every digit of one value is drawn in the same ink. A glyph much dimmer than the brightest
+    # one is a faded digit whose cut kept only part of it (a faded 4 kept as its stem reads 1).
+    peaks = [float(v[p["y"]:p["y"] + p["h"], p["x"]:p["x"] + p["w"]].max()) - bgv for p in kept]
+    if min(peaks) < _ROW_INK_RATIO * max(peaks):
+        return None
+    # A whole digit fainter than its neighbours falls under the cut and leaves no piece, so the
+    # value would lose that digit. Look again at a lower cut on the local background (a 5x5
+    # opening removes thin strokes and keeps a highlighted row's gradient): a glyph-like piece
+    # there that is beside every kept glyph is a missing digit.
+    k = max(5, int(round(5 * scale)))
+    lift = v.astype(np.float32) - cv2.morphologyEx(v, cv2.MORPH_OPEN, np.ones((k, k), np.uint8)).astype(np.float32)
+    peak = max(float(lift[p["y"]:p["y"] + p["h"], p["x"]:p["x"] + p["w"]].max()) for p in kept)
+    low = (lift > max(_ROW_LOW_MIN, _ROW_LOW_FRAC * peak)).astype(np.uint8)
+    # Only the glyph band: a label above the digits (the personal card) is not a digit.
+    band0 = max(0, min(p["y"] for p in kept) - 1)
+    band1 = max(p["y"] + p["h"] for p in kept) + 1
+    low[:band0] = 0
+    low[band1:] = 0
+    # Take out each kept glyph's own ink, grown by one pixel for its edge.
+    own = np.zeros_like(low)
+    for p in kept:
+        own[p["y"]:p["y"] + p["h"], p["x"]:p["x"] + p["w"]] |= (p["glyph"] > 0).astype(np.uint8)
+    low[cv2.dilate(own, np.ones((5, 5), np.uint8)) > 0] = 0
+    ln, _llab, lst, _ = cv2.connectedComponentsWithStats(low, connectivity=8)
+    for i in range(1, ln):
+        _lx, _ly, _lw, lh, la = (int(t) for t in lst[i])
+        if lh >= tallh and la >= _ROW_LOW_AREA:
+            return None
+    comps = []
+    for piece in sorted(kept, key=lambda item: item["x"]):
+        gx0, gy0 = max(0, piece["x"] - 1), max(0, piece["y"] - 1)
+        gx1, gy1 = min(v.shape[1], piece["x"] + piece["w"] + 1), min(v.shape[0], piece["y"] + piece["h"] + 1)
+        comps.append((piece["x"], piece["glyph"], v[gy0:gy1, gx0:gx1].copy()))
+    return comps
+
+
+def _row_digit_string(img, x0: int, x1: int, y0: int, y1: int, thr: int, scale: float, bank=None) -> str | None:
+    """Digits in one column, any length up to _ROW_GLYPH_MAX. None when any glyph is missing,
+    below the score gate, or too close to another digit. An unread value stays unread."""
+    np = _libs()[1]
+    bank = _row_digit_bank() if bank is None else bank
+    if np is None or bank is None:
+        return None
+    vecs, labels = bank
+    comps = _row_glyph_pieces(img, x0, x1, y0, y1, thr, scale)
+    if comps is None:
         return None
     text = ""
-    for _, glyph in comps:
-        vec = _vec(np, glyph, (12, 18))
-        if vec is None:
-            return None
-        scores = vecs @ vec
-        by: dict[str, float] = {}
-        for lab_i, name in enumerate(labels):
-            score = float(scores[lab_i])
-            if name not in by or score > by[name]:
-                by[name] = score
-        ranked = sorted(by.items(), key=lambda kv: -kv[1])
-        best, top = ranked[0]
-        second = ranked[1][1] if len(ranked) > 1 else -1.0
-        if top < _ROW_DIGIT_MIN or top - second < _ROW_DIGIT_MARGIN:
+    for _x, glyph, gray in comps:
+        best, _top, _second = _row_classify(vecs, labels, glyph, gray)
+        if best is None:
             return None
         text += best
     return text if text.isdigit() else None
