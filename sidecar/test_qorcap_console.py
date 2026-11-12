@@ -1,6 +1,7 @@
 """Snapshots and fallbacks for the Start Match console. Presentation only."""
 import io
 import json
+import os
 import subprocess
 import sys
 import threading
@@ -179,6 +180,12 @@ def test_dashboard_footer_is_never_gold():
 
 # The gold escape at each colour level the console can paint.
 _GOLD_ESC = {"truecolor": "38;2;255;194;61", "256": "38;5;220", "16": "\x1b[93m"}
+# Pinned literal VERIFIED-banner bytes (QorProof G2). Not taken from paint_inline.
+_GOLD_BANNER = {
+    "truecolor": lambda msg: "\x1b[38;2;255;194;61m\x1b[48;2;4;5;10m" + msg + "\x1b[0m",
+    "256": lambda msg: "\x1b[38;5;220m\x1b[48;5;16m" + msg + "\x1b[0m",
+    "16": lambda msg: "\x1b[93m\x1b[40m" + msg + "\x1b[0m",
+}
 
 
 @pytest.mark.parametrize("level", ["truecolor", "256", "16"])
@@ -203,7 +210,7 @@ def test_verified_match_banner_is_still_gold(level, env):
     assert qc._color_level(env) == level
     for msg in ("RESULT: VERIFIED", "  OFFICIAL RESULT: VERIFIED"):
         painted = qc.tint_verified_banner(msg, env, Tty(), verdict="VERIFIED")
-        assert painted == qc.paint_inline(msg, "gold", level)
+        assert painted == _GOLD_BANNER[level](msg)
         assert _GOLD_ESC[level] in painted
     # An unrelated line is not gold even when the typed verdict is VERIFIED.
     assert _GOLD_ESC[level] not in qc.tint_verified_banner("Challenge kickoff PASSED", env, Tty(), verdict="VERIFIED")
@@ -276,9 +283,9 @@ def test_gold_is_gated_on_the_typed_verdict_not_a_text_prefix(level, env):
         assert gold not in qc.tint_verified_banner(msg, env, tty, verdict="verified")
         assert gold not in qc.tint_verified_banner(msg, env, tty, verdict="VERIFIED ")
         assert gold not in qc.tint_verified_banner(msg, env, tty, verdict="UNKNOWN")
-    # Existing VERIFIED-banner output stays byte-identical to the previous paint.
-    assert qc.tint_verified_banner(banner, env, tty, verdict="VERIFIED") == qc.paint_inline(banner, "gold", level)
-    assert qc.tint_verified_banner(official, env, tty, verdict="VERIFIED") == qc.paint_inline(official, "gold", level)
+    # Existing VERIFIED-banner output is pinned to the literal gold escape at this level (QorProof G2).
+    assert qc.tint_verified_banner(banner, env, tty, verdict="VERIFIED") == _GOLD_BANNER[level](banner)
+    assert qc.tint_verified_banner(official, env, tty, verdict="VERIFIED") == _GOLD_BANNER[level](official)
 
 
 def test_match_and_submit_result_lines_pass_the_typed_verdict(capsys):
@@ -302,6 +309,147 @@ def test_match_and_submit_result_lines_pass_the_typed_verdict(capsys):
         assert seen[-1] == ("hello", None)
     finally:
         qc.tint_verified_banner = orig
+
+
+def _qortime():
+    for p in (os.getenv("QORTIME") or "", HERE.parent / "qortime", HERE.parent.parent / "qortime"):
+        if p and (Path(p) / "qor_receipt").exists():
+            return Path(p)
+    return None
+
+
+def _keys_and_cps(tmp_path):
+    """Synthetic device, referee and two countersigned checkpoints. Needs a qortime checkout."""
+    qt = _qortime()
+    if qt is None:
+        pytest.skip("no qortime checkout")
+    if str(qt) not in sys.path:
+        sys.path.insert(0, str(qt))
+    from qor_receipt.checkpoints import Chain
+
+    dev, ref = qm.load_keys(tmp_path / "keys")
+    t = [1000]
+    cs = qm.Countersigner(ref, "local-1", "home", clock=lambda: t[0] + 50)
+    ch = Chain()
+    for _ in range(2):
+        cp = ch.next(t[0], "a" * 64, "b" * 64)
+        cp["qorcap"] = {"trigger": "segment"}
+        assert cs.offer(cp)
+        t[0] += 2000
+    draft = {
+        "schema": "qor-receipt/v0",
+        "match": {"match_id": "local-1", "game": "madden27", "platform": "ps5",
+                  "scorebug_profile": "madden27_standard", "mode": "single",
+                  "started_ms": 0, "ended_ms": 0},
+        "result": {"home_score": 14, "away_score": 10, "quarter": 4, "final_t_ms": 5000,
+                   "winner": "home", "method": "agreed_scorebug_final", "final_basis": "clock_zero"},
+        "players": [{"role": "home", "player_id": "psn:me", "pubkey": "0" * 64, "key_kind": "software"}],
+        "referee": {}, "challenges": [], "checkpoints": {},
+        "agreement": {"timelines_agree": None, "mismatches": []},
+        "signals": {"motion_permille": {"home": None}},
+    }
+    return dev, ref, cs.signed, draft, qt
+
+
+def _capture_tints(monkeypatch, level="truecolor"):
+    """Route emit() through a TTY at ``level`` and record every tint_verified_banner call."""
+    env = {"truecolor": {"COLORTERM": "truecolor"}, "256": {"TERM": "xterm-256color"},
+           "16": {"QORCAP_COLOR": "16"}}[level]
+    for key in ("NO_COLOR", "QORCAP_PLAIN", "QORCAP_COLOR", "COLORTERM", "TERM"):
+        monkeypatch.delenv(key, raising=False)
+    for key, val in env.items():
+        monkeypatch.setenv(key, val)
+    monkeypatch.setattr(sys, "stdout", Tty())
+    seen = []
+    orig = qc.tint_verified_banner
+
+    def wrap(msg, env=None, stream=None, *, verdict=None):
+        out = orig(msg, env, stream, verdict=verdict)
+        seen.append((msg, verdict, out))
+        return out
+
+    monkeypatch.setattr(qc, "tint_verified_banner", wrap)
+    return seen
+
+
+def _assert_banner_gold(msg, verdict, painted, status, kind):
+    assert verdict == status, (kind, verdict, status)
+    assert f"{kind}: {status}" in msg
+    if status == "VERIFIED":
+        assert painted == _GOLD_BANNER["truecolor"](msg)
+    else:
+        assert painted == msg
+        assert "\x1b[38;2;255;194;61m" not in painted
+
+
+@pytest.mark.parametrize("status", ["VERIFIED", "SELF_ATTESTED", "PARTIAL", "FAIL"])
+def test_sign_and_report_forwards_the_verifier_status_as_the_typed_verdict(tmp_path, monkeypatch, status):
+    """QorProof G1: sign_and_report (qorcap_match.py) forwards overall(run_cmd status) as the typed verdict."""
+    dev, ref, cps, draft, qt = _keys_and_cps(tmp_path)
+    bundle = tmp_path / "match"
+    bundle.mkdir()
+
+    def fake_run_cmd(cmd, env=None):
+        if "qor_receipt.cli" in cmd:
+            return 0, json.dumps({"status": status, "errors": [], "partial": [], "trust_tier": "t"})
+        if "verify-bundle" in cmd:
+            return 0, "ok"
+        raise AssertionError(cmd)
+
+    monkeypatch.setattr(qm, "run_cmd", fake_run_cmd)
+    seen = _capture_tints(monkeypatch)
+    qm.sign_and_report(
+        bundle, draft, cps, dev, ref, match_id="local-1", role="home", started_ms=900,
+        qt=qt, qorcap="qorcap-stub", no_open=True,
+    )
+    rows = [(m, v, out) for m, v, out in seen if m.strip().startswith("RESULT:")]
+    assert len(rows) == 1, seen
+    _assert_banner_gold(*rows[0], status, "RESULT")
+
+
+@pytest.mark.parametrize("status", ["VERIFIED", "SELF_ATTESTED", "PARTIAL", "FAIL"])
+def test_submit_forwards_verify_receipt_status_as_the_typed_verdict(tmp_path, monkeypatch, status):
+    """QorProof G1: submit (qorcap_submit.py) forwards verify_receipt status as the typed verdict."""
+    dev, ref, cps, draft, qt = _keys_and_cps(tmp_path)
+    rec = qm.build_receipt(draft, cps, dev, ref, match_id="local-1", role="home", started_ms=900)
+    bundle = tmp_path / "match"
+    bundle.mkdir()
+    (bundle / "manifest.jsonl").write_text("", encoding="utf-8")
+    (bundle / "checkpoints.jsonl").write_text("", encoding="utf-8")
+    (bundle / "receipt.json").write_text(json.dumps(rec), encoding="utf-8")
+    (bundle / "bundle.json").write_text(json.dumps({"schema": "qorcap-bundle/v0", "role": "home"}), encoding="utf-8")
+
+    class FakeReferee:
+        def __init__(self):
+            self.token = None
+
+        def call(self, method, path, data=None, ctype="application/json", timeout=None, headers=None):
+            if method == "GET" and path.startswith("/v1/referee"):
+                return {"pubkey": rec["referee"]["pubkey"]}
+            if method == "GET" and "submit/challenge" in path:
+                raise qs.RefereeError(404, {})
+            if method == "POST" and path.startswith("/v1/submissions?"):
+                return {"id": "sub1", "upload_token": "tok", "state": "accepted", "required": [], "commit": "c" * 40}
+            if method == "POST" and str(path).endswith("/review"):
+                return {"state": "awaiting_player_signature", "receipt": rec,
+                        "review": {"scope": "spot-check", "not_proven": [], "checks": {}}}
+            raise AssertionError((method, path))
+
+        def post_json(self, path, body, timeout=None):
+            assert "player-signature" in path
+            return {"receipt": rec}
+
+    import qor_receipt.receipt as receipt_mod
+
+    monkeypatch.setattr(
+        receipt_mod, "verify_receipt",
+        lambda *a, **k: {"status": status, "errors": [], "partial": [], "referee_id": "ref-test"},
+    )
+    seen = _capture_tints(monkeypatch)
+    qs.submit(bundle, base="http://referee.test", client=FakeReferee(), device=dev)
+    rows = [(m, v, out) for m, v, out in seen if "OFFICIAL RESULT:" in m]
+    assert len(rows) == 1, seen
+    _assert_banner_gold(*rows[0], status, "OFFICIAL RESULT")
 
 
 def test_color_and_plain_policy():
