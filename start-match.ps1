@@ -46,6 +46,19 @@ function Find-ThisRunBundle($argList, $since) {
 }
 
 # Console game cards. DarkRed is the burgundy accent. This screen does not use a gold color.
+# Frame clock default for PRACTICE runs only. A practice run is "Test Without Card.cmd" (--test-pattern)
+# or QORCAP_LANE=practice. It returns the QORCAP_FRAME_CLOCK value to set, or $null to leave it alone.
+# REAL MATCH: always $null, so the environment and the qorcap.exe default (off) are unchanged.
+# An explicit QORCAP_FRAME_CLOCK wins. --no-frame-clock on a practice run turns it off.
+# Offline commands (finalize, highlights, submit, psn-names) do not record, so they are left alone.
+function Get-QorCapPracticeFrameClock($argList, $envVal, $laneVal) {
+  $practice = ($argList -contains "--test-pattern") -or ($laneVal -and $laneVal.Trim().ToLower() -eq "practice")
+  if (-not $practice) { return $null }
+  foreach ($c in @("finalize", "highlights", "submit", "psn-names")) { if ($argList -contains $c) { return $null } }
+  if ($argList -contains "--no-frame-clock") { return "0" }
+  if ($envVal) { return $null }
+  return "1"
+}
 function Test-QorCapFrameClockOn($argList) {
   if ($argList -contains "--frame-clock") { return $true }
   $v = $env:QORCAP_FRAME_CLOCK
@@ -193,6 +206,15 @@ $fwd = @($args)
 # finalize is an offline sign of a finished bundle. Live-only flags (side prompt, official challenges)
 # must not be forwarded or argparse rejects the whole finalize before any clip is cut.
 $isFinalize = $fwd -contains "finalize"
+# PRACTICE runs record frame_clock.jsonl by default (qorcap.exe, started by qorcap_match.py, inherits
+# QORCAP_FRAME_CLOCK). A REAL MATCH run gets no change here. --no-frame-clock is a launcher flag only:
+# it is removed in every lane (REAL MATCH, practice, offline) so qorcap_match.py never sees it. On a
+# REAL MATCH it changes nothing (the clock is already off unless QORCAP_FRAME_CLOCK was set by hand).
+$practiceClock = Get-QorCapPracticeFrameClock $fwd $env:QORCAP_FRAME_CLOCK $env:QORCAP_LANE
+if ($null -ne $practiceClock) {
+  $env:QORCAP_FRAME_CLOCK = $practiceClock
+}
+$fwd = @($fwd | Where-Object { $_ -ne "--no-frame-clock" })
 $hasChallengeFlag = $false
 foreach ($x in $fwd) {
   if ($x -eq "--official-challenges" -or $x -eq "--no-official-challenges") { $hasChallengeFlag = $true }

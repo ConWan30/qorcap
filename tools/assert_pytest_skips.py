@@ -68,6 +68,7 @@ LINUX_FILES = (
     "sidecar/test_final_screen_pause.py",
     "sidecar/test_post_final_tail.py",
     "sidecar/test_start_match_glimpse.py",
+    "sidecar/test_start_match_frame_clock.py",
     "sidecar/test_qorcap_ai_loop.py",
     "sidecar/test_qorcap_console.py",
     "sidecar/test_qorcap_release.py",
@@ -136,6 +137,7 @@ WINDOWS_FILES = (
     "sidecar/test_final_screen_pause.py",
     "sidecar/test_post_final_tail.py",
     "sidecar/test_start_match_glimpse.py",
+    "sidecar/test_start_match_frame_clock.py",
     "sidecar/test_qorcap_ai_loop.py",
     "sidecar/test_qorcap_console.py",
     "sidecar/test_qorcap_release.py",
@@ -203,8 +205,8 @@ WINDOWS_FILES = (
 # Collect-only of these lists after the tail tests in sidecar/test_post_final_tail.py.
 # Main e00d374, including the guard tests, collected 596 linux / 578 windows.
 # Re-collect after any list or test change.
-LINUX_MIN_COLLECTED = 937
-WINDOWS_MIN_COLLECTED = 919
+LINUX_MIN_COLLECTED = 957
+WINDOWS_MIN_COLLECTED = 939
 
 # Absent from both sidecar suites. A reason is required; whitespace does not count.
 EXCLUDED_TEST_FILES = {
