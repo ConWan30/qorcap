@@ -125,17 +125,19 @@ pub enum Cmd {
         /// Report path; refused if it is inside the bundle folder
         #[arg(long)]
         out: String,
-        /// Session id (e.g. match-20261111-194037)
-        #[arg(long)]
+        /// Optional check: must name the bundle's own id (folder match-<stamp> = bundle.json match_id
+        /// local-<stamp>), or the run is refused. The report always uses the bundle's own id.
+        #[arg(long, default_value = "")]
         session_id: String,
         /// Rule config JSON (default: built-in standby (A), docs/s2s/threshold_A.standby.json)
         #[arg(long)]
         config: Option<String>,
-        /// rehashed_match | locked_not_rehashed | failed | missing (only rehashed_match can be COUNTED)
-        #[arg(long, default_value = "locked_not_rehashed")]
+        /// Caller claim, recorded only (COUNTED is disabled in this build; the tool does not check seals)
+        #[arg(long, default_value = "locked_not_rehashed", ignore_case = true,
+              value_parser = ["rehashed_match", "locked_not_rehashed", "failed", "missing"])]
         seal_status: String,
-        /// ok | UNKNOWN | VOID | FAIL
-        #[arg(long, default_value = "UNKNOWN")]
+        /// Caller claim. VOID and FAIL are refused (case-insensitive)
+        #[arg(long, default_value = "UNKNOWN", ignore_case = true, value_parser = ["ok", "UNKNOWN", "VOID", "FAIL"])]
         disposition: String,
         /// Tuning session: no per-burst values are reported (R1), only the threshold-free burst count
         #[arg(long)]
@@ -521,6 +523,15 @@ mod tests {
             Cmd::S2sCounted { input, out, seal_status, disposition, in_calibration_set, holdout_reused, config, .. } => {
                 assert_eq!((input.as_str(), out.as_str(), seal_status.as_str(), disposition.as_str()), ("b", "o.json", "locked_not_rehashed", "UNKNOWN"));
                 assert!(!in_calibration_set && !holdout_reused && config.is_none());
+            }
+            _ => panic!(),
+        }
+        assert!(Cli::try_parse_from(["qorcap", "s2s-counted", "b", "--out", "o.json", "--disposition", "voided"]).is_err());
+        assert!(Cli::try_parse_from(["qorcap", "s2s-counted", "b", "--out", "o.json", "--seal-status", "trust-me"]).is_err());
+        match Cli::try_parse_from(["qorcap", "s2s-counted", "b", "--out", "o.json", "--disposition", "void", "--seal-status", "REHASHED_MATCH"]).unwrap().cmd {
+            Cmd::S2sCounted { session_id, disposition, seal_status, .. } => {
+                assert!(session_id.is_empty());
+                assert!(disposition.eq_ignore_ascii_case("VOID") && seal_status.eq_ignore_ascii_case("rehashed_match"));
             }
             _ => panic!(),
         }

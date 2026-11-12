@@ -147,20 +147,45 @@ pub fn energy_from_diffs(d: &[f32], span: usize) -> Vec<f32> {
 /// The video stream's own `r_frame_rate`: ffprobe beside `ffmpeg` if there is one, else the
 /// `tbr` field of `ffmpeg -i`. Err when neither gives a rate (the caller reports UNMEASURED).
 pub fn probe_rate(ffmpeg: &str, file: &str) -> Result<Rate, String> {
+    probe_rates(ffmpeg, file).map(|(r, _)| r)
+}
+
+/// [`probe_rate`] plus ffprobe's `avg_frame_rate` (None from the `ffmpeg -i` fallback, or when it is
+/// 0/0). The average is a note only: analysis always uses `r_frame_rate`.
+pub fn probe_rates(ffmpeg: &str, file: &str) -> Result<(Rate, Option<Rate>), String> {
     let probe = {
         let p = std::path::Path::new(ffmpeg);
         let name = p.file_name().map(|n| n.to_string_lossy().replace("ffmpeg", "ffprobe")).unwrap_or_else(|| "ffprobe".into());
         p.with_file_name(name)
     };
-    if let Ok(o) = crate::ffmpeg::command(&probe.to_string_lossy()).args(["-v", "error", "-select_streams", "v:0", "-show_entries", "stream=r_frame_rate", "-of", "csv=p=0", file])
+    if let Ok(o) = crate::ffmpeg::command(&probe.to_string_lossy()).args(["-v", "error", "-select_streams", "v:0", "-show_entries", "stream=r_frame_rate,avg_frame_rate", "-of", "default=nw=1", file])
         .stdin(Stdio::null()).stderr(Stdio::null()).output() {
         if o.status.success() {
-            if let Some(r) = parse_rational(String::from_utf8_lossy(&o.stdout).trim()) { return Ok(r); }
+            if let (Some(r), avg) = parse_probe_rates(&String::from_utf8_lossy(&o.stdout)) { return Ok((r, avg)); }
         }
     }
     let o = crate::ffmpeg::command(ffmpeg).args(["-hide_banner", "-i", file]).stdin(Stdio::null()).stdout(Stdio::null()).output()
         .map_err(|e| format!("ffmpeg: {e}"))?;
-    parse_banner_rate(&String::from_utf8_lossy(&o.stderr)).ok_or_else(|| "frame rate UNMEASURED: no r_frame_rate from ffprobe and no tbr in ffmpeg -i".into())
+    parse_banner_rate(&String::from_utf8_lossy(&o.stderr)).map(|r| (r, None)).ok_or_else(|| "frame rate UNMEASURED: no r_frame_rate from ffprobe and no tbr in ffmpeg -i".into())
+}
+
+/// ffprobe `default=nw=1` lines: `r_frame_rate=60/1`, `avg_frame_rate=30000/1001` (either order).
+pub fn parse_probe_rates(stdout: &str) -> (Option<Rate>, Option<Rate>) {
+    let mut r = None;
+    let mut avg = None;
+    for l in stdout.lines() {
+        if let Some(v) = l.trim().strip_prefix("r_frame_rate=") { r = r.or(parse_rational(v)); }
+        if let Some(v) = l.trim().strip_prefix("avg_frame_rate=") { avg = avg.or(parse_rational(v)); }
+    }
+    (r, avg)
+}
+
+/// Note when the stream's average rate differs from `r_frame_rate` (for example a 29.97 stream that
+/// reports 30/1). Note only; the scoring rate is unchanged.
+pub fn avg_rate_note(file: &str, r: Rate, avg: Option<Rate>) -> Option<String> {
+    let a = avg?;
+    (a.num as u128 * r.den as u128 != r.num as u128 * a.den as u128)
+        .then(|| format!("{file}: avg_frame_rate {} differs from r_frame_rate {} (note only; analysed at r_frame_rate)", a.filter(), r.filter()))
 }
 
 /// `60/1`, `30000/1001`.
@@ -204,7 +229,15 @@ fn gcd(a: u64, b: u64) -> u64 { if b == 0 { a } else { gcd(b, a % b) } }
 /// The rate a file is analysed at. Probe first, frame clock second; if both exist they must agree
 /// within 1 %, otherwise Err (fail closed). Neither -> Err (UNMEASURED).
 pub fn file_rate(ffmpeg: Option<&str>, path: Option<&str>, file: &str, stamps: &[FrameStamp]) -> Result<Rate, String> {
-    let probed = match (ffmpeg, path) { (Some(ff), Some(p)) => Some(probe_rate(ff, p)), _ => None };
+    file_rate_noted(ffmpeg, path, file, stamps, &mut vec![])
+}
+
+/// [`file_rate`], adding an [`avg_rate_note`] to `notes` when ffprobe's average differs.
+pub fn file_rate_noted(ffmpeg: Option<&str>, path: Option<&str>, file: &str, stamps: &[FrameStamp], notes: &mut Vec<String>) -> Result<Rate, String> {
+    let probed = match (ffmpeg, path) {
+        (Some(ff), Some(p)) => Some(probe_rates(ff, p).map(|(r, avg)| { notes.extend(avg_rate_note(file, r, avg)); r })),
+        _ => None,
+    };
     let fc = frame_clock_rate(stamps, file);
     match (probed, fc) {
         (Some(Ok(p)), Some(f)) if (p.fps() / f.fps() - 1.0).abs() > 0.01 =>
@@ -512,10 +545,17 @@ pub fn align_bundle(dir: &std::path::Path, recs: &[Value], manifest: &[Value], t
     // Rates are only read when there is a video pass; the no-video path scores nothing either way.
     let rates = if ffmpeg.is_some() { file_rates(dir, manifest, ffmpeg, &stamps, true, &mut notes) } else { Default::default() };
     let clocks = file_clocks(manifest, &|f: &str| rates.get(f).map(|r| r.fps()));
+    // Parts left out because their rate is UNMEASURED. Listed in the output (only when non-empty, so a
+    // fully measured session keeps its bytes) so a partial score is never silent.
+    let mut unscored: Vec<String> = vec![];
     let mut out = if let (Some(ff), false) = (ffmpeg, clocks.is_empty()) {
         let mut tracks = vec![];
         for c in &clocks {
-            let Some(rate) = rates.get(&c.file).copied() else { tracks.push(Energy::default()); continue; };
+            let Some(rate) = rates.get(&c.file).copied() else {
+                if !unscored.contains(&c.file) { unscored.push(c.file.clone()); }
+                tracks.push(Energy::default());
+                continue;
+            };
             match crate::bundle::contained_file(dir, &c.file).and_then(|p| decode_energy(ff, &p.to_string_lossy(), rate)) {
                 Ok(e) => tracks.push(e),
                 Err(e) => { notes.push(format!("{}: {e}", c.file)); tracks.push(Energy::default()); }
@@ -555,6 +595,9 @@ pub fn align_bundle(dir: &std::path::Path, recs: &[Value], manifest: &[Value], t
         out["score_events_with_input_30s"] = json!(with);
     }
     out["key_presses"] = json!(presses.len());
+    if !unscored.is_empty() {
+        out["parts_unscored_unknown_rate"] = json!({"count": unscored.len(), "of_parts": clocks.len(), "files": unscored});
+    }
     out["notes"] = json!(notes);
     out["method"] = json!("v2: one-pass 96x54 motion energy; presses on a still screen (20-frame baseline) match when energy jumps >=5x within 100-667 ms; offset calibrated on half the presses, scored on the other half (2-fold); chance = presses shifted 3-8 s through the same filter");
     out
@@ -572,7 +615,7 @@ fn file_rates(dir: &std::path::Path, manifest: &[Value], ffmpeg: Option<&str>, s
     for f in files {
         let path = if contained { crate::bundle::contained_file(dir, &f).ok() } else { Some(dir.join(&f)) };
         let path = path.filter(|p| p.exists()).map(|p| p.to_string_lossy().into_owned());
-        match file_rate(ffmpeg, path.as_deref(), &f, stamps) {
+        match file_rate_noted(ffmpeg, path.as_deref(), &f, stamps, notes) {
             Ok(r) => { out.insert(f, r); }
             Err(e) => notes.push(format!("{f}: {e}")),
         }
@@ -1004,6 +1047,41 @@ mod tests {
         for i in 1..20 { let fr = i * 60; man.push(json!({"type":"segment","kind":"media","file":"video.mp4","mono_ms": fr * 1000 / 30 + 7, "frames": fr})); }
         let st: Vec<FrameStamp> = (0..300).map(|f| FrameStamp { file: "video.mp4".into(), frame: f, t_mono_us: (f as f64 * 1_000_000.0 / FPS).round() as u64 + 9000 + (f as u64 * 37 % 5000), pts_90k: f as u64 * 3000 }).collect();
         assert_eq!(serde_json::to_string(&clock_ab(&man, &st, &r30)).unwrap(), GOLDEN_AB_30);
+    }
+
+    /// QorProof M5: a part whose rate is UNMEASURED is listed in the output, not silently dropped.
+    #[test]
+    fn part_with_unknown_rate_is_listed_not_silently_dropped() {
+        let dir = std::env::temp_dir().join(format!("qorcap-align-m5-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut m = vec![];
+        for f in ["a.mp4", "b.mp4"] {
+            m.push(json!({"type":"segment","kind":"init","file":f,"mono_ms":0,"frames":0}));
+            for i in 1..5 { m.push(json!({"type":"segment","kind":"media","file":f,"mono_ms": i * 2000, "frames": i * 120})); }
+        }
+        // frame_clock rows give a.mp4 a 60 fps rate (PTS step 1500); b.mp4 has none and no probe (no file).
+        let fc: String = (0..20).map(|k| json!({"type":"frame","file":"a.mp4","frame":k,"t_mono_us":k * 16_667,"pts_90k":k * 1500}).to_string() + "\n").collect();
+        std::fs::write(dir.join(frameclock::FILE_NAME), fc).unwrap();
+        let v = align_bundle(&dir, &[], &m, &[], None, Some("ffmpeg-not-installed-for-this-test"), 15);
+        assert_eq!(v["parts_unscored_unknown_rate"], json!({"count": 1, "of_parts": 2, "files": ["b.mp4"]}), "{v:#}");
+        assert!(v["notes"].as_array().unwrap().iter().any(|n| n.as_str().unwrap().starts_with("b.mp4: frame rate UNMEASURED")), "{v:#}");
+        // every part measured -> no key at all (keeps fully measured outputs byte-identical)
+        let none = align_bundle(&dir, &[], &m[..5], &[], None, Some("ffmpeg-not-installed-for-this-test"), 15);
+        assert!(none.get("parts_unscored_unknown_rate").is_none(), "{none:#}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// QorProof L2 note: ffprobe's avg_frame_rate is read and flagged when it differs; scoring stays on r_frame_rate.
+    #[test]
+    fn avg_frame_rate_difference_is_a_note_only() {
+        let (r, avg) = parse_probe_rates("r_frame_rate=30/1\navg_frame_rate=30000/1001\n");
+        assert_eq!((r, avg), (Some(Rate { num: 30, den: 1 }), Some(Rate { num: 30000, den: 1001 })));
+        let note = avg_rate_note("video.mp4", r.unwrap(), avg).unwrap();
+        assert!(note.contains("avg_frame_rate 30000/1001 differs from r_frame_rate 30/1") && note.contains("note only"), "{note}");
+        assert_eq!(parse_probe_rates("avg_frame_rate=0/0\nr_frame_rate=60/1\n"), (Some(Rate { num: 60, den: 1 }), None));
+        assert!(avg_rate_note("v", Rate { num: 60, den: 1 }, Some(Rate { num: 120, den: 2 })).is_none(), "equal rationals are not flagged");
+        assert!(avg_rate_note("v", Rate { num: 60, den: 1 }, None).is_none());
     }
 
     /// The same press/response session at 60 fps: the track has twice the frames, the picture reacts

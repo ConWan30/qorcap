@@ -403,6 +403,10 @@ fn main() {
                     Err(e) => { eprintln!("error: --config {p}: {e}"); std::process::exit(2); }
                 },
             };
+            if let Err(e) = cfg.validate() { eprintln!("error: {e}"); std::process::exit(2); }
+            // Canonical spellings (clap accepts any case). Both stay caller claims.
+            let seal_status = seal_status.to_ascii_lowercase();
+            let disposition = ["ok", "UNKNOWN", "VOID", "FAIL"].iter().find(|d| d.eq_ignore_ascii_case(&disposition)).map(|d| d.to_string()).unwrap_or(disposition);
             let meta = qorcap::s2s::SessionMeta { session_id, seal_status, disposition, in_calibration_set, holdout_reused };
             match qorcap::s2s::run(std::path::Path::new(&input), std::path::Path::new(&out), &meta, &cfg) {
                 Ok(r) => { eprintln!("wrote {out}: status {} tier {}", r["status"], r["tier"]); 0 }

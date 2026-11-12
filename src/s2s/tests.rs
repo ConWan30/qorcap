@@ -12,7 +12,8 @@ fn meta() -> SessionMeta {
         holdout_reused: false,
     }
 }
-/// Test-only: the standby values marked frozen, so the COUNTED path can be exercised.
+/// Test-only: the standby values hand-marked "frozen" plus a rehashed_match claim (meta()). In this
+/// build that must still never yield COUNTED (QorProof H1); the descriptive values are what is tested.
 fn frozen() -> Config {
     let mut c = Config::standby_a();
     c.status = "frozen".into();
@@ -97,9 +98,9 @@ fn one_onset() -> F {
 }
 
 #[test]
-fn clean_onset_is_counted_with_bracket_and_provenance() {
+fn clean_onset_has_bracket_and_provenance_and_is_not_counted() {
     let v = go(&one_onset().done());
-    assert_eq!(v["tier"], "COUNTED", "{v:#}");
+    assert_eq!(v["tier"], "INFO_ONLY", "{v:#}");
     let a = &v["anchors"][0];
     assert_eq!(a["outcome"], "onset");
     assert_eq!(a["s2_s4_us"], 200_000);
@@ -298,7 +299,7 @@ fn burst_merges_taps_and_reused_onset_is_reported_not_counted_twice() {
     assert_eq!(v["anchors"][0]["burst"]["edges_in_burst"], 3);
     assert_eq!(outcomes(&v), ["onset", "onset_reused"]);
     assert!(v["anchors"][1]["s2_s4_us"].is_null());
-    assert_eq!(v["headline"]["s2_s4"]["n"], 1);
+    assert_eq!(v["descriptive"]["s2_s4"]["n"], 1);
 }
 
 /// R10-2: a slow squeeze (no > 60 jump between consecutive rows) makes no edge, even with the bit set.
@@ -430,7 +431,7 @@ fn denominator_table_counts_every_outcome() {
         .sum();
     assert_eq!(sum, v["outcome_table"]["r2_bursts"].as_u64().unwrap());
     assert_eq!(v["outcome_table"]["gate_passing_r2_bursts"], 4);
-    assert_eq!(v["headline"]["outcome_table"], v["outcome_table"]);
+    assert_eq!(v["descriptive"]["outcome_table"], v["outcome_table"]);
 }
 
 fn many(n: u64) -> Vec<Value> {
@@ -449,15 +450,15 @@ fn below_the_30_burst_minimum_the_headline_is_unmeasured() {
     let v = go(&many(29));
     assert_eq!(v["outcome_table"]["outcomes"]["onset"], 29);
     assert_eq!(
-        v["headline"]["s2_s4"]["status"], "UNMEASURED",
+        v["descriptive"]["s2_s4"]["status"], "UNMEASURED",
         "{:#}",
-        v["headline"]
+        v["descriptive"]
     );
-    assert!(v["headline"]["s2_s4"].get("median_us").is_none());
+    assert!(v["descriptive"]["s2_s4"].get("median_us").is_none());
     let w = go(&many(30));
-    assert_eq!(w["headline"]["s2_s4"]["status"], "ok");
-    assert_eq!(w["headline"]["s2_s4"]["n"], 30);
-    assert_eq!(w["headline"]["s2_s4"]["median_us"], 114_000);
+    assert_eq!(w["descriptive"]["s2_s4"]["status"], "ok");
+    assert_eq!(w["descriptive"]["s2_s4"]["n"], 30);
+    assert_eq!(w["descriptive"]["s2_s4"]["median_us"], 114_000);
     assert_eq!(w["headline"]["label"], "R2 press bursts");
 }
 
@@ -468,10 +469,10 @@ fn threshold_id_is_deterministic_and_hashes_rule_sessions_and_pins() {
     assert_eq!(a.threshold_id().len(), 64);
     let mut s = a.clone();
     s.status = "frozen".into();
-    assert_eq!(
+    assert_ne!(
         s.threshold_id(),
         a.threshold_id(),
-        "freeze status is not part of the rule"
+        "freeze status is hashed: a hand-edited \"frozen\" file has a different id than the ledgered one would need"
     );
     let mut x = a.clone();
     x.excluded_sessions.clear();
@@ -586,13 +587,28 @@ fn excluded_and_calibration_sessions_report_no_values() {
         assert_eq!(v["status"], "excluded", "{sid}");
         assert!(v.get("anchors").is_none() && v.get("headline").is_none());
     }
-    let mut m = meta();
-    m.disposition = "VOID".into();
-    assert_eq!(analyze(&rows, "sha", &m, &frozen())["status"], "excluded");
+    for d in ["VOID", "void", " Fail "] {
+        let mut m = meta();
+        m.disposition = d.into();
+        assert_eq!(
+            analyze(&rows, "sha", &m, &frozen())["status"],
+            "excluded",
+            "{d}"
+        );
+    }
+    // listed by inputs sha256 as well as by id
+    let mut cfg = frozen();
+    cfg.excluded_sessions.push(Excluded {
+        session: "zzz".into(),
+        reason: "test".into(),
+        inputs_sha256: Some("sha-x".into()),
+    });
+    assert_eq!(analyze(&rows, "sha-x", &meta(), &cfg)["status"], "excluded");
     let mut c = meta();
     c.in_calibration_set = true;
     let v = analyze(&rows, "sha", &c, &frozen());
     assert_eq!(v["status"], "in_calibration_set");
+    assert_eq!(v["tier"], CALIBRATION_SET_TIER);
     assert_eq!(v["m4_gate_passing_r2_bursts"], 30);
     assert!(
         v.get("anchors").is_none() && v.get("headline").is_none() && v.get("descriptive").is_none()
@@ -611,6 +627,11 @@ fn never_writes_inside_the_bundle_and_leaves_inputs_untouched() {
         .map(|r| r.to_string() + "\n")
         .collect();
     std::fs::write(bundle.join("inputs.jsonl"), &text).unwrap();
+    std::fs::write(
+        bundle.join("bundle.json"),
+        r#"{"match_id":"local-20990101-000000"}"#,
+    )
+    .unwrap();
     let before = ev::sha256_hex(&std::fs::read(bundle.join("inputs.jsonl")).unwrap());
     let listing = |d: &Path| {
         let mut v: Vec<String> = std::fs::read_dir(d)
@@ -641,7 +662,10 @@ fn never_writes_inside_the_bundle_and_leaves_inputs_untouched() {
     let rep = run(&bundle, &out, &meta(), &frozen()).unwrap();
     assert_eq!(rep["session"]["inputs_sha256"], before);
     assert!(out.exists());
-    assert_eq!(listing(&bundle), vec!["inputs.jsonl".to_string()]);
+    assert_eq!(
+        listing(&bundle),
+        vec!["bundle.json".to_string(), "inputs.jsonl".to_string()]
+    );
     assert_eq!(
         ev::sha256_hex(&std::fs::read(bundle.join("inputs.jsonl")).unwrap()),
         before
@@ -666,4 +690,245 @@ fn output_wording() {
     ] {
         assert!(!v.contains(w), "{w} in {v}");
     }
+}
+
+/// Write a synthetic bundle `base/<folder>` with `bundle.json` match_id `mid` (None = no bundle.json).
+fn fixture_bundle(base: &Path, folder: &str, mid: Option<&str>, rows: &[Value]) -> PathBuf {
+    let b = base.join(folder);
+    std::fs::create_dir_all(&b).unwrap();
+    let text: String = rows.iter().map(|r| r.to_string() + "\n").collect();
+    std::fs::write(b.join("inputs.jsonl"), text).unwrap();
+    if let Some(m) = mid {
+        std::fs::write(b.join("bundle.json"), json!({"match_id": m}).to_string()).unwrap();
+    }
+    b
+}
+fn scratch(tag: &str) -> PathBuf {
+    let base = std::env::temp_dir().join(format!("qorcap-s2s-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+    base
+}
+fn no_counted_anywhere(v: &Value) {
+    assert_eq!(v["counted"]["enabled"], false);
+    assert_ne!(v["tier"], "COUNTED");
+    assert_ne!(v["headline"]["tier"], "COUNTED");
+    assert!(v
+        .get("anchors")
+        .and_then(|a| a.as_array())
+        .is_none_or(|a| a.iter().all(|r| r["tier"] != "COUNTED")));
+    let text = serde_json::to_string(v)
+        .unwrap()
+        .replace(COUNTED_DISABLED_NOTE, "");
+    assert!(!text.contains("\"COUNTED\""), "{text}");
+}
+
+/// QorProof H1: a hand-edited "frozen" config plus --seal-status rehashed_match still yields no COUNTED.
+#[test]
+fn hand_frozen_config_and_rehashed_claim_never_yield_counted() {
+    const _: () = assert!(!COUNTED_ENABLED, "COUNTED must stay disabled in this build");
+    let base = scratch("h1");
+    let b = fixture_bundle(
+        &base,
+        "match-20990101-000001",
+        Some("local-20990101-000001"),
+        &many(30),
+    );
+    let cfg_path = base.join("frozen.json");
+    let mut j = serde_json::to_value(Config::standby_a()).unwrap();
+    j["status"] = json!("frozen");
+    std::fs::write(&cfg_path, j.to_string()).unwrap();
+    let cfg: Config = serde_json::from_str(&std::fs::read_to_string(&cfg_path).unwrap()).unwrap();
+    assert_eq!(cfg.status, "frozen");
+    let rep = run(&b, &base.join("out.json"), &meta_for("000001"), &cfg).unwrap();
+    no_counted_anywhere(&rep);
+    assert_eq!(rep["tier"], "INFO_ONLY");
+    assert_eq!(rep["info_only_reasons"], json!([COUNTED_DISABLED_REASON]));
+    assert_eq!(rep["session"]["seal_status_claim"], "rehashed_match");
+    assert_eq!(rep["session"]["seal_status_checked"], false);
+    assert_eq!(rep["threshold"]["provenance"]["status_claim"], "frozen");
+    assert_eq!(rep["threshold"]["provenance"]["status_checked"], false);
+    assert_eq!(rep["headline"]["status"], "NOT_COUNTED");
+    assert_eq!(rep["descriptive"]["s2_s4"]["n"], 30);
+    for v in [go(&many(30)), go(&many(29)), go(&one_onset().done())] {
+        no_counted_anywhere(&v);
+    }
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// QorProof M1: the exclusion is bound to the bundle's own id, not the typed one.
+#[test]
+fn exclusion_is_bound_to_the_bundle_and_a_rename_fails_closed() {
+    let base = scratch("m1");
+    let rows = one_onset().done();
+    let out = base.join("out.json");
+    let typed = |id: &str| SessionMeta {
+        session_id: id.into(),
+        ..meta()
+    };
+    // the real 073204 bundle under a harmless typed id: refused by id check; untyped: excluded
+    let ex = fixture_bundle(
+        &base,
+        "match-20261110-073204",
+        Some("local-20261110-073204"),
+        &rows,
+    );
+    assert!(run(&ex, &out, &typed("match-20990101-000000"), &frozen())
+        .unwrap_err()
+        .contains("does not match the bundle's own id"));
+    let v = run(&ex, &out, &typed(""), &frozen()).unwrap();
+    assert_eq!(v["status"], "excluded");
+    assert_eq!(v["session"]["session_id"], "match-20261110-073204");
+    for ok_typed in [
+        "073204",
+        "20261110-073204",
+        "local-20261110-073204",
+        "match-20261110-073204",
+    ] {
+        assert_eq!(
+            run(&ex, &out, &typed(ok_typed), &frozen()).unwrap()["status"],
+            "excluded",
+            "{ok_typed}"
+        );
+    }
+    // rename bypass: folder renamed, bundle.json still says 073204 -> mismatch, refused
+    let renamed = fixture_bundle(
+        &base,
+        "match-20261110-999999",
+        Some("local-20261110-073204"),
+        &rows,
+    );
+    assert!(run(&renamed, &out, &typed("999999"), &frozen())
+        .unwrap_err()
+        .contains("bundle id mismatch"));
+    let odd = fixture_bundle(&base, "my-copy", Some("local-20261110-073204"), &rows);
+    assert!(run(&odd, &out, &typed(""), &frozen())
+        .unwrap_err()
+        .contains("bundle id UNKNOWN"));
+    let nojson = fixture_bundle(&base, "match-20261110-111111", None, &rows);
+    assert!(run(&nojson, &out, &typed(""), &frozen())
+        .unwrap_err()
+        .contains("bundle id UNKNOWN"));
+    // bare inputs.jsonl path works the same (its folder is the bundle)
+    assert!(
+        run(&renamed.join("inputs.jsonl"), &out, &typed(""), &frozen())
+            .unwrap_err()
+            .contains("bundle id mismatch")
+    );
+    // a clean bundle runs, and the typed id must agree
+    let good = fixture_bundle(
+        &base,
+        "match-20990101-000002",
+        Some("local-20990101-000002"),
+        &rows,
+    );
+    assert_eq!(
+        run(&good, &out, &typed("000002"), &frozen()).unwrap()["status"],
+        "ok"
+    );
+    assert!(run(&good, &out, &typed("000003"), &frozen()).is_err());
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// QorProof M2: temp + rename, links at `out` refused, and every bundle folder protected.
+#[test]
+fn output_path_hardening() {
+    let base = scratch("m2");
+    let rows = one_onset().done();
+    let b = fixture_bundle(
+        &base,
+        "match-20990101-000004",
+        Some("local-20990101-000004"),
+        &rows,
+    );
+    let other = fixture_bundle(
+        &base,
+        "match-20990101-000005",
+        Some("local-20990101-000005"),
+        &rows,
+    );
+    let m = meta_for("match-20990101-000004");
+    // another bundle (and a folder below it) is refused, not only the input's
+    assert!(run(&b, &other.join("s2s.json"), &m, &frozen())
+        .unwrap_err()
+        .contains("bundle marker"));
+    std::fs::create_dir_all(other.join("deep")).unwrap();
+    assert!(run(&b, &other.join("deep").join("s2s.json"), &m, &frozen())
+        .unwrap_err()
+        .contains("bundle marker"));
+    // an unnamed folder that holds a receipt counts as a bundle too
+    let loose = base.join("loose");
+    std::fs::create_dir_all(&loose).unwrap();
+    std::fs::write(loose.join("receipt.json"), "{}").unwrap();
+    assert!(run(&b, &loose.join("s2s.json"), &m, &frozen()).is_err());
+    let before = std::fs::read(other.join("inputs.jsonl")).unwrap();
+    #[cfg(unix)]
+    {
+        let link = base.join("link.json");
+        std::os::unix::fs::symlink(other.join("inputs.jsonl"), &link).unwrap();
+        assert!(run(&b, &link, &m, &frozen())
+            .unwrap_err()
+            .contains("symlink"));
+        let hard = base.join("hard.json");
+        std::fs::hard_link(other.join("inputs.jsonl"), &hard).unwrap();
+        assert!(run(&b, &hard, &m, &frozen())
+            .unwrap_err()
+            .contains("hard link"));
+        // even past the checks, the rename replaces the entry instead of writing through it
+        let rep = analyze(&rows, "sha", &m, &frozen());
+        assert!(write_report(&b, &hard, &rep).is_err());
+    }
+    assert_eq!(std::fs::read(other.join("inputs.jsonl")).unwrap(), before);
+    // an existing regular report is replaced atomically; no temp file is left
+    let out = base.join("report.json");
+    std::fs::write(&out, "old").unwrap();
+    run(&b, &out, &m, &frozen()).unwrap();
+    assert!(std::fs::read_to_string(&out).unwrap().contains(SCHEMA));
+    let leftovers: Vec<_> = std::fs::read_dir(&base)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().contains(".tmp-"))
+        .collect();
+    assert!(leftovers.is_empty());
+    // a bare relative inputs.jsonl has an empty bundle path: every write is refused (fail-safe)
+    assert!(inside(Path::new(""), &base.join("anything.json")));
+    let _ = std::fs::remove_dir_all(&base);
+}
+fn meta_for(id: &str) -> SessionMeta {
+    SessionMeta {
+        session_id: id.into(),
+        ..meta()
+    }
+}
+
+/// QorProof L4: nonsense configs are refused before anything runs, and pct cannot underflow.
+#[test]
+fn invalid_configs_are_refused() {
+    assert!(Config::standby_a().validate().is_ok());
+    for k in 0..5 {
+        let mut c = Config::standby_a();
+        match k {
+            0 => c.params.min_bursts_for_headline = 0,
+            1 => c.params.release_d = 26,
+            2 => c.params.onset_d = 200,
+            3 => c.params.window_us = c.params.quiet_us,
+            _ => c.params.edge_delta = 0,
+        }
+        assert!(c.validate().is_err(), "case {k}");
+        let base = scratch(&format!("l4-{k}"));
+        let b = fixture_bundle(
+            &base,
+            "match-20990101-000006",
+            Some("local-20990101-000006"),
+            &one_onset().done(),
+        );
+        assert!(run(&b, &base.join("o.json"), &meta(), &c)
+            .unwrap_err()
+            .contains("invalid s2s config"));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+    let mut c = Config::standby_a();
+    c.params.min_bursts_for_headline = 0;
+    let v = analyze(&F::new(3).done(), "sha", &meta(), &c); // zero onsets: must not panic
+    assert_eq!(v["descriptive"]["s2_s4"]["status"], "UNMEASURED");
 }

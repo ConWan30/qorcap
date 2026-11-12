@@ -1,4 +1,5 @@
-//! Sight-to-shot Stage S1: COUNTED-only S2 -> S4 timing descriptors from USB `inputs.jsonl` rows.
+//! Sight-to-shot Stage S1: S2 -> S4 timing descriptors from USB `inputs.jsonl` rows (COUNTED-only rule;
+//! COUNTED itself is disabled in this build, see below).
 //!
 //! Offline and read-only. It reads one bundle's `inputs.jsonl` (`header`, `in`, `hb`, `status` rows)
 //! and nothing else: no video, no frame clock, no screen reader, no detector. It never writes inside
@@ -16,7 +17,12 @@
 //! * The headline is the S2 -> S4 distribution over every gate-passing "R2 press burst" with an onset,
 //!   shown with the full outcome table. Nothing on the screen side filters it.
 //!
-//! COUNTED here is a private descriptive tier: host-observed USB rows that passed preregistered gates
+//! COUNTED IS DISABLED IN THIS BUILD ([`COUNTED_ENABLED`] is `false`). Every output is INFO_ONLY or
+//! DESCRIPTIVE_ONLY_HOLDOUT_REUSED. `--seal-status` and a config's `"status"` are recorded as caller
+//! claims only. COUNTED needs a later change in which the tool itself recomputes the seal and the input
+//! hash chain and checks threshold_id (which includes the freeze status) against the ledger.
+//!
+//! COUNTED (when a later build enables it) is a private descriptive tier: host-observed USB rows that passed preregistered gates
 //! on this capture setup. It is not a rating, not a measure of the person, and it says nothing about who
 //! held the controller or whether the input came from a person. The physical thumb onset is UNMEASURED.
 use serde::{Deserialize, Serialize};
@@ -31,6 +37,23 @@ pub const LIMIT: &str = "Host-observed USB row timing on this capture setup. A p
 /// Label for (A) outputs after the held-out set was already touched (PLAN-r10 R10-3). Never COUNTED.
 pub const DESCRIPTIVE_ONLY_HOLDOUT_REUSED: &str = "DESCRIPTIVE_ONLY_HOLDOUT_REUSED";
 pub const TRANSPORT_USB: &str = "usb-hid";
+/// Hard off (QorProof H1). No CLI flag or config value can produce COUNTED in this build: the seal
+/// status and the freeze status are caller claims the tool does not check.
+pub const COUNTED_ENABLED: bool = false;
+pub const COUNTED_DISABLED_REASON: &str = "counted_disabled_in_this_build";
+pub const COUNTED_DISABLED_NOTE: &str = "COUNTED is disabled in this build. --seal-status and the config status are caller claims and are not checked. A later change must have the tool recompute the seal and the input hash chain and check threshold_id (including freeze status) against the ledger before anything can be COUNTED.";
+/// Calibration-set label (R1). Not COUNTED.
+pub const CALIBRATION_SET_TIER: &str = "NOT_COUNTED_CALIBRATION_SET";
+/// Files whose presence marks a match bundle folder. The report is never written into one.
+pub const BUNDLE_MARKERS: &[&str] = &[
+    "inputs.jsonl",
+    "manifest.jsonl",
+    "bundle.json",
+    "receipt.json",
+    "receipt.v0.json",
+    "receipt.draft.json",
+    "checkpoints.jsonl",
+];
 
 /// Preregistered rule values. Integers only, so the threshold_id hash is JCS-safe.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -83,13 +106,18 @@ pub struct CodePins {
 pub struct Excluded {
     pub session: String,
     pub reason: String,
+    /// sha256 of the session's inputs.jsonl, when known. Also matched, so a renamed copy is caught.
+    /// UNKNOWN (absent) for the listed sessions: this tool has not read their real files.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inputs_sha256: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Config {
     /// "A_standby" (a-priori rule, no session data) or "E" (tuned; not built here).
     pub source: String,
-    /// "standby_unfrozen" until a frozen, ledgered threshold exists. Only "frozen" can yield COUNTED.
+    /// "standby_unfrozen" until a frozen, ledgered threshold exists. A caller claim: this build records it
+    /// (and hashes it into threshold_id) but never derives COUNTED from it.
     pub status: String,
     pub params: Params,
     /// Empty for (A). Hashed into threshold_id with each seal status and inputs sha256 (R2).
@@ -97,7 +125,7 @@ pub struct Config {
     /// Held-out sessions named before freeze (R8-3). Hashed into threshold_id.
     pub heldout_sessions: Vec<String>,
     pub code_pins: CodePins,
-    /// Sessions this tool refuses to compute (073204 per Con, VOID/FAIL). Not part of threshold_id.
+    /// Sessions this tool refuses to compute (073204, VOID/FAIL). Not part of threshold_id.
     #[serde(default)]
     pub excluded_sessions: Vec<Excluded>,
 }
@@ -174,30 +202,33 @@ impl Config {
             excluded_sessions: vec![
                 Excluded {
                     session: "073204".into(),
-                    reason: "excluded by Con (Nov 12 2026 1:14 PM CST: \"073204: leave it out\")"
-                        .into(),
+                    reason: "EXCLUDED per PLAN-r11 R11-3 (agent-relayed instruction, QorProof-unverified; excluding is the safe direction)".into(),
+                    inputs_sha256: None,
                 },
                 Excluded {
                     session: "201029".into(),
                     reason: "VOID".into(),
+                    inputs_sha256: None,
                 },
                 Excluded {
                     session: "153536".into(),
                     reason: "VOID".into(),
+                    inputs_sha256: None,
                 },
                 Excluded {
                     session: "112342".into(),
                     reason: "FAIL".into(),
+                    inputs_sha256: None,
                 },
             ],
         }
     }
 
-    /// sha256(JCS) of the rule, tuning sessions (with seal status and inputs sha256), held-out names
-    /// and the code pins (main SHA). Status and the exclude list are not part of it.
+    /// sha256(JCS) of the rule, freeze status, tuning sessions (with seal status and inputs sha256),
+    /// held-out names and the code pins (main SHA). The exclude list is not part of it.
     pub fn threshold_id(&self) -> String {
         let v = json!({
-            "schema": "qorcap-s2s-threshold/v0", "source": self.source, "params": self.params,
+            "schema": "qorcap-s2s-threshold/v0", "source": self.source, "status": self.status, "params": self.params,
             "tuning_sessions": self.tuning_sessions, "heldout_sessions": self.heldout_sessions, "code_pins": self.code_pins,
         });
         ev::try_jcs_sha(&v).expect("threshold config is integers and strings only")
@@ -205,7 +236,7 @@ impl Config {
 
     pub fn provenance(&self) -> Value {
         json!({
-            "source": self.source, "status": self.status,
+            "source": self.source, "status_claim": self.status, "status_checked": false,
             "sessions": self.tuning_sessions.iter().map(|s| s.session_id.clone()).collect::<Vec<_>>(),
             "seal_status": self.tuning_sessions.iter().map(|s| s.seal_status.clone()).collect::<Vec<_>>(),
             "inputs_sha256": self.tuning_sessions.iter().map(|s| s.inputs_sha256.clone()).collect::<Vec<_>>(),
@@ -213,21 +244,53 @@ impl Config {
         })
     }
 
-    fn excluded(&self, session_id: &str) -> Option<&Excluded> {
-        self.excluded_sessions
-            .iter()
-            .find(|e| session_id == e.session || session_id.ends_with(&format!("-{}", e.session)))
+    fn excluded(&self, session_id: &str, inputs_sha256: &str) -> Option<&Excluded> {
+        self.excluded_sessions.iter().find(|e| {
+            session_id == e.session
+                || session_id.ends_with(&format!("-{}", e.session))
+                || e.inputs_sha256.as_deref() == Some(inputs_sha256)
+        })
+    }
+
+    /// Reject values that make the rule meaningless or panic (QorProof L4).
+    pub fn validate(&self) -> Result<(), String> {
+        let p = &self.params;
+        let mut bad = vec![];
+        if p.onset_d > 127 || p.release_d >= p.onset_d {
+            bad.push("need release_d < onset_d <= 127");
+        }
+        if p.quiet_us == 0 || p.window_us <= p.quiet_us {
+            bad.push("need 0 < quiet_us < window_us");
+        }
+        if !(1..=254).contains(&p.edge_delta) {
+            bad.push("need 1 <= edge_delta <= 254");
+        }
+        if p.burst_gap_us == 0 {
+            bad.push("need burst_gap_us > 0");
+        }
+        if p.min_bursts_for_headline == 0 {
+            bad.push("need min_bursts_for_headline >= 1");
+        }
+        if p.onset_rule != "ii" {
+            bad.push("only onset_rule \"ii\" is implemented");
+        }
+        if bad.is_empty() {
+            Ok(())
+        } else {
+            Err(format!("invalid s2s config: {}", bad.join("; ")))
+        }
     }
 }
 
-/// Caller-stated session facts. The tool does not check seals itself; a seal counts only when the
-/// caller states its echo hash was recomputed from inputs.jsonl and matched (`rehashed_match`).
+/// Session facts. [`run`] replaces `session_id` with the bundle's own id (QorProof M1); the typed id
+/// only has to agree with it. `seal_status` and `disposition` are caller claims: the tool does not
+/// check seals, and no claim can produce COUNTED in this build.
 #[derive(Debug, Clone)]
 pub struct SessionMeta {
     pub session_id: String,
-    /// rehashed_match | locked_not_rehashed | failed | missing
+    /// Claim: rehashed_match | locked_not_rehashed | failed | missing
     pub seal_status: String,
-    /// ok | UNKNOWN | VOID | FAIL
+    /// Claim: ok | UNKNOWN | VOID | FAIL (matched case-insensitively)
     pub disposition: String,
     pub in_calibration_set: bool,
     /// (A) triggered after held-out scoring started (R10-3): outputs are DESCRIPTIVE_ONLY_HOLDOUT_REUSED.
@@ -478,13 +541,16 @@ fn span_gate(
 
 /// Percentile by nearest rank on sorted values (same convention as `align::pct`).
 fn pct(xs: &[i64], p: usize) -> i64 {
+    if xs.is_empty() {
+        return 0;
+    }
     xs[(xs.len() - 1) * p / 100]
 }
 
 fn stats(vals_us: &[i64], min_n: usize) -> Value {
     let mut v = vals_us.to_vec();
     v.sort();
-    if v.len() < min_n {
+    if v.len() < min_n.max(1) {
         return json!({"status": "UNMEASURED", "n": v.len(), "reason": format!("{} R2 press bursts with an onset; the preregistered minimum is {min_n}", v.len())});
     }
     json!({"status": "ok", "n": v.len(), "unit": "us", "median_us": pct(&v, 50), "p25_us": pct(&v, 25), "p75_us": pct(&v, 75),
@@ -500,19 +566,23 @@ pub fn analyze(rows: &[Value], inputs_sha256: &str, meta: &SessionMeta, cfg: &Co
     let mut out = json!({
         "schema": SCHEMA, "label": HEADLINE_LABEL, "limit": LIMIT,
         "session": {"session_id": meta.session_id, "inputs_file": "inputs.jsonl", "inputs_sha256": inputs_sha256,
-                    "seal_status": meta.seal_status, "disposition": meta.disposition,
+                    "seal_status_claim": meta.seal_status, "seal_status_checked": false, "disposition_claim": meta.disposition,
                     "in_calibration_set": meta.in_calibration_set, "holdout_reused": meta.holdout_reused},
         "threshold": {"threshold_id": threshold_id, "provenance": prov, "params": p, "code_pins": cfg.code_pins},
         "gold": false, "referee_submit": false, "upload": false,
+        "counted": {"enabled": COUNTED_ENABLED, "note": COUNTED_DISABLED_NOTE},
     });
-    if let Some(x) = cfg.excluded(&meta.session_id) {
+    if let Some(x) = cfg.excluded(&meta.session_id, inputs_sha256) {
         out["status"] = json!("excluded");
         out["excluded_reason"] = json!(x.reason);
         return out;
     }
-    if matches!(meta.disposition.as_str(), "VOID" | "FAIL") {
+    if ["VOID", "FAIL"]
+        .iter()
+        .any(|d| meta.disposition.trim().eq_ignore_ascii_case(d))
+    {
         out["status"] = json!("excluded");
-        out["excluded_reason"] = json!(meta.disposition.to_lowercase());
+        out["excluded_reason"] = json!(meta.disposition.trim().to_lowercase());
         return out;
     }
     let header_transport = rows
@@ -568,12 +638,16 @@ pub fn analyze(rows: &[Value], inputs_sha256: &str, meta: &SessionMeta, cfg: &Co
     out["counts"] = json!({"in_rows": ins.len(), "hb_rows": hbs.len(), "r2_edges": edges.len(), "r2_bursts": anchors.len(),
                            "r2_bit_rises_diagnostic": bit_rises.len()});
 
+    // H1: COUNTED is unreachable here. The claims below only add reasons; none of them can lift a tier.
     let tier = if meta.holdout_reused {
         DESCRIPTIVE_ONLY_HOLDOUT_REUSED.to_string()
     } else {
-        "COUNTED".to_string()
+        "INFO_ONLY".to_string()
     };
     let mut info_only: Vec<String> = vec![];
+    if !COUNTED_ENABLED {
+        info_only.push(COUNTED_DISABLED_REASON.into());
+    }
     if meta.seal_status != "rehashed_match" {
         info_only.push(
             match meta.seal_status.as_str() {
@@ -587,11 +661,6 @@ pub fn analyze(rows: &[Value], inputs_sha256: &str, meta: &SessionMeta, cfg: &Co
     if cfg.status != "frozen" {
         info_only.push("stick_onset_threshold_provisional".into());
     }
-    let tier = if tier == "COUNTED" && !info_only.is_empty() {
-        "INFO_ONLY".to_string()
-    } else {
-        tier
-    };
 
     let mut rows_out: Vec<Value> = vec![];
     let mut used: std::collections::BTreeSet<u64> = Default::default();
@@ -686,6 +755,7 @@ pub fn analyze(rows: &[Value], inputs_sha256: &str, meta: &SessionMeta, cfg: &Co
     out["info_only_reasons"] = json!(info_only);
     if meta.in_calibration_set {
         // R1: no value from a calibration session is ever reported. Only the threshold-free M4 count.
+        out["tier"] = json!(CALIBRATION_SET_TIER);
         out["status"] = json!("in_calibration_set");
         out["m4_gate_passing_r2_bursts"] = json!(gate_passing);
         out["note"] = json!("in_calibration_set: no per-burst rows, no timing values (R1). Only the threshold-free burst count is shown.");
@@ -694,31 +764,94 @@ pub fn analyze(rows: &[Value], inputs_sha256: &str, meta: &SessionMeta, cfg: &Co
     out["status"] = json!("ok");
     out["outcome_table"] = table_json;
     let st = stats(&vals, p.min_bursts_for_headline);
-    if tier == "COUNTED" {
-        out["headline"] = json!({"label": HEADLINE_LABEL, "tier": "COUNTED", "s2_s4": st, "outcome_table": out["outcome_table"].clone()});
-    } else {
-        out["headline"] = json!({"label": HEADLINE_LABEL, "status": "NOT_COUNTED", "tier": tier, "reasons": info_only});
-        out["descriptive"] = json!({"tier": tier, "not_counted": true, "s2_s4": st, "outcome_table": out["outcome_table"].clone()});
-    }
+    // Never a COUNTED headline in this build: the values sit under `descriptive` with not_counted true.
+    out["headline"] = json!({"label": HEADLINE_LABEL, "status": "NOT_COUNTED", "tier": tier, "reasons": info_only});
+    out["descriptive"] = json!({"tier": tier, "not_counted": true, "s2_s4": st, "outcome_table": out["outcome_table"].clone()});
     out["anchors"] = json!(rows_out);
     out
 }
 
 /// True when `out` would land inside `bundle` (after resolving the existing parts of both paths).
+/// A bare relative `inputs.jsonl` has an empty bundle path, which contains every path: every write
+/// is then refused (fail-safe; pass the bundle folder or a path with a folder instead).
 pub fn inside(bundle: &Path, out: &Path) -> bool {
     let b = std::fs::canonicalize(bundle).unwrap_or_else(|_| bundle.to_path_buf());
+    let o = resolved_out(out);
+    o.starts_with(&b)
+}
+
+fn resolved_out(out: &Path) -> PathBuf {
     let parent = out
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
     let pc = std::fs::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf());
-    let o = pc.join(out.file_name().unwrap_or_default());
-    o.starts_with(&b)
+    pc.join(out.file_name().unwrap_or_default())
 }
 
-/// `input` is a bundle folder or its inputs.jsonl. Reads it, analyses, writes `out` (never inside the
-/// bundle folder). Returns the report.
+/// The nearest folder at or above `out`'s folder that holds a bundle marker file, if any (QorProof M2b).
+/// Any match bundle is protected, not only the input's.
+pub fn bundle_folder_above(out: &Path) -> Option<PathBuf> {
+    let o = resolved_out(out);
+    let mut d = o.parent();
+    while let Some(dir) = d {
+        if BUNDLE_MARKERS.iter().any(|m| dir.join(m).exists())
+            || dir
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("match-") && dir.join("inputs.jsonl").exists())
+        {
+            return Some(dir.to_path_buf());
+        }
+        d = dir.parent();
+    }
+    None
+}
+
+/// The bundle's own identity (QorProof M1): its folder name `match-<stamp>` and `bundle.json`
+/// `match_id` `local-<stamp>`. Both must be present and name the same stamp; otherwise Err (fail closed:
+/// exclusions are bound to the bundle, not to a typed id).
+pub fn bundle_identity(bundle: &Path) -> Result<String, String> {
+    let canon = std::fs::canonicalize(bundle)
+        .map_err(|e| format!("bundle id UNKNOWN: {}: {e}", bundle.display()))?;
+    let folder = canon
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("")
+        .to_string();
+    let Some(stamp_folder) = folder.strip_prefix("match-") else {
+        return Err(format!("bundle id UNKNOWN: folder {folder:?} is not named match-<stamp>; refusing (exclusions are bound to the bundle's own id)"));
+    };
+    let text = std::fs::read_to_string(canon.join("bundle.json"))
+        .map_err(|e| format!("bundle id UNKNOWN: bundle.json not readable ({e}); refusing (exclusions are bound to the bundle's own id)"))?;
+    let v: Value =
+        serde_json::from_str(&text).map_err(|e| format!("bundle id UNKNOWN: bundle.json: {e}"))?;
+    let mid = v["match_id"]
+        .as_str()
+        .ok_or("bundle id UNKNOWN: bundle.json has no match_id")?;
+    let stamp_mid = mid.strip_prefix("local-").unwrap_or(mid);
+    if stamp_mid != stamp_folder {
+        return Err(format!("bundle id mismatch: folder {folder:?} but bundle.json match_id {mid:?} (renamed or copied folder); refusing"));
+    }
+    Ok(folder)
+}
+
+/// A typed `--session-id` must name the bundle's own id: the folder name, `local-<stamp>`, `<stamp>`
+/// or its time part. Empty means not typed.
+fn typed_id_agrees(typed: &str, bundle_id: &str) -> bool {
+    let t = typed.trim();
+    let stamp = bundle_id.strip_prefix("match-").unwrap_or(bundle_id);
+    t.is_empty()
+        || t == bundle_id
+        || t == stamp
+        || t == format!("local-{stamp}")
+        || stamp.ends_with(&format!("-{t}"))
+}
+
+/// `input` is a bundle folder or its inputs.jsonl. Reads it, analyses, writes `out` (never inside any
+/// bundle folder). `meta.session_id` is the typed id (may be empty); the report uses the bundle's own id.
 pub fn run(input: &Path, out: &Path, meta: &SessionMeta, cfg: &Config) -> Result<Value, String> {
+    cfg.validate()?;
     let (bundle, inputs) = if input.is_dir() {
         (input.to_path_buf(), input.join("inputs.jsonl"))
     } else {
@@ -730,8 +863,13 @@ pub fn run(input: &Path, out: &Path, meta: &SessionMeta, cfg: &Config) -> Result
             input.to_path_buf(),
         )
     };
-    if inside(&bundle, out) {
-        return Err(format!("refusing to write {} inside the bundle folder {} (seal integrity); pick a path outside it", out.display(), bundle.display()));
+    check_out(&bundle, out)?;
+    let bundle_id = bundle_identity(&bundle)?;
+    if !typed_id_agrees(&meta.session_id, &bundle_id) {
+        return Err(format!(
+            "typed --session-id {:?} does not match the bundle's own id {bundle_id:?}; refusing",
+            meta.session_id
+        ));
     }
     let bytes = std::fs::read(&inputs).map_err(|e| format!("read {}: {e}", inputs.display()))?;
     let sha = ev::sha256_hex(&bytes);
@@ -748,18 +886,92 @@ pub fn run(input: &Path, out: &Path, meta: &SessionMeta, cfg: &Config) -> Result
             }
         })
         .collect();
-    let mut rep = analyze(&rows, &sha, meta, cfg);
+    let mut m = meta.clone();
+    m.session_id = bundle_id.clone();
+    let mut rep = analyze(&rows, &sha, &m, cfg);
+    rep["session"]["session_id_source"] = json!("bundle folder name + bundle.json match_id");
+    rep["session"]["session_id_typed"] = if meta.session_id.trim().is_empty() {
+        Value::Null
+    } else {
+        json!(meta.session_id)
+    };
     rep["unparsed_lines"] = json!(bad);
     write_report(&bundle, out, &rep)?;
     Ok(rep)
 }
 
-pub fn write_report(bundle: &Path, out: &Path, rep: &Value) -> Result<(), String> {
+/// Every refusal for an output path (QorProof M2): inside the input's bundle, inside any folder with
+/// bundle markers, or an existing symlink / hard-linked file at `out`.
+fn check_out(bundle: &Path, out: &Path) -> Result<(), String> {
     if inside(bundle, out) {
-        return Err("refusing to write inside the bundle folder".into());
+        return Err(format!("refusing to write {} inside the bundle folder {} (seal integrity); pick a path outside it", out.display(), bundle.display()));
     }
-    std::fs::write(out, serde_json::to_string_pretty(rep).unwrap() + "\n")
-        .map_err(|e| format!("write {}: {e}", out.display()))
+    if let Some(b) = bundle_folder_above(out) {
+        return Err(format!("refusing to write {} inside the bundle folder {} (bundle marker files found; seal integrity)", out.display(), b.display()));
+    }
+    if let Ok(md) = std::fs::symlink_metadata(out) {
+        if md.file_type().is_symlink() {
+            return Err(format!(
+                "refusing to write {}: it is a symlink",
+                out.display()
+            ));
+        }
+        if !md.is_file() {
+            return Err(format!(
+                "refusing to write {}: it exists and is not a regular file",
+                out.display()
+            ));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if md.nlink() > 1 {
+                return Err(format!(
+                    "refusing to write {}: it is a hard link ({} links)",
+                    out.display(),
+                    md.nlink()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Checks [`check_out`], writes a temp file beside `out`, then renames it over `out`. The rename
+/// replaces the directory entry, so a link at `out` is never written through.
+pub fn write_report(bundle: &Path, out: &Path, rep: &Value) -> Result<(), String> {
+    check_out(bundle, out)?;
+    let dir = out
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let name = out
+        .file_name()
+        .ok_or("refusing an output path with no file name")?
+        .to_string_lossy()
+        .into_owned();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp = dir.join(format!(".{name}.tmp-{}-{nanos}", std::process::id()));
+    let body = serde_json::to_string_pretty(rep).unwrap() + "\n";
+    let res = (|| -> std::io::Result<()> {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)?;
+        f.write_all(body.as_bytes())?;
+        f.sync_all()?;
+        drop(f);
+        std::fs::rename(&tmp, out)
+    })();
+    if let Err(e) = res {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("write {}: {e}", out.display()));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
