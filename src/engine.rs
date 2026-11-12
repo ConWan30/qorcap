@@ -109,6 +109,17 @@ pub struct Engine {
     /// Length of `checkpoints.jsonl` before a failed append. A line past it may or may not be
     /// durable, so the next checkpoint restores this length and syncs before it writes.
     ckpt_durable_len: Mutex<Option<u64>>,
+    /// Practice lane only (src/capstop.rs): one stop record per capture writer, bound into the stop
+    /// checkpoint. None (REAL MATCH and every non-practice run): nothing is recorded or written.
+    pub capture_stop: Option<Mutex<CaptureStopState>>,
+}
+
+/// Per-writer stop records for `capture_stop.v0.json` (practice lane only).
+#[derive(Default)]
+pub struct CaptureStopState {
+    pub writers: Vec<Value>,
+    /// File name of the most recently opened recording part.
+    pub last_part: Option<String>,
 }
 
 /// QorTime evidence state for this run.
@@ -445,7 +456,9 @@ impl Engine {
             running: AtomicBool::new(false), api_closed: AtomicBool::new(false), sealed: AtomicBool::new(false),
             countersigned: std::sync::atomic::AtomicI64::new(-1),
             stop_reason: Mutex::new(None), bundle_write: Mutex::new(()), bundle_finalized: AtomicBool::new(false),
-            persist_fault: Mutex::new(None), ckpt_durable_len: Mutex::new(None), args })
+            persist_fault: Mutex::new(None), ckpt_durable_len: Mutex::new(None),
+            capture_stop: crate::capstop::enabled(args.practice_lane, std::env::var(crate::livetap::ENV_LANE).ok().as_deref()).then(|| Mutex::new(CaptureStopState::default())),
+            args })
     }
     fn ms(&self) -> u64 { self.started.elapsed().as_millis() as u64 }
     /// The monotonic clock behind every mono_ms (manifest, checkpoints) and inputs.jsonl t_us.
@@ -549,6 +562,9 @@ impl Engine {
             if let Some((off, seg)) = sp.finish() { me.on_segment(&p2, off, &seg); }
             let _ = file.sync_all();
         });
+        if let Some(cs) = &self.capture_stop {
+            cs.lock().unwrap_or_else(|e| e.into_inner()).last_part = Some(part_file_name(&path));
+        }
         Ok(Recorder { reader: Some(reader), child, stdin, path, started: Instant::now(), deadline, wait_key: true, base: base.to_string(), part })
     }
     pub fn stop_recording(&self) -> Option<String> {
@@ -833,6 +849,16 @@ impl Engine {
             extra.insert("pad_link_sha256".into(), json!(sha));
             extra.insert("pad_link_file".into(), json!("pad_link.v0.json"));
         }
+        // Practice lane only: bind capture_stop.v0.json by SHA-256 of its bytes. Off: the stop checkpoint is unchanged.
+        if self.capture_stop.is_some() {
+            match self.write_capture_stop("stop") {
+                Ok(sha) => {
+                    extra.insert("capture_stop_sha256".into(), json!(sha));
+                    extra.insert("capture_stop_file".into(), json!(crate::capstop::FILE_NAME));
+                }
+                Err(e) => { error!("capture stop record not written: {e}"); extra.insert("capture_stop_error".into(), json!(e)); }
+            }
+        }
         let cp = self.checkpoint("stop", Value::Object(extra));
         let durable = cp.get("hash").is_some() && cp.get("persisted") != Some(&Value::Bool(false));
         if !durable {
@@ -852,6 +878,46 @@ impl Engine {
         }
         warn!("referee did not confirm countersigning through checkpoint {last} within {}s (got {})", wait.as_secs(), self.countersigned.load(Ordering::SeqCst));
         Some(last)
+    }
+
+    /// Practice lane only: add one writer's stop record and refresh the unbound (`open`) file, so a
+    /// crash still leaves the records of writers that already ended. No-op when the lane is off.
+    fn note_writer_end(&self, end: crate::capstop::WriterEnd, tally: &crate::capstop::WriterTally) {
+        let Some(cs) = &self.capture_stop else { return };
+        let at_end = self.rec.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(|r| part_file_name(&r.path));
+        {
+            let mut g = cs.lock().unwrap_or_else(|e| e.into_inner());
+            let (part, basis) = match (at_end, g.last_part.clone()) {
+                (Some(p), _) => (Some(p), "recorder_at_end"),
+                (None, Some(p)) => (Some(p), "last_opened_recorder"),
+                (None, None) => (None, "none"),
+            };
+            let seq = g.writers.len() as u64;
+            let rec = crate::capstop::writer_record(seq, part.as_deref(), basis, &end, tally);
+            info!("capture writer {seq} stop record: ended_by {} exit {} end_seen {} input-drop warnings {}",
+                rec["writer"]["ended_by"], rec["writer"]["exit_code"], rec["encoder"]["end_seen"], rec["input_drops"]["warning_lines"]);
+            g.writers.push(rec);
+        }
+        if let Err(e) = self.write_capture_stop("open") { warn!("capture stop record (open) not written: {e}"); }
+    }
+
+    /// Write `capture_stop.v0.json` (`open` while recording, `stop` for the stop checkpoint). Returns the SHA-256 of its bytes.
+    fn write_capture_stop(&self, state: &str) -> Result<String, String> {
+        let cs = self.capture_stop.as_ref().ok_or("capture stop record is off")?;
+        let writers = cs.lock().unwrap_or_else(|e| e.into_inner()).writers.clone();
+        let mut files: Vec<String> = vec![];
+        for w in &writers { if let Some(f) = w["part_file"].as_str() { if !files.iter().any(|x| x == f) { files.push(f.to_string()); } } }
+        let fc = if state == "stop" {
+            let path = self.bundle_dir().map(|d| d.join(crate::frameclock::FILE_NAME));
+            crate::capstop::frame_clock_section(path.as_deref(), &files)
+        } else {
+            json!({"status": "PENDING", "reason": "the frame-clock gap check runs at stop"})
+        };
+        let reason = self.stop_reason.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let doc = crate::capstop::document(&self.args.match_id, state, reason.as_deref(), &writers, fc);
+        let path = self.ev_path(crate::capstop::FILE_NAME);
+        if let Some(d) = path.parent() { if !d.as_os_str().is_empty() { let _ = std::fs::create_dir_all(d); } }
+        crate::capstop::write_file(&path, &crate::capstop::render(&doc))
     }
 
     fn write_pad_link(&self) -> Option<String> {
@@ -919,15 +985,23 @@ impl Engine {
             }
             Err(e) => Err(e),
         };
-        let mut child = match child { Ok(c) => c, Err(e) => { let m = format!("cannot start ffmpeg `{}`: {e}", self.ffmpeg); error!("{m}"); self.set_state("reopening", Some(m)); return (false, ffmpeg::Failure::Other); } };
+        let mut child = match child { Ok(c) => c, Err(e) => {
+            let m = format!("cannot start ffmpeg `{}`: {e}", self.ffmpeg); error!("{m}"); self.set_state("reopening", Some(m));
+            let end = crate::capstop::WriterEnd { spawn_error: Some(e.to_string()), ..Default::default() };
+            self.note_writer_end(end, &crate::capstop::WriterTally::default());
+            return (false, ffmpeg::Failure::Other);
+        } };
         self.snap_pub.lock().unwrap_or_else(|e| e.into_inner()).mark_producer_started();
         let mut stdout = child.stdout.take().unwrap();
         let stderr = child.stderr.take().unwrap();
         let child = Arc::new(Mutex::new(child));
         let alive = Arc::new(AtomicBool::new(true));
         let last_err = Arc::new(Mutex::new(Vec::<String>::new()));
+        // Practice lane only: this writer's stop record (progress counters, `progress=end`, input-side drop warnings).
+        let tally = self.capture_stop.as_ref().map(|_| Arc::new(Mutex::new(crate::capstop::WriterTally::default())));
+        let kill_sent: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
         // stderr: progress key=value -> status; everything else -> log
-        { let me = self.clone(); let last_err = last_err.clone(); std::thread::spawn(move || {
+        let stderr_thread = { let me = self.clone(); let last_err = last_err.clone(); let tally = tally.clone(); std::thread::spawn(move || {
             use std::io::BufRead;
             let mut cursor = ProgressCursor::default();
             // Logging only: one encoder progress line per 5 s from the -progress blocks read here.
@@ -950,16 +1024,18 @@ impl Engine {
                             me.snap_pub.lock().unwrap_or_else(|e| e.into_inner()).note_progress(seq, pts_us);
                         }
                         if let Some(m) = plog.observe(k, v, t0.elapsed().as_millis() as u64) { info!("{m}"); }
+                        if let Some(t) = &tally { t.lock().unwrap_or_else(|e| e.into_inner()).observe_kv(k, v); }
                         continue;
                     }
                 }
                 if l.is_empty() { continue; }
+                if let Some(t) = &tally { t.lock().unwrap_or_else(|e| e.into_inner()).observe_line(l); }
                 warn!("ffmpeg: {l}");
                 let mut e = last_err.lock().unwrap_or_else(|e| e.into_inner()); e.push(l.to_string()); if e.len() > 5 { e.remove(0); }
             }
-        }); }
+        }) };
         // watchdog: kill if no data for N seconds (frozen driver / shared device / unplug)
-        { let me = self.clone(); let child = child.clone(); let alive = alive.clone(); let start = self.ms(); std::thread::spawn(move || {
+        { let me = self.clone(); let child = child.clone(); let alive = alive.clone(); let kill_sent = kill_sent.clone(); let start = self.ms(); std::thread::spawn(move || {
             let wd = me.args.watchdog.max(1) * 1000;
             while alive.load(Ordering::SeqCst) {
                 std::thread::sleep(Duration::from_millis(250));
@@ -967,8 +1043,11 @@ impl Engine {
                 let last = me.last_data_ms.load(Ordering::Relaxed).max(start);
                 let grace = if last == start { 15_000 } else { wd };
                 if me.shutdown.load(Ordering::SeqCst) || watchdog_stalled(now, last, grace) {
+                    let why = if me.shutdown.load(Ordering::SeqCst) { "stop" } else { "watchdog_no_data" };
                     if !me.shutdown.load(Ordering::SeqCst) { let m = format!("no data from device for {}s: treating as frozen/unplugged, restarting", grace / 1000); error!("{m}"); me.set_state("reopening", Some(m)); }
-                    let _ = child.lock().unwrap_or_else(|e| e.into_inner()).kill();
+                    let mut c = child.lock().unwrap_or_else(|e| e.into_inner());
+                    if me.capture_stop.is_some() && !matches!(c.try_wait(), Ok(Some(_))) { kill_sent.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(|| why.to_string()); }
+                    let _ = c.kill();
                     break;
                 }
             }
@@ -995,7 +1074,22 @@ impl Engine {
             }
         }
         alive.store(false, Ordering::SeqCst);
-        let st = { let mut c = child.lock().unwrap_or_else(|e| e.into_inner()); let _ = c.kill(); c.wait() };
+        let st = { let mut c = child.lock().unwrap_or_else(|e| e.into_inner());
+            if tally.is_some() && matches!(c.try_wait(), Ok(None)) { kill_sent.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(|| "stdout_closed".to_string()); }
+            let _ = c.kill(); c.wait() };
+        if let Some(t) = &tally {
+            // Bounded: the writer has exited, so its stderr reaches EOF. A reader still busy after 2 s leaves the counts UNKNOWN.
+            let until = Instant::now() + Duration::from_secs(2);
+            while !stderr_thread.is_finished() && Instant::now() < until { std::thread::sleep(Duration::from_millis(20)); }
+            let drained = stderr_thread.is_finished();
+            if drained { let _ = stderr_thread.join(); }
+            let end = crate::capstop::WriterEnd {
+                exit_code: st.as_ref().ok().and_then(|s| s.code()), status_known: st.is_ok(),
+                kill_sent: kill_sent.lock().unwrap_or_else(|e| e.into_inner()).clone(), spawn_error: None, stderr_drained: drained,
+            };
+            let snapshot = t.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            self.note_writer_end(end, &snapshot);
+        } else { drop(stderr_thread); }
         let mut why = ffmpeg::Failure::Other;
         if !self.shutdown.load(Ordering::SeqCst) {
             std::thread::sleep(Duration::from_millis(200));
@@ -1027,6 +1121,10 @@ impl Drop for StopPublisher {
         self.flag.store(true, Ordering::SeqCst);
         if let Some(handle) = self.handle.take() { let _ = handle.join(); }
     }
+}
+
+fn part_file_name(path: &str) -> String {
+    Path::new(path).file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| path.to_string())
 }
 
 fn finish(mut r: Recorder) -> String {
@@ -1752,6 +1850,194 @@ mod tests {
         e.request_stop("post_final_tail");
         e.end_live_tap();
         assert!(!dir.join(crate::livetap::FILE_NAME).exists());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Practice capture stop record with a stubbed capture writer (a shell script, so unix only).
+    /// Writers in order: 0 clean exit with `progress=end`; 1 progress only, input-drop warnings, exit 1;
+    /// 2 garbage and exit 228; 3 data then silence (watchdog kill); 4 silence until stop (stop kill).
+    #[cfg(unix)]
+    fn stub_writer(dir: &Path) -> String {
+        use std::os::unix::fs::PermissionsExt;
+        let script = dir.join("stub-ffmpeg.sh");
+        let n = dir.join("stub-n");
+        std::fs::write(&n, "0").unwrap();
+        let body = format!(r#"#!/bin/sh
+n=$(cat '{n}'); echo $((n+1)) > '{n}'
+case "$n" in
+0) printf 'frame=10\ndup_frames=0\ndrop_frames=0\nprogress=continue\nframe=27669\ndup_frames=0\ndrop_frames=0\nprogress=end\n' >&2; exit 0 ;;
+1) printf 'frame=600\ndup_frames=2\ndrop_frames=1\nprogress=continue\n' >&2
+   printf '[in#0/dshow @ 0x1] real-time buffer [Card] [video input] too full or near too full (62%% of size: 512000000 [rtbufsize parameter])! frame dropped!\n' >&2
+   printf '    Last message repeated 3 times\n' >&2
+   printf '[in#1/dshow @ 0x2] real-time buffer [Card] [audio input] too full or near too full (70%% of size: 3041280 [rtbufsize parameter])! frame dropped!\n' >&2
+   printf 'frame=610\nprogress=continue\n' >&2; exit 1 ;;
+2) printf 'garbage \377 line\n=\nframe=abc\nprogress=\n' >&2; exit 228 ;;
+3) printf 'frame=5\nprogress=continue\n' >&2; printf 'G'; head -c 187 /dev/zero; exec sleep 30 ;;
+*) printf 'frame=7\nprogress=continue\n' >&2; exec sleep 30 ;;
+esac
+"#, n = n.display());
+        std::fs::write(&script, body).unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        script.to_string_lossy().into_owned()
+    }
+
+    #[cfg(unix)]
+    fn stub_engine(dir: &Path, practice: bool) -> Arc<Engine> {
+        use clap::Parser;
+        let d = dir.to_string_lossy().into_owned();
+        let mut a = vec!["q", "record", "--device", "testpattern", "--audio", "none", "--bundle", &d, "--no-controller", "--match-id", "m-capstop", "--watchdog", "1", "--frame-clock"];
+        if practice { a.push("--practice-lane"); }
+        let crate::cli::Cmd::Record(r) = crate::cli::Cli::try_parse_from(a).unwrap().cmd else { panic!() };
+        let ff = stub_writer(dir);
+        std::fs::write(dir.join("manifest.jsonl"), "").unwrap(); // no video segments in these runs
+        Engine::new(r, ff)
+    }
+
+    #[cfg(unix)]
+    fn run_stub_writers(e: &Arc<Engine>) {
+        for _ in 0..4 { let _ = e.run_capture_once("auto", None); }
+        // Writer 4 only ends when the stop arrives.
+        let me = e.clone();
+        let t = std::thread::spawn(move || { std::thread::sleep(Duration::from_millis(400)); me.note_stop("enter"); me.shutdown.store(true, Ordering::SeqCst); });
+        let _ = e.run_capture_once("auto", None);
+        t.join().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn capture_stop_record_covers_every_writer_end_and_is_bound_into_the_stop_checkpoint() {
+        let base = std::env::temp_dir().join(format!("qorcap-capstop-eng-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let dir = base.join("on");
+        std::fs::create_dir_all(&dir).unwrap();
+        let e = stub_engine(&dir, true);
+        assert!(e.capture_stop.is_some());
+        // Synthetic frame clock for one part: 12 frames at 60 fps with one 3-slot PTS hole.
+        for i in 0..12u64 {
+            let pts = if i < 6 { i * 1500 } else { (i + 3) * 1500 };
+            e.frame_clock.observe(&crate::frameclock::video_ts_packet(0x100, pts), 1_000_000 + i * 16_667, "video.mp4");
+        }
+        e.capture_stop.as_ref().unwrap().lock().unwrap().last_part = Some("video.mp4".into());
+        run_stub_writers(&e);
+        let open: Value = serde_json::from_str(&std::fs::read_to_string(dir.join(crate::capstop::FILE_NAME)).unwrap()).unwrap();
+        assert_eq!(open["state"], "open", "written as each writer ends, before the stop");
+        assert_eq!(open["writers"].as_array().unwrap().len(), 5);
+
+        let last = e.seal_and_wait_countersign(Duration::from_secs(1)).unwrap();
+        let text = std::fs::read_to_string(dir.join(crate::capstop::FILE_NAME)).unwrap();
+        let doc: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(doc["schema"], crate::capstop::SCHEMA);
+        assert_eq!(doc["state"], "stop");
+        assert_eq!(doc["stop_reason"], "enter");
+        let w = doc["writers"].as_array().unwrap();
+        assert_eq!(w.len(), 5);
+        // 0: clean exit, final block seen.
+        assert_eq!(w[0]["writer"]["ended_by"], "self_exit");
+        assert_eq!(w[0]["writer"]["exit_code"], 0);
+        assert_eq!(w[0]["encoder"]["end_seen"], true);
+        assert_eq!(w[0]["encoder"]["frame"], 27669);
+        assert_eq!(w[0]["part_file"], "video.mp4");
+        assert_eq!(w[0]["part_basis"], "last_opened_recorder");
+        // 1: progress only, writer error, input-side drops counted apart from the encoder counters.
+        assert_eq!(w[1]["writer"]["exit_code"], 1);
+        assert_eq!(w[1]["writer"]["ended_by"], "self_exit");
+        assert_eq!(w[1]["encoder"]["end_seen"], false);
+        assert_eq!(w[1]["encoder"]["counters_basis"], "last_progress_block");
+        assert_eq!(w[1]["encoder"]["frame"], 610);
+        assert_eq!(w[1]["encoder"]["drop"], crate::capstop::UNMEASURED);
+        assert_eq!(w[1]["input_drops"]["warning_lines"], 2);
+        assert_eq!(w[1]["input_drops"]["video_input_lines"], 1);
+        assert_eq!(w[1]["input_drops"]["repeated_after_warning"], 3);
+        assert_eq!(w[1]["input_drops"]["dropped_frames"], crate::capstop::UNMEASURED);
+        // 2: garbage only, non-zero exit; nothing invented.
+        assert_eq!(w[2]["writer"]["exit_code"], 228);
+        assert_eq!(w[2]["encoder"]["frame"], crate::capstop::UNMEASURED);
+        assert_eq!(w[2]["input_drops"]["warning_lines"], 0);
+        // 3: device went quiet -> watchdog kill. 4: stop -> kill. A signal death has no exit code.
+        assert_eq!(w[3]["writer"]["ended_by"], "qorcap_kill");
+        assert_eq!(w[3]["writer"]["kill_sent"], "watchdog_no_data");
+        assert_eq!(w[3]["writer"]["exit_code"], crate::capstop::UNKNOWN);
+        assert_eq!(w[4]["writer"]["kill_sent"], "stop");
+        assert_eq!(w[4]["encoder"]["frame"], 7);
+        for x in w { assert_eq!(x["writer"]["stderr_drained"], true); }
+        // Frame-clock gap check for the part.
+        let fc = &doc["frame_clock"]["parts"][0];
+        assert_eq!(fc["part_file"], "video.mp4");
+        assert_eq!(fc["rate"], "60/1");
+        assert_eq!(fc["pts_gaps"], 1);
+        assert_eq!(fc["pts_missing_slots"], 3);
+        // Bound: the stop checkpoint carries the file's SHA-256, and verify-bundle checks it.
+        let cps = crate::bundle::verify(&dir).unwrap();
+        assert!(cps.errors.is_empty(), "{:?}", cps.errors);
+        let stop = e.ev.lock().unwrap().checkpoints.last().cloned().unwrap();
+        assert_eq!(stop["seq"].as_u64(), Some(last));
+        assert_eq!(stop["qorcap"]["trigger"], "stop");
+        assert_eq!(stop["qorcap"]["capture_stop_file"], crate::capstop::FILE_NAME);
+        assert_eq!(stop["qorcap"]["capture_stop_sha256"], crate::evidence::sha256_hex(text.as_bytes()));
+        std::fs::write(dir.join(crate::capstop::FILE_NAME), text.replace("\"exit_code\": 1", "\"exit_code\": 0")).unwrap();
+        let bad = crate::bundle::verify(&dir).unwrap();
+        assert!(bad.errors.iter().any(|m| m.contains("capture_stop.v0.json SHA-256 does not match")), "{:?}", bad.errors);
+        std::fs::remove_file(dir.join(crate::capstop::FILE_NAME)).unwrap();
+        assert!(!crate::bundle::verify(&dir).unwrap().errors.is_empty(), "a bound record that is missing is an error");
+
+        // Lane off (REAL MATCH and every non-practice run): same writers, no record, no file, and the stop
+        // checkpoint's evidence is the same apart from the two new keys.
+        let off_dir = base.join("off");
+        std::fs::create_dir_all(&off_dir).unwrap();
+        let off = stub_engine(&off_dir, false);
+        assert!(off.capture_stop.is_none());
+        run_stub_writers(&off);
+        off.seal_and_wait_countersign(Duration::from_secs(1)).unwrap();
+        assert!(!off_dir.join(crate::capstop::FILE_NAME).exists());
+        let off_stop = off.ev.lock().unwrap().checkpoints.last().cloned().unwrap();
+        let mut on_ext = stop["qorcap"].clone();
+        let mut off_ext = off_stop["qorcap"].clone();
+        for k in ["capture_stop_file", "capture_stop_sha256"] { on_ext.as_object_mut().unwrap().remove(k); }
+        // mono_ms is the engine clock at the checkpoint, different on every run.
+        for x in [&mut on_ext, &mut off_ext] { assert!(x["mono_ms"].is_u64()); x["mono_ms"] = json!(0); }
+        assert_eq!(on_ext, off_ext);
+        assert!(!off_stop.to_string().contains("capture_stop"));
+        assert!(crate::bundle::verify(&off_dir).unwrap().errors.is_empty());
+        let names = |d: &Path| -> std::collections::BTreeSet<String> { std::fs::read_dir(d).unwrap().map(|x| x.unwrap().file_name().to_string_lossy().into_owned()).collect() };
+        let mut on_names = names(&dir);
+        on_names.insert(crate::capstop::FILE_NAME.into()); // removed above for the missing-file check
+        let mut off_names = names(&off_dir);
+        off_names.insert(crate::capstop::FILE_NAME.into());
+        assert_eq!(on_names, off_names, "the only new bundle file is the record");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn capture_stop_spawn_failure_is_recorded_and_lane_off_records_nothing() {
+        use clap::Parser;
+        let base = std::env::temp_dir().join(format!("qorcap-capstop-spawn-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        for practice in [true, false] {
+            let dir = base.join(practice.to_string());
+            std::fs::create_dir_all(&dir).unwrap();
+            let d = dir.to_string_lossy().into_owned();
+            let mut a = vec!["q", "record", "--device", "testpattern", "--audio", "none", "--bundle", &d, "--no-controller"];
+            if practice { a.push("--practice-lane"); }
+            let crate::cli::Cmd::Record(r) = crate::cli::Cli::try_parse_from(a).unwrap().cmd else { panic!() };
+            let e = Engine::new(r, dir.join("no-such-ffmpeg").to_string_lossy().into_owned());
+            let (got, _) = e.run_capture_once("auto", None);
+            assert!(!got);
+            e.seal_and_wait_countersign(Duration::from_secs(1)).unwrap();
+            let stop = e.ev.lock().unwrap().checkpoints.last().cloned().unwrap();
+            if practice {
+                let doc: Value = serde_json::from_str(&std::fs::read_to_string(dir.join(crate::capstop::FILE_NAME)).unwrap()).unwrap();
+                let w = &doc["writers"][0];
+                assert_eq!(w["writer"]["ended_by"], "spawn_failed");
+                assert_eq!(w["writer"]["exit_code"], crate::capstop::UNKNOWN);
+                assert_eq!(w["encoder"]["frame"], crate::capstop::UNMEASURED);
+                assert_eq!(w["input_drops"]["warning_lines"], crate::capstop::UNKNOWN);
+                assert_eq!(doc["frame_clock"]["status"], crate::capstop::UNMEASURED, "frame clock off: UNMEASURED, not 0");
+                assert!(stop["qorcap"]["capture_stop_sha256"].is_string());
+            } else {
+                assert!(!dir.join(crate::capstop::FILE_NAME).exists());
+                assert!(stop["qorcap"].get("capture_stop_sha256").is_none() && stop["qorcap"].get("capture_stop_error").is_none());
+            }
+        }
         let _ = std::fs::remove_dir_all(&base);
     }
 

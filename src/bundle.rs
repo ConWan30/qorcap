@@ -116,6 +116,20 @@ pub struct Report { pub segments: u64, pub bytes: u64, pub checkpoints: u64, pub
     /// Controller input chunks verified (0 when the bundle has no inputs.jsonl).
     pub input_chunks: u64, pub input_head: Option<String> }
 
+/// Practice capture stop record: a stop checkpoint that names `capture_stop_sha256` must match the file's
+/// bytes. A bundle whose stop checkpoint does not name it (REAL MATCH, older bundles) is not checked here.
+fn check_capture_stop(dir: &Path, cps: &[Value], errors: &mut Vec<String>) {
+    for (i, c) in cps.iter().enumerate() {
+        let q = &c["qorcap"];
+        let Some(want) = q["capture_stop_sha256"].as_str() else { continue };
+        let name = q["capture_stop_file"].as_str().unwrap_or(crate::capstop::FILE_NAME);
+        match contained_file(dir, name).and_then(|p| std::fs::read(&p).map_err(|e| format!("cannot read {name}: {e}"))) {
+            Ok(bytes) => if ev::sha256_hex(&bytes) != want { errors.push(format!("checkpoint {i}: {name} SHA-256 does not match the stop checkpoint (record altered)")); },
+            Err(e) => errors.push(format!("checkpoint {i}: capture stop record: {e}")),
+        }
+    }
+}
+
 pub fn verify(dir: &Path) -> Result<Report, String> {
     let man = lines(&dir.join("manifest.jsonl"))?;
     let mut r = Report { segments: 0, bytes: 0, checkpoints: 0, chain_head: GENESIS.into(), errors: vec![], input_chunks: 0, input_head: None };
@@ -188,6 +202,7 @@ pub fn verify(dir: &Path) -> Result<Report, String> {
     let empty_input = crate::inputs::empty_hash();
     let mut committed = 0usize;
     if let Ok(cps) = lines(&dir.join("checkpoints.jsonl")) {
+        check_capture_stop(dir, &cps, &mut r.errors);
         let mut prev = GENESIS.to_string();
         for (i, c) in cps.iter().enumerate() {
             match ev::check_checkpoint(c, &prev) { Ok(h) => prev = h, Err(e) => { r.errors.push(format!("checkpoint {i}: {e}")); prev = c["hash"].as_str().unwrap_or("").into(); } }
