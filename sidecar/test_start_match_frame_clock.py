@@ -78,3 +78,56 @@ def test_practice_frame_clock_function(args, env_val, lane, expected):
                          capture_output=True, text=True, timeout=60)
     assert out.returncode == 0, out.stderr
     assert out.stdout.strip() == expected
+
+
+def _block():
+    start = PS.index("$practiceClock = Get-QorCapPracticeFrameClock")
+    end = PS.index('$fwd = @($fwd | Where-Object { $_ -ne "--no-frame-clock" })', start)
+    return PS[start:end] + '$fwd = @($fwd | Where-Object { $_ -ne "--no-frame-clock" })\n'
+
+
+def test_no_frame_clock_is_stripped_in_every_lane():
+    # The strip sits after the practice-only if-block, so a REAL MATCH launch never forwards it.
+    block = _block()
+    assert block.index("if ($null -ne $practiceClock) {") < block.index("}\n$fwd = @($fwd | Where-Object")
+    sidecar = (ROOT / "sidecar" / "qorcap_match.py").read_text(encoding="utf-8")
+    assert '"--no-frame-clock"' not in sidecar  # argparse would reject it, so the launcher must strip it
+
+
+LANE_CASES = [
+    # (args, QORCAP_FRAME_CLOCK, QORCAP_LANE, expected env after, expected args after)
+    (["--no-frame-clock"], None, None, "UNSET", ["--official-challenges"]),            # REAL MATCH: stripped, env untouched
+    (["--no-frame-clock", "--side", "home"], "1", None, "1", ["--official-challenges", "--side", "home"]),
+    (["--test-pattern", "--no-frame-clock"], None, None, "0", ["--official-challenges", "--test-pattern"]),
+    (["finalize", "--no-frame-clock"], None, None, "UNSET", ["finalize"]),
+    (["--test-pattern"], None, None, "1", ["--official-challenges", "--test-pattern"]),
+]
+
+
+@pytest.mark.parametrize("args,env_val,lane,env_after,args_after", LANE_CASES)
+def test_launcher_block_strips_no_frame_clock(args, env_val, lane, env_after, args_after):
+    if _shell() is None:
+        # No skip (CI skip guard). Without PowerShell only the block text is checked.
+        assert "$fwd = @($fwd | Where-Object { $_ -ne \"--no-frame-clock\" })" in _block()
+        return
+
+    def lit(v):
+        return "$null" if v is None else "'" + v.replace("'", "''") + "'"
+    setenv = "".join(
+        (f"$env:{k} = {lit(v)}\n" if v is not None else f"Remove-Item Env:{k} -ErrorAction SilentlyContinue\n")
+        for k, v in (("QORCAP_FRAME_CLOCK", env_val), ("QORCAP_LANE", lane)))
+    # The block runs where start-match.ps1 runs it: right after $isFinalize, before the challenge flag
+    # is prepended. The challenge step is replayed so the final forwarded args can be compared.
+    script = (_function("Get-QorCapPracticeFrameClock") + "\n" + setenv
+              + "$fwd = @(" + ",".join(lit(a) for a in args) + ")\n"
+              + '$isFinalize = $fwd -contains "finalize"\n'
+              + _block()
+              + 'if (-not $isFinalize) { $fwd = @("--official-challenges") + $fwd }\n'
+              + "if ($null -eq $env:QORCAP_FRAME_CLOCK) { 'ENV=UNSET' } else { 'ENV=' + $env:QORCAP_FRAME_CLOCK }\n"
+              + "'ARGS=' + ($fwd -join '|')\n")
+    out = subprocess.run([_shell(), "-NoProfile", "-NonInteractive", "-Command", script],
+                         capture_output=True, text=True, timeout=60)
+    assert out.returncode == 0, out.stderr
+    lines = dict(l.split("=", 1) for l in out.stdout.strip().splitlines() if "=" in l)
+    assert lines["ENV"] == env_after
+    assert (lines["ARGS"].split("|") if lines["ARGS"] else []) == args_after
