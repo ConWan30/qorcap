@@ -3,9 +3,12 @@
 //! One record per capture writer (the capture ffmpeg that reads the card and encodes): how it ended,
 //! the encoder's last `-progress` counters and whether ffmpeg's closing `progress=end` block arrived,
 //! and a separate count of DirectShow input-side "real-time buffer ... frame dropped!" warnings, which
-//! the encoder's dup/drop counters do not include. At stop, a frame-clock gap check per part is added,
-//! because ffmpeg cannot see frames lost before it. The file is bound into the `stop` checkpoint by
-//! SHA-256 (`capture_stop_sha256`), the same way `pad_link.v0.json` is.
+//! the encoder's dup/drop counters do not include. At stop, a frame-clock gap check per part is added.
+//! That check reads the encoder's OUTPUT timestamps only. The capture runs `-vf fps=N ... -fps_mode cfr`
+//! (src/ffmpeg.rs), so frames lost before ffmpeg or at its input are filled with duplicates before the
+//! encoder and leave no PTS hole: 0 PTS gaps does NOT mean no drops, and the check cannot see losses
+//! before ffmpeg. `input_drops.dropped_frames` stays UNMEASURED. The file is bound into the `stop`
+//! checkpoint by SHA-256 (`capture_stop_sha256`), the same way `pad_link.v0.json` is.
 //!
 //! Practice lane only (`--practice-lane` or `QORCAP_LANE=practice`). Off: nothing here runs, no file is
 //! written, and the stop checkpoint is unchanged. The capture command and the recording are unchanged.
@@ -25,6 +28,10 @@ pub const PTS_GAP_DEN: u64 = 2;
 /// PROVISIONAL. Frame-clock stamps are taken per pipe read, so several frames share one arrival time.
 /// An arrival gap above this many measured frame periods is counted.
 pub const ARRIVAL_GAP_PERIODS: u64 = 3;
+/// Written into every frame-clock part: what a PTS gap count can and cannot show.
+pub const PTS_GAP_NOTE: &str = "pts_gaps counts holes in the encoder's output PTS only. The capture runs -vf fps=N with -fps_mode cfr, so input-side loss (and any loss before ffmpeg) is filled with duplicate frames before the encoder and does not show here. pts_gaps 0 does NOT mean no drops. input_drops.dropped_frames stays UNMEASURED.";
+/// Written into every writer record that QorCap killed.
+pub const KILLED_NOTE: &str = "QorCap killed this writer, so the OS exit status is the kill's, not the writer's (Windows TerminateProcess exits with 1; a Unix signal gives no code). exit_code is UNKNOWN; exit_code_raw is what the OS returned.";
 
 /// On for the practice lane only: `--practice-lane`, or `QORCAP_LANE=practice` (the live tap's rule).
 pub fn enabled(practice_flag: bool, env_lane: Option<&str>) -> bool {
@@ -53,7 +60,10 @@ pub struct WriterTally {
     pub input_drop_lines: u64,
     pub input_drop_video_lines: u64,
     pub input_drop_audio_lines: u64,
-    /// Sum of N from `Last message repeated N times` lines that directly follow an input-drop line.
+    /// Sum of N from `Last message repeated N times` lines in a run that started at an input-drop line.
+    /// `-progress` keys do not end the run (they are written outside ffmpeg's log). A lower bound: ffmpeg
+    /// prints a pending repeat count only when its next different log message arrives, so a run still
+    /// pending when the writer ends (killed, or no later message) is never printed.
     pub input_drop_repeats: u64,
     /// `Last message repeated` lines after an input-drop line whose N could not be read.
     pub input_drop_repeats_unread: u64,
@@ -76,9 +86,11 @@ pub fn repeat_count(line: &str) -> Option<Option<u64>> {
 
 impl WriterTally {
     /// One `-progress` key from the capture ffmpeg's stderr. A `frame` value holding `=` is a whole stats line.
+    /// `-progress` keys go to stderr outside ffmpeg's log, so they leave a drop-warning repeat run open.
+    /// A stats line is a log message, so it ends the run.
     pub fn observe_kv(&mut self, key: &str, value: &str) {
-        self.last_was_drop = false;
         if key == "frame" && value.contains('=') {
+            self.last_was_drop = false;
             let r = crate::encprog::parse_stats_line(&format!("{key}={value}"));
             let c = Counters { frame: r.frame, dup: r.dup, drop: r.drop };
             if !c.is_empty() { self.last = Some(c); }
@@ -123,10 +135,12 @@ impl WriterTally {
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct WriterEnd {
     /// The OS exit code (Windows: the DWORD as i32, so ENOSPC -28 reads -28). None: no code (a signal, or no status).
+    /// After a QorCap kill this is the kill's code (Windows TerminateProcess: 1), recorded only as `exit_code_raw`.
     pub exit_code: Option<i32>,
     /// `wait()` returned a status.
     pub status_known: bool,
-    /// Why QorCap sent a kill, if it did, before the exit was seen: `stop`, `watchdog_no_data`, `stdout_closed`.
+    /// Why QorCap sent a kill, if it did, before the exit was seen: `stop`, `watchdog_no_data`, `stdout_closed`
+    /// (stdout reached EOF and the writer had not exited 2 s later), `read_error` (reading stdout failed).
     pub kill_sent: Option<String>,
     /// The writer never started.
     pub spawn_error: Option<String>,
@@ -142,10 +156,17 @@ pub fn writer_record(seq: u64, part_file: Option<&str>, part_basis: &str, end: &
         else if !end.status_known { UNKNOWN }
         else if end.kill_sent.is_some() { "qorcap_kill" }
         else { "self_exit" };
-    let exit_code = match (end.status_known, end.exit_code) { (true, Some(c)) => json!(c), _ => json!(UNKNOWN) };
+    let killed = end.kill_sent.is_some();
+    let raw = match (end.status_known, end.exit_code) { (true, Some(c)) => json!(c), _ => json!(UNKNOWN) };
     let mut writer = Map::new();
     writer.insert("ended_by".into(), json!(ended_by));
-    writer.insert("exit_code".into(), exit_code);
+    // A QorCap kill's status is not the writer's own: exit_code UNKNOWN, the OS value kept as exit_code_raw.
+    writer.insert("exit_code".into(), if killed { json!(UNKNOWN) } else { raw.clone() });
+    writer.insert("killed_by_qorcap".into(), json!(killed));
+    if killed {
+        writer.insert("exit_code_raw".into(), raw);
+        writer.insert("exit_code_note".into(), json!(KILLED_NOTE));
+    }
     writer.insert("kill_sent".into(), end.kill_sent.as_deref().map(Value::from).unwrap_or(Value::Null));
     if let Some(e) = &end.spawn_error { writer.insert("spawn_error".into(), json!(e)); }
     writer.insert("stderr_drained".into(), json!(end.stderr_drained));
@@ -169,10 +190,10 @@ pub fn writer_record(seq: u64, part_file: Option<&str>, part_basis: &str, end: &
         "warning_lines_seen": t.input_drop_lines,
         "video_input_lines": count(t.input_drop_video_lines),
         "audio_input_lines": count(t.input_drop_audio_lines),
-        "repeated_after_warning": count(t.input_drop_repeats),
+        "repeated_after_warning_lower_bound": count(t.input_drop_repeats),
         "repeat_lines_unread": t.input_drop_repeats_unread,
         "dropped_frames": UNMEASURED,
-        "note": "A warning line is not a frame count: one line per dropped frame was not checked.",
+        "note": "A warning line is not a frame count: one line per dropped frame was not checked. repeated_after_warning_lower_bound is a lower bound: ffmpeg prints a pending 'Last message repeated N times' only when its next different log message arrives, so a run still pending when the writer ends is never printed.",
     });
     json!({
         "writer_seq": seq,
@@ -204,21 +225,25 @@ pub fn frame_clock_gaps(stamps: &[FrameStamp], file: &str, discontinuities: u64)
     let rate = crate::align::frame_clock_rate(stamps, file);
     let Some((rate, step)) = rate.and_then(|r| step_ticks(r).map(|s| (r, s))) else {
         return json!({
-            "part_file": file, "status": UNMEASURED, "reason": "frame rate not measured from frame_clock PTS steps (fewer than 10 steps)",
+            "part_file": file, "status": UNMEASURED, "reason": "frame rate not measured from frame_clock PTS steps (fewer than 10 consecutive PTS steps, i.e. increasing PTS between consecutive frame numbers)",
             "frames": frames, "largest_arrival_gap_us": if frames > 1 { json!(largest_arrival_us) } else { json!(UNMEASURED) },
             "pts_discontinuities": discontinuities,
+            "pts_gap_note": PTS_GAP_NOTE,
         });
     };
     let pts_limit = step * PTS_GAP_NUM / PTS_GAP_DEN;
     let period_us = step * 1_000_000 / 90_000;
     let arrival_limit = period_us * ARRIVAL_GAP_PERIODS;
     let (mut pts_gaps, mut missing_slots, mut largest_pts) = (0u64, 0u64, 0u64);
-    let mut arrival_gaps = 0u64;
+    let (mut arrival_gaps, mut nonincreasing) = (0u64, 0u64);
     for w in mine.windows(2) {
         if w[1].pts_90k > w[0].pts_90k {
             let d = w[1].pts_90k - w[0].pts_90k;
             largest_pts = largest_pts.max(d);
             if d > pts_limit { pts_gaps += 1; missing_slots += ((d + step / 2) / step).saturating_sub(1); }
+        } else {
+            // Equal or backwards PTS between neighbours in frame order: counted, not a gap.
+            nonincreasing += 1;
         }
         if w[1].t_mono_us.saturating_sub(w[0].t_mono_us) > arrival_limit { arrival_gaps += 1; }
     }
@@ -230,7 +255,9 @@ pub fn frame_clock_gaps(stamps: &[FrameStamp], file: &str, discontinuities: u64)
         "step_90k": step,
         "pts_gap_threshold_90k": pts_limit,
         "pts_gaps": pts_gaps,
+        "pts_gap_note": PTS_GAP_NOTE,
         "pts_missing_slots": missing_slots,
+        "pts_nonincreasing": nonincreasing,
         "largest_pts_step_90k": largest_pts,
         "arrival_gap_threshold_us": arrival_limit,
         "arrival_gaps": arrival_gaps,
@@ -270,7 +297,10 @@ pub fn document(session: &str, state: &str, stop_reason: Option<&str>, writers: 
         "writers": writers,
         "frame_clock": frame_clock,
         "unmeasured": [
-            "input-side dropped frame count (warning lines are not frames)",
+            "input-side dropped frame count (warning lines are not frames; frame-clock pts_gaps 0 is not a no-drop result, see pts_gap_note)",
+            "frames lost before ffmpeg (the frame-clock check reads encoder output PTS only)",
+            "the writer's own exit status after a QorCap kill (exit_code UNKNOWN, exit_code_raw is the kill's)",
+            "a 'Last message repeated' count still pending when a writer ended",
             "encoder counters after the last progress block when progress=end was not seen",
             "the fMP4 remux ffmpeg's exit status",
         ],
@@ -281,14 +311,22 @@ pub fn document(session: &str, state: &str, stop_reason: Option<&str>, writers: 
 /// Pretty JSON plus a newline: the exact bytes that are hashed.
 pub fn render(doc: &Value) -> String { format!("{}\n", serde_json::to_string_pretty(doc).unwrap_or_else(|_| "{}".into())) }
 
+/// An io error's kind and OS code only: its Display text can carry a local path.
+fn io_kind(e: &std::io::Error) -> String {
+    match e.raw_os_error() { Some(c) => format!("{:?} (os error {c})", e.kind()), None => format!("{:?}", e.kind()) }
+}
+
 /// Write `text` to `path` through a temp file and a rename, synced. Returns the SHA-256 of the bytes.
 pub fn write_file(path: &Path, text: &str) -> Result<String, String> {
     use std::io::Write;
     let tmp = path.with_extension("json.tmp");
-    let mut f = std::fs::File::create(&tmp).map_err(|e| format!("create {}: {e}", tmp.display()))?;
-    f.write_all(text.as_bytes()).and_then(|_| f.sync_all()).map_err(|e| { let _ = std::fs::remove_file(&tmp); format!("write {}: {e}", tmp.display()) })?;
+    // Errors name the file only, never the local directory (they can go into the stop checkpoint).
+    let base = |p: &Path| p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let (tn, pn) = (base(&tmp), base(path));
+    let mut f = std::fs::File::create(&tmp).map_err(|e| format!("create {tn}: {}", io_kind(&e)))?;
+    f.write_all(text.as_bytes()).and_then(|_| f.sync_all()).map_err(|e| { let _ = std::fs::remove_file(&tmp); format!("write {tn}: {}", io_kind(&e)) })?;
     drop(f);
-    std::fs::rename(&tmp, path).map_err(|e| { let _ = std::fs::remove_file(&tmp); format!("rename to {}: {e}", path.display()) })?;
+    std::fs::rename(&tmp, path).map_err(|e| { let _ = std::fs::remove_file(&tmp); format!("rename to {pn}: {}", io_kind(&e)) })?;
     Ok(crate::evidence::sha256_hex(text.as_bytes()))
 }
 
@@ -341,6 +379,11 @@ mod tests {
         assert_eq!(r["encoder"]["frame"], 42712);
         assert_eq!(r["writer"]["ended_by"], "qorcap_kill");
         assert_eq!(r["writer"]["kill_sent"], "stop");
+        // C1: the kill's status (Windows TerminateProcess exits with 1) is not presented as the writer's.
+        assert_eq!(r["writer"]["exit_code"], UNKNOWN);
+        assert_eq!(r["writer"]["exit_code_raw"], 1);
+        assert_eq!(r["writer"]["killed_by_qorcap"], true);
+        assert!(r["writer"]["exit_code_note"].as_str().unwrap().contains("TerminateProcess"));
     }
 
     #[test]
@@ -367,12 +410,20 @@ mod tests {
             let r = writer_record(0, None, "none", &WriterEnd { exit_code: Some(code), ..clean() }, &t);
             assert_eq!(r["writer"]["exit_code"], code);
             assert_eq!(r["writer"]["ended_by"], by);
+            assert_eq!(r["writer"]["killed_by_qorcap"], false);
+            assert!(r["writer"].get("exit_code_raw").is_none());
         }
         // Windows reports ENOSPC as 4294967268: the same bits as i32 are -28.
         assert_eq!(4294967268u32 as i32, -28);
         let r = writer_record(0, None, "none", &WriterEnd { exit_code: Some(1), kill_sent: Some("watchdog_no_data".into()), ..clean() }, &t);
         assert_eq!(r["writer"]["ended_by"], "qorcap_kill");
         assert_eq!(r["writer"]["kill_sent"], "watchdog_no_data");
+        assert_eq!(r["writer"]["exit_code"], UNKNOWN, "a kill's exit 1 is not the writer's");
+        assert_eq!(r["writer"]["exit_code_raw"], 1);
+        // A Unix signal kill: no raw code either.
+        let r = writer_record(0, None, "none", &WriterEnd { exit_code: None, kill_sent: Some("stdout_closed".into()), ..clean() }, &t);
+        assert_eq!(r["writer"]["exit_code"], UNKNOWN);
+        assert_eq!(r["writer"]["exit_code_raw"], UNKNOWN);
         let r = writer_record(0, None, "none", &WriterEnd { exit_code: None, status_known: false, ..clean() }, &t);
         assert_eq!(r["writer"]["exit_code"], UNKNOWN);
         assert_eq!(r["writer"]["ended_by"], UNKNOWN);
@@ -395,20 +446,29 @@ mod tests {
         t.observe_line("Last message repeated x times");
         t.observe_line("[out#1/image2 @ 0x1] Error muxing a packet");
         t.observe_line("Last message repeated 9 times"); // repeats a non-drop line: not counted
+        t.observe_line(v);
+        // C2: -progress keys are written outside ffmpeg's log, so the repeat run stays open across them.
         feed_block(&mut t, 500, 0, 0, "continue");
-        t.observe_line("Last message repeated 7 times"); // after progress keys: not counted
+        t.observe_line("Last message repeated 7 times"); // after progress keys: still the drop warning's run
+        // A stats line is a log message: it ends the run.
+        t.observe_line(v);
+        let (k, sv) = "frame= 1234 fps= 30 q=23.0 size=1kB time=00:00:41.13 bitrate=1kbits/s dup=3 drop=1 speed=1.00x".split_once('=').unwrap();
+        t.observe_kv(k, sv);
+        t.observe_line("Last message repeated 50 times"); // repeats the stats line: not counted
         let r = writer_record(0, Some("video.mp4"), "recorder_at_end", &clean(), &t);
-        assert_eq!(r["input_drops"]["warning_lines"], 2);
-        assert_eq!(r["input_drops"]["video_input_lines"], 1);
+        assert_eq!(r["input_drops"]["warning_lines"], 4);
+        assert_eq!(r["input_drops"]["video_input_lines"], 3);
         assert_eq!(r["input_drops"]["audio_input_lines"], 1);
-        assert_eq!(r["input_drops"]["repeated_after_warning"], 5);
+        assert_eq!(r["input_drops"]["repeated_after_warning_lower_bound"], 12);
+        assert!(r["input_drops"].get("repeated_after_warning").is_none(), "no unlabelled complete-looking count");
+        assert!(r["input_drops"]["note"].as_str().unwrap().contains("lower bound"));
         assert_eq!(r["input_drops"]["repeat_lines_unread"], 1);
         assert_eq!(r["input_drops"]["dropped_frames"], UNMEASURED);
-        assert_eq!(r["encoder"]["drop"], 0, "encoder counters are their own");
+        assert_eq!(r["encoder"]["drop"], 1, "encoder counters are their own (last stats line)");
         // A writer whose stderr was not fully read: counts are UNKNOWN, the seen count stays as a lower bound.
         let r = writer_record(0, None, "none", &WriterEnd { stderr_drained: false, ..clean() }, &t);
         assert_eq!(r["input_drops"]["warning_lines"], UNKNOWN);
-        assert_eq!(r["input_drops"]["warning_lines_seen"], 2);
+        assert_eq!(r["input_drops"]["warning_lines_seen"], 4);
     }
 
     #[test]
@@ -457,6 +517,10 @@ mod tests {
         assert_eq!(g["arrival_gap_threshold_us"], 16_666 * 3);
         assert_eq!(g["arrival_gaps"], 1);
         assert_eq!(g["largest_arrival_gap_us"], 100_000);
+        assert_eq!(g["pts_nonincreasing"], 0);
+        // C3: the record itself says 0 PTS gaps is not a no-drop result.
+        let note = g["pts_gap_note"].as_str().unwrap();
+        assert!(note.contains("does NOT mean no drops") && note.contains("-fps_mode cfr") && note.contains("before ffmpeg"), "{note}");
         // 30 fps at the same check: step 3000, no gaps.
         let pts: Vec<u64> = (0..15).map(|i| i * 3000).collect();
         let t: Vec<u64> = (0..15).map(|i| i * 33_333).collect();
@@ -465,6 +529,16 @@ mod tests {
         assert_eq!(g["pts_gaps"], 0);
         assert_eq!(g["arrival_gaps"], 0);
         assert_eq!(g["pts_discontinuities"], 2);
+        assert!(g["pts_gap_note"].is_string());
+        // G1: equal or backwards PTS between neighbours is counted, not skipped silently.
+        let mut pts: Vec<u64> = (0..15).map(|i| i * 1500).collect();
+        pts.insert(7, 6 * 1500); // equal to its neighbour
+        pts.insert(11, 9 * 1500 - 100); // after 9*1500: backwards by 100 ticks
+        let t: Vec<u64> = (0..pts.len() as u64).map(|i| i * 16_667).collect();
+        let g = frame_clock_gaps(&stamps("p3.mp4", &pts, &t), "p3.mp4", 0);
+        assert_eq!(g["status"], "measured");
+        assert_eq!(g["pts_nonincreasing"], 2);
+        assert_eq!(g["pts_gaps"], 0);
     }
 
     #[test]
@@ -476,6 +550,8 @@ mod tests {
         assert_eq!(g["status"], UNMEASURED);
         assert_eq!(g["frames"], 3);
         assert!(g.get("pts_gaps").is_none(), "no gap count without a measured rate");
+        assert!(g["reason"].as_str().unwrap().contains("fewer than 10 consecutive PTS steps"));
+        assert!(g["pts_gap_note"].is_string());
         let sec = frame_clock_section(None, &["video.mp4".into()]);
         assert_eq!(sec["status"], UNMEASURED);
         let sec = frame_clock_section(Some(Path::new("/nonexistent/frame_clock.jsonl")), &["video.mp4".into()]);
@@ -506,6 +582,10 @@ mod tests {
         assert_eq!(sha, crate::evidence::sha256_hex(&std::fs::read(&p).unwrap()));
         assert!(!dir.join("capture_stop.v0.json.tmp").exists());
         for w in ["verified", "proven", "skill", "reaction time", "anti-cheat"] { assert!(!a.to_lowercase().contains(w), "{w}"); }
+        // A failed write names the file only, not the local directory (the error can go into the stop checkpoint).
+        let e = write_file(&dir.join("no-such-dir").join(FILE_NAME), &a).unwrap_err();
+        assert!(e.contains("capture_stop.v0.json.tmp"), "{e}");
+        assert!(!e.contains(&*dir.to_string_lossy()) && !e.contains("no-such-dir"), "{e}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

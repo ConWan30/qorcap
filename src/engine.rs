@@ -1055,6 +1055,8 @@ impl Engine {
         let mut buf = vec![0u8; TS * 512];
         let mut fill = 0usize;
         let mut got = false;
+        // Why the read loop ended: EOF (the writer closed stdout) or a read error (stdout may still be open).
+        let mut read_failed = false;
         loop {
             match stdout.read(&mut buf[fill..]) {
                 Ok(0) => break,
@@ -1070,20 +1072,21 @@ impl Engine {
                         fill -= whole;
                     }
                 }
-                Err(e) => { error!("capture read error: {e}"); break; }
+                Err(e) => { error!("capture read error: {e}"); read_failed = true; break; }
             }
         }
         alive.store(false, Ordering::SeqCst);
         let st = { let mut c = child.lock().unwrap_or_else(|e| e.into_inner());
-            // Practice lane only: a writer that closed stdout on its own gets up to 2 s to exit, so its own
-            // exit code is recorded rather than the kill's. Output bytes are unaffected (stdout is closed).
+            // Practice lane only: a writer whose stdout ended (EOF or a read error) gets up to 2 s to exit, so its
+            // own exit code is recorded rather than the kill's. Nothing more is read, so output bytes are unaffected.
             if tally.is_some() && kill_sent.lock().unwrap_or_else(|e| e.into_inner()).is_none() {
+                let label = grace_kill_label(read_failed);
                 let until = Instant::now() + Duration::from_secs(2);
                 loop {
                     match c.try_wait() {
                         Ok(Some(_)) => break,
                         Ok(None) if Instant::now() < until => std::thread::sleep(Duration::from_millis(20)),
-                        _ => { kill_sent.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(|| "stdout_closed".to_string()); break; }
+                        _ => { kill_sent.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(|| label.to_string()); break; }
                     }
                 }
             }
@@ -1120,6 +1123,10 @@ impl Engine {
         (got, why)
     }
 }
+
+/// The `kill_sent` label when the 2 s practice-lane grace runs out: `stdout_closed` only after EOF;
+/// a read error does not mean the writer closed stdout.
+fn grace_kill_label(read_failed: bool) -> &'static str { if read_failed { "read_error" } else { "stdout_closed" } }
 
 /// Watchdog stall test on the engine's u64 ms clock. `last` is stored by the reader thread and can be
 /// read after `now` was taken, so `last > now` happens when a frame lands between the two reads; that
@@ -1958,7 +1965,7 @@ esac
         assert_eq!(w[1]["encoder"]["drop"], crate::capstop::UNMEASURED);
         assert_eq!(w[1]["input_drops"]["warning_lines"], 2);
         assert_eq!(w[1]["input_drops"]["video_input_lines"], 1);
-        assert_eq!(w[1]["input_drops"]["repeated_after_warning"], 3);
+        assert_eq!(w[1]["input_drops"]["repeated_after_warning_lower_bound"], 3);
         assert_eq!(w[1]["input_drops"]["dropped_frames"], crate::capstop::UNMEASURED);
         // 2: garbage only, non-zero exit; nothing invented.
         assert_eq!(w[2]["writer"]["exit_code"], 228);
@@ -1968,7 +1975,11 @@ esac
         assert_eq!(w[3]["writer"]["ended_by"], "qorcap_kill");
         assert_eq!(w[3]["writer"]["kill_sent"], "watchdog_no_data");
         assert_eq!(w[3]["writer"]["exit_code"], crate::capstop::UNKNOWN);
+        assert_eq!(w[3]["writer"]["killed_by_qorcap"], true);
         assert_eq!(w[4]["writer"]["kill_sent"], "stop");
+        assert_eq!(w[4]["writer"]["exit_code"], crate::capstop::UNKNOWN);
+        assert_eq!(w[4]["writer"]["killed_by_qorcap"], true);
+        for x in &w[..3] { assert_eq!(x["writer"]["killed_by_qorcap"], false); }
         assert_eq!(w[4]["encoder"]["frame"], 7);
         for x in w { assert_eq!(x["writer"]["stderr_drained"], true); }
         // Frame-clock gap check for the part.
@@ -1977,9 +1988,12 @@ esac
         assert_eq!(fc["rate"], "60/1");
         assert_eq!(fc["pts_gaps"], 1);
         assert_eq!(fc["pts_missing_slots"], 3);
+        assert_eq!(fc["pts_nonincreasing"], 0);
+        assert!(fc["pts_gap_note"].as_str().unwrap().contains("does NOT mean no drops"));
         // Bound: the stop checkpoint carries the file's SHA-256, and verify-bundle checks it.
         let cps = crate::bundle::verify(&dir).unwrap();
         assert!(cps.errors.is_empty(), "{:?}", cps.errors);
+        assert!(cps.warnings.is_empty(), "a bound record is not flagged: {:?}", cps.warnings);
         let stop = e.ev.lock().unwrap().checkpoints.last().cloned().unwrap();
         assert_eq!(stop["seq"].as_u64(), Some(last));
         assert_eq!(stop["qorcap"]["trigger"], "stop");
@@ -2008,7 +2022,8 @@ esac
         for x in [&mut on_ext, &mut off_ext] { assert!(x["mono_ms"].is_u64()); x["mono_ms"] = json!(0); }
         assert_eq!(on_ext, off_ext);
         assert!(!off_stop.to_string().contains("capture_stop"));
-        assert!(crate::bundle::verify(&off_dir).unwrap().errors.is_empty());
+        let off_report = crate::bundle::verify(&off_dir).unwrap();
+        assert!(off_report.errors.is_empty() && off_report.warnings.is_empty(), "{:?} {:?}", off_report.errors, off_report.warnings);
         let names = |d: &Path| -> std::collections::BTreeSet<String> { std::fs::read_dir(d).unwrap().map(|x| x.unwrap().file_name().to_string_lossy().into_owned()).collect() };
         let mut on_names = names(&dir);
         on_names.insert(crate::capstop::FILE_NAME.into()); // removed above for the missing-file check
@@ -2016,6 +2031,103 @@ esac
         off_names.insert(crate::capstop::FILE_NAME.into());
         assert_eq!(on_names, off_names, "the only new bundle file is the record");
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// T3: the practice-lane 2 s grace. A writer that closes stdout and exits 0.5 s later keeps its own exit
+    /// code; one that closes stdout and lingers is killed after the grace and labelled `stdout_closed`.
+    /// Lane off: no grace, the old immediate kill.
+    #[cfg(unix)]
+    #[test]
+    fn capture_stop_grace_keeps_a_late_exit_code_and_labels_a_lingering_writer() {
+        use clap::Parser;
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::temp_dir().join(format!("qorcap-capstop-grace-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let mk = |name: &str, practice: bool| -> Arc<Engine> {
+            let dir = base.join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            let n = dir.join("stub-n");
+            std::fs::write(&n, "0").unwrap();
+            let script = dir.join("stub-ffmpeg.sh");
+            std::fs::write(&script, format!(r#"#!/bin/sh
+n=$(cat '{n}'); echo $((n+1)) > '{n}'
+printf 'frame=3\nprogress=continue\n' >&2
+exec 1>&-
+case "$n" in
+0) sleep 0.5; exit 3 ;;
+*) exec sleep 30 ;;
+esac
+"#, n = n.display())).unwrap();
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let d = dir.to_string_lossy().into_owned();
+            let mut a = vec!["q", "record", "--device", "testpattern", "--audio", "none", "--bundle", &d, "--no-controller", "--watchdog", "30"];
+            if practice { a.push("--practice-lane"); }
+            let crate::cli::Cmd::Record(r) = crate::cli::Cli::try_parse_from(a).unwrap().cmd else { panic!() };
+            std::fs::write(dir.join("manifest.jsonl"), "").unwrap();
+            Engine::new(r, script.to_string_lossy().into_owned())
+        };
+        let e = mk("on", true);
+        let t0 = Instant::now();
+        let _ = e.run_capture_once("auto", None);
+        let late_exit = t0.elapsed();
+        let t1 = Instant::now();
+        let _ = e.run_capture_once("auto", None);
+        let lingering = t1.elapsed();
+        let w = e.capture_stop.as_ref().unwrap().lock().unwrap().writers.clone();
+        assert_eq!(w.len(), 2);
+        // Exited 0.5 s after closing stdout, inside the grace: its own code, no kill.
+        assert_eq!(w[0]["writer"]["ended_by"], "self_exit");
+        assert_eq!(w[0]["writer"]["exit_code"], 3);
+        assert_eq!(w[0]["writer"]["kill_sent"], Value::Null);
+        assert_eq!(w[0]["writer"]["killed_by_qorcap"], false);
+        assert!(late_exit >= Duration::from_millis(400), "{late_exit:?}");
+        // Still running 2 s after closing stdout: killed, labelled stdout_closed, the kill's status not presented as its own.
+        assert_eq!(w[1]["writer"]["ended_by"], "qorcap_kill");
+        assert_eq!(w[1]["writer"]["kill_sent"], "stdout_closed");
+        assert_eq!(w[1]["writer"]["exit_code"], crate::capstop::UNKNOWN);
+        assert_eq!(w[1]["writer"]["killed_by_qorcap"], true);
+        assert!(lingering >= Duration::from_millis(1900) && lingering < Duration::from_secs(10), "{lingering:?}");
+        // Lane off: no grace (the old immediate kill), no record.
+        let off = mk("off", false);
+        let _ = off.run_capture_once("auto", None); // writer 0 exits by itself after 0.5 s
+        let t2 = Instant::now();
+        let _ = off.run_capture_once("auto", None);
+        assert!(t2.elapsed() < Duration::from_millis(1500), "lane off waits no grace: {:?}", t2.elapsed());
+        assert!(off.capture_stop.is_none());
+        assert!(!base.join("off").join(crate::capstop::FILE_NAME).exists());
+        // T2: a read error is not labelled as stdout closing.
+        assert_eq!(grace_kill_label(false), "stdout_closed");
+        assert_eq!(grace_kill_label(true), "read_error");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// R2: a capture stop record that no checkpoint binds (a failed stop write, a crash, a stale `state: open`
+    /// file) is reported as a warning, never an error, so bundles without one still pass.
+    #[test]
+    fn unbound_capture_stop_record_is_a_verify_bundle_warning_not_an_error() {
+        use clap::Parser;
+        let dir = std::env::temp_dir().join(format!("qorcap-capstop-unbound-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let d = dir.to_string_lossy().into_owned();
+        let a = vec!["q", "record", "--device", "testpattern", "--audio", "none", "--bundle", &d, "--no-controller"];
+        let crate::cli::Cmd::Record(r) = crate::cli::Cli::try_parse_from(a).unwrap().cmd else { panic!() };
+        std::fs::write(dir.join("manifest.jsonl"), "").unwrap();
+        let e = Engine::new(r, dir.join("no-such-ffmpeg").to_string_lossy().into_owned());
+        e.seal_and_wait_countersign(Duration::from_secs(1)).unwrap();
+        let clean = crate::bundle::verify(&dir).unwrap();
+        assert!(clean.errors.is_empty() && clean.warnings.is_empty(), "no record: nothing to report");
+        let open = crate::capstop::document("m", "open", None, &[], json!({"status": "PENDING"}));
+        std::fs::write(dir.join(crate::capstop::FILE_NAME), crate::capstop::render(&open)).unwrap();
+        let rep = crate::bundle::verify(&dir).unwrap();
+        assert!(rep.errors.is_empty(), "an old or unbound record is not an error: {:?}", rep.errors);
+        assert_eq!(rep.warnings.len(), 1, "{:?}", rep.warnings);
+        assert!(rep.warnings[0].contains("UNBOUND") && rep.warnings[0].contains("state: open"), "{:?}", rep.warnings);
+        std::fs::write(dir.join(crate::capstop::FILE_NAME), "not json").unwrap();
+        let rep = crate::bundle::verify(&dir).unwrap();
+        assert!(rep.errors.is_empty());
+        assert!(rep.warnings[0].contains("state: UNKNOWN"), "{:?}", rep.warnings);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
