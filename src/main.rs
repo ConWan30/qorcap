@@ -394,6 +394,21 @@ fn main() {
             sidecar("psn-names", bundle, python, vec!["--samples".to_string(), samples.to_string()], &ff)
         }
         Cmd::InputTest { secs } => input_test(secs),
+        Cmd::S2sCounted { input, out, session_id, config, seal_status, disposition, in_calibration_set, holdout_reused } => {
+            // Offline, read-only on the bundle. The report goes to --out only (refused inside the bundle).
+            let cfg = match config {
+                None => qorcap::s2s::Config::standby_a(),
+                Some(p) => match std::fs::read_to_string(&p).map_err(|e| e.to_string()).and_then(|t| serde_json::from_str(&t).map_err(|e| e.to_string())) {
+                    Ok(c) => c,
+                    Err(e) => { eprintln!("error: --config {p}: {e}"); std::process::exit(2); }
+                },
+            };
+            let meta = qorcap::s2s::SessionMeta { session_id, seal_status, disposition, in_calibration_set, holdout_reused };
+            match qorcap::s2s::run(std::path::Path::new(&input), std::path::Path::new(&out), &meta, &cfg) {
+                Ok(r) => { eprintln!("wrote {out}: status {} tier {}", r["status"], r["tier"]); 0 }
+                Err(e) => { eprintln!("error: {e}"); 2 }
+            }
+        }
         Cmd::AlignAb { dir, frames, no_video, rumble_echo, re_pair_tol_ms, re_max_lag_ms, re_quiet_ms, re_onset_threshold,
                        re_spike_threshold, re_spike_pct, re_mode, re_sweep, re_hist } => {
             // Prints both clocks. Does not write the receipt, the proof, or the hash chain.

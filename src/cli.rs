@@ -116,6 +116,34 @@ pub enum Cmd {
         #[arg(long)]
         secs: Option<u64>,
     },
+    /// Sight-to-shot Stage S1 (offline, read-only): S2 right-stick onset row -> S4 burst-first R2 edge
+    /// timing over "R2 press bursts", from inputs.jsonl only. Writes one JSON report to --out, which must
+    /// be outside the bundle folder. Default rule: the standby (A) config (PROVISIONAL, not frozen).
+    S2sCounted {
+        /// Bundle folder or its inputs.jsonl (read only)
+        input: String,
+        /// Report path; refused if it is inside the bundle folder
+        #[arg(long)]
+        out: String,
+        /// Session id (e.g. match-20261111-194037)
+        #[arg(long)]
+        session_id: String,
+        /// Rule config JSON (default: built-in standby (A), docs/s2s/threshold_A.standby.json)
+        #[arg(long)]
+        config: Option<String>,
+        /// rehashed_match | locked_not_rehashed | failed | missing (only rehashed_match can be COUNTED)
+        #[arg(long, default_value = "locked_not_rehashed")]
+        seal_status: String,
+        /// ok | UNKNOWN | VOID | FAIL
+        #[arg(long, default_value = "UNKNOWN")]
+        disposition: String,
+        /// Tuning session: no per-burst values are reported (R1), only the threshold-free burst count
+        #[arg(long)]
+        in_calibration_set: bool,
+        /// (A) triggered after held-out scoring: outputs are DESCRIPTIVE_ONLY_HOLDOUT_REUSED, never COUNTED
+        #[arg(long)]
+        holdout_reused: bool,
+    },
     /// Re-score a bundle's input-to-frame clock with frame_clock.jsonl and without it.
     /// Prints both. Does not write the receipt, the proof, or the hash chain.
     AlignAb {
@@ -489,6 +517,13 @@ mod tests {
         if let Cmd::Record(r) = Cli::try_parse_from(["qorcap", "record", "--frame-clock"]).unwrap().cmd { assert!(r.frame_clock); assert!(r.live_tap.is_none() && !r.practice_lane); } else { panic!() }
         if let Cmd::Record(r) = Cli::try_parse_from(["qorcap", "record", "--live-tap", "udp://127.0.0.1:1937", "--practice-lane", "--live-tap-every", "5"]).unwrap().cmd { assert_eq!(r.live_tap.as_deref(), Some("udp://127.0.0.1:1937")); assert!(r.practice_lane); assert_eq!(r.live_tap_every, Some(5)); } else { panic!() }
         assert!(matches!(Cli::try_parse_from(["qorcap", "align-ab", "b", "--no-video"]).unwrap().cmd, Cmd::AlignAb { no_video: true, frames: 15, rumble_echo: false, .. }));
+        match Cli::try_parse_from(["qorcap", "s2s-counted", "b", "--out", "o.json", "--session-id", "s"]).unwrap().cmd {
+            Cmd::S2sCounted { input, out, seal_status, disposition, in_calibration_set, holdout_reused, config, .. } => {
+                assert_eq!((input.as_str(), out.as_str(), seal_status.as_str(), disposition.as_str()), ("b", "o.json", "locked_not_rehashed", "UNKNOWN"));
+                assert!(!in_calibration_set && !holdout_reused && config.is_none());
+            }
+            _ => panic!(),
+        }
         assert!(matches!(Cli::try_parse_from(["qorcap", "align-ab", "b", "--rumble-echo"]).unwrap().cmd, Cmd::AlignAb { rumble_echo: true, .. }));
         match Cli::try_parse_from(["qorcap", "align-ab", "b", "--rumble-echo"]).unwrap().cmd {
             Cmd::AlignAb { re_pair_tol_ms, re_max_lag_ms, re_quiet_ms, re_onset_threshold, re_spike_threshold, re_spike_pct, re_mode, re_sweep, re_hist, .. } => {
