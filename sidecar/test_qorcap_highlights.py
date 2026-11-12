@@ -93,12 +93,13 @@ def test_burn_label_matches_the_evidence(tmp_path):
     assert "LOCKED SCORE" not in vf and "VERIFIED" not in vf
     # 720p panel geometry (k = height/360) stays the one the Windows build already draws
     assert "drawbox=x=20:y=20:w=660:h=116:color=0x081122@0.80:t=fill" in vf
-    assert "fontcolor=0xf0c95c" in vf
+    assert "fontcolor=0xffffff" in vf  # score: neutral white (was 0xf0c95c gold before t3228s12397)
     cap = hl.clip_caption("AWAY 0 - HOME 6   Q1 1:40", "lock #2 ab  receipt cd", 12.0, 8.0)
     assert cap.startswith("WEBVTT\n")
     assert "SCOREBUG LOCK AWAY 0 - HOME 6   Q1 1:40" in cap
     assert "scorebug read here" in cap
     assert "LOCKED SCORE" not in cap and "LOCKED " not in cap and "VERIFIED" not in cap
+    # The no-gold colour checks are in test_highlights_overlay_colors.py (runs on Windows too).
 
 
 def test_video_clock_maps_wall_to_seconds(tmp_path):

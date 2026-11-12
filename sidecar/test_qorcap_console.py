@@ -138,7 +138,7 @@ def test_short_console_keeps_the_pattern_and_the_seconds():
     assert "┌" not in packed
 
 
-def test_gold_is_only_the_referee_verified_card():
+def test_no_card_is_gold_not_even_a_referee_verified_one():
     def painted(card, level="truecolor"):
         grid = qc.layout_challenge(card, width=78, height=30, tick=1, now_ms=19_000)
         return qc.paint(grid, level)
@@ -148,7 +148,8 @@ def test_gold_is_only_the_referee_verified_card():
         assert GOLD not in blob
         assert "38;2" in blob
     verified = painted(qc.sample_card("pass", verified=True))
-    assert GOLD in verified
+    assert GOLD not in verified  # neutral since Con's card t3229s12405 (was gold)
+    assert "38;2;255;255;255" in verified
     assert "Referee verified." in qc.grid_text(qc.layout_challenge(
         qc.sample_card("pass", verified=True), width=78, height=30, tick=1, now_ms=19_000))
     none = painted(qc.sample_card("pass"), "none")
@@ -161,10 +162,10 @@ def test_gold_is_only_the_referee_verified_card():
     assert frame(qc.sample_card("pass")) == "cyan"
     assert frame(qc.sample_card("fail")) == "red"
     assert frame(qc.sample_card("expired")) == "mute"
-    assert frame(qc.sample_card("pass", verified=True)) == "gold"
+    assert frame(qc.sample_card("pass", verified=True)) == "hot"
 
 
-def test_dashboard_footer_uses_gold_only_when_verified():
+def test_dashboard_footer_is_never_gold():
     plain = qc.layout_dashboard(qc.sample_snap(), width=78, height=18, last=("game start", "pass", False))
     text = qc.grid_text(plain)
     assert "buttons on this pad" in text and "referee verified" not in text
@@ -172,7 +173,37 @@ def test_dashboard_footer_uses_gold_only_when_verified():
     assert "gold" not in colors
     verified = qc.layout_dashboard(qc.sample_snap(), width=78, height=18, last=("game start", "pass", True))
     assert "referee verified" in qc.grid_text(verified)
-    assert any(color == "gold" for row in verified for _, color in row)
+    assert all(color != "gold" for row in verified for _, color in row)  # neutral since t3229s12405
+    assert any(color == "hot" for row in verified for _, color in row)
+
+
+# The gold escape at each colour level the console can paint.
+_GOLD_ESC = {"truecolor": "38;2;255;194;61", "256": "38;5;220", "16": "\x1b[93m"}
+
+
+@pytest.mark.parametrize("level", ["truecolor", "256", "16"])
+def test_referee_verified_challenge_card_emits_no_gold_escape(level):
+    """Con's card t3229s12405: a referee-confirmed challenge is not a verified match, so it is never gold."""
+    gold = _GOLD_ESC[level]
+    assert gold in qc.paint_inline("x", "gold", level)  # the probe matches what gold paints at this level
+    card = qc.sample_card("pass", verified=True)
+    for tick in (0, 1, 2):
+        blob = qc.paint(qc.layout_challenge(card, width=78, height=30, tick=tick, now_ms=19_000), level)
+        assert gold not in blob, (level, tick)
+    for last in (("game start", "pass", True), ("game start", "pass", False), ("kickoff", "fail", False)):
+        dash = qc.paint(qc.layout_dashboard(qc.sample_snap(), width=78, height=18, last=last), level)
+        assert gold not in dash, (level, last)
+    assert qc.REFEREE_CHALLENGE_COLOR != "gold"
+
+
+@pytest.mark.parametrize("level,env", [("truecolor", {"COLORTERM": "truecolor"}), ("256", {"TERM": "xterm-256color"}),
+                                       ("16", {"QORCAP_COLOR": "16"})])
+def test_verified_match_banner_is_still_gold(level, env):
+    """Gold stays only where it marks a referee VERIFIED match."""
+    assert qc._color_level(env) == level
+    for msg in ("RESULT: VERIFIED", "  OFFICIAL RESULT: VERIFIED"):
+        assert _GOLD_ESC[level] in qc.tint_verified_banner(msg, env, Tty())
+    assert _GOLD_ESC[level] not in qc.tint_verified_banner("Challenge kickoff PASSED", env, Tty())
 
 
 def test_color_and_plain_policy():

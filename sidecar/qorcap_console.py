@@ -4,8 +4,10 @@ The capture agent, the HID reader, the referee protocol, and the receipt are unt
 This module paints the interactive console. It never writes a controller report, never
 writes a receipt, and never decides a referee result.
 
-Gold is drawn only when a caller sets ``referee_verified`` on a card. The live match
-path never sets it. Local button observation is labeled as a pad read. The words
+Gold is drawn only on a referee VERIFIED match banner (``tint_verified_banner``). A
+challenge card with ``referee_verified`` is drawn in neutral white (``REFEREE_CHALLENGE_COLOR``),
+not gold: a confirmed challenge is not a verified match (Con's card t3229s12405). The live
+match path never sets ``referee_verified``. Local button observation is labeled as a pad read. The words
 attested, attestation, and hardware-verified are not printed. A device row is not
 shown; if one is added later its strongest wording is tpm_claimed.
 
@@ -103,6 +105,10 @@ _BUTTON_COLOR = {
     "LEFT": "ink",
     "RIGHT": "ink",
 }
+
+# A referee-confirmed challenge card is neutral white, never gold. Gold marks only a
+# referee VERIFIED match (tint_verified_banner). Con's card t3229s12405.
+REFEREE_CHALLENGE_COLOR = "hot"
 
 _SPINNER = "|/-\\"
 _HOLD_S = 8.0
@@ -724,7 +730,7 @@ def layout_dashboard(snap: dict, *, width: int = 78, height: int = 24, tick: int
     if last:
         label, result, verified = last
         word = {"pass": "PASS", "fail": "FAIL", "expired": "EXPIRED"}.get(result, str(result).upper())
-        color = "gold" if verified else "cyan" if result == "pass" else "red" if result == "fail" else "mute"
+        color = REFEREE_CHALLENGE_COLOR if verified else "cyan" if result == "pass" else "red" if result == "fail" else "mute"
         tail = "referee verified" if verified else "buttons on this pad" if result == "pass" else "window closed"
         _put(grid, y, 4, _clip(f"last challenge   {label}   {word}   {tail}", width - 6), color)
         y += 2
@@ -779,7 +785,7 @@ def layout_challenge(card: ChallengeCard, *, width: int = 78, height: int = 36, 
         specs.append(("center", "At the line, before the snap. Then resume.", "ink"))
     else:
         note = "Referee verified." if card.referee_verified else card.note
-        specs.append(("center", _clip(note, width - 6), "gold" if card.referee_verified else "ink"))
+        specs.append(("center", _clip(note, width - 6), REFEREE_CHALLENGE_COLOR if card.referee_verified else "ink"))
     specs.append(("gap",))
     specs.append(("glyphs",))
     if card.result is None:
@@ -861,7 +867,7 @@ def press_feedback(card: ChallengeCard) -> tuple[str, str] | None:
 
 def _frame_color(card: ChallengeCard) -> str:
     if card.referee_verified:
-        return "gold"
+        return REFEREE_CHALLENGE_COLOR
     if card.result == "fail":
         return "red"
     if card.result == "expired":
@@ -871,7 +877,7 @@ def _frame_color(card: ChallengeCard) -> str:
 
 def _title_color(card: ChallengeCard) -> str:
     if card.referee_verified:
-        return "gold"
+        return REFEREE_CHALLENGE_COLOR
     if card.result == "pass":
         return "cyan"
     if card.result == "fail":

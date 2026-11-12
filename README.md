@@ -67,7 +67,7 @@ checkpoints at finalize time, stamping each with QorCap's recording time, and `r
 Opt out with `--no-auto-highlights`. You can still double-click **`Make Highlights`** (or run `qorcap highlights <bundle folder>`).
 For every **locked** score change (a `score_change` checkpoint in the signed hash chain whose
 evidence hash matches, normally inside `receipt.json`) it cuts about 8 s before to 4 s after (`--pre`/`--post`) and burns in a small panel
-titled **SCOREBUG LOCK** (the QorTime viewer's wording for a scorebug read), with the score in gold plus the lock and receipt hashes.
+titled **SCOREBUG LOCK** (the QorTime viewer's wording for a scorebug read), with the score in neutral white (never gold: a clip is cut before the referee rules) plus the lock and receipt hashes.
 The panel and the `.vtt` stay on **SCOREBUG LOCK** (`--no-burn` stream-copies and keeps those words only in the `.vtt`). They do not say
 **VERIFIED**. It writes `highlights/manifest.json` (`qorcap-highlights/v0`) linking each clip to its lock, the receipt SHA-256 and the
 hash-chained source segments. `qorcap highlights --check highlights/manifest.json` re-checks all of it. It never runs during recording: a fresh
