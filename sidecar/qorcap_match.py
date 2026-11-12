@@ -1274,6 +1274,8 @@ def audio_silence_hint(res: dict | None, *, when: str) -> list[str]:
     return ["",
             "  !" * 21,
             f"  WARNING: the capture card's audio is SILENT {when} ({lvl}).",
+            "  Recording audio is silent; check that console audio goes to HDMI, not only the headset.",
+            "  (Not fatal: recording continues, and audio is not used by the proof.)",
             *first,
             "  The match video will have NO GAME SOUND. Usual causes, in order:",
             "   1. PS5: Settings > Sound > Audio Output > Output Device = your TV/HDMI device, and",

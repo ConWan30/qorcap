@@ -45,6 +45,47 @@ pub fn capture_command(ffmpeg: &str) -> Command {
     c
 }
 
+/// One argument as it goes into qorcap.log. Capture arguments carry no secrets today; this keeps
+/// it that way if one is ever added: a `key=` / `token=` / `secret=` / `password=` value, a
+/// `scheme://user:pass@` login, a URL query string, and token-shaped words are replaced by `<redacted>`.
+pub fn redact_arg(a: &str) -> String {
+    let mut out = a.to_string();
+    // scheme://user:pass@host -> scheme://<redacted>@host
+    if let Some(i) = out.find("://") {
+        let rest = &out[i + 3..];
+        let end = rest.find('/').unwrap_or(rest.len());
+        if let Some(at) = rest[..end].rfind('@') {
+            out = format!("{}<redacted>{}", &out[..i + 3], &rest[at..]);
+        }
+        if let Some(q) = out.find('?') { out = format!("{}?<redacted>", &out[..q]); }
+    }
+    let lower = out.to_ascii_lowercase();
+    for k in ["key=", "token=", "secret=", "password=", "passwd=", "auth="] {
+        if let Some(i) = lower.find(k) {
+            let v0 = i + k.len();
+            let v1 = out[v0..].find(|c: char| c == ':' || c == '&' || c == ' ' || c == ',').map(|n| v0 + n).unwrap_or(out.len());
+            if v1 > v0 { out = format!("{}<redacted>{}", &out[..v0], &out[v1..]); }
+            break;
+        }
+    }
+    for p in ["ghp_", "gho_", "ghu_", "ghs_", "ghr_", "github_pat_", "sk_live_", "sk_test_"] {
+        while let Some(i) = out.find(p) {
+            let tail = &out[i..];
+            let n = tail.find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '-')).unwrap_or(tail.len());
+            out = format!("{}<redacted>{}", &out[..i], &tail[n..]);
+        }
+    }
+    out
+}
+
+/// The full ffmpeg command line for qorcap.log: program and every argument, in order, each one
+/// redacted (see `redact_arg`) and double-quoted when it has a space or is empty.
+pub fn argv_for_log(program: &str, args: &[String]) -> String {
+    std::iter::once(program.to_string()).chain(args.iter().cloned())
+        .map(|a| { let r = redact_arg(&a); if r.is_empty() || r.contains(' ') { format!("\"{r}\"") } else { r } })
+        .collect::<Vec<_>>().join(" ")
+}
+
 /// Parse `ffmpeg -list_devices true -f dshow -i dummy` stderr (old and new formats).
 pub fn parse_dshow_list(s: &str) -> Vec<Device> {
     let mut out: Vec<Device> = Vec::new();
@@ -426,6 +467,39 @@ dummy: Immediate exit requested"#;
         // Combined (one dshow graph) keeps the single 512M buffer.
         let spec = AudioSpec { name: "A".into(), alt: None, strategy: AudioStrategy::Combined };
         assert_eq!(capture_args_with(&r, "auto", Some(&spec), "s.jpg", None).join(" ").matches("-rtbufsize").count(), 1);
+    }
+    #[test]
+    fn capture_argv_log_has_every_audio_input_argument_in_order() {
+        use clap::Parser;
+        let c = crate::cli::Cli::try_parse_from(["q", "record", "--fps", "60"]).unwrap();
+        let crate::cli::Cmd::Record(mut r) = c.cmd else { panic!() };
+        r.device = "Elgato Game Capture Neo".into();
+        let name = "Elgato Game Capture Neo (Elgato Game Capture Neo)";
+        let spec = AudioSpec { name: name.into(), alt: None, strategy: AudioStrategy::Separate };
+        let a = capture_args_with(&r, "nv12", Some(&spec), "C:\\Q P\\snap.jpg", None);
+        let line = argv_for_log("C:\\QorCap\\ffmpeg.exe", &a);
+        // Video input, then the audio input with its own options before its -i, then the maps.
+        let want = "-f dshow -rtbufsize 512M -thread_queue_size 1024 -use_wallclock_as_timestamps 1 -video_size 1280x720 -framerate 60 \
+-pixel_format nv12 -i \"video=Elgato Game Capture Neo\" \
+-f dshow -rtbufsize 64M -thread_queue_size 1024 -use_wallclock_as_timestamps 1 -audio_buffer_size 50 \
+-i \"audio=Elgato Game Capture Neo (Elgato Game Capture Neo)\" -map 0:v -map 1:a ";
+        assert!(line.starts_with("C:\\QorCap\\ffmpeg.exe -hide_banner "), "{line}");
+        assert!(line.contains(want), "{line}");
+        assert!(line.ends_with("-y \"C:\\Q P\\snap.jpg\""), "{line}");
+        // Exactly one audio input, and it is input #1 (what -map 1:a and audio_check read).
+        assert_eq!(line.matches("-i \"audio=").count(), 1, "{line}");
+        assert_eq!(a.iter().filter(|x| x.as_str() == "-i").count(), 2);
+    }
+    #[test]
+    fn argv_log_redacts_secrets() {
+        assert_eq!(redact_arg("-map"), "-map");
+        assert_eq!(redact_arg("audio=Elgato Game Capture Neo (Elgato Game Capture Neo)"), "audio=Elgato Game Capture Neo (Elgato Game Capture Neo)");
+        assert_eq!(redact_arg("rtmp://live.example/app/stream?key=abc123"), "rtmp://live.example/app/stream?<redacted>");
+        assert_eq!(redact_arg("srt://user:hunter2@host:9000"), "srt://<redacted>@host:9000");
+        assert_eq!(redact_arg("drawtext=token=abc:x=1"), "drawtext=token=<redacted>:x=1");
+        assert_eq!(redact_arg("x ghp_ABCdef123456 y"), "x <redacted> y");
+        let line = argv_for_log("ffmpeg", &["-i".into(), "udp://127.0.0.1:1937?pkt_size=1316".into(), "".into()]);
+        assert_eq!(line, "ffmpeg -i udp://127.0.0.1:1937?<redacted> \"\"");
     }
     #[test]
     fn capture_command_runs_the_same_program() {
