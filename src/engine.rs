@@ -637,6 +637,8 @@ impl Engine {
             let why = stop_why.unwrap_or("shutdown");
             if let Some(r) = g.take() { finish(r); }
             drop(g);
+            // Practice live tap: final counters (skipped cue slots, queue and send drops) to qorcap.log.
+            self.live_tap.log_summary(why);
             // Start Match always passes --replay, so the old path left the supervisor running with no
             // recorder and never reached finish_stop. Any bundle recording ends here and writes the draft.
             if self.args.bundle.is_some() || self.exit_when_recording_ends.load(Ordering::Relaxed) {
@@ -887,7 +889,16 @@ impl Engine {
         };
         let _stop_publisher = StopPublisher { flag: stop_pub, handle: Some(publisher) };
         info!("opening \"{}\" format={input_format} audio={:?} ({:?}) {}x{}@{} enc={}", self.args.device, audio.map(|a| &a.name), audio.map(|a| a.strategy), self.args.res.0, self.args.res.1, self.args.fps, self.args.encoder);
-        let child = ffmpeg::command(&self.ffmpeg).args(&args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn();
+        // AboveNormal priority on Windows (no-op elsewhere). If that spawn fails, log it and start at
+        // normal priority with the same arguments: priority is never a reason not to record.
+        let child = match ffmpeg::capture_command(&self.ffmpeg).args(&args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn() {
+            Ok(c) => { if cfg!(windows) { info!("capture ffmpeg started at AboveNormal priority"); } Ok(c) }
+            Err(e) if cfg!(windows) => {
+                warn!("capture ffmpeg: could not start at AboveNormal priority ({e}); starting at normal priority");
+                ffmpeg::command(&self.ffmpeg).args(&args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()
+            }
+            Err(e) => Err(e),
+        };
         let mut child = match child { Ok(c) => c, Err(e) => { let m = format!("cannot start ffmpeg `{}`: {e}", self.ffmpeg); error!("{m}"); self.set_state("reopening", Some(m)); return (false, ffmpeg::Failure::Other); } };
         self.snap_pub.lock().unwrap_or_else(|e| e.into_inner()).mark_producer_started();
         let mut stdout = child.stdout.take().unwrap();

@@ -498,3 +498,109 @@ def test_committed_fixtures_splash_then_real_board_confirms_by_owner_row():
     assert not es.observe(ARMED + 400, read_end(splash), None, None, [], splash)
     assert es.observe(ARMED + 800, NOT_END, None, None, [], board)
     assert es.confirmed["path"] == "splash+owner_row"
+
+
+# --- match-20261111-183311: the stop note fired but cod_end_stop.json was never written ---------
+# save_tail rebound its own ``note`` helper to the stop-note string. tick() then called a string,
+# the TypeError left wait_and_countersign, and the record step after it never ran.
+
+def _save_tail_fn():
+    import ast
+    src = Path(qm.__file__).read_text(encoding="utf-8")
+    tree = ast.parse(src)
+    fns = [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "save_tail"]
+    assert len(fns) == 1
+    return src, fns[0]
+
+
+def test_save_tail_never_rebinds_its_note_helper():
+    import ast
+    _, fn = _save_tail_fn()
+    rebinds = []
+    for n in ast.walk(fn):
+        targets = []
+        if isinstance(n, ast.Assign):
+            targets = n.targets
+        elif isinstance(n, (ast.AugAssign, ast.AnnAssign)):
+            targets = [n.target]
+        for t in targets:
+            if isinstance(t, ast.Name) and t.id == "note":
+                rebinds.append(n.lineno)
+    assert rebinds == [], f"save_tail assigns to note at lines {rebinds}; tick() calls note(...)"
+
+
+def test_save_tail_writes_the_end_stop_file_before_shutdown():
+    import ast
+    src, fn = _save_tail_fn()
+    body = ast.get_source_segment(src, fn)
+    assert body.index("cod_end_stop_before_shutdown(") < body.index('api.post("/shutdown"')
+
+
+def test_wait_and_countersign_survives_a_failing_progress_tick(tmp_path):
+    class Proc:
+        returncode = 0
+
+        def __init__(self):
+            self.polls = 0
+
+        def poll(self):
+            self.polls += 1
+            return None if self.polls < 4 else 0
+
+        def kill(self):
+            raise AssertionError("must not time out")
+
+    ticks = []
+
+    def bad_tick():
+        ticks.append(1)
+        note = "stop note text"
+        note("  final checkpoints: countersigning ...")  # the 183311 failure: a str called as note()
+
+    cs = NS(signed=[], offer=lambda c: False)
+    qm.wait_and_countersign(Proc(), tmp_path / "checkpoints.jsonl", cs, timeout=5, poll_s=0.0, on_tick=bad_tick)
+    assert len(ticks) == 3
+
+
+def _fired_state():
+    es = armed_watcher(SUSTAIN, clock=Clock())
+    feed(es, ARMED, 500, [word("defeat")] * 8, owner=row())
+    assert es.confirmed is not None
+    return {"cod_end_stop": es, "cod_end_stop_fired": True, "tail_stop_wall_ms": 1_762_908_393_800}
+
+
+def test_end_stop_file_is_written_when_the_stop_note_fires(tmp_path):
+    st = _fired_state()
+    said = []
+    note = qm.cod_end_stop_before_shutdown(st, tmp_path, "post_final_tail", say=said.append)
+    assert note and "cod end screen DEFEAT" in note and "then post_final_tail" in note
+    doc = json.loads((tmp_path / ES.FILE_NAME).read_text())
+    assert doc["auto_stopped"] is True and doc["stop_reason"] == "post_final_tail"
+    assert doc["stop_wall_ms"] == 1_762_908_393_800 and doc["confirmed"]["result"] == "DEFEAT"
+    assert not list(tmp_path.glob("*.tmp")) and said == []
+    # The later write after the countersign replaces it atomically with the same fields.
+    st["cod_end_stop"].record(tmp_path, stop_reason="post_final_tail", stop_wall_ms=1_762_908_393_800, fired=True)
+    assert json.loads((tmp_path / ES.FILE_NAME).read_text()) == doc
+    assert not list(tmp_path.glob("*.tmp"))
+
+
+def test_end_stop_file_not_written_when_the_auto_stop_did_not_fire(tmp_path):
+    st = _fired_state()
+    st["cod_end_stop_fired"] = False
+    assert qm.cod_end_stop_before_shutdown(st, tmp_path, "enter") is None
+    assert not (tmp_path / ES.FILE_NAME).exists()
+    assert qm.cod_end_stop_before_shutdown({}, tmp_path, "enter") is None
+
+
+def test_end_stop_write_failure_is_said_and_the_note_still_returned(tmp_path):
+    st = _fired_state()
+    es = st["cod_end_stop"]
+
+    def boom(*a, **k):
+        raise OSError("disk full")
+
+    es.record = boom
+    said = []
+    note = qm.cod_end_stop_before_shutdown(st, tmp_path, "final", say=said.append)
+    assert note and "then final" in note
+    assert said and "cod_end_stop.json was not written" in said[0]

@@ -460,4 +460,8 @@ class EndStop:
                 "splash_candidates_cancelled": dict(self.candidates_cancelled),
                 "owner_reads_in_candidate": self.owner_reads_attempted,
             }
-        (bundle / FILE_NAME).write_text(json.dumps(doc, indent=2) + "\n", encoding="utf-8")
+        # Atomic: a reader never sees a half-written file, and a second write replaces the first.
+        path = bundle / FILE_NAME
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(json.dumps(doc, indent=2) + "\n", encoding="utf-8")
+        os.replace(tmp, path)
