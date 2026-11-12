@@ -17,8 +17,8 @@ checkpoint hash is inside the signed ``receipt.json`` are marked ``in_receipt``.
 not inside the receipt signature). A lock that a later lock contradicts (a side goes down) is skipped as a misread.
 
 Each clip is re-encoded with a small burned-in overlay. The panel title is ``SCOREBUG LOCK`` (the QorTime viewer's
-wording for a scorebug read): the score in gold, then the lock hash and the receipt hash. A ``.vtt`` sidecar carries
-the same words. ``LOCKED SCORE`` and ``VERIFIED`` stay off the picture. Those belong to a referee-verified receipt, and
+wording for a scorebug read): the score in neutral white (``SCORE_COLOR``), then the lock hash and the receipt hash. A ``.vtt`` sidecar carries
+the same words. ``LOCKED SCORE``, ``VERIFIED`` and gold stay off the picture. Those belong to a referee-verified receipt, and
 this tool does not know that verdict when it cuts the clip (a local capture key is self-attested). ``manifest.json``
 (schema ``qorcap-highlights/v0``) links every clip to its lock, the receipt's SHA-256 and the hash-chained source
 segments that cover the window, so anyone can check it. A re-encoded clip cannot be byte-matched to the source; what is
@@ -409,8 +409,13 @@ def probe_height(ffmpeg: str, src: Path) -> int:
         return 720
 
 
+# Neutral white, never gold. Gold is reserved for a referee-verified result, and a clip is cut before the referee
+# rules (Con's card t3228s12397; QorProof P1). The old 0xf0c95c gold was in the overlay since #36.
+SCORE_COLOR = "0xffffff"
+
+
 def overlay_filter(score_txt: str, meta_txt: str, workdir: Path, stem: str, font: str | None, height: int = 720) -> str:
-    """Small navy glass panel at the TOP-left (the game's own scorebug at the bottom stays visible), score in gold.
+    """Small navy glass panel at the TOP-left (the game's own scorebug at the bottom stays visible), score in white.
 
     The aqua title is ``BURN_LABEL`` (``SCOREBUG LOCK``). It is a scorebug read committed into the checkpoint
     chain, not a referee-verified result.
@@ -423,7 +428,7 @@ def overlay_filter(score_txt: str, meta_txt: str, workdir: Path, stem: str, font
     return (f"drawbox=x={x}:y={y}:w={w}:h={h}:color=0x081122@0.80:t=fill,"
             f"drawbox=x={x}:y={y}:w={max(2, int(2 * k))}:h={h}:color=0x3fe0d0@0.95:t=fill,"
             f"drawtext=text='{BURN_LABEL}'{ff}:fontsize={int(9 * k)}:fontcolor=0x3fe0d0:x={x + int(9 * k)}:y={y + int(6 * k)},"
-            f"drawtext=textfile='{_esc(str(workdir / (stem + '.score.txt')))}'{ff}:fontsize={int(18 * k)}:fontcolor=0xf0c95c"
+            f"drawtext=textfile='{_esc(str(workdir / (stem + '.score.txt')))}'{ff}:fontsize={int(18 * k)}:fontcolor={SCORE_COLOR}"
             f":x={x + int(9 * k)}:y={y + int(18 * k)},"
             f"drawtext=textfile='{_esc(str(workdir / (stem + '.meta.txt')))}'{ff}:fontsize={int(8 * k)}:fontcolor=0xb8c7da"
             f":x={x + int(9 * k)}:y={y + int(43 * k)}")

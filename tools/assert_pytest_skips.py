@@ -64,6 +64,7 @@ WINDOWS_SKIP_REASONS = {
 LINUX_FILES = (
     "sidecar/test_pairing.py",
     "sidecar/test_qorcap_highlights.py",
+    "sidecar/test_highlights_overlay_colors.py",
     "sidecar/test_auto_highlights.py",
     "sidecar/test_highlights_frame_rate.py",
     "sidecar/test_final_screen_pause.py",
@@ -134,6 +135,7 @@ LINUX_FILES = (
 )
 WINDOWS_FILES = (
     "sidecar/test_pairing.py",
+    "sidecar/test_highlights_overlay_colors.py",
     "sidecar/test_auto_highlights.py",
     "sidecar/test_highlights_frame_rate.py",
     "sidecar/test_final_screen_pause.py",
@@ -207,8 +209,8 @@ WINDOWS_FILES = (
 # Collect-only of these lists after the tail tests in sidecar/test_post_final_tail.py.
 # Main e00d374, including the guard tests, collected 596 linux / 578 windows.
 # Re-collect after any list or test change.
-LINUX_MIN_COLLECTED = 976
-WINDOWS_MIN_COLLECTED = 957
+LINUX_MIN_COLLECTED = 986
+WINDOWS_MIN_COLLECTED = 967
 
 # Absent from both sidecar suites. A reason is required; whitespace does not count.
 EXCLUDED_TEST_FILES = {
