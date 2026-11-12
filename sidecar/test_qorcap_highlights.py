@@ -93,12 +93,13 @@ def test_burn_label_matches_the_evidence(tmp_path):
     assert "LOCKED SCORE" not in vf and "VERIFIED" not in vf
     # 720p panel geometry (k = height/360) stays the one the Windows build already draws
     assert "drawbox=x=20:y=20:w=660:h=116:color=0x081122@0.80:t=fill" in vf
-    assert "fontcolor=0xf0c95c" in vf
+    assert "fontcolor=0xffffff" in vf  # score: neutral white (was 0xf0c95c gold before t3228s12397)
     cap = hl.clip_caption("AWAY 0 - HOME 6   Q1 1:40", "lock #2 ab  receipt cd", 12.0, 8.0)
     assert cap.startswith("WEBVTT\n")
     assert "SCOREBUG LOCK AWAY 0 - HOME 6   Q1 1:40" in cap
     assert "scorebug read here" in cap
     assert "LOCKED SCORE" not in cap and "LOCKED " not in cap and "VERIFIED" not in cap
+    # The no-gold colour checks are in test_highlights_overlay_colors.py (runs on Windows too).
 
 
 def test_video_clock_maps_wall_to_seconds(tmp_path):
@@ -127,3 +128,27 @@ def test_cuts_clips_and_manifest_checks(tmp_path, burn):
     with open(b / "highlights" / c["file"], "ab") as f:
         f.write(b"x")
     assert any("clip sha256" in e for e in hl.check_manifest(b / "highlights" / "manifest.json"))
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="needs ffmpeg")
+def test_sixty_fps_recording_cuts_the_right_window(tmp_path):
+    # A real 60 fps file: the manifest frame counter runs twice as fast, so the pre-fix 30 fps cutter
+    # started this clip at 32 s instead of 12 s. The measured rate (ffprobe r_frame_rate) puts it back.
+    b = _bundle(tmp_path, [(500, 0, 0), (20_000, 0, 6)])
+    rows = hl.read_jsonl(b / "manifest.jsonl")
+    for r in rows:
+        r["frames"] *= 2
+    (b / "manifest.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
+    subprocess.run(["ffmpeg", "-loglevel", "error", "-y", "-f", "lavfi", "-i", "testsrc=size=320x180:rate=60:duration=30",
+                    "-c:v", "libx264", "-pix_fmt", "yuv420p", str(b / "video.mp4")], check=True)
+    man = hl.make_highlights(b, burn=False)
+    assert len(man["clips"]) == 1, man["skipped"]
+    c = man["clips"][0]
+    assert c["source"]["start_s"] == 12.0 and c["source"]["end_s"] == 24.0
+    assert c["source"]["frame_rate"] == "60/1"
+    probe = shutil.which("ffprobe")
+    if probe:
+        d = subprocess.run([probe, "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0",
+                            str(b / "highlights" / c["file"])], capture_output=True, text=True, check=True)
+        assert 11.0 < float(d.stdout.strip()) < 13.0
+    assert hl.check_manifest(b / "highlights" / "manifest.json") == []
