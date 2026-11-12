@@ -22,7 +22,10 @@
 //! Output is only `rumble_echo.json`, written by `qorcap align-ab DIR --rumble-echo`. It is not in the
 //! hash chain, the receipt, or the input proof. Its status is `ok`, `partial` (disagrees with the press
 //! offset by more than 100 ms), or `unscorable`. It can never raise anything and never fails a bundle.
-use crate::align::{Energy, FileClock, FPS};
+use crate::align::{Energy, FileClock};
+/// Lag histogram bin width: 1000/30 ms ("33 ms bins"). A display unit, unchanged by the 60 fps
+/// align fix; it is not the video rate (tracks carry their own rate, see `align::Energy::fps`).
+const FPS: f64 = crate::align::REFERENCE_FPS;
 use crate::frameclock::FrameStamp;
 use serde_json::{json, Value};
 
@@ -364,8 +367,8 @@ mod tests {
             hap.push(json!({"type": "haptic", "t_us": (g(f as f64) * 1000.0).round() as u64 + 200_000, "confidence": 200, "confidence_label": "low"}));
             put(f + 50 + (i * 17) % 23); // unrelated visual spike
         }
-        let clocks = vec![FileClock { file: "video.mp4".into(), start_ms: lat, ms_per_frame: mpf, end_ms: 1e9, fitted: true }];
-        (vec![Energy { e }], clocks, stamps, hap)
+        let clocks = vec![FileClock { file: "video.mp4".into(), start_ms: lat, ms_per_frame: mpf, end_ms: 1e9, fitted: true, fps: FPS }];
+        (vec![Energy::new(e, FPS)], clocks, stamps, hap)
     }
 
     #[test]

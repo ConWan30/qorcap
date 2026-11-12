@@ -29,8 +29,14 @@ use serde_json::{json, Value};
 use std::io::Read;
 use std::process::{Command, Stdio};
 
-pub const FPS: f64 = 30.0;
-/// Response window length in frames (window = frames 3 .. 3+n+2 after the press).
+/// The rate every frame-count constant in this file was written at (PRE, A0, SEARCH, STEP, MEAS_*,
+/// the 2-frame energy span and `DEFAULT_N_FRAMES`). It is a unit, not an assumption about a video:
+/// each video is decoded at its own rate ([`probe_rate`], else the frame clock's PTS step), and every
+/// count is scaled by `fps / REFERENCE_FPS` so it keeps its millisecond meaning. At a genuine 30/1
+/// stream the scale is exactly 1 and the result is the same as before this change. If the rate is
+/// unknown the file is not decoded and is not scored (UNMEASURED); no rate is assumed.
+pub const REFERENCE_FPS: f64 = 30.0;
+/// Response window length in frames at [`REFERENCE_FPS`] (window = frames 3 .. 3+n+2 after the press).
 pub const DEFAULT_N_FRAMES: usize = 15;
 const W: usize = 96; const H: usize = 54;
 const PRE: usize = 20;          // baseline frames before the press
@@ -56,35 +62,165 @@ const CHANCE_SPAN_US: u64 = 5_000_000;
 const CHANCE_CLEAR_US: u64 = 700_000;
 pub const MAX_EVENTS: usize = 5000;
 
-/// Motion energy per frame for one video file (index = frame number at `FPS`).
+/// Motion energy per frame for one video file (index = the file's own frame number at `fps`).
+/// `fps` is 0.0 for an empty track (rate UNMEASURED or not decoded).
 #[derive(Debug, Clone, Default)]
-pub struct Energy { pub e: Vec<f32> }
+pub struct Energy { pub e: Vec<f32>, pub fps: f64 }
 
-/// One press tested against the energy track: Some(lag frames) on a match, None if not tested/static.
+impl Energy {
+    pub fn new(e: Vec<f32>, fps: f64) -> Self { Energy { e, fps } }
+}
+
+/// A stream's own frame rate as a rational (`r_frame_rate`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Rate { pub num: u64, pub den: u64 }
+
+impl Rate {
+    pub fn fps(&self) -> f64 { self.num as f64 / self.den as f64 }
+    /// ffmpeg filter form, e.g. `60/1`, `30000/1001`.
+    pub fn filter(&self) -> String { format!("{}/{}", self.num, self.den) }
+    fn valid(&self) -> bool { self.num > 0 && self.den > 0 && (1.0..=1000.0).contains(&self.fps()) }
+}
+
+/// Frame-count constants at one video rate. `Grid::at(30.0)` is exactly the pre-0.3.44 constant set.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Grid { pub fps: f64, pub pre: usize, pub a0: usize, pub search: i64, pub step: i64, pub meas_min: i64, pub meas_max: i64, pub span: usize }
+
+fn scale(frames_at_ref: f64, fps: f64) -> f64 { (frames_at_ref * fps / REFERENCE_FPS).round() }
+
+impl Grid {
+    pub fn at(fps: f64) -> Grid {
+        Grid {
+            fps,
+            pre: (scale(PRE as f64, fps) as usize).max(1),
+            a0: scale(A0 as f64, fps) as usize,
+            search: scale(SEARCH as f64, fps) as i64,
+            step: (scale(STEP as f64, fps) as i64).max(1),
+            meas_min: scale(MEAS_MIN_FRAMES as f64, fps) as i64,
+            meas_max: scale(MEAS_MAX_FRAMES as f64, fps) as i64,
+            span: (scale(2.0, fps) as usize).max(1),
+        }
+    }
+    /// The response window `n` (given in frames at REFERENCE_FPS) at this rate.
+    pub fn window(&self, n: usize) -> usize { scale(n as f64, self.fps) as usize }
+    pub fn ms(&self, frames: f64) -> i64 { (frames * 1000.0 / self.fps).round() as i64 }
+}
+
+/// One press tested against the energy track at REFERENCE_FPS: Some(lag frames) on a match, None if not tested/static.
 pub fn press_response(e: &[f32], k: i64, n: usize) -> Option<Option<usize>> {
-    let b = A0 + n + 2;
-    if k < PRE as i64 || k as usize + b >= e.len() { return None; }
+    press_response_at(e, k, n, &Grid::at(REFERENCE_FPS))
+}
+
+/// [`press_response`] on a track at `g.fps`. `n` is the window at REFERENCE_FPS; it is scaled here.
+pub fn press_response_at(e: &[f32], k: i64, n: usize, g: &Grid) -> Option<Option<usize>> {
+    let (pre_n, a0) = (g.pre, g.a0);
+    let b = a0 + g.window(n) + g.span;
+    if k < pre_n as i64 || k as usize + b >= e.len() { return None; }
     let k = k as usize;
-    let mut pre: Vec<f32> = e[k - PRE..k].to_vec();
+    let mut pre: Vec<f32> = e[k - pre_n..k].to_vec();
     pre.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let base = pre[pre.len() / 2];
     if base >= STATIC_MAX { return None; }
     let thr = RATIO * (base + EPS);
-    Some((A0..b).find(|&j| e[k + j] > thr))
+    Some((a0..b).find(|&j| e[k + j] > thr))
 }
 
-/// Energy from consecutive gray frames: 2-frame mean absolute difference.
+/// Energy from consecutive gray frames: 2-frame mean absolute difference (REFERENCE_FPS span).
 pub fn energy_from_frames(frames: &[&[u8]]) -> Vec<f32> {
     let d: Vec<f32> = std::iter::once(0.0).chain(frames.windows(2).map(|p| {
         p[0].iter().zip(p[1]).map(|(a, b)| (*a as i32 - *b as i32).unsigned_abs()).sum::<u32>() as f32 / p[0].len() as f32
     })).collect();
-    (0..d.len()).map(|i| d[i] + if i > 0 { d[i - 1] } else { 0.0 }).collect()
+    energy_from_diffs(&d, 2)
 }
 
-/// Decode a whole file once at 96x54 gray, streaming (constant memory).
-pub fn decode_energy(ffmpeg: &str, file: &str) -> Result<Energy, String> {
+/// Sum of the last `span` per-frame differences. `span` = 2 at 30 fps and 4 at 60 fps, so the energy
+/// always covers ~67 ms and STATIC_MAX / RATIO keep their meaning. `span == 2` is bit-identical to the
+/// pre-0.3.44 `d[i] + d[i - 1]`.
+pub fn energy_from_diffs(d: &[f32], span: usize) -> Vec<f32> {
+    (0..d.len()).map(|i| {
+        let mut acc = d[i];
+        for j in 1..span.max(1) { if i >= j { acc += d[i - j]; } else { acc += 0.0; } }
+        acc
+    }).collect()
+}
+
+/// The video stream's own `r_frame_rate`: ffprobe beside `ffmpeg` if there is one, else the
+/// `tbr` field of `ffmpeg -i`. Err when neither gives a rate (the caller reports UNMEASURED).
+pub fn probe_rate(ffmpeg: &str, file: &str) -> Result<Rate, String> {
+    let probe = {
+        let p = std::path::Path::new(ffmpeg);
+        let name = p.file_name().map(|n| n.to_string_lossy().replace("ffmpeg", "ffprobe")).unwrap_or_else(|| "ffprobe".into());
+        p.with_file_name(name)
+    };
+    if let Ok(o) = crate::ffmpeg::command(&probe.to_string_lossy()).args(["-v", "error", "-select_streams", "v:0", "-show_entries", "stream=r_frame_rate", "-of", "csv=p=0", file])
+        .stdin(Stdio::null()).stderr(Stdio::null()).output() {
+        if o.status.success() {
+            if let Some(r) = parse_rational(String::from_utf8_lossy(&o.stdout).trim()) { return Ok(r); }
+        }
+    }
+    let o = crate::ffmpeg::command(ffmpeg).args(["-hide_banner", "-i", file]).stdin(Stdio::null()).stdout(Stdio::null()).output()
+        .map_err(|e| format!("ffmpeg: {e}"))?;
+    parse_banner_rate(&String::from_utf8_lossy(&o.stderr)).ok_or_else(|| "frame rate UNMEASURED: no r_frame_rate from ffprobe and no tbr in ffmpeg -i".into())
+}
+
+/// `60/1`, `30000/1001`.
+pub fn parse_rational(s: &str) -> Option<Rate> {
+    let (a, b) = s.split_once('/')?;
+    let r = Rate { num: a.trim().parse().ok()?, den: b.trim().parse().ok()? };
+    r.valid().then_some(r)
+}
+
+/// First video stream line of `ffmpeg -i`: `..., 60 fps, 60 tbr, 90k tbn` -> 60/1. `29.97 tbr` -> 30000/1001.
+pub fn parse_banner_rate(stderr: &str) -> Option<Rate> {
+    let line = stderr.lines().find(|l| l.contains("Stream #") && l.contains("Video:"))?;
+    let toks: Vec<&str> = line.split([',', ' ']).filter(|t| !t.is_empty()).collect();
+    let i = toks.iter().position(|t| *t == "tbr").or_else(|| toks.iter().position(|t| *t == "fps"))?;
+    let raw = toks.get(i.checked_sub(1)?)?;
+    let v: f64 = if let Some(k) = raw.strip_suffix('k') { k.parse::<f64>().ok()? * 1000.0 } else { raw.parse().ok()? };
+    if v <= 0.0 { return None; }
+    let r = if (v - v.round()).abs() < 1e-6 { Rate { num: v.round() as u64, den: 1 } }
+        else if ((v * 1.001) - (v * 1.001).round()).abs() < 0.01 { Rate { num: (v * 1.001).round() as u64 * 1000, den: 1001 } }
+        else { Rate { num: (v * 100.0).round() as u64, den: 100 } };
+    r.valid().then_some(r)
+}
+
+/// Rate of `file` from its frame_clock.jsonl rows: 90000 / the modal PTS step between consecutive
+/// frames. None with fewer than 10 steps or no positive step.
+pub fn frame_clock_rate(stamps: &[FrameStamp], file: &str) -> Option<Rate> {
+    let mine: Vec<&FrameStamp> = stamps.iter().filter(|s| s.file == file).collect();
+    let mut counts: std::collections::BTreeMap<u64, usize> = Default::default();
+    for w in mine.windows(2) {
+        if w[1].frame == w[0].frame + 1 && w[1].pts_90k > w[0].pts_90k { *counts.entry(w[1].pts_90k - w[0].pts_90k).or_default() += 1; }
+    }
+    if counts.values().sum::<usize>() < 10 { return None; }
+    let (&step, _) = counts.iter().max_by_key(|(k, v)| (**v, std::cmp::Reverse(**k)))?;
+    let g = gcd(90_000, step);
+    let r = Rate { num: 90_000 / g, den: step / g };
+    r.valid().then_some(r)
+}
+
+fn gcd(a: u64, b: u64) -> u64 { if b == 0 { a } else { gcd(b, a % b) } }
+
+/// The rate a file is analysed at. Probe first, frame clock second; if both exist they must agree
+/// within 1 %, otherwise Err (fail closed). Neither -> Err (UNMEASURED).
+pub fn file_rate(ffmpeg: Option<&str>, path: Option<&str>, file: &str, stamps: &[FrameStamp]) -> Result<Rate, String> {
+    let probed = match (ffmpeg, path) { (Some(ff), Some(p)) => Some(probe_rate(ff, p)), _ => None };
+    let fc = frame_clock_rate(stamps, file);
+    match (probed, fc) {
+        (Some(Ok(p)), Some(f)) if (p.fps() / f.fps() - 1.0).abs() > 0.01 =>
+            Err(format!("frame rate UNMEASURED: stream says {} but frame_clock PTS step says {}", p.filter(), f.filter())),
+        (Some(Ok(p)), _) => Ok(p),
+        (_, Some(f)) => Ok(f),
+        (Some(Err(e)), None) => Err(e),
+        (None, None) => Err("frame rate UNMEASURED: no ffmpeg probe and no frame_clock rows for this file".into()),
+    }
+}
+
+/// Decode a whole file once at 96x54 gray, streaming (constant memory), at the stream's own `rate`.
+pub fn decode_energy(ffmpeg: &str, file: &str, rate: Rate) -> Result<Energy, String> {
+    let g = Grid::at(rate.fps());
     let mut child = Command::new(ffmpeg).args(["-v", "error", "-threads", "0", "-i", file, "-an",
-        "-vf", &format!("fps={FPS},scale={W}:{H}:flags=fast_bilinear,format=gray"), "-f", "rawvideo", "-"])
+        "-vf", &format!("fps={},scale={W}:{H}:flags=fast_bilinear,format=gray", rate.filter()), "-f", "rawvideo", "-"])
         .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().map_err(|e| format!("ffmpeg: {e}"))?;
     let mut out = child.stdout.take().unwrap();
     let (mut prev, mut cur) = (vec![0u8; W * H], vec![0u8; W * H]);
@@ -97,8 +233,8 @@ pub fn decode_energy(ffmpeg: &str, file: &str) -> Result<Energy, String> {
         std::mem::swap(&mut prev, &mut cur);
     }
     let _ = child.wait();
-    if d.len() < 2 * PRE { return Err("too few frames decoded".into()); }
-    Ok(Energy { e: (0..d.len()).map(|i| d[i] + if i > 0 { d[i - 1] } else { 0.0 }).collect() })
+    if d.len() < 2 * g.pre { return Err("too few frames decoded".into()); }
+    Ok(Energy { e: energy_from_diffs(&d, g.span), fps: rate.fps() })
 }
 
 /// Key presses (rising edges of KEY_BUTTONS) in mono microseconds.
@@ -140,10 +276,16 @@ pub fn chance_times(presses: &[u64], all_presses: &[u64]) -> Vec<u64> {
 }
 
 /// Video file -> mono_ms of frame 0 and ms per frame, from the manifest's media segments.
+/// `fps` is the file's own rate (0.0 = UNMEASURED: the clock is not used to place any press).
 #[derive(Debug, Clone, PartialEq)]
-pub struct FileClock { pub file: String, pub start_ms: f64, pub ms_per_frame: f64, pub end_ms: f64, pub fitted: bool }
+pub struct FileClock { pub file: String, pub start_ms: f64, pub ms_per_frame: f64, pub end_ms: f64, pub fitted: bool, pub fps: f64 }
 
-pub fn file_clocks(manifest: &[Value]) -> Vec<FileClock> {
+impl FileClock {
+    fn usable(&self) -> bool { self.fps > 0.0 && self.ms_per_frame > 0.0 }
+}
+
+/// Per-file clocks. `rate(file)` is the file's own frame rate; None -> that file's clock is UNMEASURED.
+pub fn file_clocks(manifest: &[Value], rate: &dyn Fn(&str) -> Option<f64>) -> Vec<FileClock> {
     let mut out: Vec<FileClock> = vec![];
     let segs: Vec<&Value> = manifest.iter().filter(|m| m["type"] == "segment").collect();
     let mut files: Vec<String> = vec![];
@@ -155,8 +297,12 @@ pub fn file_clocks(manifest: &[Value]) -> Vec<FileClock> {
         let init = mine.iter().find(|s| s["kind"] == "init").and_then(|s| s["mono_ms"].as_f64())
             .or_else(|| mine.first().and_then(|s| s["mono_ms"].as_f64())).unwrap_or(0.0);
         let end = mine.iter().filter_map(|s| s["mono_ms"].as_f64()).fold(init, f64::max);
-        let nominal = 1000.0 / FPS;
-        let fit = if pts.len() >= 5 && pts.last().unwrap().0 - pts[0].0 >= 10.0 * FPS {
+        let Some(fps) = rate(&f).filter(|r| *r > 0.0) else {
+            out.push(FileClock { file: f, start_ms: init, ms_per_frame: 0.0, end_ms: end, fitted: false, fps: 0.0 });
+            continue;
+        };
+        let nominal = 1000.0 / fps;
+        let fit = if pts.len() >= 5 && pts.last().unwrap().0 - pts[0].0 >= 10.0 * fps {
             let n = pts.len() as f64;
             let (mx, my) = (pts.iter().map(|p| p.0).sum::<f64>() / n, pts.iter().map(|p| p.1).sum::<f64>() / n);
             let sxy: f64 = pts.iter().map(|p| (p.0 - mx) * (p.1 - my)).sum();
@@ -167,7 +313,7 @@ pub fn file_clocks(manifest: &[Value]) -> Vec<FileClock> {
             Some((my - slope * mx, slope))
         } else { None };
         let (start, mpf, fitted) = match fit { Some((s, m)) => (s, m, true), None => (init, nominal, false) };
-        out.push(FileClock { file: f, start_ms: start, ms_per_frame: mpf, end_ms: end, fitted });
+        out.push(FileClock { file: f, start_ms: start, ms_per_frame: mpf, end_ms: end, fitted, fps });
     }
     out
 }
@@ -175,6 +321,7 @@ pub fn file_clocks(manifest: &[Value]) -> Vec<FileClock> {
 fn locate(clocks: &[FileClock], t_us: u64) -> Option<(usize, i64)> {
     let t = t_us as f64 / 1000.0;
     let i = clocks.iter().rposition(|c| c.start_ms <= t + 3000.0)?;
+    if !clocks[i].usable() { return None; }
     Some((i, ((t - clocks[i].start_ms) / clocks[i].ms_per_frame).round() as i64))
 }
 
@@ -188,7 +335,7 @@ pub fn measured_locate(clocks: &[FileClock], stamps: &[FrameStamp], t_us: u64) -
         let Some(s) = stamps.get(j) else { continue };
         let d = s.t_mono_us.abs_diff(t_us);
         if d > frameclock::MEASURED_MAX_GAP_US { continue; }
-        let Some(ci) = clocks.iter().position(|c| c.file == s.file) else { continue; };
+        let Some(ci) = clocks.iter().position(|c| c.file == s.file && c.usable()) else { continue; };
         if best.as_ref().map(|(bd, _, _)| d < *bd).unwrap_or(true) { best = Some((d, ci, s.frame)); }
     }
     best.map(|(_, ci, fr)| (ci, fr))
@@ -202,26 +349,26 @@ fn locate_frame(clocks: &[FileClock], stamps: &[FrameStamp], t_us: u64) -> Optio
 /// Score a set of event times at offset `off` frames: (tested, matched, lags of matches).
 /// With stamps, only presses that have a stamp within 500 ms are scored: mixing the measured clock with the
 /// manifest fit (which sits ~0.5 s away from it on a real card) inside one offset search smears the offset.
-fn score(tracks: &[Energy], clocks: &[FileClock], stamps: &[FrameStamp], ts: &[u64], off: i64, n: usize) -> (usize, usize, Vec<usize>) {
+fn score(tracks: &[Energy], clocks: &[FileClock], stamps: &[FrameStamp], ts: &[u64], off: i64, n: usize, g: &Grid) -> (usize, usize, Vec<usize>) {
     let (mut t, mut m, mut lags) = (0, 0, vec![]);
     for &x in ts {
         let loc = if stamps.is_empty() { locate(clocks, x) } else { measured_locate(clocks, stamps, x) };
         let Some((i, k)) = loc else { continue };
         let Some(tr) = tracks.get(i) else { continue };
         if tr.e.is_empty() { continue; }
-        if let Some(r) = press_response(&tr.e, k + off, n) { t += 1; if let Some(l) = r { m += 1; lags.push(l); } }
+        if let Some(r) = press_response_at(&tr.e, k + off, n, g) { t += 1; if let Some(l) = r { m += 1; lags.push(l); } }
     }
     (t, m, lags)
 }
 
 /// Offset (frames) maximising the match rate of `ts`; ties -> smallest |offset|.
 /// Fit clock: +/-3 s in 3-frame steps (unchanged). Measured clock: 0 ..= 1500 ms in 1-frame steps.
-fn calibrate(tracks: &[Energy], clocks: &[FileClock], stamps: &[FrameStamp], ts: &[u64], n: usize) -> i64 {
-    let (lo, hi, step) = if stamps.is_empty() { (-SEARCH, SEARCH, STEP) } else { (MEAS_MIN_FRAMES, MEAS_MAX_FRAMES, 1) };
+fn calibrate(tracks: &[Energy], clocks: &[FileClock], stamps: &[FrameStamp], ts: &[u64], n: usize, g: &Grid) -> i64 {
+    let (lo, hi, step) = if stamps.is_empty() { (-g.search, g.search, g.step) } else { (g.meas_min, g.meas_max, 1) };
     let mut best = (f64::MIN, lo.max(0).min(hi));
     let mut o = lo;
     while o <= hi {
-        let (t, m, _) = score(tracks, clocks, stamps, ts, o, n);
+        let (t, m, _) = score(tracks, clocks, stamps, ts, o, n, g);
         let r = if t >= 3 { m as f64 / t as f64 } else { -1.0 };
         if r > best.0 + 1e-9 || ((r - best.0).abs() <= 1e-9 && o.abs() < best.1.abs()) { best = (r, o); }
         o += step;
@@ -237,20 +384,37 @@ pub fn align_tracks(tracks: &[Energy], clocks: &[FileClock], presses: &[u64], n:
 /// Like [`align_tracks`]. Non-empty `stamps` locate a press on the measured frame clock when a stamp
 /// is within 500 ms; every other press uses the manifest fit. An empty stamp list is the fit alone,
 /// and the JSON is the same object [`align_tracks`] has always returned.
+/// The session's analysis rate: the one rate shared by every non-empty track. Tracks that disagree
+/// (or no decoded track) -> None, and nothing is scored (fail closed).
+pub fn session_fps(tracks: &[Energy]) -> Result<Option<f64>, String> {
+    let rates: Vec<f64> = tracks.iter().filter(|t| !t.e.is_empty()).map(|t| t.fps).collect();
+    if rates.iter().any(|r| *r <= 0.0) { return Err("a decoded track has no frame rate".into()); }
+    match rates.first() {
+        None => Ok(None),
+        Some(&r0) if rates.iter().all(|r| (r / r0 - 1.0).abs() < 1e-9) => Ok(Some(r0)),
+        Some(_) => Err(format!("video files disagree on frame rate ({:?}); alignment UNMEASURED", rates)),
+    }
+}
+
 pub fn align_tracks_with(tracks: &[Energy], clocks: &[FileClock], presses: &[u64], n: usize, stamps: &[FrameStamp]) -> Value {
+    let (fps, rate_note) = match session_fps(tracks) { Ok(f) => (f, None), Err(e) => (None, Some(e)) };
+    let no_tracks: Vec<Energy> = vec![];
+    // Unknown or mixed rate: score nothing (every count below is 0 / null). Never assume a rate.
+    let tracks = if fps.is_some() { tracks } else { &no_tracks[..] };
+    let g = Grid::at(fps.unwrap_or(REFERENCE_FPS));
     let pts = sample(presses, MAX_EVENTS);
     let ch = chance_times(&pts, presses);
     let (a, b): (Vec<u64>, Vec<u64>) = (pts.iter().step_by(2).copied().collect(), pts.iter().skip(1).step_by(2).copied().collect());
     let (ca, cb): (Vec<u64>, Vec<u64>) = (ch.iter().step_by(2).copied().collect(), ch.iter().skip(1).step_by(2).copied().collect());
-    let (oa, ob) = (calibrate(tracks, clocks, stamps, &a, n), calibrate(tracks, clocks, stamps, &b, n));
+    let (oa, ob) = (calibrate(tracks, clocks, stamps, &a, n, &g), calibrate(tracks, clocks, stamps, &b, n, &g));
     // held out: B scored at A's offset, A at B's offset; same for chance
-    let (t1, m1, l1) = score(tracks, clocks, stamps, &b, oa, n);
-    let (t2, m2, l2) = score(tracks, clocks, stamps, &a, ob, n);
-    let (ct1, cm1, _) = score(tracks, clocks, stamps, &cb, oa, n);
-    let (ct2, cm2, _) = score(tracks, clocks, stamps, &ca, ob, n);
+    let (t1, m1, l1) = score(tracks, clocks, stamps, &b, oa, n, &g);
+    let (t2, m2, l2) = score(tracks, clocks, stamps, &a, ob, n, &g);
+    let (ct1, cm1, _) = score(tracks, clocks, stamps, &cb, oa, n, &g);
+    let (ct2, cm2, _) = score(tracks, clocks, stamps, &ca, ob, n, &g);
     let (pt, pm_, ct, cm) = (t1 + t2, m1 + m2, ct1 + ct2, cm1 + cm2);
     let pm = |a: usize, b: usize| if b == 0 { Value::Null } else { json!((a as f64 * 1000.0 / b as f64).round() as i64) };
-    let fms = |f: f64| (f * 1000.0 / FPS).round() as i64;
+    let fms = |f: f64| g.ms(f);
     let mut ms: Vec<i64> = l1.iter().map(|l| fms(*l as f64 + oa as f64)).chain(l2.iter().map(|l| fms(*l as f64 + ob as f64))).collect();
     ms.sort();
     let offset = if ms.is_empty() { Value::Null } else { json!(ms[ms.len() / 2]) };
@@ -262,14 +426,17 @@ pub fn align_tracks_with(tracks: &[Energy], clocks: &[FileClock], presses: &[u64
         let se = (p * (1.0 - p) * (1.0 / pt as f64 + 1.0 / ct as f64)).sqrt();
         if se > 0.0 { json!(((p1 - p2) / se * 100.0).round() as i64) } else { Value::Null }
     } else { Value::Null };
-    let (all_t, _, _) = score(tracks, clocks, stamps, &pts, 0, n);
+    let (all_t, _, _) = score(tracks, clocks, stamps, &pts, 0, n, &g);
     let _ = all_t;
     let mut out = json!({"presses_tested": pt, "presses_matched": pm_, "match_permille": pm(pm_, pt),
            "chance_tested": ct, "chance_matched": cm, "chance_permille": pm(cm, ct),
            "z_x100": z, "offset_ms": offset, "offset_iqr_ms": spread,
            "calibration_offsets_ms": [fms(oa as f64), fms(ob as f64)],
-           "presses_spaced": pts.len(), "window_frames": n, "fps": FPS as i64,
+           "presses_spaced": pts.len(), "window_frames": if fps.is_some() { g.window(n) } else { n },
+           "fps": fps.map(|f| json!(f.round() as i64)).unwrap_or(Value::Null),
            "clock_fitted": clocks.iter().all(|c| c.fitted)});
+    // Only on the fail-closed path, so a decoded 30/1 session keeps its exact JSON.
+    if let Some(r) = rate_note { out["fps_status"] = json!(format!("UNMEASURED: {r}")); }
     // Absent unless a measured clock was supplied. Adding the key on the fit path would change
     // input_proof.json for every bundle recorded with the flag off.
     if !stamps.is_empty() {
@@ -278,7 +445,7 @@ pub fn align_tracks_with(tracks: &[Energy], clocks: &[FileClock], presses: &[u64
         let mut lat = latency_block(&ms);
         // The two held-out halves must agree on the latency. A half that locks onto another peak
         // (a neighbouring press, a reaction before the press) is not one session latency.
-        let split = fms_i((oa - ob).abs());
+        let split = g.ms((oa - ob).abs() as f64);
         lat["halves_apart_ms"] = json!(split);
         if split > MEAS_MAX_IQR_MS && lat["status"] == "ok" {
             lat["status"] = json!("unscorable");
@@ -311,7 +478,9 @@ pub fn latency_block(ms: &[i64]) -> Value {
     })
 }
 
-fn fms_i(f: i64) -> i64 { (f as f64 * 1000.0 / FPS).round() as i64 }
+/// Search range labels in ms: the frame counts are defined at REFERENCE_FPS and scaled per rate, so
+/// the range is the same 0 ..= 1500 ms at every rate.
+fn fms_i(f: i64) -> i64 { (f as f64 * 1000.0 / REFERENCE_FPS).round() as i64 }
 
 /// Lower-only choice for the input proof when frame_clock.jsonl is present. The fit is the default.
 /// The measured score replaces it only when its latency is scorable AND its z is not above the fit's,
@@ -338,13 +507,16 @@ pub fn lower_only(fit: Value, measured: Value) -> Value {
 pub fn align_bundle(dir: &std::path::Path, recs: &[Value], manifest: &[Value], timeline: &[Value], wall_anchor_ms: Option<u64>, ffmpeg: Option<&str>, n: usize) -> Value {
     let presses = key_presses(recs);
     let all: Vec<u64> = recs.iter().filter(|r| r["type"] == "in").filter_map(|r| r["t_us"].as_u64()).collect();
-    let clocks = file_clocks(manifest);
     let stamps = frameclock::load(&dir.join(frameclock::FILE_NAME));
     let mut notes: Vec<String> = vec![];
+    // Rates are only read when there is a video pass; the no-video path scores nothing either way.
+    let rates = if ffmpeg.is_some() { file_rates(dir, manifest, ffmpeg, &stamps, true, &mut notes) } else { Default::default() };
+    let clocks = file_clocks(manifest, &|f: &str| rates.get(f).map(|r| r.fps()));
     let mut out = if let (Some(ff), false) = (ffmpeg, clocks.is_empty()) {
         let mut tracks = vec![];
         for c in &clocks {
-            match crate::bundle::contained_file(dir, &c.file).and_then(|p| decode_energy(ff, &p.to_string_lossy()).map_err(|e| e)) {
+            let Some(rate) = rates.get(&c.file).copied() else { tracks.push(Energy::default()); continue; };
+            match crate::bundle::contained_file(dir, &c.file).and_then(|p| decode_energy(ff, &p.to_string_lossy(), rate)) {
                 Ok(e) => tracks.push(e),
                 Err(e) => { notes.push(format!("{}: {e}", c.file)); tracks.push(Energy::default()); }
             }
@@ -388,6 +560,26 @@ pub fn align_bundle(dir: &std::path::Path, recs: &[Value], manifest: &[Value], t
     out
 }
 
+/// Each manifest video file's own rate ([`file_rate`]). A file without one is left out and noted
+/// (UNMEASURED); it is then neither decoded nor used to place a press.
+fn file_rates(dir: &std::path::Path, manifest: &[Value], ffmpeg: Option<&str>, stamps: &[FrameStamp], contained: bool, notes: &mut Vec<String>) -> std::collections::BTreeMap<String, Rate> {
+    let mut files: Vec<String> = vec![];
+    for m in manifest.iter().filter(|m| m["type"] == "segment") {
+        let f = m["file"].as_str().unwrap_or("video.mp4").to_string();
+        if !files.contains(&f) { files.push(f); }
+    }
+    let mut out = std::collections::BTreeMap::new();
+    for f in files {
+        let path = if contained { crate::bundle::contained_file(dir, &f).ok() } else { Some(dir.join(&f)) };
+        let path = path.filter(|p| p.exists()).map(|p| p.to_string_lossy().into_owned());
+        match file_rate(ffmpeg, path.as_deref(), &f, stamps) {
+            Ok(r) => { out.insert(f, r); }
+            Err(e) => notes.push(format!("{f}: {e}")),
+        }
+    }
+    out
+}
+
 fn pct(xs: &mut [i64], p: usize) -> i64 {
     if xs.is_empty() { return 0; }
     xs.sort();
@@ -398,8 +590,8 @@ fn pct(xs: &mut [i64], p: usize) -> i64 {
 /// absolute residual, in ms. `measured` is present only when `stamps` is non-empty: those same percentiles
 /// for |stamp time − fitted time of that frame|, plus how far consecutive stamp gaps sit from one nominal frame.
 /// This does not write a receipt.
-pub fn clock_ab(manifest: &[Value], stamps: &[FrameStamp]) -> Value {
-    let clocks = file_clocks(manifest);
+pub fn clock_ab(manifest: &[Value], stamps: &[FrameStamp], rate: &dyn Fn(&str) -> Option<f64>) -> Value {
+    let clocks = file_clocks(manifest, rate);
     let Some(c) = clocks.iter().find(|c| c.fitted).or_else(|| clocks.first()) else {
         return json!({"fit": Value::Null, "measured": Value::Null});
     };
@@ -425,7 +617,10 @@ pub fn clock_ab(manifest: &[Value], stamps: &[FrameStamp]) -> Value {
         (s.t_mono_us as f64 / 1000.0 - fitted).round() as i64
     }).collect();
     let mut vs: Vec<i64> = signed.iter().map(|v| v.abs()).collect();
-    let nominal_us = (1_000_000.0 / FPS).round() as i64;
+    if c.fps <= 0.0 {
+        return json!({"fit": fit, "measured": {"n": mine.len(), "status": "UNMEASURED: no frame rate for this file"}});
+    }
+    let nominal_us = (1_000_000.0 / c.fps).round() as i64;
     let mut gaps: Vec<i64> = mine.windows(2).map(|w| {
         ((w[1].t_mono_us as i64 - w[0].t_mono_us as i64) - nominal_us).abs() / 1000
     }).collect();
@@ -458,18 +653,24 @@ pub fn ab_report_with(dir: &std::path::Path, ffmpeg: Option<&str>, n: usize, rum
     let manifest = read("manifest.jsonl");
     let inputs = read("inputs.jsonl");
     let stamps = frameclock::load(&dir.join(frameclock::FILE_NAME));
-    let mut out = clock_ab(&manifest, &stamps);
+    let mut rate_notes = vec![];
+    let rates = file_rates(dir, &manifest, ffmpeg, &stamps, false, &mut rate_notes);
+    let rate_of = |f: &str| rates.get(f).map(|r| r.fps());
+    let mut out = clock_ab(&manifest, &stamps, &rate_of);
     out["frame_clock_file"] = json!(dir.join(frameclock::FILE_NAME).exists());
     out["frame_clock_frames"] = json!(stamps.len());
+    out["video_rates"] = json!(rates.iter().map(|(f, r)| (f.clone(), json!(r.filter()))).collect::<serde_json::Map<String, Value>>());
+    if !rate_notes.is_empty() { out["video_rate_notes"] = json!(rate_notes); }
     let presses = key_presses(&inputs);
-    let clocks = file_clocks(&manifest);
+    let clocks = file_clocks(&manifest, &rate_of);
     if let Some(ff) = ffmpeg {
         if clocks.is_empty() {
             out["video"] = json!("no segments");
         } else {
             let mut tracks = vec![];
             for c in &clocks {
-                match decode_energy(ff, &dir.join(&c.file).to_string_lossy()) {
+                let Some(rate) = rates.get(&c.file).copied() else { tracks.push(Energy::default()); continue; };
+                match decode_energy(ff, &dir.join(&c.file).to_string_lossy(), rate) {
                     Ok(e) => tracks.push(e),
                     Err(e) => { out["video_error"] = json!(e); tracks.push(Energy::default()); }
                 }
@@ -487,7 +688,7 @@ pub fn ab_report_with(dir: &std::path::Path, ffmpeg: Option<&str>, n: usize, rum
         out["video"] = json!("skipped");
         if rumble_echo.is_some() { out["rumble_echo"] = json!("skipped: needs the video decode (drop --no-video)"); }
     }
-    out["how_to_read"] = json!("fit.resid_* is the fragment-close straight line (flag off). measured.vs_fit_* is how far real frame arrivals sit from that line. measured.interval_* is frame-to-frame jitter of the arrivals (one frame is 33 ms). measured.vs_fit_signed_p50_ms < 0 means arrivals sit before the fit line. fit_alignment / measured_alignment are the input-proof scores; measured_alignment.latency is the per-session capture latency on the measured clock (status unscorable if IQR > 100 ms or < 3 anchors). This command does not write a receipt.");
+    out["how_to_read"] = json!("fit.resid_* is the fragment-close straight line (flag off). measured.vs_fit_* is how far real frame arrivals sit from that line. measured.interval_* is frame-to-frame jitter of the arrivals (one frame is 1000/fps ms at the file's own rate, see video_rates). measured.vs_fit_signed_p50_ms < 0 means arrivals sit before the fit line. fit_alignment / measured_alignment are the input-proof scores; measured_alignment.latency is the per-session capture latency on the measured clock (status unscorable if IQR > 100 ms or < 3 anchors). This command does not write a receipt.");
     out
 }
 
@@ -498,13 +699,15 @@ fn frameclock_read(dir: &std::path::Path, name: &str) -> Vec<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    const FPS: f64 = REFERENCE_FPS;
+    fn r30(_: &str) -> Option<f64> { Some(30.0) }
     /// Synthetic track: still screen (energy ~1) with a spike `lag` frames after each listed frame.
     fn track(len: usize, spikes: &[usize], lag: usize) -> Energy {
         let mut e: Vec<f32> = (0..len).map(|i| 1.0 + 0.2 * ((i * 7 % 5) as f32)).collect();
         for &s in spikes { for j in 0..4 { if s + lag + j < len { e[s + lag + j] = 40.0; } } }
-        Energy { e }
+        Energy::new(e, FPS)
     }
-    fn clock(start_ms: f64) -> Vec<FileClock> { vec![FileClock { file: "video.mp4".into(), start_ms, ms_per_frame: 1000.0 / FPS, end_ms: 1e9, fitted: true }] }
+    fn clock(start_ms: f64) -> Vec<FileClock> { vec![FileClock { file: "video.mp4".into(), start_ms, ms_per_frame: 1000.0 / FPS, end_ms: 1e9, fitted: true, fps: FPS }] }
 
     #[test]
     fn responsive_presses_beat_chance_and_offset_is_recovered() {
@@ -532,7 +735,7 @@ mod tests {
     }
     #[test]
     fn busy_screen_is_not_scored() {
-        let tr = Energy { e: vec![20.0; 2000] };
+        let tr = Energy::new(vec![20.0; 2000], FPS);
         assert_eq!(press_response(&tr.e, 500, 15), None);
         let still = track(2000, &[500], 4);
         assert_eq!(press_response(&still.e, 500, 15), Some(Some(4)));
@@ -543,10 +746,10 @@ mod tests {
         // frame 0 at mono 4000 ms; init segment arrives at 9300 ms with 160 frames already captured
         let mut m = vec![json!({"type":"segment","kind":"init","file":"video.mp4","mono_ms":9300,"frames":160})];
         for i in 0..50 { let fr = 160 + i * 60; m.push(json!({"type":"segment","kind":"media","file":"video.mp4","mono_ms": 4000 + fr * 1000 / 30,"frames":fr})); }
-        let c = file_clocks(&m);
+        let c = file_clocks(&m, &r30);
         assert!(c[0].fitted && (c[0].start_ms - 4000.0).abs() < 40.0, "{c:?}");
         let short = vec![json!({"type":"segment","kind":"init","file":"video.mp4","mono_ms":0})];
-        assert_eq!(file_clocks(&short)[0].start_ms, 0.0);
+        assert_eq!(file_clocks(&short, &r30)[0].start_ms, 0.0);
     }
     #[test]
     fn sampling_and_chance_times() {
@@ -631,13 +834,13 @@ mod tests {
             let fr = i * 60;
             m.push(json!({"type":"segment","kind":"media","file":"video.mp4","mono_ms": fr * 1000 / 30, "frames": fr}));
         }
-        let z = clock_ab(&m, &[]);
+        let z = clock_ab(&m, &[], &r30);
         assert!(z["measured"].is_null());
         assert!(z["fit"]["resid_abs_max_ms"].as_i64().unwrap() <= 1, "{z:#}");
         let mut late = m.clone();
         let n = late.len() - 1;
         late[n]["mono_ms"] = json!(late[n]["mono_ms"].as_i64().unwrap() + 800);
-        let bad = clock_ab(&late, &[]);
+        let bad = clock_ab(&late, &[], &r30);
         assert!(bad["fit"]["resid_abs_max_ms"].as_i64().unwrap() >= 400, "{bad:#}");
         let stamps: Vec<FrameStamp> = (0..10).map(|f| FrameStamp {
             file: "video.mp4".into(),
@@ -645,7 +848,7 @@ mod tests {
             t_mono_us: (f as f64 * 1_000_000.0 / FPS).round() as u64,
             pts_90k: f as u64 * 3000,
         }).collect();
-        let ok = clock_ab(&m, &stamps);
+        let ok = clock_ab(&m, &stamps, &r30);
         assert!(ok["measured"]["vs_fit_abs_max_ms"].as_i64().unwrap() <= 2, "{ok:#}");
         assert_eq!(ok["measured"]["interval_abs_dev_max_ms"], 0);
     }
@@ -681,8 +884,8 @@ mod tests {
         let sxy: f64 = (0..len).map(|f| (f as f64 - mx) * (g(f as f64) + lat_ms - my)).sum();
         let sxx: f64 = (0..len).map(|f| (f as f64 - mx).powi(2)).sum();
         let slope = sxy / sxx;
-        let clocks = vec![FileClock { file: "video.mp4".into(), start_ms: my - slope * mx, ms_per_frame: slope, end_ms: 1e9, fitted: true }];
-        Session { tracks: vec![Energy { e }], clocks, presses, stamps }
+        let clocks = vec![FileClock { file: "video.mp4".into(), start_ms: my - slope * mx, ms_per_frame: slope, end_ms: 1e9, fitted: true, fps: FPS }];
+        Session { tracks: vec![Energy::new(e, FPS)], clocks, presses, stamps }
     }
 
     #[test]
@@ -718,12 +921,13 @@ mod tests {
         assert_eq!(m["latency"]["status"], "ok");
         // the old symmetric search on the same stamps finds the reaction peak instead
         let mut best = (f64::MIN, 0i64);
-        let mut o = -SEARCH;
-        while o <= SEARCH {
-            let (t, mt, _) = score(&s.tracks, &s.clocks, &s.stamps, &s.presses, o, 15);
+        let g = Grid::at(FPS);
+        let mut o = -g.search;
+        while o <= g.search {
+            let (t, mt, _) = score(&s.tracks, &s.clocks, &s.stamps, &s.presses, o, 15, &g);
             let r = if t >= 3 { mt as f64 / t as f64 } else { -1.0 };
             if r > best.0 + 1e-9 || ((r - best.0).abs() <= 1e-9 && o.abs() < best.1.abs()) { best = (r, o); }
-            o += STEP;
+            o += g.step;
         }
         assert!(best.1 < 0, "symmetric search picked {} frames", best.1);
     }
@@ -767,7 +971,132 @@ mod tests {
         let mut m = vec![json!({"type":"segment","kind":"init","file":"video.mp4","mono_ms":0,"frames":0})];
         for i in 1..20 { let fr = i * 60; m.push(json!({"type":"segment","kind":"media","file":"video.mp4","mono_ms": fr * 1000 / 30 + 522, "frames": fr})); }
         let stamps: Vec<FrameStamp> = (0..10).map(|f| FrameStamp { file: "video.mp4".into(), frame: f, t_mono_us: (f as f64 * 1_000_000.0 / FPS).round() as u64, pts_90k: 0 }).collect();
-        let z = clock_ab(&m, &stamps);
+        let z = clock_ab(&m, &stamps, &r30);
         assert!((z["measured"]["vs_fit_signed_p50_ms"].as_i64().unwrap() + 522).abs() <= 2, "{z:#}");
+    }
+
+    // ---- 60 fps fix (sight-to-shot PLAN-r10 A1). Golden strings were produced by the pre-fix code
+    // (main 4888a63, `FPS = 30.0`) on the same fixtures: a 30/1 session must stay byte-identical.
+    const GOLDEN_FIT_30: &str = r#"{"presses_tested":120,"presses_matched":119,"match_permille":992,"chance_tested":8,"chance_matched":0,"chance_permille":0,"z_x100":1062,"offset_ms":1200,"offset_iqr_ms":1300,"calibration_offsets_ms":[600,-200],"presses_spaced":120,"window_frames":15,"fps":30,"clock_fitted":true}"#;
+    const GOLDEN_MEAS_30: &str = r#"{"presses_tested":120,"presses_matched":80,"match_permille":667,"chance_tested":120,"chance_matched":15,"chance_permille":125,"z_x100":858,"offset_ms":533,"offset_iqr_ms":33,"calibration_offsets_ms":[0,0],"presses_spaced":120,"window_frames":15,"fps":30,"clock_fitted":true,"clock_source":"frame_clock","frame_clock_frames":13800,"latency":{"latency_ms":533,"iqr_ms":33,"anchors":80,"search_ms":[0,1500],"status":"ok","reason":null,"sign":"positive = the picture of a press arrives this long after the press (same convention as offset_ms on the fit path)","halves_apart_ms":0}}"#;
+    const GOLDEN_AB_30: &str = r#"{"fit":{"file":"video.mp4","fitted":true,"ms_per_frame_milli":33333,"n":19,"resid_abs_p50_ms":0,"resid_abs_p95_ms":0,"resid_abs_max_ms":0},"measured":{"n":300,"vs_fit_abs_p50_ms":4,"vs_fit_abs_p95_ms":7,"vs_fit_abs_max_ms":7,"vs_fit_signed_p50_ms":4,"interval_abs_dev_p50_ms":0,"interval_abs_dev_p95_ms":0,"interval_abs_dev_max_ms":4}}"#;
+
+    #[test]
+    fn grid_at_30_is_the_pre_fix_constant_set_and_ntsc_rounds_to_it() {
+        let g = Grid::at(30.0);
+        assert_eq!((g.pre, g.a0, g.search, g.step, g.meas_min, g.meas_max, g.span, g.window(15)), (PRE, A0, SEARCH, STEP, MEAS_MIN_FRAMES, MEAS_MAX_FRAMES, 2, 15));
+        let ntsc = Grid::at(30000.0 / 1001.0);
+        assert_eq!((ntsc.pre, ntsc.a0, ntsc.search, ntsc.step, ntsc.meas_max, ntsc.span), (g.pre, g.a0, g.search, g.step, g.meas_max, g.span));
+        let g60 = Grid::at(60.0);
+        assert_eq!((g60.pre, g60.a0, g60.search, g60.step, g60.meas_max, g60.span, g60.window(15)), (40, 6, 180, 6, 90, 4, 30));
+        assert_eq!(g60.ms(g60.meas_max as f64), 1500);
+    }
+
+    #[test]
+    fn thirty_fps_outputs_are_byte_identical_to_the_pre_fix_code() {
+        let frames: Vec<usize> = (0..120).map(|i| 200 + i * 41).collect();
+        let tr = track(6000, &frames, 6 + 30);
+        let presses: Vec<u64> = frames.iter().map(|&f| (f as f64 * 1000.0 / FPS * 1000.0) as u64).collect();
+        assert_eq!(serde_json::to_string(&align_tracks(&[tr], &clock(0.0), &presses, 15)).unwrap(), GOLDEN_FIT_30);
+        let s = session(520.0, 120, 3, true);
+        assert_eq!(serde_json::to_string(&align_tracks_with(&s.tracks, &s.clocks, &s.presses, 15, &s.stamps)).unwrap(), GOLDEN_MEAS_30);
+        let mut man = vec![json!({"type":"segment","kind":"init","file":"video.mp4","mono_ms":0,"frames":0})];
+        for i in 1..20 { let fr = i * 60; man.push(json!({"type":"segment","kind":"media","file":"video.mp4","mono_ms": fr * 1000 / 30 + 7, "frames": fr})); }
+        let st: Vec<FrameStamp> = (0..300).map(|f| FrameStamp { file: "video.mp4".into(), frame: f, t_mono_us: (f as f64 * 1_000_000.0 / FPS).round() as u64 + 9000 + (f as u64 * 37 % 5000), pts_90k: f as u64 * 3000 }).collect();
+        assert_eq!(serde_json::to_string(&clock_ab(&man, &st, &r30)).unwrap(), GOLDEN_AB_30);
+    }
+
+    /// The same press/response session at 60 fps: the track has twice the frames, the picture reacts
+    /// 200 ms after each press. At 60 fps the offset in ms is recovered and `fps` says 60.
+    #[test]
+    fn sixty_fps_session_recovers_the_same_ms_offset_as_thirty() {
+        let run = |fps: f64| {
+            let k = fps / 30.0;
+            let frames: Vec<usize> = (0..120).map(|i| ((200 + i * 41) as f64 * k) as usize).collect();
+            let lag = (6.0 * k) as usize; // 200 ms
+            let mut e: Vec<f32> = (0..(6000.0 * k) as usize).map(|i| 1.0 + 0.2 * ((i * 7 % 5) as f32) / k as f32).collect();
+            for &f in &frames { for j in 0..(4.0 * k) as usize { if f + lag + j < e.len() { e[f + lag + j] = 40.0; } } }
+            let presses: Vec<u64> = frames.iter().map(|&f| (f as f64 * 1_000_000.0 / fps) as u64).collect();
+            let clocks = vec![FileClock { file: "video.mp4".into(), start_ms: 0.0, ms_per_frame: 1000.0 / fps, end_ms: 1e9, fitted: true, fps }];
+            align_tracks(&[Energy::new(e, fps)], &clocks, &presses, 15)
+        };
+        let (a, b) = (run(30.0), run(60.0));
+        assert_eq!(b["fps"], 60, "{b:#}");
+        assert_eq!(b["window_frames"], 30);
+        assert!(b["match_permille"].as_i64().unwrap() >= 900, "{b:#}");
+        let (oa, ob) = (a["offset_ms"].as_i64().unwrap(), b["offset_ms"].as_i64().unwrap());
+        assert!((oa - ob).abs() <= 34, "30 fps {oa} ms vs 60 fps {ob} ms");
+        assert!((150..=300).contains(&ob), "{b:#}");
+    }
+
+    /// Pre-fix, a 60 fps manifest fit (slope 16.7 ms) failed the 5 % check against 33.3 ms and fell
+    /// back to the 30 fps nominal. With the file's own rate the fitted slope is kept.
+    #[test]
+    fn sixty_fps_manifest_keeps_its_fitted_slope() {
+        let mut m = vec![json!({"type":"segment","kind":"init","file":"video.mp4","mono_ms":0,"frames":0})];
+        for i in 1..40 { let fr = i * 120; m.push(json!({"type":"segment","kind":"media","file":"video.mp4","mono_ms": fr * 1000 / 60 + 500, "frames": fr})); }
+        let c = &file_clocks(&m, &|_: &str| Some(60.0))[0];
+        assert!(c.fitted && (c.ms_per_frame - 1000.0 / 60.0).abs() < 0.01 && (c.start_ms - 500.0).abs() < 1.0, "{c:?}");
+        let old = &file_clocks(&m, &r30)[0];
+        assert!((old.ms_per_frame - 1000.0 / 30.0).abs() < 1e-9, "the 30 fps nominal rejects a 60 fps fit: {old:?}");
+        let unknown = &file_clocks(&m, &|_: &str| None)[0];
+        assert_eq!((unknown.fps, unknown.fitted), (0.0, false));
+        assert!(locate(std::slice::from_ref(unknown), 1_000_000).is_none(), "an UNMEASURED rate places no press");
+    }
+
+    #[test]
+    fn rate_parsers_and_frame_clock_rate() {
+        assert_eq!(parse_rational("60/1"), Some(Rate { num: 60, den: 1 }));
+        assert_eq!(parse_rational("30000/1001").unwrap().filter(), "30000/1001");
+        assert_eq!(parse_rational("0/0"), None);
+        let banner = "  Stream #0:0[0x1](und): Video: h264 (High) (avc1 / 0x31637661), yuv420p, 1280x720, 2999 kb/s, 60 fps, 60 tbr, 90k tbn (default)";
+        assert_eq!(parse_banner_rate(banner), Some(Rate { num: 60, den: 1 }));
+        let ntsc = "    Stream #0:0: Video: h264, yuv420p, 640x480, 29.97 fps, 29.97 tbr, 30k tbn";
+        assert_eq!(parse_banner_rate(ntsc), Some(Rate { num: 30000, den: 1001 }));
+        assert_eq!(parse_banner_rate("Stream #0:1: Audio: aac, 48000 Hz"), None);
+        // Stage-0 shape: one opening step of 3420 ticks, then 1500 -> 60/1.
+        let mut pts = 0u64;
+        let st: Vec<FrameStamp> = (0..50).map(|f| { if f == 1 { pts += 3420 } else if f > 1 { pts += 1500 } FrameStamp { file: "video.mp4".into(), frame: f, t_mono_us: f as u64 * 16_667, pts_90k: pts } }).collect();
+        assert_eq!(frame_clock_rate(&st, "video.mp4"), Some(Rate { num: 60, den: 1 }));
+        assert_eq!(frame_clock_rate(&st, "other.mp4"), None);
+        assert_eq!(file_rate(None, None, "video.mp4", &st), Ok(Rate { num: 60, den: 1 }));
+        assert!(file_rate(None, None, "other.mp4", &st).unwrap_err().contains("UNMEASURED"));
+    }
+
+    /// Files at different rates: nothing is scored and the rate is reported UNMEASURED.
+    #[test]
+    fn mixed_rates_fail_closed() {
+        let a = Energy::new(vec![1.0; 600], 30.0);
+        let b = Energy::new(vec![1.0; 1200], 60.0);
+        let clocks = vec![
+            FileClock { file: "a.mp4".into(), start_ms: 0.0, ms_per_frame: 1000.0 / 30.0, end_ms: 2e4, fitted: true, fps: 30.0 },
+            FileClock { file: "b.mp4".into(), start_ms: 2e4, ms_per_frame: 1000.0 / 60.0, end_ms: 4e4, fitted: true, fps: 60.0 },
+        ];
+        let presses: Vec<u64> = (0..30).map(|i| 1_000_000 + i * 1_200_000).collect();
+        let v = align_tracks(&[a, b], &clocks, &presses, 15);
+        assert_eq!(v["presses_tested"], 0, "{v:#}");
+        assert!(v["fps"].is_null());
+        assert!(v["fps_status"].as_str().unwrap().starts_with("UNMEASURED"), "{v:#}");
+        let none = align_tracks(&[], &[], &[], 15);
+        assert!(none["fps"].is_null() && none.get("fps_status").is_none());
+    }
+
+    /// Real ffmpeg: a 30/1 and a 60/1 clip are probed at their own rate and decoded at it.
+    #[test]
+    fn probe_and_decode_at_the_streams_own_rate() {
+        let ok = std::process::Command::new("ffmpeg").arg("-version").stdout(Stdio::null()).status().map(|s| s.success()).unwrap_or(false);
+        if !ok { eprintln!("ffmpeg not on PATH; skipping"); return; }
+        let dir = std::env::temp_dir().join(format!("qorcap-rate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir); std::fs::create_dir_all(&dir).unwrap();
+        for fps in [30u64, 60] {
+            let f = dir.join(format!("v{fps}.mp4"));
+            let st = std::process::Command::new("ffmpeg").args(["-v", "error", "-y", "-f", "lavfi", "-i", &format!("testsrc2=size=160x90:rate={fps}"), "-t", "3", "-pix_fmt", "yuv420p", f.to_str().unwrap()]).status().unwrap();
+            assert!(st.success());
+            let r = probe_rate("ffmpeg", f.to_str().unwrap()).unwrap();
+            assert_eq!(r, Rate { num: fps, den: 1 });
+            let e = decode_energy("ffmpeg", f.to_str().unwrap(), r).unwrap();
+            assert_eq!((e.e.len() as u64, e.fps), (3 * fps, fps as f64));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

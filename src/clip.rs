@@ -6,7 +6,11 @@
 //! `verify-bundle` is clean. A FAIL receipt is not signed. This module does not download QorTime
 //! and does not add fields to `receipt.json`.
 
-use crate::align::FPS;
+/// UNCHANGED 30 fps assumption, moved here from `align::FPS` by the 60 fps align fix so clip cuts keep
+/// their exact pre-fix behaviour. Flagged, NOT fixed in that change (SUSPECTED, not verified): manifest
+/// `frames` count the file's own frames, so on a 60 fps recording this frame-based cut window may be
+/// off by 2x. Clip / content-credential behaviour is out of scope for the align fix.
+const FPS: f64 = 30.0;
 use crate::bundle;
 use crate::credentials::{self, MatchReceipt, SignRequest};
 use crate::evidence;
