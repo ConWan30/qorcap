@@ -346,7 +346,7 @@ fn main() {
                 for l in &lines { println!("{l}"); }
                 code
             }
-            Err(e) => { eprintln!("error: {e}"); 2 }
+            Err(e) => { eprintln!("error: {}", qorcap::bundle::escape_output(&e)); 2 }
         },
         Cmd::Finalize { bundle, python, recover, mut rest } => {
             if recover { rest.insert(0, "--recover".into()); }
