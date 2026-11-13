@@ -52,7 +52,8 @@ The final uses a different read: Qortrola30's row on the end scoreboard (also ma
 `cod_session.json` sits beside the match:
 
 - `power` is `unknown`.
-- `controller_path` is `usb` only when the input log header already says `usb-hid` (the path QorCap read). Otherwise it is `unknown`.
+- `controller_path` is `usb` only when the input log header says `usb-hid` and the log shows the pad was read there (an `in` report row or a `connected` status). A header with only `missing` status lines is where QorCap looked, not a path it read, so it stays `unknown`.
+- When Qortrola30's end-scoreboard row is not read, the per-frame `end_eval` in `cod_signals.jsonl` adds `owner_stage`: `tag_not_matched`, `kills_header_not_found`, `kills_not_read`, `assists_not_read`, `deaths_not_read`, `board_scale`, `pack_missing`, or `frame_invalid`. It names the step that stopped the read. It is diagnostic only, not a score, not Counted, and no gate changes.
 
 These tags are not written onto input rows. Input rows stay in the checkpoint hash, and this set does not change them.
 
