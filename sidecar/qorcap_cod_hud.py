@@ -96,6 +96,8 @@ _HEADER_ORDER = ("SCORE", "KILLS", "ASSISTS", "DEATHS")
 # The same letters on the personal card score about 0.56. A neighboring name
 # fragment scores about 0.42. JPEG quality 40 still scores about 0.91.
 # Below this the letters did not agree, so the row is not read.
+# A second, thinner sample (match-20261113-133025, text supplement owner_tags) is
+# matched at this same gate; the higher of the two is kept. Gate unchanged.
 _OWNER_MIN = 0.80
 # KILLS on that frame scores about 0.96. The other team's header scores about 0.54.
 # DEATHS on the personal card scores about 0.86. The next hit scores about 0.40.
@@ -174,6 +176,14 @@ def _apply_text_supplement(data):
         mask = _mask_from_rows(headers["deaths_column"].get("mask_rows"))
         if mask is not None:
             data["deaths_column_header_mask"] = mask
+    # Extra owner-tag samples (same letters, another capture's stroke width). The npz owner_mask stays first.
+    tags = []
+    for item in extra.get("owner_tags", []):
+        mask = _mask_from_rows(item.get("mask_rows"))
+        if mask is not None and "owner_mask" in data and mask.shape == data["owner_mask"].shape:
+            tags.append(mask)
+    if tags:
+        data["owner_tag_masks"] = tags
     return data
 
 
@@ -1447,6 +1457,26 @@ def _owner_row_header_hits(bgr, scale, pack, row_x, row_y, row_h):
     return kills_h, deaths_h, assists_h, confirms_h, personal
 
 
+def _owner_masks(pack):
+    """The shipped owner_mask, then any extra owner-tag samples from the text supplement."""
+    out = [pack["owner_mask"]] if "owner_mask" in pack else []
+    out.extend(pack.get("owner_tag_masks") or [])
+    return out
+
+
+def _best_owner_hit(search, pack, scale: float):
+    """Highest owner-tag hit over every sample, or None when none reaches _OWNER_MIN.
+
+    Every sample is the same gamertag at the same size. The gate is the same for each.
+    """
+    best = None
+    for mask in _owner_masks(pack):
+        hit = _best_mask(search, mask, scale, _OWNER_MIN)
+        if hit is not None and (best is None or hit[0] > best[0]):
+            best = hit
+    return best
+
+
 def read_owner_row(img):
     """Qortrola30's end-scoreboard row.
 
@@ -1468,7 +1498,7 @@ def read_owner_row(img):
             "owner_row", "not_present",
             "Qortrola30's scoreboard row was not read. It is not Counted.",
             "board_scale" if scale is None else "pack_missing")
-    name_hit = _best_mask(_value_mask(bgr, _OWNER_SEARCH_VALUE), pack["owner_mask"], scale, _OWNER_MIN)
+    name_hit = _best_owner_hit(_value_mask(bgr, _OWNER_SEARCH_VALUE), pack, scale)
     if name_hit is None:
         return _not_read(
             "owner_row", "not_present",
