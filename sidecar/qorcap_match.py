@@ -953,8 +953,13 @@ def attach_cod_end_stop(state: dict, game, *, environ=None, say=None):
     state["cod_end_stop"] = es
     if say is not None:
         c = es.cfg
-        say(f"Practice auto stop is on: after a confirmed VICTORY or DEFEAT end screen, capture runs "
-            f"{c.tail_s:g} s more and then stops the same way as Enter (armed after {c.arm_ms // 1000} s).")
+        if c.best_play:
+            say(f"Practice auto stop is on: after a confirmed VICTORY or DEFEAT end screen, capture runs until the "
+                f"BEST PLAY replay title is read (at most {c.best_play_max_s:g} s) and then stops the same way as "
+                f"Enter (armed after {c.arm_ms // 1000} s).")
+        else:
+            say(f"Practice auto stop is on: after a confirmed VICTORY or DEFEAT end screen, capture runs "
+                f"{c.tail_s:g} s more and then stops the same way as Enter (armed after {c.arm_ms // 1000} s).")
     return es
 
 
@@ -3248,7 +3253,7 @@ def cod_end_stop_reason(state: dict, reason: str | None, *, now: float | None = 
         state["cod_end_stop_said"] = True
         if say is not None:
             try:
-                say(f"\n\n{es.describe()} Capture continues {es.cfg.tail_s:g} s, then stops the same way as Enter.")
+                say(f"\n\n{es.describe()} {es.stop_plan()}")
             except Exception:
                 pass
     due = es.stop_due(now)
