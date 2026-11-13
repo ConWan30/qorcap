@@ -199,8 +199,6 @@ class RegionRead:
     deaths: int | None = None
     confirms: int | None = None
     player_tag: str | None = None
-    # Which owner-row step stopped the read (diagnostic only, not a score). None when not set.
-    stage: str | None = None
 
 
 def crop_box(img, box: tuple[float, float, float, float]):

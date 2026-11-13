@@ -91,8 +91,8 @@ def test_owner_row_abstain_carries_the_owner_step():
     posted = []
     runner = CodSetRunner(posted.append)
     end = RegionRead(region="end_screen", status="read", ok=True, calibrated=True, confirm=True, reason="defeat")
-    owner = RegionRead(region="owner_row", status="not_read", ok=False, calibrated=False, reason="not_present",
-                       stage="tag_not_matched")
+    owner = RegionRead(region="owner_row", status="not_read", ok=False, calibrated=False, reason="not_present")
+    owner.stage = "tag_not_matched"
     runner._post_owner_end(3000, 3000, end, owner)
     assert posted == []
     assert runner._frame_end == {"status": "abstain", "reason": "owner_row_not_read", "owner_stage": "tag_not_matched"}

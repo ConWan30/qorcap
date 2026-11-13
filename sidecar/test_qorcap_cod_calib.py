@@ -915,7 +915,7 @@ def test_owner_row_not_read_names_the_step_that_stopped_it():
     """
     board = _synthetic_tdm_board()
     row = H.read_owner_row(board)
-    assert row.ok and row.stage is None
+    assert row.ok and getattr(row, "stage", None) is None
     cases = {
         "tag_not_matched": (534, 550, 172, 240),
         "kills_not_read": (532, 548, 428, 442),

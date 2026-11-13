@@ -217,7 +217,12 @@ def _crop(img, name: str):
 
 def _not_read(region: str, reason: str, note: str, stage: str | None = None):
     from qorcap_cod import RegionRead
-    return RegionRead(region, "not_read", False, reason, False, note, stage=stage)
+    rd = RegionRead(region, "not_read", False, reason, False, note)
+    if stage:
+        # Which owner-row step stopped the read. Diagnostic only: not a score, not Counted,
+        # and not a RegionRead field, so region rows and their evidence hashes are unchanged.
+        rd.stage = stage
+    return rd
 
 
 def _present(region: str, reason: str, note: str, **kw):
