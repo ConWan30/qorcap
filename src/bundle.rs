@@ -25,7 +25,7 @@ fn lines_resilient(p: &Path, salvage: bool) -> Result<Vec<Value>, String> {
                 if !salvage || bad > 3 {
                     return Err(msg);
                 }
-                eprintln!("WARN: {msg}");
+                eprintln!("WARN: {}", escape_output(&msg));
             }
         }
     }
@@ -150,12 +150,36 @@ fn check_capture_stop(dir: &Path, cps: &[Value], errors: &mut Vec<String>, warni
     warnings.push(format!("{name} is present but no checkpoint binds it (state: {state}): UNBOUND, not evidence"));
 }
 
+/// Render an untrusted string so no control character, CR, LF, or ANSI escape
+/// can reach verify-bundle stdout, stderr, or the sidecar's verify.txt.
+/// Printable text (including spaces and ordinary Unicode) is unchanged, so a
+/// valid bundle's output stays byte-identical.
+pub fn escape_output(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{1b}' => out.push_str("\\x1b"),
+            '\0' => out.push_str("\\0"),
+            '\u{2028}' => out.push_str("\\u{2028}"),
+            '\u{2029}' => out.push_str("\\u{2029}"),
+            c if c.is_control() => out.push_str(&format!("\\u{{{:x}}}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 /// The text `qorcap verify-bundle` prints for a report, one entry per line, and its exit code.
+/// Every untrusted string (file names, ids, states, errors, warnings, chain heads) is passed
+/// through [`escape_output`] here, which is the only print path for a successful verify.
 pub fn report_lines(r: &Report) -> (Vec<String>, i32) {
-    let mut out = vec![format!("segments={} bytes={} checkpoints={} chain_head={}", r.segments, r.bytes, r.checkpoints, r.chain_head)];
-    if let Some(h) = &r.input_head { out.push(format!("controller input chunks={} inputs_chain_head={h}", r.input_chunks)); }
-    for e in &r.errors { out.push(format!("FAIL: {e}")); }
-    for w in &r.warnings { out.push(format!("WARN: {w}")); }
+    let mut out = vec![format!("segments={} bytes={} checkpoints={} chain_head={}", r.segments, r.bytes, r.checkpoints, escape_output(&r.chain_head))];
+    if let Some(h) = &r.input_head { out.push(format!("controller input chunks={} inputs_chain_head={}", r.input_chunks, escape_output(h))); }
+    for e in &r.errors { out.push(format!("FAIL: {}", escape_output(e))); }
+    for w in &r.warnings { out.push(format!("WARN: {}", escape_output(w))); }
     out.push(if r.errors.is_empty() { "OK: video bytes match the hash chain; checkpoints link. (Integrity + timing only; does not prove who played.)".into() } else { "FAILED".into() });
     (out, if r.errors.is_empty() { 0 } else { 1 })
 }
@@ -344,5 +368,143 @@ mod tests {
         }
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_file(&outside);
+    }
+
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "qorcap-vb-{}-{}-{}",
+            tag,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    fn write_segment(dir: &Path, file: &str, body: &[u8]) -> String {
+        let sha = ev::sha256_hex(body);
+        let head = ev::link(GENESIS, 0, &sha);
+        std::fs::write(
+            dir.join("manifest.jsonl"),
+            format!(
+                "{}\n",
+                serde_json::json!({"type":"segment","seq":0,"file":file,"offset":0,"bytes": body.len(),
+                    "sha256": sha, "prev": GENESIS, "chain_head": head})
+            ),
+        )
+        .unwrap();
+        head
+    }
+
+    /// Valid bundles (ordinary file names, no controls) must print the same bytes as before
+    /// the escape helper: escape is a no-op on this text.
+    #[test]
+    fn valid_bundle_report_lines_are_byte_identical() {
+        let dir = scratch("ok");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let body = b"abcdef";
+        std::fs::write(dir.join("video.mp4"), body).unwrap();
+        let head = write_segment(&dir, "video.mp4", body);
+        let rep = verify(&dir).unwrap();
+        assert!(rep.errors.is_empty() && rep.warnings.is_empty(), "{:?} {:?}", rep.errors, rep.warnings);
+        let (lines, code) = report_lines(&rep);
+        assert_eq!(code, 0);
+        let expected = format!(
+            "segments=1 bytes=6 checkpoints=0 chain_head={head}\nOK: video bytes match the hash chain; checkpoints link. (Integrity + timing only; does not prove who played.)"
+        );
+        assert_eq!(lines.join("\n"), expected);
+        assert_eq!(lines.join("\n").as_bytes(), expected.as_bytes());
+        // A typical FAIL with a valid file name is also unchanged (escape is a no-op).
+        std::fs::write(dir.join("video.mp4"), b"XXXXXX").unwrap();
+        let bad = verify(&dir).unwrap();
+        let (fail_lines, fail_code) = report_lines(&bad);
+        assert_eq!(fail_code, 1);
+        let fail_expected = format!(
+            "segments=1 bytes=6 checkpoints=0 chain_head={head}\nFAIL: segment 0 (video.mp4@0): SHA-256 mismatch (video bytes altered)\nFAILED"
+        );
+        assert_eq!(fail_lines.join("\n"), fail_expected);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn assert_no_control_in_report(lines: &[String]) {
+        for l in lines {
+            assert!(
+                !l.chars().any(|c| c.is_control() || c == '\u{2028}' || c == '\u{2029}'),
+                "control or line-break in report line: {l:?}"
+            );
+        }
+        let text = lines.join("\n");
+        assert_eq!(text.lines().count(), lines.len(), "{text:?}");
+        assert_eq!(text.lines().filter(|l| l.starts_with("OK:")).count(), 0, "{text}");
+        assert!(!text.contains('\u{1b}'), "{text:?}");
+    }
+
+    /// Manifest `file` and checkpoint `capture_stop_file` used to be printed raw, so a newline,
+    /// CRLF, ESC[, or tab could add a fake `OK:` line or an ANSI run to stdout / verify.txt.
+    #[test]
+    fn verify_bundle_escapes_injected_file_names() {
+        let cases: &[(&str, &str)] = &[
+            ("nl", "video.mp4\nOK: fake"),
+            ("crlf", "video.mp4\r\nOK: fake"),
+            ("esc", "video.mp4\u{1b}[32mOK: fake"),
+            ("tab", "video.mp4\tOK: fake"),
+        ];
+        for (tag, name) in cases {
+            let dir = scratch(&format!("inj-{tag}"));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            write_segment(&dir, name, b"abcdef");
+            let rep = verify(&dir).unwrap();
+            assert!(!rep.errors.is_empty(), "{tag}: expected a FAIL, got {:?}", rep.errors);
+            let (lines, code) = report_lines(&rep);
+            assert_eq!(code, 1, "{tag}");
+            assert_eq!(lines.last().map(String::as_str), Some("FAILED"), "{tag}: {lines:?}");
+            assert_no_control_in_report(&lines);
+            let text = lines.join("\n");
+            assert!(text.contains("fake"), "{tag}: escaped name should still be visible: {text}");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        // The same injection through a bound capture-stop file name on a checkpoint.
+        for (tag, name) in cases {
+            let dir = scratch(&format!("stop-{tag}"));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("manifest.jsonl"), "").unwrap();
+            let cp = serde_json::json!({"qorcap":{"capture_stop_sha256": "00".repeat(32), "capture_stop_file": name}});
+            std::fs::write(dir.join("checkpoints.jsonl"), format!("{cp}\n")).unwrap();
+            let rep = verify(&dir).unwrap();
+            assert!(
+                rep.errors.iter().any(|e| e.contains("capture stop") || e.contains(*name) || e.contains("cannot read")),
+                "{tag}: {name:?} not reflected in errors: {:?}",
+                rep.errors
+            );
+            let (lines, code) = report_lines(&rep);
+            assert_eq!(code, 1, "{tag}");
+            assert_eq!(lines.last().map(String::as_str), Some("FAILED"), "{tag}: {lines:?}");
+            assert_no_control_in_report(&lines);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+    #[test]
+    fn escape_output_is_identity_for_plain_text_and_strips_controls() {
+        assert_eq!(escape_output(""), "");
+        assert_eq!(escape_output("video.mp4"), "video.mp4");
+        assert_eq!(
+            escape_output("segment 0 (video.mp4@0): SHA-256 mismatch (video bytes altered)"),
+            "segment 0 (video.mp4@0): SHA-256 mismatch (video bytes altered)"
+        );
+        assert_eq!(escape_output("café.mp4"), "café.mp4");
+        assert_eq!(escape_output("video.mp4\nOK: fake"), "video.mp4\\nOK: fake");
+        assert_eq!(escape_output("video.mp4\r\nOK: fake"), "video.mp4\\r\\nOK: fake");
+        assert_eq!(escape_output("video.mp4\u{1b}[32mOK: fake"), "video.mp4\\x1b[32mOK: fake");
+        assert_eq!(escape_output("video.mp4\tOK: fake"), "video.mp4\\tOK: fake");
+        assert_eq!(escape_output("x\u{2028}OK: fake"), "x\\u{2028}OK: fake");
+        assert_eq!(escape_output("\0"), "\\0");
+        assert_eq!(escape_output("a\u{07}b\u{9b}c"), "a\\u{7}b\\u{9b}c");
+        let cleaned = escape_output("a\n\r\t\u{1b}[0m\u{2028}\u{2029}\0");
+        assert!(!cleaned.chars().any(|c| c.is_control() || c == '\u{2028}' || c == '\u{2029}'));
     }
 }
