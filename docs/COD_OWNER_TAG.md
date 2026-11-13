@@ -39,6 +39,43 @@ fade-in frame stays rejected.
 Held-out score ranges, both samples: owner rows 0.638-0.968 (per-match medians 0.89-0.94); impostor rows max 0.366;
 non-board frames max 0.517.
 
+### Per match (board frames)
+
+| held-out match | board frames | shipped only accepted | both samples accepted | other-row slots | non-board frames |
+|---|---|---|---|---|---|
+| 20261104-162225 | 5 | 5 | 5 | 55 | 5 |
+| 20261104-202724 | 5 | 5 | 5 | 55 | 5 |
+| 20261107-073204 (excluded session, see below) | 14 | 13 | 13 | 154 | 1 |
+| 20261111-183311 | 13 | 7 | 13 | 143 | 67 |
+| 20261111-194037 | 13 | 13 | 13 | 143 | 67 |
+| 20261111-081216 (no board) | 0 | - | - | 0 | 160 |
+| 20261111-165658 (no board) | 0 | - | - | 0 | 80 |
+| 20261113-131754 (no board) | 0 | - | - | 0 | 151 |
+
+No other-row slot and no non-board frame reached 0.80 in any match.
+
+### With and without 20261107-073204
+
+Same measurements as above, only regrouped. No frame was re-scored.
+
+| set | held-out | board frames | accepted | false rejects | other-row slots (accepts) | non-board frames (accepts) |
+|---|---|---|---|---|---|---|
+| shipped only | with 073204 | 50 | 43 | 7 | 550 (0) | 536 (0) |
+| shipped only | without 073204 | 36 | 30 | 6 | 396 (0) | 535 (0) |
+| both samples | with 073204 | 50 | 49 | 1 | 550 (0) | 536 (0) |
+| both samples | without 073204 | 36 | 36 | 0 | 396 (0) | 535 (0) |
+
+### 20261107-073204 standing exclusion
+
+- 20261107-073204 is a v0.3.40 practice session. A standing rule from Con keeps it **EXCLUDED**. For the S2S work it
+  is never a tuning, Counted, or held-out session, and `docs/s2s/threshold_A.standby.json` still lists it under
+  `excluded_sessions`. This change does not touch that file.
+- It is **not a template source.** Neither tag sample was cut from it, and no threshold here was set on it.
+- It appears above only as an extra held-out illustration for this practice-lane tag reader. Its one fade-in frame
+  (0.638) is the **only false reject** with both samples. Without it the held-out set has 0 false rejects on 36 board
+  frames.
+- The end-to-end read on this session (K9 A2 D21) is an illustration only, under the same exclusion.
+
 **Rates:** five held-out matches with end boards, and frames within one match are strongly correlated. A
 per-match false-accept or false-reject rate is **UNKNOWN** from this data. Frame counts above are raw.
 
