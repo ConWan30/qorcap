@@ -36,7 +36,7 @@ The 7 shipped-only rejects are 6 frames of 20261111-183311 where the board sits 
 one fade-in frame of 20261107-073204 (0.638). With both samples the 183311 frames score 0.897-0.968; the
 fade-in frame stays rejected.
 
-Held-out score ranges, both samples: owner rows 0.638-0.968 (median about 0.90 per match); impostor rows max 0.366;
+Held-out score ranges, both samples: owner rows 0.638-0.968 (per-match medians 0.89-0.94); impostor rows max 0.366;
 non-board frames max 0.517.
 
 **Rates:** five held-out matches with end boards, and frames within one match are strongly correlated. A
@@ -50,3 +50,46 @@ per-match false-accept or false-reject rate is **UNKNOWN** from this data. Frame
 - Not changed here: the ASSISTS column header is missed on the TDM boards (20261113-133025, 20261104-162225), and
   the KILLS header margin is thin (0.714-0.96 against 0.70; at JPEG 90 it drops below on 20261104-162225).
   Deaths are not read on 20261111-183311.
+
+## Row highlight as a cue (evaluated, not shipped)
+
+The console fills the local player's row with a dark yellow band. The fill only marks whoever is signed in on
+the console. It does not bind that row to Qortrola30, so the tag stays the identity check.
+
+**Cue measured.** Share of pixels with hue 15-40, saturation >= 80 and value >= 25 across the stat cells of each
+row slot. The slot grid is shifted by the KILLS header offset.
+
+**Thresholds.** Set on the tuning matches only:
+- The highlight locates a row when its fill is >= 0.65 and beats every other slot by >= 0.30.
+- Highlight plus tag: the tag must reach 0.70 on the highlighted row. With no highlight, the tag-only path at 0.80
+  applies.
+- On tuning, owner fill was 0.726-0.960. Other slots reached 0.555 and non-board frames 0.435.
+
+**Held-out, same matches and frames as above:**
+
+| mode | board frames | correct row | false reject | wrong row | other rows tag >= gate | non-board frames | non-board accepts |
+|---|---|---|---|---|---|---|---|
+| highlight only (locator, no identity) | 50 | 45 | 5 | 0 | not an identity check | 536 | 1 (located) |
+| tag only, shipped sample | 50 | 43 | 7 | 0 | 0 / 550 at 0.80 | 536 | 0 |
+| tag only, both samples (this change) | 50 | 49 | 1 | 0 | 0 / 550 at 0.80 | 536 | 0 |
+| highlight + tag, shipped sample | 50 | 49 | 1 | 0 | 0 / 550 at 0.70 | 536 | 0 |
+| highlight + tag, both samples | 50 | 49 | 1 | 0 | 0 / 550 at 0.70 | 536 | 0 |
+
+**Where highlight-only fails.**
+- It misses 4 frames of 20261111-183311, where the neighbouring rows are also yellow and the margin falls under 0.30.
+- It misses the 20261107-073204 fade-in frame.
+- It locates a row on one 20261111-194037 frame, where the board is fading out and no KILLS header is found.
+- It cannot reject another local player. Highlight alone must never post an owner read.
+
+**Decision.** Highlight plus tag gives the same held-out count as tag-only with both samples (49/50) and needs a
+lower tag gate on the highlighted row, so it is not added here. It is a candidate if a future render falls under
+0.80 on both samples.
+
+**Does the highlight explain the thin tag?** UNCONFIRMED.
+- Every owner-row tag in this data is on a highlighted row. No non-highlighted Qortrola30 row exists in the data,
+  and the personal card uses a different text size.
+- On 20261113-133025 the fill is the darkest and most saturated (value about 38, saturation about 221). The tag has
+  the thinnest strokes (mean ink run 1.76 px against 1.86-2.02 elsewhere).
+- But 20261104-162225 has a similar dark fill (value about 45) and still scores 0.94 on the shipped sample.
+- Text hue (about 30) and peak value (225-233) are the same in every match.
+- Sub-pixel placement from the capture scaler is another possible cause. It was not measured.
