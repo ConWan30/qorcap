@@ -150,22 +150,57 @@ fn check_capture_stop(dir: &Path, cps: &[Value], errors: &mut Vec<String>, warni
     warnings.push(format!("{name} is present but no checkpoint binds it (state: {state}): UNBOUND, not evidence"));
 }
 
-/// Render an untrusted string so no control character, CR, LF, or ANSI escape
-/// can reach verify-bundle stdout, stderr, or the sidecar's verify.txt.
-/// Printable text (including spaces and ordinary Unicode) is unchanged, so a
-/// valid bundle's output stays byte-identical.
+/// Unicode general category Cf (format), plus the line and paragraph separators
+/// U+2028 / U+2029 (Zl / Zp). Ranges from Unicode 15.1. Rust `char::is_control()`
+/// is Cc only and would let these through.
+fn is_unicode_format(c: char) -> bool {
+    matches!(c,
+        '\u{00AD}' |
+        '\u{0600}'..='\u{0605}' |
+        '\u{061C}' |
+        '\u{06DD}' |
+        '\u{070F}' |
+        '\u{0890}'..='\u{0891}' |
+        '\u{08E2}' |
+        '\u{180E}' |
+        '\u{200B}'..='\u{200F}' |
+        '\u{2028}'..='\u{2029}' |
+        '\u{202A}'..='\u{202E}' |
+        '\u{2060}'..='\u{2064}' |
+        '\u{2066}'..='\u{206F}' |
+        '\u{FEFF}' |
+        '\u{FFF9}'..='\u{FFFB}' |
+        '\u{110BD}' |
+        '\u{110CD}' |
+        '\u{13430}'..='\u{1343F}' |
+        '\u{1BCA0}'..='\u{1BCA3}' |
+        '\u{1D173}'..='\u{1D17A}' |
+        '\u{E0001}' |
+        '\u{E0020}'..='\u{E007F}'
+    )
+}
+
+/// Render an untrusted string so no control character, CR, LF, ANSI escape,
+/// backslash, or Unicode format character (including bidi overrides) can reach
+/// verify-bundle stdout, stderr, or the sidecar's verify.txt.
+///
+/// Backslash is emitted as `\\` first, then controls, so a literal `\n` in a
+/// name is distinct from an escaped newline. Printable text other than
+/// backslash (including spaces and ordinary Unicode) is unchanged, so a valid
+/// ASCII bundle's output stays byte-identical.
 pub fn escape_output(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         match c {
+            '\\' => out.push_str("\\\\"),
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
             '\u{1b}' => out.push_str("\\x1b"),
             '\0' => out.push_str("\\0"),
-            '\u{2028}' => out.push_str("\\u{2028}"),
-            '\u{2029}' => out.push_str("\\u{2029}"),
-            c if c.is_control() => out.push_str(&format!("\\u{{{:x}}}", c as u32)),
+            c if c.is_control() || is_unicode_format(c) => {
+                out.push_str(&format!("\\u{{{:x}}}", c as u32));
+            }
             c => out.push(c),
         }
     }
@@ -431,8 +466,8 @@ mod tests {
     fn assert_no_control_in_report(lines: &[String]) {
         for l in lines {
             assert!(
-                !l.chars().any(|c| c.is_control() || c == '\u{2028}' || c == '\u{2029}'),
-                "control or line-break in report line: {l:?}"
+                !l.chars().any(|c| c.is_control() || is_unicode_format(c)),
+                "control or format character in report line: {l:?}"
             );
         }
         let text = lines.join("\n");
@@ -450,6 +485,9 @@ mod tests {
             ("crlf", "video.mp4\r\nOK: fake"),
             ("esc", "video.mp4\u{1b}[32mOK: fake"),
             ("tab", "video.mp4\tOK: fake"),
+            ("bidi", "video.mp4\u{202e}fake"),
+            ("zwsp", "video.mp4\u{200b}fake"),
+            ("bsn", "video.mp4\\nOK: fake"),
         ];
         for (tag, name) in cases {
             let dir = scratch(&format!("inj-{tag}"));
@@ -504,7 +542,31 @@ mod tests {
         assert_eq!(escape_output("x\u{2028}OK: fake"), "x\\u{2028}OK: fake");
         assert_eq!(escape_output("\0"), "\\0");
         assert_eq!(escape_output("a\u{07}b\u{9b}c"), "a\\u{7}b\\u{9b}c");
-        let cleaned = escape_output("a\n\r\t\u{1b}[0m\u{2028}\u{2029}\0");
-        assert!(!cleaned.chars().any(|c| c.is_control() || c == '\u{2028}' || c == '\u{2029}'));
+        // A literal backslash-n in a name is distinct from an escaped newline.
+        assert_eq!(escape_output("video.mp4\\nOK: fake"), "video.mp4\\\\nOK: fake");
+        assert_ne!(escape_output("video.mp4\nOK: fake"), escape_output("video.mp4\\nOK: fake"));
+        assert_eq!(escape_output("video.mp4\u{202e}fake"), "video.mp4\\u{202e}fake");
+        assert_eq!(escape_output("video.mp4\u{200b}fake"), "video.mp4\\u{200b}fake");
+        assert_eq!(escape_output("\u{202a}\u{2066}\u{feff}"), "\\u{202a}\\u{2066}\\u{feff}");
+        let cleaned = escape_output("a\n\r\t\u{1b}[0m\u{2028}\u{2029}\0\u{202e}\u{200b}\\");
+        assert!(!cleaned.chars().any(|c| c.is_control() || is_unicode_format(c)), "{cleaned:?}");
+        assert!(cleaned.ends_with("\\\\"), "{cleaned:?}");
+        // Every Cf / Zl / Zp code point is escaped and does not appear raw.
+        const FORMAT: &[(u32, u32)] = &[
+            (0x00AD, 0x00AD), (0x0600, 0x0605), (0x061C, 0x061C), (0x06DD, 0x06DD),
+            (0x070F, 0x070F), (0x0890, 0x0891), (0x08E2, 0x08E2), (0x180E, 0x180E),
+            (0x200B, 0x200F), (0x2028, 0x2029), (0x202A, 0x202E), (0x2060, 0x2064),
+            (0x2066, 0x206F), (0xFEFF, 0xFEFF), (0xFFF9, 0xFFFB), (0x110BD, 0x110BD),
+            (0x110CD, 0x110CD), (0x13430, 0x1343F), (0x1BCA0, 0x1BCA3), (0x1D173, 0x1D17A),
+            (0xE0001, 0xE0001), (0xE0020, 0xE007F),
+        ];
+        for &(lo, hi) in FORMAT {
+            for u in lo..=hi {
+                let c = char::from_u32(u).unwrap();
+                let got = escape_output(&c.to_string());
+                assert_eq!(got, format!("\\u{{{u:x}}}"), "U+{u:04X}");
+                assert!(!got.contains(c), "U+{u:04X} leaked: {got:?}");
+            }
+        }
     }
 }
