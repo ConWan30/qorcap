@@ -342,11 +342,9 @@ fn main() {
         Cmd::Status => print_resp(api::call(cli.port, "GET", "/status", "")),
         Cmd::VerifyBundle { dir } => match qorcap::bundle::verify(std::path::Path::new(&dir)) {
             Ok(r) => {
-                println!("segments={} bytes={} checkpoints={} chain_head={}", r.segments, r.bytes, r.checkpoints, r.chain_head);
-                if let Some(h) = &r.input_head { println!("controller input chunks={} inputs_chain_head={h}", r.input_chunks); }
-                for e in &r.errors { println!("FAIL: {e}"); }
-                println!("{}", if r.errors.is_empty() { "OK: video bytes match the hash chain; checkpoints link. (Integrity + timing only; does not prove who played.)" } else { "FAILED" });
-                if r.errors.is_empty() { 0 } else { 1 }
+                let (lines, code) = qorcap::bundle::report_lines(&r);
+                for l in &lines { println!("{l}"); }
+                code
             }
             Err(e) => { eprintln!("error: {e}"); 2 }
         },

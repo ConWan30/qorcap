@@ -114,11 +114,55 @@ fn sha256_range(path: &Path, start: u64, len: u64) -> Result<String, String> {
 
 pub struct Report { pub segments: u64, pub bytes: u64, pub checkpoints: u64, pub chain_head: String, pub errors: Vec<String>,
     /// Controller input chunks verified (0 when the bundle has no inputs.jsonl).
-    pub input_chunks: u64, pub input_head: Option<String> }
+    pub input_chunks: u64, pub input_head: Option<String>,
+    /// Not failures: things a reader must not take as evidence (e.g. an unbound capture stop record).
+    pub warnings: Vec<String> }
+
+/// Practice capture stop record: a stop checkpoint that names `capture_stop_sha256` must match the file's
+/// bytes. A record file that no checkpoint binds (a stop write that failed, a crash, or a stale `state: open`
+/// file) is a warning, never an error, so older bundles still pass: it is UNBOUND and is not evidence.
+fn check_capture_stop(dir: &Path, cps: &[Value], errors: &mut Vec<String>, warnings: &mut Vec<String>) {
+    let mut bound = false;
+    for (i, c) in cps.iter().enumerate() {
+        let q = &c["qorcap"];
+        let Some(want) = q["capture_stop_sha256"].as_str() else { continue };
+        bound = true;
+        let name = q["capture_stop_file"].as_str().unwrap_or(crate::capstop::FILE_NAME);
+        match contained_file(dir, name).and_then(|p| std::fs::read(&p).map_err(|e| format!("cannot read {name}: {e}"))) {
+            Ok(bytes) => if ev::sha256_hex(&bytes) != want { errors.push(format!("checkpoint {i}: {name} SHA-256 does not match the stop checkpoint (record altered)")); },
+            Err(e) => errors.push(format!("checkpoint {i}: capture stop record: {e}")),
+        }
+    }
+    // A temp file left by an interrupted write (capstop::write_file renames it into place).
+    let tmp = format!("{}.tmp", crate::capstop::FILE_NAME);
+    if std::fs::symlink_metadata(dir.join(&tmp)).is_ok() {
+        warnings.push(format!("{tmp} is present (an interrupted capture stop record write): not evidence"));
+    }
+    if bound { return; }
+    let name = crate::capstop::FILE_NAME;
+    let Ok(p) = contained_file(dir, name) else { return };
+    let Ok(text) = std::fs::read_to_string(&p) else { return };
+    // The file is unbound, so untrusted: only `open` or `stop` is echoed, anything else prints as UNKNOWN,
+    // so its text can never add lines to verify-bundle output (or the verify.txt made from it).
+    let state = serde_json::from_str::<Value>(&text).ok()
+        .and_then(|v| v["state"].as_str().filter(|s| matches!(*s, "open" | "stop")).map(str::to_owned))
+        .unwrap_or_else(|| crate::capstop::UNKNOWN.into());
+    warnings.push(format!("{name} is present but no checkpoint binds it (state: {state}): UNBOUND, not evidence"));
+}
+
+/// The text `qorcap verify-bundle` prints for a report, one entry per line, and its exit code.
+pub fn report_lines(r: &Report) -> (Vec<String>, i32) {
+    let mut out = vec![format!("segments={} bytes={} checkpoints={} chain_head={}", r.segments, r.bytes, r.checkpoints, r.chain_head)];
+    if let Some(h) = &r.input_head { out.push(format!("controller input chunks={} inputs_chain_head={h}", r.input_chunks)); }
+    for e in &r.errors { out.push(format!("FAIL: {e}")); }
+    for w in &r.warnings { out.push(format!("WARN: {w}")); }
+    out.push(if r.errors.is_empty() { "OK: video bytes match the hash chain; checkpoints link. (Integrity + timing only; does not prove who played.)".into() } else { "FAILED".into() });
+    (out, if r.errors.is_empty() { 0 } else { 1 })
+}
 
 pub fn verify(dir: &Path) -> Result<Report, String> {
     let man = lines(&dir.join("manifest.jsonl"))?;
-    let mut r = Report { segments: 0, bytes: 0, checkpoints: 0, chain_head: GENESIS.into(), errors: vec![], input_chunks: 0, input_head: None };
+    let mut r = Report { segments: 0, bytes: 0, checkpoints: 0, chain_head: GENESIS.into(), errors: vec![], input_chunks: 0, input_head: None, warnings: vec![] };
     let mut expect_off: std::collections::HashMap<String, u64> = Default::default();
     let mut heads = std::collections::HashSet::new();
     heads.insert(GENESIS.to_string());
@@ -188,6 +232,7 @@ pub fn verify(dir: &Path) -> Result<Report, String> {
     let empty_input = crate::inputs::empty_hash();
     let mut committed = 0usize;
     if let Ok(cps) = lines(&dir.join("checkpoints.jsonl")) {
+        check_capture_stop(dir, &cps, &mut r.errors, &mut r.warnings);
         let mut prev = GENESIS.to_string();
         for (i, c) in cps.iter().enumerate() {
             match ev::check_checkpoint(c, &prev) { Ok(h) => prev = h, Err(e) => { r.errors.push(format!("checkpoint {i}: {e}")); prev = c["hash"].as_str().unwrap_or("").into(); } }
