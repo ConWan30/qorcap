@@ -51,3 +51,39 @@ def test_every_end_word_sample_held_on_screen_confirms_its_own_word():
         assert es.confirmed is not None, f.name
         assert es.confirmed["result"] == w.upper()
     assert seen > 0
+
+
+BEST_PLAY_ROOT = Path(os.environ.get("QORCAP_COD_BEST_PLAY_FRAMES", "/workspace/cod-1113b/all"))
+BEST_PLAY_LABELS = BEST_PLAY_ROOT.parent / "cal" / "labels.json"
+BEST_PLAY_TUNING = {"145809", "154154"}
+
+
+def test_best_play_title_on_held_out_tails():
+    """4 fps frames of local practice tails (other players' names on screen, so not committed).
+
+    Labels are cal/labels.json: pos = full BEST PLAY title, amb = slide-in or fade (not scored).
+    Held-out = every clip not used to build the mask.
+    """
+    import json
+    from qorcap_cod_bestplay import read_best_play
+    if not BEST_PLAY_ROOT.is_dir() or not BEST_PLAY_LABELS.is_file():
+        pytest.skip(f"box-only frames not present: {BEST_PLAY_ROOT}")
+    labels = json.loads(BEST_PLAY_LABELS.read_text(encoding="utf-8"))
+    counts = {"tp": 0, "fn": 0, "fp": 0, "tn": 0}
+    fired = set()
+    for clip in sorted(p for p in BEST_PLAY_ROOT.iterdir() if p.is_dir()):
+        if clip.name in BEST_PLAY_TUNING or clip.name not in labels:
+            continue
+        lab = labels[clip.name]
+        for i, f in enumerate(sorted(clip.glob("*.jpg"))):
+            t = i * 0.25
+            if any(a - 1e-6 <= t <= b + 1e-6 for a, b in lab["amb"]):
+                continue
+            pos = any(a - 1e-6 <= t <= b + 1e-6 for a, b in lab["pos"])
+            seen = read_best_play(cv2.imread(str(f))).seen
+            counts[("tp" if seen else "fn") if pos else ("fp" if seen else "tn")] += 1
+            if seen:
+                fired.add(clip.name)
+    assert counts["fp"] == 0, counts
+    assert counts["tp"] >= 20 and counts["fn"] <= 1, counts
+    assert fired == {"133025", "183311", "194037"}

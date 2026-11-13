@@ -51,6 +51,22 @@ The tail is measured from confirmation, not from the splash. On the splash path 
 least 8 + 12 s after the word unless the row or a second word read confirms sooner, so the end
 scoreboard that follows the splash is in the recording.
 
+Best Play stop (default on). Call of Duty shows the splash, then the end scoreboard (about 7 s),
+then a black cut, then the "Best Play of the Match" replay with a BEST PLAY title. In practice
+match-20261113-154154 the old fixed 12 s tail ended in that replay, so the board was recorded, but
+Qortrola30's row was only read while a candidate was open. After confirmation the watcher now keeps
+reading Qortrola30's row on every frame until it is read, and reads the BEST PLAY title
+(``qorcap_cod_bestplay``). It stops at the first of:
+
+- the title read on ``best_play_reads`` (2) frames in a row within 1.5 s, once the board read has had
+  its chance: Qortrola30's row was read (before or after confirmation), or ``board_floor_s`` (8 s)
+  have passed since confirmation;
+- ``best_play_max_s`` (``QORCAP_AUTOCLOSE_BEST_PLAY_MAX_S``, default 25 s, clamped 15..45) after
+  confirmation, whether or not the title was read.
+
+``QORCAP_AUTOCLOSE_BEST_PLAY=0`` keeps the older fixed tail (``tail_s``). Either way the stop reason
+stays ``post_final_tail`` (or ``final``); which rule fired is written to ``cod_end_stop.json`` only.
+
 What it is not. The trigger is a recording-control decision. It is not a final, not a score, not a
 receipt field, and not a verification input. What happened is written to qorcap.log (one
 ``stop note:`` line) and to ``cod_end_stop.json`` beside the bundle. That file is not bundle.json,
@@ -89,6 +105,17 @@ SPLASH_PAIR_MS = 1500
 CANDIDATE_WINDOW_MS = 30_000
 QUIET_MS = 8000
 RESIGHT_MS = 2000
+ENV_BEST_PLAY = "QORCAP_AUTOCLOSE_BEST_PLAY"
+ENV_BEST_PLAY_MAX = "QORCAP_AUTOCLOSE_BEST_PLAY_MAX_S"
+# Observed on five practice matches (154154, 145809, 133025, 183311, 194037): the BEST PLAY title
+# came 13.75-15.5 s after the splash and 10.4-12.7 s after confirmation (154154, 145809). The end
+# board ended 4.5-6.6 s after confirmation (same two). See docs/COD_BEST_PLAY_STOP.md.
+BOARD_FLOOR_S = 8.0
+BEST_PLAY_MAX_DEFAULT_S = 25.0
+BEST_PLAY_MAX_MIN_S = 15.0
+BEST_PLAY_MAX_MAX_S = 45.0
+BEST_PLAY_READS = 2
+BEST_PLAY_PAIR_MS = 1500
 GAMEPLAY_HUD = ("hitmarker", "kill_popup", "killfeed")
 END_WORDS = ("victory", "defeat")
 
@@ -106,6 +133,10 @@ def enabled(game, environ=None) -> bool:
         and _truthy(env.get(ENV_FLAG))
         and isinstance(lane, str) and lane.strip().lower() == "practice"
     )
+
+
+def _falsy(v) -> bool:
+    return isinstance(v, str) and v.strip().lower() in ("0", "false", "no", "off")
 
 
 def _num(raw, default, lo, hi):
@@ -133,6 +164,11 @@ class Config:
     quiet_ms: int = QUIET_MS
     resight_ms: int = RESIGHT_MS
     splash: bool = True  # False keeps only the sustained path (tests)
+    best_play: bool = True  # False keeps the older fixed tail_s after confirmation
+    board_floor_s: float = BOARD_FLOOR_S
+    best_play_max_s: float = BEST_PLAY_MAX_DEFAULT_S
+    best_play_reads: int = BEST_PLAY_READS
+    best_play_pair_ms: int = BEST_PLAY_PAIR_MS
 
     @property
     def solo_frames(self) -> int:
@@ -149,6 +185,9 @@ def config_from_env(environ=None) -> Config:
         frames=int(_num(env.get(ENV_FRAMES), FRAMES_DEFAULT, FRAMES_MIN, FRAMES_MAX)),
         arm_ms=int(_num(env.get(ENV_ARM), ARM_DEFAULT_S, 0.0, ARM_MAX_S) * 1000),
         tail_s=_num(env.get(ENV_TAIL), TAIL_DEFAULT_S, TAIL_MIN_S, TAIL_MAX_S),
+        best_play=not _falsy(env.get(ENV_BEST_PLAY)),
+        best_play_max_s=_num(env.get(ENV_BEST_PLAY_MAX), BEST_PLAY_MAX_DEFAULT_S,
+                             BEST_PLAY_MAX_MIN_S, BEST_PLAY_MAX_MAX_S),
     )
 
 
@@ -190,6 +229,11 @@ def _default_owner_reader(img):
     return read_owner_row(img)
 
 
+def _default_best_play_reader(img):
+    from qorcap_cod_bestplay import read_best_play
+    return read_best_play(img)
+
+
 def _int(v):
     return v if isinstance(v, int) and not isinstance(v, bool) else None
 
@@ -202,9 +246,20 @@ class EndStop:
     """
 
     def __init__(self, cfg: Config | None = None, clock=time.monotonic, wall=lambda: int(time.time() * 1000),
-                 owner_reader=_default_owner_reader):
+                 owner_reader=_default_owner_reader, best_play_reader=_default_best_play_reader):
         self.cfg = cfg or Config()
         self._owner_reader = owner_reader
+        self._bp_reader = best_play_reader
+        # After confirmation (Best Play rule only).
+        self.post_frames = 0
+        self.post_owner_reads = 0
+        self._post_last_t = None
+        self._post_owner_t = None
+        self._bp_pend = None
+        self._bp_best = None
+        self.best_play: dict | None = None
+        self._bp_mono = None
+        self.stop_rule: str | None = None
         self._pend = None
         self._cand = None
         self.candidates = 0
@@ -240,7 +295,10 @@ class EndStop:
         """One sampled frame. True only on the frame that confirms."""
         t = _int(t_ms)
         with self._lock:
-            if self.confirmed is not None or t is None:
+            if t is None:
+                return False
+            if self.confirmed is not None:
+                self._after_confirm(t, owner, img, source if isinstance(source, dict) else None)
                 return False
             self.frames_seen += 1
             if self._first_t is None:
@@ -387,12 +445,77 @@ class EndStop:
         self._cand = None
         return self._stamp(doc, t, src)
 
+    def _owner_any(self) -> bool:
+        c = self.confirmed or {}
+        return bool(c.get("owner_row_seen")) or self._post_owner_t is not None
+
+    def _after_confirm(self, t, owner, img, src) -> None:
+        """Frames after confirmation: keep reading Qortrola30's row until read, and the BEST PLAY title."""
+        if not self.cfg.best_play or self.best_play is not None:
+            return
+        if self._post_last_t is not None and t <= self._post_last_t:
+            return
+        self._post_last_t = t
+        self.post_frames += 1
+        if not self._owner_any():
+            if owner is None and img is not None and self._owner_reader is not None:
+                self.post_owner_reads += 1
+                try:
+                    owner = self._owner_reader(img)
+                except Exception:
+                    owner = None
+            if owner_row_seen(owner):
+                self._post_owner_t = t
+        rd = None
+        if img is not None and self._bp_reader is not None:
+            try:
+                rd = self._bp_reader(img)
+            except Exception:
+                rd = None
+        score = getattr(rd, "score", None)
+        if isinstance(score, (int, float)) and (self._bp_best is None or score > self._bp_best):
+            self._bp_best = float(score)
+        if not getattr(rd, "seen", False):
+            self._bp_pend = None  # the reads have to be on frames in a row
+            return
+        p = self._bp_pend
+        if p is not None and t - p["first"] <= self.cfg.best_play_pair_ms:
+            p["n"] += 1
+            p["min_score"] = min(p["min_score"], float(score))
+        else:
+            p = self._bp_pend = {"first": t, "n": 1, "min_score": float(score), "src": src}
+        if p["n"] < self.cfg.best_play_reads:
+            return
+        c = self.confirmed or {}
+        first_src = p["src"] or {}
+        self.best_play = {
+            "first_t_ms": p["first"],
+            "read_t_ms": t,
+            "reads": p["n"],
+            "min_score": round(p["min_score"], 4),
+            "first_frame_seq": _int(first_src.get("seq")),
+            "read_frame_seq": _int((src or {}).get("seq")),
+            "after_confirm_ms": t - c["confirm_t_ms"] if isinstance(c.get("confirm_t_ms"), int) else None,
+        }
+        self._bp_mono = float(self._clock())
+
     def stop_due(self, now: float | None = None) -> bool:
         with self._lock:
             if self._confirm_mono is None:
                 return False
             now = float(self._clock()) if now is None else float(now)
-            return now - self._confirm_mono >= self.cfg.tail_s
+            el = now - self._confirm_mono
+            if not self.cfg.best_play:
+                rule = "tail" if el >= self.cfg.tail_s else None
+            elif el >= self.cfg.best_play_max_s:
+                rule = "best_play_timeout"
+            elif self.best_play is not None and (self._owner_any() or el >= self.cfg.board_floor_s):
+                rule = "best_play"
+            else:
+                rule = None
+            if rule is not None and self.stop_rule is None:
+                self.stop_rule = rule
+            return rule is not None
 
     def tail_elapsed_s(self, now: float | None = None) -> float | None:
         with self._lock:
@@ -413,6 +536,15 @@ class EndStop:
         return (f"Call of Duty {c['result']} end screen confirmed ({c['consecutive']} splash reads, then {why} "
                 f"{c.get('follow_up_ms', 0) / 1000:.1f} s later).")
 
+    def stop_plan(self) -> str:
+        """What happens after confirmation, in one sentence."""
+        c = self.cfg
+        if not c.best_play:
+            return f"Capture continues {c.tail_s:g} s, then stops the same way as Enter."
+        return (f"Capture continues until the BEST PLAY replay title is read (not before Qortrola30's board row "
+                f"is read or {c.board_floor_s:g} s have passed), at most {c.best_play_max_s:g} s, then stops the "
+                f"same way as Enter.")
+
     def log_note(self, stop_reason: str) -> str:
         """One printable-ASCII line for qorcap.log. Practice only, info only."""
         c = self.confirmed or {}
@@ -426,7 +558,8 @@ class EndStop:
             f"follow_up {c.get('follow_up')} after {c.get('follow_up_ms')} ms",
             f"frame_seq {c.get('confirm_frame_seq')}",
             f"t_ms {c.get('confirm_t_ms')}",
-            f"tail_s {self.cfg.tail_s:g}",
+            (f"tail_s {self.cfg.tail_s:g}" if not self.cfg.best_play
+             else f"rule {self.stop_rule} best_play_t_ms {(self.best_play or {}).get('read_t_ms')}"),
             f"then {stop_reason}",
             "info only, not a final",
         ]
@@ -448,7 +581,10 @@ class EndStop:
                            "gap_ms": self.cfg.gap_ms, "arm_ms": self.cfg.arm_ms, "tail_s": self.cfg.tail_s,
                            "splash_reads": self.cfg.splash_reads, "splash_pair_ms": self.cfg.splash_pair_ms,
                            "window_ms": self.cfg.window_ms, "quiet_ms": self.cfg.quiet_ms,
-                           "resight_ms": self.cfg.resight_ms},
+                           "resight_ms": self.cfg.resight_ms, "best_play": self.cfg.best_play,
+                           "board_floor_s": self.cfg.board_floor_s, "best_play_max_s": self.cfg.best_play_max_s,
+                           "best_play_reads": self.cfg.best_play_reads,
+                           "best_play_pair_ms": self.cfg.best_play_pair_ms},
                 "confirmed": self.confirmed,
                 "auto_stopped": bool(fired),
                 "stop_reason": stop_reason,
@@ -459,6 +595,12 @@ class EndStop:
                 "splash_candidates": self.candidates,
                 "splash_candidates_cancelled": dict(self.candidates_cancelled),
                 "owner_reads_in_candidate": self.owner_reads_attempted,
+                "stop_rule": self.stop_rule,
+                "best_play": self.best_play,
+                "best_play_best_score": None if self._bp_best is None else round(self._bp_best, 4),
+                "owner_row_after_confirm_t_ms": self._post_owner_t,
+                "frames_after_confirm": self.post_frames,
+                "owner_reads_after_confirm": self.post_owner_reads,
             }
         # Atomic: a reader never sees a half-written file, and a second write replaces the first.
         path = bundle / FILE_NAME

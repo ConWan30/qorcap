@@ -186,7 +186,7 @@ def test_arm_zero_allows_an_immediate_run():
 
 def test_tail_timing_with_injected_clock():
     clk = Clock()
-    es = armed_watcher(ES.Config(tail_s=12.0), clock=clk)
+    es = armed_watcher(ES.Config(tail_s=12.0, best_play=False), clock=clk)
     assert not es.stop_due()
     feed(es, ARMED, 500, [word("defeat")] * 8, owner=row())
     assert es.confirmed is not None
@@ -199,7 +199,7 @@ def test_tail_timing_with_injected_clock():
 
 def test_confirmed_is_final_and_later_frames_do_not_move_it():
     clk = Clock()
-    es = armed_watcher(clock=clk)
+    es = armed_watcher(ES.Config(best_play=False), clock=clk)
     feed(es, ARMED, 500, [word("victory")] * 8, owner=row())
     first = dict(es.confirmed)
     clk.now += 5
@@ -218,7 +218,7 @@ def _state_with(es, final=None):
 
 def test_stop_reason_wiring_adds_time_only():
     clk = Clock()
-    es = armed_watcher(clock=clk)
+    es = armed_watcher(ES.Config(best_play=False), clock=clk)
     said = []
     st = _state_with(es)
     # Off: unchanged.
@@ -339,8 +339,14 @@ def test_attach_is_gated_and_reader_gets_the_hook():
     assert qm.attach_cod_end_stop(st, "madden", environ={"QORCAP_AUTOCLOSE": "1", "QORCAP_LANE": "practice"}) is None
     said = []
     es = qm.attach_cod_end_stop(st, "cod", environ={"QORCAP_AUTOCLOSE": "1", "QORCAP_LANE": "practice",
-                                                    "QORCAP_AUTOCLOSE_TAIL_S": "14"}, say=said.append)
+                                                    "QORCAP_AUTOCLOSE_TAIL_S": "14",
+                                                    "QORCAP_AUTOCLOSE_BEST_PLAY": "0"}, say=said.append)
     assert es is st["cod_end_stop"] and es.cfg.tail_s == 14.0 and "14 s" in said[0]
+    assert not es.cfg.best_play
+    st, said = {}, []
+    es = qm.attach_cod_end_stop(st, "cod", environ={"QORCAP_AUTOCLOSE": "1", "QORCAP_LANE": "practice"},
+                                say=said.append)
+    assert es.cfg.best_play and "BEST PLAY" in said[0] and "at most 25 s" in said[0]
 
 
 # ---------------------------------------------------------------- splash path (match-20261111-165658)
@@ -374,7 +380,7 @@ def match_165658(after_ms=40_000, hud_after=None):
 
 def test_regression_match_165658_short_splash_then_board_stops():
     clk = Clock()
-    es = ES.EndStop(ES.Config(), clock=clk, owner_reader=lambda img: row(ok=False))
+    es = ES.EndStop(ES.Config(best_play=False), clock=clk, owner_reader=lambda img: row(ok=False))
     hit = replay(es, match_165658(), img=object())
     assert hit is not None
     c = es.confirmed
@@ -604,3 +610,191 @@ def test_end_stop_write_failure_is_said_and_the_note_still_returned(tmp_path):
     note = qm.cod_end_stop_before_shutdown(st, tmp_path, "final", say=said.append)
     assert note and "then final" in note
     assert said and "cod_end_stop.json was not written" in said[0]
+
+
+# ---------------------------------------------------------------- Best Play stop (match-20261113-154154)
+
+import numpy as np  # noqa: E402
+
+import qorcap_cod_bestplay as BP  # noqa: E402
+
+TIMELINES = json.loads((FIX / "end_timelines_best_play.json").read_text(encoding="utf-8"))
+
+
+def _title_frame(dx=0, dy=0, h=720):
+    """A dark 16:9 frame with the pack's own BEST PLAY mask drawn at its 720p place (no real pixels)."""
+    pack = json.loads(BP.PACK_PATH.read_text(encoding="utf-8"))
+    mask = np.array([[255 if c == "1" else 0 for c in r] for r in pack["mask_rows"]], np.uint8)
+    big = cv2.resize(mask, None, fx=2, fy=2, interpolation=cv2.INTER_NEAREST)
+    img = np.full((720, 1280, 3), 30, np.uint8)
+    x0, y0 = pack["box_720p"]["template"][:2]
+    img[y0 + dy:y0 + dy + big.shape[0], x0 + dx:x0 + dx + big.shape[1]][big > 0] = (235, 235, 250)
+    if h != 720:
+        img = cv2.resize(img, (h * 16 // 9, h), interpolation=cv2.INTER_AREA)
+    return img
+
+
+def test_best_play_reader_on_synthetic_frames():
+    assert BP.threshold() == 0.60
+    for kw in ({}, {"dx": 12, "dy": -8}, {"dx": -20, "dy": 10}, {"h": 1080}):
+        rd = BP.read_best_play(_title_frame(**kw))
+        assert rd.seen and rd.score >= 0.9 and rd.reason == "best_play", kw
+    blank = np.full((720, 1280, 3), 30, np.uint8)
+    assert BP.read_best_play(blank) == BP.BestPlayRead(False, 0.0, "no_ink")
+    noise = np.random.default_rng(7).integers(0, 256, (720, 1280, 3), dtype=np.uint8)
+    rd = BP.read_best_play(noise)
+    assert not rd.seen and rd.score < 0.3
+    assert BP.read_best_play(np.zeros((720, 960, 3), np.uint8)).reason == "frame_size"
+    assert BP.read_best_play(object()).reason == "frame_invalid"
+    assert BP.read_best_play(None).reason == "frame_invalid"
+
+
+def _replay_timeline(m, *, best_play=True, owner_after=False, until=None):
+    """Feed one committed timeline through EndStop. Reader outputs come from the fixture, the clock is t_ms."""
+    clk = Clock()
+    cur = {}
+    clk.now = 0.0
+    bp = (lambda img: NS(seen=cur.get("bp", 0.0) >= 0.60, score=cur.get("bp", 0.0))) if best_play else None
+    es = ES.EndStop(ES.Config(), clock=clk, wall=lambda: 0,
+                    owner_reader=lambda img: row(ok=bool(cur.get("owner") or (owner_after and cur.get("board")))),
+                    best_play_reader=bp)
+    es.observe(0, None)
+    stop_t = None
+    for r in m["rows"]:
+        if until is not None and r["t_ms"] > until:
+            break
+        cur.clear()
+        cur.update(r)
+        clk.now = r["t_ms"] / 1000.0
+        es.observe(r["t_ms"], word(r["word"]) if r.get("word") else NOT_END, None, {"seq": r.get("frame")}, None, object())
+        if es.stop_due():
+            stop_t = r["t_ms"]
+            break
+    return es, stop_t
+
+
+@pytest.mark.parametrize("m", TIMELINES["matches"], ids=lambda m: m["match"])
+def test_timeline_stops_on_best_play_after_the_board(m):
+    es, stop_t = _replay_timeline(m)
+    c = es.confirmed
+    assert c is not None and c["result"] in ("VICTORY", "DEFEAT")
+    board = [r["t_ms"] for r in m["rows"] if r.get("board")]
+    titles = [r["t_ms"] for r in m["rows"] if r.get("bp", 0) >= 0.60]
+    assert board and titles and max(board) < min(titles)  # the game's own order: board, then BEST PLAY
+    assert stop_t is not None and es.stop_rule == "best_play"
+    assert stop_t >= max(board)  # never before the board was gone
+    assert stop_t >= c["confirm_t_ms"] + 8000 or es._owner_any()
+    assert stop_t - c["confirm_t_ms"] < 25_000
+    assert es.best_play["reads"] == 2 and es.best_play["read_t_ms"] == stop_t
+    assert stop_t <= m["clip_t_ms"][1]
+
+
+def test_timeline_154154_old_tail_and_new_stop():
+    m = next(x for x in TIMELINES["matches"] if x["match"] == "20261113-154154")
+    es, stop_t = _replay_timeline(m)
+    board = [r["t_ms"] for r in m["rows"] if r.get("board")]
+    # The board row was found from 608.0 s to 613.5 s (owner stage past the tag) and the old tail stop was
+    # at about 621.9 s, so the board was recorded. The new stop is the second BEST PLAY read.
+    assert (min(board), max(board)) == (608025, 613541)
+    assert m["confirm"]["stop_t_ms_actual"] > max(board)
+    assert stop_t == 620524 and stop_t - es.confirmed["confirm_t_ms"] == 10765
+
+
+@pytest.mark.parametrize("m", TIMELINES["matches"], ids=lambda m: m["match"])
+def test_timeline_without_a_title_stops_at_the_bound(m):
+    es, stop_t = _replay_timeline(m, best_play=False)
+    assert stop_t is None and es.confirmed is not None  # the clip ends before the 25 s bound
+    t0 = es.confirmed["confirm_t_ms"]
+    board_end = max(r["t_ms"] for r in m["rows"] if r.get("board"))
+    assert not es.stop_due(t0 / 1000 + 24.999)
+    assert es.stop_due(t0 / 1000 + 25.0) and es.stop_rule == "best_play_timeout"
+    assert t0 + 25_000 > board_end
+
+
+def test_title_before_the_board_floor_waits_unless_the_row_was_read():
+    clk = Clock()
+    seen = {"bp": False}
+    es = armed_watcher(ES.Config(), clock=clk)
+    es._bp_reader = lambda img: NS(seen=seen["bp"], score=0.95 if seen["bp"] else 0.1)
+    es._owner_reader = lambda img: row(ok=False)
+    feed(es, ARMED, 500, [word("defeat")] * 16)
+    assert es.confirmed is not None and es.confirmed["owner_row_seen"] is False
+    t = ARMED + 16 * 500
+    seen["bp"] = True
+    for _ in range(2):
+        clk.now += 0.5
+        es.observe(t, NOT_END, None, None, None, object())
+        t += 500
+    assert es.best_play is not None and not es.stop_due()  # 1 s after confirmation, no row read
+    clk.now += 6.999
+    assert not es.stop_due()
+    clk.now += 0.001
+    assert es.stop_due() and es.stop_rule == "best_play"
+
+
+def test_row_read_after_confirmation_lets_the_title_stop_at_once():
+    clk = Clock()
+    state = {"owner": False, "bp": False}
+    es = armed_watcher(ES.Config(), clock=clk)
+    calls = []
+    es._owner_reader = lambda img: calls.append(1) or row(ok=state["owner"])
+    es._bp_reader = lambda img: NS(seen=state["bp"], score=0.9 if state["bp"] else 0.0)
+    feed(es, ARMED, 500, [word("victory")] * 16)
+    assert es.confirmed is not None
+    t = ARMED + 20_000
+    es.observe(t, NOT_END, None, None, None, object())
+    state["owner"] = True
+    es.observe(t + 400, NOT_END, None, None, None, object())
+    assert es._post_owner_t == t + 400
+    n = len(calls)
+    state["bp"] = True
+    clk.now += 2
+    es.observe(t + 800, NOT_END, None, None, None, object())
+    es.observe(t + 1200, NOT_END, None, None, None, object())
+    assert len(calls) == n  # the row is not read again once read
+    assert es.stop_due() and es.stop_rule == "best_play"
+
+
+def test_title_reads_must_be_in_a_row():
+    clk = Clock()
+    seq = iter([True, False, True, False, True])
+    es = armed_watcher(ES.Config(), clock=clk)
+    es._owner_reader = None
+    es._bp_reader = lambda img: NS(seen=next(seq), score=0.9)
+    feed(es, ARMED, 500, [word("defeat")] * 16)
+    for i in range(5):
+        es.observe(ARMED + 20_000 + i * 300, NOT_END, None, None, None, object())
+    assert es.best_play is None
+    clk.now += 24.9
+    assert not es.stop_due()
+
+
+def test_best_play_env_and_sidecar_fields(tmp_path):
+    assert ES.config_from_env({}).best_play is True
+    assert ES.config_from_env({"QORCAP_AUTOCLOSE_BEST_PLAY": "0"}).best_play is False
+    assert ES.config_from_env({"QORCAP_AUTOCLOSE_BEST_PLAY": "off"}).best_play is False
+    assert ES.config_from_env({"QORCAP_AUTOCLOSE_BEST_PLAY_MAX_S": "5"}).best_play_max_s == 15.0
+    assert ES.config_from_env({"QORCAP_AUTOCLOSE_BEST_PLAY_MAX_S": "99"}).best_play_max_s == 45.0
+    assert ES.config_from_env({"QORCAP_AUTOCLOSE_BEST_PLAY_MAX_S": "nan"}).best_play_max_s == 25.0
+    m = next(x for x in TIMELINES["matches"] if x["match"] == "20261113-145809")
+    es, stop_t = _replay_timeline(m)
+    note = es.log_note("post_final_tail")
+    assert "rule best_play" in note and len(note) <= 240 and note.isascii()
+    assert "BEST PLAY" in es.stop_plan()
+    es.record(tmp_path, stop_reason="post_final_tail", stop_wall_ms=1, fired=True)
+    doc = json.loads((tmp_path / ES.FILE_NAME).read_text(encoding="utf-8"))
+    assert doc["stop_rule"] == "best_play" and doc["best_play"]["read_t_ms"] == stop_t
+    assert doc["config"]["best_play"] is True and doc["config"]["best_play_max_s"] == 25.0
+    assert doc["frames_after_confirm"] > 0 and doc["info_only"] is True
+
+
+def test_timelines_split_and_exclusions():
+    names = [m["match"] for m in TIMELINES["matches"]]
+    assert not any("073204" in n for n in names)
+    pack = json.loads(BP.PACK_PATH.read_text(encoding="utf-8"))
+    tuning = {s.replace("local-", "") for s in pack["source"]["tuning_sessions"]}
+    assert {m["match"] for m in TIMELINES["matches"] if m["split"] == "tuning"} == tuning
+    held = [m for m in TIMELINES["matches"] if m["split"] == "held_out"]
+    assert len(held) == 3 and not tuning & {m["match"] for m in held}
+    raw = json.dumps(TIMELINES)
+    assert "Qortrola30" not in raw and "player_tag" not in raw
