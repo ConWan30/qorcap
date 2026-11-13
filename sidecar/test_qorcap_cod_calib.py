@@ -955,3 +955,55 @@ def test_thinner_owner_tag_stays_not_read_and_says_so():
     assert H._OWNER_MIN == 0.80
     miss = H.read_owner_row(board)
     assert miss.ok is False and miss.stage == "tag_not_matched"
+
+
+def _owner_tag_rows():
+    return json.loads(H.TEXT_PACK_PATH.read_text(encoding="utf-8")).get("owner_tags", [])
+
+
+def test_owner_tag_samples_load_after_the_shipped_mask():
+    """The text supplement adds owner-tag samples of the same size. The shipped mask stays first."""
+    pack = H._pack()
+    tags = _owner_tag_rows()
+    assert len(tags) == 1 and tags[0]["source"] == "match-20261113-133025"
+    masks = H._owner_masks(pack)
+    assert len(masks) == 2
+    assert masks[0] is pack["owner_mask"]
+    assert masks[1].shape == pack["owner_mask"].shape
+    assert H._OWNER_MIN == 0.80
+
+
+def test_thin_owner_tag_sample_reads_the_synthetic_row():
+    """Synthetic board with the thin sample as the name. The shipped mask alone is under the gate.
+
+    With both samples the row reads K9 A2 D21, the same as the shipped-mask board.
+    """
+    board = _synthetic_tdm_board()
+    pack = H._pack()
+    thin = pack["owner_tag_masks"][0]
+    board[534:550, 172:238] = 0
+    _stamp(board, thin, 172, 534, (255, 255, 255))
+    search = H._value_mask(board, H._OWNER_SEARCH_VALUE)
+    alone = H._best_mask(search, pack["owner_mask"], 1.0, 0.0)
+    assert alone is not None and alone[0] < H._OWNER_MIN
+    hit = H._best_owner_hit(search, pack, 1.0)
+    assert hit is not None and (hit[1], hit[2]) == (172, 534)
+    row = H.read_owner_row(board)
+    assert row.ok and row.player_tag == "Qortrola30"
+    assert (row.kills, row.assists, row.deaths) == (9, 2, 21)
+    assert getattr(row, "stage", None) is None
+
+
+def test_thin_owner_tag_sample_does_not_read_other_letters():
+    """Synthetic. The thin sample mirrored, or with its halves swapped, is not the gamertag."""
+    pack = H._pack()
+    thin = pack["owner_tag_masks"][0]
+    half = thin.shape[1] // 2
+    for other in (thin[:, ::-1].copy(), np.concatenate([thin[:, half:], thin[:, :half]], axis=1)):
+        board = _synthetic_tdm_board()
+        board[534:550, 172:238] = 0
+        _stamp(board, other, 172, 534, (255, 255, 255))
+        assert H._best_owner_hit(H._value_mask(board, H._OWNER_SEARCH_VALUE), pack, 1.0) is None
+        miss = H.read_owner_row(board)
+        assert miss.ok is False and miss.stage == "tag_not_matched"
+        assert miss.kills is None and miss.player_tag is None
