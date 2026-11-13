@@ -84,3 +84,19 @@ def test_posted_final_requires_both_agreement_and_existing_eligibility(monkeypat
     if not feed_ok:
         assert posted[0]["agreement"]["reason"] == "killfeed_coverage_unknown"
         assert any("killfeed_coverage_unknown" in note for note in posted[0]["notes"])
+
+
+def test_owner_row_abstain_carries_the_owner_step():
+    """Synthetic reads. The abstain row names the owner step; it posts nothing."""
+    posted = []
+    runner = CodSetRunner(posted.append)
+    end = RegionRead(region="end_screen", status="read", ok=True, calibrated=True, confirm=True, reason="defeat")
+    owner = RegionRead(region="owner_row", status="not_read", ok=False, calibrated=False, reason="not_present")
+    owner.stage = "tag_not_matched"
+    runner._post_owner_end(3000, 3000, end, owner)
+    assert posted == []
+    assert runner._frame_end == {"status": "abstain", "reason": "owner_row_not_read", "owner_stage": "tag_not_matched"}
+    assert runner.owner_row_ever_read is False
+    bare = RegionRead(region="owner_row", status="not_read", ok=False, calibrated=False, reason="not_present")
+    runner._post_owner_end(3500, 3500, end, bare)
+    assert runner._frame_end == {"status": "abstain", "reason": "owner_row_not_read"}

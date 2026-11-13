@@ -1130,6 +1130,10 @@ class CodSetRunner:
         if not ready:
             self.stats["end_screen_not_read"] += 1
             self._frame_end = {"status": "abstain", "reason": "owner_row_not_read"}
+            stage = getattr(owner, "stage", None)
+            if isinstance(stage, str) and stage:
+                # Which owner-row step stopped this frame. Diagnostic only: not a score and not Counted.
+                self._frame_end["owner_stage"] = stage
             self._clear_end_candidate()
             return
         self.owner_row_ever_read = True
@@ -1920,16 +1924,24 @@ def _public_owner_row(owner: dict) -> dict:
 def session_document(*, frame_stamps=None, inputs=None, wall_anchor_ms=None, owner_row=None) -> dict:
     """Power and controller path beside the match. Not a receipt field.
 
-    ``controller_path`` is ``usb`` only when the input log header already says
-    ``usb-hid`` (the path QorCap read). Power stays ``unknown`` until a held-out
-    report map says battery versus plugged. No timing band is applied.
+    ``controller_path`` is ``usb`` only when the input log header says
+    ``usb-hid`` and the log shows the pad was read on that path: at least one
+    ``in`` report row or a ``connected`` status. A header alone is the path
+    QorCap looked on, not a path it read, so it stays ``unknown``. Power stays
+    ``unknown`` until a held-out report map says battery versus plugged. No
+    timing band is applied.
     """
     header = None
+    read = False
     for row in inputs or []:
-        if isinstance(row, dict) and row.get("type") == "header":
+        if not isinstance(row, dict):
+            continue
+        if header is None and row.get("type") == "header":
             header = row
-            break
-    path = "usb" if isinstance(header, dict) and header.get("transport") == "usb-hid" else "unknown"
+        elif row.get("type") == "in" or (row.get("type") == "status" and row.get("state") == "connected"):
+            read = True
+    usb = isinstance(header, dict) and header.get("transport") == "usb-hid"
+    path = "usb" if usb and read else "unknown"
     stamps = list(frame_stamps or [])
     doc = {
         "schema": "qorcap-cod-session/v0",

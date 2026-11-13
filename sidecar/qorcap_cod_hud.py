@@ -215,9 +215,14 @@ def _crop(img, name: str):
     return crop_box(img, _region(name))
 
 
-def _not_read(region: str, reason: str, note: str):
+def _not_read(region: str, reason: str, note: str, stage: str | None = None):
     from qorcap_cod import RegionRead
-    return RegionRead(region, "not_read", False, reason, False, note)
+    rd = RegionRead(region, "not_read", False, reason, False, note)
+    if stage:
+        # Which owner-row step stopped the read. Diagnostic only: not a score, not Counted,
+        # and not a RegionRead field, so region rows and their evidence hashes are unchanged.
+        rd.stage = stage
+    return rd
 
 
 def _present(region: str, reason: str, note: str, **kw):
@@ -1455,37 +1460,38 @@ def read_owner_row(img):
     from qorcap_cod import OWNER_TAG
     bgr = _as_bgr(img)
     if bgr is None:
-        return _not_read("owner_row", "frame_invalid", "frame could not be cropped; it is not Counted")
+        return _not_read("owner_row", "frame_invalid", "frame could not be cropped; it is not Counted", "frame_invalid")
     scale = _board_scale(bgr)
     pack = _pack()
     if scale is None or pack is None or "owner_mask" not in pack:
         return _not_read(
             "owner_row", "not_present",
-            "Qortrola30's scoreboard row was not read. It is not Counted.")
+            "Qortrola30's scoreboard row was not read. It is not Counted.",
+            "board_scale" if scale is None else "pack_missing")
     name_hit = _best_mask(_value_mask(bgr, _OWNER_SEARCH_VALUE), pack["owner_mask"], scale, _OWNER_MIN)
     if name_hit is None:
         return _not_read(
             "owner_row", "not_present",
-            "Qortrola30's scoreboard row was not read. It is not Counted.")
+            "Qortrola30's scoreboard row was not read. It is not Counted.", "tag_not_matched")
     _name_score, row_x, row_y, _row_w, row_h = name_hit
     kills_h, deaths_h, assists_h, confirms_h, personal = _owner_row_header_hits(
         bgr, scale, pack, row_x, row_y, row_h)
     if kills_h is None:
         return _not_read(
             "owner_row", "not_present",
-            "Kills were not read on Qortrola30's row. They are not Counted.")
+            "Kills were not read on Qortrola30's row. They are not Counted.", "kills_header_not_found")
     kills = _digits_for_column(bgr, kills_h, row_y, row_h, scale)
     if kills is None:
         return _not_read(
             "owner_row", "not_present",
-            "Kills were not read on Qortrola30's row. They are not Counted.")
+            "Kills were not read on Qortrola30's row. They are not Counted.", "kills_not_read")
     assists = None
     if assists_h is not None:
         assists = _digits_for_column(bgr, assists_h, row_y, row_h, scale)
         if assists is None:
             return _not_read(
                 "owner_row", "not_present",
-                "Assists are on the board and were not read. They are not Counted.")
+                "Assists are on the board and were not read. They are not Counted.", "assists_not_read")
     confirms = None
     if confirms_h is not None:
         confirms = _digits_for_column(bgr, confirms_h, row_y, row_h, scale)
@@ -1496,7 +1502,7 @@ def read_owner_row(img):
     if deaths is None:
         return _not_read(
             "owner_row", "not_present",
-            "Deaths were not read for Qortrola30. They are not Counted.")
+            "Deaths were not read for Qortrola30. They are not Counted.", "deaths_not_read")
     return _present(
         "owner_row", "owner_row",
         "Qortrola30's scoreboard row was read. Kills and deaths are that row, not a home or away score.",

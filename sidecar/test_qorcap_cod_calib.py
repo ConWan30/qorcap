@@ -905,3 +905,53 @@ def test_rebuild_writes_a_temporary_pack_only(tmp_path):
     assert H.PACK_PATH.read_bytes() == before
     raw = np.load(dest, allow_pickle=False)
     assert "assists_header_mask" not in raw.files
+
+
+def test_owner_row_not_read_names_the_step_that_stopped_it():
+    """Synthetic board only. Each missing piece names its own step; a full row has no step.
+
+    The step is diagnostic. It is not a score, it does not loosen any gate, and the
+    reason stays ``not_present`` as before.
+    """
+    board = _synthetic_tdm_board()
+    row = H.read_owner_row(board)
+    assert row.ok and getattr(row, "stage", None) is None
+    cases = {
+        "tag_not_matched": (534, 550, 172, 240),
+        "kills_not_read": (532, 548, 428, 442),
+        "assists_not_read": (532, 548, 490, 508),
+        "deaths_not_read": (532, 548, 560, 590),
+    }
+    for stage, (y0, y1, x0, x1) in cases.items():
+        cut = board.copy()
+        cut[y0:y1, x0:x1] = 0
+        miss = H.read_owner_row(cut)
+        assert miss.ok is False and miss.calibrated is False, stage
+        assert miss.reason == "not_present", stage
+        assert miss.stage == stage, (stage, miss.stage)
+        assert miss.kills is None and miss.deaths is None and miss.player_tag is None
+    no_header = board.copy()
+    pack = H._pack()
+    kh, kw = pack["kills_header_mask"].shape
+    no_header[400:400 + kh, 420:420 + kw] = 0
+    assert H.read_owner_row(no_header).stage == "kills_header_not_found"
+    strip = np.zeros((40, 1280, 3), np.uint8)
+    assert H.read_owner_row(strip).stage == "board_scale"
+
+
+def test_thinner_owner_tag_stays_not_read_and_says_so():
+    """A synthetic tag drawn thinner than the shipped mask stays under the tag gate.
+
+    The gate is unchanged. The read names the tag step, so a missed row
+    can be told apart from a missed kill or death digit.
+    """
+    board = _synthetic_tdm_board()
+    pack = H._pack()
+    thin = cv2.erode(pack["owner_mask"], np.ones((1, 2), np.uint8))
+    board[534:550, 172:238] = 0
+    _stamp(board, thin, 172, 534, (255, 255, 255))
+    hit = H._best_mask(H._value_mask(board, H._OWNER_SEARCH_VALUE), pack["owner_mask"], 1.0, 0.0)
+    assert hit is not None and hit[0] < H._OWNER_MIN
+    assert H._OWNER_MIN == 0.80
+    miss = H.read_owner_row(board)
+    assert miss.ok is False and miss.stage == "tag_not_matched"

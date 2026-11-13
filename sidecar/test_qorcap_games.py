@@ -176,7 +176,9 @@ def test_info_only_and_session_tags(tmp_path):
     far = C.clock_sync_status([1_000_000], [{"type": "in", "t_us": 9_000_000}], 1)
     assert far == C.MISMATCH
     (tmp_path / "inputs.jsonl").write_text(
-        json.dumps({"type": "header", "transport": "usb-hid", "wall_anchor_ms": 5}) + "\n", encoding="utf-8")
+        json.dumps({"type": "header", "transport": "usb-hid", "wall_anchor_ms": 5}) + "\n"
+        + json.dumps({"type": "status", "t_us": 10, "state": "connected", "detail": "DualSense (USB)"}) + "\n",
+        encoding="utf-8")
     written = C.attach_session(tmp_path)
     assert written["controller_path"] == "usb"
     assert not (tmp_path / "bundle.json").exists()
@@ -857,3 +859,18 @@ def test_scrub_reader_error_drops_bearer_unc_tilde_and_spaced_paths():
     assert "Program" not in quoted
     assert "device.cfg" not in quoted
     assert quoted == "OSError: [path] missing"
+
+
+def test_controller_path_is_not_usb_when_the_pad_was_never_read():
+    """Synthetic logs. A usb-hid header is where QorCap looked, not a path it read."""
+    header = {"type": "header", "transport": "usb-hid", "wall_anchor_ms": 1}
+    missing = {"type": "status", "t_us": 7043, "state": "missing", "detail": "no DualSense found on USB"}
+    chunk = {"type": "chunk", "seq": 0, "n": 2}
+    assert C.session_document(inputs=[header])["controller_path"] == "unknown"
+    assert C.session_document(inputs=[header, missing, chunk])["controller_path"] == "unknown"
+    connected = {"type": "status", "t_us": 9000, "state": "connected", "detail": "DualSense Edge (USB)"}
+    assert C.session_document(inputs=[header, missing, connected])["controller_path"] == "usb"
+    report = {"type": "in", "t_us": 9100, "b": 0, "r2": 0}
+    assert C.session_document(inputs=[header, report])["controller_path"] == "usb"
+    other = {"type": "header", "transport": "bluetooth"}
+    assert C.session_document(inputs=[other, report])["controller_path"] == "unknown"
