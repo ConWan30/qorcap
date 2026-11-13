@@ -4,7 +4,9 @@ The capture agent, the HID reader, the referee protocol, and the receipt are unt
 This module paints the interactive console. It never writes a controller report, never
 writes a receipt, and never decides a referee result.
 
-Gold is drawn only on a referee VERIFIED match banner (``tint_verified_banner``). A
+Gold is drawn only on a referee VERIFIED match banner (``tint_verified_banner``), and
+only when the caller passes the typed verdict ``VERIFIED``. A missing or unknown verdict
+is not gold, even if the line text starts with ``RESULT: VERIFIED``. A
 challenge card with ``referee_verified`` is drawn in neutral white (``REFEREE_CHALLENGE_COLOR``),
 not gold: a confirmed challenge is not a verified match (Con's card t3229s12405). The live
 match path never sets ``referee_verified``. Local button observation is labeled as a pad read. The words
@@ -107,7 +109,8 @@ _BUTTON_COLOR = {
 }
 
 # A referee-confirmed challenge card is neutral white, never gold. Gold marks only a
-# referee VERIFIED match (tint_verified_banner). Con's card t3229s12405.
+# referee VERIFIED match (tint_verified_banner), and only when the typed verdict is
+# VERIFIED (QorProof N2, Con's card t3230s12414). Con's card t3229s12405.
 REFEREE_CHALLENGE_COLOR = "hot"
 
 _SPINNER = "|/-\\"
@@ -152,7 +155,7 @@ def set_say_hook(fn) -> None:
     _SAY_HOOK = fn
 
 
-def emit(msg: str = "") -> None:
+def emit(msg: str = "", *, verdict: str | None = None) -> None:
     """Print to the interactive console. A live dashboard may hold the line and reprint it later."""
     hook = _SAY_HOOK
     if hook is not None:
@@ -162,19 +165,27 @@ def emit(msg: str = "") -> None:
         except Exception:
             pass
     try:
-        msg = tint_verified_banner(msg)
+        msg = tint_verified_banner(msg, verdict=verdict)
     except Exception:
         pass
     print(msg, flush=True)
 
 
-def tint_verified_banner(msg: str, env: dict | None = None, stream=None) -> str:
-    """Gold on a referee VERIFIED banner only. Other results stay uncolored."""
+def tint_verified_banner(msg: str, env: dict | None = None, stream=None, *, verdict: str | None = None) -> str:
+    """Gold only when the typed verdict is VERIFIED. A missing or unknown verdict stays uncolored.
+
+    The banner line is still selected by its usual wording so an unrelated ``say()`` that
+    accidentally carries ``verdict="VERIFIED"`` is not painted. The text prefix alone is
+    never enough: ``RESULT: VERIFIED`` with no verdict, or with any other status, stays plain.
+    """
     env = os.environ if env is None else env
     stream = sys.stdout if stream is None else stream
     if _color_level(env) == "none":
         return msg
     if not _isatty(stream):
+        return msg
+    # Fail closed: gold only on the typed VERIFIED verdict, never on a text prefix alone.
+    if verdict != "VERIFIED":
         return msg
     stripped = msg.strip()
     if stripped.startswith("RESULT: VERIFIED") or stripped.startswith("OFFICIAL RESULT: VERIFIED"):
