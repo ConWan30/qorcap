@@ -340,7 +340,7 @@ fn judge_bundle(dir: &Path, qortime: Option<&Path>, python: Option<&str>) -> Res
     if qt_status.is_empty() {
         return Err("QorTime verifier returned no status".into());
     }
-    let report = bundle::verify(dir)?;
+    let report = verify_bundle(dir)?;
     let bundle_ok = report.errors.is_empty();
     if !bundle_ok {
         eprint_bundle_errors(&report.errors);
@@ -361,16 +361,26 @@ fn judge_bundle(dir: &Path, qortime: Option<&Path>, python: Option<&str>) -> Res
     })
 }
 
+fn verify_bundle(dir: &Path) -> Result<bundle::Report, String> {
+    bundle::verify(dir).map_err(|e| bundle::escape_output(&e))
+}
+
+/// Lines clip export / sign print on stderr for a failed `verify-bundle`. File names
+/// and other untrusted text go through the same helper as verify-bundle itself.
+fn format_bundle_error_lines(errors: &[String]) -> Vec<String> {
+    errors.iter().map(|e| format!("verify-bundle: {}", bundle::escape_output(e))).collect()
+}
+
 fn eprint_bundle(dir: &Path) -> Result<(), String> {
-    let report = bundle::verify(dir)?;
+    let report = verify_bundle(dir)?;
     eprint_bundle_errors(&report.errors);
     Ok(())
 }
 
 fn eprint_bundle_errors(errors: &[String]) {
-    for e in errors {
+    for line in format_bundle_error_lines(errors) {
         // verify-bundle messages can contain file names. They stay on stderr, never in the manifest.
-        eprintln!("verify-bundle: {e}");
+        eprintln!("{line}");
     }
 }
 
@@ -571,7 +581,7 @@ fn load_span(dir: &Path, start: u64, end: u64) -> Result<Span, String> {
     if end_frame <= start_frame && end <= start {
         return Err("clip duration is zero".into());
     }
-    let report = bundle::verify(dir)?;
+    let report = verify_bundle(dir)?;
     let input_span_sha256 = input_span_hash(dir, start, end)?;
     Ok(Span {
         start_mono_ms: start,
@@ -1508,6 +1518,63 @@ mod tests {
                 assert!((d - 1.0).abs() <= 0.1, "60 fps clip of 1 s came out {d} s");
             }
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Clip export / sign print verify-bundle errors through format_bundle_error_lines.
+    /// A bidi override, ZWSP, newline, or literal backslash-n in a name cannot reach stderr raw.
+    #[test]
+    fn clip_export_escapes_verify_bundle_errors() {
+        let raw = [
+            "segment 0 (video.mp4\nOK: fake@0): SHA-256 mismatch (video bytes altered)",
+            "segment 0 (video.mp4\u{202e}fake@0): SHA-256 mismatch (video bytes altered)",
+            "segment 0 (video.mp4\u{200b}fake@0): SHA-256 mismatch (video bytes altered)",
+            "segment 0 (video.mp4\\nOK: fake@0): SHA-256 mismatch (video bytes altered)",
+        ];
+        let lines = format_bundle_error_lines(&raw.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        assert_eq!(lines.len(), 4);
+        assert_eq!(lines[0], "verify-bundle: segment 0 (video.mp4\\nOK: fake@0): SHA-256 mismatch (video bytes altered)");
+        assert_eq!(lines[1], "verify-bundle: segment 0 (video.mp4\\u{202e}fake@0): SHA-256 mismatch (video bytes altered)");
+        assert_eq!(lines[2], "verify-bundle: segment 0 (video.mp4\\u{200b}fake@0): SHA-256 mismatch (video bytes altered)");
+        assert_eq!(lines[3], "verify-bundle: segment 0 (video.mp4\\\\nOK: fake@0): SHA-256 mismatch (video bytes altered)");
+        assert_ne!(lines[0], lines[3], "a real newline and a literal backslash-n must not collide");
+        for l in &lines {
+            assert!(l.starts_with("verify-bundle: "));
+            assert!(!l.contains('\u{202e}') && !l.contains('\u{200b}') && !l.contains('\n') && !l.contains('\u{1b}'));
+            assert!(l.chars().all(|c| !c.is_control()), "{l:?}");
+        }
+        // Ordinary ASCII FAIL text is unchanged after the prefix (valid-bundle byte identity).
+        let plain = "segment 0 (video.mp4@0): SHA-256 mismatch (video bytes altered)";
+        assert_eq!(
+            format_bundle_error_lines(&[plain.to_string()]),
+            vec![format!("verify-bundle: {plain}")]
+        );
+
+        // The same helper is what eprint_bundle uses on a real failing bundle.
+        let dir = temp("clip-vb-esc");
+        let video = include_bytes!("../tests/fixtures/tiny_clip.mp4");
+        write_video_bundle(&dir, video, "DEVICE-SENTINEL-9f3a", "GAMERTAG-SENTINEL-9f3a");
+        std::fs::write(dir.join("video.mp4"), b"XXXX").unwrap();
+        let report = verify_bundle(&dir).unwrap();
+        assert!(!report.errors.is_empty(), "{:?}", report.errors);
+        let printed = format_bundle_error_lines(&report.errors);
+        assert!(!printed.is_empty() && printed.iter().all(|l| l.starts_with("verify-bundle: ")), "{printed:?}");
+        for l in &printed {
+            assert!(!l.chars().any(|c| c.is_control() || c == '\u{2028}' || c == '\u{2029}' || c == '\u{202e}' || c == '\u{200b}'), "{l:?}");
+        }
+
+        // verify() Err (the exit-2 class) is escaped before clip export/sign propagate it.
+        let missing = dir.join("no-such-bundle");
+        let err = match verify_bundle(&missing) {
+            Err(e) => e,
+            Ok(_) => panic!("expected an error for a missing bundle"),
+        };
+        let raw_err = match bundle::verify(&missing) {
+            Err(e) => e,
+            Ok(_) => panic!("expected an error for a missing bundle"),
+        };
+        assert_eq!(err, bundle::escape_output(&raw_err));
+        assert!(!err.chars().any(|c| c.is_control() || c == '\u{202e}' || c == '\u{200b}'));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
