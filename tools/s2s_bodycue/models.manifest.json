@@ -1,0 +1,35 @@
+{
+ "schema": "s2s-bodycue-models/v0",
+ "note": "Hashes only. Model files are never committed. Fetch and export with the commands in README.md.",
+ "yolox_tiny_onnx": {
+  "url": "https://github.com/Megvii-BaseDetection/YOLOX/releases/download/0.1.1rc0/yolox_tiny.onnx",
+  "sha256": "427cc366d34e27ff7a03e2899b5e3671425c262ea2291f88bb942bc1cc70b0f7",
+  "bytes": 20219662,
+  "license": "Apache-2.0",
+  "io": "images [1,3,416,416] BGR 0..255 letterboxed (pad 114); output [1,3549,85] raw, decode with strides 8/16/32"
+ },
+ "rfdetr_nano_pth": {
+  "url": "https://repo.roboflow.com/rfdetr/nano_coco/checkpoint_best_regular.pth",
+  "md5_expected_by_rfdetr": "fb6504cce7fbdc783f7a46991f07639f",
+  "sha256": "d8d6b9ee57d4d0ed2b1f305163624712a0532cb7bce0c747317984fc5457440d",
+  "bytes": 366287238,
+  "license": "Apache-2.0 (rfdetr base package)"
+ },
+ "rfdetr_nano_onnx": {
+  "sha256": "2a5f36b0e0a255fb2074c75b91b17ecef1f3ae78e0cdcd4b2e2f7688945972ea",
+  "bytes": 107826617,
+  "opset": 17,
+  "io": "input [1,3,384,384] RGB ImageNet-normalised; dets [1,300,4] cxcywh 0..1; labels [1,300,91] logits"
+ },
+ "rfdetr_nano_ir": {
+  "xml_sha256": "fb2be9f913efc1f05f70e0566c98a81d142790f292609b7289868c2785d1f0d2",
+  "bin_sha256": "f3ba2cf92ca360d1615c5c886b584b05fe46e5bcd4708b0a4d03667eddef046c",
+  "precision": "fp32 (compress_to_fp16=False)"
+ },
+ "versions": {
+  "rfdetr": "1.12.1",
+  "torch": "2.15.0+cpu",
+  "onnx": "1.23.2",
+  "openvino": "2026.4.1-22982-e213a147257-releases/2026/4"
+ }
+}
