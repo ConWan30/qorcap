@@ -20,6 +20,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import bodycue_core as core  # noqa: E402
+import pins  # noqa: E402
 
 VERSION = "s2s1-bodycue/0.1-draft"
 DEFAULT_THR = {"yolox": 0.30, "rfdetr": 0.50}  # pre-registered: YOLOX demo default / rfdetr predict default
@@ -53,6 +54,7 @@ def cpu_name() -> str:
 class Runner:
     def __init__(self, kind: str, runtime: str, model: str, threads: int = 0):
         self.kind, self.runtime = kind, runtime
+        self.pin = pins.check_model(model)  # P173-L1: sha256 vs models.manifest.json BEFORE load, fail closed
         if runtime == "onnxruntime":
             import onnxruntime as ort
             so = ort.SessionOptions()
@@ -63,6 +65,7 @@ class Runner:
             self.version = f"onnxruntime {ort.__version__}"
             self._run = lambda x: self.sess.run(None, {self.inp: x})
         elif runtime == "openvino":
+            pins.require_openvino_telemetry_opt_out()  # P173-L3
             import openvino as ov
             core_ = ov.Core()
             cfg = {"INFERENCE_PRECISION_HINT": "f32"}  # RF-DETR logits collapse in f16 (rfdetr OpenVINO docs)

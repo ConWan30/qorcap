@@ -1,0 +1,77 @@
+{
+ "schema": "s2s-bodycue-fusion-frozen/v0",
+ "frozen_at": "2026-11-13 20:55:46 CST",
+ "rule": "tuned on the 60-frame pilot only (labels-con-20261113.json); held-out-1 not used for tuning; frozen before any heldout-2 frame exists; heldout-2 is scored once with these params",
+ "params": {
+  "version": "s2s1-fusion/0.1-draft",
+  "person_thr": {
+   "yolox": 0.3,
+   "rfdetr": 0.5
+  },
+  "dedupe_iou": 0.5,
+  "min_box_h": 12,
+  "max_box_h": 300,
+  "person_cues_require_hud": true,
+  "head_region": {
+   "w_scale": 1.6,
+   "w_min": 48,
+   "up_frac": 0.45,
+   "up_min": 28,
+   "down_frac": 0.12
+  },
+  "reticle_mask": [
+   628,
+   348,
+   652,
+   372
+  ],
+  "red_hsv": {
+   "h_lo": 9,
+   "h_hi": 171,
+   "s_min": 120,
+   "v_min": 110
+  },
+  "friend_hsv": {
+   "h": [
+    78,
+    112
+   ],
+   "s_min": 90,
+   "v_min": 120
+  },
+  "green_hsv": {
+   "h": [
+    45,
+    77
+   ],
+   "s_min": 120,
+   "v_min": 120
+  },
+  "foe_red_px_min": 12,
+  "foe_red_px_max": 900,
+  "foe_ratio": 2.0,
+  "friend_px_min": 12,
+  "friend_ratio": 2.0,
+  "tag_crop_pad": 96,
+  "tag_requires_person": true,
+  "dot_plus_person": {
+   "enabled": false,
+   "person_score_min": 0.6,
+   "dots_min": 1
+  },
+  "no_rule_enabled": true
+ },
+ "tuned_on": {
+  "labels_sha256": "24080cfecedadbfb227fa1fd39b8368f4cef6621ef9fb4ea9f3bac025cd1b27a",
+  "v02_script_sha256": "7e014b24050db66546aff58f3770e196a842bb2bd3e63b761fe8d4f48bc223ef"
+ },
+ "code_sha256": {
+  "fusion_core.py": "b3e0fb5d7a0c9c474477431f836a3bb97f487fe3c17ae930aca8cc99120497b5",
+  "fuse.py": "4e6d14869304254a5b44e622ff250930a26de808d88fc540fa5cf94067d5ec3a",
+  "detect_person.py": "303d639c7db96f6205e53542240b2794423982cd16b84a70670acc6b8aeb4b16",
+  "bodycue_core.py": "f710065b412c0d0e1c58cc3aca3b59679a87427006a1e4ac416e580661f56736",
+  "pins.py": "f9059058bff69b421c6380d10096f156fdc72e4ff04bf72f3a6e01b5850acec2",
+  "models.manifest.json": "4337344dbc070d047383ad24e684ec798b1380d8a198b29eb0d2e2acd8efd47f"
+ },
+ "tuning_note": "Pilot grid (INFO, 8 positives): person thresholds yolox {0.1,0.15,0.2,0.3} x rfdetr {0.1,0.15,0.2,0.3,0.5} x dot_plus_person(min 0.6) on/off gave the same 3 TP everywhere; kept the A1 thresholds 0.30/0.50. Killcam/death views gave red-head false flags, so person cues need the v0.2 HUD gate. The only v0.2 tag flag on a no-enemy frame was off any person, so tags must sit on a person head region. Colour rule stable over foe_red_px_min {6..30}, foe_ratio {1.5..3}, up_frac {0.45,0.6}; up_frac 0.30 lost 1 TP. dot_plus_person kept off: at min 0.4 with rfdetr thr 0.4 it added 1 TP and 1 false flag; at the frozen thresholds with min 0.4 it added 0 TP and 1 false flag."
+}

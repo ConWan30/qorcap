@@ -1,6 +1,6 @@
 {
  "schema": "s2s-bodycue-models/v0",
- "note": "Hashes only. Model files are never committed. Fetch and export with the commands in README.md.",
+ "note": "Hashes only. Model files are never committed. Fetch and export with the commands in README.md. Every loader checks sha256 against this file before loading and fails closed (pins.py).",
  "yolox_tiny_onnx": {
   "url": "https://github.com/Megvii-BaseDetection/YOLOX/releases/download/0.1.1rc0/yolox_tiny.onnx",
   "sha256": "427cc366d34e27ff7a03e2899b5e3671425c262ea2291f88bb942bc1cc70b0f7",
@@ -13,7 +13,8 @@
   "md5_expected_by_rfdetr": "fb6504cce7fbdc783f7a46991f07639f",
   "sha256": "d8d6b9ee57d4d0ed2b1f305163624712a0532cb7bce0c747317984fc5457440d",
   "bytes": 366287238,
-  "license": "Apache-2.0 (rfdetr base package)"
+  "license": "Apache-2.0 (rfdetr base package)",
+  "pin_note": "P173-L2: this Roboflow URL is a mutable product path, not a release or commit URL; the bytes could change at the same URL. The sha256 here is the real pin: export_rfdetr.py, parity_rfdetr.py and detect_person.py refuse any file whose sha256 is not in this manifest before loading it (P173-L1). Independent fetch by QorProof on Nov 13 2026 matched this sha256 and the rfdetr MD5."
  },
  "rfdetr_nano_onnx": {
   "sha256": "2a5f36b0e0a255fb2074c75b91b17ecef1f3ae78e0cdcd4b2e2f7688945972ea",

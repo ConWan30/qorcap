@@ -2,14 +2,20 @@
 """Export RF-DETR Nano (pretrained COCO, Apache-2.0, `pip install rfdetr`, never rfdetr[plus]) to ONNX, then
 ONNX -> OpenVINO IR fp32. Writes a hash manifest; model files are never committed.
 
-  RF_HOME=/path/models python export_rfdetr.py --out /path/models --manifest models.json
+  python export_rfdetr.py --out /path/models --manifest models.json
 
+The .pth is fetched only if absent, then checked against the committed models.manifest.json sha256 before it is
+loaded (fail closed). OpenVINO telemetry must be opted out first (`opt_in_out --opt_out`), or the script refuses.
+A fresh export's ONNX/IR hashes are reported against the committed pins, not required to match them.
 Optional deps: torch (CPU wheel), rfdetr, onnx, openvino. CPU only.
 """
 from __future__ import annotations
 
-import argparse, hashlib, importlib.metadata, json, os, sys
+import argparse, hashlib, importlib.metadata, json, os, sys, urllib.request
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import pins  # noqa: E402
 
 
 def sha256(p) -> str:
@@ -26,12 +32,18 @@ def main(argv=None) -> int:
     ap.add_argument("--manifest", required=True)
     ap.add_argument("--opset", type=int, default=17)
     a = ap.parse_args(argv)
+    pins.require_openvino_telemetry_opt_out()  # P173-L3: refuse before any conversion call
+    pinned = json.load(open(pins.MANIFEST, encoding="utf-8"))["rfdetr_nano_pth"]
+    out = Path(a.out); out.mkdir(parents=True, exist_ok=True)
+    pth = out / "rf-detr-nano.pth"
+    if not pth.is_file():
+        # P173-L2: the Roboflow URL is a mutable product path, so the committed sha256 is the real pin.
+        urllib.request.urlretrieve(pinned["url"], pth)
+    pins.check_model(pth)  # P173-L1: sha256 vs models.manifest.json BEFORE torch/rfdetr load it, fail closed
     import openvino as ov, rfdetr, torch, onnx
     from rfdetr import RFDETRNano
     from rfdetr.assets.model_weights import ModelWeights
-    out = Path(a.out); out.mkdir(parents=True, exist_ok=True)
-    m = RFDETRNano()  # downloads to $RF_HOME (MD5-checked by rfdetr)
-    pth = Path(str(m.model_config.pretrain_weights))
+    m = RFDETRNano(pretrain_weights=str(pth.resolve()))
     asset = ModelWeights.RF_DETR_NANO
     onnx_p = Path(m.export(output_dir=str(out / "rfdetr_nano_onnx"), format="onnx", opset_version=a.opset, verbose=False))
     onnx.checker.check_model(str(onnx_p))
@@ -46,6 +58,9 @@ def main(argv=None) -> int:
                               "precision": "fp32 (compress_to_fp16=False)"},
            "versions": {"rfdetr": importlib.metadata.version("rfdetr"),
                         "torch": torch.__version__, "onnx": onnx.__version__, "openvino": ov.__version__}}
+    pin = pins.pinned_hashes()
+    rec["matches_committed_manifest"] = {"onnx": rec["rfdetr_nano_onnx"]["sha256"] in pin["file"],
+                                         "ir": (rec["rfdetr_nano_ir"]["xml_sha256"], rec["rfdetr_nano_ir"]["bin_sha256"]) in pin["ir_pair"]}
     json.dump(rec, open(a.manifest, "w"), indent=1)
     print(json.dumps(rec, indent=1))
     return 0
