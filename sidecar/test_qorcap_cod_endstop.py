@@ -798,3 +798,42 @@ def test_timelines_split_and_exclusions():
     assert len(held) == 3 and not tuning & {m["match"] for m in held}
     raw = json.dumps(TIMELINES)
     assert "Qortrola30" not in raw and "player_tag" not in raw
+
+
+def unknown_row():
+    rd = row()
+    rd.deaths = None
+    rd.deaths_status = "UNKNOWN_NO_COLUMN"
+    return rd
+
+
+def test_unknown_deaths_row_does_not_shorten_the_sustained_or_splash_stop():
+    """A row with deaths UNKNOWN waits like no row: 16 frames / 6 s, and no splash+owner_row."""
+    es = armed_watcher(SUSTAIN)
+    hit = feed(es, ARMED, 400, [word("victory")] * 20, owner=unknown_row())
+    assert hit == 15 and es.confirmed["owner_row_seen"] is False and es.confirmed["consecutive"] == 16
+    full = armed_watcher(SUSTAIN)
+    assert feed(full, ARMED, 500, [word("victory")] * 10, owner=row()) == 7
+    splash = ES.EndStop(ES.Config(), clock=Clock(), owner_reader=lambda img: unknown_row())
+    replay(splash, match_165658(), img=object())
+    assert splash.confirmed is not None and splash.confirmed["path"] != "splash+owner_row"
+
+
+def test_unknown_deaths_row_keeps_the_best_play_board_floor():
+    clk = Clock()
+    es = armed_watcher(ES.Config(), clock=clk)
+    es._bp_reader = lambda img: NS(seen=True, score=0.95)
+    es._owner_reader = lambda img: unknown_row()
+    feed(es, ARMED, 500, [word("defeat")] * 16)
+    assert es.confirmed is not None and es.confirmed["owner_row_seen"] is False
+    t = ARMED + 16 * 500
+    for _ in range(2):
+        clk.now += 0.5
+        es.observe(t, NOT_END, None, None, None, object())
+        t += 500
+    assert es.best_play is not None and es._post_owner_t is None
+    assert not es.stop_due()
+    clk.now += 6.999
+    assert not es.stop_due()
+    clk.now += 0.001
+    assert es.stop_due() and es.stop_rule == "best_play"
