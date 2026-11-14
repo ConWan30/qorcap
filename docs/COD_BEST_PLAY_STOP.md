@@ -35,6 +35,8 @@ match-20261113-211713 the card was another player's (DEATHS 27); that card now g
 `UNKNOWN_NO_COLUMN` does not shorten the stop: for `owner_row_seen` (sustained bar, splash path) and
 for the BEST PLAY board floor it counts as no row, so those frames wait for the same 16 frames / 6 s,
 the same splash resight and the same 8 s floor as a frame without the row.
+Deaths read from the personal card are logged but never Counted: the final agreement abstains with
+`scoreboard_deaths_card_provisional` until the card masks are checked on a held-out set.
 
 ## Owner-row fields
 
