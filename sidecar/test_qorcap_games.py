@@ -874,3 +874,22 @@ def test_controller_path_is_not_usb_when_the_pad_was_never_read():
     assert C.session_document(inputs=[header, report])["controller_path"] == "usb"
     other = {"type": "header", "transport": "bluetooth"}
     assert C.session_document(inputs=[other, report])["controller_path"] == "unknown"
+
+
+def test_reader_stats_owner_fields_survive_published_copy_and_stay_null_when_missing(tmp_path):
+    runner = C.CodSetRunner(lambda _e: None)
+    runner.owner_row_ever_read = True
+    runner.owner_row_good_frames = 1
+    runner.owner_row_accepted = False
+    runner.publish_reader_observation(reader_error=None, cod_signal_error=None, reader_tick=10)
+    runner.owner_row_good_frames = 5
+    runner.owner_row_accepted = True
+    published = C.reader_stats_document(runner.published_reader_observation(), reader_join="timed_out")
+    assert (published["owner_row_ever_read"], published["owner_row_good_frames"], published["owner_row_accepted"]) == (
+        True, 1, False)
+    blank = C.reader_stats_document(C._blank_observation(), reader_join="not_joined")
+    assert (blank["owner_row_ever_read"], blank["owner_row_good_frames"], blank["owner_row_accepted"]) == (
+        None, None, None)
+    bad = C.reader_stats_document({"owner_row_good_frames": True, "owner_row_accepted": 1}, reader_join="joined")
+    assert bad["owner_row_good_frames"] is None and bad["owner_row_accepted"] is None
+    assert "does not mean accepted" in published["note"]

@@ -29,6 +29,33 @@ Finding (not fixed here, UNCONFIRMED beyond one match): on 145809 the personal c
 showed the cursor-selected player (row 3), not Qortrola30 (row 5). `read_owner_row` returned deaths 18
 from that card, which is that other player's number.
 
+Follow-up (this build): card deaths are used only when the card's name matches Qortrola30. On
+match-20261113-211713 the card was another player's (DEATHS 27); that card now gives `deaths` null with
+`card_name_match` false. See `docs/GAME_SETS.md` for `deaths_status`. A row read with deaths
+`UNKNOWN_NO_COLUMN` does not shorten the stop: for `owner_row_seen` (sustained bar, splash path) and
+for the BEST PLAY board floor it counts as no row, so those frames wait for the same 16 frames / 6 s,
+the same splash resight and the same 8 s floor as a frame without the row.
+
+## Owner-row fields
+
+Four files talk about Qortrola30's row. They mean different things. None is a receipt field.
+
+| file | field | meaning |
+|---|---|---|
+| `cod_end_stop.json` | `confirmed.owner_row_seen` | The row was the read that confirmed the end screen (`splash+owner_row`, or a sustained run with the row). A row read after confirmation does not change it. A row with deaths `UNKNOWN_NO_COLUMN` does not count. |
+| `cod_end_stop.json` | `owner_row_after_confirm_t_ms` | First frame after confirmation where the row passed the per-frame read with its deaths. One frame is enough; it is not an accepted row. A row with deaths `UNKNOWN_NO_COLUMN` does not set it. |
+| `cod_reader_stats.json` | `owner_row_ever_read` | At least one frame passed the per-frame row read: tag, kills, and deaths, or deaths `UNKNOWN_NO_COLUMN` on a board with positive no-DEATHS-column evidence. Same name as before; it now also turns true on those UNKNOWN frames. It does not mean accepted. |
+| `cod_reader_stats.json` | `owner_row_good_frames` | How many frames passed that per-frame read. |
+| `cod_reader_stats.json` | `owner_row_accepted` | The row met the 3-frame / 3000 ms agreement and the owner-row consensus and was committed with the final. Only then does `cod_session.json` carry `owner_row`. |
+
+On match-20261113-211713 the row passed on one frame (t_ms 752650), 1531 ms after the stop had
+confirmed on `splash+word_again` at 751119. So `owner_row_seen` was false, `owner_row_ever_read` was
+true, and no row was accepted: the frames after it stopped at `kills_not_read` and each one clears
+the end candidate. On match-20261113-210612 the row passed on 5 frames in a row and was accepted
+(kills 14, deaths 17). Replayed through this build, those reads would give `owner_row_good_frames` 1 / `owner_row_accepted`
+false and 5 / true. `end_eval.owner_stage_detail` in `cod_signals.jsonl` names the digit check that
+failed (see `docs/GAME_SETS.md`). No gate, threshold, or agreement rule changes.
+
 ## Rule
 
 After confirmation the watcher keeps reading Qortrola30's row (until read) and the BEST PLAY title
