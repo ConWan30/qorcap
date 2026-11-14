@@ -119,6 +119,14 @@ DEATHS_COLUMN = "column"
 # Measured in that band: real Kill Confirmed / Hijack boards 0.34-0.46 (720p and 1080p
 # upscaled), the synthetic TDM DEATHS column 0.93-1.0. Without both, deaths_not_read as on main.
 _DEATHS_ABSENT_MAX = 0.55
+# Ink check cut: the row digit reader runs at 130 and its per-cell Otsu cut may go down to
+# 130 - 40 = 90 (_row_cell_thr), so digits that dim are still read down to V 90. The ink
+# check counts ink from the same lowest cut, so dimmed DEATHS digits (V 90-150) are seen.
+# A piece shorter than _ROW_INK_MIN_ROWS rows is a row edge or speck, as in _row_glyph_pieces
+# (4+ rows is not a speck there); real boards show 1-row edge lines at V 90-135.
+_ROW_DIGIT_VALUE = 130
+_ROW_INK_VALUE = _ROW_DIGIT_VALUE - 40
+_ROW_INK_MIN_ROWS = 4
 DEATHS_PERSONAL_CARD = "personal_card"
 DEATHS_UNKNOWN_NO_COLUMN = "UNKNOWN_NO_COLUMN"
 # Why deaths are UNKNOWN on a board with positive no-DEATHS-column evidence.
@@ -207,6 +215,7 @@ def _apply_text_supplement(data):
         if mask is not None:
             data["deaths_column_header_mask"] = mask
     # Mode headers that mean the board has no DEATHS column (Hijack). CONFIRMS is in the npz.
+    # Single-match and PROVISIONAL: both plus SCORE are from 211713 seq3006. No new data.
     modes = {}
     for key, label in (("mode_captures", "CAPTURES"), ("mode_data_uploaded", "DATA UPLOADED")):
         if key in headers:
@@ -1485,7 +1494,7 @@ def _digits_for_column(img, hit, row_y: int, row_h: int, scale: float, *, detail
     _score, x, _y, w, _h = hit
     text = _row_digit_string(
         img, x - int(4 * scale), x + w + int(8 * scale),
-        row_y - int(2 * scale), row_y + row_h + int(6 * scale), 130, scale, detail=detail)
+        row_y - int(2 * scale), row_y + row_h + int(6 * scale), _ROW_DIGIT_VALUE, scale, detail=detail)
     return _column_int(text, detail)
 
 
@@ -1493,7 +1502,8 @@ def _no_deaths_column_evidence(bgr, scale, pack, row_x, row_y, row_w, row_h, kil
                                assists_h=None) -> dict:
     """Positive evidence that this board has no DEATHS column. Never inferred from a miss alone."""
     out = {"positive": False, "mode_header": None, "mode_score": None, "deaths_word_max": None,
-           "unexplained_ink_x": None, "header_min": _ROW_HEADER_MIN, "deaths_absent_max": _DEATHS_ABSENT_MAX}
+           "unexplained_ink_x": None, "assists_header": assists_h is not None,
+           "ink_value": _ROW_INK_VALUE, "header_min": _ROW_HEADER_MIN, "deaths_absent_max": _DEATHS_ABSENT_MAX}
     if kills_h is None:
         return out
     _ks, _kx, ky, _kw, kh = kills_h
@@ -1532,25 +1542,33 @@ def _no_deaths_column_evidence(bgr, scale, pack, row_x, row_y, row_w, row_h, kil
         out["mode_header"], out["mode_score"] = best[0], round(best[1], 4)
     unexplained = _row_ink_outside(bgr, scale, row_x, row_y, row_w, row_h, spans)
     out["unexplained_ink_x"] = unexplained
-    out["positive"] = best is not None and worst < _DEATHS_ABSENT_MAX and unexplained == []
+    # An ASSISTS column is a TDM-style layout: the Kill Confirmed and Hijack boards seen have
+    # none. A mode word sitting where DEATHS was (edited pixels) would explain the deaths
+    # digits, so ASSISTS on the board means the column is not shown absent.
+    out["positive"] = (best is not None and worst < _DEATHS_ABSENT_MAX
+                       and unexplained == [] and assists_h is None)
     return out
 
 
-def _row_ink_outside(bgr, scale, row_x, row_y, row_w, row_h, spans) -> list:
-    """x of digit ink on the owner row that sits under no matched header.
+def _row_ink_outside(bgr, scale, row_x, row_y, row_w, row_h, spans) -> list | None:
+    """x of digit ink on the owner row that sits under no matched header, or None.
 
     A DEATHS cell whose header was occluded still has its digits, so ink that no matched
-    header (SCORE, KILLS, CONFIRMS, CAPTURES, DATA UPLOADED) accounts for means the column is
-    not shown to be absent.
+    header (SCORE, KILLS, ASSISTS, CONFIRMS, CAPTURES, DATA UPLOADED) accounts for means the
+    column is not shown to be absent. None when the row strip cannot be scanned (empty or
+    out-of-frame bounds): the caller treats that as not shown absent, never as no ink.
     """
     np = _libs()[1]
+    if np is None or bgr is None:
+        return None
     h, w = bgr.shape[:2]
-    pad = int(2 * scale)
-    x0, x1 = min(w, row_x + row_w + int(10 * scale)), min(w, row_x + int(480 * scale))
-    y0, y1 = max(0, row_y - pad), min(h, row_y + row_h + pad)
-    if x1 <= x0 or y1 <= y0:
-        return []
-    cols = np.where((_value_mask(bgr[y0:y1, x0:x1], _OWNER_SEARCH_VALUE) > 0).any(axis=0))[0]
+    x0, x1 = row_x + row_w + int(10 * scale), row_x + int(480 * scale)
+    # Same rows as a column cell read (_digits_for_column).
+    y0, y1 = row_y - int(2 * scale), row_y + row_h + int(6 * scale)
+    if x0 < 0 or y0 < 0 or x1 > w or y1 > h or x1 - x0 < 3 or y1 - y0 < 3:
+        return None
+    ink = _value_mask(bgr[y0:y1, x0:x1], _ROW_INK_VALUE) > 0
+    cols = np.where(ink.any(axis=0))[0]
     groups = []
     for c in cols.tolist():
         if groups and c - groups[-1][1] <= int(8 * scale):
@@ -1560,6 +1578,8 @@ def _row_ink_outside(bgr, scale, row_x, row_y, row_w, row_h, spans) -> list:
     slack = int(6 * scale)
     out = []
     for a, b in groups:
+        if int(ink[:, a:b + 1].any(axis=1).sum()) < _ROW_INK_MIN_ROWS:
+            continue  # a row edge or speck, not a digit
         a, b = a + x0, b + x0
         if not any(sx - slack <= a and b <= sx + sw + slack for sx, sw in spans):
             out.append(int((a + b) // 2))
