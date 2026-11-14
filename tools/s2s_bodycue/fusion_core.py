@@ -14,9 +14,12 @@ Decision rules (parameters in DEFAULT_PARAMS, frozen into FROZEN-fusion-params.j
   no       : only on positive evidence: HUD on, at least one person box, every person box friend-coloured,
              no foe-coloured head, no v0.2 tag, and zero minimap dots. It still only means "the people seen are
              friendlies and no enemy is on the map near the player"; reported separately, never imputed.
-  unknown  : everything else. Absence of evidence is never "no".
+  unknown  : everything else. Absence of evidence is never "no". A v0.2 record with a missing, None, wrong-type,
+             non-finite or negative field that the rules read is malformed and always gives unknown (P174-M1).
 """
 from __future__ import annotations
+
+import math
 
 import numpy as np
 
@@ -133,11 +136,55 @@ def tag_on_person(tag: dict, region) -> bool:
     return not (x + w <= region[0] or region[2] <= x or y + h <= region[1] or region[3] <= y)
 
 
+HUD_STATES = ("gameplay_hud", "no_minimap")
+
+
+def _finite_number(x) -> bool:
+    return isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x)
+
+
+def v02_problems(v02) -> list[str]:
+    """Schema check of every v0.2 field the decision reads (P174-M1). Empty list = well formed.
+
+    Missing, None, wrong-type, non-finite or negative values are problems. They are never read as a clean zero:
+    a malformed record can only give `unknown`."""
+    if not isinstance(v02, dict):
+        return ["v02_record_not_an_object"]
+    probs = []
+    if v02.get("hud_state") not in HUD_STATES:
+        probs.append("hud_state_missing_or_invalid")
+    md = v02.get("minimap_enemy_dots")
+    c = md.get("count") if isinstance(md, dict) else None
+    if not isinstance(md, dict):
+        probs.append("minimap_enemy_dots_missing_or_not_object")
+    elif not (isinstance(c, int) and not isinstance(c, bool)) or c < 0:
+        probs.append("minimap_dot_count_missing_nonint_or_negative")
+    it = v02.get("inworld_tag")
+    if not isinstance(it, dict):
+        probs.append("inworld_tag_missing_or_not_object")
+    else:
+        if not isinstance(it.get("gated_no_hud"), bool):
+            probs.append("inworld_tag_gated_no_hud_missing_or_not_bool")
+        tags = it.get("tags")
+        if not isinstance(tags, list):
+            probs.append("inworld_tag_tags_missing_or_not_list")
+        elif not all(isinstance(t, dict) and isinstance(t.get("strip"), (list, tuple)) and len(t["strip"]) == 4
+                     and all(_finite_number(v) for v in t["strip"]) for t in tags):
+            probs.append("inworld_tag_strip_malformed")
+    return probs
+
+
 def decide(v02: dict, persons: list[dict], hsv: np.ndarray | None, P=DEFAULT_PARAMS) -> dict:
-    """v02: one frame record of detect_enemy_v02 output. persons: merge_persons() output. hsv: full-frame HSV."""
-    hud = v02.get("hud_state") == "gameplay_hud"
-    dots = int(v02.get("minimap_enemy_dots", {}).get("count", 0))
-    tags = [] if v02.get("inworld_tag", {}).get("gated_no_hud") else v02.get("inworld_tag", {}).get("tags", [])
+    """v02: one frame record of detect_enemy_v02 output. persons: merge_persons() output. hsv: full-frame HSV.
+
+    A malformed v0.2 record (see v02_problems) returns `unknown` with the problems as reasons, never `yes`/`no`."""
+    probs = v02_problems(v02)
+    if probs:
+        return {"decision": "unknown", "enemy_flag": False, "reasons": ["malformed_v02_record: " + ", ".join(probs)],
+                "malformed": probs, "hud": None, "minimap_dots": None, "tags_near_crop": None, "persons": []}
+    hud = v02["hud_state"] == "gameplay_hud"
+    dots = v02["minimap_enemy_dots"]["count"]
+    tags = [] if v02["inworld_tag"]["gated_no_hud"] else v02["inworld_tag"]["tags"]
     near_tags = [t for t in tags if tag_near_crop(t, P)]
     reasons, people = [], []
     hud_ok = not (P["person_cues_require_hud"] and not hud)
@@ -176,5 +223,5 @@ def decide(v02: dict, persons: list[dict], hsv: np.ndarray | None, P=DEFAULT_PAR
             reasons.append(f"minimap_dots_prior x{dots} (enemy on map, not on screen)")
         if not hud:
             reasons.append("no_gameplay_hud (person cues gated)" if person_gate else "no_gameplay_hud")
-    return {"decision": decision, "enemy_flag": decision == "yes", "reasons": reasons, "hud": hud,
+    return {"decision": decision, "enemy_flag": decision == "yes", "reasons": reasons, "malformed": [], "hud": hud,
             "minimap_dots": dots, "tags_near_crop": len(near_tags), "persons": people}

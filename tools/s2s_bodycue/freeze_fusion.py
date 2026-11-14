@@ -13,6 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import fusion_core as F  # noqa: E402
 
 HERE = Path(__file__).resolve().parent
+# frozen_pin.py is deliberately absent: it holds this file's published sha256 (no hash cycle).
 CODE = ("fusion_core.py", "fuse.py", "detect_person.py", "bodycue_core.py", "pins.py", "models.manifest.json")
 
 
@@ -24,6 +25,8 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--labels", required=True); ap.add_argument("--v02-sha256", required=True)
     ap.add_argument("--tuning-note", required=True); ap.add_argument("--frozen-at", default=None)
+    ap.add_argument("--supersedes", default=None, help="previous frozen file; its params must be identical")
+    ap.add_argument("--supersede-reason", default=None)
     ap.add_argument("--out", required=True)
     a = ap.parse_args(argv)
     fz = {"schema": "s2s-bodycue-fusion-frozen/v0",
@@ -34,6 +37,12 @@ def main(argv=None) -> int:
           "tuned_on": {"labels_sha256": sha256(a.labels), "v02_script_sha256": a.v02_sha256},
           "code_sha256": {n: sha256(HERE / n) for n in CODE},
           "tuning_note": a.tuning_note}
+    if a.supersedes:
+        old_b = Path(a.supersedes).read_bytes(); old = json.loads(old_b)
+        if json.dumps(old["params"], indent=1) != json.dumps(F.DEFAULT_PARAMS, indent=1):
+            raise SystemExit("superseded params differ from DEFAULT_PARAMS; a re-freeze must not retune")
+        fz["supersedes"] = {"sha256": hashlib.sha256(old_b).hexdigest(), "frozen_at": old["frozen_at"],
+                            "params_identical": True, "reason": a.supersede_reason or ""}
     Path(a.out).write_text(json.dumps(fz, indent=1) + "\n", encoding="utf-8")
     print(sha256(a.out))
     return 0

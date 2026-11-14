@@ -15,9 +15,10 @@ an enemy-on-screen measure by itself, and no pass bar is claimed.
 | `export_rfdetr.py` | torch (CPU), rfdetr, onnx, openvino | RF-DETR Nano COCO -> ONNX (opset 17) -> OpenVINO IR fp32, hash manifest |
 | `parity_rfdetr.py` | torch, rfdetr, onnxruntime, openvino | PyTorch vs ONNX vs OpenVINO outputs and latency on crops |
 | `test_bodycue_core.py` | numpy, pytest | synthetic tests; on both CI sidecar lists |
-| `pins.py` | stdlib | P173-L1 sha256 check against `models.manifest.json` before any model load (fail closed); P173-L3 OpenVINO telemetry opt-out check |
+| `pins.py` | stdlib | P173-L1/P174-L1 role-bound sha256 pins: read once, hash, load those bytes (fail closed); manifest pinned through the frozen file; P173-L3 OpenVINO telemetry opt-out check |
+| `frozen_pin.py` | stdlib | P174-L2 published sha256 of `FROZEN-fusion-params.json` (kept outside the frozen code hashes) |
 | `fusion_core.py` | numpy | phase B fusion: v0.2 minimap dots (prior) + v0.2 in-world tag + person boxes + head-region friend/foe colour -> yes / no / unknown with reasons |
-| `fuse.py` | numpy, Pillow or OpenCV | run the frozen fusion over v0.2 + person JSONs + frames; refuses a params file whose sha256 or params differ |
+| `fuse.py` | numpy, Pillow or OpenCV | run the frozen fusion over v0.2 + person JSONs + frames; refuses a params file whose sha256 or params differ; reports malformed v0.2 records |
 | `freeze_fusion.py` | stdlib | write `FROZEN-fusion-params.json` (params + code/input hashes) |
 | `FROZEN-fusion-params.json` | | the frozen phase B params, tuned on the 60-frame pilot only |
 | `test_fusion_core.py`, `test_pins.py` | numpy, pytest | synthetic tests; on both CI sidecar lists |
@@ -35,9 +36,12 @@ venv-bodycue/bin/pip install --index-url https://download.pytorch.org/whl/cpu \
 
 ## Model pins and telemetry
 
-Every loader (`detect_person.py`, `parity_rfdetr.py`, `export_rfdetr.py`) checks the model file's sha256 (for an
-OpenVINO IR, the .xml + .bin pair) against `models.manifest.json` **before** loading it and refuses on any mismatch.
-There is no override flag. The RF-DETR .pth URL is a mutable Roboflow path (P173-L2), so the sha256 is the real pin.
+Every loader (`detect_person.py`, `parity_rfdetr.py`, `export_rfdetr.py`) reads the model file once, checks its
+sha256 against the hash for its **role** in `models.manifest.json` (`yolox_onnx`, `rfdetr_pth`, `rfdetr_onnx`,
+`ov_xml`, `ov_bin`), and loads those same bytes (the .pth via a private checked temp copy). A pinned file passed in
+the wrong role (for example the pinned ONNX as `--pth`) is refused. The manifest itself must hash to the value
+recorded in `FROZEN-fusion-params.json`, and that file must hash to `frozen_pin.FROZEN_PARAMS_SHA256`. There is no
+override flag. The RF-DETR .pth URL is a mutable Roboflow path (P173-L2), so the sha256 is the real pin.
 
 OpenVINO's model-conversion API sends anonymous telemetry unless the machine has opted out. Run this once in the
 venv before any OpenVINO step; every bodycue OpenVINO path refuses to run until the consent file reads `0`:
@@ -53,9 +57,12 @@ venv-bodycue/bin/opt_in_out --opt_out
   v0.2 HUD gate sees the minimap (death/killcam/menu views are gated).
 * `no`: only on positive evidence: HUD on, every person box friend-coloured, no tag, zero minimap dots.
 * `unknown`: everything else. Minimap dots alone never give `yes` (a dot is an enemy on the map, not on screen),
-  and absence of evidence never gives `no`.
+  and absence of evidence never gives `no`. A v0.2 record with a missing, None, wrong-type, non-finite or negative
+  field (HUD state, dot count, tag object, tag list, tag strip) gives `unknown` with a `malformed_v02_record` reason
+  (P174-M1); `fuse.py` lists such frames on stderr and in `detector.malformed_frames`.
 
-Params are tuned on the 60-frame pilot only and frozen in `FROZEN-fusion-params.json`; `fuse.py` needs its sha256.
+Params are tuned on the 60-frame pilot only and frozen in `FROZEN-fusion-params.json`; `fuse.py` checks it against
+`frozen_pin.FROZEN_PARAMS_SHA256` and parses the same bytes it hashed. `--params-sha256` is an optional extra check.
 
 ## Commands
 
@@ -66,7 +73,7 @@ python detect_person.py --kind yolox  --model models/yolox_tiny.onnx --frames RA
 python detect_person.py --kind rfdetr --model models/rfdetr_nano_onnx/rfdetr-nano.onnx --frames RAW --manifest manifest.json --out det.json
 python parity_rfdetr.py --pth models/rf-detr-nano.pth --onnx models/rfdetr_nano_onnx/rfdetr-nano.onnx --ir models/rfdetr_nano_ov/rfdetr-nano.xml \
     --frames RAW --manifest manifest.json --out parity.json
-python fuse.py --params FROZEN-fusion-params.json --params-sha256 <sha256> --v02 v02_fid.json \
+python fuse.py --params FROZEN-fusion-params.json --v02 v02_fid.json \
     --yolox det_yolox.json --rfdetr det_rfdetr.json --frames RAW --manifest manifest.json --out fused.json
 BODYCUE_MODELS=models python -m pytest -q tools/s2s_bodycue/test_bodycue_runtime.py
 ```

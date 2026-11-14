@@ -1,6 +1,6 @@
 {
  "schema": "s2s-bodycue-fusion-frozen/v0",
- "frozen_at": "2026-11-13 20:55:46 CST",
+ "frozen_at": "2026-11-13 21:21:58 CST",
  "rule": "tuned on the 60-frame pilot only (labels-con-20261113.json); held-out-1 not used for tuning; frozen before any heldout-2 frame exists; heldout-2 is scored once with these params",
  "params": {
   "version": "s2s1-fusion/0.1-draft",
@@ -66,12 +66,18 @@
   "v02_script_sha256": "7e014b24050db66546aff58f3770e196a842bb2bd3e63b761fe8d4f48bc223ef"
  },
  "code_sha256": {
-  "fusion_core.py": "b3e0fb5d7a0c9c474477431f836a3bb97f487fe3c17ae930aca8cc99120497b5",
-  "fuse.py": "4e6d14869304254a5b44e622ff250930a26de808d88fc540fa5cf94067d5ec3a",
-  "detect_person.py": "303d639c7db96f6205e53542240b2794423982cd16b84a70670acc6b8aeb4b16",
+  "fusion_core.py": "1bad3588912bf53408fa4e97c0d1d7591edab84a6afeb89334108ef108249397",
+  "fuse.py": "1d0f730b75f3b357866f872997a445c8c666fca4a2a6d4435268884081673fe8",
+  "detect_person.py": "f39928fdecc73359bb4df846664e6372f3186f83309688e5724d4c16b8601304",
   "bodycue_core.py": "f710065b412c0d0e1c58cc3aca3b59679a87427006a1e4ac416e580661f56736",
-  "pins.py": "f9059058bff69b421c6380d10096f156fdc72e4ff04bf72f3a6e01b5850acec2",
+  "pins.py": "dbafad495cb7af882dab00a84c6de96aff12ffd38e6ade774262c102b5c2da3a",
   "models.manifest.json": "4337344dbc070d047383ad24e684ec798b1380d8a198b29eb0d2e2acd8efd47f"
  },
- "tuning_note": "Pilot grid (INFO, 8 positives): person thresholds yolox {0.1,0.15,0.2,0.3} x rfdetr {0.1,0.15,0.2,0.3,0.5} x dot_plus_person(min 0.6) on/off gave the same 3 TP everywhere; kept the A1 thresholds 0.30/0.50. Killcam/death views gave red-head false flags, so person cues need the v0.2 HUD gate. The only v0.2 tag flag on a no-enemy frame was off any person, so tags must sit on a person head region. Colour rule stable over foe_red_px_min {6..30}, foe_ratio {1.5..3}, up_frac {0.45,0.6}; up_frac 0.30 lost 1 TP. dot_plus_person kept off: at min 0.4 with rfdetr thr 0.4 it added 1 TP and 1 false flag; at the frozen thresholds with min 0.4 it added 0 TP and 1 false flag."
+ "tuning_note": "Pilot grid (INFO, 8 positives): person thresholds yolox {0.1,0.15,0.2,0.3} x rfdetr {0.1,0.15,0.2,0.3,0.5} x dot_plus_person(min 0.6) on/off gave the same 3 TP everywhere; kept the A1 thresholds 0.30/0.50. Killcam/death views gave red-head false flags, so person cues need the v0.2 HUD gate. The only v0.2 tag flag on a no-enemy frame was off any person, so tags must sit on a person head region. Colour rule stable over foe_red_px_min {6..30}, foe_ratio {1.5..3}, up_frac {0.45,0.6}; up_frac 0.30 lost 1 TP. dot_plus_person kept off: at min 0.4 with rfdetr thr 0.4 it added 1 TP and 1 false flag; at the frozen thresholds with min 0.4 it added 0 TP and 1 false flag.",
+ "supersedes": {
+  "sha256": "83dddd8e145ba69b9daa4f0c7384d0eaeb4d34515b7a3c609abee75c5696372b",
+  "frozen_at": "2026-11-13 20:55:46 CST",
+  "params_identical": true,
+  "reason": "P174-M1/L1/L2 code fixes (malformed v0.2 records -> unknown; role-bound same-bytes pins; pinned manifest; published params hash constant). No retuning: params byte-identical; only code_sha256 values change."
+ }
 }

@@ -1,8 +1,12 @@
-"""S2S body cue: fail-closed model pins and OpenVINO telemetry opt-out (stdlib only).
+"""S2S body cue: fail-closed, role-bound model pins and OpenVINO telemetry opt-out (stdlib only).
 
-P173-L1: every model file is checked against the committed models.manifest.json sha256 BEFORE it is loaded.
-A file whose sha256 is not pinned there (or an OpenVINO IR whose .xml/.bin pair does not match one entry) raises
-PinError and nothing is loaded. There is no override flag.
+P173-L1 / P174-L1: every model file is read ONCE, its sha256 is compared with the hash bound to its ROLE in
+models.manifest.json, and only those same bytes are loaded (from memory, or from a private checked temp copy when
+a library needs a path). A file whose hash is not the one for its role raises PinError; there is no override.
+Roles: yolox_onnx, rfdetr_pth, rfdetr_onnx, ov_xml, ov_bin.
+
+The manifest is itself pinned: its bytes must hash to code_sha256["models.manifest.json"] recorded in
+FROZEN-fusion-params.json, whose own bytes must hash to frozen_pin.FROZEN_PARAMS_SHA256.
 
 P173-L3: OpenVINO's model-conversion API sends anonymous telemetry unless the machine has opted out
 (`opt_in_out --opt_out`, which writes "0" to the openvino_telemetry consent file). Any bodycue path that imports
@@ -10,16 +14,32 @@ openvino calls require_openvino_telemetry_opt_out() first and refuses to run unl
 """
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
+import shutil
+import tempfile
 from pathlib import Path
 
-MANIFEST = Path(__file__).resolve().parent / "models.manifest.json"
+HERE = Path(__file__).resolve().parent
+MANIFEST = HERE / "models.manifest.json"
+FROZEN = HERE / "FROZEN-fusion-params.json"
+ROLES = {
+    "yolox_onnx": ("yolox_tiny_onnx", "sha256"),
+    "rfdetr_pth": ("rfdetr_nano_pth", "sha256"),
+    "rfdetr_onnx": ("rfdetr_nano_onnx", "sha256"),
+    "ov_xml": ("rfdetr_nano_ir", "xml_sha256"),
+    "ov_bin": ("rfdetr_nano_ir", "bin_sha256"),
+}
 
 
 class PinError(RuntimeError):
     pass
+
+
+def sha256_bytes(b: bytes) -> str:
+    return hashlib.sha256(b).hexdigest()
 
 
 def sha256_file(p) -> str:
@@ -30,38 +50,86 @@ def sha256_file(p) -> str:
     return h.hexdigest()
 
 
-def pinned_hashes(manifest=MANIFEST) -> dict:
-    """{kind: set(sha256)} from the manifest: 'file' for single files, 'ir_pair' for (xml, bin) tuples."""
-    m = json.load(open(manifest, encoding="utf-8"))
-    files, pairs = set(), set()
-    for k, v in m.items():
-        if not isinstance(v, dict):
-            continue
-        if "sha256" in v:
-            files.add(v["sha256"])
-        if "xml_sha256" in v and "bin_sha256" in v:
-            pairs.add((v["xml_sha256"], v["bin_sha256"]))
-    return {"file": files, "ir_pair": pairs}
+def _no_dupes(pairs):
+    d = {}
+    for k, v in pairs:
+        if k in d:
+            raise PinError(f"duplicate JSON key {k!r}")
+        d[k] = v
+    return d
 
 
-def check_model(path, manifest=MANIFEST) -> dict:
-    """Fail closed unless `path` (or an .xml with its sibling .bin) is pinned. Returns the hashes on success."""
+def parse_json_bytes(b: bytes):
+    return json.loads(b.decode("utf-8"), object_pairs_hook=_no_dupes)
+
+
+def read_frozen(path=None, expected_sha=None) -> dict:
+    """Read FROZEN-fusion-params.json once, require its published sha256, parse those same bytes."""
+    if expected_sha is None:
+        from frozen_pin import FROZEN_PARAMS_SHA256 as expected_sha  # noqa: N811
+    b = Path(path or FROZEN).read_bytes()
+    got = sha256_bytes(b)
+    if got != expected_sha:
+        raise PinError(f"frozen params sha256 {got[:12]}… != published {str(expected_sha)[:12]}…; refusing")
+    return parse_json_bytes(b)
+
+
+def load_manifest(manifest=None, expected_sha=None) -> dict:
+    """Manifest bytes must hash to the value recorded in the frozen file (or `expected_sha`), read once."""
+    if expected_sha is None:
+        expected_sha = read_frozen()["code_sha256"]["models.manifest.json"]
+    b = Path(manifest or MANIFEST).read_bytes()
+    got = sha256_bytes(b)
+    if got != expected_sha:
+        raise PinError(f"models.manifest.json sha256 {got[:12]}… is not the frozen one; refusing")
+    return parse_json_bytes(b)
+
+
+def role_hash(manifest: dict, role: str) -> str:
+    if role not in ROLES:
+        raise PinError(f"unknown model role {role!r}")
+    key, field = ROLES[role]
+    try:
+        h = manifest[key][field]
+    except (KeyError, TypeError):
+        raise PinError(f"manifest has no {key}.{field} for role {role}") from None
+    if not isinstance(h, str) or len(h) != 64:
+        raise PinError(f"manifest hash for role {role} is malformed")
+    return h
+
+
+def read_pinned(path, role: str, manifest: dict | None = None) -> bytes:
+    """Read the file once; return its bytes only if they hash to the pin for `role`. Fail closed otherwise."""
+    m = load_manifest() if manifest is None else manifest
+    want = role_hash(m, role)
     p = Path(path)
     if not p.is_file():
         raise PinError(f"model file missing: {p.name}")
-    pins = pinned_hashes(manifest)
-    if p.suffix.lower() == ".xml":
-        b = p.with_suffix(".bin")
-        if not b.is_file():
-            raise PinError(f"OpenVINO IR weights missing: {b.name}")
-        pair = (sha256_file(p), sha256_file(b))
-        if pair not in pins["ir_pair"]:
-            raise PinError(f"OpenVINO IR {p.name} (+.bin) is not pinned in {Path(manifest).name}; refusing to load")
-        return {"xml_sha256": pair[0], "bin_sha256": pair[1]}
-    h = sha256_file(p)
-    if h not in pins["file"]:
-        raise PinError(f"{p.name} sha256 {h[:12]}… is not pinned in {Path(manifest).name}; refusing to load")
-    return {"sha256": h}
+    b = p.read_bytes()
+    if sha256_bytes(b) != want:
+        raise PinError(f"{p.name} is not the pinned {role} (sha256 {sha256_bytes(b)[:12]}…); refusing to load")
+    return b
+
+
+def read_pinned_ir(xml_path, manifest: dict | None = None) -> tuple[bytes, bytes]:
+    m = load_manifest() if manifest is None else manifest
+    x = Path(xml_path)
+    return read_pinned(x, "ov_xml", m), read_pinned(x.with_suffix(".bin"), "ov_bin", m)
+
+
+@contextlib.contextmanager
+def pinned_copy(path, role: str, manifest: dict | None = None, name: str | None = None):
+    """For libraries that need a path: write the checked bytes to a private temp dir, yield that path, delete it."""
+    b = read_pinned(path, role, manifest)
+    d = tempfile.mkdtemp(prefix="bodycue-pin-")
+    try:
+        os.chmod(d, 0o700)
+        q = Path(d) / (name or Path(path).name)
+        q.write_bytes(b)
+        del b
+        yield q
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
 
 
 def openvino_consent_file() -> Path | None:

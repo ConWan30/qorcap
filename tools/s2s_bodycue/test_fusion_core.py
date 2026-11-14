@@ -126,3 +126,55 @@ def test_committed_frozen_params_equal_defaults():
     fz = json.load(open(HERE / "FROZEN-fusion-params.json", encoding="utf-8"))
     assert fz["params"] == F.DEFAULT_PARAMS
     assert fz["schema"] == "s2s-bodycue-fusion-frozen/v0"
+
+
+MALFORMED = {
+    "missing_count": lambda r: r["minimap_enemy_dots"].pop("count"),
+    "nan_count": lambda r: r["minimap_enemy_dots"].__setitem__("count", float("nan")),
+    "none_count": lambda r: r["minimap_enemy_dots"].__setitem__("count", None),
+    "negative_count": lambda r: r["minimap_enemy_dots"].__setitem__("count", -1),
+    "bool_count": lambda r: r["minimap_enemy_dots"].__setitem__("count", False),
+    "float_count": lambda r: r["minimap_enemy_dots"].__setitem__("count", 0.0),
+    "missing_dots_object": lambda r: r.pop("minimap_enemy_dots"),
+    "missing_tags": lambda r: r["inworld_tag"].pop("tags"),
+    "tags_none": lambda r: r["inworld_tag"].__setitem__("tags", None),
+    "bad_tag_strip": lambda r: r["inworld_tag"].__setitem__("tags", [{"strip": [1, 2, float("inf"), 4]}]),
+    "missing_tag_object": lambda r: r.pop("inworld_tag"),
+    "missing_gated_flag": lambda r: r["inworld_tag"].pop("gated_no_hud"),
+    "missing_minimap_flag": lambda r: r.pop("hud_state"),
+    "invalid_minimap_flag": lambda r: r.__setitem__("hud_state", True),
+}
+
+
+@pytest.mark.parametrize("case", sorted(MALFORMED))
+def test_malformed_v02_record_is_unknown_never_no(case):
+    """P174-M1: a friend-coloured person would give `no` on a clean record; a broken field must give unknown."""
+    img = paint_head(frame(), BOX, CYAN)
+    hsv = F.bgr_to_hsv(img)
+    ps = F.merge_persons([], [person(BOX)], F.DEFAULT_PARAMS)
+    assert F.decide(v02(), ps, hsv)["decision"] == "no"
+    rec = v02(); MALFORMED[case](rec)
+    r = F.decide(rec, ps, hsv)
+    assert r["decision"] == "unknown" and r["enemy_flag"] is False and r["malformed"]
+    assert r["reasons"][0].startswith("malformed_v02_record")
+
+
+def test_malformed_record_cannot_give_yes_either():
+    img = paint_head(frame(), BOX, RED)
+    ps = F.merge_persons([], [person(BOX)], F.DEFAULT_PARAMS)
+    rec = v02(); rec["minimap_enemy_dots"].pop("count")
+    assert F.decide(rec, ps, F.bgr_to_hsv(img))["decision"] == "unknown"
+    assert F.decide("not a dict", ps, F.bgr_to_hsv(img))["malformed"] == ["v02_record_not_an_object"]
+
+
+def test_fuse_load_params_pins_published_hash_and_parses_the_same_bytes(tmp_path):
+    import fuse
+    from frozen_pin import FROZEN_PARAMS_SHA256
+    fz, sha = fuse.load_params(HERE / "FROZEN-fusion-params.json")
+    assert sha == FROZEN_PARAMS_SHA256 and fz["params"] == F.DEFAULT_PARAMS
+    other = tmp_path / "f.json"
+    other.write_bytes((HERE / "FROZEN-fusion-params.json").read_bytes() + b"\n")
+    with pytest.raises(SystemExit):
+        fuse.load_params(other)
+    with pytest.raises(SystemExit):
+        fuse.load_params(HERE / "FROZEN-fusion-params.json", "0" * 64)

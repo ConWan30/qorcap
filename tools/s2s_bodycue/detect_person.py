@@ -54,13 +54,24 @@ def cpu_name() -> str:
 class Runner:
     def __init__(self, kind: str, runtime: str, model: str, threads: int = 0):
         self.kind, self.runtime = kind, runtime
-        self.pin = pins.check_model(model)  # P173-L1: sha256 vs models.manifest.json BEFORE load, fail closed
+        # P173-L1 / P174-L1: read once, check the hash bound to this role, load those same bytes. Fail closed.
+        role = {("yolox", "onnxruntime"): "yolox_onnx", ("rfdetr", "onnxruntime"): "rfdetr_onnx",
+                ("rfdetr", "openvino"): "ov_xml"}.get((kind, runtime))
+        if role is None:
+            raise pins.PinError(f"no pinned model role for {kind} on {runtime}")
+        if runtime == "openvino":
+            xml_b, bin_b = pins.read_pinned_ir(model)
+            self.pin = {"role": role, "xml_sha256": pins.sha256_bytes(xml_b), "bin_sha256": pins.sha256_bytes(bin_b)}
+        else:
+            model_b = pins.read_pinned(model, role)
+            self.pin = {"role": role, "sha256": pins.sha256_bytes(model_b)}
         if runtime == "onnxruntime":
             import onnxruntime as ort
             so = ort.SessionOptions()
             if threads:
                 so.intra_op_num_threads = threads
-            self.sess = ort.InferenceSession(model, so, providers=["CPUExecutionProvider"])
+            self.sess = ort.InferenceSession(model_b, so, providers=["CPUExecutionProvider"])
+            del model_b
             self.inp = self.sess.get_inputs()[0].name
             self.version = f"onnxruntime {ort.__version__}"
             self._run = lambda x: self.sess.run(None, {self.inp: x})
@@ -71,7 +82,9 @@ class Runner:
             cfg = {"INFERENCE_PRECISION_HINT": "f32"}  # RF-DETR logits collapse in f16 (rfdetr OpenVINO docs)
             if threads:
                 cfg["INFERENCE_NUM_THREADS"] = threads
-            self.cm = core_.compile_model(model, "CPU", cfg)
+            ovm = core_.read_model(model=xml_b, weights=ov.Tensor(np.frombuffer(bin_b, np.uint8).copy()))
+            del xml_b, bin_b
+            self.cm = core_.compile_model(ovm, "CPU", cfg)
             self.req = self.cm.create_infer_request()
             self.version = f"openvino {ov.__version__}"
             outs = self.cm.outputs
@@ -146,7 +159,7 @@ def main(argv=None) -> int:
            "note": "per crop, excludes image decode; this host only. MyTurn latency UNMEASURED."}
     out = {"schema": core.SCHEMA,
            "detector": {"name": f"coco_person_zeroshot_{a.kind}", "version": VERSION, "kind": a.kind,
-                        "runtime": run.version, "model_sha256": sha256(a.model), "model_file": os.path.basename(a.model),
+                        "runtime": run.version, "model_sha256": run.pin.get("sha256") or run.pin["xml_sha256"], "model_pin": run.pin, "model_file": os.path.basename(a.model),
                         "script_sha256": sha256(__file__), "core_sha256": sha256(core.__file__),
                         "params": {"crop": a.crop, "crop_size": core.CROP, "classes": [a.classes], "thr": thr,
                                    "enemy_flag": "any person box >= thr in crop", "foe": "foe_unknown (phase B)"}},

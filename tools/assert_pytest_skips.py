@@ -215,8 +215,8 @@ WINDOWS_FILES = (
 # Collect-only of these lists after the tail tests in sidecar/test_post_final_tail.py.
 # Main e00d374, including the guard tests, collected 596 linux / 578 windows.
 # Re-collect after any list or test change.
-LINUX_MIN_COLLECTED = 1084
-WINDOWS_MIN_COLLECTED = 1065
+LINUX_MIN_COLLECTED = 1108
+WINDOWS_MIN_COLLECTED = 1089
 
 # Absent from both sidecar suites. A reason is required; whitespace does not count.
 EXCLUDED_TEST_FILES = {
