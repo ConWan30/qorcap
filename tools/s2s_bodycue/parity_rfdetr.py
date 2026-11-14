@@ -8,7 +8,8 @@ Per crop and runtime pair: max |diff| of boxes (cxcywh, 0..1) and of sigmoid sco
 cells (query order can differ when two-stage top-k scores tie, so this per-query number is an upper bound),
 order-free matched detections >= 0.3, per-query top-1 class agreement, and agreement of the highest-scoring (query, class). Latency is the
 model call only (batch 1, after warm-up), median and p95, on this host. Optional deps: torch, rfdetr, onnxruntime,
-openvino, Pillow.
+openvino, Pillow. All three model files must match models.manifest.json (checked before load); the .pth is
+never downloaded by this script; OpenVINO telemetry must be opted out.
 """
 from __future__ import annotations
 
@@ -20,6 +21,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import bodycue_core as core  # noqa: E402
 from detect_person import cpu_name, read_bgr, sha256  # noqa: E402
+import pins  # noqa: E402
 
 
 def matched_dets(da, la, db, lb, thr: float = 0.3):
@@ -41,15 +43,25 @@ def matched_dets(da, la, db, lb, thr: float = 0.3):
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--onnx", required=True); ap.add_argument("--ir", required=True)
+    ap.add_argument("--pth", required=True, help="local RF-DETR Nano .pth; pinned, never downloaded here")
     ap.add_argument("--frames", required=True); ap.add_argument("--manifest", required=True)
     ap.add_argument("--warmup", type=int, default=3); ap.add_argument("--out", required=True)
     a = ap.parse_args(argv)
+    # P173-L1 / P174-L1: role-bound pins, checked before any load; the same checked bytes are loaded.
+    man_ = pins.load_manifest()
+    onnx_b = pins.read_pinned(a.onnx, "rfdetr_onnx", man_)
+    xml_b, bin_b = pins.read_pinned_ir(a.ir, man_)
+    pins.require_openvino_telemetry_opt_out()  # P173-L3
     import onnxruntime as ort, openvino as ov, torch
     from rfdetr import RFDETRNano
-    m = RFDETRNano()
+    with pins.pinned_copy(a.pth, "rfdetr_pth", man_, name="rf-detr-nano.pth") as pth:
+        m = RFDETRNano(pretrain_weights=str(pth))  # P173-I2: local pinned file, no download
     net = m.model.model.eval()
-    sess = ort.InferenceSession(a.onnx, providers=["CPUExecutionProvider"]); iname = sess.get_inputs()[0].name
-    cm = ov.Core().compile_model(a.ir, "CPU", {"INFERENCE_PRECISION_HINT": "f32"}); req = cm.create_infer_request()
+    sess = ort.InferenceSession(onnx_b, providers=["CPUExecutionProvider"]); iname = sess.get_inputs()[0].name
+    core_ = ov.Core()
+    ovm = core_.read_model(model=xml_b, weights=ov.Tensor(np.frombuffer(bin_b, np.uint8).copy()))
+    cm = core_.compile_model(ovm, "CPU", {"INFERENCE_PRECISION_HINT": "f32"}); req = cm.create_infer_request()
+    del onnx_b, xml_b, bin_b
 
     def run_pt(x):
         with torch.no_grad():
