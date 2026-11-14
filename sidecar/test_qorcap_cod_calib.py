@@ -1084,10 +1084,55 @@ def test_owner_missing_column_detail(column):
         assert not row.ok
         assert row.stage_detail == {"column": "kills", "check": "missing_column", "header_min": H._ROW_HEADER_MIN}
         return
-    # No DEATHS column and no personal card: kills stay read, deaths are UNKNOWN, never guessed.
-    assert row.ok and row.kills == 9 and row.deaths is None
-    assert row.deaths_status == H.DEATHS_UNKNOWN_NO_COLUMN and row.card_name_match is None
-    assert row.deaths_detail["check"] == "missing_column_and_personal_label"
+    # A missed DEATHS header is not evidence of no column: same refusal as main.
+    assert not row.ok and row.stage == "deaths_not_read"
+    assert row.stage_detail["check"] == "deaths_column_not_shown_absent"
+
+
+def _up_cubic(img):
+    # INTER_LINEAR 1080p upscales miss the row tag on the synthetic board; cubic keeps it.
+    return cv2.resize(img, (1920, 1080), interpolation=cv2.INTER_CUBIC)
+
+
+@pytest.mark.parametrize("res", ["720p", "1080p"])
+@pytest.mark.parametrize("hide", [0.5, 1.0])
+@pytest.mark.parametrize("mode_header", [False, True])
+def test_occluded_deaths_header_with_digits_never_claims_no_column(res, hide, mode_header):
+    """TDM board, DEATHS header half or fully blanked, deaths 21 still on the row.
+
+    Even with a CONFIRMS header pasted on the board, the unexplained deaths digits keep it
+    from being called a no-DEATHS board. The row fails as on main.
+    """
+    pack = H._pack()
+    board = _synthetic_tdm_board()
+    if mode_header:
+        _stamp(board, pack["confirms_header_mask"], 600, 400, (255, 255, 255))
+    h, w = pack["deaths_column_header_mask"].shape
+    board[403:403 + h, 560:560 + int(w * hide)] = 0
+    img = board if res == "720p" else _up_cubic(board)
+    row = H.read_owner_row(img)
+    assert not row.ok and row.stage == "deaths_not_read" and row.deaths is None
+    assert row.stage_detail["check"] == "deaths_column_not_shown_absent"
+    assert getattr(row, "deaths_status", None) is None
+    if mode_header:
+        assert row.stage_detail["mode_header"] == "CONFIRMS"
+        assert row.stage_detail["unexplained_ink_x"]  # the deaths digits
+
+
+@pytest.mark.parametrize("name, mode", [
+    ("owner_card_214647_crop.png", "CONFIRMS"), ("owner_card_211713_crop.png", "CAPTURES")])
+def test_mode_header_boards_give_positive_no_column_evidence(name, mode):
+    board = _padded_crop(name)
+    scale = H._board_scale(board)
+    pack = H._pack()
+    hit = H._best_owner_hit(H._value_mask(board, H._OWNER_SEARCH_VALUE), pack, scale)
+    _s, rx, ry, rw, rh = hit
+    kills_h, deaths_h, assists_h, confirms_h, _p = H._owner_row_header_hits(board, scale, pack, rx, ry, rh)
+    assert deaths_h is None
+    ev = H._no_deaths_column_evidence(board, scale, pack, rx, ry, rw, rh, kills_h, confirms_h, assists_h)
+    assert ev["positive"] is True and ev["unexplained_ink_x"] == []
+    assert ev["mode_header"] in (mode, "DATA UPLOADED") and ev["mode_score"] >= H._ROW_HEADER_MIN
+    assert ev["deaths_word_max"] < H._DEATHS_ABSENT_MAX
 
 
 def test_owner_diagnostics_leave_existing_fixture_decisions_identical(monkeypatch):
@@ -1127,11 +1172,18 @@ def test_kill_confirmed_board_without_deaths_column_reads_kills_and_unknown_deat
     assert row.card_name_match is True and row.card_name_score >= H._OWNER_MIN
     assert row.deaths_detail["source"] == "personal_card"
     assert row.deaths_detail["check"] == "glyph_gate" and row.deaths_detail["margin_failed"] is True
-    assert "UNKNOWN" in row.note and "not zero" in row.note
+    assert row.deaths_unknown_reason == H.DEATHS_REASON_CARD_DIGITS
+    assert row.no_column_evidence["mode_header"] == "CONFIRMS"
+    assert "UNKNOWN" in row.note and "not zero" in row.note and "mode header" in row.note
 
 
 def test_enemy_personal_card_deaths_are_never_used(monkeypatch):
-    """211713: the card is HFAutomaton's (ELIMINATIONS 40, DEATHS 27). Kills are forced for this test only."""
+    """211713 board (Hijack). The card's name, eliminations and deaths are synthetic here.
+
+    The real card named another player (DEATHS 27); that frame stays on the box. The crop has a
+    made-up name and canonical-mask digits 40 / 27 in the same places. Kills are forced for
+    this test only (the real kills fail the margin gate).
+    """
     board = _padded_crop("owner_card_211713_crop.png")
     scale = H._board_scale(board)
     pack = H._pack()
@@ -1153,6 +1205,8 @@ def test_enemy_personal_card_deaths_are_never_used(monkeypatch):
     assert row.deaths_status == H.DEATHS_UNKNOWN_NO_COLUMN
     assert row.card_name_match is False and row.card_name_score < H._OWNER_MIN
     assert row.deaths_detail["check"] == "card_not_owner"
+    assert row.deaths_unknown_reason == H.DEATHS_REASON_CARD_NAME
+    assert row.no_column_evidence["mode_header"] in ("CAPTURES", "DATA UPLOADED")
 
 
 def test_matching_card_deaths_are_used_only_without_a_deaths_column(monkeypatch):
@@ -1169,6 +1223,7 @@ def test_matching_card_deaths_are_used_only_without_a_deaths_column(monkeypatch)
     row = H.read_owner_row(blank)
     assert row.ok and row.kills == 13 and row.deaths is None
     assert row.deaths_status == H.DEATHS_UNKNOWN_NO_COLUMN and row.card_name_match is False
+    assert row.deaths_unknown_reason == H.DEATHS_REASON_CARD_NAME
     # A DEATHS column on the board: the card is never consulted.
     monkeypatch.setattr(H, "_card_owner_match", lambda *a, **kw: pytest.fail("card read on a column board"))
     tdm = H.read_owner_row(_synthetic_tdm_board())
@@ -1202,3 +1257,55 @@ def test_consensus_accepts_five_unknown_deaths_frames():
     probe = C._summarize_end_frame(board)
     assert probe["owner_row"]["kills"] == 17 and probe["owner_row"]["deaths"] is None
     assert probe["owner_row"]["deaths_status"] == H.DEATHS_UNKNOWN_NO_COLUMN
+    assert probe["owner_row"]["deaths_unknown_reason"] == H.DEATHS_REASON_CARD_DIGITS
+
+
+_CARD_SEGS = ((0, 4), (6, 10), (14, 17), (20, 24), (27, 30), (32, 36), (39, 42), (45, 50), (52, 56), (58, 62))
+
+
+def _look_alike(drop=(), shift=0, shift_from=0):
+    """Qortrola30's card mask with glyphs removed or spaced apart. Synthetic, no other player's name."""
+    mask = H._pack()["owner_card_masks"][0].copy()
+    for i in drop:
+        a, b = _CARD_SEGS[i]
+        mask[:, a:b + 1] = 0
+    if shift:
+        a = _CARD_SEGS[shift_from][0]
+        out = np.zeros((mask.shape[0], mask.shape[1] + shift), np.uint8)
+        out[:, :a] = mask[:, :a]
+        out[:, a + shift:] = mask[:, a:]
+        mask = out
+    return mask
+
+
+def _card_name_board(mask):
+    board = frame("end_173922_019.jpg").copy()
+    board[620:646, 372:560] = 0
+    view = board[626:626 + mask.shape[0], 379:379 + mask.shape[1]]
+    view[mask > 0] = (60, 175, 215)
+    return board
+
+
+@pytest.mark.parametrize("res", ["720p", "1080p"])
+@pytest.mark.parametrize("change", [
+    {"drop": (0, 9)}, {"drop": (1, 5, 8)}, {"drop": (0, 4, 9)}, {"shift": 3, "shift_from": 5}])
+def test_near_threshold_look_alike_card_names_are_refused(res, change):
+    """Look-alikes score 0.63-0.78 against the 0.80 gate (measured). Deaths stay UNKNOWN.
+
+    PROVISIONAL mask: a tag one glyph away from Qortrola30 in the same font scores 0.89-0.97
+    and would pass; see docs/GAME_SETS.md.
+    """
+    board = _card_name_board(_look_alike(**change))
+    img = board if res == "720p" else _up_cubic(board)
+    row = H.read_owner_row(img)
+    assert row.ok and row.kills == 13 and row.deaths is None
+    assert row.card_name_match is False and 0.55 < row.card_name_score < H._OWNER_MIN
+    assert row.deaths_unknown_reason == H.DEATHS_REASON_CARD_NAME
+
+
+@pytest.mark.parametrize("res", ["720p", "1080p"])
+def test_owner_name_pasted_on_the_card_still_matches(res):
+    board = _card_name_board(_look_alike())
+    img = board if res == "720p" else _up_cubic(board)
+    row = H.read_owner_row(img)
+    assert row.card_name_match is True and row.deaths == 13 and row.deaths_status == H.DEATHS_PERSONAL_CARD

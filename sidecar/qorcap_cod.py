@@ -640,7 +640,7 @@ def cod_final_agreement(*, feed, scoreboard, end_screen, frame_stamps) -> dict:
     if (scoreboard.get("calibrated") is not True or _score(scoreboard.get("kills")) is None):
         return abstain("scoreboard_not_read")
     if _score(scoreboard.get("deaths")) is None:
-        # No DEATHS column and no owner card deaths: deaths are UNKNOWN, so the three legs
+        # A mode header with no DEATHS column, and no owner card deaths: deaths are UNKNOWN, so the three legs
         # cannot agree on K/D. This says so instead of using a guessed number.
         if scoreboard.get("deaths_status") == "UNKNOWN_NO_COLUMN":
             return abstain("scoreboard_deaths_unknown")
@@ -1137,7 +1137,7 @@ class CodSetRunner:
         assists = _score(getattr(owner, "assists", None))
         confirms = _score(getattr(owner, "confirms", None))
         tag = getattr(owner, "player_tag", None)
-        # Deaths may be None only with deaths_status UNKNOWN_NO_COLUMN (the board has no
+        # Deaths may be None only with deaths_status UNKNOWN_NO_COLUMN (positive evidence of no
         # DEATHS column and no owner card deaths were read). A DEATHS column that was not
         # read still stops the row. The 3-frame/3000 ms bar is unchanged.
         deaths_status = owner_deaths_status(owner)
@@ -1192,7 +1192,7 @@ class CodSetRunner:
                 f"kills {kills}, deaths {deaths}."
                 if deaths is not None else
                 f"The end word is {end.reason}. {OWNER_TAG}'s scoreboard row was read: "
-                f"kills {kills}. Deaths are UNKNOWN: the board has no DEATHS column and no "
+                f"kills {kills}. Deaths are UNKNOWN: the board shows a mode header with no DEATHS column and no "
                 "owner card deaths were read. They are not zero."
             ),
             "Home and away were not read. Those row numbers are not a home or away score.",
@@ -1215,6 +1215,9 @@ class CodSetRunner:
             # Shape change only off DEATHS-column boards: deaths_status and the card name check.
             owner_doc["deaths_status"] = deaths_status
             owner_doc["card_name_match"] = getattr(owner, "card_name_match", None)
+            if deaths is None:
+                # Why: no_column_positive, card_name_mismatch, or card_digits_failed.
+                owner_doc["deaths_unknown_reason"] = getattr(owner, "deaths_unknown_reason", None)
         gate = self.final_eligibility(visual_ok=True, evidence_us=self._evidence_us())
         agreement = self._final_agreement(end, owner)
         confirmed = gate["confirmed"] and agreement["counted"]
@@ -1945,9 +1948,24 @@ def owner_row_from_signals(bundle: Path) -> dict | None:
 def _public_owner_row(owner: dict) -> dict:
     """The fields that sit beside the match. No other name is copied."""
     kills, deaths = _score(owner.get("kills")), _score(owner.get("deaths"))
-    unknown = deaths is None and owner.get("deaths_status") == "UNKNOWN_NO_COLUMN"
-    if kills is None or (deaths is None and not unknown):
+    status = owner.get("deaths_status")
+    match = owner.get("card_name_match")
+    # Deaths and their status have to agree in both directions. A file that says otherwise
+    # (hand-edited or corrupt) gives no row rather than a number with the wrong label.
+    if kills is None:
         return {}
+    if status is None or status == "column":
+        if deaths is None:
+            return {}
+    elif status == "personal_card":
+        if deaths is None or match is not True:
+            return {}
+    elif status == "UNKNOWN_NO_COLUMN":
+        if owner.get("deaths") is not None:
+            return {}
+    else:
+        return {}
+    unknown = status == "UNKNOWN_NO_COLUMN"
     assists = _score(owner.get("assists"))
     confirms = _score(owner.get("confirms"))
     result = owner.get("result") if owner.get("result") in ("victory", "defeat") else None
@@ -1963,14 +1981,16 @@ def _public_owner_row(owner: dict) -> dict:
             "Not a home or away score. Not a verification verdict."
         ),
     }
-    status = owner.get("deaths_status")
     if status in ("personal_card", "UNKNOWN_NO_COLUMN"):
         # Only rows without a DEATHS column carry these keys, so column boards keep the old shape.
         out["deaths_status"] = status
-        match = owner.get("card_name_match")
         out["card_name_match"] = match if isinstance(match, bool) else None
         if unknown:
-            out["note"] += " Deaths are UNKNOWN: no DEATHS column and no owner card deaths. Not zero."
+            why = owner.get("deaths_unknown_reason")
+            out["deaths_unknown_reason"] = why if why in (
+                "no_column_positive", "card_name_mismatch", "card_digits_failed") else None
+            out["note"] += (" Deaths are UNKNOWN: a mode header with no DEATHS column and no owner card "
+                            "deaths. Not zero.")
     return out
 
 
@@ -2324,6 +2344,8 @@ def _summarize_end_frame(img) -> dict:
             }
             if owner_deaths_status(owner) != "column":
                 row["deaths_status"] = owner_deaths_status(owner)
+                if deaths is None:
+                    row["deaths_unknown_reason"] = getattr(owner, "deaths_unknown_reason", None)
     return {"result": result, "owner_row": row}
 
 

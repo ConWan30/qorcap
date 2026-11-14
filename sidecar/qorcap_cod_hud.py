@@ -100,18 +100,35 @@ _HEADER_ORDER = ("SCORE", "KILLS", "ASSISTS", "DEATHS")
 # matched at this same gate; the higher of the two is kept. Gate unchanged.
 _OWNER_MIN = 0.80
 # The personal card shows one player's name, which is not always Qortrola30
-# (211713: HFAutomaton). The card name is a dimmer gold than the row tag, so it
+# (211713: another player). The card name is a dimmer gold than the row tag, so it
 # is cut at this value and matched with the owner_card_tags mask at the same
 # _OWNER_MIN gate. 214647 (tuning) about 0.98-1.0, end_173922_019 (held-out)
-# about 0.92, the 211713 HFAutomaton card about 0.37-0.39.
+# about 0.92, the 211713 other player's card about 0.37-0.39. PROVISIONAL: one tuning
+# match; a tag one glyph away from Qortrola30 in the same font scores 0.89-0.97 and would pass.
 _CARD_NAME_VALUE = 100
 # Deaths status on an owner-row read. "column": a DEATHS column on the row.
 # "personal_card": the DEATHS label on a card whose name matched Qortrola30.
 # UNKNOWN_NO_COLUMN: the board has no DEATHS column and no owner card deaths
 # were read, so deaths is None. It is never guessed.
 DEATHS_COLUMN = "column"
+# Positive evidence that the board has no DEATHS column. A failed DEATHS header match
+# alone is not evidence: an occluded or blurred header on a TDM board would look the same.
+# A mode header with no DEATHS column (CONFIRMS, CAPTURES, DATA UPLOADED) must match in the
+# row's header band at _ROW_HEADER_MIN, AND neither DEATHS mask may score near a hit there,
+# AND every digit cluster on the owner row must sit under a matched header (no DEATHS cell ink).
+# Measured in that band: real Kill Confirmed / Hijack boards 0.34-0.46 (720p and 1080p
+# upscaled), the synthetic TDM DEATHS column 0.93-1.0. Without both, deaths_not_read as on main.
+_DEATHS_ABSENT_MAX = 0.55
 DEATHS_PERSONAL_CARD = "personal_card"
 DEATHS_UNKNOWN_NO_COLUMN = "UNKNOWN_NO_COLUMN"
+# Why deaths are UNKNOWN on a board with positive no-DEATHS-column evidence.
+# no_column_positive: no personal-card DEATHS label was found.
+# card_name_mismatch: the card's name is not Qortrola30.
+# card_digits_failed: Qortrola30's card, but its digits failed the unchanged gates.
+DEATHS_REASON_NO_CARD = "no_column_positive"
+DEATHS_REASON_CARD_NAME = "card_name_mismatch"
+DEATHS_REASON_CARD_DIGITS = "card_digits_failed"
+DEATHS_UNKNOWN_REASONS = (DEATHS_REASON_NO_CARD, DEATHS_REASON_CARD_NAME, DEATHS_REASON_CARD_DIGITS)
 # KILLS on that frame scores about 0.96. The other team's header scores about 0.54.
 # DEATHS on the personal card scores about 0.86. The next hit scores about 0.40.
 # A 720p frame scaled to 1080p scores about 0.74 on KILLS and about 0.72 on CONFIRMS.
@@ -189,6 +206,19 @@ def _apply_text_supplement(data):
         mask = _mask_from_rows(headers["deaths_column"].get("mask_rows"))
         if mask is not None:
             data["deaths_column_header_mask"] = mask
+    # Mode headers that mean the board has no DEATHS column (Hijack). CONFIRMS is in the npz.
+    modes = {}
+    for key, label in (("mode_captures", "CAPTURES"), ("mode_data_uploaded", "DATA UPLOADED")):
+        if key in headers:
+            mask = _mask_from_rows(headers[key].get("mask_rows"))
+            if mask is not None:
+                modes[label] = mask
+    if modes:
+        data["mode_header_masks"] = modes
+    if "score" in headers:
+        mask = _mask_from_rows(headers["score"].get("mask_rows"))
+        if mask is not None:
+            data["score_header_mask"] = mask
     # Extra owner-tag samples (same letters, another capture's stroke width). The npz owner_mask stays first.
     tags = []
     for item in extra.get("owner_tags", []):
@@ -1459,6 +1489,83 @@ def _digits_for_column(img, hit, row_y: int, row_h: int, scale: float, *, detail
     return _column_int(text, detail)
 
 
+def _no_deaths_column_evidence(bgr, scale, pack, row_x, row_y, row_w, row_h, kills_h, confirms_h,
+                               assists_h=None) -> dict:
+    """Positive evidence that this board has no DEATHS column. Never inferred from a miss alone."""
+    out = {"positive": False, "mode_header": None, "mode_score": None, "deaths_word_max": None,
+           "unexplained_ink_x": None, "header_min": _ROW_HEADER_MIN, "deaths_absent_max": _DEATHS_ABSENT_MAX}
+    if kills_h is None:
+        return out
+    _ks, _kx, ky, _kw, kh = kills_h
+    h, w = bgr.shape[:2]
+    y0, y1 = max(0, ky - int(15 * scale)), min(h, ky + kh + int(15 * scale))
+    x0, x1 = max(0, row_x), min(w, row_x + int(500 * scale))
+    if y1 <= y0 or x1 <= x0:
+        return out
+    best = None
+    spans = [(kills_h[1], kills_h[3])]
+    if assists_h is not None:
+        spans.append((assists_h[1], assists_h[3]))
+    if confirms_h is not None:
+        best = ("CONFIRMS", float(confirms_h[0]))
+        spans.append((confirms_h[1], confirms_h[3]))
+    band = _value_mask(bgr[y0:y1, x0:x1], _HEADER_SEARCH_VALUE)
+    for label, mask in (pack.get("mode_header_masks") or {}).items():
+        hit = _best_mask(band, mask, scale, _ROW_HEADER_MIN)
+        if hit is not None:
+            spans.append((x0 + hit[1], hit[3]))
+            if best is None or hit[0] > best[1]:
+                best = (label, float(hit[0]))
+    if "score_header_mask" in pack:
+        hit = _best_mask(band, pack["score_header_mask"], scale, _ROW_HEADER_MIN)
+        if hit is not None:
+            spans.append((x0 + hit[1], hit[3]))
+    worst = 0.0
+    derived = _value_mask(bgr[y0:y1, x0:x1], _DERIVED_HEADER_VALUE)
+    for search, key in ((derived, "deaths_column_header_mask"), (band, "deaths_header_mask")):
+        if key in pack:
+            hit = _best_mask(search, pack[key], scale, 0.0)
+            if hit is not None:
+                worst = max(worst, float(hit[0]))
+    out["deaths_word_max"] = round(worst, 4)
+    if best is not None:
+        out["mode_header"], out["mode_score"] = best[0], round(best[1], 4)
+    unexplained = _row_ink_outside(bgr, scale, row_x, row_y, row_w, row_h, spans)
+    out["unexplained_ink_x"] = unexplained
+    out["positive"] = best is not None and worst < _DEATHS_ABSENT_MAX and unexplained == []
+    return out
+
+
+def _row_ink_outside(bgr, scale, row_x, row_y, row_w, row_h, spans) -> list:
+    """x of digit ink on the owner row that sits under no matched header.
+
+    A DEATHS cell whose header was occluded still has its digits, so ink that no matched
+    header (SCORE, KILLS, CONFIRMS, CAPTURES, DATA UPLOADED) accounts for means the column is
+    not shown to be absent.
+    """
+    np = _libs()[1]
+    h, w = bgr.shape[:2]
+    pad = int(2 * scale)
+    x0, x1 = min(w, row_x + row_w + int(10 * scale)), min(w, row_x + int(480 * scale))
+    y0, y1 = max(0, row_y - pad), min(h, row_y + row_h + pad)
+    if x1 <= x0 or y1 <= y0:
+        return []
+    cols = np.where((_value_mask(bgr[y0:y1, x0:x1], _OWNER_SEARCH_VALUE) > 0).any(axis=0))[0]
+    groups = []
+    for c in cols.tolist():
+        if groups and c - groups[-1][1] <= int(8 * scale):
+            groups[-1][1] = c
+        else:
+            groups.append([c, c])
+    slack = int(6 * scale)
+    out = []
+    for a, b in groups:
+        a, b = a + x0, b + x0
+        if not any(sx - slack <= a and b <= sx + sw + slack for sx, sw in spans):
+            out.append(int((a + b) // 2))
+    return out
+
+
 def _card_owner_match(img, hit, pack, scale: float) -> dict:
     """Is the personal card's name Qortrola30? The card's eliminations are never kills."""
     masks = pack.get("owner_card_masks") or []
@@ -1563,9 +1670,12 @@ def read_owner_row(img):
     The gamertag letters have to agree. Kills come from the KILLS column on
     that row. Deaths come from a DEATHS column on that row, or from the DEATHS
     label on the personal card below it when the row has no deaths column and
-    the card's name matches Qortrola30. With no DEATHS column and no owner card
-    deaths, the row is still read with deaths None and deaths_status
-    UNKNOWN_NO_COLUMN; a DEATHS column whose digits fail is still not read.
+    the card's name matches Qortrola30. "No deaths column" needs positive
+    evidence (a CONFIRMS / CAPTURES / DATA UPLOADED header and no DEATHS mask
+    near a hit); a header miss alone stays deaths_not_read, as on main. With
+    that evidence and no owner card deaths, the row is read with deaths None,
+    deaths_status UNKNOWN_NO_COLUMN and deaths_unknown_reason; a DEATHS column
+    whose digits fail is still not read.
     Assists are read only when that column is on the board. Confirms are not
     assists. A missing row, a different tag, or an unreadable kill or death
     is not read. This does not fill home or away.
@@ -1621,20 +1731,35 @@ def read_owner_row(img):
                 "Deaths were not read for Qortrola30. They are not Counted.", "deaths_not_read", detail=detail)
         status = DEATHS_COLUMN
     else:
+        evidence = _no_deaths_column_evidence(
+            bgr, scale, pack, row_x, row_y, _row_w, row_h, kills_h, confirms_h, assists_h)
+        if not evidence["positive"]:
+            # No DEATHS header matched, but nothing shows the column is absent: same refusal as main.
+            _row_miss(detail, "deaths_column_not_shown_absent",
+                      **{k: v for k, v in evidence.items() if k != "positive"})
+            return _not_read(
+                "owner_row", "not_present",
+                "Deaths were not read for Qortrola30. They are not Counted.", "deaths_not_read", detail=detail)
         deaths = None
+        reason = None
         if personal is None:
-            _row_miss(detail, "missing_column_and_personal_label", header_min=_ROW_HEADER_MIN)
+            reason = DEATHS_REASON_NO_CARD
+            _row_miss(detail, "missing_personal_label", header_min=_ROW_HEADER_MIN)
         else:
             card = _card_owner_match(bgr, personal, pack, scale)
             if card["match"] is True:
                 deaths = _digits_under_label(bgr, personal, scale, detail=detail)
+                if deaths is None:
+                    reason = DEATHS_REASON_CARD_DIGITS
             else:
+                reason = DEATHS_REASON_CARD_NAME
                 _row_miss(detail, "card_not_owner", card_name_score=card.get("score"),
                           owner_min=_OWNER_MIN)
         status = DEATHS_PERSONAL_CARD if deaths is not None else DEATHS_UNKNOWN_NO_COLUMN
     if deaths is None:
-        note = ("Qortrola30's scoreboard row was read. Kills are that row. The board has no DEATHS column "
-                "and no owner card deaths were read, so deaths are UNKNOWN, not zero.")
+        note = ("Qortrola30's scoreboard row was read. Kills are that row. The board shows a mode header "
+                f"with no DEATHS column ({evidence['mode_header']}) and no owner card deaths were read, "
+                "so deaths are UNKNOWN, not zero.")
     else:
         note = "Qortrola30's scoreboard row was read. Kills and deaths are that row, not a home or away score."
     rd = _present(
@@ -1644,8 +1769,12 @@ def read_owner_row(img):
     rd.deaths_status = status
     rd.card_name_match = None if card is None else card["match"]
     rd.card_name_score = None if card is None else card.get("score")
+    rd.deaths_unknown_reason = None
+    if deaths_h is None:
+        rd.no_column_evidence = {k: v for k, v in evidence.items() if k != "positive"}
     if deaths is None:
         rd.deaths_detail = dict(detail)
+        rd.deaths_unknown_reason = reason
     return rd
 
 

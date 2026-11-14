@@ -202,8 +202,15 @@ def end_word(end) -> str | None:
 
 
 def owner_row_seen(owner) -> bool:
-    """Qortrola30's own end-scoreboard row was read on this frame."""
+    """Qortrola30's own end-scoreboard row was read on this frame, with its deaths.
+
+    A row read with deaths UNKNOWN (no DEATHS column, deaths_status UNKNOWN_NO_COLUMN) does
+    not count here: it must not shorten the stop. Those frames wait for the same solo bar,
+    the same splash resight and the same BEST PLAY board floor as a frame with no row.
+    """
     if owner is None or not (getattr(owner, "ok", False) and getattr(owner, "calibrated", False)):
+        return False
+    if getattr(owner, "deaths_status", None) == "UNKNOWN_NO_COLUMN":
         return False
     try:
         from qorcap_cod import same_owner_tag

@@ -169,6 +169,7 @@ def _unknown_deaths_owner(card_match=True):
                        player_tag=OWNER_TAG, kills=17, deaths=None)
     owner.deaths_status = "UNKNOWN_NO_COLUMN"
     owner.card_name_match = card_match
+    owner.deaths_unknown_reason = "card_digits_failed" if card_match else "card_name_mismatch"
     return owner
 
 
@@ -180,6 +181,7 @@ def test_unknown_deaths_row_posts_with_null_deaths_and_says_so(monkeypatch):
     owner = posted[0]["owner_row"]
     assert owner["kills"] == 17 and owner["deaths"] is None
     assert owner["deaths_status"] == "UNKNOWN_NO_COLUMN" and owner["card_name_match"] is True
+    assert owner["deaths_unknown_reason"] == "card_digits_failed"
     assert any("Deaths are UNKNOWN" in note for note in posted[0]["notes"])
     assert not any("deaths None" in note for note in posted[0]["notes"])
     assert posted[0]["counted"] is False
@@ -230,3 +232,31 @@ def test_public_owner_row_accepts_unknown_deaths_only_with_the_status():
     assert "UNKNOWN" in out["note"]
     column = _public_owner_row({**base, "deaths": 4})
     assert "deaths_status" not in column and "card_name_match" not in column
+
+
+@pytest.mark.parametrize("bad", [
+    {"deaths": 4, "deaths_status": "UNKNOWN_NO_COLUMN"},
+    {"deaths": None},
+    {"deaths": None, "deaths_status": "column"},
+    {"deaths": 4, "deaths_status": "personal_card", "card_name_match": False},
+    {"deaths": 4, "deaths_status": "personal_card"},
+    {"deaths": None, "deaths_status": "personal_card", "card_name_match": True},
+    {"deaths": "4", "deaths_status": "UNKNOWN_NO_COLUMN"},
+    {"deaths": 4, "deaths_status": "guessed"},
+])
+def test_public_owner_row_checks_deaths_and_status_both_ways(bad):
+    """A hand-edited or corrupt signals row gives no public owner row, never a mislabelled number."""
+    from qorcap_cod import _public_owner_row
+    base = {"tag": "Qortrola30", "kills": 17, "assists": None, "confirms": 5, "result": "victory"}
+    assert _public_owner_row({**base, **bad}) == {}
+
+
+def test_public_owner_row_carries_the_unknown_reason():
+    from qorcap_cod import _public_owner_row
+    base = {"tag": "Qortrola30", "kills": 17, "deaths": None, "assists": None, "confirms": 5,
+            "result": "victory", "deaths_status": "UNKNOWN_NO_COLUMN", "card_name_match": False}
+    assert _public_owner_row({**base, "deaths_unknown_reason": "card_name_mismatch"})[
+        "deaths_unknown_reason"] == "card_name_mismatch"
+    assert _public_owner_row({**base, "deaths_unknown_reason": "made_up"})["deaths_unknown_reason"] is None
+    card = _public_owner_row({**base, "deaths": 13, "deaths_status": "personal_card", "card_name_match": True})
+    assert card["deaths"] == 13 and "deaths_unknown_reason" not in card
