@@ -1309,3 +1309,76 @@ def test_owner_name_pasted_on_the_card_still_matches(res):
     img = board if res == "720p" else _up_cubic(board)
     row = H.read_owner_row(img)
     assert row.card_name_match is True and row.deaths == 13 and row.deaths_status == H.DEATHS_PERSONAL_CARD
+
+
+@pytest.mark.parametrize("res", ["720p", "1080p"])
+@pytest.mark.parametrize("value", [91, 130, 140, 149, 150])
+def test_dim_deaths_digits_are_unexplained_ink(res, value):
+    """Dim DEATHS digits still count as ink at the digit reader's lowest cut (90)."""
+    board = _synthetic_tdm_board(deaths_digits=())
+    masks = _canonical_masks()
+    _stamp(board, masks["2"], 566, 536, (0, value, value))
+    _stamp(board, masks["1"], 574, 536, (0, value, value))
+    scale = 1.0
+    if res == "1080p":
+        board = _up_cubic(board)
+        scale = 1.5
+    spans = [(int(420 * scale), int(29 * scale)), (int(484 * scale), int(34 * scale))]
+    ink = H._row_ink_outside(board, scale, int(172 * scale), int(534 * scale),
+                              int(66 * scale), int(16 * scale), spans)
+    assert ink and any(abs(x - 571 * scale) < 12 * scale for x in ink)
+    assert H._ROW_INK_VALUE == H._ROW_DIGIT_VALUE - 40 == 90
+
+
+@pytest.mark.parametrize("value", [130, 140, 149])
+def test_dim_digit_ink_stops_a_positive_mode_board(value):
+    """Positive CONFIRMS board plus unexplained dim digits: no no-column claim."""
+    board = _padded_crop("owner_card_214647_crop.png")
+    _stamp(board, _canonical_masks()["2"], 480, 484, (0, value, value))
+    row = H.read_owner_row(board)
+    assert not row.ok and row.stage == "deaths_not_read"
+    assert row.stage_detail["check"] == "deaths_column_not_shown_absent"
+    assert row.stage_detail["mode_header"] == "CONFIRMS"
+    assert row.stage_detail["unexplained_ink_x"]
+
+
+@pytest.mark.parametrize("bounds", [
+    (1300, 534, 66, 16),  # right of the image
+    (172, 800, 66, 16),   # below the image
+    (172, 534, 500, 16),  # empty x strip
+    (-300, 534, 66, 16),  # left of the image
+    (172, -20, 66, 16),  # above the image
+    (1000, 534, 66, 16), # truncated strip, not enough frame to scan the row
+])
+def test_degenerate_ink_bounds_are_unknown_not_empty(bounds):
+    board = _synthetic_tdm_board()
+    assert H._row_ink_outside(board, 1.0, *bounds, []) is None
+
+
+def test_unknown_ink_result_never_gives_positive_no_column(monkeypatch):
+    board = _padded_crop("owner_card_214647_crop.png")
+    monkeypatch.setattr(H, "_row_ink_outside", lambda *a: None)
+    row = H.read_owner_row(board)
+    assert not row.ok and row.stage == "deaths_not_read"
+    assert row.stage_detail["mode_header"] == "CONFIRMS"
+    assert row.stage_detail["unexplained_ink_x"] is None
+
+
+@pytest.mark.parametrize("res", ["720p", "1080p"])
+def test_mode_header_pasted_over_deaths_does_not_show_no_column(res):
+    """Edited synthetic TDM pixels: a mode word now explains the deaths digits.
+
+    The ASSISTS header still identifies a TDM-style layout and refuses the no-column claim.
+    """
+    board = _synthetic_tdm_board()
+    pack = H._pack()
+    h, w = pack["deaths_column_header_mask"].shape
+    board[403:403 + h, 560:560 + w] = 0
+    _stamp(board, pack["confirms_header_mask"], 553, 400, (255, 255, 255))
+    if res == "1080p":
+        board = _up_cubic(board)
+    row = H.read_owner_row(board)
+    assert not row.ok and row.stage == "deaths_not_read" and getattr(row, "deaths_status", None) is None
+    assert row.stage_detail["mode_header"] == "CONFIRMS"
+    assert row.stage_detail["assists_header"] is True
+    assert row.stage_detail["unexplained_ink_x"] == []  # the pasted header explains the digits

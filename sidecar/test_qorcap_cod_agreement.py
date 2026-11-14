@@ -158,7 +158,7 @@ def test_reader_stats_keep_one_good_owner_frame_unaccepted(monkeypatch):
     assert states == ["abstain"] * 7 + ["not_ready"] + ["abstain"] * 3
     assert posted == [] and runner.final is None
     assert runner._frame_end["owner_stage_detail"] == {
-        "column": "kills", "check": "glyph_gate", "top": 0.7, "second": 0.6}
+        "column": "kills", "check": "glyph_gate", "top_q10000": 7000, "second_q10000": 6000}
     assert (runner.owner_row_ever_read, runner.owner_row_good_frames, runner.owner_row_accepted) == (True, 1, False)
     assert (doc["owner_row_ever_read"], doc["owner_row_good_frames"], doc["owner_row_accepted"]) == (True, 1, False)
 
@@ -260,3 +260,70 @@ def test_public_owner_row_carries_the_unknown_reason():
     assert _public_owner_row({**base, "deaths_unknown_reason": "made_up"})["deaths_unknown_reason"] is None
     card = _public_owner_row({**base, "deaths": 13, "deaths_status": "personal_card", "card_name_match": True})
     assert card["deaths"] == 13 and "deaths_unknown_reason" not in card
+
+
+@pytest.mark.parametrize("status, counted, reason", [
+    ("column", True, "three_leg_agreement"),
+    ("personal_card", False, "scoreboard_deaths_card_provisional"),
+])
+def test_personal_card_deaths_never_count(status, counted, reason):
+    args = legs()
+    args["scoreboard"]["deaths_status"] = status
+    result = cod_final_agreement(**args)
+    assert result["counted"] is counted and result["reason"] == reason
+
+
+@pytest.mark.parametrize("unknown", [False, True])
+def test_accepted_rows_persist_no_column_evidence(tmp_path, monkeypatch, unknown):
+    """Both a personal-card number and UNKNOWN keep the mode scores and ink result in the files."""
+    import json
+    import qorcap_cod as C
+    import qorcap_cod_hud as H
+    import test_qorcap_cod_calib as T
+    owner = H.read_owner_row(T._padded_crop("owner_card_214647_crop.png") if unknown else T.frame("end_173922_019.jpg"))
+    assert owner.ok and owner.no_column_evidence["unexplained_ink_x"] == []
+    path = tmp_path / "cod_signals.jsonl"
+    posted = []
+    runner = C.CodSetRunner(posted.append, log_path=path)
+    monkeypatch.setattr(runner, "_screen_us", lambda: 1000000)
+    monkeypatch.setattr(runner, "_offer", lambda *a, **kw: {"t_ms": 0, "until_ms": 3000, "frames": 3})
+    monkeypatch.setattr(runner, "final_eligibility", lambda **kw: {"confirmed": True})
+    monkeypatch.setattr(H, "consensus_owner_row", lambda *a: {"status": "accepted"})
+    args = legs()
+    monkeypatch.setattr(runner, "own_kill_coverage", lambda: {**args["feed"], "kills": owner.kills})
+    runner._last_feed_us = 1000000
+    runner.frame_stamps = [1000000]
+    end = RegionRead(region="end_screen", status="read", ok=True, calibrated=True, confirm=True, reason="victory")
+    runner._post_owner_end(3000, 3000, end, owner)
+    assert len(posted) == 1 and posted[0]["counted"] is False
+    assert posted[0]["agreement"]["reason"] == (
+        "scoreboard_deaths_unknown" if unknown else "scoreboard_deaths_card_provisional")
+    evidence = posted[0]["owner_row"]["no_column_evidence"]
+    assert evidence["mode_header"] == "CONFIRMS" and evidence["ink_value"] == 90
+    assert evidence["unexplained_ink_x"] == [] and evidence["assists_header"] is False
+    assert evidence["mode_score_q10000"] == round(owner.no_column_evidence["mode_score"] * 10000)
+    assert evidence["header_min_q10000"] == 7000
+    assert evidence["deaths_absent_max_q10000"] == 5500
+    rows = [json.loads(line) for line in path.read_text().splitlines()]
+    saved = next(row["owner_row"] for row in rows if row.get("kind") == "end_screen")
+    assert saved["no_column_evidence"] == evidence
+    public = C._public_owner_row(saved)
+    assert public["no_column_evidence"] == evidence
+    probe = C._summarize_end_frame(T._padded_crop("owner_card_214647_crop.png") if unknown else T.frame("end_173922_019.jpg"))
+    assert probe["owner_row"]["no_column_evidence"] == evidence
+    assert runner._log_fault is False
+
+
+def test_failed_glyph_detail_is_saved_without_faulting_the_signal_log(tmp_path):
+    import json
+    import qorcap_cod as C
+    runner = C.CodSetRunner(lambda e: None, log_path=tmp_path / "cod_signals.jsonl")
+    end = RegionRead(region="end_screen", status="read", ok=True, calibrated=True, confirm=True, reason="defeat")
+    owner = _missed_owner("kills_not_read")
+    runner._post_owner_end(0, 0, end, owner)
+    runner._emit_frame(0)
+    runner.close_signals()
+    text = (tmp_path / "cod_signals.jsonl").read_text()
+    rows = [json.loads(line) for line in text.splitlines()]
+    assert rows[0]["end_eval"]["owner_stage_detail"]["top_q10000"] == 7000
+    assert runner._log_fault is False and C.verify_signal_chain(text) == []

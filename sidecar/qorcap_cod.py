@@ -645,6 +645,10 @@ def cod_final_agreement(*, feed, scoreboard, end_screen, frame_stamps) -> dict:
         if scoreboard.get("deaths_status") == "UNKNOWN_NO_COLUMN":
             return abstain("scoreboard_deaths_unknown")
         return abstain("scoreboard_not_read")
+    if scoreboard.get("deaths_status") == "personal_card":
+        # Card deaths rest on a PROVISIONAL card-name mask (one tuning match; a one-glyph
+        # look-alike tag can pass). They are logged but never Counted until a held-out set exists.
+        return abstain("scoreboard_deaths_card_provisional")
     if end_screen.get("calibrated") is not True or end_screen.get("outcome") not in ("victory", "defeat"):
         return abstain("end_screen_not_read")
     times = [leg.get("t_us") for leg in legs.values()]
@@ -1162,7 +1166,7 @@ class CodSetRunner:
             if isinstance(detail, dict) and detail:
                 # The exact check that stopped the kills or deaths read, with its scores.
                 # Diagnostic only: the decision above is unchanged and nothing here is Counted.
-                self._frame_end["owner_stage_detail"] = dict(detail)
+                self._frame_end["owner_stage_detail"] = _int_detail(detail)
             self._clear_end_candidate()
             return
         self.owner_row_ever_read = True
@@ -1218,6 +1222,10 @@ class CodSetRunner:
             if deaths is None:
                 # Why: no_column_positive, card_name_mismatch, or card_digits_failed.
                 owner_doc["deaths_unknown_reason"] = getattr(owner, "deaths_unknown_reason", None)
+            evidence = _no_column_evidence_doc(getattr(owner, "no_column_evidence", None))
+            if evidence is not None:
+                # Header scores and the ink result that showed the DEATHS column absent.
+                owner_doc["no_column_evidence"] = evidence
         gate = self.final_eligibility(visual_ok=True, evidence_us=self._evidence_us())
         agreement = self._final_agreement(end, owner)
         confirmed = gate["confirmed"] and agreement["counted"]
@@ -1991,7 +1999,76 @@ def _public_owner_row(owner: dict) -> dict:
                 "no_column_positive", "card_name_mismatch", "card_digits_failed") else None
             out["note"] += (" Deaths are UNKNOWN: a mode header with no DEATHS column and no owner card "
                             "deaths. Not zero.")
+        evidence = _no_column_evidence_doc(owner.get("no_column_evidence"))
+        if evidence is not None:
+            out["no_column_evidence"] = evidence
     return out
+
+
+_NO_COLUMN_EVIDENCE_MODES = ("CONFIRMS", "CAPTURES", "DATA UPLOADED")
+
+
+def _int_detail(detail: dict) -> dict:
+    """``owner_stage_detail`` for the signal chain, whose canonical JSON takes no floats.
+
+    A float score ``x`` is written as ``<key>_q10000`` = round(x * 10000). Ints, strings,
+    bools, None and int lists are copied. Anything else is dropped. Without this a refused
+    row with glyph scores was skipped from cod_signals.jsonl and marked the log faulted.
+    """
+    import math
+    out = {}
+    for key, value in detail.items():
+        if not isinstance(key, str):
+            continue
+        if value is None or isinstance(value, (bool, int, str)):
+            out[key] = value
+        elif isinstance(value, float):
+            out[key + "_q10000"] = int(round(value * 10000)) if math.isfinite(value) else None
+        elif isinstance(value, list) and all(isinstance(v, int) and not isinstance(v, bool) for v in value):
+            out[key] = list(value)
+    return out
+
+
+def _no_column_evidence_doc(evidence) -> dict | None:
+    """The no-DEATHS-column evidence of an accepted row, typed field by field, or None.
+
+    Only rows that passed the positive check carry it (a matched mode header, an empty ink list,
+    no ASSISTS header). Anything else in a file is dropped, not copied.
+    """
+    if not isinstance(evidence, dict):
+        return None
+    mode = evidence.get("mode_header")
+    ink = evidence.get("unexplained_ink_x")
+    if mode not in _NO_COLUMN_EVIDENCE_MODES or ink != [] or evidence.get("assists_header") is not False:
+        return None
+
+    def q10000(key):
+        # The signal-chain canonical JSON accepts no floats. Scores are integers / 10000,
+        # with the unit in the key so a saved 7981 cannot be confused with a score of 7981.
+        import math
+        v = evidence.get(key)
+        if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v):
+            return None
+        return int(round(v * 10000)) if 0 <= v <= 1 else None
+
+    # Accept a read (float keys) or a saved document (fixed-point integer keys), not arbitrary values.
+    def saved_score(key):
+        v = evidence.get(key + "_q10000")
+        if isinstance(v, int) and not isinstance(v, bool) and 0 <= v <= 10000:
+            return v
+        return q10000(key)
+
+    value = evidence.get("ink_value")
+    return {
+        "mode_header": mode,
+        "mode_score_q10000": saved_score("mode_score"),
+        "deaths_word_max_q10000": saved_score("deaths_word_max"),
+        "unexplained_ink_x": [],
+        "assists_header": False,
+        "ink_value": value if isinstance(value, int) and not isinstance(value, bool) else None,
+        "header_min_q10000": saved_score("header_min"),
+        "deaths_absent_max_q10000": saved_score("deaths_absent_max"),
+    }
 
 
 def session_document(*, frame_stamps=None, inputs=None, wall_anchor_ms=None, owner_row=None) -> dict:
@@ -2346,6 +2423,9 @@ def _summarize_end_frame(img) -> dict:
                 row["deaths_status"] = owner_deaths_status(owner)
                 if deaths is None:
                     row["deaths_unknown_reason"] = getattr(owner, "deaths_unknown_reason", None)
+                evidence = _no_column_evidence_doc(getattr(owner, "no_column_evidence", None))
+                if evidence is not None:
+                    row["no_column_evidence"] = evidence
     return {"result": result, "owner_row": row}
 
 
