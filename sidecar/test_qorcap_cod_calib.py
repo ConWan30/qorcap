@@ -13,6 +13,7 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+import pytest
 
 import qorcap_cod as C
 import qorcap_cod_hud as H
@@ -1007,3 +1008,197 @@ def test_thin_owner_tag_sample_does_not_read_other_letters():
         miss = H.read_owner_row(board)
         assert miss.ok is False and miss.stage == "tag_not_matched"
         assert miss.kills is None and miss.player_tag is None
+
+
+@pytest.mark.parametrize("column,box", [
+    ("kills", (532, 548, 428, 442)),
+    ("deaths", (532, 548, 560, 590)),
+])
+def test_owner_digit_failure_detail_reaches_signal_log(tmp_path, column, box):
+    """Synthetic blank cell. The persisted failure names the exact check, never a score."""
+    board = _synthetic_tdm_board()
+    y0, y1, x0, x1 = box
+    board[y0:y1, x0:x1] = 0
+    row = H.read_owner_row(board)
+    assert not row.ok and row.stage == column + "_not_read"
+    assert row.stage_detail["column"] == column
+    assert row.stage_detail["check"] == "cell_contrast"
+    assert row.stage_detail["contrast"] == 0
+    log = tmp_path / "cod_signals.jsonl"
+    posted = []
+    runner = C.CodSetRunner(posted.append, log_path=log)
+    end = C.RegionRead("end_screen", "read", True, "defeat", True, confirm=True)
+    runner._post_owner_end(3000, 3000, end, row)
+    runner._emit_frame(3000)
+    saved = json.loads(log.read_text(encoding="utf-8").splitlines()[-1])
+    assert saved["end_eval"] == {
+        "status": "abstain", "reason": "owner_row_not_read", "owner_stage": column + "_not_read",
+        "owner_stage_detail": row.stage_detail,
+    }
+    assert runner.final is None and posted == []
+    assert runner.owner_row_good_frames == 0 and runner.owner_row_accepted is False
+
+
+@pytest.mark.parametrize("scores,score_fail,margin_fail", [
+    ((0.74, 0.40), True, False),
+    ((0.90, 0.80), False, True),
+    ((0.70, 0.69), True, True),
+])
+def test_owner_glyph_diagnostic_splits_score_and_margin(monkeypatch, scores, score_fail, margin_fail):
+    """Synthetic feature scores, including a glyph that fails both gates."""
+    monkeypatch.setattr(H, "_row_feature", lambda *a: np.array([1.0], dtype=np.float32))
+    vecs = np.array([[scores[0]], [scores[1]]], dtype=np.float32)
+    detail = {}
+    old_shape = H._row_classify(vecs, ["1", "2"], None)
+    with_detail = H._row_classify(vecs, ["1", "2"], None, detail=detail)
+    assert old_shape == with_detail and with_detail[0] is None
+    assert detail["check"] == "glyph_gate"
+    assert detail["score_gate_failed"] is score_fail and detail["margin_failed"] is margin_fail
+    assert detail["top"] == pytest.approx(scores[0], abs=0.0001)
+    assert detail["second"] == pytest.approx(scores[1], abs=0.0001)
+    assert detail["margin"] == pytest.approx(scores[0] - scores[1], abs=0.0001)
+    assert detail["score_min"] == 0.75 and detail["margin_min"] == 0.15
+
+
+def test_owner_digit_count_diagnostic_does_not_trim_a_value():
+    img = _paint("1234567", _canonical_masks(), HIGHLIGHT_INK)
+    detail = {}
+    args = (img, 0, img.shape[1], 0, img.shape[0], 130, 1.0)
+    assert H._row_digit_string(*args) is None
+    assert H._row_digit_string(*args, detail=detail) is None
+    assert detail == {"check": "digit_count", "digit_count": 7, "digit_max": 6}
+
+
+@pytest.mark.parametrize("column", ["kills", "deaths"])
+def test_owner_missing_column_detail(column):
+    board = _synthetic_tdm_board()
+    pack = H._pack()
+    if column == "kills":
+        h, w = pack["kills_header_mask"].shape
+        board[400:400 + h, 420:420 + w] = 0
+    else:
+        h, w = pack["deaths_column_header_mask"].shape
+        board[403:403 + h, 560:560 + w] = 0
+    row = H.read_owner_row(board)
+    if column == "kills":
+        assert not row.ok
+        assert row.stage_detail == {"column": "kills", "check": "missing_column", "header_min": H._ROW_HEADER_MIN}
+        return
+    # No DEATHS column and no personal card: kills stay read, deaths are UNKNOWN, never guessed.
+    assert row.ok and row.kills == 9 and row.deaths is None
+    assert row.deaths_status == H.DEATHS_UNKNOWN_NO_COLUMN and row.card_name_match is None
+    assert row.deaths_detail["check"] == "missing_column_and_personal_label"
+
+
+def test_owner_diagnostics_leave_existing_fixture_decisions_identical(monkeypatch):
+    """Turn only the diagnostic sink off; all existing fixture decisions stay byte-identical."""
+    paths = sorted(FIX.glob("*.jpg")) + sorted(FIX.glob("*.png"))
+    def decisions():
+        return [vars(H.read_owner_row(frame(p.name))).copy() for p in paths]
+    def decision_fields(rows):
+        return [{k: v for k, v in r.items() if k not in ("stage_detail", "deaths_detail")} for r in rows]
+    on = decision_fields(decisions())
+    monkeypatch.setattr(H, "_row_miss", lambda *a, **kw: None)
+    assert decision_fields(decisions()) == on
+    assert sum(r["ok"] for r in on) == 1
+    good = next(r for r in on if r["ok"])
+    assert (good["kills"], good["deaths"], good["confirms"]) == (13, 13, 7)
+
+
+def _padded_crop(name, fill=0):
+    """A small real crop from an end board, put back at its 1280x720 offset (x150, y390).
+
+    Other players' names on the board are blanked. The personal card is kept.
+    """
+    crop = cv2.imread(str(FIX / name))
+    assert crop is not None
+    board = np.full((720, 1280, 3), fill, np.uint8)
+    board[390:390 + crop.shape[0], 150:150 + crop.shape[1]] = crop
+    return board
+
+
+def test_kill_confirmed_board_without_deaths_column_reads_kills_and_unknown_deaths():
+    """214647 Kill Confirmed: SCORE/KILLS/CONFIRMS, no DEATHS column. Owner card digits fail the margin gate."""
+    row = H.read_owner_row(_padded_crop("owner_card_214647_crop.png"))
+    assert row.ok and row.calibrated and row.player_tag == "Qortrola30"
+    assert (row.kills, row.confirms, row.assists) == (17, 5, None)
+    assert row.kills != 22  # the card's ELIMINATIONS are never kills
+    assert row.deaths is None and row.deaths_status == H.DEATHS_UNKNOWN_NO_COLUMN
+    assert row.card_name_match is True and row.card_name_score >= H._OWNER_MIN
+    assert row.deaths_detail["source"] == "personal_card"
+    assert row.deaths_detail["check"] == "glyph_gate" and row.deaths_detail["margin_failed"] is True
+    assert "UNKNOWN" in row.note and "not zero" in row.note
+
+
+def test_enemy_personal_card_deaths_are_never_used(monkeypatch):
+    """211713: the card is HFAutomaton's (ELIMINATIONS 40, DEATHS 27). Kills are forced for this test only."""
+    board = _padded_crop("owner_card_211713_crop.png")
+    scale = H._board_scale(board)
+    pack = H._pack()
+    name = H._best_owner_hit(H._value_mask(board, H._OWNER_SEARCH_VALUE), pack, scale)
+    personal = H._owner_row_header_hits(board, scale, pack, name[1], name[2], name[4])[4]
+    assert personal is not None
+    assert H._digits_under_label(board, personal, scale) == 27  # what the card label alone would give
+    real = H._digits_for_column
+
+    def kills_19(img, hit, row_y, row_h, scale, *, detail=None):
+        if detail is not None and detail.get("column") == "kills":
+            return 19
+        return real(img, hit, row_y, row_h, scale, detail=detail)
+
+    monkeypatch.setattr(H, "_digits_for_column", kills_19)
+    row = H.read_owner_row(board)
+    assert row.ok and row.kills == 19 and row.kills != 40
+    assert row.deaths is None and row.deaths != 27
+    assert row.deaths_status == H.DEATHS_UNKNOWN_NO_COLUMN
+    assert row.card_name_match is False and row.card_name_score < H._OWNER_MIN
+    assert row.deaths_detail["check"] == "card_not_owner"
+
+
+def test_matching_card_deaths_are_used_only_without_a_deaths_column(monkeypatch):
+    board = frame("end_173922_019.jpg")
+    row = H.read_owner_row(board)
+    assert (row.kills, row.deaths, row.confirms) == (13, 13, 7)
+    assert row.deaths_status == H.DEATHS_PERSONAL_CARD and row.card_name_match is True
+    up = cv2.resize(board, (1920, 1080), interpolation=cv2.INTER_LINEAR)
+    big = H.read_owner_row(up)
+    assert big.deaths == 13 and big.card_name_match is True
+    # The same card with its name blanked is not the owner's card: deaths UNKNOWN.
+    blank = board.copy()
+    blank[618:646, 340:520] = 0
+    row = H.read_owner_row(blank)
+    assert row.ok and row.kills == 13 and row.deaths is None
+    assert row.deaths_status == H.DEATHS_UNKNOWN_NO_COLUMN and row.card_name_match is False
+    # A DEATHS column on the board: the card is never consulted.
+    monkeypatch.setattr(H, "_card_owner_match", lambda *a, **kw: pytest.fail("card read on a column board"))
+    tdm = H.read_owner_row(_synthetic_tdm_board())
+    assert (tdm.kills, tdm.deaths) == (9, 21)
+
+
+def test_deaths_column_boards_read_exactly_as_before():
+    row = H.read_owner_row(_synthetic_tdm_board())
+    assert row.ok and (row.kills, row.deaths, row.assists) == (9, 21, 2)
+    assert row.deaths_status == H.DEATHS_COLUMN and row.card_name_match is None and row.card_name_score is None
+    assert not hasattr(row, "deaths_detail")
+    assert row.note == ("Qortrola30's scoreboard row was read. Kills and deaths are that row, "
+                        "not a home or away score.")
+    # A DEATHS column whose digits fail is still not read; it is not turned into UNKNOWN.
+    missed = H.read_owner_row(_synthetic_tdm_board(deaths_digits=()))
+    assert not missed.ok and missed.stage == "deaths_not_read"
+    assert missed.stage_detail["source"] == "column"
+
+
+def test_consensus_accepts_five_unknown_deaths_frames():
+    board = _padded_crop("owner_card_214647_crop.png", fill=60)  # a black pad reads as a faded frame
+    assert H.frame_is_real(board)
+    frames = []
+    for i in range(5):
+        img = board.copy()
+        img[0, i] = 40 * (i + 1)
+        frames.append({"img": img, "source_id": f"src-{i}", "captured_us": i * 1_000_000, "pixel_id": f"pix-{i}"})
+    verdict = H.consensus_owner_row(frames, None)
+    assert verdict["status"] == "accepted" and verdict["kills"] == 17
+    assert verdict["deaths"] is None and verdict["deaths_status"] == H.DEATHS_UNKNOWN_NO_COLUMN
+    probe = C._summarize_end_frame(board)
+    assert probe["owner_row"]["kills"] == 17 and probe["owner_row"]["deaths"] is None
+    assert probe["owner_row"]["deaths_status"] == H.DEATHS_UNKNOWN_NO_COLUMN

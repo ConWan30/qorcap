@@ -431,6 +431,9 @@ class EndStop:
             "path": path,
             "result": c["word"].upper(),
             "reader": "cod_end_screen" + ("+owner_row" if follow == "owner_row" else ""),
+            # Only the follow-up that confirmed. A row read after confirmation is
+            # owner_row_after_confirm_t_ms, not this. Neither means the row was accepted:
+            # that is cod_reader_stats.json owner_row_accepted.
             "owner_row_seen": follow == "owner_row",
             "consecutive": c["reads"],
             "span_ms": c["formed_t"] - c["t0"],
@@ -598,6 +601,7 @@ class EndStop:
                 "stop_rule": self.stop_rule,
                 "best_play": self.best_play,
                 "best_play_best_score": None if self._bp_best is None else round(self._bp_best, 4),
+                # First post-confirm frame whose row passed the per-frame read (one frame, not accepted).
                 "owner_row_after_confirm_t_ms": self._post_owner_t,
                 "frames_after_confirm": self.post_frames,
                 "owner_reads_after_confirm": self.post_owner_reads,

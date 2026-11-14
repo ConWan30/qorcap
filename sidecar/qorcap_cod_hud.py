@@ -99,6 +99,19 @@ _HEADER_ORDER = ("SCORE", "KILLS", "ASSISTS", "DEATHS")
 # A second, thinner sample (match-20261113-133025, text supplement owner_tags) is
 # matched at this same gate; the higher of the two is kept. Gate unchanged.
 _OWNER_MIN = 0.80
+# The personal card shows one player's name, which is not always Qortrola30
+# (211713: HFAutomaton). The card name is a dimmer gold than the row tag, so it
+# is cut at this value and matched with the owner_card_tags mask at the same
+# _OWNER_MIN gate. 214647 (tuning) about 0.98-1.0, end_173922_019 (held-out)
+# about 0.92, the 211713 HFAutomaton card about 0.37-0.39.
+_CARD_NAME_VALUE = 100
+# Deaths status on an owner-row read. "column": a DEATHS column on the row.
+# "personal_card": the DEATHS label on a card whose name matched Qortrola30.
+# UNKNOWN_NO_COLUMN: the board has no DEATHS column and no owner card deaths
+# were read, so deaths is None. It is never guessed.
+DEATHS_COLUMN = "column"
+DEATHS_PERSONAL_CARD = "personal_card"
+DEATHS_UNKNOWN_NO_COLUMN = "UNKNOWN_NO_COLUMN"
 # KILLS on that frame scores about 0.96. The other team's header scores about 0.54.
 # DEATHS on the personal card scores about 0.86. The next hit scores about 0.40.
 # A 720p frame scaled to 1080p scores about 0.74 on KILLS and about 0.72 on CONFIRMS.
@@ -184,6 +197,14 @@ def _apply_text_supplement(data):
             tags.append(mask)
     if tags:
         data["owner_tag_masks"] = tags
+    # Qortrola30 on the personal card (owner_card_tags). Only the card's own name check uses it.
+    cards = []
+    for item in extra.get("owner_card_tags", []):
+        mask = _mask_from_rows(item.get("mask_rows"))
+        if mask is not None:
+            cards.append(mask)
+    if cards:
+        data["owner_card_masks"] = cards
     return data
 
 
@@ -225,13 +246,15 @@ def _crop(img, name: str):
     return crop_box(img, _region(name))
 
 
-def _not_read(region: str, reason: str, note: str, stage: str | None = None):
+def _not_read(region: str, reason: str, note: str, stage: str | None = None, *, detail=None):
     from qorcap_cod import RegionRead
     rd = RegionRead(region, "not_read", False, reason, False, note)
     if stage:
         # Which owner-row step stopped the read. Diagnostic only: not a score, not Counted,
         # and not a RegionRead field, so region rows and their evidence hashes are unchanged.
         rd.stage = stage
+    if detail:
+        rd.stage_detail = detail
     return rd
 
 
@@ -1207,10 +1230,18 @@ def _row_digit_bank(path=None):
     return bank
 
 
-def _row_classify(vecs, labels, glyph, gray=None):
+def _row_miss(detail, check, **values):
+    """Optional, per-call diagnostic sink. Never feeds a read decision or stores pixels."""
+    if detail is not None:
+        detail.update(check=check, **{k: (round(v, 4) if isinstance(v, float) else v) for k, v in values.items()})
+    return None
+
+
+def _row_classify(vecs, labels, glyph, gray=None, *, detail=None):
     """(label, top, second) for one glyph. label is None unless both gates pass."""
     v = _row_feature(glyph, gray)
     if v is None:
+        _row_miss(detail, "feature_empty")
         return None, 0.0, 0.0
     scores = vecs @ v
     by: dict[str, float] = {}
@@ -1222,11 +1253,16 @@ def _row_classify(vecs, labels, glyph, gray=None):
     best, top = ranked[0]
     second = ranked[1][1] if len(ranked) > 1 else -1.0
     if top < _ROW_DIGIT_MIN or top - second < _ROW_DIGIT_MARGIN:
+        # Keep the original OR decision, including when both checks fail.
+        _row_miss(detail, "glyph_gate", score_gate_failed=bool(top < _ROW_DIGIT_MIN),
+                  margin_failed=bool(top - second < _ROW_DIGIT_MARGIN),
+                  top=top, second=second, margin=top - second,
+                  score_min=_ROW_DIGIT_MIN, margin_min=_ROW_DIGIT_MARGIN)
         return None, top, second
     return best, top, second
 
 
-def _row_cell_thr(v, thr: int) -> int | None:
+def _row_cell_thr(v, thr: int, *, detail=None) -> int | None:
     """Ink cut for one cell: Otsu on the cell's value channel, kept within ``thr`` -40..+30.
 
     A fixed cut thinned the 3 on a highlighted 720p row (practice 194037) until it no longer
@@ -1234,12 +1270,13 @@ def _row_cell_thr(v, thr: int) -> int | None:
     """
     cv2, np = _libs()
     if v.size == 0 or int(v.max()) - int(np.median(v)) < _ROW_MIN_CONTRAST:
-        return None
+        return _row_miss(detail, "cell_contrast", contrast=(int(v.max()) - int(np.median(v))) if v.size else None,
+                         contrast_min=_ROW_MIN_CONTRAST)
     t, _ = cv2.threshold(v, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     return int(min(thr + 30, max(thr - 40, int(t))))
 
 
-def _row_glyph_pieces(img, x0: int, x1: int, y0: int, y1: int, thr: int, scale: float):
+def _row_glyph_pieces(img, x0: int, x1: int, y0: int, y1: int, thr: int, scale: float, *, detail=None):
     """Glyph masks in one cell, left to right, or None.
 
     None when there is no ink, too many glyphs, or ink that is not a glyph and not a speck:
@@ -1250,14 +1287,14 @@ def _row_glyph_pieces(img, x0: int, x1: int, y0: int, y1: int, thr: int, scale: 
     cv2, np = _libs()
     bgr = _as_bgr(img)
     if cv2 is None or bgr is None:
-        return None
+        return _row_miss(detail, "frame_or_library_missing")
     h, w = bgr.shape[:2]
     x0, x1 = max(0, int(x0)), min(w, int(x1))
     y0, y1 = max(0, int(y0)), min(h, int(y1))
     if x1 - x0 < 3 or y1 - y0 < 3:
-        return None
+        return _row_miss(detail, "cell_bounds", width=x1 - x0, height=y1 - y0)
     hsv = cv2.cvtColor(bgr[y0:y1, x0:x1], cv2.COLOR_BGR2HSV)
-    cut = _row_cell_thr(hsv[:, :, 2], thr)
+    cut = _row_cell_thr(hsv[:, :, 2], thr, detail=detail)
     if cut is None:
         return None
     mask = (hsv[:, :, 2] > cut).astype(np.uint8) * 255
@@ -1270,7 +1307,7 @@ def _row_glyph_pieces(img, x0: int, x1: int, y0: int, y1: int, thr: int, scale: 
     for i in range(1, n):
         x, y, ww, hh, area = (int(t) for t in st[i])
         if ww > maxw and hh >= minh and area >= 8:
-            return None  # wider than one digit at glyph height: merged or not a digit
+            return _row_miss(detail, "merged_or_wide_glyph", width=ww, max_width=maxw, height=hh, area=area)
         if ww > maxw or hh < 1:
             continue
         g = (lab[y:y + hh, x:x + ww] == i).astype(np.uint8) * 255
@@ -1323,24 +1360,29 @@ def _row_glyph_pieces(img, x0: int, x1: int, y0: int, y1: int, thr: int, scale: 
             break
     loose = [frag for frag in frags if not frag["joined"]]
     if any(frag["area"] >= 8 or frag["h"] >= tallh for frag in loose):
-        return None
+        return _row_miss(detail, "loose_fragment", loose_count=len(loose),
+                         max_area=max(frag["area"] for frag in loose),
+                         max_height=max(frag["h"] for frag in loose), height_limit=tallh)
     if not kept or len(kept) > _ROW_GLYPH_MAX:
-        return None
+        return _row_miss(detail, "digit_count", digit_count=len(kept), digit_max=_ROW_GLYPH_MAX)
     # Several small pieces together are a faded glyph, not one speck (practice 162225 '13'
     # with its 3 faded). The bar grows with the glyph size so a large card glyph's fringe is not one.
     if sum(frag["area"] for frag in loose) >= max(8, 0.35 * max(piece["area"] for piece in kept)):
-        return None
+        return _row_miss(detail, "loose_ink_total", area=sum(frag["area"] for frag in loose),
+                         area_limit=max(8, 0.35 * max(piece["area"] for piece in kept)))
     # Every digit of this font is the same height. A shorter glyph is a digit that lost ink.
     tall = max(piece["h"] for piece in kept)
     if any(tall - piece["h"] > max(2, int(round(0.2 * tall))) for piece in kept):
-        return None
+        return _row_miss(detail, "glyph_height", heights=[piece["h"] for piece in kept],
+                         height_delta_max=max(2, int(round(0.2 * tall))))
     v = hsv[:, :, 2]
     bgv = float(np.median(v))
     # Every digit of one value is drawn in the same ink. A glyph much dimmer than the brightest
     # one is a faded digit whose cut kept only part of it (a faded 4 kept as its stem reads 1).
     peaks = [float(v[p["y"]:p["y"] + p["h"], p["x"]:p["x"] + p["w"]].max()) - bgv for p in kept]
     if min(peaks) < _ROW_INK_RATIO * max(peaks):
-        return None
+        return _row_miss(detail, "ink_ratio", peak_min=min(peaks), peak_max=max(peaks),
+                         ratio_min=_ROW_INK_RATIO)
     # A whole digit fainter than its neighbours falls under the cut and leaves no piece, so the
     # value would lose that digit. Look again at a lower cut on the local background (a 5x5
     # opening removes thin strokes and keeps a highlighted row's gradient): a glyph-like piece
@@ -1363,7 +1405,8 @@ def _row_glyph_pieces(img, x0: int, x1: int, y0: int, y1: int, thr: int, scale: 
     for i in range(1, ln):
         _lx, _ly, _lw, lh, la = (int(t) for t in lst[i])
         if lh >= tallh and la >= _ROW_LOW_AREA:
-            return None
+            return _row_miss(detail, "low_cut_missing_digit", height=lh, area=la,
+                             height_min=tallh, area_min=_ROW_LOW_AREA)
     comps = []
     for piece in sorted(kept, key=lambda item: item["x"]):
         gx0, gy0 = max(0, piece["x"] - 1), max(0, piece["y"] - 1)
@@ -1372,24 +1415,26 @@ def _row_glyph_pieces(img, x0: int, x1: int, y0: int, y1: int, thr: int, scale: 
     return comps
 
 
-def _row_digit_string(img, x0: int, x1: int, y0: int, y1: int, thr: int, scale: float, bank=None) -> str | None:
+def _row_digit_string(img, x0: int, x1: int, y0: int, y1: int, thr: int, scale: float, bank=None, *, detail=None) -> str | None:
     """Digits in one column, any length up to _ROW_GLYPH_MAX. None when any glyph is missing,
     below the score gate, or too close to another digit. An unread value stays unread."""
     np = _libs()[1]
     bank = _row_digit_bank() if bank is None else bank
     if np is None or bank is None:
-        return None
+        return _row_miss(detail, "library_or_bank_missing")
     vecs, labels = bank
-    comps = _row_glyph_pieces(img, x0, x1, y0, y1, thr, scale)
+    comps = _row_glyph_pieces(img, x0, x1, y0, y1, thr, scale, detail=detail)
     if comps is None:
         return None
     text = ""
-    for _x, glyph, gray in comps:
-        best, _top, _second = _row_classify(vecs, labels, glyph, gray)
+    for index, (_x, glyph, gray) in enumerate(comps):
+        best, _top, _second = _row_classify(vecs, labels, glyph, gray, detail=detail)
         if best is None:
+            if detail is not None:
+                detail.update(glyph_index=index, digit_count=len(comps))
             return None
         text += best
-    return text if text.isdigit() else None
+    return text if text.isdigit() else _row_miss(detail, "non_digit_text", digit_count=len(comps))
 
 
 def _stat_int(text: str | None) -> int | None:
@@ -1398,20 +1443,55 @@ def _stat_int(text: str | None) -> int | None:
     return int(text)
 
 
-def _digits_for_column(img, hit, row_y: int, row_h: int, scale: float) -> int | None:
+def _column_int(text: str | None, detail=None) -> int | None:
+    """``_stat_int`` plus the diagnostic for a digit string it refuses."""
+    value = _stat_int(text)
+    if value is None and text is not None:
+        _row_miss(detail, "value_length", digit_count=len(text), digit_max=_ROW_GLYPH_MAX)
+    return value
+
+
+def _digits_for_column(img, hit, row_y: int, row_h: int, scale: float, *, detail=None) -> int | None:
     _score, x, _y, w, _h = hit
     text = _row_digit_string(
         img, x - int(4 * scale), x + w + int(8 * scale),
-        row_y - int(2 * scale), row_y + row_h + int(6 * scale), 130, scale)
-    return _stat_int(text)
+        row_y - int(2 * scale), row_y + row_h + int(6 * scale), 130, scale, detail=detail)
+    return _column_int(text, detail)
 
 
-def _digits_under_label(img, hit, scale: float) -> int | None:
+def _card_owner_match(img, hit, pack, scale: float) -> dict:
+    """Is the personal card's name Qortrola30? The card's eliminations are never kills."""
+    masks = pack.get("owner_card_masks") or []
+    if not masks:
+        return {"match": None, "score": None, "check": "card_mask_missing"}
+    _score, x, y, _w, _h = hit
+    h, w = img.shape[:2]
+    x0, x1 = max(0, x - int(460 * scale)), max(0, min(w, x - int(240 * scale)))
+    y0, y1 = max(0, y - int(24 * scale)), min(h, y + int(24 * scale))
+    if x1 <= x0 or y1 <= y0:
+        return {"match": False, "score": None, "check": "card_name_out_of_frame"}
+    crop = img[y0:y1, x0:x1]
+    if abs(scale - 1.0) >= 0.02:
+        # The card letters are 1-2 px strokes: bring the crop to 720p instead of growing the mask.
+        cv2 = _libs()[0]
+        crop = cv2.resize(crop, None, fx=1.0 / scale, fy=1.0 / scale, interpolation=cv2.INTER_AREA)
+    search = _value_mask(crop, _CARD_NAME_VALUE)
+    best = None
+    for mask in masks:
+        got = _best_mask(search, mask, 1.0, 0.0)
+        if got is not None and (best is None or got[0] > best):
+            best = got[0]
+    if best is None:
+        return {"match": False, "score": None, "check": "card_name_not_found"}
+    return {"match": best >= _OWNER_MIN, "score": round(float(best), 4), "owner_min": _OWNER_MIN}
+
+
+def _digits_under_label(img, hit, scale: float, *, detail=None) -> int | None:
     _score, x, y, w, h = hit
     text = _row_digit_string(
         img, x - int(8 * scale), x + w + int(12 * scale),
-        y + h, y + h + int(28 * scale), 130, scale)
-    return _stat_int(text)
+        y + h, y + h + int(28 * scale), 130, scale, detail=detail)
+    return _column_int(text, detail)
 
 
 def _owner_row_header_hits(bgr, scale, pack, row_x, row_y, row_h):
@@ -1482,7 +1562,10 @@ def read_owner_row(img):
 
     The gamertag letters have to agree. Kills come from the KILLS column on
     that row. Deaths come from a DEATHS column on that row, or from the DEATHS
-    label on the personal card below it when the row has no deaths column.
+    label on the personal card below it when the row has no deaths column and
+    the card's name matches Qortrola30. With no DEATHS column and no owner card
+    deaths, the row is still read with deaths None and deaths_status
+    UNKNOWN_NO_COLUMN; a DEATHS column whose digits fail is still not read.
     Assists are read only when that column is on the board. Confirms are not
     assists. A missing row, a different tag, or an unreadable kill or death
     is not read. This does not fill home or away.
@@ -1506,15 +1589,17 @@ def read_owner_row(img):
     _name_score, row_x, row_y, _row_w, row_h = name_hit
     kills_h, deaths_h, assists_h, confirms_h, personal = _owner_row_header_hits(
         bgr, scale, pack, row_x, row_y, row_h)
+    detail = {"column": "kills"}
     if kills_h is None:
         return _not_read(
             "owner_row", "not_present",
-            "Kills were not read on Qortrola30's row. They are not Counted.", "kills_header_not_found")
-    kills = _digits_for_column(bgr, kills_h, row_y, row_h, scale)
+            "Kills were not read on Qortrola30's row. They are not Counted.", "kills_header_not_found",
+            detail={"column": "kills", "check": "missing_column", "header_min": _ROW_HEADER_MIN})
+    kills = _digits_for_column(bgr, kills_h, row_y, row_h, scale, detail=detail)
     if kills is None:
         return _not_read(
             "owner_row", "not_present",
-            "Kills were not read on Qortrola30's row. They are not Counted.", "kills_not_read")
+            "Kills were not read on Qortrola30's row. They are not Counted.", "kills_not_read", detail=detail)
     assists = None
     if assists_h is not None:
         assists = _digits_for_column(bgr, assists_h, row_y, row_h, scale)
@@ -1525,19 +1610,43 @@ def read_owner_row(img):
     confirms = None
     if confirms_h is not None:
         confirms = _digits_for_column(bgr, confirms_h, row_y, row_h, scale)
+    detail = {"column": "deaths", "source": "column" if deaths_h is not None else "personal_card"}
+    card = None
     if deaths_h is not None:
-        deaths = _digits_for_column(bgr, deaths_h, row_y, row_h, scale)
+        # A DEATHS column is on the board: same read and same refusal as before.
+        deaths = _digits_for_column(bgr, deaths_h, row_y, row_h, scale, detail=detail)
+        if deaths is None:
+            return _not_read(
+                "owner_row", "not_present",
+                "Deaths were not read for Qortrola30. They are not Counted.", "deaths_not_read", detail=detail)
+        status = DEATHS_COLUMN
     else:
-        deaths = _digits_under_label(bgr, personal, scale) if personal is not None else None
+        deaths = None
+        if personal is None:
+            _row_miss(detail, "missing_column_and_personal_label", header_min=_ROW_HEADER_MIN)
+        else:
+            card = _card_owner_match(bgr, personal, pack, scale)
+            if card["match"] is True:
+                deaths = _digits_under_label(bgr, personal, scale, detail=detail)
+            else:
+                _row_miss(detail, "card_not_owner", card_name_score=card.get("score"),
+                          owner_min=_OWNER_MIN)
+        status = DEATHS_PERSONAL_CARD if deaths is not None else DEATHS_UNKNOWN_NO_COLUMN
     if deaths is None:
-        return _not_read(
-            "owner_row", "not_present",
-            "Deaths were not read for Qortrola30. They are not Counted.", "deaths_not_read")
-    return _present(
-        "owner_row", "owner_row",
-        "Qortrola30's scoreboard row was read. Kills and deaths are that row, not a home or away score.",
+        note = ("Qortrola30's scoreboard row was read. Kills are that row. The board has no DEATHS column "
+                "and no owner card deaths were read, so deaths are UNKNOWN, not zero.")
+    else:
+        note = "Qortrola30's scoreboard row was read. Kills and deaths are that row, not a home or away score."
+    rd = _present(
+        "owner_row", "owner_row", note,
         kills=kills, deaths=deaths, assists=assists, confirms=confirms, player_tag=OWNER_TAG,
     )
+    rd.deaths_status = status
+    rd.card_name_match = None if card is None else card["match"]
+    rd.card_name_score = None if card is None else card.get("score")
+    if deaths is None:
+        rd.deaths_detail = dict(detail)
+    return rd
 
 
 def read_hitmarker(img, *, cropped: bool = False):
@@ -1906,20 +2015,37 @@ def consensus_owner_row(frames, feed=None) -> dict:
     if any(later <= earlier for earlier, later in zip(times, times[1:])):
         return {**empty, "reason": "repeated_frame"}
     reads = [read_owner_row(img) for img, _meta in tail]
-    if not all(r.ok and r.calibrated and r.kills is not None and r.deaths is not None for r in reads):
+    # Deaths None counts only with the explicit UNKNOWN_NO_COLUMN status (no DEATHS column,
+    # no owner card deaths). The five frames must agree on kills and on the deaths status.
+    if not all(r.ok and r.calibrated and r.kills is not None and owner_deaths_ok(r) for r in reads):
         return {**empty, "reason": "row_not_read"}
     kills = {r.kills for r in reads}
-    deaths = {r.deaths for r in reads}
+    deaths = {(r.deaths, owner_deaths_status(r)) for r in reads}
     if len(kills) != 1 or len(deaths) != 1:
         return {**empty, "reason": "frames_disagree"}
     k = next(iter(kills))
-    d = next(iter(deaths))
+    d, d_status = next(iter(deaths))
     check = _feed_check(feed, int(k))
     if check == "inconsistent":
-        return {"status": "abstain", "reason": "feed_inconsistent", "kills": k, "deaths": d, "feed_check": check}
+        return {"status": "abstain", "reason": "feed_inconsistent", "kills": k, "deaths": d, "feed_check": check,
+                "deaths_status": d_status}
     last = reads[-1]
     return {
         "status": "accepted", "reason": "five_frame_consensus",
         "kills": k, "deaths": d, "assists": last.assists, "confirms": last.confirms,
-        "player_tag": last.player_tag, "feed_check": check,
+        "player_tag": last.player_tag, "feed_check": check, "deaths_status": d_status,
     }
+
+
+def owner_deaths_status(rd) -> str:
+    """The deaths status on an owner-row read. Reads made before the status existed are "column"."""
+    status = getattr(rd, "deaths_status", None)
+    return status if isinstance(status, str) and status else DEATHS_COLUMN
+
+
+def owner_deaths_ok(rd) -> bool:
+    """Deaths are an int, or None with the explicit UNKNOWN_NO_COLUMN status. Never guessed."""
+    deaths = getattr(rd, "deaths", None)
+    if isinstance(deaths, int) and not isinstance(deaths, bool):
+        return True
+    return deaths is None and owner_deaths_status(rd) == DEATHS_UNKNOWN_NO_COLUMN

@@ -637,8 +637,13 @@ def cod_final_agreement(*, feed, scoreboard, end_screen, frame_stamps) -> dict:
     if (feed.get("coverage") != "covered" or feed.get("ownership_qualified") is not True
             or feed.get("deduped") is not True or _score(feed.get("kills")) is None):
         return abstain("killfeed_coverage_unknown")
-    if (scoreboard.get("calibrated") is not True or _score(scoreboard.get("kills")) is None
-            or _score(scoreboard.get("deaths")) is None):
+    if (scoreboard.get("calibrated") is not True or _score(scoreboard.get("kills")) is None):
+        return abstain("scoreboard_not_read")
+    if _score(scoreboard.get("deaths")) is None:
+        # No DEATHS column and no owner card deaths: deaths are UNKNOWN, so the three legs
+        # cannot agree on K/D. This says so instead of using a guessed number.
+        if scoreboard.get("deaths_status") == "UNKNOWN_NO_COLUMN":
+            return abstain("scoreboard_deaths_unknown")
         return abstain("scoreboard_not_read")
     if end_screen.get("calibrated") is not True or end_screen.get("outcome") not in ("victory", "defeat"):
         return abstain("end_screen_not_read")
@@ -780,7 +785,17 @@ class CodSetRunner:
         # Stop-time health only. These do not change what a frame posts or logs.
         self.end_word_first_ms = None
         self.end_word_last_ms = None
+        # Owner-row stop health (info only; none of these changes a decision):
+        # - owner_row_ever_read: at least one frame passed the per-frame owner-row gate
+        #   (tag, kills, deaths). Kept for compatibility. It does not mean the row was accepted.
+        # - owner_row_good_frames: how many frames passed that per-frame gate.
+        # - owner_row_accepted: the row met the 3-frame / 3000 ms agreement and the owner-row
+        #   consensus and was committed with the final (the cod_session.json owner_row).
+        # cod_end_stop.json owner_row_seen is a different, EndStop field: the row was the read
+        # that confirmed the end screen (splash+owner_row or a sustained run with the row).
         self.owner_row_ever_read = False
+        self.owner_row_good_frames = 0
+        self.owner_row_accepted = False
         self._observe_lock = threading.Lock()
         self._published = None
         # Optional practice auto-stop watcher (qorcap_cod_endstop). Sees the reads this loop already
@@ -825,6 +840,8 @@ class CodSetRunner:
             "end_word_first_ms": _optional_ms(self.end_word_first_ms),
             "end_word_last_ms": _optional_ms(self.end_word_last_ms),
             "owner_row_ever_read": bool(self.owner_row_ever_read),
+            "owner_row_good_frames": _stat_count({"n": self.owner_row_good_frames}, "n"),
+            "owner_row_accepted": bool(self.owner_row_accepted),
             "published": True,
         }
         with self._observe_lock:
@@ -845,6 +862,8 @@ class CodSetRunner:
                 "end_word_first_ms": snap.get("end_word_first_ms"),
                 "end_word_last_ms": snap.get("end_word_last_ms"),
                 "owner_row_ever_read": snap.get("owner_row_ever_read"),
+                "owner_row_good_frames": snap.get("owner_row_good_frames"),
+                "owner_row_accepted": snap.get("owner_row_accepted"),
                 "published": True,
             }
 
@@ -1112,11 +1131,16 @@ class CodSetRunner:
         is on the board. A missing row, a different tag, or an unreadable
         digit is not Counted.
         """
+        from qorcap_cod_hud import owner_deaths_ok, owner_deaths_status
         kills = _score(getattr(owner, "kills", None))
         deaths = _score(getattr(owner, "deaths", None))
         assists = _score(getattr(owner, "assists", None))
         confirms = _score(getattr(owner, "confirms", None))
         tag = getattr(owner, "player_tag", None)
+        # Deaths may be None only with deaths_status UNKNOWN_NO_COLUMN (the board has no
+        # DEATHS column and no owner card deaths were read). A DEATHS column that was not
+        # read still stops the row. The 3-frame/3000 ms bar is unchanged.
+        deaths_status = owner_deaths_status(owner)
         ready = (
             isinstance(end.reason, str)
             and end.reason in ("victory", "defeat")
@@ -1125,7 +1149,7 @@ class CodSetRunner:
             and owner.calibrated
             and same_owner_tag(tag or "")
             and kills is not None
-            and deaths is not None
+            and (deaths is not None or owner_deaths_ok(owner))
         )
         if not ready:
             self.stats["end_screen_not_read"] += 1
@@ -1134,10 +1158,19 @@ class CodSetRunner:
             if isinstance(stage, str) and stage:
                 # Which owner-row step stopped this frame. Diagnostic only: not a score and not Counted.
                 self._frame_end["owner_stage"] = stage
+            detail = getattr(owner, "stage_detail", None)
+            if isinstance(detail, dict) and detail:
+                # The exact check that stopped the kills or deaths read, with its scores.
+                # Diagnostic only: the decision above is unchanged and nothing here is Counted.
+                self._frame_end["owner_stage_detail"] = dict(detail)
             self._clear_end_candidate()
             return
         self.owner_row_ever_read = True
+        self.owner_row_good_frames += 1
         extra = (OWNER_TAG.casefold(), kills, deaths, assists, confirms)
+        if deaths_status != "column":
+            # Agreement across frames is on kills plus the deaths status. Column boards keep the old key.
+            extra = extra + (deaths_status,)
         agreed = self._offer(when, end.reason, True, None, None, extra=extra)
         if agreed is None:
             self._frame_end = {"status": "not_ready", "reason": end.reason, "visual_ok": False}
@@ -1157,6 +1190,10 @@ class CodSetRunner:
             (
                 f"The end word is {end.reason}. {OWNER_TAG}'s scoreboard row was read: "
                 f"kills {kills}, deaths {deaths}."
+                if deaths is not None else
+                f"The end word is {end.reason}. {OWNER_TAG}'s scoreboard row was read: "
+                f"kills {kills}. Deaths are UNKNOWN: the board has no DEATHS column and no "
+                "owner card deaths were read. They are not zero."
             ),
             "Home and away were not read. Those row numbers are not a home or away score.",
         ]
@@ -1174,9 +1211,14 @@ class CodSetRunner:
             "confirms": confirms,
             "result": end.reason,
         }
+        if deaths_status != "column":
+            # Shape change only off DEATHS-column boards: deaths_status and the card name check.
+            owner_doc["deaths_status"] = deaths_status
+            owner_doc["card_name_match"] = getattr(owner, "card_name_match", None)
         gate = self.final_eligibility(visual_ok=True, evidence_us=self._evidence_us())
         agreement = self._final_agreement(end, owner)
         confirmed = gate["confirmed"] and agreement["counted"]
+        self.owner_row_accepted = True
         self._frame_end = {
             "status": "accepted", "reason": end.reason, "visual_ok": True, "eligible": confirmed,
         }
@@ -1196,6 +1238,7 @@ class CodSetRunner:
             "kills": _score(owner.kills), "deaths": _score(owner.deaths),
             "assists": _score(owner.assists), "calibrated": bool(owner.ok and owner.calibrated),
             "t_us": self._screen_us(),
+            "deaths_status": getattr(owner, "deaths_status", None),
         }
         return cod_final_agreement(
             feed=feed, scoreboard=board,
@@ -1902,12 +1945,13 @@ def owner_row_from_signals(bundle: Path) -> dict | None:
 def _public_owner_row(owner: dict) -> dict:
     """The fields that sit beside the match. No other name is copied."""
     kills, deaths = _score(owner.get("kills")), _score(owner.get("deaths"))
-    if kills is None or deaths is None:
+    unknown = deaths is None and owner.get("deaths_status") == "UNKNOWN_NO_COLUMN"
+    if kills is None or (deaths is None and not unknown):
         return {}
     assists = _score(owner.get("assists"))
     confirms = _score(owner.get("confirms"))
     result = owner.get("result") if owner.get("result") in ("victory", "defeat") else None
-    return {
+    out = {
         "tag": OWNER_TAG,
         "kills": kills,
         "deaths": deaths,
@@ -1919,6 +1963,15 @@ def _public_owner_row(owner: dict) -> dict:
             "Not a home or away score. Not a verification verdict."
         ),
     }
+    status = owner.get("deaths_status")
+    if status in ("personal_card", "UNKNOWN_NO_COLUMN"):
+        # Only rows without a DEATHS column carry these keys, so column boards keep the old shape.
+        out["deaths_status"] = status
+        match = owner.get("card_name_match")
+        out["card_name_match"] = match if isinstance(match, bool) else None
+        if unknown:
+            out["note"] += " Deaths are UNKNOWN: no DEATHS column and no owner card deaths. Not zero."
+    return out
 
 
 def session_document(*, frame_stamps=None, inputs=None, wall_anchor_ms=None, owner_row=None) -> dict:
@@ -2106,6 +2159,8 @@ def _blank_observation() -> dict:
         "end_word_first_ms": None,
         "end_word_last_ms": None,
         "owner_row_ever_read": None,
+        "owner_row_good_frames": None,
+        "owner_row_accepted": None,
         "published": False,
     }
 
@@ -2123,6 +2178,8 @@ def observation_from_runner(runner, *, reader_error=None, cod_signal_error=None,
         "end_word_first_ms": _optional_ms(getattr(runner, "end_word_first_ms", None)),
         "end_word_last_ms": _optional_ms(getattr(runner, "end_word_last_ms", None)),
         "owner_row_ever_read": bool(getattr(runner, "owner_row_ever_read", False)),
+        "owner_row_good_frames": _stat_count({"n": getattr(runner, "owner_row_good_frames", 0)}, "n"),
+        "owner_row_accepted": bool(getattr(runner, "owner_row_accepted", False)),
         "published": True,
     }
 
@@ -2145,6 +2202,12 @@ def reader_stats_document(observation: dict, *, reader_join: str) -> dict:
     owner = obs.get("owner_row_ever_read")
     if not isinstance(owner, bool):
         owner = None
+    good = obs.get("owner_row_good_frames")
+    if isinstance(good, bool) or not isinstance(good, int) or good < 0:
+        good = None
+    accepted = obs.get("owner_row_accepted")
+    if not isinstance(accepted, bool):
+        accepted = None
     if reader_join not in ("joined", "timed_out", "not_joined"):
         reader_join = "not_joined"
     return {
@@ -2159,12 +2222,17 @@ def reader_stats_document(observation: dict, *, reader_join: str) -> dict:
         "end_word_last_ms": _optional_ms(obs.get("end_word_last_ms")),
         "end_word_clock": END_WORD_CLOCK,
         "owner_row_ever_read": owner,
+        "owner_row_good_frames": good,
+        "owner_row_accepted": accepted,
         "note": (
             "Reader counts from this sidecar when stop passes practice and the game is Call of Duty. "
             "This file has no switch that reads another installed build. Not a receipt field. No images. "
             "reader_tick is wall Unix milliseconds. end_word_first_ms and end_word_last_ms are capture "
             "monotonic milliseconds. Do not subtract those clocks. A timed-out join keeps the last "
-            "published copy and is not a finished reader."
+            "published copy and is not a finished reader. owner_row_ever_read: at least one frame "
+            "passed the per-frame owner-row read; it does not mean accepted. owner_row_good_frames: "
+            "frames that passed it. owner_row_accepted: the row met the 3-frame agreement and was "
+            "committed with the final."
         ),
     }
 
@@ -2244,8 +2312,9 @@ def _summarize_end_frame(img) -> dict:
     owner = read_owner_row(img)
     row = None
     if owner.ok and owner.calibrated and same_owner_tag(owner.player_tag or ""):
+        from qorcap_cod_hud import owner_deaths_ok, owner_deaths_status
         kills, deaths = _score(owner.kills), _score(owner.deaths)
-        if kills is not None and deaths is not None:
+        if kills is not None and (deaths is not None or owner_deaths_ok(owner)):
             row = {
                 "tag": OWNER_TAG,
                 "kills": kills,
@@ -2253,6 +2322,8 @@ def _summarize_end_frame(img) -> dict:
                 "assists": _score(owner.assists),
                 "confirms": _score(owner.confirms),
             }
+            if owner_deaths_status(owner) != "column":
+                row["deaths_status"] = owner_deaths_status(owner)
     return {"result": result, "owner_row": row}
 
 
