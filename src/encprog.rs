@@ -23,6 +23,8 @@
 //! WARN per episode; `RECOVER_MS` of windows at or above `OK_PACE` closes it with one summary line.
 //! A window without a pace reading (no `out_time_us` at either end) neither extends nor breaks a
 //! slow streak or a recovery; `WARN_AFTER_MS` and `RECOVER_MS` count measured windows only.
+//! `finish` runs when the stderr stream ends for any reason, so an episode that was open when ffmpeg
+//! was killed (no `progress=end`) still gets its closing line and pending drop messages are summarised.
 //! DirectShow "real-time buffer ... frame dropped!" warning lines and the `Last message repeated N
 //! times` lines after them are counted (`observe_line`) and summarised every `DROP_SUMMARY_MS` when
 //! any arrived. Those are warning messages, not a dropped-frame count (dropped frames stay
@@ -192,6 +194,10 @@ pub struct ProgressLog {
     drops_at_summary: DropCounts,
     summary_ms: Option<u64>,
     last_was_drop: bool,
+    /// A `progress=end` key arrived.
+    end_seen: bool,
+    /// `finish` ran; later calls do nothing.
+    finished: bool,
     #[cfg(test)]
     notes: Vec<(bool, String)>,
 }
@@ -343,11 +349,26 @@ impl ProgressLog {
         }
         if key == "progress" {
             let end = value.trim() == "end";
+            if end { self.end_seen = true; }
             return self.take_line(now_ms, end, end);
         }
         if key == "out_time_us" { self.cur_out_us = uint(value); return None; }
         self.cur.set(key, value);
         None
+    }
+
+    /// The stderr stream ended, for any reason (EOF after `progress=end`, broken pipe, kill, crash).
+    /// Closes an open slow episode with its summary line and flushes a pending drop-message summary.
+    /// Logging only. Idempotent: a second call does nothing, and after a `progress=end` line that
+    /// already closed everything it writes nothing.
+    pub fn finish(&mut self, now_ms: u64) {
+        if self.finished { return; }
+        self.finished = true;
+        self.drop_summary(now_ms, true);
+        if let Some(e) = self.episode.take() {
+            let why = if self.end_seen { "still below real time at stream end" } else { "closed at stream end without end line" };
+            self.close_episode(e, now_ms, why);
+        }
     }
 
     /// One stderr line that is not a `-progress` key: counts DirectShow input-drop warnings and the
@@ -631,5 +652,70 @@ mod tests {
             p.observe_line(l);
         }
         assert_eq!(p.drops(), &DropCounts::default());
+    }
+
+    // ---- finish at stream end ----
+
+    #[test]
+    fn killed_mid_episode_closes_and_flushes_drops_at_finish() {
+        let mut p = ProgressLog::new(INTERVAL_MS);
+        let mut f = 0;
+        run(&mut p, &mut f, 0, 20, 55);
+        assert_eq!(warns(&p).len(), 1);
+        assert!(infos(&p).is_empty());
+        p.observe_line(DROP_V);
+        p.observe_line("Last message repeated 4 times");
+        // No progress=end: the writer was killed. The stderr loop ends and finish runs.
+        p.finish(21_500);
+        let i = infos(&p);
+        assert_eq!(i.len(), 2, "{i:?}");
+        assert!(i[0].starts_with("encoder input-drop messages in the last 21500 ms: video_lines=1 audio_lines=0 other_lines=0 repeats=4"), "{}", i[0]);
+        assert!(i[1].starts_with("output pace episode 1 closed (closed at stream end without end line; cause UNMEASURED"), "{}", i[1]);
+        assert!(i[1].contains("input-drop messages=5"), "{}", i[1]);
+        assert_eq!(warns(&p).len(), 1, "finish never warns");
+        p.finish(30_000);
+        assert_eq!(p.notes.len(), 3, "second finish writes nothing");
+    }
+
+    #[test]
+    fn finish_after_a_normal_end_writes_nothing() {
+        let mut p = ProgressLog::new(INTERVAL_MS);
+        let mut f = 0;
+        run(&mut p, &mut f, 0, 20, 55);
+        p.observe_line(DROP_V);
+        f += 55;
+        pb(&mut p, f, Some(f * 1_000_000 / 60), 21_000, "end").unwrap();
+        let n = p.notes.len();
+        assert!(infos(&p).iter().any(|s| s.contains("still below real time when the encoder ended")));
+        assert!(infos(&p).iter().any(|s| s.starts_with("encoder input-drop messages")));
+        p.finish(21_100);
+        assert_eq!(p.notes.len(), n, "the end line already closed everything");
+    }
+
+    #[test]
+    fn an_empty_end_block_leaves_the_episode_to_finish() {
+        let mut p = ProgressLog::new(INTERVAL_MS);
+        let mut f = 0;
+        run(&mut p, &mut f, 0, 20, 55);
+        assert!(p.observe("progress", "end", 21_000).is_none(), "nothing in the block, no line");
+        assert!(infos(&p).is_empty());
+        p.finish(21_000);
+        assert_eq!(infos(&p).len(), 1);
+        assert!(infos(&p)[0].contains("closed (still below real time at stream end;"), "{}", infos(&p)[0]);
+    }
+
+    #[test]
+    fn double_finish_and_no_episode_write_nothing() {
+        let mut p = ProgressLog::new(INTERVAL_MS);
+        p.finish(0);
+        p.finish(0);
+        assert!(p.notes.is_empty(), "never started");
+        let mut q = ProgressLog::new(INTERVAL_MS);
+        let mut f = 0;
+        run(&mut q, &mut f, 0, 40, 60);
+        q.finish(41_000);
+        q.finish(u64::MAX);
+        q.finish(0);
+        assert!(q.notes.is_empty(), "real time and no drops: nothing to close or flush");
     }
 }
