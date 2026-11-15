@@ -1,0 +1,168 @@
+2026-11-15T05:02:55.5789003Z [INFO] capture ffmpeg argv: C:\REDACTED\ffmpeg.exe -hide_banner -nostdin -loglevel warning -stats_period 1 -progress pipe:2 -f dshow -rtbufsize 512M -thread_queue_size 1024 -use_wallclock_as_timestamps 1 -video_size 1280x720 -framerate 60 -pixel_format nv12 -i "video=Elgato Game Capture Neo" -f dshow -rtbufsize 64M -thread_queue_size 1024 -use_wallclock_as_timestamps 1 -audio_buffer_size 50 -i "audio=Elgato Game Capture Neo (Elgato Game Capture Neo)" -map 0:v -map 1:a -vf fps=60,format=nv12 -fps_mode cfr -r 60 -c:v h264_mf -hw_encoding 1 -rate_control cbr -scenario live_streaming -b:v 8M -maxrate 8M -bufsize 8M -g 60 -bf 0 -c:a aac -b:a 160k -ar 48000 -af aresample=async=1000:first_pts=0 -f mpegts -mpegts_flags +resend_headers -pat_period 0.2 -muxdelay 0 pipe:1 -map 0:v -vf fps=4 -q:v 3 -f image2 -update 1 -y "C:\REDACTED\snapshot.incoming.jpg"
+2026-11-15T05:02:56.2436035Z [WARN] ffmpeg: [aist#1:0/pcm_s16le @ 0000000000000000] Guessed Channel Layout: stereo
+2026-11-15T05:02:56.4737941Z [WARN] ffmpeg: [h264_mf @ 0000000000000000] stream format change
+2026-11-15T05:02:57.2582934Z [INFO] encoder progress: frame=57 fps=56.23 speed=0.989x dup=0 drop=0
+2026-11-15T05:03:02.335066Z [INFO] encoder progress: frame=365 fps=59.93 speed=0.999x dup=0 drop=0
+2026-11-15T05:03:07.4133113Z [INFO] encoder progress: frame=671 fps=60.08 speed=1x dup=0 drop=0
+2026-11-15T05:03:12.4925052Z [INFO] encoder progress: frame=972 fps=59.82 speed=1x dup=0 drop=0
+2026-11-15T05:03:17.5691794Z [INFO] encoder progress: frame=1281 fps=60.07 speed=1x dup=0 drop=0
+2026-11-15T05:03:22.6474051Z [INFO] encoder progress: frame=1579 fps=59.80 speed=0.999x dup=0 drop=0
+2026-11-15T05:03:25.2360266Z [INFO] live tap stats: frames 1732 cues 116 skipped_cue_slots 0 (0.0% of 116) skipped_frames 0 queue_drops 0 slices / 0 TS packets send_errors 0 datagrams / 0 TS packets (would_block 0) datagrams_sent 24565 pkt_size 1316 sndbuf 8388608
+2026-11-15T05:03:27.7252842Z [INFO] encoder progress: frame=1891 fps=60.07 speed=1x dup=0 drop=0
+2026-11-15T05:03:32.8041573Z [INFO] encoder progress: frame=2187 fps=59.82 speed=0.998x dup=0 drop=0
+2026-11-15T05:03:37.8831566Z [INFO] encoder progress: frame=2501 fps=60.06 speed=1x dup=0 drop=0
+2026-11-15T05:03:42.9617262Z [INFO] encoder progress: frame=2804 fps=60.02 speed=1x dup=0 drop=0
+2026-11-15T05:03:48.0382237Z [INFO] encoder progress: frame=3108 fps=60.01 speed=1x dup=0 drop=0
+2026-11-15T05:03:53.1172976Z [INFO] encoder progress: frame=3413 fps=60.01 speed=1x dup=0 drop=0
+2026-11-15T05:03:55.2361624Z [INFO] live tap stats: frames 3536 cues 236 skipped_cue_slots 0 (0.0% of 236) skipped_frames 0 queue_drops 0 slices / 0 TS packets send_errors 0 datagrams / 0 TS packets (would_block 0) datagrams_sent 50163 pkt_size 1316 sndbuf 8388608
+2026-11-15T05:03:58.1947982Z [INFO] encoder progress: frame=3711 fps=59.90 speed=0.999x dup=0 drop=0
+2026-11-15T05:04:03.2824814Z [INFO] encoder progress: frame=4015 fps=59.89 speed=1x dup=0 drop=0
+2026-11-15T05:04:08.351186Z [INFO] encoder progress: frame=4329 fps=60.04 speed=1x dup=0 drop=0
+2026-11-15T05:04:13.429673Z [INFO] encoder progress: frame=4633 fps=60.02 speed=1x dup=0 drop=0
+2026-11-15T05:04:18.5081197Z [INFO] encoder progress: frame=4933 fps=59.97 speed=1x dup=0 drop=0
+2026-11-15T05:04:23.5849924Z [INFO] encoder progress: frame=5238 fps=59.97 speed=1x dup=0 drop=0
+2026-11-15T05:04:25.2364256Z [INFO] live tap stats: frames 5334 cues 356 skipped_cue_slots 0 (0.0% of 356) skipped_frames 0 queue_drops 0 slices / 0 TS packets send_errors 0 datagrams / 0 TS packets (would_block 0) datagrams_sent 74329 pkt_size 1316 sndbuf 8388608
+2026-11-15T05:04:28.6631573Z [INFO] encoder progress: frame=5540 fps=59.94 speed=0.999x dup=0 drop=0
+2026-11-15T05:04:33.7418708Z [INFO] encoder progress: frame=5774 fps=59.22 speed=0.991x dup=0 drop=0
+2026-11-15T05:04:34.3976722Z [WARN] ffmpeg: [in#0/dshow @ 0000000000000000] real-time buffer [Elgato Game Capture Neo] [video input] too full or near too full (62% of size: 512000000 [rtbufsize parameter])! frame dropped!
+2026-11-15T05:04:34.5309209Z [WARN] ffmpeg: Last message repeated 1 times
+2026-11-15T05:04:34.5310276Z [WARN] ffmpeg: [in#0/dshow @ 0000000000000000] real-time buffer [Elgato Game Capture Neo] [video input] too full or near too full (63% of size: 512000000 [rtbufsize parameter])! frame dropped!
+2026-11-15T05:04:34.5975005Z [WARN] ffmpeg: [in#0/dshow @ 0000000000000000] real-time buffer [Elgato Game Capture Neo] [video input] too full or near too full (64% of size: 512000000 [rtbufsize parameter])! frame dropped!
+2026-11-15T05:04:34.6641395Z [WARN] ffmpeg: [in#0/dshow @ 0000000000000000] real-time buffer [Elgato Game Capture Neo] [video input] too full or near too full (65% of size: 512000000 [rtbufsize parameter])! frame dropped!
+2026-11-15T05:04:34.8642729Z [WARN] ffmpeg: Last message repeated 2 times
+2026-11-15T05:04:34.864424Z [WARN] ffmpeg: [in#0/dshow @ 0000000000000000] real-time buffer [Elgato Game Capture Neo] [video input] too full or near too full (66% of size: 512000000 [rtbufsize parameter])! frame dropped!
+2026-11-15T05:04:34.9308688Z [WARN] ffmpeg: [in#0/dshow @ 0000000000000000] real-time buffer [Elgato Game Capture Neo] [video input] too full or near too full (67% of size: 512000000 [rtbufsize parameter])! frame dropped!
+2026-11-15T05:04:35.0324007Z [WARN] ffmpeg: [in#0/dshow @ 0000000000000000] real-time buffer [Elgato Game Capture Neo] [video input] too full or near too full (68% of size: 512000000 [rtbufsize parameter])! frame dropped!
+2026-11-15T05:04:35.1308187Z [WARN] ffmpeg: Last message repeated 1 times
+2026-11-15T05:04:35.1309361Z [WARN] ffmpeg: [in#0/dshow @ 0000000000000000] real-time buffer [Elgato Game Capture Neo] [video input] too full or near too full (69% of size: 512000000 [rtbufsize parameter])! frame dropped!
+2026-11-15T05:04:35.1975457Z [WARN] ffmpeg: [in#0/dshow @ 0000000000000000] real-time buffer [Elgato Game Capture Neo] [video input] too full or near too full (70% of size: 512000000 [rtbufsize parameter])! frame dropped!
+2026-11-15T05:04:35.3308828Z [WARN] ffmpeg: Last message repeated 1 times
+2026-11-15T05:04:35.3310008Z [WARN] ffmpeg: [in#0/dshow @ 0000000000000000] real-time buffer [Elgato Game Capture Neo] [video input] too full or near too full (71% of size: 512000000 [rtbufsize parameter])! frame dropped!
+2026-11-15T05:04:35.3974874Z [WARN] ffmpeg: [in#0/dshow @ 0000000000000000] real-time buffer [Elgato Game Capture Neo] [video input] too full or near too full (72% of size: 512000000 [rtbufsize parameter])! frame dropped!
+2026-11-15T05:04:35.530829Z [WARN] ffmpeg: Last message repeated 1 times
+2026-11-15T05:04:35.5309687Z [WARN] ffmpeg: [in#0/dshow @ 0000000000000000] real-time buffer [Elgato Game Capture Neo] [video input] too full or near too full (73% of size: 512000000 [rtbufsize parameter])! frame dropped!
+2026-11-15T05:04:35.5975789Z [WARN] ffmpeg: [in#0/dshow @ 0000000000000000] real-time buffer [Elgato Game Capture Neo] [video input] too full or near too full (74% of size: 512000000 [rtbufsize parameter])! frame dropped!
+2026-11-15T05:04:35.6641135Z [WARN] ffmpeg: [in#0/dshow @ 0000000000000000] real-time buffer [Elgato Game Capture Neo] [video input] too full or near too full (75% of size: 512000000 [rtbufsize parameter])! frame dropped!
+2026-11-15T05:04:35.8641289Z [WARN] ffmpeg: Last message repeated 5 times
+2026-11-15T05:04:35.8642532Z [WARN] ffmpeg: [in#0/dshow @ 0000000000000000] real-time buffer [Elgato Game Capture Neo] [video input] too full or near too full (76% of size: 512000000 [rtbufsize parameter])! frame dropped!
+2026-11-15T05:04:35.8807981Z [WARN] ffmpeg: [in#0/dshow @ 0000000000000000] real-time buffer [Elgato Game Capture Neo] [video input] too full or near too full (75% of size: 512000000 [rtbufsize parameter])! frame dropped!
+2026-11-15T05:04:35.9308414Z [WARN] ffmpeg: [in#0/dshow @ 0000000000000000] real-time buffer [Elgato Game Capture Neo] [video input] too full or near too full (76% of size: 512000000 [rtbufsize parameter])! frame dropped!
+2026-11-15T05:04:36.1307662Z [WARN] ffmpeg: Last message repeated 5 times
+2026-11-15T05:04:36.1308766Z [WARN] ffmpeg: [in#0/dshow @ 0000000000000000] real-time buffer [Elgato Game Capture Neo] [video input] too full or near too full (77% of size: 512000000 [rtbufsize parameter])! frame dropped!
+2026-11-15T05:04:36.1974425Z [WARN] ffmpeg: Last message repeated 1 times
+2026-11-15T05:04:36.1975912Z [WARN] ffmpeg: [in#0/dshow @ 0000000000000000] real-time buffer [Elgato Game Capture Neo] [video input] too full or near too full (78% of size: 512000000 [rtbufsize parameter])! frame dropped!
+2026-11-15T05:04:36.330833Z [WARN] ffmpeg: Last message repeated 3 times
+2026-11-15T05:04:36.330939Z [WARN] ffmpeg: [in#0/dshow @ 0000000000000000] real-time buffer [Elgato Game Capture Neo] [video input] too full or near too full (79% of size: 512000000 [rtbufsize parameter])! frame dropped!
+2026-11-15T05:04:36.4141424Z [WARN] ffmpeg: Last message repeated 2 times
+2026-11-15T05:04:36.4142976Z [WARN] ffmpeg: [in#0/dshow @ 0000000000000000] real-time buffer [Elgato Game Capture Neo] [video input] too full or near too full (78% of size: 512000000 [rtbufsize parameter])! frame dropped!
+2026-11-15T05:04:36.4641052Z [WARN] ffmpeg: [in#0/dshow @ 0000000000000000] real-time buffer [Elgato Game Capture Neo] [video input] too full or near too full (79% of size: 512000000 [rtbufsize parameter])! frame dropped!
+2026-11-15T05:04:36.5975092Z [WARN] ffmpeg: Last message repeated 3 times
+2026-11-15T05:04:36.597619Z [WARN] ffmpeg: [in#0/dshow @ 0000000000000000] real-time buffer [Elgato Game Capture Neo] [video input] too full or near too full (80% of size: 512000000 [rtbufsize parameter])! frame dropped!
+2026-11-15T05:04:36.7307754Z [WARN] ffmpeg: Last message repeated 3 times
+2026-11-15T05:04:36.7309142Z [WARN] ffmpeg: [in#0/dshow @ 0000000000000000] real-time buffer [Elgato Game Capture Neo] [video input] too full or near too full (81% of size: 512000000 [rtbufsize parameter])! frame dropped!
+2026-11-15T05:04:36.9307359Z [WARN] ffmpeg: Last message repeated 5 times
+2026-11-15T05:04:36.9308899Z [WARN] ffmpeg: [in#0/dshow @ 0000000000000000] real-time buffer [Elgato Game Capture Neo] [video input] too full or near too full (82% of size: 512000000 [rtbufsize parameter])! frame dropped!
+2026-11-15T05:04:37.0640256Z [WARN] ffmpeg: Last message repeated 3 times
+2026-11-15T05:04:37.0641793Z [WARN] ffmpeg: [in#0/dshow @ 0000000000000000] real-time buffer [Elgato Game Capture Neo] [video input] too full or near too full (83% of size: 512000000 [rtbufsize parameter])! frame dropped!
+2026-11-15T05:04:37.0807095Z [WARN] ffmpeg: [in#0/dshow @ 0000000000000000] real-time buffer [Elgato Game Capture Neo] [video input] too full or near too full (82% of size: 512000000 [rtbufsize parameter])! frame dropped!
+2026-11-15T05:04:37.1316248Z [WARN] ffmpeg: [in#0/dshow @ 0000000000000000] real-time buffer [Elgato Game Capture Neo] [video input] too full or near too full (83% of size: 512000000 [rtbufsize parameter])! frame dropped!
+2026-11-15T05:04:37.2640443Z [WARN] ffmpeg: Last message repeated 3 times
+2026-11-15T05:04:37.2641474Z [WARN] ffmpeg: [in#0/dshow @ 0000000000000000] real-time buffer [Elgato Game Capture Neo] [video input] too full or near too full (84% of size: 512000000 [rtbufsize parameter])! frame dropped!
+2026-11-15T05:04:37.3308678Z [WARN] ffmpeg: Last message repeated 1 times
+2026-11-15T05:04:37.3309752Z [WARN] ffmpeg: [in#0/dshow @ 0000000000000000] real-time buffer [Elgato Game Capture Neo] [video input] too full or near too full (85% of size: 512000000 [rtbufsize parameter])! frame dropped!
+2026-11-15T05:04:37.5973561Z [WARN] ffmpeg: Last message repeated 7 times
+2026-11-15T05:04:37.5974668Z [WARN] ffmpeg: [in#0/dshow @ 0000000000000000] real-time buffer [Elgato Game Capture Neo] [video input] too full or near too full (86% of size: 512000000 [rtbufsize parameter])! frame dropped!
+2026-11-15T05:04:37.7975853Z [WARN] ffmpeg: Last message repeated 5 times
+2026-11-15T05:04:37.7977104Z [WARN] ffmpeg: [in#0/dshow @ 0000000000000000] real-time buffer [Elgato Game Capture Neo] [video input] too full or near too full (87% of size: 512000000 [rtbufsize parameter])! frame dropped!
+2026-11-15T05:04:37.9974474Z [WARN] ffmpeg: Last message repeated 8 times
+2026-11-15T05:04:37.9976042Z [WARN] ffmpeg: [in#0/dshow @ 0000000000000000] real-time buffer [Elgato Game Capture Neo] [video input] too full or near too full (88% of size: 512000000 [rtbufsize parameter])! frame dropped!
+2026-11-15T05:04:38.0640796Z [WARN] ffmpeg: Last message repeated 2 times
+2026-11-15T05:04:38.0642252Z [WARN] ffmpeg: [in#0/dshow @ 0000000000000000] real-time buffer [Elgato Game Capture Neo] [video input] too full or near too full (87% of size: 512000000 [rtbufsize parameter])! frame dropped!
+2026-11-15T05:04:38.1307832Z [WARN] ffmpeg: Last message repeated 2 times
+2026-11-15T05:04:38.1309574Z [WARN] ffmpeg: [in#0/dshow @ 0000000000000000] real-time buffer [Elgato Game Capture Neo] [video input] too full or near too full (88% of size: 512000000 [rtbufsize parameter])! frame dropped!
+2026-11-15T05:04:38.1473952Z [WARN] ffmpeg: [in#0/dshow @ 0000000000000000] real-time buffer [Elgato Game Capture Neo] [video input] too full or near too full (87% of size: 512000000 [rtbufsize parameter])! frame dropped!
+2026-11-15T05:04:38.1974167Z [WARN] ffmpeg: Last message repeated 1 times
+2026-11-15T05:04:38.197565Z [WARN] ffmpeg: [in#0/dshow @ 0000000000000000] real-time buffer [Elgato Game Capture Neo] [video input] too full or near too full (88% of size: 512000000 [rtbufsize parameter])! frame dropped!
+2026-11-15T05:04:38.730649Z [WARN] ffmpeg: Last message repeated 23 times
+2026-11-15T05:04:38.7307839Z [WARN] ffmpeg: [in#0/dshow @ 0000000000000000] real-time buffer [Elgato Game Capture Neo] [video input] too full or near too full (89% of size: 512000000 [rtbufsize parameter])! frame dropped!
+2026-11-15T05:04:38.8189595Z [INFO] encoder progress: frame=6047 fps=58.95 speed=0.984x dup=0 drop=0
+2026-11-15T05:04:43.8979505Z [INFO] encoder progress: frame=6340 fps=58.89 speed=0.986x dup=0 drop=0
+2026-11-15T05:04:48.9777987Z [INFO] encoder progress: frame=6625 fps=58.77 speed=0.982x dup=0 drop=0
+2026-11-15T05:04:54.053771Z [INFO] encoder progress: frame=6912 fps=58.67 speed=0.98x dup=0 drop=0
+2026-11-15T05:04:55.2849265Z [INFO] live tap stats: frames 6970 cues 465 skipped_cue_slots 0 (0.0% of 465) skipped_frames 0 queue_drops 0 slices / 0 TS packets send_errors 0 datagrams / 0 TS packets (would_block 0) datagrams_sent 96501 pkt_size 1316 sndbuf 8388608
+2026-11-15T05:04:59.1321582Z [INFO] encoder progress: frame=7205 fps=58.63 speed=0.979x dup=0 drop=0
+2026-11-15T05:05:04.2107352Z [INFO] encoder progress: frame=7487 fps=58.51 speed=0.977x dup=0 drop=0
+2026-11-15T05:05:09.2893475Z [INFO] encoder progress: frame=7762 fps=58.34 speed=0.973x dup=0 drop=0
+2026-11-15T05:05:14.3663306Z [INFO] encoder progress: frame=8045 fps=58.25 speed=0.972x dup=0 drop=0
+2026-11-15T05:05:19.4449188Z [INFO] encoder progress: frame=8319 fps=58.09 speed=0.971x dup=0 drop=0
+2026-11-15T05:05:24.5219473Z [INFO] encoder progress: frame=8602 fps=58.01 speed=0.967x dup=0 drop=0
+2026-11-15T05:05:29.6018919Z [INFO] encoder progress: frame=8888 fps=57.96 speed=0.967x dup=0 drop=0
+2026-11-15T05:05:34.6786292Z [INFO] encoder progress: frame=9179 fps=57.94 speed=0.967x dup=0 drop=0
+2026-11-15T05:05:35.5720143Z [WARN] ffmpeg: [out_#0:0 @ 0000000000000000] 100 buffers queued in out_#0:0, something may be wrong.
+2026-11-15T05:05:39.7577521Z [INFO] encoder progress: frame=9486 fps=58.01 speed=0.968x dup=0 drop=0
+2026-11-15T05:05:44.8344849Z [INFO] encoder progress: frame=9767 fps=57.93 speed=0.967x dup=0 drop=0
+2026-11-15T05:05:49.912652Z [INFO] encoder progress: frame=10055 fps=57.90 speed=0.966x dup=0 drop=0
+2026-11-15T05:05:54.9907739Z [INFO] encoder progress: frame=10338 fps=57.84 speed=0.965x dup=0 drop=0
+2026-11-15T05:06:00.0688588Z [INFO] encoder progress: frame=10605 fps=57.69 speed=0.963x dup=0 drop=0
+2026-11-15T05:06:05.1476473Z [INFO] encoder progress: frame=10855 fps=57.46 speed=0.965x dup=0 drop=0
+2026-11-15T05:06:10.2260522Z [INFO] encoder progress: frame=11146 fps=57.46 speed=0.961x dup=0 drop=0
+2026-11-15T05:06:15.3039526Z [INFO] encoder progress: frame=11402 fps=57.28 speed=0.957x dup=0 drop=0
+2026-11-15T05:06:20.3815074Z [INFO] encoder progress: frame=11705 fps=57.34 speed=0.957x dup=0 drop=0
+2026-11-15T05:06:25.4626794Z [INFO] encoder progress: frame=11991 fps=57.31 speed=0.956x dup=0 drop=0
+2026-11-15T05:06:30.5496082Z [INFO] encoder progress: frame=12291 fps=57.35 speed=0.965x dup=0 drop=0
+2026-11-15T05:06:35.6192588Z [INFO] encoder progress: frame=12584 fps=57.36 speed=0.96x dup=0 drop=0
+2026-11-15T05:06:40.7004717Z [INFO] encoder progress: frame=12871 fps=57.34 speed=0.958x dup=0 drop=0
+2026-11-15T05:06:45.7727024Z [INFO] encoder progress: frame=13179 fps=57.42 speed=0.957x dup=0 drop=0
+2026-11-15T05:06:50.850389Z [INFO] encoder progress: frame=13434 fps=57.26 speed=0.957x dup=0 drop=0
+2026-11-15T05:06:55.9291592Z [INFO] encoder progress: frame=13733 fps=57.30 speed=0.956x dup=0 drop=0
+2026-11-15T05:07:01.0112239Z [INFO] encoder progress: frame=14019 fps=57.27 speed=0.955x dup=0 drop=0
+2026-11-15T05:07:06.0872587Z [INFO] encoder progress: frame=14302 fps=57.24 speed=0.956x dup=0 drop=0
+2026-11-15T05:07:11.1676505Z [INFO] encoder progress: frame=14655 fps=57.49 speed=0.965x dup=0 drop=0
+2026-11-15T05:07:16.2459621Z [INFO] encoder progress: frame=14941 fps=57.47 speed=0.959x dup=0 drop=0
+2026-11-15T05:07:21.3201066Z [INFO] encoder progress: frame=15254 fps=57.55 speed=0.968x dup=0 drop=0
+2026-11-15T05:07:26.4072535Z [INFO] encoder progress: frame=15638 fps=57.88 speed=0.965x dup=0 drop=0
+2026-11-15T05:07:31.4753837Z [INFO] encoder progress: frame=15913 fps=57.82 speed=0.966x dup=0 drop=0
+2026-11-15T05:07:36.5665261Z [INFO] encoder progress: frame=16188 fps=57.75 speed=0.966x dup=0 drop=0
+2026-11-15T05:07:41.6392288Z [INFO] encoder progress: frame=16486 fps=57.77 speed=0.964x dup=0 drop=0
+2026-11-15T05:07:46.712362Z [INFO] encoder progress: frame=16760 fps=57.70 speed=0.962x dup=0 drop=0
+2026-11-15T05:07:51.7938719Z [INFO] encoder progress: frame=17029 fps=57.62 speed=0.964x dup=0 drop=0
+2026-11-15T05:07:56.8780677Z [INFO] encoder progress: frame=17318 fps=57.61 speed=0.96x dup=0 drop=0
+2026-11-15T05:08:01.9553977Z [INFO] encoder progress: frame=17675 fps=57.82 speed=0.964x dup=0 drop=0
+2026-11-15T05:08:07.0280099Z [INFO] encoder progress: frame=17919 fps=57.66 speed=0.961x dup=0 drop=0
+2026-11-15T05:08:12.1155153Z [INFO] encoder progress: frame=18186 fps=57.57 speed=0.962x dup=0 drop=0
+2026-11-15T05:08:17.1801105Z [INFO] encoder progress: frame=18456 fps=57.51 speed=0.964x dup=0 drop=0
+2026-11-15T05:08:22.2579948Z [INFO] encoder progress: frame=18706 fps=57.38 speed=0.959x dup=0 drop=0
+2026-11-15T05:08:27.3487604Z [INFO] encoder progress: frame=18969 fps=57.29 speed=0.956x dup=0 drop=0
+2026-11-15T05:08:32.4319457Z [INFO] encoder progress: frame=19240 fps=57.23 speed=0.961x dup=0 drop=0
+2026-11-15T05:08:37.5110994Z [INFO] encoder progress: frame=19519 fps=57.20 speed=0.957x dup=0 drop=0
+2026-11-15T05:08:42.5907015Z [INFO] encoder progress: frame=19815 fps=57.21 speed=0.954x dup=0 drop=0
+2026-11-15T05:08:47.6671032Z [INFO] encoder progress: frame=20061 fps=57.09 speed=0.952x dup=0 drop=0
+2026-11-15T05:08:52.7414034Z [INFO] encoder progress: frame=20314 fps=56.98 speed=0.951x dup=0 drop=0
+2026-11-15T05:08:57.824576Z [INFO] encoder progress: frame=20624 fps=57.04 speed=0.951x dup=0 drop=0
+2026-11-15T05:09:02.9232307Z [INFO] encoder progress: frame=20915 fps=57.04 speed=0.954x dup=0 drop=0
+2026-11-15T05:09:07.9971619Z [INFO] encoder progress: frame=21173 fps=56.95 speed=0.958x dup=0 drop=0
+2026-11-15T05:09:13.0824044Z [INFO] encoder progress: frame=21486 fps=57.02 speed=0.956x dup=0 drop=0
+2026-11-15T05:09:18.1544665Z [INFO] encoder progress: frame=21826 fps=57.15 speed=0.956x dup=0 drop=0
+2026-11-15T05:09:23.2382966Z [INFO] encoder progress: frame=22130 fps=57.18 speed=0.954x dup=0 drop=0
+2026-11-15T05:09:28.3159222Z [INFO] encoder progress: frame=22439 fps=57.23 speed=0.956x dup=0 drop=0
+2026-11-15T05:09:33.3889448Z [INFO] encoder progress: frame=22705 fps=57.17 speed=0.954x dup=0 drop=0
+2026-11-15T05:09:38.4627171Z [INFO] encoder progress: frame=22993 fps=57.17 speed=0.953x dup=0 drop=0
+2026-11-15T05:09:43.5380187Z [INFO] encoder progress: frame=23277 fps=57.15 speed=0.966x dup=0 drop=0
+2026-11-15T05:09:48.6292525Z [INFO] encoder progress: frame=23567 fps=57.15 speed=0.955x dup=0 drop=0
+2026-11-15T05:09:53.6991205Z [INFO] encoder progress: frame=23861 fps=57.16 speed=0.953x dup=0 drop=0
+2026-11-15T05:09:58.7772631Z [INFO] encoder progress: frame=24132 fps=57.11 speed=0.953x dup=0 drop=0
+2026-11-15T05:10:03.8650637Z [INFO] encoder progress: frame=24392 fps=57.04 speed=0.951x dup=0 drop=0
+2026-11-15T05:10:08.934561Z [INFO] encoder progress: frame=24705 fps=57.10 speed=0.955x dup=0 drop=0
+2026-11-15T05:10:14.0184943Z [INFO] encoder progress: frame=25097 fps=57.33 speed=0.956x dup=0 drop=0
+2026-11-15T05:10:19.0897946Z [INFO] encoder progress: frame=25437 fps=57.44 speed=0.958x dup=0 drop=0
+2026-11-15T05:10:24.1707011Z [INFO] encoder progress: frame=25718 fps=57.42 speed=0.969x dup=0 drop=0
+2026-11-15T05:10:29.2449191Z [INFO] encoder progress: frame=26010 fps=57.42 speed=0.959x dup=0 drop=0
+2026-11-15T05:10:34.3238012Z [INFO] encoder progress: frame=26290 fps=57.39 speed=0.957x dup=0 drop=0
+2026-11-15T05:10:39.4120666Z [INFO] encoder progress: frame=26560 fps=57.34 speed=0.956x dup=0 drop=0
+2026-11-15T05:10:44.4844556Z [INFO] encoder progress: frame=26843 fps=57.33 speed=0.956x dup=0 drop=0
+2026-11-15T05:10:49.5682326Z [INFO] encoder progress: frame=27156 fps=57.37 speed=0.959x dup=0 drop=0
+2026-11-15T05:10:54.6422614Z [INFO] encoder progress: frame=27469 fps=57.42 speed=0.957x dup=0 drop=0
+2026-11-15T05:10:59.7103369Z [INFO] encoder progress: frame=27776 fps=57.45 speed=0.958x dup=0 drop=0
+2026-11-15T05:11:04.7880139Z [INFO] encoder progress: frame=28463 fps=58.26 speed=0.971x dup=0 drop=0
+2026-11-15T05:11:09.8663886Z [INFO] encoder progress: frame=29039 fps=58.83 speed=0.982x dup=0 drop=0
+2026-11-15T05:11:14.945198Z [INFO] encoder progress: frame=29922 fps=60.00 speed=1x dup=0 drop=0
