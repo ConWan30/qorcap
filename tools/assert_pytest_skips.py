@@ -75,6 +75,7 @@ LINUX_FILES = (
     "sidecar/test_qorcap_console.py",
     "sidecar/test_qorcap_release.py",
     "tools/test_frame_clock_ab.py",
+    "tools/test_encoder_pace.py",
     "tools/test_assert_pytest_skips.py",
     "sidecar/test_qorcap_reader.py",
     "sidecar/test_c11_snapshot_inputs_timeout.py",
@@ -149,6 +150,7 @@ WINDOWS_FILES = (
     "sidecar/test_qorcap_console.py",
     "sidecar/test_qorcap_release.py",
     "tools/test_frame_clock_ab.py",
+    "tools/test_encoder_pace.py",
     "tools/test_assert_pytest_skips.py",
     "sidecar/test_qorcap_reader.py",
     "sidecar/test_c11_snapshot_inputs_timeout.py",
@@ -212,11 +214,11 @@ WINDOWS_FILES = (
 # The floor is a minimum. A PR that adds tests, and any merge resolution, must
 # re-collect and set both floors to those exact counts. Leaving the old floor
 # keeps a dropped test green.
-# Collect-only of these lists after the tail tests in sidecar/test_post_final_tail.py.
-# Main e00d374, including the guard tests, collected 596 linux / 578 windows.
-# Re-collect after any list or test change.
-LINUX_MIN_COLLECTED = 1189
-WINDOWS_MIN_COLLECTED = 1170
+# Main 7e77c92 (#174) collected 1189 linux / 1170 windows (CI run of #177 at 7785378).
+# tools/test_encoder_pace.py adds 12 non-parametrized tests: 1201 / 1182. Set by count,
+# not re-collected; CI's collected total is authoritative. Re-collect after any list or test change.
+LINUX_MIN_COLLECTED = 1201
+WINDOWS_MIN_COLLECTED = 1182
 
 # Absent from both sidecar suites. A reason is required; whitespace does not count.
 EXCLUDED_TEST_FILES = {
