@@ -40,6 +40,11 @@ python tools/encoder_pace.py path\to\qorcap.log --fps 30   # override the nomina
 - The capture runs `-vf fps=N … -fps_mode cfr`, so frames lost at the input are filled with duplicates before the encoder. The encoder's `dup=` and `drop=` don't count them, and neither does this report.
 - This report can't tell what caused a slow window: the GPU, heat, another app, or the pipe to QorCap. `cause` is always `UNMEASURED`.
 
+## Slices and empty segments
+
+- **A slice reports what it contains.** A cut-off slice of a log that still has its `capture ffmpeg argv:` line is drop-capable and pace-readable. It reports `MEASURED` and exits 0, but its totals cover only the lines it contains. The repo fixture is exactly that case: it reports 126 drop messages, against 23,219 in the full log (below). `MEASURED` means measured from this file, not from the whole session.
+- **Empty segments are dropped.** A segment that has only an argv line, with no progress, drop or `ffmpeg:` line after it, isn't listed. That happens when a writer was started and replaced before it logged anything.
+
 ## Fixture (reproducible)
 
 `tools/fixtures/encoder_pace/match-230248-redacted.txt` comes from practice match-20261114-230248 (Nov 14 2026, 11:02–11:11 PM CT).
