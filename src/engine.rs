@@ -1029,6 +1029,7 @@ impl Engine {
                     }
                 }
                 if l.is_empty() { continue; }
+                plog.observe_line(l); // Logging only: counts dshow input-drop warning messages for the pace summary.
                 if let Some(t) = &tally { t.lock().unwrap_or_else(|e| e.into_inner()).observe_line(l); }
                 warn!("ffmpeg: {l}");
                 let mut e = last_err.lock().unwrap_or_else(|e| e.into_inner()); e.push(l.to_string()); if e.len() > 5 { e.remove(0); }
