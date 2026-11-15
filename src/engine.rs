@@ -1029,10 +1029,12 @@ impl Engine {
                     }
                 }
                 if l.is_empty() { continue; }
+                plog.observe_line(l); // Logging only: counts dshow input-drop warning messages for the pace summary.
                 if let Some(t) = &tally { t.lock().unwrap_or_else(|e| e.into_inner()).observe_line(l); }
                 warn!("ffmpeg: {l}");
                 let mut e = last_err.lock().unwrap_or_else(|e| e.into_inner()); e.push(l.to_string()); if e.len() > 5 { e.remove(0); }
             }
+            plog.finish(t0.elapsed().as_millis() as u64); // Logging only: stderr ended (EOF, broken pipe, kill, crash); close an open pace episode, flush drop messages.
         }) };
         // watchdog: kill if no data for N seconds (frozen driver / shared device / unplug)
         { let me = self.clone(); let child = child.clone(); let alive = alive.clone(); let kill_sent = kill_sent.clone(); let start = self.ms(); std::thread::spawn(move || {
