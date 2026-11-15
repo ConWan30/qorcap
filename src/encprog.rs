@@ -2,9 +2,12 @@
 //!
 //! The capture ffmpeg already writes `-progress pipe:2` key=value blocks every second
 //! (`-stats_period 1`), and the engine's stderr thread already drains them. This module
-//! condenses those blocks into at most one log line per interval so a frame-drop
-//! episode can be read as encoder slowness (fps/speed falling) or as a capture-side
-//! stall (fps/speed steady while frames drop).
+//! condenses those blocks into at most one log line per interval, so the output rate
+//! (fps/speed) can be read next to any drop warnings from the same stretch. These lines
+//! alone do not say whether a slow or dropping stretch came from the encoder, the capture
+//! input, or QorCap reading the pipe late: the cause stays UNMEASURED. The `drop=` field is
+//! ffmpeg's own output-side `drop_frames` counter. With `-vf fps=N -fps_mode cfr` input-side
+//! loss is filled with duplicates before it, so `drop=` is not a frame-loss measure here.
 //!
 //! Values are copied from ffmpeg after a parse check. A missing or unparsable field
 //! is left out of the line, never filled in. Nothing here panics on bad input.
@@ -12,10 +15,14 @@
 //! Pace telemetry (logging only, default on, all lanes). Between two logged lines at least
 //! `MIN_WINDOW_MS` apart the line also carries `win_ms`, `win_fps` (frame delta / wall delta),
 //! `pace` (media-time delta from `out_time_us` / wall delta, 1.000 = real time at any output rate)
-//! and `lag_ms` (wall time minus media time since the first block that had `out_time_us`, so it is
-//! relative to that block, not absolute). Wall time is when QorCap read the block from stderr.
+//! and `lag_ms` (wall time minus media time since the first *logged* line whose block carried
+//! `out_time_us`, so it is relative to that line, not absolute; normally that is the first block).
+//! Wall time is when QorCap read the block from stderr, so a late reader looks the same as a slow
+//! encoder: the WARN names output pace, not a cause.
 //! Two windows in a row below `SLOW_PACE` (59 of 60 fps) covering at least `WARN_AFTER_MS` write one
 //! WARN per episode; `RECOVER_MS` of windows at or above `OK_PACE` closes it with one summary line.
+//! A window without a pace reading (no `out_time_us` at either end) neither extends nor breaks a
+//! slow streak or a recovery; `WARN_AFTER_MS` and `RECOVER_MS` count measured windows only.
 //! DirectShow "real-time buffer ... frame dropped!" warning lines and the `Last message repeated N
 //! times` lines after them are counted (`observe_line`) and summarised every `DROP_SUMMARY_MS` when
 //! any arrived. Those are warning messages, not a dropped-frame count (dropped frames stay
@@ -119,7 +126,7 @@ pub struct Window {
     pub fps: f64,
     /// Media-time delta / wall delta. `None` when `out_time_us` was missing at either end.
     pub pace: Option<f64>,
-    /// Wall minus media time since the first block with `out_time_us`. `None` when not measurable.
+    /// Wall minus media time since the first logged line whose block had `out_time_us`. `None` when not measurable.
     pub lag_ms: Option<i64>,
 }
 
@@ -255,6 +262,7 @@ impl ProgressLog {
         Some(Window { ms, frames, fps, pace, lag_ms })
     }
 
+    /// A window without a pace reading returns here: it neither extends nor breaks a streak or a recovery.
     fn track(&mut self, w: &Window, now_ms: u64) {
         let Some(p) = w.pace else { return };
         if let Some(e) = self.episode.as_mut() {
@@ -282,7 +290,7 @@ impl ProgressLog {
                     min_pace: self.streak_min_pace, max_lag_ms: self.streak_max_lag, drops_at_start: self.drops.messages(),
                 };
                 let text = format!(
-                    "encoder below real time: episode {} after {} slow windows over {} ms (pace below {:.3}); min win_fps={:.1} min pace={:.3} lag_ms={}. Cause UNMEASURED; capture unchanged.",
+                    "output pace below real time (cause UNMEASURED; capture settings unchanged): episode {} after {} slow windows over {} ms (pace below {:.3}); min win_fps={:.1} min pace={:.3} lag_ms={}.",
                     e.n, self.slow_windows, self.slow_ms, SLOW_PACE, e.min_fps, e.min_pace, lag_text(e.max_lag_ms));
                 self.episode = Some(e);
                 self.note(true, text);
@@ -300,7 +308,7 @@ impl ProgressLog {
     fn close_episode(&mut self, e: Episode, now_ms: u64, why: &str) {
         let drops = self.drops.messages().saturating_sub(e.drops_at_start);
         let text = format!(
-            "encoder pace episode {} closed ({why}): {} ms from first slow window to this line; min win_fps={:.1} min pace={:.3} max lag_ms={} input-drop messages={} (messages, not frames).",
+            "output pace episode {} closed ({why}; cause UNMEASURED; capture settings unchanged): {} ms from first slow window to this line; min win_fps={:.1} min pace={:.3} max lag_ms={} input-drop messages={} (messages, not frames).",
             e.n, now_ms.saturating_sub(e.start_ms), e.min_fps, e.min_pace, lag_text(e.max_lag_ms), drops);
         self.note(false, text);
     }
@@ -500,8 +508,8 @@ mod tests {
         assert!(warns(&p).is_empty(), "one slow window (0-5 s) is not enough");
         run(&mut p, &mut f, 10, 10, 55);
         assert_eq!(warns(&p).len(), 1, "second slow window at 10 s opens the episode");
-        assert!(warns(&p)[0].starts_with("encoder below real time: episode 1 after 2 slow windows over 10000 ms"), "{}", warns(&p)[0]);
-        assert!(warns(&p)[0].contains("Cause UNMEASURED"));
+        assert!(warns(&p)[0].starts_with("output pace below real time (cause UNMEASURED; capture settings unchanged): episode 1 after 2 slow windows over 10000 ms"), "{}", warns(&p)[0]);
+        assert!(!warns(&p)[0].contains("encoder below"));
         run(&mut p, &mut f, 11, 60, 55);
         assert_eq!(warns(&p).len(), 1, "still one WARN for the whole episode");
         // Catch up at 65 fps: 30 s of windows at or above OK_PACE closes it.
@@ -509,12 +517,12 @@ mod tests {
         assert!(infos(&p).is_empty(), "25 s of recovery is not enough");
         run(&mut p, &mut f, 86, 90, 65);
         assert_eq!(infos(&p).len(), 1);
-        assert!(infos(&p)[0].starts_with("encoder pace episode 1 closed (back to real time)"), "{}", infos(&p)[0]);
+        assert!(infos(&p)[0].starts_with("output pace episode 1 closed (back to real time; cause UNMEASURED; capture settings unchanged)"), "{}", infos(&p)[0]);
         assert!(infos(&p)[0].contains("min win_fps=55.0"));
         // A new slow stretch is a new episode.
         run(&mut p, &mut f, 91, 101, 50);
         assert_eq!(warns(&p).len(), 2);
-        assert!(warns(&p)[1].starts_with("encoder below real time: episode 2 "));
+        assert!(warns(&p)[1].starts_with("output pace below real time (cause UNMEASURED; capture settings unchanged): episode 2 "));
     }
 
     #[test]
