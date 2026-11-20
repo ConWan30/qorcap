@@ -28,7 +28,7 @@ One record per capture writer (the capture ffmpeg that reads the card and encode
   log at the capture's `-loglevel` is UNKNOWN for the pinned build, and if not, this can only
   under-count. It is a **lower bound**: ffmpeg prints a pending repeat count
   only when its next different log message arrives, so a run still pending when the writer ends is
-  never printed. `dropped_frames` stays `UNMEASURED`: one line per frame was not checked. When no warning line was logged on a drained stderr stream, `warning_status` records `"no input-drop warning logged; earlier drops UNMEASURED"`. If stderr was not fully drained (the 2 s bound ran out, or a read / UTF-8 error stopped the drain), counts are `UNKNOWN` and `warning_status` says the stream was not fully drained, with earlier drops `UNMEASURED`.
+  never printed. `dropped_frames` stays `UNMEASURED`: one line per frame was not checked. When no warning line was logged on a drained stderr stream, `warning_status` records `"no input-drop warning logged; earlier drops UNMEASURED"`. If stderr was not fully parsed (the 2 s bound ran out, or a read / UTF-8 error stopped line parsing), counts are `UNKNOWN` and `warning_status` says the stream was not fully drained, with earlier drops `UNMEASURED`. After a read or UTF-8 error the rest of stderr is discarded as raw bytes until EOF so the writer is not sent EPIPE.
 
 At stop, a **frame-clock gap check** runs per part on `frame_clock.jsonl`: the rate measured from the
 modal PTS step, PTS gaps above 3/2 of that step (and the missing slots), equal or backwards PTS steps

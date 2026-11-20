@@ -1002,19 +1002,24 @@ impl Engine {
         let kill_sent: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
         // stderr: progress key=value -> status; everything else -> log
         let stderr_thread = { let me = self.clone(); let last_err = last_err.clone(); let tally = tally.clone(); std::thread::spawn(move || {
-            use std::io::BufRead;
+            use std::io::{BufRead, Read};
             let mut cursor = ProgressCursor::default();
             // Logging only: one encoder progress line per 5 s from the -progress blocks read here.
             let mut plog = crate::encprog::ProgressLog::new(crate::encprog::INTERVAL_MS);
             let t0 = Instant::now();
-            // A lines() IO or UTF-8 error stops the read. Mark the stream partial so
-            // input-drop counts stay UNKNOWN / UNMEASURED, never a clean zero.
+            // A read_line IO or UTF-8 error stops line parsing and marks the stream partial so
+            // input-drop counts stay UNKNOWN / UNMEASURED, never a clean zero; raw bytes are
+            // still discarded to EOF so the writer never gets EPIPE on stderr.
             let mut stderr_partial = false;
-            for line in std::io::BufReader::new(stderr).lines() {
-                let line = match line {
-                    Ok(s) => s,
+            let mut reader = std::io::BufReader::new(stderr);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match reader.read_line(&mut line) {
+                    Ok(0) => break,
+                    Ok(_) => {}
                     Err(_) => { stderr_partial = true; break; }
-                };
+                }
                 let l = line.trim();
                 if let Some((k, v)) = l.split_once('=') {
                     if !k.contains(' ') {
@@ -1040,6 +1045,18 @@ impl Engine {
                 if let Some(t) = &tally { t.lock().unwrap_or_else(|e| e.into_inner()).observe_line(l); }
                 warn!("ffmpeg: {l}");
                 let mut e = last_err.lock().unwrap_or_else(|e| e.into_inner()); e.push(l.to_string()); if e.len() > 5 { e.remove(0); }
+            }
+            if stderr_partial {
+                // Discard leftover bytes (incl. Interrupted retries) so the write end is not closed early.
+                let mut discard = [0u8; 8192];
+                loop {
+                    match reader.read(&mut discard) {
+                        Ok(0) => break,
+                        Ok(_) => {}
+                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                        Err(_) => break,
+                    }
+                }
             }
             plog.finish(t0.elapsed().as_millis() as u64); // Logging only: stderr ended (EOF, broken pipe, kill, crash); close an open pace episode, flush drop messages.
             stderr_partial
@@ -1106,7 +1123,7 @@ impl Engine {
             let until = Instant::now() + Duration::from_secs(2);
             while !stderr_thread.is_finished() && Instant::now() < until { std::thread::sleep(Duration::from_millis(20)); }
             let finished = stderr_thread.is_finished();
-            // Finished + no read error => fully drained. A lines() error or a panic is partial.
+            // Finished + no read error => fully drained. A read_line error or a panic is partial.
             let drained = if finished {
                 match stderr_thread.join() {
                     Ok(partial) => !partial,
@@ -2129,6 +2146,45 @@ esac
         // T2: a read error is not labelled as stdout closing.
         assert_eq!(grace_kill_label(false), "stdout_closed");
         assert_eq!(grace_kill_label(true), "read_error");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stderr_invalid_utf8_drains_raw_tail_without_epipe_and_stays_partial() {
+        use clap::Parser;
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::temp_dir().join(format!("qorcap-capstop-rawdrain-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let script = base.join("stub-ffmpeg.sh");
+        // Invalid UTF-8 followed by 512 KiB on stderr (exceeding typical pipe buffers), then clean exit 0.
+        // Closing the stderr read end on the UTF-8 error would break the tail write with SIGPIPE/EPIPE.
+        // exit_code 0 after that tail is the proof the drain kept the pipe open and consumed it to EOF.
+        std::fs::write(&script, "#!/bin/sh\nset -e\nprintf 'bad \\377 utf8\\n' >&2\nhead -c 524288 /dev/zero >&2\nexit 0\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let d = base.to_string_lossy().into_owned();
+        let a = ["q", "record", "--device", "testpattern", "--audio", "none", "--bundle", &d, "--no-controller", "--watchdog", "30", "--practice-lane"];
+        let crate::cli::Cmd::Record(r) = crate::cli::Cli::try_parse_from(a).unwrap().cmd else { panic!() };
+        std::fs::write(base.join("manifest.jsonl"), "").unwrap();
+        let e = Engine::new(r, script.to_string_lossy().into_owned());
+        let t0 = Instant::now();
+        let _ = e.run_capture_once("auto", None);
+        let elapsed = t0.elapsed();
+        // Generous bound only: run_capture_once also sleeps 200 ms after a non-shutdown exit. The
+        // no-EPIPE proof is exit 0 after the 512 KiB tail, not this timer.
+        assert!(elapsed < Duration::from_secs(8), "stderr tail drained to EOF without stalling: {elapsed:?}");
+        let w = e.capture_stop.as_ref().unwrap().lock().unwrap().writers.clone();
+        assert_eq!(w.len(), 1);
+        assert_eq!(w[0]["writer"]["ended_by"], "self_exit");
+        assert_eq!(w[0]["writer"]["exit_code"], 0);
+        assert_eq!(w[0]["writer"]["kill_sent"], Value::Null);
+        assert_eq!(w[0]["writer"]["killed_by_qorcap"], false);
+        assert_eq!(w[0]["writer"]["stderr_drained"], false);
+        assert_eq!(w[0]["input_drops"]["warning_lines"], crate::capstop::UNKNOWN);
+        assert_eq!(w[0]["input_drops"]["warning_lines_seen"], 0);
+        assert_eq!(w[0]["input_drops"]["dropped_frames"], crate::capstop::UNMEASURED);
+        assert_eq!(w[0]["input_drops"]["warning_status"], crate::capstop::INPUT_DROP_PARTIAL_NONE_LOGGED);
         let _ = std::fs::remove_dir_all(&base);
     }
 
