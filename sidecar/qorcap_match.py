@@ -385,6 +385,26 @@ def maybe_write_cod_reader_stats(bundle: Path, state: dict, game: str, *,
     return True
 
 
+def maybe_write_engagement_windows(bundle: Path, game: str, *, environ=None, out_root=None) -> bool:
+    """Info-only engagement window index (PWEC) after the stop. Never Counted; never raises.
+
+    Off unless ``QORCAP_LANE=practice`` and Call of Duty (``QORCAP_PWEC=0`` turns it off there).
+    It reads ``inputs.jsonl`` and ``frame_clock.jsonl`` and writes only outside the match folder
+    (``%LOCALAPPDATA%\\QorCapEngagement\\<match>\\``). The bundle, the seal and the receipt are not
+    touched. See ``qorcap_engagement``.
+    """
+    try:
+        sys.path.insert(0, str(HERE))
+        from qorcap_engagement import maybe_write_engagement_windows as _pwec
+        return bool(_pwec(bundle, game, environ=environ, out_root=out_root, say=say))
+    except Exception as e:
+        try:
+            say(f"  Engagement windows were not written (info only; the match is unaffected): {type(e).__name__}")
+        except Exception:
+            pass
+        return False
+
+
 def mark_health_sealed(state: dict) -> None:
     """Drop later reader_health rows. The receipt is about to be signed."""
     state["health_sealed"] = True
@@ -1995,6 +2015,11 @@ def main(argv=None) -> int:
     def persist_stats():
         maybe_write_cod_reader_stats(
             bundle, state, game, practice=True, reader_joined=stop_box["joined"])
+        # Info-only PWEC index: practice lane + CoD only, written outside the match folder.
+        try:
+            maybe_write_engagement_windows(bundle, game)
+        except Exception:
+            pass
 
     tail_s = post_final_tail_s()
     stop_reason = "final"

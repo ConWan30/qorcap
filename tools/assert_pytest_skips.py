@@ -133,6 +133,7 @@ LINUX_FILES = (
     "sidecar/test_qorcap_glimpse_witness.py",
     "sidecar/test_qorcap_submit.py",
     "sidecar/test_qorcap_rlr_stage_a.py",
+    "sidecar/test_qorcap_engagement.py",
     "tools/s2s_bodycue/test_bodycue_core.py",
     "tools/s2s_bodycue/test_fusion_core.py",
     "tools/s2s_bodycue/test_pins.py",
@@ -205,6 +206,7 @@ WINDOWS_FILES = (
     "sidecar/test_qorcap_glimpse_witness.py",
     "sidecar/test_qorcap_submit.py",
     "sidecar/test_qorcap_rlr_stage_a.py",
+    "sidecar/test_qorcap_engagement.py",
     "tools/s2s_bodycue/test_bodycue_core.py",
     "tools/s2s_bodycue/test_fusion_core.py",
     "tools/s2s_bodycue/test_pins.py",
@@ -217,8 +219,10 @@ WINDOWS_FILES = (
 # Main 7e77c92 (#174) collected 1189 linux / 1170 windows (CI run of #177 at 7785378).
 # tools/test_encoder_pace.py adds 12 non-parametrized tests: 1201 / 1182. Set by count,
 # not re-collected; CI's collected total is authoritative. Re-collect after any list or test change.
-LINUX_MIN_COLLECTED = 1201
-WINDOWS_MIN_COLLECTED = 1182
+# sidecar/test_qorcap_engagement.py (PWEC) adds 24 non-parametrized tests on both lists: linux
+# re-collected locally at 1225 (main 0932fe8 + this file); windows set by count to 1206.
+LINUX_MIN_COLLECTED = 1225
+WINDOWS_MIN_COLLECTED = 1206
 
 # Absent from both sidecar suites. A reason is required; whitespace does not count.
 EXCLUDED_TEST_FILES = {
