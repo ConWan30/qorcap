@@ -1,0 +1,17 @@
+{
+ "champion": "5be69bfae881050fb7a2ffa555c6b08232bec4985e0203ed3659aafcb2a5ae39",
+ "history": [
+  "5be69bfae881050fb7a2ffa555c6b08232bec4985e0203ed3659aafcb2a5ae39"
+ ],
+ "pending": [],
+ "versions": {
+  "5be69bfae881050fb7a2ffa555c6b08232bec4985e0203ed3659aafcb2a5ae39": {
+   "base": "full_v0",
+   "checks": [],
+   "note": "initial",
+   "routes": {},
+   "sha256": "5be69bfae881050fb7a2ffa555c6b08232bec4985e0203ed3659aafcb2a5ae39",
+   "status": "champion"
+  }
+ }
+}

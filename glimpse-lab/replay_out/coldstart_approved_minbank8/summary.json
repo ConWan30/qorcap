@@ -1,0 +1,508 @@
+[
+ {
+  "match": "match-20261016-125430",
+  "layout": "regular",
+  "chain": {
+   "verified": true,
+   "head": "fd211615b70197d6f77ea10b66552448cb3a484ff7073debfa2ba75183891d09",
+   "n": 593
+  },
+  "champion": "full_v0",
+  "frames_cached": 0,
+  "labelled": 0,
+  "grades": {},
+  "bank_added": 0,
+  "tune": 0,
+  "bank_stats": {},
+  "candidates": [],
+  "lesson": null,
+  "pending": null,
+  "decision": null,
+  "champion_on_game": {
+   "right": 0,
+   "wrong": 0,
+   "abstain": 0,
+   "other": 0,
+   "missing": 0
+  },
+  "note": "no cached Glimpse reads for this game: labels only (they wait for reads)",
+  "hard": {
+   "wrong": [],
+   "unsure": [],
+   "disagree_reader": []
+  },
+  "review_queue": [],
+  "spend_usd": 0.0,
+  "would_cost_live_usd": 0.0,
+  "lab_version": "glimpse-lab/0.1.0-proposal",
+  "label_audit": {
+   "labelled": 0,
+   "not_comparable_no_scorebug": 0,
+   "agree_with_eye": 0,
+   "disagree": 0,
+   "examples": []
+  },
+  "label_capacity": {
+   "sampled": 184,
+   "labelled": 106,
+   "step_s": 4
+  }
+ },
+ {
+  "match": "match-20261017-002326",
+  "layout": "primetime",
+  "chain": {
+   "verified": false,
+   "head": null,
+   "n": 5
+  },
+  "champion": "full_v0",
+  "frames_cached": 17,
+  "labelled": 1,
+  "grades": {
+   "B": 1
+  },
+  "bank_added": 1,
+  "tune": 0,
+  "bank_stats": {
+   "primetime:active": 1
+  },
+  "candidates": [],
+  "lesson": null,
+  "pending": null,
+  "decision": null,
+  "champion_on_game": {
+   "right": 0,
+   "wrong": 0,
+   "abstain": 1,
+   "other": 0,
+   "missing": 4
+  },
+  "hard": {
+   "wrong": [],
+   "unsure": [],
+   "disagree_reader": []
+  },
+  "review_queue": [
+   "snp-122"
+  ],
+  "spend_usd": 0.0,
+  "would_cost_live_usd": 0.0,
+  "lab_version": "glimpse-lab/0.1.0-proposal",
+  "label_audit": {
+   "labelled": 1,
+   "not_comparable_no_scorebug": 0,
+   "agree_with_eye": 1,
+   "disagree": 0,
+   "examples": []
+  },
+  "label_capacity": {
+   "sampled": 150,
+   "labelled": 89,
+   "step_s": 4
+  }
+ },
+ {
+  "match": "match-20261017-010703",
+  "layout": "thursday_night",
+  "chain": {
+   "verified": false,
+   "head": null,
+   "n": 15
+  },
+  "champion": "full_v0",
+  "frames_cached": 55,
+  "labelled": 21,
+  "grades": {
+   "B": 21
+  },
+  "bank_added": 9,
+  "tune": 12,
+  "bank_stats": {
+   "primetime:active": 1,
+   "thursday_night:active": 9
+  },
+  "candidates": [
+   {
+    "kind": "INV",
+    "harness": "full_v0+lockguard",
+    "verdict": "TUNE_PASS",
+    "d_right": 0,
+    "d_wrong": -4,
+    "new_wrong": 0,
+    "cost_delta": 0.0,
+    "score": 20
+   },
+   {
+    "kind": "INV",
+    "harness": "full_v0+stats_never_score",
+    "verdict": "TUNE_FAIL",
+    "d_right": 0,
+    "d_wrong": 0,
+    "new_wrong": 0,
+    "cost_delta": 0.0,
+    "score": 0
+   },
+   {
+    "kind": "DOM",
+    "harness": "full_v0+thursday_night->crop_v0",
+    "verdict": "TUNE_PASS",
+    "d_right": 4,
+    "d_wrong": 0,
+    "new_wrong": 0,
+    "cost_delta": -0.001038,
+    "score": 4
+   },
+   {
+    "kind": "DOM",
+    "harness": "full_v0+thursday_night->crop_v1",
+    "verdict": "TUNE_PASS",
+    "d_right": 4,
+    "d_wrong": -4,
+    "new_wrong": 0,
+    "cost_delta": 0.004182,
+    "score": 24
+   },
+   {
+    "kind": "DOM",
+    "harness": "full_v0+thursday_night->watch_012",
+    "verdict": "TUNE_PASS",
+    "d_right": 4,
+    "d_wrong": -4,
+    "new_wrong": 0,
+    "cost_delta": 0.005766,
+    "score": 24
+   }
+  ],
+  "lesson": {
+   "key": {
+    "game": "madden27",
+    "layout": "thursday_night"
+   },
+   "cue": "thursday_night: champion wrong on 4 tune frame(s)",
+   "action": {
+    "routes": {
+     "thursday_night": "crop_v1"
+    },
+    "checks": []
+   },
+   "evidence": {
+    "tune": {
+     "verdict": "TUNE_PASS",
+     "d_right": 4,
+     "d_wrong": -4,
+     "new_wrong": 0,
+     "cost_delta": 0.004182,
+     "score": 24
+    },
+    "bank": "FAIL_NOT_SIGNIFICANT",
+    "match": "match-20261017-010703"
+   },
+   "receipt_refs": {
+    "chain_head": null,
+    "label_basis": [
+     "reader-lock:match-20261017-010703:1792217435",
+     "reader-lock:match-20261017-010703:1792217981",
+     "reader-lock:match-20261017-010703:1792218614",
+     "reader-lock:match-20261017-010703:1792218815",
+     "reader-lock:match-20261017-010703:1792219448"
+    ],
+    "receipt_sha256": null
+   },
+   "replay_digest": "c124851b396419cb713e18bca495fb8954e515e31ea294ea0e3469a1bd25ab88",
+   "harness_sha256": "0bfcd9022888b18fc5cd2d2b5b0840337714f5c9c04824b126502489c555979e",
+   "status": "candidate",
+   "confidence": "medium",
+   "tag": "ADVISORY_AI"
+  },
+  "pending": null,
+  "decision": null,
+  "champion_on_game": {
+   "right": 7,
+   "wrong": 4,
+   "abstain": 8,
+   "other": 0,
+   "missing": 5
+  },
+  "hard": {
+   "wrong": [
+    "tnp-089",
+    "tnp-153",
+    "tnp-193",
+    "tnp-263"
+   ],
+   "unsure": [
+    "tnp-018",
+    "tnp-113",
+    "tnp-167",
+    "tnp-278"
+   ],
+   "disagree_reader": [
+    "tnp-089",
+    "tnp-153",
+    "tnp-193",
+    "tnp-263"
+   ]
+  },
+  "review_queue": [
+   "tnp-016",
+   "tnp-082",
+   "tnp-084",
+   "tnp-120",
+   "tnp-139",
+   "tnp-140",
+   "tnp-162",
+   "tnp-212",
+   "tnp-244",
+   "tnp-283",
+   "tnp-296",
+   "tnp-301",
+   "tnp-315"
+  ],
+  "bank_gate": {
+   "harness": "full_v0+thursday_night->crop_v1",
+   "n": 8,
+   "champ_right": 4,
+   "cand_right": 5,
+   "champ_wrong": 0,
+   "cand_wrong": 0,
+   "new_wrong": [],
+   "b_only_cand": 1,
+   "c_only_champ": 0,
+   "p_mcnemar": 0.5,
+   "champ_cost": 0.00408,
+   "cand_cost": 0.00653,
+   "verdict": "FAIL_NOT_SIGNIFICANT"
+  },
+  "spend_usd": 0.0,
+  "would_cost_live_usd": 0.038,
+  "lab_version": "glimpse-lab/0.1.0-proposal",
+  "label_audit": {
+   "labelled": 21,
+   "not_comparable_no_scorebug": 8,
+   "agree_with_eye": 13,
+   "disagree": 0,
+   "examples": []
+  },
+  "label_capacity": {
+   "sampled": 776,
+   "labelled": 608,
+   "step_s": 4
+  }
+ },
+ {
+  "match": "match-20261017-021003",
+  "layout": "primetime",
+  "chain": {
+   "verified": false,
+   "head": null,
+   "n": 9
+  },
+  "champion": "full_v0",
+  "frames_cached": 43,
+  "labelled": 11,
+  "grades": {
+   "B": 11
+  },
+  "bank_added": 6,
+  "tune": 5,
+  "bank_stats": {
+   "primetime:active": 7,
+   "thursday_night:active": 9
+  },
+  "candidates": [
+   {
+    "kind": "INV",
+    "harness": "full_v0+lockguard",
+    "verdict": "TUNE_FAIL",
+    "d_right": 0,
+    "d_wrong": 0,
+    "new_wrong": 0,
+    "cost_delta": 0.0,
+    "score": 0
+   },
+   {
+    "kind": "INV",
+    "harness": "full_v0+stats_never_score",
+    "verdict": "TUNE_FAIL",
+    "d_right": 0,
+    "d_wrong": 0,
+    "new_wrong": 0,
+    "cost_delta": 0.0,
+    "score": 0
+   },
+   {
+    "kind": "DOM",
+    "harness": "full_v0+primetime->crop_v0",
+    "verdict": "TUNE_PASS",
+    "d_right": 1,
+    "d_wrong": 0,
+    "new_wrong": 0,
+    "cost_delta": -0.000135,
+    "score": 1
+   },
+   {
+    "kind": "DOM",
+    "harness": "full_v0+primetime->crop_v1",
+    "verdict": "TUNE_PASS",
+    "d_right": 1,
+    "d_wrong": 0,
+    "new_wrong": 0,
+    "cost_delta": 0.00204,
+    "score": 1
+   },
+   {
+    "kind": "DOM",
+    "harness": "full_v0+primetime->watch_012",
+    "verdict": "TUNE_PASS",
+    "d_right": 1,
+    "d_wrong": 0,
+    "new_wrong": 0,
+    "cost_delta": 0.0027,
+    "score": 1
+   }
+  ],
+  "lesson": {
+   "key": {
+    "game": "madden27",
+    "layout": "primetime"
+   },
+   "cue": "primetime: champion unsure on 1 tune frame(s)",
+   "action": {
+    "routes": {
+     "primetime": "crop_v0"
+    },
+    "checks": []
+   },
+   "evidence": {
+    "tune": {
+     "verdict": "TUNE_PASS",
+     "d_right": 1,
+     "d_wrong": 0,
+     "new_wrong": 0,
+     "cost_delta": -0.000135,
+     "score": 1
+    },
+    "bank": "INSUFFICIENT_BANK",
+    "match": "match-20261017-021003"
+   },
+   "receipt_refs": {
+    "chain_head": null,
+    "label_basis": [
+     "reader-lock:match-20261017-021003:1792223233"
+    ],
+    "receipt_sha256": null
+   },
+   "replay_digest": "bfdd86aec80f81deb80b200803f656fce305f16e29c201f215b59d2a18736afd",
+   "harness_sha256": "f5df99ea04e171de58ddb35e75ac5d88533dc920ee6b9ebc762e030f4621ae46",
+   "status": "candidate",
+   "confidence": "low",
+   "tag": "ADVISORY_AI"
+  },
+  "pending": null,
+  "decision": null,
+  "champion_on_game": {
+   "right": 3,
+   "wrong": 0,
+   "abstain": 5,
+   "other": 0,
+   "missing": 9
+  },
+  "hard": {
+   "wrong": [],
+   "unsure": [
+    "m4-024729"
+   ],
+   "disagree_reader": []
+  },
+  "review_queue": [
+   "m4-021638",
+   "m4-021646",
+   "m4-022014",
+   "m4-022022",
+   "m4-022110",
+   "m4-022126",
+   "m4-022351",
+   "m4-022359",
+   "m4-023400",
+   "m4-024705",
+   "m4-024906",
+   "m4-025210"
+  ],
+  "bank_gate": {
+   "harness": "full_v0+primetime->crop_v0",
+   "verdict": "INSUFFICIENT_BANK",
+   "n": 5,
+   "need": 8
+  },
+  "spend_usd": 0.0,
+  "would_cost_live_usd": 0.0158,
+  "lab_version": "glimpse-lab/0.1.0-proposal",
+  "label_audit": {
+   "labelled": 11,
+   "not_comparable_no_scorebug": 2,
+   "agree_with_eye": 9,
+   "disagree": 0,
+   "examples": []
+  },
+  "label_capacity": {
+   "sampled": 582,
+   "labelled": 257,
+   "step_s": 4
+  }
+ },
+ {
+  "match": "match-20261017-162055",
+  "layout": "monday_night",
+  "chain": {
+   "verified": true,
+   "head": "652b4607430815541ee3a8098fbfe8712b8d638688c3daa04f865c5a9ca9009d",
+   "n": 100
+  },
+  "champion": "full_v0",
+  "frames_cached": 90,
+  "labelled": 45,
+  "grades": {
+   "B": 45
+  },
+  "bank_added": 20,
+  "tune": 25,
+  "bank_stats": {
+   "primetime:active": 7,
+   "thursday_night:active": 9,
+   "monday_night:active": 20
+  },
+  "candidates": [],
+  "lesson": null,
+  "pending": null,
+  "decision": null,
+  "champion_on_game": {
+   "right": 0,
+   "wrong": 0,
+   "abstain": 0,
+   "other": 0,
+   "missing": 90
+  },
+  "hard": {
+   "wrong": [],
+   "unsure": [],
+   "disagree_reader": []
+  },
+  "review_queue": [],
+  "spend_usd": 0.0,
+  "would_cost_live_usd": 0.0,
+  "lab_version": "glimpse-lab/0.1.0-proposal",
+  "label_audit": {
+   "labelled": 45,
+   "not_comparable_no_scorebug": 0,
+   "agree_with_eye": 45,
+   "disagree": 0,
+   "examples": []
+  },
+  "label_capacity": {
+   "sampled": 392,
+   "labelled": 224,
+   "step_s": 4
+  }
+ }
+]

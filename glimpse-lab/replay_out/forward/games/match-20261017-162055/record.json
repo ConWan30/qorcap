@@ -1,0 +1,46 @@
+{
+ "match": "match-20261017-162055",
+ "layout": "monday_night",
+ "chain": {
+  "verified": true,
+  "head": "652b4607430815541ee3a8098fbfe8712b8d638688c3daa04f865c5a9ca9009d",
+  "n": 100
+ },
+ "champion": "watch_012",
+ "frames_cached": 90,
+ "labelled": 45,
+ "grades": {
+  "B": 45
+ },
+ "bank_added": 20,
+ "tune": 25,
+ "bank_stats": {
+  "primetime:active": 7,
+  "thursday_night:active": 9,
+  "monday_night:active": 20
+ },
+ "candidates": [],
+ "lesson": null,
+ "pending": null,
+ "decision": null,
+ "champion_on_game": {
+  "right": 45,
+  "wrong": 0,
+  "abstain": 0,
+  "other": 0,
+  "missing": 0
+ },
+ "hard": {
+  "wrong": [],
+  "unsure": [],
+  "disagree_reader": []
+ },
+ "review_queue": [
+  "mnp-f_0730000",
+  "mnp-f_0750000",
+  "mnp-f_1130000"
+ ],
+ "spend_usd": 0.0,
+ "would_cost_live_usd": 0.0,
+ "lab_version": "glimpse-lab/0.1.0-proposal"
+}
