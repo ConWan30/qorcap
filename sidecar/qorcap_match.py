@@ -385,6 +385,39 @@ def maybe_write_cod_reader_stats(bundle: Path, state: dict, game: str, *,
     return True
 
 
+def maybe_write_engagement_windows(bundle: Path, game: str, *, environ=None, out_root=None) -> bool:
+    """Info-only engagement window index (PWEC) after the stop. Never Counted; never raises.
+
+    Off unless ``QORCAP_LANE=practice`` and Call of Duty (``QORCAP_PWEC=0`` turns it off there).
+    It reads ``inputs.jsonl`` and ``frame_clock.jsonl`` and writes only outside the match folder
+    (``%LOCALAPPDATA%\\QorCapEngagement\\<match>\\``). The bundle, the seal and the receipt are not
+    touched. See ``qorcap_engagement``.
+    """
+    try:
+        env = os.environ if environ is None else environ
+        # Gate before any import or sys.path change, so a Madden, REAL MATCH, or no-lane
+        # stop does not load the module. QORCAP_PWEC=0/false/no/off is off on the practice lane.
+        lane = env.get("QORCAP_LANE")
+        flag = env.get("QORCAP_PWEC")
+        if (
+            game != "cod"
+            or not (isinstance(lane, str) and lane.strip().lower() == "practice")
+            or (isinstance(flag, str) and flag.strip().lower() in ("0", "false", "no", "off"))
+        ):
+            return False
+        here = str(HERE)
+        if here not in sys.path:
+            sys.path.insert(0, here)
+        from qorcap_engagement import maybe_write_engagement_windows as _pwec
+        return bool(_pwec(bundle, game, environ=env, out_root=out_root, say=say))
+    except Exception as e:
+        try:
+            say(f"  Engagement windows were not written (info only; the match is unaffected): {type(e).__name__}: {e}")
+        except Exception:
+            pass
+        return False
+
+
 def mark_health_sealed(state: dict) -> None:
     """Drop later reader_health rows. The receipt is about to be signed."""
     state["health_sealed"] = True
@@ -1995,6 +2028,11 @@ def main(argv=None) -> int:
     def persist_stats():
         maybe_write_cod_reader_stats(
             bundle, state, game, practice=True, reader_joined=stop_box["joined"])
+        # Info-only PWEC index: practice lane + CoD only, written outside the match folder.
+        try:
+            maybe_write_engagement_windows(bundle, game)
+        except Exception:
+            pass
 
     tail_s = post_final_tail_s()
     stop_reason = "final"
