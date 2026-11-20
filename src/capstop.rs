@@ -32,6 +32,13 @@ pub const ARRIVAL_GAP_PERIODS: u64 = 3;
 pub const PTS_GAP_NOTE: &str = "pts_gaps counts holes in the encoder's output PTS only. The capture runs -vf fps=N with -fps_mode cfr, so input-side loss (and any loss before ffmpeg) is filled with duplicate frames before the encoder and does not show here. pts_gaps 0 does NOT mean no drops. input_drops.dropped_frames stays UNMEASURED.";
 /// Written into every writer record that QorCap killed.
 pub const KILLED_NOTE: &str = "QorCap killed this writer, so the OS exit status is the kill's, not the writer's (Windows TerminateProcess exits with 1; a Unix signal gives no code). exit_code is UNKNOWN; exit_code_raw is what the OS returned.";
+/// Clock domain labels (QorData: stamp every count so wall and capture-monotonic are never mixed).
+pub const CLOCK_CAPTURE_MONOTONIC: &str = "capture-monotonic";
+pub const CLOCK_ENCODER_PTS_90K: &str = "encoder-pts-90k";
+pub const CLOCK_ENCODER_STREAM_COUNTER: &str = "encoder-stream-counter";
+pub const CLOCK_STDERR_LOG_COUNTER: &str = "stderr-log-counter";
+/// Wording rule: zero logged drop warnings never claims zero drops.
+pub const INPUT_DROP_NONE_LOGGED: &str = "no input-drop warning logged; earlier drops UNMEASURED";
 
 /// On for the practice lane only: `--practice-lane`, or `QORCAP_LANE=practice` (the live tap's rule).
 pub fn enabled(practice_flag: bool, env_lane: Option<&str>) -> bool {
@@ -176,6 +183,14 @@ pub fn writer_record(seq: u64, part_file: Option<&str>, part_basis: &str, end: &
     let c = t.last.clone().unwrap_or_default();
     let encoder = json!({
         "source": "ffmpeg -progress pipe:2",
+        "clock_domain": CLOCK_ENCODER_STREAM_COUNTER,
+        "wall_time_used": false,
+        "clock_domains": {
+            "frame": CLOCK_ENCODER_STREAM_COUNTER,
+            "dup": CLOCK_ENCODER_STREAM_COUNTER,
+            "drop": CLOCK_ENCODER_STREAM_COUNTER,
+            "progress_blocks": CLOCK_STDERR_LOG_COUNTER,
+        },
         "end_seen": t.end_seen,
         "counters_basis": basis,
         "frame": num_or(c.frame, UNMEASURED),
@@ -186,8 +201,27 @@ pub fn writer_record(seq: u64, part_file: Option<&str>, part_basis: &str, end: &
     // Counts are complete only when the whole stderr stream was read; otherwise they are lower bounds.
     let full = end.stderr_drained && end.spawn_error.is_none();
     let count = |n: u64| if full { json!(n) } else { json!(UNKNOWN) };
+    let warning_status = if full {
+        if t.input_drop_lines == 0 { INPUT_DROP_NONE_LOGGED } else { "input-drop warnings logged; dropped_frames stays UNMEASURED" }
+    } else if t.input_drop_lines == 0 {
+        "stderr not fully drained; no input-drop warning logged in read portion; earlier drops UNMEASURED"
+    } else {
+        "stderr not fully drained; input-drop warnings seen in read portion; dropped_frames stays UNMEASURED"
+    };
     let input = json!({
         "source": "ffmpeg dshow real-time buffer warnings (input side, before the encoder)",
+        "clock_domain": CLOCK_STDERR_LOG_COUNTER,
+        "wall_time_used": false,
+        "clock_domains": {
+            "warning_lines": CLOCK_STDERR_LOG_COUNTER,
+            "warning_lines_seen": CLOCK_STDERR_LOG_COUNTER,
+            "video_input_lines": CLOCK_STDERR_LOG_COUNTER,
+            "audio_input_lines": CLOCK_STDERR_LOG_COUNTER,
+            "repeated_after_warning_lower_bound": CLOCK_STDERR_LOG_COUNTER,
+            "repeat_lines_unread": CLOCK_STDERR_LOG_COUNTER,
+            "dropped_frames": UNMEASURED,
+        },
+        "warning_status": warning_status,
         "warning_lines": count(t.input_drop_lines),
         "warning_lines_seen": t.input_drop_lines,
         "video_input_lines": count(t.input_drop_video_lines),
@@ -218,7 +252,13 @@ fn step_ticks(r: crate::align::Rate) -> Option<u64> {
 pub fn frame_clock_gaps(stamps: &[FrameStamp], file: &str, discontinuities: u64) -> Value {
     let mut mine: Vec<&FrameStamp> = stamps.iter().filter(|s| s.file == file).collect();
     if mine.is_empty() {
-        return json!({"part_file": file, "status": UNMEASURED, "reason": "no frame_clock rows for this part"});
+        return json!({
+            "part_file": file,
+            "status": UNMEASURED,
+            "reason": "no frame_clock rows for this part",
+            "wall_time_used": false,
+            "clock_domains": {},
+        });
     }
     mine.sort_by_key(|s| s.frame);
     let frames = mine.len() as u64;
@@ -228,6 +268,12 @@ pub fn frame_clock_gaps(stamps: &[FrameStamp], file: &str, discontinuities: u64)
     let Some((rate, step)) = rate.and_then(|r| step_ticks(r).map(|s| (r, s))) else {
         return json!({
             "part_file": file, "status": UNMEASURED, "reason": "frame rate not measured from frame_clock PTS steps (fewer than 10 consecutive PTS steps, i.e. increasing PTS between consecutive frame numbers)",
+            "wall_time_used": false,
+            "clock_domains": {
+                "frames": CLOCK_CAPTURE_MONOTONIC,
+                "largest_arrival_gap_us": if frames > 1 { json!(CLOCK_CAPTURE_MONOTONIC) } else { json!(UNMEASURED) },
+                "pts_discontinuities": CLOCK_ENCODER_PTS_90K,
+            },
             "frames": frames, "largest_arrival_gap_us": if frames > 1 { json!(largest_arrival_us) } else { json!(UNMEASURED) },
             "pts_discontinuities": discontinuities,
             "pts_gap_note": PTS_GAP_NOTE,
@@ -251,6 +297,21 @@ pub fn frame_clock_gaps(stamps: &[FrameStamp], file: &str, discontinuities: u64)
     }
     json!({
         "part_file": file, "status": "measured",
+        "wall_time_used": false,
+        "clock_domains": {
+            "frames": CLOCK_CAPTURE_MONOTONIC,
+            "rate": CLOCK_ENCODER_PTS_90K,
+            "step_90k": CLOCK_ENCODER_PTS_90K,
+            "pts_gap_threshold_90k": CLOCK_ENCODER_PTS_90K,
+            "pts_gaps": CLOCK_ENCODER_PTS_90K,
+            "pts_missing_slots": CLOCK_ENCODER_PTS_90K,
+            "pts_nonincreasing": CLOCK_ENCODER_PTS_90K,
+            "largest_pts_step_90k": CLOCK_ENCODER_PTS_90K,
+            "pts_discontinuities": CLOCK_ENCODER_PTS_90K,
+            "arrival_gap_threshold_us": CLOCK_CAPTURE_MONOTONIC,
+            "arrival_gaps": CLOCK_CAPTURE_MONOTONIC,
+            "largest_arrival_gap_us": CLOCK_CAPTURE_MONOTONIC,
+        },
         "frames": frames,
         "rate": rate.filter(),
         "rate_source": "frame_clock modal PTS step",
@@ -279,13 +340,24 @@ pub fn discontinuities(text: &str, file: &str) -> u64 {
 pub fn frame_clock_section(frame_clock: Option<&Path>, files: &[String]) -> Value {
     let text = frame_clock.and_then(|p| std::fs::read_to_string(p).ok());
     let Some(text) = text else {
-        return json!({"status": UNMEASURED, "reason": "frame_clock.jsonl not present (frame clock off or not written)", "parts": []});
+        return json!({
+            "status": UNMEASURED,
+            "reason": "frame_clock.jsonl not present (frame clock off or not written)",
+            "wall_time_used": false,
+            "parts": []
+        });
     };
     let stamps = crate::frameclock::load(frame_clock.unwrap_or(Path::new("")));
     let mut names: Vec<String> = files.to_vec();
     for s in &stamps { if !names.contains(&s.file) { names.push(s.file.clone()); } }
     let parts: Vec<Value> = names.iter().map(|f| frame_clock_gaps(&stamps, f, discontinuities(&text, f))).collect();
-    json!({"status": "present", "file": crate::frameclock::FILE_NAME, "parts": parts})
+    json!({
+        "status": "present",
+        "file": crate::frameclock::FILE_NAME,
+        "wall_time_used": false,
+        "clock_domain_note": "PTS counts use encoder-pts-90k (encoder output stream PTS); arrival counts use capture-monotonic (t_mono_us, QorCap Instant). Wall clock is not used.",
+        "parts": parts
+    })
 }
 
 /// The whole document. `state` is `open` while recording (not bound) and `stop` when written for the stop checkpoint.
@@ -589,5 +661,53 @@ mod tests {
         assert!(e.contains("capture_stop.v0.json.tmp"), "{e}");
         assert!(!e.contains(&*dir.to_string_lossy()) && !e.contains("no-such-dir"), "{e}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn counts_are_stamped_with_clock_domain_and_missing_warnings_use_unmeasured_wording() {
+        let mut t = WriterTally::default();
+        feed_block(&mut t, 120, 0, 0, "end");
+        let w = writer_record(0, Some("video.mp4"), "recorder_at_end", &clean(), &t);
+        assert_eq!(w["encoder"]["wall_time_used"], false);
+        assert_eq!(w["encoder"]["clock_domain"], CLOCK_ENCODER_STREAM_COUNTER);
+        assert_eq!(w["encoder"]["clock_domains"]["frame"], CLOCK_ENCODER_STREAM_COUNTER);
+        assert_eq!(w["encoder"]["clock_domains"]["dup"], CLOCK_ENCODER_STREAM_COUNTER);
+        assert_eq!(w["encoder"]["clock_domains"]["drop"], CLOCK_ENCODER_STREAM_COUNTER);
+        assert_eq!(w["encoder"]["clock_domains"]["progress_blocks"], CLOCK_STDERR_LOG_COUNTER);
+        assert_eq!(w["input_drops"]["wall_time_used"], false);
+        assert_eq!(w["input_drops"]["clock_domain"], CLOCK_STDERR_LOG_COUNTER);
+        assert_eq!(w["input_drops"]["clock_domains"]["warning_lines"], CLOCK_STDERR_LOG_COUNTER);
+        assert_eq!(w["input_drops"]["clock_domains"]["dropped_frames"], UNMEASURED);
+        assert_eq!(w["input_drops"]["warning_status"], INPUT_DROP_NONE_LOGGED);
+
+        // Partial stderr with zero warnings seen still keeps earlier drops UNMEASURED.
+        let w_partial = writer_record(0, None, "none", &WriterEnd { stderr_drained: false, ..clean() }, &t);
+        assert_eq!(w_partial["input_drops"]["warning_lines"], UNKNOWN);
+        assert!(w_partial["input_drops"]["warning_status"].as_str().unwrap().contains("earlier drops UNMEASURED"));
+
+        // Frame-clock gap check separates encoder-pts-90k and capture-monotonic, never mixing wall clock.
+        let pts: Vec<u64> = (0..15).map(|i| i * 1500).collect();
+        let mono: Vec<u64> = (0..15).map(|i| 1_000_000 + i * 16_667).collect();
+        let g = frame_clock_gaps(&stamps("video.mp4", &pts, &mono), "video.mp4", 0);
+        assert_eq!(g["wall_time_used"], false);
+        assert_eq!(g["clock_domains"]["frames"], CLOCK_CAPTURE_MONOTONIC);
+        assert_eq!(g["clock_domains"]["arrival_gaps"], CLOCK_CAPTURE_MONOTONIC);
+        assert_eq!(g["clock_domains"]["largest_arrival_gap_us"], CLOCK_CAPTURE_MONOTONIC);
+        assert_eq!(g["clock_domains"]["pts_gaps"], CLOCK_ENCODER_PTS_90K);
+        assert_eq!(g["clock_domains"]["pts_missing_slots"], CLOCK_ENCODER_PTS_90K);
+        assert_eq!(g["clock_domains"]["pts_nonincreasing"], CLOCK_ENCODER_PTS_90K);
+        assert_eq!(g["clock_domains"]["pts_discontinuities"], CLOCK_ENCODER_PTS_90K);
+
+        let g_short = frame_clock_gaps(&stamps("short.mp4", &[0, 1500], &[10, 20]), "short.mp4", 1);
+        assert_eq!(g_short["wall_time_used"], false);
+        assert_eq!(g_short["clock_domains"]["frames"], CLOCK_CAPTURE_MONOTONIC);
+        assert_eq!(g_short["clock_domains"]["largest_arrival_gap_us"], CLOCK_CAPTURE_MONOTONIC);
+        assert_eq!(g_short["clock_domains"]["pts_discontinuities"], CLOCK_ENCODER_PTS_90K);
+
+        let doc = document("m2", "stop", Some("enter"), &[w], json!({"status": UNMEASURED, "wall_time_used": false, "parts": []}));
+        let rendered = render(&doc);
+        for banned in ["verified", "proven", "skill", "reaction time", "anti-cheat"] {
+            assert!(!rendered.to_lowercase().contains(banned), "{banned}");
+        }
     }
 }
