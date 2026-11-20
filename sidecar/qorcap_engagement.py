@@ -29,8 +29,8 @@ frame" as an input fact).
 
 Exclusion flags (the window is still written, with ``excluded: true``):
 ``out_of_span``, ``open_at_log_end``, ``long_core`` (core > 8 s), ``hid_doubt`` (controller
-heartbeat faults, stale/short/parse/seq faults, rx gap > 50 ms, heartbeats > 1.5 s apart, or no
-heartbeat after the window), ``backlog`` (a frame whose arrival trails T by > 500 ms within
+heartbeat faults, stale/short/parse/seq faults, rx gap > 50 ms, heartbeats > 1.5 s apart, a leading gap to the first heartbeat when none precedes the
+padded start, or no heartbeat after the window), ``backlog`` (a frame whose arrival trails T by > 500 ms within
 [start - 1 s, end + 0.5 s]) and ``match_b4`` (only when the caller passes it: the B4 alignment
 check is not run here, so the summary records it as UNMEASURED).
 
@@ -227,7 +227,12 @@ def build_windows(inputs: dict, frames: list, *, match_flags=()) -> tuple[list, 
         k = bisect.bisect_left(hbt, b)
         if j >= len(hb) or k >= len(hb):
             return True
-        if j > 0 and hbt[j] - hbt[j - 1] > HB_MAX_GAP_US:
+        # j == 0: no heartbeat at or before the padded start. A late first heartbeat
+        # is a leading gap of hbt[0] - a (the mid-log j > 0 branch cannot see it).
+        if j == 0:
+            if hbt[0] - a > HB_MAX_GAP_US:
+                return True
+        elif hbt[j] - hbt[j - 1] > HB_MAX_GAP_US:
             return True
         if any(hbt[x] - hbt[x - 1] > HB_MAX_GAP_US for x in range(max(j, 1), k + 1)):
             return True
@@ -313,6 +318,13 @@ def analyze_match_dir(match_dir: Path, *, match_flags=()) -> tuple[list, dict]:
             raise PwecError(f"{p.name} not present")
     with open(ip, "r", encoding="utf-8", errors="replace") as f:
         inputs = parse_inputs(f)
+    if not inputs["rows"] and not inputs["hb"]:
+        # File exists but has no valid in or hb row. Do not write a 0-window index
+        # that can be read as a quiet match. Status is UNKNOWN (no index).
+        raise PwecError(
+            "inputs.jsonl exists but does not parse: no valid in or hb row "
+            "(index not written; status UNKNOWN)"
+        )
     with open(fp, "r", encoding="utf-8", errors="replace") as f:
         fc = parse_frame_clock(f)
     windows, meta = build_windows(inputs, fc["frames"], match_flags=match_flags)
@@ -340,9 +352,21 @@ def _under(child: Path, parent: Path) -> bool:
         return False
 
 
+def require_safe_leaf(name: str) -> str:
+    """A single folder name that cannot escape the output root.
+
+    Rejects empty, ``.``, ``..``, an absolute name, and any name with a path separator.
+    """
+    if not name or name in (".", ".."):
+        raise PwecError("refusing: the match folder name is empty or a path parent")
+    if os.path.isabs(name) or "/" in name or "\\" in name or "\x00" in name:
+        raise PwecError("refusing: the match folder name is not a single leaf")
+    return name
+
+
 def out_dir_for(match_dir: Path, out_root: Path) -> Path:
     match_dir, out_root = Path(match_dir), Path(out_root)
-    out = out_root / match_dir.name
+    out = out_root / require_safe_leaf(match_dir.name)
     if _under(out, match_dir) or _under(match_dir, out_root):
         raise PwecError("refusing: the engagement window folder must be outside the match folder")
     return out
@@ -396,7 +420,7 @@ def maybe_write_engagement_windows(bundle, game, *, environ=None, out_root=None,
     except Exception as e:  # noqa: BLE001 - info-only sidecar: never let it reach the save path
         try:
             if say is not None:
-                say(f"  Engagement windows were not written (info only; the match is unaffected): {type(e).__name__}")
+                say(f"  Engagement windows were not written (info only; the match is unaffected): {type(e).__name__}: {e}")
         except Exception:
             pass
         return False

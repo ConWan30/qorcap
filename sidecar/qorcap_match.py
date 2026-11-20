@@ -394,12 +394,25 @@ def maybe_write_engagement_windows(bundle: Path, game: str, *, environ=None, out
     touched. See ``qorcap_engagement``.
     """
     try:
-        sys.path.insert(0, str(HERE))
+        env = os.environ if environ is None else environ
+        # Gate before any import or sys.path change, so a Madden, REAL MATCH, or no-lane
+        # stop does not load the module. QORCAP_PWEC=0/false/no/off is off on the practice lane.
+        lane = env.get("QORCAP_LANE")
+        flag = env.get("QORCAP_PWEC")
+        if (
+            game != "cod"
+            or not (isinstance(lane, str) and lane.strip().lower() == "practice")
+            or (isinstance(flag, str) and flag.strip().lower() in ("0", "false", "no", "off"))
+        ):
+            return False
+        here = str(HERE)
+        if here not in sys.path:
+            sys.path.insert(0, here)
         from qorcap_engagement import maybe_write_engagement_windows as _pwec
-        return bool(_pwec(bundle, game, environ=environ, out_root=out_root, say=say))
+        return bool(_pwec(bundle, game, environ=env, out_root=out_root, say=say))
     except Exception as e:
         try:
-            say(f"  Engagement windows were not written (info only; the match is unaffected): {type(e).__name__}")
+            say(f"  Engagement windows were not written (info only; the match is unaffected): {type(e).__name__}: {e}")
         except Exception:
             pass
         return False

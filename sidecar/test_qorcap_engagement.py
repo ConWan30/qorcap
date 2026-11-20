@@ -45,12 +45,16 @@ def _frames(n=1200, start_us=0, lag_us=4000, lag_at=None):
     return out
 
 
-def _bundle(tmp_path, rows, frames=None, name="match-20990101-000000", hb_every=1_000_000, hb_until=None, extra_hb=()):
+def _bundle(tmp_path, rows, frames=None, name="match-20990101-000000", hb_every=1_000_000, hb_until=None,
+           extra_hb=(), heartbeats=None):
     d = tmp_path / name
     d.mkdir(parents=True)
     last = max(r["t_us"] for r in rows)
     hb_until = last + 2_000_000 if hb_until is None else hb_until
-    hb = [_hb(t) for t in range(hb_every, hb_until + 1, hb_every)] + list(extra_hb)
+    if heartbeats is not None:
+        hb = list(heartbeats)
+    else:
+        hb = [_hb(t) for t in range(hb_every, hb_until + 1, hb_every)] + list(extra_hb)
     allrows = [{"type": "header", "schema": "qorcap-inputs/v0", "t_us": 0}] + sorted(rows + hb, key=lambda r: r["t_us"])
     (d / "inputs.jsonl").write_text("".join(json.dumps(r) + "\n" for r in allrows), encoding="utf-8")
     fr = [{"type": "header", "schema": "qorcap-frame-clock/v0"}] + (frames if frames is not None else _frames())
@@ -154,6 +158,17 @@ def test_heartbeat_gap_or_none_after_window_is_hid_doubt(tmp_path):
     assert "hid_doubt" in _windows(none_after)[0][0]["flags"]
 
 
+def test_leading_heartbeat_gap_when_j_is_zero(tmp_path):
+    """No heartbeat precedes the padded start (j == 0). A first heartbeat more than 1.5 s
+    after that start is hid_doubt; one within 1.5 s is not, if later gaps are also healthy."""
+    rows = [_in(0), _in(5_000_000, r2=200, l2=200), _in(5_500_000)]
+    # padded start is 4_500_000. First hb 1.6 s later, then 1 s steps through the end.
+    late = _bundle(tmp_path / "late", rows, heartbeats=[_hb(6_100_000), _hb(7_100_000), _hb(8_100_000)])
+    assert "hid_doubt" in _windows(late)[0][0]["flags"]
+    ok = _bundle(tmp_path / "ok", rows, heartbeats=[_hb(5_500_000), _hb(6_500_000), _hb(7_500_000), _hb(8_500_000)])
+    assert "hid_doubt" not in _windows(ok)[0][0]["flags"]
+
+
 def test_backlog_and_out_of_span_and_open_at_end(tmp_path):
     rows = [_in(0), _in(10_000_000, r2=200, l2=200), _in(10_500_000)]
     lagged = _bundle(tmp_path / "lag", rows, frames=_frames(lag_at={600: 700_000}))
@@ -234,6 +249,27 @@ def test_default_out_root_is_localappdata_engagement_folder(tmp_path):
     assert E.default_out_root({"LOCALAPPDATA": str(tmp_path), "QORCAP_PWEC_OUT": str(tmp_path / "x")}) == tmp_path / "x"
 
 
+def test_out_dir_for_rejects_unsafe_leaf_names(tmp_path):
+    out_root = tmp_path / "QorCapEngagement"
+    out_root.mkdir()
+    safe = tmp_path / "matches" / "match-20990101-000000"
+    safe.mkdir(parents=True)
+    assert E.out_dir_for(safe, out_root) == out_root / "match-20990101-000000"
+    # Path(".../..").name is ".."; without the check this would be out_root.parent.
+    escaped = (tmp_path / "any" / "match") / ".."
+    assert escaped.name == ".."
+    assert (out_root / escaped.name).resolve() == out_root.parent.resolve()
+    with pytest.raises(E.PwecError, match="empty or a path parent"):
+        E.out_dir_for(escaped, out_root)
+    with pytest.raises(E.PwecError, match="empty or a path parent"):
+        E.out_dir_for(Path(".."), out_root)
+    with pytest.raises(E.PwecError, match="empty or a path parent"):
+        E.out_dir_for(Path("."), out_root)
+    for name in ("", "foo/bar", "foo\\bar", "/abs"):
+        with pytest.raises(E.PwecError, match="empty or a path parent|not a single leaf"):
+            E.require_safe_leaf(name)
+
+
 # ------------------------------------------------------------------------------------------ seal isolation
 def _tree(d: Path) -> dict:
     return {str(p.relative_to(d)): hashlib.sha256(p.read_bytes()).hexdigest() for p in sorted(d.rglob("*")) if p.is_file()}
@@ -273,6 +309,13 @@ def test_output_root_inside_the_match_folder_is_refused(tmp_path):
     assert E.maybe_write_engagement_windows(d, "cod", environ=PRACTICE, out_root=d.parent, say=said.append) is False
     assert _tree(d) == before and not (d / "sub").exists()
     assert all("not written" in m for m in said)
+    # Successful path (valid out root): the match folder must still be unchanged. A write into
+    # the match folder after a valid out root must fail this test, not only the tree-hash and
+    # audit-hook tests.
+    ok_root = tmp_path / "LocalAppData" / "QorCapEngagement"
+    assert E.maybe_write_engagement_windows(d, "cod", environ=PRACTICE, out_root=ok_root, say=said.append) is True
+    assert (ok_root / d.name / E.FILE_NAME).is_file()
+    assert _tree(d) == before
 
 
 def test_match_folder_gets_no_write_open_rename_or_mkdir(tmp_path):
@@ -350,6 +393,35 @@ def test_corrupt_lines_are_counted_not_fatal(tmp_path):
     assert len(ws) == 1 and s["inputs"]["inputs_bad_lines"] == 2
 
 
+def test_unreadable_inputs_write_no_index(tmp_path):
+    """An inputs log that exists but does not parse must not write a 0-window index."""
+    d = tmp_path / "match-20990101-000000"
+    d.mkdir()
+    (d / "inputs.jsonl").write_text("{not json\n[1,2]\n", encoding="utf-8")
+    (d / "frame_clock.jsonl").write_text("".join(json.dumps(r) + "\n" for r in ([{"type": "header"}] + _frames())),
+                                        encoding="utf-8")
+    said = []
+    out = tmp_path / "out"
+    assert E.maybe_write_engagement_windows(d, "cod", environ=PRACTICE, out_root=out, say=said.append) is False
+    assert list(out.rglob(E.FILE_NAME)) == []
+    summaries = list(out.rglob(E.SUMMARY_NAME))
+    for sp in summaries:
+        doc = json.loads(sp.read_text(encoding="utf-8"))
+        assert doc.get("status") == "UNKNOWN"
+        assert "windows" not in doc
+    assert said and "does not parse" in said[0] and "UNKNOWN" in said[0]
+    with pytest.raises(E.PwecError, match="does not parse"):
+        E.analyze_match_dir(d)
+    # Header-only (parses as JSON, but no in or hb row) is the same: no index.
+    d2 = tmp_path / "match-20990101-000001"
+    d2.mkdir()
+    (d2 / "inputs.jsonl").write_text(json.dumps({"type": "header", "schema": "qorcap-inputs/v0", "t_us": 0}) + "\n",
+                                     encoding="utf-8")
+    (d2 / "frame_clock.jsonl").write_bytes((d / "frame_clock.jsonl").read_bytes())
+    assert E.maybe_write_engagement_windows(d2, "cod", environ=PRACTICE, out_root=out, say=said.append) is False
+    assert list(out.rglob(E.FILE_NAME)) == []
+
+
 def test_match_hook_never_raises_and_runs_after_reader_stats(tmp_path, monkeypatch):
     import qorcap_engagement
 
@@ -365,6 +437,8 @@ def test_match_hook_never_raises_and_runs_after_reader_stats(tmp_path, monkeypat
     persist = src.split("def persist_stats():", 1)[1].split("\n    tail_s = ", 1)[0]
     assert persist.index("maybe_write_cod_reader_stats(") < persist.index("maybe_write_engagement_windows(bundle, game)")
     assert "try:" in persist.split("maybe_write_cod_reader_stats(", 1)[1]
+    wrapper = src.split("def maybe_write_engagement_windows(", 1)[1].split("def mark_health_sealed(", 1)[0]
+    assert wrapper.index("QORCAP_LANE") < wrapper.index("from qorcap_engagement import")
     # persist_stats runs in run_with_reader_stats' finally, after save_tail (seal, countersign,
     # receipt); its exceptions cannot replace the save result.
     assert "run_with_reader_stats(save_tail, persist_stats)" in src
@@ -377,8 +451,10 @@ def test_real_match_lane_hook_is_a_no_op(tmp_path, monkeypatch):
     monkeypatch.delenv("QORCAP_LANE", raising=False)
     monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "lad"))
     before = _tree(d)
+    path_before = list(sys.path)
     assert M.maybe_write_engagement_windows(d, "cod") is False
     assert _tree(d) == before and not (tmp_path / "lad").exists()
+    assert sys.path == path_before
 
 
 # ------------------------------------------------------------------------------------------ parity
