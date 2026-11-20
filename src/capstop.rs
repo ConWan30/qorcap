@@ -39,6 +39,10 @@ pub const CLOCK_ENCODER_STREAM_COUNTER: &str = "encoder-stream-counter";
 pub const CLOCK_STDERR_LOG_COUNTER: &str = "stderr-log-counter";
 /// Wording rule: zero logged drop warnings never claims zero drops.
 pub const INPUT_DROP_NONE_LOGGED: &str = "no input-drop warning logged; earlier drops UNMEASURED";
+/// Partial stderr, no warning line in the portion that was read.
+pub const INPUT_DROP_PARTIAL_NONE_LOGGED: &str = "stderr not fully drained; no input-drop warning logged in read portion; earlier drops UNMEASURED";
+/// Partial stderr, at least one warning line in the portion that was read.
+pub const INPUT_DROP_PARTIAL_WARNINGS: &str = "stderr not fully drained; input-drop warnings seen in read portion; dropped_frames stays UNMEASURED";
 
 /// On for the practice lane only: `--practice-lane`, or `QORCAP_LANE=practice` (the live tap's rule).
 pub fn enabled(practice_flag: bool, env_lane: Option<&str>) -> bool {
@@ -204,9 +208,9 @@ pub fn writer_record(seq: u64, part_file: Option<&str>, part_basis: &str, end: &
     let warning_status = if full {
         if t.input_drop_lines == 0 { INPUT_DROP_NONE_LOGGED } else { "input-drop warnings logged; dropped_frames stays UNMEASURED" }
     } else if t.input_drop_lines == 0 {
-        "stderr not fully drained; no input-drop warning logged in read portion; earlier drops UNMEASURED"
+        INPUT_DROP_PARTIAL_NONE_LOGGED
     } else {
-        "stderr not fully drained; input-drop warnings seen in read portion; dropped_frames stays UNMEASURED"
+        INPUT_DROP_PARTIAL_WARNINGS
     };
     let input = json!({
         "source": "ffmpeg dshow real-time buffer warnings (input side, before the encoder)",
@@ -308,7 +312,7 @@ pub fn frame_clock_gaps(stamps: &[FrameStamp], file: &str, discontinuities: u64)
             "pts_nonincreasing": CLOCK_ENCODER_PTS_90K,
             "largest_pts_step_90k": CLOCK_ENCODER_PTS_90K,
             "pts_discontinuities": CLOCK_ENCODER_PTS_90K,
-            "arrival_gap_threshold_us": CLOCK_CAPTURE_MONOTONIC,
+            "arrival_gap_threshold_us": CLOCK_ENCODER_PTS_90K,
             "arrival_gaps": CLOCK_CAPTURE_MONOTONIC,
             "largest_arrival_gap_us": CLOCK_CAPTURE_MONOTONIC,
         },
@@ -326,7 +330,7 @@ pub fn frame_clock_gaps(stamps: &[FrameStamp], file: &str, discontinuities: u64)
         "arrival_gaps": arrival_gaps,
         "largest_arrival_gap_us": largest_arrival_us,
         "pts_discontinuities": discontinuities,
-        "note": "Arrival is when QorCap read the frame's MPEG-TS packet (after the encoder). Thresholds are PROVISIONAL.",
+        "note": "Arrival is when QorCap read the frame's MPEG-TS packet (after the encoder). arrival_gap_threshold_us is a converted encoder-pts-90k period applied to capture-monotonic arrivals. Thresholds are PROVISIONAL.",
     })
 }
 
@@ -355,7 +359,7 @@ pub fn frame_clock_section(frame_clock: Option<&Path>, files: &[String]) -> Valu
         "status": "present",
         "file": crate::frameclock::FILE_NAME,
         "wall_time_used": false,
-        "clock_domain_note": "PTS counts use encoder-pts-90k (encoder output stream PTS); arrival counts use capture-monotonic (t_mono_us, QorCap Instant). Wall clock is not used.",
+        "clock_domain_note": "PTS counts use encoder-pts-90k (encoder output stream PTS); arrival counts use capture-monotonic (t_mono_us, QorCap Instant). arrival_gap_threshold_us is a converted encoder-pts-90k period applied to those arrivals. Wall clock is not used.",
         "parts": parts
     })
 }
@@ -680,10 +684,22 @@ mod tests {
         assert_eq!(w["input_drops"]["clock_domains"]["dropped_frames"], UNMEASURED);
         assert_eq!(w["input_drops"]["warning_status"], INPUT_DROP_NONE_LOGGED);
 
-        // Partial stderr with zero warnings seen still keeps earlier drops UNMEASURED.
+        // Partial stderr with zero warnings: exact status, never a clean zero.
         let w_partial = writer_record(0, None, "none", &WriterEnd { stderr_drained: false, ..clean() }, &t);
         assert_eq!(w_partial["input_drops"]["warning_lines"], UNKNOWN);
-        assert!(w_partial["input_drops"]["warning_status"].as_str().unwrap().contains("earlier drops UNMEASURED"));
+        assert_eq!(w_partial["input_drops"]["warning_lines_seen"], 0);
+        assert_eq!(w_partial["input_drops"]["dropped_frames"], UNMEASURED);
+        assert_eq!(w_partial["input_drops"]["warning_status"], INPUT_DROP_PARTIAL_NONE_LOGGED);
+
+        // Partial stderr with warnings in the read portion: exact status, counts stay UNKNOWN.
+        let drop_line = "[in#0/dshow @ 000001d3d0b13480] real-time buffer [Elgato Game Capture Neo] [video input] too full or near too full (62% of size: 512000000 [rtbufsize parameter])! frame dropped!";
+        let mut t_warn = t.clone();
+        t_warn.observe_line(drop_line);
+        let w_partial_warn = writer_record(0, None, "none", &WriterEnd { stderr_drained: false, ..clean() }, &t_warn);
+        assert_eq!(w_partial_warn["input_drops"]["warning_lines"], UNKNOWN);
+        assert_eq!(w_partial_warn["input_drops"]["warning_lines_seen"], 1);
+        assert_eq!(w_partial_warn["input_drops"]["dropped_frames"], UNMEASURED);
+        assert_eq!(w_partial_warn["input_drops"]["warning_status"], INPUT_DROP_PARTIAL_WARNINGS);
 
         // Frame-clock gap check separates encoder-pts-90k and capture-monotonic, never mixing wall clock.
         let pts: Vec<u64> = (0..15).map(|i| i * 1500).collect();
@@ -693,6 +709,7 @@ mod tests {
         assert_eq!(g["clock_domains"]["frames"], CLOCK_CAPTURE_MONOTONIC);
         assert_eq!(g["clock_domains"]["arrival_gaps"], CLOCK_CAPTURE_MONOTONIC);
         assert_eq!(g["clock_domains"]["largest_arrival_gap_us"], CLOCK_CAPTURE_MONOTONIC);
+        assert_eq!(g["clock_domains"]["arrival_gap_threshold_us"], CLOCK_ENCODER_PTS_90K);
         assert_eq!(g["clock_domains"]["pts_gaps"], CLOCK_ENCODER_PTS_90K);
         assert_eq!(g["clock_domains"]["pts_missing_slots"], CLOCK_ENCODER_PTS_90K);
         assert_eq!(g["clock_domains"]["pts_nonincreasing"], CLOCK_ENCODER_PTS_90K);

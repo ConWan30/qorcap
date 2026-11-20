@@ -1007,7 +1007,14 @@ impl Engine {
             // Logging only: one encoder progress line per 5 s from the -progress blocks read here.
             let mut plog = crate::encprog::ProgressLog::new(crate::encprog::INTERVAL_MS);
             let t0 = Instant::now();
-            for line in std::io::BufReader::new(stderr).lines().map_while(Result::ok) {
+            // A lines() IO or UTF-8 error stops the read. Mark the stream partial so
+            // input-drop counts stay UNKNOWN / UNMEASURED, never a clean zero.
+            let mut stderr_partial = false;
+            for line in std::io::BufReader::new(stderr).lines() {
+                let line = match line {
+                    Ok(s) => s,
+                    Err(_) => { stderr_partial = true; break; }
+                };
                 let l = line.trim();
                 if let Some((k, v)) = l.split_once('=') {
                     if !k.contains(' ') {
@@ -1035,6 +1042,7 @@ impl Engine {
                 let mut e = last_err.lock().unwrap_or_else(|e| e.into_inner()); e.push(l.to_string()); if e.len() > 5 { e.remove(0); }
             }
             plog.finish(t0.elapsed().as_millis() as u64); // Logging only: stderr ended (EOF, broken pipe, kill, crash); close an open pace episode, flush drop messages.
+            stderr_partial
         }) };
         // watchdog: kill if no data for N seconds (frozen driver / shared device / unplug)
         { let me = self.clone(); let child = child.clone(); let alive = alive.clone(); let kill_sent = kill_sent.clone(); let start = self.ms(); std::thread::spawn(move || {
@@ -1097,8 +1105,16 @@ impl Engine {
             // Bounded: the writer has exited, so its stderr reaches EOF. A reader still busy after 2 s leaves the counts UNKNOWN.
             let until = Instant::now() + Duration::from_secs(2);
             while !stderr_thread.is_finished() && Instant::now() < until { std::thread::sleep(Duration::from_millis(20)); }
-            let drained = stderr_thread.is_finished();
-            if drained { let _ = stderr_thread.join(); }
+            let finished = stderr_thread.is_finished();
+            // Finished + no read error => fully drained. A lines() error or a panic is partial.
+            let drained = if finished {
+                match stderr_thread.join() {
+                    Ok(partial) => !partial,
+                    Err(_) => false,
+                }
+            } else {
+                false
+            };
             let end = crate::capstop::WriterEnd {
                 exit_code: st.as_ref().ok().and_then(|s| s.code()), status_known: st.is_ok(),
                 kill_sent: kill_sent.lock().unwrap_or_else(|e| e.into_inner()).clone(), spawn_error: None, stderr_drained: drained,
@@ -1969,10 +1985,15 @@ esac
         assert_eq!(w[1]["input_drops"]["video_input_lines"], 1);
         assert_eq!(w[1]["input_drops"]["repeated_after_warning_lower_bound"], 3);
         assert_eq!(w[1]["input_drops"]["dropped_frames"], crate::capstop::UNMEASURED);
-        // 2: garbage only, non-zero exit; nothing invented.
+        // 2: garbage only, including invalid UTF-8 (\377). The drain stops on that error, so
+        // the stream is partial: warning_lines is UNKNOWN, not a clean zero.
         assert_eq!(w[2]["writer"]["exit_code"], 228);
         assert_eq!(w[2]["encoder"]["frame"], crate::capstop::UNMEASURED);
-        assert_eq!(w[2]["input_drops"]["warning_lines"], 0);
+        assert_eq!(w[2]["writer"]["stderr_drained"], false);
+        assert_eq!(w[2]["input_drops"]["warning_lines"], crate::capstop::UNKNOWN);
+        assert_eq!(w[2]["input_drops"]["warning_lines_seen"], 0);
+        assert_eq!(w[2]["input_drops"]["dropped_frames"], crate::capstop::UNMEASURED);
+        assert_eq!(w[2]["input_drops"]["warning_status"], crate::capstop::INPUT_DROP_PARTIAL_NONE_LOGGED);
         // 3: device went quiet -> watchdog kill. 4: stop -> kill. A signal death has no exit code.
         assert_eq!(w[3]["writer"]["ended_by"], "qorcap_kill");
         assert_eq!(w[3]["writer"]["kill_sent"], "watchdog_no_data");
@@ -1983,7 +2004,13 @@ esac
         assert_eq!(w[4]["writer"]["killed_by_qorcap"], true);
         for x in &w[..3] { assert_eq!(x["writer"]["killed_by_qorcap"], false); }
         assert_eq!(w[4]["encoder"]["frame"], 7);
-        for x in w { assert_eq!(x["writer"]["stderr_drained"], true); }
+        for (i, x) in w.iter().enumerate() {
+            if i == 2 {
+                assert_eq!(x["writer"]["stderr_drained"], false, "writer 2 stderr has invalid UTF-8");
+            } else {
+                assert_eq!(x["writer"]["stderr_drained"], true, "writer {i}");
+            }
+        }
         // Frame-clock gap check for the part.
         let fc = &doc["frame_clock"]["parts"][0];
         assert_eq!(fc["part_file"], "video.mp4");

@@ -28,7 +28,7 @@ One record per capture writer (the capture ffmpeg that reads the card and encode
   log at the capture's `-loglevel` is UNKNOWN for the pinned build, and if not, this can only
   under-count. It is a **lower bound**: ffmpeg prints a pending repeat count
   only when its next different log message arrives, so a run still pending when the writer ends is
-  never printed. `dropped_frames` stays `UNMEASURED`: one line per frame was not checked. When no warning line was logged on a drained stderr stream, `warning_status` records `"no input-drop warning logged; earlier drops UNMEASURED"`.
+  never printed. `dropped_frames` stays `UNMEASURED`: one line per frame was not checked. When no warning line was logged on a drained stderr stream, `warning_status` records `"no input-drop warning logged; earlier drops UNMEASURED"`. If stderr was not fully drained (the 2 s bound ran out, or a read / UTF-8 error stopped the drain), counts are `UNKNOWN` and `warning_status` says the stream was not fully drained, with earlier drops `UNMEASURED`.
 
 At stop, a **frame-clock gap check** runs per part on `frame_clock.jsonl`: the rate measured from the
 modal PTS step, PTS gaps above 3/2 of that step (and the missing slots), equal or backwards PTS steps
@@ -44,11 +44,13 @@ ffmpeg. Every part carries this as `pts_gap_note`. Arrival gaps can show deliver
 
 - **Clock domains**: every count in `encoder`, `input_drops`, and `frame_clock.parts[*]` is stamped
   in `clock_domains` (with `wall_time_used: false`). Frame-clock arrival counts (`frames`,
-  `arrival_gaps`, `largest_arrival_gap_us`, `arrival_gap_threshold_us`) use `capture-monotonic`
-  (`t_mono_us`, QorCap `Instant`); PTS counts (`rate`, `step_90k`, `pts_gaps`, `pts_missing_slots`,
-  `pts_nonincreasing`, `largest_pts_step_90k`, `pts_discontinuities`, `pts_gap_threshold_90k`) use
-  `encoder-pts-90k`; encoder and stderr counts use `encoder-stream-counter` and
-  `stderr-log-counter`. Wall clock is never used or mixed into gap checks.
+  `arrival_gaps`, `largest_arrival_gap_us`) use `capture-monotonic`
+  (`t_mono_us`, QorCap `Instant`). `arrival_gap_threshold_us` is a converted encoder PTS period
+  applied to those arrivals, so it is stamped `encoder-pts-90k`. PTS counts (`rate`, `step_90k`,
+  `pts_gaps`, `pts_missing_slots`, `pts_nonincreasing`, `largest_pts_step_90k`,
+  `pts_discontinuities`, `pts_gap_threshold_90k`) use `encoder-pts-90k`; encoder and stderr counts
+  use `encoder-stream-counter` and `stderr-log-counter`. Wall clock is never used or mixed into
+  gap checks.
 
 Anything not seen is `UNMEASURED` or `UNKNOWN`, never 0.
 
