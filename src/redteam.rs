@@ -356,7 +356,7 @@ fn build(plan: &Plan) -> Built {
 
     let report = bundle::verify(&dir).unwrap_or_else(|e| bundle::Report {
         segments: 0, bytes: 0, checkpoints: 0, chain_head: String::new(),
-        errors: vec![e], input_chunks: 0, input_head: None,
+        errors: vec![e], input_chunks: 0, input_head: None, warnings: vec![],
     });
     let (recs, _) = inputs::read_file(&dir.join("inputs.jsonl")).unwrap_or_default();
     Built { _dir: hold, receipt, recs, phases, verify_errors: report.errors }
@@ -615,8 +615,8 @@ fn fail_layer(name: &str, detail: impl Into<String>) -> Layer {
 /// `attack` is true for a relay row: a recovered offset is a weak signal, because the aligner does not reject it.
 fn alignment_layer(delay_ms: i64, attack: bool) -> Layer {
     let frames: Vec<usize> = (0..100).map(|i| 200 + i * 41).collect();
-    let presses: Vec<u64> = frames.iter().map(|&f| (f as f64 * 1000.0 / align::FPS * 1000.0).round() as u64).collect();
-    let delay_frames = (delay_ms as f64 / (1000.0 / align::FPS)).round() as usize;
+    let presses: Vec<u64> = frames.iter().map(|&f| (f as f64 * 1000.0 / align::REFERENCE_FPS * 1000.0).round() as u64).collect();
+    let delay_frames = (delay_ms as f64 / (1000.0 / align::REFERENCE_FPS)).round() as usize;
     alignment_for_presses(&presses, delay_frames + 6, attack).into_named(delay_ms)
 }
 
@@ -633,10 +633,10 @@ fn alignment_for_presses(presses: &[u64], lag_frames: usize, attack: bool) -> Al
     if presses.len() < 8 {
         return AlignRaw { result: "pass".into(), detail: "too few key presses to score alignment".into() };
     }
-    let frames: Vec<usize> = presses.iter().map(|t| ((*t as f64 / 1000.0) / (1000.0 / align::FPS)).round() as usize).collect();
+    let frames: Vec<usize> = presses.iter().map(|t| ((*t as f64 / 1000.0) / (1000.0 / align::REFERENCE_FPS)).round() as usize).collect();
     let last = frames.iter().copied().max().unwrap_or(0) + lag_frames + 40;
     let track = spike_track(last + 8, &frames, lag_frames);
-    let clock = align::FileClock { file: "video.mp4".into(), start_ms: 0.0, ms_per_frame: 1000.0 / align::FPS, end_ms: 1e12, fitted: true };
+    let clock = align::FileClock { file: "video.mp4".into(), start_ms: 0.0, ms_per_frame: 1000.0 / align::REFERENCE_FPS, end_ms: 1e12, fitted: true, fps: align::REFERENCE_FPS };
     let scored = align::align_tracks(&[track], &[clock], presses, align::DEFAULT_N_FRAMES);
     let detail = format!(
         "match_permille {} chance_permille {} offset_ms {} presses_tested {}",
@@ -659,7 +659,7 @@ fn spike_track(len: usize, spikes: &[usize], lag: usize) -> align::Energy {
             if k < e.len() { e[k] = 40.0; }
         }
     }
-    align::Energy { e }
+    align::Energy::new(e, align::REFERENCE_FPS)
 }
 
 fn key_presses_us(recs: &[Value]) -> Vec<u64> { align::key_presses(recs) }
@@ -695,12 +695,9 @@ struct Cr { ok: bool, reason: &'static str, latency_ms: Option<i64> }
 
 /// Same shape as QorTime `verify_response` with the rule v2 ceiling passed in.
 fn verify_response(pattern: &[&str], presses: &[(i64, &str)], pause_seen_ms: Option<i64>, max_latency_ms: i64) -> Cr {
-    let Some(start) = response_start(pattern, presses) else {
-        return Cr { ok: false, reason: "no_pause_press", latency_ms: None };
-    };
-    let seq: Vec<&str> = presses.iter().skip(start).take(pattern.len()).map(|(_, b)| *b).collect();
-    if seq != pattern { return Cr { ok: false, reason: "pattern_mismatch", latency_ms: None }; }
-    let p_ms = presses[start].0;
+    let m = ev::match_pattern(pattern, presses);
+    if !m.matched { return Cr { ok: false, reason: m.reason, latency_ms: None }; }
+    let p_ms = m.start_ms.unwrap();
     let Some(seen) = pause_seen_ms else {
         return Cr { ok: false, reason: "pause_not_seen_on_video", latency_ms: None };
     };
@@ -708,17 +705,6 @@ fn verify_response(pattern: &[&str], presses: &[(i64, &str)], pause_seen_ms: Opt
     if lat < 0 { return Cr { ok: false, reason: "video_before_input", latency_ms: Some(lat) }; }
     if lat > max_latency_ms { return Cr { ok: false, reason: "video_latency_too_high", latency_ms: Some(lat) }; }
     Cr { ok: true, reason: "ok", latency_ms: Some(lat) }
-}
-
-fn response_start(pattern: &[&str], presses: &[(i64, &str)]) -> Option<usize> {
-    let mut first = None;
-    for (i, (_, b)) in presses.iter().enumerate() {
-        if *b != "OPTIONS" { continue; }
-        if first.is_none() { first = Some(i); }
-        let seq: Vec<&str> = presses.iter().skip(i).take(pattern.len()).map(|(_, b)| *b).collect();
-        if seq == pattern { return Some(i); }
-    }
-    first
 }
 
 fn median_ms(values: &[i64]) -> f64 {

@@ -28,7 +28,7 @@ Viewer step ids are a different list (`schema`, `pin`, `refsig`, `trust`, `playe
 
 `referee_verdict.json` (`qortime-referee-verdict/v0`, from `qortime referee-ai`) is a model-bearing file. Its `accept` / `dispute` / `abstain` word is not a review check and is not a training label.
 
-Today `final_reread.detail` is prose. This loop does not parse prose. A label carries a machine-readable `value` only when the producer already has a structured read. A `pass` with no `value` cannot confirm a score.
+`final_reread.detail` remains prose; optional structured `value` carries independent reader numbers. This loop does not parse prose. A label carries a machine-readable `value` only when the producer already has a structured read. A `pass` with no `value` cannot confirm a score.
 
 ## 1. Proposal, then referee outcome
 
@@ -259,7 +259,7 @@ It does not train a model, does not call the referee, does not modify `receipt.j
 
 ## What should also land in QorTime
 
-1. **Structured `final_reread` value.** Keep today's `state` and prose `detail`. Add an optional structured value when the referee's reader already has `away` / `home` (and quarter, when it has one), so QorCap can confirm a score without parsing a sentence. Absent value stays unverifiable on this side.
+1. **Structured `final_reread` value — implemented.** `referee_label_view(match_id, review)` consumes independent `review.checks` after caller authentication. Madden uses `away` / `home` plus optional quarter; CoD uses `{game: "cod", kills, deaths, outcome, assists?}`. Required counts must be non-negative safe integers (not booleans). A pass without value stays unverifiable. Optional reads compare only when supplied; a requested missing read stays unverifiable. Prose is never parsed. This does not enable a CoD referee reader or authenticate a review by itself.
 2. **Viewer identification.** Add the `qorcap-ai-proposal`, `qorcap-ai-outcome`, `qorcap-ai-consolidation`, `qorcap-ai-stance`, and `qorcap-ai-label-view` families to the sidecar list in `verify/receipt-view.js`. Render them as section 8 describes: `info` or `absent`, never gold.
 3. **Leave `schema/receipt.v0.json` alone.** Learning fields do not belong on the signed receipt.
 4. **Say in `docs/REFEREE_AI.md` that `referee_verdict.json` is not a training label.** Integrity errors inside that tool are code; the verdict word mixes in model agreement. On-device learning consumes `review.checks`, not that file.

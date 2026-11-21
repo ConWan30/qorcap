@@ -2,7 +2,7 @@
 
 # QorCap
 
-**Website:** https://conwan30.github.io/qorcap/ · **Download:** [v0.3.38](https://github.com/ConWan30/qorcap/releases/tag/v0.3.38) ([latest release](https://github.com/ConWan30/qorcap/releases/latest))
+**Website:** https://conwan30.github.io/qorcap/ · **Download:** [v0.3.43](https://github.com/ConWan30/qorcap/releases/tag/v0.3.43) ([latest release](https://github.com/ConWan30/qorcap/releases/latest))
 
 A small Windows recorder for a USB HDMI capture card (built for a generic **"USB3.0 Video"** card carrying a PS5),
 made for **[QorTime](https://github.com/ConWan30/qortime)** match receipts. It does two jobs:
@@ -29,16 +29,17 @@ with a local control surface). QorCap copies only that design idea, no code. No 
 
 ## Quickstart: double-click Start Match
 
-1. Download `qorcap-v0.3.38-windows-x64.zip` from the [latest release](https://github.com/ConWan30/qorcap/releases/latest)
+1. Download `qorcap-v0.3.43-windows-x64.zip` from the [latest release](https://github.com/ConWan30/qorcap/releases/latest)
    and unzip it, for example to `C:\QorCap` (right-click the zip, *Extract All*).
 2. Connect PS5 HDMI out to the **USB3.0 Video** card, and the card to a blue USB 3 port. Close OBS or the Camera app.
 3. Double-click **`Start Match`**. On the first run it downloads ffmpeg, installs Python 3.12 through winget if it
    is missing, and sets up its Python packages in `%LOCALAPPDATA%\QorCap\venv`. This happens once.
-4. Play. The Start Match window is a QorCap console: match state, capture fps, controller, referee link, score, disk, and elapsed time. A referee challenge takes the window over with the button pattern and a countdown. `Start Match.cmd --plain` (or `QORCAP_PLAIN=1`) keeps the old one-line status. `NO_COLOR` keeps the new layout without color. Preview the console without recording anything: `py sidecar\qorcap_console.py`.
-5. Recording stops by itself when the final score is read from Madden's **end-of-game menu** (authoritative; a scorebug-only final waits up to 120 s for that menu). After a committed end screen (3 frames over 3 seconds) or a posted end-menu / final-screen final, capture keeps going for `QORCAP_POST_FINAL_TAIL_S` seconds as well (default 10, clamped to 0–60). That tail only adds time: it does not shorten the 4 s end-menu hold or the 120 s scorebug wait. Set it to `0` for the older stop. Enter or Q still stops at once. What actually happened (why the tail started, start and stop time, actual seconds) is `post_final_tail.json` in the match folder. It is not part of the receipt. You can also press **Enter** (or Q, or Ctrl+C).
-6. It signs `receipt.json`, runs `qortime verify` and `qorcap verify-bundle`, prints **VERIFIED / PARTIAL / FAIL**,
+4. Choose the game, then your side (Madden only; Call of Duty has no home/away pick, and `--side away` is ignored for it: the receipt role is recorded as `home`, the legacy signing-role slot receipt.v0 requires, not a not-applicable value). Start Match draws the QORCAP / QORTIME cards: **1 Madden**, **2 Call of Duty**. Enter keeps the last choice, or Madden. **Madden** keeps home/away, the scorebug, and the end-of-game menu. **Call of Duty** (MW4 / modern) loads its own HUD hooks (hitmarker, kill popup, killfeed, pause, recoil, scoreboard) and ends the match when the end screen is read. `Start Match.cmd --game madden` or `--game cod` skips the cards. A one-shot `next-game.txt` (`madden` or `cod`) in `%LOCALAPPDATA%\QorCap` does too. A scripted run with no console and no `--game` stays Madden. See [docs/GAME_SETS.md](docs/GAME_SETS.md).
+5. Play. The Start Match window is a QorCap console: match state, capture fps, controller, referee link, score, disk, and elapsed time. A referee challenge takes the window over with the button pattern and a countdown. `Start Match.cmd --plain` (or `QORCAP_PLAIN=1`) keeps the old one-line status. `NO_COLOR` keeps the new layout without color. Preview the console without recording anything: `py sidecar\qorcap_console.py`.
+6. Recording stops by itself when the final score is read from Madden's **end-of-game menu** (authoritative; a scorebug-only final waits up to 120 s for that menu). A Call of Duty match stops when its end screen is read. Stopping the recorder early leaves that score not Counted. After a committed end screen (3 frames over 3 seconds) or a posted end-menu / final-screen final, capture keeps going for `QORCAP_POST_FINAL_TAIL_S` seconds as well (default 10, clamped to 0–60). That tail only adds time: it does not shorten the 4 s end-menu hold or the 120 s scorebug wait. Set it to `0` for the older stop. Enter or Q still stops at once. What actually happened (why the tail started, start and stop time, actual seconds) is `post_final_tail.json` in the match folder. It is not part of the receipt. You can also press **Enter** (or Q, or Ctrl+C).
+7. It signs `receipt.json`, runs `qortime verify` and `qorcap verify-bundle`, prints **VERIFIED / PARTIAL / FAIL**,
    and opens the match folder (`Documents\QorCap Matches\match-YYYYMMDD-HHMMSS`).
-7. To view it online, open https://qortime.com/verify/, click *Choose file* and pick `receipt.json`
+8. To view it online, open https://qortime.com/verify/, click *Choose file* and pick `receipt.json`
    (or paste its text), paste the contents of `referee.pub` into the key box, then click *Verify*. It runs in the browser and
    uploads nothing.
 
@@ -66,7 +67,7 @@ checkpoints at finalize time, stamping each with QorCap's recording time, and `r
 Opt out with `--no-auto-highlights`. You can still double-click **`Make Highlights`** (or run `qorcap highlights <bundle folder>`).
 For every **locked** score change (a `score_change` checkpoint in the signed hash chain whose
 evidence hash matches, normally inside `receipt.json`) it cuts about 8 s before to 4 s after (`--pre`/`--post`) and burns in a small panel
-titled **SCOREBUG LOCK** (the QorTime viewer's wording for a scorebug read), with the score in gold plus the lock and receipt hashes.
+titled **SCOREBUG LOCK** (the QorTime viewer's wording for a scorebug read), with the score in neutral white (never gold: a clip is cut before the referee rules) plus the lock and receipt hashes.
 The panel and the `.vtt` stay on **SCOREBUG LOCK** (`--no-burn` stream-copies and keeps those words only in the `.vtt`). They do not say
 **VERIFIED**. It writes `highlights/manifest.json` (`qorcap-highlights/v0`) linking each clip to its lock, the receipt SHA-256 and the
 hash-chained source segments. `qorcap highlights --check highlights/manifest.json` re-checks all of it. It never runs during recording: a fresh
@@ -195,7 +196,17 @@ Setup this is built for: the DualSense / DualSense Edge plays the PS5 over **Blu
   segment is hashed, the inputs received so far are sealed into a chunk: `input_hash = SHA-256(JCS([records]))`
   goes into that segment's checkpoint (so it is part of the checkpoint hash chain), and chunks are chained like
   the video (`head_n = SHA-256(JCS({prev, seq, sha256}))`). Records go to `inputs.jsonl` in the bundle.
-  Buttons are always logged; analog-only changes at most every 4 ms.
+  Buttons are always logged; analog-only changes at most every 4 ms. Every 1000 ms of host monotonic
+  time the reader that receives HID reports appends an `hb` row (heartbeat for pad-link continuity
+  (skill-proof join), not identity/anti-cheat), even when no button or stick changed. `hb_seq` starts at 0
+  and does not wrap. `epoch` increments on every HID handle open and on a device identity change, and a
+  `status` row is still written on disconnect and reconnect. Stale telemetry resets on reconnect.
+  `rx_total` counts reports received, not only logged changes. Each `hb` also records that interval's
+  `max_rx_gap_us` (largest gap between consecutive received reports, including the gap from the previous
+  interval's last report), `stale_over_50ms`, `short_reads`, `parse_faults`, and `first_rx_t_us`. Those
+  interval fields reset every heartbeat. `dev_counter` is a diagnostic raw report byte with unvalidated
+  semantics. The `hb` row is sealed in the same chunk hash chain as the other input rows. `receipt.v0.json`
+  is unchanged.
 * **Missing / unplugged controller:** recording never stops. A `WARN CONTROLLER: ...` line is logged, `/status`
   shows `input.state` = `missing` / `unplugged` / `stalled` with a warning, and the state change is itself a
   record in `inputs.jsonl` (absence is committed, not hidden). `--no-controller` turns logging off.
@@ -389,7 +400,7 @@ Global: `--port 8788`, `--ffmpeg PATH`, `--log FILE` (default `qorcap.log`, or `
 ## Run on Windows by hand (PowerShell, advanced)
 
 ```powershell
-# 1. unzip qorcap-v0.3.38-windows-x64.zip to C:\QorCap, then:
+# 1. unzip qorcap-v0.3.43-windows-x64.zip to C:\QorCap, then:
 cd C:\QorCap
 Unblock-File .\qorcap.exe, .\get-ffmpeg.ps1
 powershell -ExecutionPolicy Bypass -File .\get-ffmpeg.ps1     # puts ffmpeg.exe next to qorcap.exe
@@ -447,6 +458,16 @@ python tools/assert_pytest_skips.py --list windows | xargs python -m pytest --co
 ```
 
 The floor has to be at least the number of listed entries. A report with zero testcases fails even when the floor is zero. Do not lower the floor to hide a dropped file.
+
+**v0.3.43:** Practice live tap, default off ([#146](https://github.com/ConWan30/qorcap/pull/146)). With `QORCAP_LIVE_TAP=udp://127.0.0.1:1937` and `QORCAP_LANE=practice`, QorCap stays the only reader of the capture card and also sends the TS bytes it records to a loopback port, with timed-ID3 Live Weave cues (frame index, QorCap clock, seal state, newest press). Refused outside the practice lane or for a non-loopback target. The recording, the hash chain and `receipt.v0.json` are unchanged. See [docs/LIVE_TAP.md](docs/LIVE_TAP.md).
+
+**v0.3.42:** Practice CoD finals need three agreeing legs on the frame clock: own killfeed tally by gamertag Qortrola30, readable scoreboard K/D, and a calibrated end word ([#143](https://github.com/ConWan30/qorcap/pull/143), [#144](https://github.com/ConWan30/qorcap/pull/144)). Owner-row follow-ups keep DEATHS off the KILLS column and drop unsafe digit-fragment joins ([#139](https://github.com/ConWan30/qorcap/pull/139)). At stop, practice CoD writes `cod_reader_stats.json` with reader counts and last errors ([#136](https://github.com/ConWan30/qorcap/pull/136)). `receipt.v0.json` is unchanged. Practice only: not sent, no referee submit. REAL MATCH users can stay on their current build.
+
+**v0.3.41:** For Call of Duty, the practice picker no longer asks home or away. `start_cod_reader()` is called with `side=None`, so a leftover `side_choice.json` is never read. CoD stays in the legacy `home` signing-role bucket that `receipt.v0` requires. Madden still asks home or away. `receipt.v0.json` is unchanged.
+
+**v0.3.40:** `start-match.ps1` is UTF-8 with a BOM so Windows PowerShell 5.1 can parse the QORCAP / QORTIME cards. Shipped `.ps1` files must be pure ASCII or carry that BOM, and they must parse under `powershell.exe` 5.1. `hb` rows add `max_rx_gap_us`, `stale_over_50ms`, `short_reads`, `parse_faults`, and `first_rx_t_us`, reset every heartbeat, so a stall that recovers inside the interval stays visible after `last_rx_t_us` moves. `dev_counter` is a diagnostic raw report byte with unvalidated semantics. Epoch increments on every HID handle open and on a device identity change, and stale telemetry resets on reconnect. `receipt.v0.json` is unchanged.
+
+**v0.3.39:** Start Match draws QORCAP / QORTIME cards before the side prompt. 1 is Madden. 2 is Call of Duty. Enter keeps the last choice, or Madden. `Start Match.cmd --game madden` or `--game cod` skips the cards. A scripted run with no console and no `--game` stays Madden. Madden still loads home/away, the scorebug, and the end-of-game menu. Call of Duty loads receipt game `cod_mw4` and profile `cod_mw4_hud`: hitmarker, kill popup, killfeed, pause, recoil, and an end scoreboard, and the match window ends on the end screen. Hitmarker, the XP plate, killfeed presence, VICTORY, DEFEAT, and scoreboard K/A are calibrated from private practice frames. DEFEAT agrees when the top-right header letters sit in that header box and the red field around them agrees. A thinner Kill Confirmed header is joined, then checked on the same gates. VICTORY agrees on its splash box or its match-complete header box. A word elsewhere in the crop does not agree, and a frame where both words agree is not read. The glitched splash does not agree. A blurred word does not agree. A Call of Duty final uses the end word together with Qortrola30's own scoreboard row (kills and deaths; assists when that column is on the board). The row is whose match it is. Another player's row is not used. A missing row, a different tag, or an unreadable digit stays not Counted. Home and away are not filled from that row, and a scoreboard K/A number is not home or away. The 3-frame, 3-second bar can post from that word and that row. The offline probe reads only the last 5 end frames. Five frames closer together than 3 seconds do not post. The row is written to `cod_signals.jsonl` and `cod_session.json`, not into `receipt.v0.json`. Pause stays not read. A signal is Counted only when a calibrated hook and the controller agree on the frame clock (500 ms, the same window as the frame clock). Otherwise it is flagged a mismatch, or it is not Counted. Stick turn against camera turn, and rumble against an on-screen hit, are INFO-ONLY. Session tags (`cod_session.json`, and `clock_sync`, `controller_path`, `power` on `bundle.json`) sit beside the match. They are not receipt fields. Power stays unknown. `receipt.v0.json` is unchanged. No Call of Duty match is claimed as a public verification. `inputs.jsonl` gains an additive `hb` row, a heartbeat for pad-link continuity (skill-proof join), not identity/anti-cheat, written every 1000 ms by the HID reader and sealed on the same input chunk chain. Existing input record types are unchanged. QorCap/QorTime’s CoD path is built so a player can leave a correlated match record (controller + video + HUD + scoreboard hooks) that others can check: agreed, Counted, a receipt, a mismatch, or not Counted ([#122](https://github.com/ConWan30/qorcap/pull/122), [#123](https://github.com/ConWan30/qorcap/pull/123), [#124](https://github.com/ConWan30/qorcap/pull/124), [#125](https://github.com/ConWan30/qorcap/pull/125), [#126](https://github.com/ConWan30/qorcap/pull/126), [#127](https://github.com/ConWan30/qorcap/pull/127), [#129](https://github.com/ConWan30/qorcap/pull/129), [#130](https://github.com/ConWan30/qorcap/pull/130)).
 
 **v0.3.38:** end-menu reader no longer fails `home_glyph_count` when the team logo fringe next to the home score is clipped (online FINISH GAME). Clean side glyphs (w≥12) are preferred when at least two are present, so a thin clipped blob is dropped instead of poisoning the count ([#116](https://github.com/ConWan30/qorcap/pull/116)). Live auto-stop can log `FINAL via end_menu` on the same geometry that stayed PARTIAL on match-20261026-205511. `receipt.v0.json` is unchanged.
 

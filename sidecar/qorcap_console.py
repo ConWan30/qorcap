@@ -4,8 +4,12 @@ The capture agent, the HID reader, the referee protocol, and the receipt are unt
 This module paints the interactive console. It never writes a controller report, never
 writes a receipt, and never decides a referee result.
 
-Gold is drawn only when a caller sets ``referee_verified`` on a card. The live match
-path never sets it. Local button observation is labeled as a pad read. The words
+Gold is drawn only on a referee VERIFIED match banner (``tint_verified_banner``), and
+only when the caller passes the typed verdict ``VERIFIED``. A missing or unknown verdict
+is not gold, even if the line text starts with ``RESULT: VERIFIED``. A
+challenge card with ``referee_verified`` is drawn in neutral white (``REFEREE_CHALLENGE_COLOR``),
+not gold: a confirmed challenge is not a verified match (Con's card t3229s12405). The live
+match path never sets ``referee_verified``. Local button observation is labeled as a pad read. The words
 attested, attestation, and hardware-verified are not printed. A device row is not
 shown; if one is added later its strongest wording is tpm_claimed.
 
@@ -104,6 +108,11 @@ _BUTTON_COLOR = {
     "RIGHT": "ink",
 }
 
+# A referee-confirmed challenge card is neutral white, never gold. Gold marks only a
+# referee VERIFIED match (tint_verified_banner), and only when the typed verdict is
+# VERIFIED (QorProof N2, Con's card t3230s12414). Con's card t3229s12405.
+REFEREE_CHALLENGE_COLOR = "hot"
+
 _SPINNER = "|/-\\"
 _HOLD_S = 8.0
 # The pattern is pressed in the order on the card. CIRCLE closes Madden's pause
@@ -146,7 +155,7 @@ def set_say_hook(fn) -> None:
     _SAY_HOOK = fn
 
 
-def emit(msg: str = "") -> None:
+def emit(msg: str = "", *, verdict: str | None = None) -> None:
     """Print to the interactive console. A live dashboard may hold the line and reprint it later."""
     hook = _SAY_HOOK
     if hook is not None:
@@ -156,19 +165,27 @@ def emit(msg: str = "") -> None:
         except Exception:
             pass
     try:
-        msg = tint_verified_banner(msg)
+        msg = tint_verified_banner(msg, verdict=verdict)
     except Exception:
         pass
     print(msg, flush=True)
 
 
-def tint_verified_banner(msg: str, env: dict | None = None, stream=None) -> str:
-    """Gold on a referee VERIFIED banner only. Other results stay uncolored."""
+def tint_verified_banner(msg: str, env: dict | None = None, stream=None, *, verdict: str | None = None) -> str:
+    """Gold only when the typed verdict is VERIFIED. A missing or unknown verdict stays uncolored.
+
+    The banner line is still selected by its usual wording so an unrelated ``say()`` that
+    accidentally carries ``verdict="VERIFIED"`` is not painted. The text prefix alone is
+    never enough: ``RESULT: VERIFIED`` with no verdict, or with any other status, stays plain.
+    """
     env = os.environ if env is None else env
     stream = sys.stdout if stream is None else stream
     if _color_level(env) == "none":
         return msg
     if not _isatty(stream):
+        return msg
+    # Fail closed: gold only on the typed VERIFIED verdict, never on a text prefix alone.
+    if verdict != "VERIFIED":
         return msg
     stripped = msg.strip()
     if stripped.startswith("RESULT: VERIFIED") or stripped.startswith("OFFICIAL RESULT: VERIFIED"):
@@ -259,6 +276,7 @@ class ChallengeCard:
     edges: bool = False
     _last_t_ms: int | None = None
     _last_dpad: str = ""
+    practice: bool = False
 
     def text(self) -> str:
         parts = [self.label, self.result or "pending", self.note, " ".join(self.pattern)]
@@ -431,6 +449,7 @@ def console_snapshot(st: dict, info: dict, signed: int, live) -> dict:
         "anchors": anchors,
         "retries": failures if live is not None else 0,
         "res": st.get("res") or "",
+        "seal_line": str(inp.get("seal_line") or ""),
     }
 
 
@@ -699,6 +718,9 @@ def layout_dashboard(snap: dict, *, width: int = 78, height: int = 24, tick: int
     hid = _HID.get(str(snap.get("hid_state") or "off"), str(snap.get("hid_state") or "off"))
     dev = str(snap.get("hid_device") or "").strip()
     hid_line = f"HID     {hid}" + (f"    {dev}" if dev else "")
+    seal = str(snap.get("seal_line") or "").strip()
+    if seal:
+        hid_line += "    " + seal
     hid_color = "cyan" if hid == "connected" else "mute" if hid in {"off", "searching"} else "red"
     _put(grid, top + 6, 4, _clip(hid_line, width - 6), hid_color)
     _put(grid, top + 6, 4, "HID", "mute")
@@ -720,7 +742,7 @@ def layout_dashboard(snap: dict, *, width: int = 78, height: int = 24, tick: int
     if last:
         label, result, verified = last
         word = {"pass": "PASS", "fail": "FAIL", "expired": "EXPIRED"}.get(result, str(result).upper())
-        color = "gold" if verified else "cyan" if result == "pass" else "red" if result == "fail" else "mute"
+        color = REFEREE_CHALLENGE_COLOR if verified else "cyan" if result == "pass" else "red" if result == "fail" else "mute"
         tail = "referee verified" if verified else "buttons on this pad" if result == "pass" else "window closed"
         _put(grid, y, 4, _clip(f"last challenge   {label}   {word}   {tail}", width - 6), color)
         y += 2
@@ -768,14 +790,16 @@ def layout_challenge(card: ChallengeCard, *, width: int = 78, height: int = 36, 
     title = phase if card.result is None else {"pass": "PASS", "fail": "FAIL", "expired": "EXPIRED"}[card.result]
     title_lines = [title] if compact else (big(title) if card.result is None else emphasize(title, width))
     title_color = _title_color(card)
-    specs: list[tuple] = [("center", "REFEREE CHALLENGE", "pink"), ("gap",)]
+    badge = "PRACTICE RESPONSE BOUND" if card.practice else "REFEREE CHALLENGE"
+    specs: list[tuple] = [("center", badge, "pink"), ("gap",)]
     for line in title_lines:
         specs.append(("center", line, title_color))
     if card.result is None:
-        specs.append(("center", "At the line, before the snap. Then resume.", "ink"))
+        prompt = "Press OPTIONS then the shown buttons (advisory only)." if card.practice else "At the line, before the snap. Then resume."
+        specs.append(("center", prompt, "ink"))
     else:
-        note = "Referee verified." if card.referee_verified else card.note
-        specs.append(("center", _clip(note, width - 6), "gold" if card.referee_verified else "ink"))
+        note = "Referee verified." if (card.referee_verified and not card.practice) else card.note
+        specs.append(("center", _clip(note, width - 6), REFEREE_CHALLENGE_COLOR if (card.referee_verified and not card.practice) else "ink"))
     specs.append(("gap",))
     specs.append(("glyphs",))
     if card.result is None:
@@ -799,9 +823,11 @@ def layout_challenge(card: ChallengeCard, *, width: int = 78, height: int = 36, 
         fb = press_feedback(card)
         if fb:
             specs.append(("center", _clip(fb[0], width - 6), fb[1]))
-        specs.append(("center", "If the snap comes first, do it at the next play.", "dim"))
+        hint = "Practice lane only; receipt status is unchanged." if card.practice else "If the snap comes first, do it at the next play."
+        specs.append(("center", hint, "dim"))
     else:
-        specs.append(("center", "The referee reads the controller log and the pause.", "dim"))
+        foot = "Advisory only; sealed pad stream checked after stop." if card.practice else "The referee reads the controller log and the pause."
+        specs.append(("center", foot, "dim"))
     glyph_h = _pattern_rows(card.pattern, width) * 6
 
     def spec_height(spec: tuple) -> int:
@@ -857,7 +883,7 @@ def press_feedback(card: ChallengeCard) -> tuple[str, str] | None:
 
 def _frame_color(card: ChallengeCard) -> str:
     if card.referee_verified:
-        return "gold"
+        return REFEREE_CHALLENGE_COLOR
     if card.result == "fail":
         return "red"
     if card.result == "expired":
@@ -867,7 +893,7 @@ def _frame_color(card: ChallengeCard) -> str:
 
 def _title_color(card: ChallengeCard) -> str:
     if card.referee_verified:
-        return "gold"
+        return REFEREE_CHALLENGE_COLOR
     if card.result == "pass":
         return "cyan"
     if card.result == "fail":
@@ -986,9 +1012,9 @@ class MatchConsole:
             self._snap = dict(snap)
         self._wake.set()
 
-    def show_challenge(self, *, phase: str, label: str, pattern: list[str], issued_ms: int, deadline_ms: int) -> bool:
+    def show_challenge(self, *, phase: str, label: str, pattern: list[str], issued_ms: int, deadline_ms: int, practice: bool = False) -> bool:
         card = ChallengeCard(phase=phase, label=label, pattern=list(pattern),
-                             issued_ms=int(issued_ms), deadline_ms=int(deadline_ms))
+                             issued_ms=int(issued_ms), deadline_ms=int(deadline_ms), practice=bool(practice))
         with self._lock:
             self._card = card
             self._banner = ""

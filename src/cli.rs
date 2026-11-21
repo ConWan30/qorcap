@@ -36,6 +36,17 @@ pub enum Cmd {
     Status,
     /// Re-hash a match bundle's video against its manifest and check the checkpoint chain
     VerifyBundle { dir: String },
+    /// Re-hash a practice bundle's hand_timeline.v0.jsonl: every 1 s window, the chain, each raw file, and the
+    /// checkpoints that bind it. Read-only.
+    CheckHandTimeline { dir: String },
+    /// Info-only, practice-only response bound: check sealed hand/input stream against challenge nonces and
+    /// bound chunk heads. Advisory only; never changes receipt status.
+    CheckResponseBound {
+        dir: String,
+        /// Write hand_challenge.jsonl beside the bundle.
+        #[arg(long)]
+        write: bool,
+    },
     /// Offline: run QorTime's scorebug reader over a recorded bundle's video.mp4, write score
     /// checkpoints + final detection and sign receipt.json (self-attested local referee).
     /// Runs sidecar/qorcap_match.py finalize (needs Python with numpy, opencv, cryptography).
@@ -115,6 +126,36 @@ pub enum Cmd {
         /// Stop after N seconds (default: until Ctrl+C)
         #[arg(long)]
         secs: Option<u64>,
+    },
+    /// Sight-to-shot Stage S1 (offline, read-only): S2 right-stick onset row -> S4 burst-first R2 edge
+    /// timing over "R2 press bursts", from inputs.jsonl only. Writes one JSON report to --out, which must
+    /// be outside the bundle folder. Default rule: the standby (A) config (PROVISIONAL, not frozen).
+    S2sCounted {
+        /// Bundle folder or its inputs.jsonl (read only)
+        input: String,
+        /// Report path; refused if it is inside the bundle folder
+        #[arg(long)]
+        out: String,
+        /// Optional check: must name the bundle's own id (folder match-<stamp> = bundle.json match_id
+        /// local-<stamp>), or the run is refused. The report always uses the bundle's own id.
+        #[arg(long, default_value = "")]
+        session_id: String,
+        /// Rule config JSON (default: built-in standby (A), docs/s2s/threshold_A.standby.json)
+        #[arg(long)]
+        config: Option<String>,
+        /// Caller claim, recorded only (COUNTED is disabled in this build; the tool does not check seals)
+        #[arg(long, default_value = "locked_not_rehashed", ignore_case = true,
+              value_parser = ["rehashed_match", "locked_not_rehashed", "failed", "missing"])]
+        seal_status: String,
+        /// Caller claim. VOID and FAIL are refused (case-insensitive)
+        #[arg(long, default_value = "UNKNOWN", ignore_case = true, value_parser = ["ok", "UNKNOWN", "VOID", "FAIL"])]
+        disposition: String,
+        /// Tuning session: no per-burst values are reported (R1), only the threshold-free burst count
+        #[arg(long)]
+        in_calibration_set: bool,
+        /// (A) triggered after held-out scoring: outputs are DESCRIPTIVE_ONLY_HOLDOUT_REUSED, never COUNTED
+        #[arg(long)]
+        holdout_reused: bool,
     },
     /// Re-score a bundle's input-to-frame clock with frame_clock.jsonl and without it.
     /// Prints both. Does not write the receipt, the proof, or the hash chain.
@@ -373,6 +414,15 @@ pub struct RecordArgs {
     /// start checkpoint and bundle.json. Omitted = not recorded (older launchers, tests).
     #[arg(long, value_parser = ["prompt", "flag", "file"])]
     pub side_source: Option<String>,
+    /// Receipt ``match.game``. Omitted keeps ``madden27`` (older launchers and tests).
+    #[arg(long, value_parser = ["madden27", "cod_mw4"])]
+    pub game: Option<String>,
+    /// Receipt ``match.scorebug_profile``. Omitted keeps ``madden27_standard``.
+    #[arg(long, value_parser = [
+        "madden27_standard", "madden27_monday_night", "madden27_sunday_night",
+        "madden27_thursday_night", "cod_mw4_hud"
+    ])]
+    pub scorebug_profile: Option<String>,
     #[arg(long, default_value = "local:player")]
     pub player_id: String,
     /// Seconds saved for each automatic score-change clip
@@ -400,6 +450,37 @@ pub struct RecordArgs {
     /// (`qorcap align-ab`, docs/FRAME_CLOCK_AB.md).
     #[arg(long)]
     pub frame_clock: bool,
+    /// PRACTICE lane only, default off. Also send the recorded MPEG-TS bytes to a loopback UDP port
+    /// (e.g. udp://127.0.0.1:1937, QorStream's live ingest) with timed ID3 weave cues carrying QorCap's
+    /// frame clock, the session seal state and the newest controller press. Also QORCAP_LIVE_TAP=URL.
+    /// Refused unless --practice-lane (or QORCAP_LANE=practice). The recording, the hash chain and the
+    /// receipt are unchanged. See docs/LIVE_TAP.md.
+    #[arg(long)]
+    pub live_tap: Option<String>,
+    /// Marks this run as the practice lane (no referee submit). Required by --live-tap. Also QORCAP_LANE=practice.
+    #[arg(long)]
+    pub practice_lane: bool,
+    /// Live tap: one weave cue every N recorded frames (1..=600, default 15). Also QORCAP_LIVE_TAP_EVERY.
+    #[arg(long)]
+    pub live_tap_every: Option<u32>,
+    /// Kept as a no-op alias. In the practice lane the hand timeline is already on; this flag changes nothing.
+    /// Outside the practice lane it is refused (no file, no checkpoint key). Also QORCAP_HAND_TIMELINE=1.
+    /// See --no-hand-timeline and docs/HAND_TIMELINE.md.
+    #[arg(long)]
+    pub hand_timeline: bool,
+    /// PRACTICE lane only. Turn the hand timeline off for this session. Recorded as hand_timeline: false on the
+    /// start and stop checkpoints; no hand file is written. Also QORCAP_HAND_TIMELINE=0. The off switch wins if
+    /// both this and --hand-timeline are set.
+    #[arg(long)]
+    pub no_hand_timeline: bool,
+    /// Hand timeline: do not keep the full-rate raw USB reports (hand_raw.v0.bin) for this session. Raw logging is on
+    /// by default when the hand timeline runs; an off session is recorded as raw_usb: false. Also QORCAP_RAW_USB=0.
+    #[arg(long)]
+    pub no_raw_usb: bool,
+    /// PRACTICE lane only. Override the hand and raw output folder (defaults to D:\QorCap\practice-hand\<session>\
+    /// on Windows, failing soft to the session bundle folder). Also QORCAP_HAND_DIR.
+    #[arg(long)]
+    pub hand_dir: Option<String>,
 }
 
 impl RecordArgs {
@@ -464,8 +545,42 @@ mod tests {
         assert!(matches!(Cli::try_parse_from(["qorcap", "pair", "join", "qorpair1.abc", "--bundle", "b"]).unwrap().cmd, Cmd::Pair { action: PairCmd::Join { .. }, .. }));
         assert!(matches!(Cli::try_parse_from(["qorcap", "input-proof", "b", "--frames", "10"]).unwrap().cmd, Cmd::InputProof { frames: 10, .. }));
         if let Cmd::Record(r) = Cli::try_parse_from(["qorcap", "record", "--no-controller"]).unwrap().cmd { assert!(r.no_controller); assert!(!r.frame_clock); } else { panic!() }
-        if let Cmd::Record(r) = Cli::try_parse_from(["qorcap", "record", "--frame-clock"]).unwrap().cmd { assert!(r.frame_clock); } else { panic!() }
+        if let Cmd::Record(r) = Cli::try_parse_from(["qorcap", "record"]).unwrap().cmd {
+            assert!(!r.hand_timeline && !r.no_hand_timeline && !r.no_raw_usb && !r.practice_lane, "flags default off; the logger itself is default-on only once the practice lane is set");
+        } else { panic!() }
+        if let Cmd::Record(r) = Cli::try_parse_from(["qorcap", "record", "--practice-lane"]).unwrap().cmd {
+            assert!(r.practice_lane && !r.no_hand_timeline && !r.hand_timeline, "practice: no off switch, alias not required");
+        } else { panic!() }
+        if let Cmd::Record(r) = Cli::try_parse_from(["qorcap", "record", "--no-hand-timeline", "--practice-lane", "--no-raw-usb"]).unwrap().cmd {
+            assert!(r.no_hand_timeline && r.practice_lane && r.no_raw_usb && !r.hand_timeline);
+        } else { panic!() }
+        if let Cmd::Record(r) = Cli::try_parse_from(["qorcap", "record", "--hand-timeline", "--practice-lane"]).unwrap().cmd {
+            assert!(r.hand_timeline && r.practice_lane && !r.no_hand_timeline && r.hand_dir.is_none(), "alias still parses");
+        } else { panic!() }
+        if let Cmd::Record(r) = Cli::try_parse_from(["qorcap", "record", "--practice-lane", "--hand-dir", "/tmp/h"]).unwrap().cmd {
+            assert_eq!(r.hand_dir.as_deref(), Some("/tmp/h"));
+        } else { panic!() }
+        assert!(matches!(Cli::try_parse_from(["qorcap", "check-hand-timeline", "b"]).unwrap().cmd, Cmd::CheckHandTimeline { .. }));
+        assert!(matches!(Cli::try_parse_from(["qorcap", "check-response-bound", "b", "--write"]).unwrap().cmd, Cmd::CheckResponseBound { write: true, .. }));
+        if let Cmd::Record(r) = Cli::try_parse_from(["qorcap", "record", "--frame-clock"]).unwrap().cmd { assert!(r.frame_clock); assert!(r.live_tap.is_none() && !r.practice_lane); } else { panic!() }
+        if let Cmd::Record(r) = Cli::try_parse_from(["qorcap", "record", "--live-tap", "udp://127.0.0.1:1937", "--practice-lane", "--live-tap-every", "5"]).unwrap().cmd { assert_eq!(r.live_tap.as_deref(), Some("udp://127.0.0.1:1937")); assert!(r.practice_lane); assert_eq!(r.live_tap_every, Some(5)); } else { panic!() }
         assert!(matches!(Cli::try_parse_from(["qorcap", "align-ab", "b", "--no-video"]).unwrap().cmd, Cmd::AlignAb { no_video: true, frames: 15, rumble_echo: false, .. }));
+        match Cli::try_parse_from(["qorcap", "s2s-counted", "b", "--out", "o.json", "--session-id", "s"]).unwrap().cmd {
+            Cmd::S2sCounted { input, out, seal_status, disposition, in_calibration_set, holdout_reused, config, .. } => {
+                assert_eq!((input.as_str(), out.as_str(), seal_status.as_str(), disposition.as_str()), ("b", "o.json", "locked_not_rehashed", "UNKNOWN"));
+                assert!(!in_calibration_set && !holdout_reused && config.is_none());
+            }
+            _ => panic!(),
+        }
+        assert!(Cli::try_parse_from(["qorcap", "s2s-counted", "b", "--out", "o.json", "--disposition", "voided"]).is_err());
+        assert!(Cli::try_parse_from(["qorcap", "s2s-counted", "b", "--out", "o.json", "--seal-status", "trust-me"]).is_err());
+        match Cli::try_parse_from(["qorcap", "s2s-counted", "b", "--out", "o.json", "--disposition", "void", "--seal-status", "REHASHED_MATCH"]).unwrap().cmd {
+            Cmd::S2sCounted { session_id, disposition, seal_status, .. } => {
+                assert!(session_id.is_empty());
+                assert!(disposition.eq_ignore_ascii_case("VOID") && seal_status.eq_ignore_ascii_case("rehashed_match"));
+            }
+            _ => panic!(),
+        }
         assert!(matches!(Cli::try_parse_from(["qorcap", "align-ab", "b", "--rumble-echo"]).unwrap().cmd, Cmd::AlignAb { rumble_echo: true, .. }));
         match Cli::try_parse_from(["qorcap", "align-ab", "b", "--rumble-echo"]).unwrap().cmd {
             Cmd::AlignAb { re_pair_tol_ms, re_max_lag_ms, re_quiet_ms, re_onset_threshold, re_spike_threshold, re_spike_pct, re_mode, re_sweep, re_hist, .. } => {

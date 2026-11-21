@@ -1,7 +1,9 @@
 pub mod api;
 pub mod cfr;
+pub mod capstop;
 pub mod cli;
 pub mod engine;
+pub mod encprog;
 pub mod ffmpeg;
 pub mod ring;
 pub mod evidence;
@@ -11,7 +13,9 @@ pub mod hid;
 pub mod inputs;
 pub mod humanlike;
 pub mod align;
+pub mod s2s;
 pub mod frameclock;
+pub mod livetap;
 pub mod rumble_echo;
 pub mod inputproof;
 pub mod haptics;
@@ -20,3 +24,11 @@ pub mod credentials;
 pub mod clip;
 pub mod redteam;
 pub mod device_attest;
+/// Practice-only, off by default. Reachable only with `--features practice-anchor-seen-at`.
+#[cfg(feature = "practice-anchor-seen-at")]
+pub mod anchor_seen_at;
+pub mod seal;
+pub mod pad_link;
+pub mod snap;
+/// Hand timeline (practice lane only, default on; `--no-hand-timeline` to switch off): read-only controller input log clocked to the video.
+pub mod hand;
