@@ -36,6 +36,17 @@ pub enum Cmd {
     Status,
     /// Re-hash a match bundle's video against its manifest and check the checkpoint chain
     VerifyBundle { dir: String },
+    /// Re-hash a practice bundle's hand_timeline.v0.jsonl: every 1 s window, the chain, each raw file, and the
+    /// checkpoints that bind it. Read-only.
+    CheckHandTimeline { dir: String },
+    /// Info-only, practice-only response bound: check sealed hand/input stream against challenge nonces and
+    /// bound chunk heads. Advisory only; never changes receipt status.
+    CheckResponseBound {
+        dir: String,
+        /// Write hand_challenge.jsonl beside the bundle.
+        #[arg(long)]
+        write: bool,
+    },
     /// Offline: run QorTime's scorebug reader over a recorded bundle's video.mp4, write score
     /// checkpoints + final detection and sign receipt.json (self-attested local referee).
     /// Runs sidecar/qorcap_match.py finalize (needs Python with numpy, opencv, cryptography).
@@ -452,6 +463,20 @@ pub struct RecordArgs {
     /// Live tap: one weave cue every N recorded frames (1..=600, default 15). Also QORCAP_LIVE_TAP_EVERY.
     #[arg(long)]
     pub live_tap_every: Option<u32>,
+    /// Kept as a no-op alias. In the practice lane the hand timeline is already on; this flag changes nothing.
+    /// Outside the practice lane it is refused (no file, no checkpoint key). Also QORCAP_HAND_TIMELINE=1.
+    /// See --no-hand-timeline and docs/HAND_TIMELINE.md.
+    #[arg(long)]
+    pub hand_timeline: bool,
+    /// PRACTICE lane only. Turn the hand timeline off for this session. Recorded as hand_timeline: false on the
+    /// start and stop checkpoints; no hand file is written. Also QORCAP_HAND_TIMELINE=0. The off switch wins if
+    /// both this and --hand-timeline are set.
+    #[arg(long)]
+    pub no_hand_timeline: bool,
+    /// Hand timeline: do not keep the full-rate raw USB reports (hand_raw/) for this session. Raw logging is on
+    /// by default when the hand timeline runs; an off session is recorded as raw_usb: false. Also QORCAP_RAW_USB=0.
+    #[arg(long)]
+    pub no_raw_usb: bool,
 }
 
 impl RecordArgs {
@@ -516,6 +541,20 @@ mod tests {
         assert!(matches!(Cli::try_parse_from(["qorcap", "pair", "join", "qorpair1.abc", "--bundle", "b"]).unwrap().cmd, Cmd::Pair { action: PairCmd::Join { .. }, .. }));
         assert!(matches!(Cli::try_parse_from(["qorcap", "input-proof", "b", "--frames", "10"]).unwrap().cmd, Cmd::InputProof { frames: 10, .. }));
         if let Cmd::Record(r) = Cli::try_parse_from(["qorcap", "record", "--no-controller"]).unwrap().cmd { assert!(r.no_controller); assert!(!r.frame_clock); } else { panic!() }
+        if let Cmd::Record(r) = Cli::try_parse_from(["qorcap", "record"]).unwrap().cmd {
+            assert!(!r.hand_timeline && !r.no_hand_timeline && !r.no_raw_usb && !r.practice_lane, "flags default off; the logger itself is default-on only once the practice lane is set");
+        } else { panic!() }
+        if let Cmd::Record(r) = Cli::try_parse_from(["qorcap", "record", "--practice-lane"]).unwrap().cmd {
+            assert!(r.practice_lane && !r.no_hand_timeline && !r.hand_timeline, "practice: no off switch, alias not required");
+        } else { panic!() }
+        if let Cmd::Record(r) = Cli::try_parse_from(["qorcap", "record", "--no-hand-timeline", "--practice-lane", "--no-raw-usb"]).unwrap().cmd {
+            assert!(r.no_hand_timeline && r.practice_lane && r.no_raw_usb && !r.hand_timeline);
+        } else { panic!() }
+        if let Cmd::Record(r) = Cli::try_parse_from(["qorcap", "record", "--hand-timeline", "--practice-lane"]).unwrap().cmd {
+            assert!(r.hand_timeline && r.practice_lane && !r.no_hand_timeline, "alias still parses");
+        } else { panic!() }
+        assert!(matches!(Cli::try_parse_from(["qorcap", "check-hand-timeline", "b"]).unwrap().cmd, Cmd::CheckHandTimeline { .. }));
+        assert!(matches!(Cli::try_parse_from(["qorcap", "check-response-bound", "b", "--write"]).unwrap().cmd, Cmd::CheckResponseBound { write: true, .. }));
         if let Cmd::Record(r) = Cli::try_parse_from(["qorcap", "record", "--frame-clock"]).unwrap().cmd { assert!(r.frame_clock); assert!(r.live_tap.is_none() && !r.practice_lane); } else { panic!() }
         if let Cmd::Record(r) = Cli::try_parse_from(["qorcap", "record", "--live-tap", "udp://127.0.0.1:1937", "--practice-lane", "--live-tap-every", "5"]).unwrap().cmd { assert_eq!(r.live_tap.as_deref(), Some("udp://127.0.0.1:1937")); assert!(r.practice_lane); assert_eq!(r.live_tap_every, Some(5)); } else { panic!() }
         assert!(matches!(Cli::try_parse_from(["qorcap", "align-ab", "b", "--no-video"]).unwrap().cmd, Cmd::AlignAb { no_video: true, frames: 15, rumble_echo: false, .. }));

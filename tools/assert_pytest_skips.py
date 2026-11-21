@@ -135,6 +135,7 @@ LINUX_FILES = (
     "sidecar/test_qorcap_submit.py",
     "sidecar/test_qorcap_rlr_stage_a.py",
     "sidecar/test_qorcap_engagement.py",
+    "sidecar/test_qorcap_practice_challenge.py",
     "tools/s2s_bodycue/test_bodycue_core.py",
     "tools/s2s_bodycue/test_fusion_core.py",
     "tools/s2s_bodycue/test_pins.py",
@@ -209,6 +210,7 @@ WINDOWS_FILES = (
     "sidecar/test_qorcap_submit.py",
     "sidecar/test_qorcap_rlr_stage_a.py",
     "sidecar/test_qorcap_engagement.py",
+    "sidecar/test_qorcap_practice_challenge.py",
     "tools/s2s_bodycue/test_bodycue_core.py",
     "tools/s2s_bodycue/test_fusion_core.py",
     "tools/s2s_bodycue/test_pins.py",
@@ -223,10 +225,12 @@ WINDOWS_FILES = (
 # not re-collected; CI's collected total is authoritative. Re-collect after any list or test change.
 # sidecar/test_qorcap_engagement.py (PWEC) adds 27 non-parametrized tests on both lists: linux
 # re-collected locally at 1228 (main 0932fe8 + this file); windows set by count to 1209.
-# tools/pwec2/test_pwec2.py adds 41 non-parametrized tests on both lists. Set by count
-# from 1228 / 1209. Re-collect after any further list or test change.
-LINUX_MIN_COLLECTED = 1269
-WINDOWS_MIN_COLLECTED = 1250
+# Merge of main 527296c (#186, 1234 linux / 1215 windows) with this branch's
+# tools/pwec2/test_pwec2.py (41 tests on both lists). Neither side's floor was
+# kept. Provisional 1275 / 1256 = 1234+41 / 1215+41, to be re-collected after
+# the review fixes add tests.
+LINUX_MIN_COLLECTED = 1275
+WINDOWS_MIN_COLLECTED = 1256
 
 # Absent from both sidecar suites. A reason is required; whitespace does not count.
 EXCLUDED_TEST_FILES = {

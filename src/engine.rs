@@ -53,6 +53,9 @@ pub struct Status {
     /// Practice live tap counters. Absent (not serialized) when the tap is off.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub live_tap: Option<crate::livetap::TapStats>,
+    /// Practice-lane hand timeline. Absent (not serialized) outside the practice lane, so REAL MATCH /status is unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hand: Option<crate::hand::LiveStatus>,
 }
 
 /// One injected append failure. Remaining counts down so a retry can succeed.
@@ -112,6 +115,12 @@ pub struct Engine {
     /// Practice lane only (src/capstop.rs): one stop record per capture writer, bound into the stop
     /// checkpoint. None (REAL MATCH and every non-practice run): nothing is recorded or written.
     pub capture_stop: Option<Mutex<CaptureStopState>>,
+    /// Practice-lane hand timeline (src/hand). Unset outside the practice lane (REAL MATCH / default lane):
+    /// nothing is opened or written and no checkpoint key is added, so those runs stay byte-identical.
+    pub hand: std::sync::OnceLock<Arc<crate::hand::logger::HandHandle>>,
+    /// Set when this is a practice session and the logger is off for the session (`--no-hand-timeline`,
+    /// a false env word, or `--no-controller`). The start and stop checkpoints then record `hand_timeline: false`.
+    pub hand_off: AtomicBool,
 }
 
 /// Per-writer stop records for `capture_stop.v0.json` (practice lane only).
@@ -458,11 +467,41 @@ impl Engine {
             stop_reason: Mutex::new(None), bundle_write: Mutex::new(()), bundle_finalized: AtomicBool::new(false),
             persist_fault: Mutex::new(None), ckpt_durable_len: Mutex::new(None),
             capture_stop: crate::capstop::enabled(args.practice_lane, std::env::var(crate::livetap::ENV_LANE).ok().as_deref()).then(|| Mutex::new(CaptureStopState::default())),
+            hand: std::sync::OnceLock::new(),
+            hand_off: AtomicBool::new(false),
             args })
     }
     fn ms(&self) -> u64 { self.started.elapsed().as_millis() as u64 }
     /// The monotonic clock behind every mono_ms (manifest, checkpoints) and inputs.jsonl t_us.
     pub fn clock(&self) -> Instant { self.started }
+    /// Start the practice-lane hand timeline logger (src/hand). Default on in the practice lane (a bundle
+    /// folder and the controller must also be on). `--no-hand-timeline` (or a false env word) switches it off
+    /// for the session and records `hand_timeline: false` on the start and stop checkpoints. Outside the
+    /// practice lane it opens nothing and adds no checkpoint key.
+    pub fn start_hand_logger(&self) -> bool {
+        if self.hand.get().is_some() { return true; }
+        let practice = crate::capstop::enabled(self.args.practice_lane, std::env::var(crate::livetap::ENV_LANE).ok().as_deref());
+        let (on, why) = crate::hand::enabled(self.args.hand_timeline, self.args.no_hand_timeline, std::env::var(crate::hand::ENV).ok().as_deref(), practice, self.args.no_controller);
+        if let Some(w) = why { warn!("{w}"); }
+        if !on {
+            if practice { self.hand_off.store(true, Ordering::SeqCst); }
+            return false;
+        }
+        let Some(dir) = self.bundle_dir() else { warn!("hand timeline needs --bundle (it writes beside the bundle); not started"); return false; };
+        let raw_usb = crate::hand::raw_enabled(self.args.no_raw_usb, std::env::var(crate::hand::ENV_RAW).ok().as_deref());
+        let wall_anchor_ms = self.ev.lock().unwrap_or_else(|e| e.into_inner()).started_wall_ms;
+        let cfg = crate::hand::timeline::Config { dir, raw_usb, raw_min_free_bytes: self.args.min_free_bytes(), wall_anchor_ms,
+            qpc: crate::hand::logger::platform_qpc_origin(self.started), frame_clock_on: self.frame_clock.enabled(), initial_device: None,
+            start_t_us: self.started.elapsed().as_micros() as u64 };
+        match crate::hand::logger::spawn(cfg, self.started, crate::hand::logger::platform_open, crate::hand::logger::platform_qpc_now) {
+            Ok(h) => {
+                info!("hand timeline on (practice lane): {} raw_usb={raw_usb}", crate::hand::timeline::FILE_NAME);
+                let _ = self.hand.set(Arc::new(h));
+                true
+            }
+            Err(e) => { error!("hand timeline not started: {e}"); false }
+        }
+    }
     /// Start the USB HID controller logger (no-op with --no-controller).
     pub fn start_input_logger(&self) -> Option<std::thread::JoinHandle<()>> {
         if self.args.no_controller { return None; }
@@ -476,6 +515,13 @@ impl Engine {
         if self.args.replay.is_none() { s.replay_bytes = 0; s.replay_secs_buffered = 0.0; }
         if !self.args.no_controller { s.input = Some(self.input.lock().unwrap_or_else(|e| e.into_inner()).live.clone()); }
         s.live_tap = self.live_tap.stats();
+        s.hand = if let Some(h) = self.hand.get() {
+            Some(h.live())
+        } else if self.hand_off.load(Ordering::SeqCst) {
+            Some(crate::hand::LiveStatus::off())
+        } else {
+            None
+        };
         {
             let pub_ = self.snap_pub.lock().unwrap_or_else(|e| e.into_inner());
             s.snapshot_frames = pub_.frames;
@@ -513,6 +559,8 @@ impl Engine {
         if let Some(src) = &self.args.side_source { start_extra.insert("side_source".into(), json!(src)); }
         if let Some(game) = &self.args.game { start_extra.insert("game".into(), json!(game)); }
         if let Some(profile) = &self.args.scorebug_profile { start_extra.insert("scorebug_profile".into(), json!(profile)); }
+        // Practice off session only: a durable `hand_timeline: false`. No key is added outside practice.
+        if self.hand_off.load(Ordering::SeqCst) { start_extra.insert("hand_timeline".into(), json!(false)); }
         self.checkpoint("start", Value::Object(start_extra));
         // Until the first video segment exists (device open, audio fallbacks, encoder warm-up), keep the
         // referee fed every 4 s. Stops for good at the first segment, so mid-match gaps are still gaps.
@@ -647,7 +695,9 @@ impl Engine {
                 // Only bytes that reached the recording. The capture command itself is unchanged.
                 if written && frame_clock.enabled() {
                     let file = Path::new(&r.path).file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-                    frame_clock.observe(slice, t_us, &file);
+                    let stamps = frame_clock.observe(slice, t_us, &file);
+                    // Practice hand timeline: bounded try_send, never a wait on its disk writes; drops are counted.
+                    if let Some(h) = self.hand.get() { h.frames(stamps); }
                 }
                 // Practice live tap: the same bytes that reached the recording, never anything else.
                 if written && self.live_tap.enabled() {
@@ -859,6 +909,22 @@ impl Engine {
                 Err(e) => { error!("capture stop record not written: {e}"); extra.insert("capture_stop_error".into(), json!(e)); }
             }
         }
+        // Practice hand timeline: seal the trailing window and bind the whole file. An off session records
+        // `hand_timeline: false` and writes no file. Outside practice: no key is added.
+        if let Some(h) = self.hand.get() {
+            match h.finish(Duration::from_secs(5)) {
+                Ok(f) => {
+                    extra.insert("hand_timeline_sha256".into(), json!(f.file_sha256));
+                    extra.insert("hand_timeline_head".into(), json!(f.head));
+                    extra.insert("hand_timeline_file".into(), json!(f.file));
+                    extra.insert("hand_timeline_chunks".into(), json!(f.chunks));
+                    extra.insert("raw_usb".into(), json!(f.raw_usb));
+                }
+                Err(e) => { error!("hand timeline not sealed: {e}"); extra.insert("hand_timeline_error".into(), json!(e)); }
+            }
+        } else if self.hand_off.load(Ordering::SeqCst) {
+            extra.insert("hand_timeline".into(), json!(false));
+        }
         let cp = self.checkpoint("stop", Value::Object(extra));
         let durable = cp.get("hash").is_some() && cp.get("persisted") != Some(&Value::Bool(false));
         if !durable {
@@ -869,6 +935,17 @@ impl Engine {
         let last = cp["seq"].as_u64()?;
         self.status.lock().unwrap_or_else(|e| e.into_inner()).final_checkpoint_seq = Some(last);
         info!("stop checkpoint {last} written; checkpoint chain sealed");
+        if self.capture_stop.is_some() {
+            if let Some(dir) = self.bundle_dir() {
+                if dir.join(crate::hand::response::PRACTICE_CHALLENGES_FILE).exists()
+                    || dir.join(crate::hand::response::CHALLENGES_FILE).exists()
+                {
+                    if let Err(e) = crate::hand::response::write_dir(&dir) {
+                        warn!("practice response bound not written: {e}");
+                    }
+                }
+            }
+        }
         if self.countersigned.load(Ordering::SeqCst) < 0 { return Some(last); }
         self.set_state("countersigning", Some("waiting for the referee to countersign the final checkpoints".into()));
         let end = Instant::now() + wait;
@@ -2321,6 +2398,168 @@ esac
         assert_eq!(stamps[0].file, "video.mp4");
         let _ = std::fs::remove_dir_all(&dir2);
     }
+
+    /// Hand timeline: default on in the practice lane. Practice with no flag (and with the --hand-timeline
+    /// alias) writes the file and binds both checkpoint keys. Practice with --no-hand-timeline writes no file,
+    /// records hand_timeline: false, and check-hand-timeline PASSes (not a failure). Outside practice, including
+    /// with the alias, there is no file and no hand key. No pad: status is missing, capture and the seal continue.
+    #[test]
+    fn hand_timeline_is_practice_only_and_binds_segments_and_stop() {
+        use clap::Parser;
+        let base = std::env::temp_dir().join(format!("qorcap-hand-engine-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        // (name, practice, alias, off, raw_off, expect_on)
+        let cases = [
+            ("practice-default", true, false, false, false, true),
+            ("practice-alias", true, true, false, false, true),
+            ("practice-off", true, false, true, false, false),
+            ("practice-raw-off", true, false, false, true, true),
+            ("non-practice", false, false, false, false, false),
+            ("non-practice-alias", false, true, false, false, false),
+        ];
+        for (name, practice, alias, off, raw_off, expect_on) in cases {
+            let dir = base.join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            let d = dir.to_string_lossy().into_owned();
+            let mut a = vec!["q", "record", "--device", "testpattern", "--audio", "none", "--bundle", &d, "--match-id", "m-hand"];
+            if practice { a.push("--practice-lane"); }
+            if alias { a.push("--hand-timeline"); }
+            if off { a.push("--no-hand-timeline"); }
+            if raw_off { a.push("--no-raw-usb"); }
+            let crate::cli::Cmd::Record(r) = crate::cli::Cli::try_parse_from(a).unwrap().cmd else { panic!() };
+            let e = Engine::new(r, dir.join("no-such-ffmpeg").to_string_lossy().into_owned());
+            let on = e.start_hand_logger();
+            assert_eq!(on, expect_on, "{name}");
+            let st = serde_json::to_value(e.status()).unwrap();
+            if practice && off {
+                assert_eq!(st["hand"]["state"], "off", "{name} /status shows off");
+            } else if !practice {
+                assert!(st.get("hand").is_none(), "{name} REAL MATCH / default lane /status has no hand field: {st}");
+            }
+            if on {
+                // Fail-soft: no pad (the USB reader is Windows-only; Linux is always missing) is recorded
+                // as missing and never blocks capture or the seal below.
+                let live = e.status().hand.expect("on session publishes live state");
+                assert_eq!(live.state, "missing", "{name} no pad -> missing, capture continues");
+                if raw_off { assert!(!live.raw_usb, "{name} raw off is visible on /status"); }
+            }
+            e.on_segment("video.mp4", 0, b"\0\0\0\x10ftypisom\0\0\0\0");
+            if on {
+                let end = Instant::now() + Duration::from_secs(10);
+                while e.hand.get().unwrap().binding().is_none() && Instant::now() < end { std::thread::sleep(Duration::from_millis(20)); }
+            }
+            e.on_segment("video.mp4", 16, b"\0\0\0\x10moofmoof\0\0\0\0");
+            e.seal_and_wait_countersign(Duration::from_secs(1)).unwrap();
+            let cps = e.ev.lock().unwrap().checkpoints.clone();
+            let segs: Vec<&Value> = cps.iter().filter(|c| c["qorcap"]["trigger"] == "segment").collect();
+            let stop = cps.last().unwrap();
+            let file = dir.join(crate::hand::timeline::FILE_NAME);
+            if on {
+                assert!(segs[0]["qorcap"]["hand_head"].is_null(), "{name}: no hand chunk sealed yet at the first segment");
+                assert!(segs[1]["qorcap"]["hand_chunk_seq"].is_u64() && segs[1]["qorcap"]["hand_head"].is_string(), "{name} {}", segs[1]);
+                let bytes = std::fs::read(&file).unwrap();
+                assert_eq!(stop["qorcap"]["hand_timeline_sha256"], crate::evidence::sha256_hex(&bytes));
+                assert_eq!(stop["qorcap"]["hand_timeline_file"], crate::hand::timeline::FILE_NAME);
+                assert_eq!(stop["qorcap"]["raw_usb"], !raw_off, "{name}");
+                let recs: Vec<Value> = String::from_utf8(bytes.clone()).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+                assert!(recs.iter().any(|r| r["type"] == "status" && r["state"] == "missing"), "{name} missing status is in the file");
+                assert!(recs.iter().any(|r| r["type"] == "hb" && r["pad_connected"] == false), "{name} no pad is not invented as connected");
+                if raw_off {
+                    assert_eq!(recs[0]["raw_usb"], false, "{name} header records raw_usb: false");
+                    assert!(!dir.join(crate::hand::timeline::RAW_DIR).exists() || std::fs::read_dir(dir.join(crate::hand::timeline::RAW_DIR)).map(|rd| rd.count()).unwrap_or(0) == 0);
+                }
+                let rep = crate::hand::check::check_dir(&dir).unwrap();
+                assert!(rep.pass(), "{name} {:?}", rep.errors);
+                assert!(rep.stop_bound && rep.segment_bindings == 1, "{name} {rep:?}");
+                assert!(!rep.off, "{name} an on session is not reported as off");
+                assert_eq!(stop["qorcap"]["hand_timeline_head"], rep.head);
+                if let Ok(vb) = crate::bundle::verify(&dir) { assert!(!vb.errors.iter().any(|m| m.contains("hand")), "{name} {:?}", vb.errors); }
+            } else if practice && off {
+                assert!(!file.exists() && !dir.join(crate::hand::timeline::RAW_DIR).exists(), "{name} no file");
+                assert_eq!(stop["qorcap"]["hand_timeline"], false, "{name} off is recorded on the stop checkpoint");
+                assert!(stop["qorcap"].get("hand_timeline_sha256").is_none() && segs.iter().all(|c| c["qorcap"].get("hand_chunk_seq").is_none()), "{name} no binding keys");
+                let rep = crate::hand::check::check_dir(&dir).unwrap();
+                assert!(rep.pass() && rep.off, "{name} off session is a PASS, not a failure: {:?}", rep.errors);
+                if let Ok(vb) = crate::bundle::verify(&dir) { assert!(!vb.errors.iter().any(|m| m.contains("hand")), "{name} {:?}", vb.errors); }
+            } else {
+                assert!(!file.exists() && !dir.join(crate::hand::timeline::RAW_DIR).exists(), "{name} no file");
+                assert!(cps.iter().all(|c| !c.to_string().contains("hand_")), "{name} no hand key outside practice: {}", cps.last().unwrap());
+            }
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn practice_challenge_binds_hand_head_and_leaves_receipt_unchanged() {
+        use clap::Parser;
+        use crate::cli::{Cli, Cmd};
+        let dir = std::env::temp_dir().join(format!("qorcap-respbound-eng-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let d = dir.to_string_lossy().into_owned();
+
+        // 1. Non-practice lane rejects practice challenges and leaves REAL MATCH untouched.
+        let Cmd::Record(r_real) = Cli::try_parse_from(["q", "record", "--device", "testpattern", "--audio", "none", "--bundle", &d, "--match-id", "m-real"]).unwrap().cmd else { panic!() };
+        let e_real = Engine::new(r_real, dir.join("no-ffmpeg").to_string_lossy().into_owned());
+        assert!(e_real.challenge(&json!({"nonce": "0123456789abcdef0123456789abcdef", "practice": true})).is_err());
+
+        // 2. Practice lane binds current hand-chunk head on POST /challenge and checkpoint, writes
+        //    practice_challenges.jsonl + hand_challenge.jsonl, and keeps receipt.draft.json challenges empty.
+        let pdir = dir.join("practice");
+        std::fs::create_dir_all(&pdir).unwrap();
+        let pd = pdir.to_string_lossy().into_owned();
+        let Cmd::Record(r_prac) = Cli::try_parse_from(["q", "record", "--device", "testpattern", "--audio", "none", "--bundle", &pd, "--match-id", "m-prac", "--practice-lane", "--no-raw-usb"]).unwrap().cmd else { panic!() };
+        let e = Engine::new(r_prac, pdir.join("no-ffmpeg").to_string_lossy().into_owned());
+        assert!(e.start_hand_logger());
+        e.on_segment("video.mp4", 0, b"\0\0\0\x10ftypisom\0\0\0\0");
+        let end = Instant::now() + Duration::from_secs(10);
+        while e.hand.get().unwrap().binding().is_none() && Instant::now() < end {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let (expected_seq, expected_head) = e.hand.get().unwrap().binding().expect("chunk 0 sealed");
+        let nonce = "0123456789abcdef0123456789abcdef";
+        let past = 1_000_000_000_000u64;
+        let resp = e.challenge(&json!({"nonce": nonce, "phase": "practice", "practice": true, "game": "cod",
+            "issued_ms": past, "deadline_ms": past + 1_000})).unwrap();
+        assert_eq!(resp["challenge"]["hand_chunk_seq"], expected_seq);
+        assert_eq!(resp["challenge"]["hand_head"], expected_head);
+        assert_eq!(resp["checkpoint"]["qorcap"]["hand_chunk_seq"], expected_seq);
+        assert_eq!(resp["checkpoint"]["qorcap"]["hand_head"], expected_head);
+        assert_eq!(resp["checkpoint"]["qorcap"]["practice"], true);
+        // Server sets the practice window; a backdated POST body is ignored.
+        let issued = resp["challenge"]["issued_ms"].as_u64().unwrap();
+        let received_wall = resp["challenge"]["received_wall_ms"].as_u64().unwrap();
+        let deadline = resp["challenge"]["deadline_ms"].as_u64().unwrap();
+        assert_eq!(issued, received_wall, "practice issued_ms is received_wall_ms");
+        assert_eq!(deadline, issued + crate::hand::response::PRACTICE_DEADLINE_MS);
+        assert_ne!(issued, past, "client issued_ms is ignored");
+        assert_eq!(resp["checkpoint"]["qorcap"]["issued_ms"], issued);
+        assert_eq!(resp["checkpoint"]["qorcap"]["deadline_ms"], deadline);
+        assert_eq!(resp["checkpoint"]["qorcap"]["received_wall_ms"], received_wall);
+        assert_eq!(resp["checkpoint"]["qorcap"]["received_mono_ms"], resp["challenge"]["received_mono_ms"]);
+        assert!(!pdir.join("stamp.txt").exists());
+        assert!(pdir.join(crate::hand::response::PRACTICE_CHALLENGES_FILE).exists());
+        assert!(!pdir.join("challenges.jsonl").exists());
+
+        e.seal_and_wait_countersign(Duration::from_secs(1)).unwrap();
+        e.write_bundle_opts(false).unwrap();
+
+        let draft: Value = serde_json::from_str(&std::fs::read_to_string(pdir.join("receipt.draft.json")).unwrap()).unwrap();
+        assert_eq!(draft["challenges"].as_array().unwrap().len(), 0, "practice challenge must never enter receipt.draft.json");
+        assert!(pdir.join(crate::hand::response::FILE_NAME).exists());
+        let hc_lines: Vec<Value> = std::fs::read_to_string(pdir.join(crate::hand::response::FILE_NAME))
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(hc_lines.len(), 1);
+        assert_eq!(hc_lines[0]["bound_chunk_seq"], expected_seq);
+        assert_eq!(hc_lines[0]["bound_head"], expected_head);
+        assert_eq!(hc_lines[0]["bound_head_status"], "matched");
+        assert_eq!(hc_lines[0]["receipt_status_changed"], false);
+        assert_eq!(hc_lines[0]["advisory_only"], true);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 impl Engine {
@@ -2361,8 +2600,15 @@ impl Engine {
         // The fsync runs outside the input-log mutex (HID logger and /status keep going); this still returns
         // only once the chunk is durable, so the checkpoint below is written after it.
         let (ih, ihead, n) = crate::inputs::seal_shared(&self.input, seq, || self.started.elapsed().as_micros() as u64);
-        if self.args.no_controller { self.checkpoint("segment", json!({})); }
-        else { self.checkpoint_with("segment", json!({"input_seg": seq, "input_n": n, "input_head": ihead}), Some(ih)); }
+        let mut ext = if self.args.no_controller { json!({}) } else { json!({"input_seg": seq, "input_n": n, "input_head": ihead}) };
+        // Practice hand timeline only: the newest durable 1 s hand chunk at this segment close (extra `qorcap` keys).
+        if let Some(h) = self.hand.get() {
+            let (s, head) = match h.binding() { Some((s, head)) => (json!(s), json!(head)), None => (Value::Null, Value::Null) };
+            ext["hand_chunk_seq"] = s;
+            ext["hand_head"] = head;
+        }
+        if self.args.no_controller { self.checkpoint("segment", ext); }
+        else { self.checkpoint_with("segment", ext, Some(ih)); }
     }
 
     /// Append a QorTime-shaped checkpoint binding the current chain head + score/clock state.
@@ -2430,17 +2676,61 @@ impl Engine {
         cp
     }
 
-    /// Referee nonce challenge: record receipt time against the chain and (optionally) stamp it on video.
+    /// Nonce challenge: record receipt time against the chain, bind current hand-chunk head when active,
+    /// and (for official challenges only, when --stamp is set) stamp video. Practice challenges stay out of
+    /// `st.challenges` and `challenges.jsonl` so `receipt.draft.json` / `receipt.json` stay untouched.
     pub fn challenge(&self, b: &Value) -> Result<Value, String> {
+        let practice_req = b["practice"].as_bool().unwrap_or(false) || b["phase"].as_str() == Some("practice");
+        if practice_req && self.capture_stop.is_none() {
+            return Err("practice challenge is allowed in the practice lane only".into());
+        }
         let nonce = b["nonce"].as_str().ok_or("missing nonce")?;
         let pattern = ev::pattern_for(nonce)?;
         let now = wall_ms();
-        let issued = b["issued_ms"].as_u64().unwrap_or(now);
+        let received_mono_ms = self.ms();
+        // Practice window is server-set: issued_ms = received_wall_ms, deadline_ms = issued_ms +
+        // PRACTICE_DEADLINE_MS (90_000). Client issued_ms / deadline_ms are ignored (the sidecar
+        // does not send them; this response carries the server values). Official challenges still
+        // take issued_ms / deadline_ms from the POST body.
+        let (issued, deadline) = if practice_req {
+            (now, now + crate::hand::response::PRACTICE_DEADLINE_MS)
+        } else {
+            let issued = b["issued_ms"].as_u64().unwrap_or(now);
+            (issued, b["deadline_ms"].as_u64().unwrap_or(issued + 90_000))
+        };
         let (seq, head) = { let st = self.ev.lock().unwrap_or_else(|e| e.into_inner()); (st.seg.seq, st.seg.head.clone()) };
-        let c = json!({"id": b["id"].as_str().map(String::from).unwrap_or_else(|| nonce[..8].to_string()),
-            "role": b["role"].as_str().unwrap_or(&self.args.role), "phase": b["phase"].as_str().unwrap_or("kickoff"),
-            "nonce": nonce, "pattern": pattern, "issued_ms": issued, "deadline_ms": b["deadline_ms"].as_u64().unwrap_or(issued + 90_000),
-            "received_wall_ms": now, "received_mono_ms": self.ms(), "segment_seq_at_receipt": seq, "chain_head_at_receipt": head});
+        let hand_bind = self.hand.get().map(|h| match h.binding() {
+            Some((s, head)) => (json!(s), json!(head)),
+            None => (Value::Null, Value::Null),
+        });
+        let mut c = json!({"id": b["id"].as_str().map(String::from).unwrap_or_else(|| nonce[..8].to_string()),
+            "role": b["role"].as_str().unwrap_or(&self.args.role),
+            "phase": b["phase"].as_str().unwrap_or(if practice_req { "practice" } else { "kickoff" }),
+            "nonce": nonce, "pattern": pattern, "issued_ms": issued, "deadline_ms": deadline,
+            "received_wall_ms": now, "received_mono_ms": received_mono_ms, "segment_seq_at_receipt": seq, "chain_head_at_receipt": head});
+        let mut cp_extra = json!({"nonce": nonce});
+        if let Some((hs, hh)) = &hand_bind {
+            c["hand_chunk_seq"] = hs.clone();
+            c["hand_head"] = hh.clone();
+            cp_extra["hand_chunk_seq"] = hs.clone();
+            cp_extra["hand_head"] = hh.clone();
+        }
+        if practice_req {
+            c["practice"] = json!(true);
+            cp_extra["practice"] = json!(true);
+            cp_extra["issued_ms"] = json!(issued);
+            cp_extra["deadline_ms"] = json!(deadline);
+            cp_extra["received_wall_ms"] = json!(now);
+            cp_extra["received_mono_ms"] = json!(received_mono_ms);
+            if let Some(g) = b["game"].as_str() {
+                c["game"] = json!(g);
+                cp_extra["game"] = json!(g);
+            }
+            let _ = append_jsonl(&self.ev_path(crate::hand::response::PRACTICE_CHALLENGES_FILE), &c);
+            let cp = self.checkpoint("challenge", cp_extra);
+            info!("practice challenge {nonce} received; pattern {pattern:?}; bound at checkpoint {}", cp["seq"]);
+            return Ok(json!({"ok": true, "challenge": c, "checkpoint": cp}));
+        }
         if self.args.stamp {
             let text = format!("QorCap nonce {}  {}", &nonce[..12], pattern.join(" "));
             let tmp = self.stamp_file.with_extension("tmp");
@@ -2448,7 +2738,7 @@ impl Engine {
         }
         self.ev.lock().unwrap_or_else(|e| e.into_inner()).challenges.push(c.clone());
         let _ = append_jsonl(&self.ev_path("challenges.jsonl"), &c);
-        let cp = self.checkpoint("challenge", json!({"nonce": nonce}));
+        let cp = self.checkpoint("challenge", cp_extra);
         info!("referee challenge {nonce} received; pattern {pattern:?}; bound at checkpoint {}", cp["seq"]);
         Ok(json!({"ok": true, "challenge": c, "checkpoint": cp}))
     }
