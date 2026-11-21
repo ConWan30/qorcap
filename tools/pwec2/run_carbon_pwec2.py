@@ -35,10 +35,9 @@ import re
 import sys
 import urllib.error
 import urllib.request
-from datetime import datetime
+from datetime import datetime, timedelta, tzinfo
 from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
-from zoneinfo import ZoneInfo
 
 import cv2
 import numpy as np
@@ -63,8 +62,63 @@ GUTTER = 8
 TIMEOUT_S = 180.0
 
 _QUANT = Decimal("0.000001")
-_CST = ZoneInfo("America/Chicago")
 _SCRUB = re.compile(r"AIza[0-9A-Za-z_\-]{8,}|key=[^\s&\"']+", re.IGNORECASE)
+
+
+def _nth_sunday(year: int, month: int, n: int) -> datetime:
+    first = datetime(year, month, 1)
+    day = 1 + (6 - first.weekday()) % 7 + (n - 1) * 7
+    return datetime(year, month, day)
+
+
+def _chicago_dst_utc(year: int) -> tuple[datetime, datetime]:
+    """UTC instants when US DST starts and ends. Rules in force since 2007."""
+    start = _nth_sunday(year, 3, 2).replace(hour=2) + timedelta(hours=6)
+    end = _nth_sunday(year, 11, 1).replace(hour=2) + timedelta(hours=5)
+    return start, end
+
+
+class _Chicago(tzinfo):
+    """America/Chicago without the tzdata package, so Windows can import this."""
+
+    def utcoffset(self, dt: datetime | None) -> timedelta:
+        if dt is None:
+            return timedelta(hours=-6)
+        wall = dt.replace(tzinfo=None)
+        start, end = _chicago_dst_utc(wall.year)
+        as_dst = wall + timedelta(hours=5)
+        as_std = wall + timedelta(hours=6)
+        dst_ok = start <= as_dst < end
+        std_ok = not (start <= as_std < end)
+        if dst_ok and std_ok:
+            return timedelta(hours=-6) if dt.fold else timedelta(hours=-5)
+        if dst_ok:
+            return timedelta(hours=-5)
+        return timedelta(hours=-6)
+
+    def dst(self, dt: datetime | None) -> timedelta:
+        offset = self.utcoffset(dt)
+        return timedelta(hours=1) if offset == timedelta(hours=-5) else timedelta(0)
+
+    def tzname(self, dt: datetime | None) -> str:
+        return "CDT" if self.dst(dt) else "CST"
+
+    def fromutc(self, dt: datetime) -> datetime:
+        if dt.tzinfo is not self:
+            raise ValueError("fromutc requires this tzinfo")
+        utc = dt.replace(tzinfo=None)
+        start, end = _chicago_dst_utc(utc.year)
+        if start <= utc < end:
+            wall = utc + timedelta(hours=-5)
+            fold = 0
+        else:
+            wall = utc + timedelta(hours=-6)
+            # The first hour after the fall-back is the second 1:00.
+            fold = 1 if end <= utc < end + timedelta(hours=1) else 0
+        return wall.replace(tzinfo=self, fold=fold)
+
+
+_CST = _Chicago()
 
 ENUMS = {
     "target_present": {"yes", "no", "unsure"},
@@ -146,6 +200,7 @@ def billed_usd(usage: object) -> tuple[Decimal | None, str]:
 
 
 def now_cst() -> str:
+    """Ledger clock. America/Chicago wall time, labeled CST, as the earlier lines were."""
     return datetime.now(_CST).strftime("%Y-%m-%d %H:%M:%S CST")
 
 

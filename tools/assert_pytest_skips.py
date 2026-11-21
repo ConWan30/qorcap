@@ -223,10 +223,10 @@ WINDOWS_FILES = (
 # not re-collected; CI's collected total is authoritative. Re-collect after any list or test change.
 # sidecar/test_qorcap_engagement.py (PWEC) adds 27 non-parametrized tests on both lists: linux
 # re-collected locally at 1228 (main 0932fe8 + this file); windows set by count to 1209.
-# tools/pwec2/test_pwec2.py adds 40 non-parametrized tests on both lists. Set by count
+# tools/pwec2/test_pwec2.py adds 41 non-parametrized tests on both lists. Set by count
 # from 1228 / 1209. Re-collect after any further list or test change.
-LINUX_MIN_COLLECTED = 1268
-WINDOWS_MIN_COLLECTED = 1249
+LINUX_MIN_COLLECTED = 1269
+WINDOWS_MIN_COLLECTED = 1250
 
 # Absent from both sidecar suites. A reason is required; whitespace does not count.
 EXCLUDED_TEST_FILES = {

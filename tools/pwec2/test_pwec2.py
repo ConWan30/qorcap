@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import sys
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 
@@ -383,6 +384,24 @@ def test_worst_case_matches_the_cap_rule_and_stops_at_exactly_ten():
     assert billed == Decimal("0.003500")
     missing, missing_mark = carbon.billed_usd({})
     assert missing is None and missing_mark == "UNMEASURED"
+
+
+def test_chicago_clock_needs_no_tzdata():
+    winter = datetime(2026, 11, 21, 7, 45, tzinfo=timezone.utc).astimezone(carbon._CST)
+    assert winter.utcoffset() == timedelta(hours=-6)
+    assert (winter.hour, winter.minute) == (1, 45)
+    summer = datetime(2026, 7, 15, 18, 0, tzinfo=timezone.utc).astimezone(carbon._CST)
+    assert summer.utcoffset() == timedelta(hours=-5)
+    assert summer.hour == 13
+    spring = datetime(2026, 3, 8, 8, 0, tzinfo=timezone.utc).astimezone(carbon._CST)
+    assert (spring.hour, spring.minute) == (3, 0)
+    assert spring.utcoffset() == timedelta(hours=-5)
+    fall = datetime(2026, 11, 1, 7, 0, tzinfo=timezone.utc).astimezone(carbon._CST)
+    assert (fall.hour, fall.minute) == (1, 0)
+    assert fall.utcoffset() == timedelta(hours=-6)
+    stamp = carbon.now_cst()
+    assert stamp.endswith(" CST")
+    datetime.strptime(stamp, "%Y-%m-%d %H:%M:%S CST")
 
 
 def test_generation_config_is_carbon_and_keeps_thinking_budget():
