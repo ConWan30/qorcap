@@ -224,18 +224,13 @@ WINDOWS_FILES = (
 # The floor is a minimum. A PR that adds tests, and any merge resolution, must
 # re-collect and set both floors to those exact counts. Leaving the old floor
 # keeps a dropped test green.
-# Main 7e77c92 (#174) collected 1189 linux / 1170 windows (CI run of #177 at 7785378).
-# tools/test_encoder_pace.py adds 12 non-parametrized tests: 1201 / 1182. Set by count,
-# not re-collected; CI's collected total is authoritative. Re-collect after any list or test change.
-# sidecar/test_qorcap_engagement.py (PWEC) adds 27 non-parametrized tests on both lists: linux
-# re-collected locally at 1228 (main 0932fe8 + this file); windows set by count to 1209.
-# Re-collected after the QorProof #183 follow-up fixes, on main 365e54f (#187).
-# pytest --collect-only -q of each --list, QORTIME pin 0204e6d8082f8c40ea1fe5e09bf16402aaee3ff2:
-# 1306 linux / 1287 windows. Previous floors were 1288 / 1269; this change adds
-# 18 collected tests on both lists.
-# Merged origin/main 617efff (#103, floors 1313/1294) with sidecar/test_qorcap_clock_vote.py.
-# Re-collected with QORTIME pin; 1313+79 / 1294+79.
-LINUX_MIN_COLLECTED = 1392
+# Merged origin/main 6caa9a1 (#81 / #103; floors 1392 linux / 1373 windows)
+# with the #97 sidecar/test_qorcap_challenge.py additions.
+# Full-suite collect-only was not re-run here (no fastapi install on this box).
+# pytest --collect-only -q sidecar/test_qorcap_challenge.py, QORTIME at the
+# revived qortime #80 tree, still collects 49 tests (7 on main, +42).
+# Windows does not run this file, so only the Linux floor rises: 1392+42 / 1373.
+LINUX_MIN_COLLECTED = 1434
 WINDOWS_MIN_COLLECTED = 1373
 
 # Absent from both sidecar suites. A reason is required; whitespace does not count.
