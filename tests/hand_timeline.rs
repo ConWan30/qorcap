@@ -7,7 +7,7 @@ use qorcap::hand::check::check_dir;
 use qorcap::hand::device::{DeviceInfo, DeviceModel};
 use qorcap::hand::logger;
 use qorcap::hand::source::{MockSource, MockStep, OpenOutcome, ReadOutcome, ReportSource};
-use qorcap::hand::timeline::{Config, HandTimeline, CHUNK_US, FILE_NAME, RAW_DIR, RAW_RECORD_BYTES, SEAL_GRACE_US, SUMMARY_FILE};
+use qorcap::hand::timeline::{Config, HandTimeline, CHUNK_US, FILE_NAME, RAW_FILE, RAW_LAYOUT, RAW_RECORD_BYTES, SEAL_GRACE_US, SUMMARY_FILE};
 use qorcap::hid::{self, Pad, CROSS, FN_LEFT, BACK_RIGHT, R2};
 use serde_json::Value;
 use std::path::PathBuf;
@@ -21,7 +21,7 @@ fn tmp(name: &str) -> PathBuf {
 fn edge() -> DeviceInfo { DeviceInfo { model: DeviceModel::DualSenseEdge, vid: 0x054C, pid: 0x0DF2, bcd_device: 0x0408, pad_id: "serial:EDGE1".into() } }
 fn dualsense() -> DeviceInfo { DeviceInfo { model: DeviceModel::DualSense, vid: 0x054C, pid: 0x0CE6, bcd_device: 0x0100, pad_id: "serial:DS1".into() } }
 fn cfg(dir: &PathBuf, raw: bool, dev: Option<DeviceInfo>) -> Config {
-    Config { dir: dir.clone(), raw_usb: raw, raw_min_free_bytes: None, wall_anchor_ms: 1_795_144_560_000, qpc: None, frame_clock_on: true, initial_device: dev, start_t_us: 0 }
+    Config { dir: dir.clone(), hand_dir_source: "direct".into(), hand_dir_fallback_reason: None, raw_usb: raw, raw_min_free_bytes: None, wall_anchor_ms: 1_795_144_560_000, qpc: None, frame_clock_on: true, initial_device: dev, start_t_us: 0 }
 }
 fn report(counter: u8, buttons: u32, lx: u8, ts: u32) -> Vec<u8> {
     let mut p = Pad::neutral();
@@ -61,11 +61,21 @@ fn windows_chain_raw_files_and_the_checker_pass() {
     assert_eq!(chunks[0]["device_model"], "dualsense_edge");
     // head_k = SHA-256(JCS({prev, seq, sha256})) re-links by hand.
     assert_eq!(chunks[1]["head"].as_str().unwrap(), ev::link(chunks[0]["head"].as_str().unwrap(), 1, chunks[1]["sha256"].as_str().unwrap()));
-    // Raw: every report kept, 72 B each.
-    let raw0 = std::fs::read(dir.join(RAW_DIR).join("w0000000000.bin")).unwrap();
-    assert_eq!(raw0.len() % RAW_RECORD_BYTES, 0);
-    assert_eq!(raw0.len() / RAW_RECORD_BYTES, 250, "1 s of 4 ms reports");
-    assert_eq!(&raw0[64..72], &10_000u64.to_le_bytes(), "QPC ticks follow the 64 B report");
+    // Raw: ONE append-only session file, 80 B v1 records (u64_le qpc_ticks + u64_le t_us + 64 B report).
+    assert_eq!(RAW_RECORD_BYTES, 80);
+    let raw_all = std::fs::read(dir.join(RAW_FILE)).unwrap();
+    assert_eq!(raw_all.len() % RAW_RECORD_BYTES, 0);
+    assert_eq!(fin.raw_file.as_deref(), Some(RAW_FILE));
+    assert_eq!(fin.raw_bytes, raw_all.len() as u64);
+    assert_eq!(chunks[0]["raw_file"], RAW_FILE);
+    assert_eq!(chunks[0]["raw_offset"], 0);
+    assert_eq!(chunks[0]["raw_len"], 250 * RAW_RECORD_BYTES as u64);
+    assert_eq!(chunks[1]["raw_offset"], 250 * RAW_RECORD_BYTES as u64);
+    assert_eq!(chunks[1]["raw_len"], 250 * RAW_RECORD_BYTES as u64);
+    assert_eq!(chunks[2]["raw_offset"], 500 * RAW_RECORD_BYTES as u64);
+    assert_eq!(&raw_all[0..8], &10_000u64.to_le_bytes(), "qpc_ticks at bytes 0..8");
+    assert_eq!(&raw_all[8..16], &1_000u64.to_le_bytes(), "t_us at bytes 8..16");
+    assert_eq!(raw_all[16], 0x01, "64 B 0x01 report at bytes 16..80");
     // Change-logged in rows: far fewer than reports, but every button edge is there.
     let ins: Vec<&Value> = recs.iter().filter(|r| r["type"] == "in").collect();
     assert!(ins.len() < 20, "{} in rows", ins.len());
@@ -82,7 +92,8 @@ fn windows_chain_raw_files_and_the_checker_pass() {
     assert_eq!(rep.chunks, 3);
     assert_eq!(rep.head, fin.head);
     assert_eq!(rep.file_sha256, fin.file_sha256);
-    assert_eq!(rep.raw_files, 3);
+    assert_eq!(rep.raw_files, 1);
+    assert_eq!(rep.raw_slices, 3);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -101,13 +112,13 @@ fn checker_catches_tampered_records_raw_bytes_and_a_broken_link() {
     let r = check_dir(&dir).unwrap();
     assert!(r.errors.iter().any(|e| e.contains("records SHA-256 does not match")), "{:?}", r.errors);
     std::fs::write(&path, &orig).unwrap();
-    // 2) flip one raw byte
-    let rp = dir.join(RAW_DIR).join("w0000000001.bin");
+    // 2) flip one raw byte in the single append-only raw file
+    let rp = dir.join(RAW_FILE);
     let mut raw = std::fs::read(&rp).unwrap();
-    raw[5] ^= 1;
+    raw[RAW_RECORD_BYTES * 250 + 20] ^= 1;
     std::fs::write(&rp, &raw).unwrap();
     let r = check_dir(&dir).unwrap();
-    assert!(r.errors.iter().any(|e| e.contains("raw file SHA-256 does not match")), "{:?}", r.errors);
+    assert!(r.errors.iter().any(|e| e.contains("raw slice SHA-256 does not match")), "{:?}", r.errors);
     raw[5] ^= 1;
     std::fs::write(&rp, &raw).unwrap();
     // 3) drop a whole window (chain must break)
@@ -175,8 +186,9 @@ fn raw_off_switch_is_recorded_and_writes_no_raw_files() {
     tl.finish(1_700_000).unwrap();
     let recs = lines(&dir);
     assert_eq!(recs[0]["raw_usb"], false);
-    assert!(recs.iter().filter(|r| r["type"] == "raw_bind").all(|r| r["raw_usb"] == false && r["file"].is_null()));
-    assert!(!dir.join(RAW_DIR).exists());
+    assert!(recs.iter().filter(|r| r["type"] == "raw_bind").all(|r| r["raw_usb"] == false && r["file"].is_null() && r["offset"].is_null() && r["len"].is_null() && r["sha256"].is_null()));
+    assert!(recs.iter().filter(|r| r["type"] == "chunk").all(|r| r["raw_file"].is_null() && r["raw_offset"].is_null() && r["raw_len"].is_null() && r["raw_sha256"].is_null()));
+    assert!(!dir.join(RAW_FILE).exists());
     assert!(check_dir(&dir).unwrap().pass());
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -353,18 +365,16 @@ fn clock_rollback_is_a_first_class_status() {
 #[test]
 fn refuses_to_overwrite_an_existing_raw_companion() {
     let dir = tmp("raw-exists");
-    let mut tl = HandTimeline::open(cfg(&dir, true, Some(edge()))).unwrap();
-    let raw_dir = dir.join(RAW_DIR);
-    std::fs::create_dir_all(&raw_dir).unwrap();
-    let p = raw_dir.join("w0000000000.bin");
+    std::fs::create_dir_all(&dir).unwrap();
+    let p = dir.join(RAW_FILE);
     std::fs::write(&p, b"KEEP-ME-DO-NOT-OVERWRITE").unwrap();
-    tl.on_report(1_000, Some(10), &report(0, 0, 128, 1));
-    let err = tl.finish(CHUNK_US + SEAL_GRACE_US + 1).unwrap_err();
-    assert!(err.contains("hand raw file") || err.contains("already exists") || err.contains("w0000000000"), "{err}");
+    let err = match HandTimeline::open(cfg(&dir, true, Some(edge()))) {
+        Ok(_) => panic!("expected open to refuse pre-existing raw file"),
+        Err(e) => e,
+    };
+    assert!(err.contains("hand raw file") || err.contains("already exists") || err.contains(RAW_FILE), "{err}");
     assert_eq!(std::fs::read(&p).unwrap(), b"KEEP-ME-DO-NOT-OVERWRITE");
-    assert!(tl.binding().is_none(), "seal fails closed: head must not move");
-    let recs = lines(&dir);
-    assert!(recs.iter().all(|r| r["type"] != "chunk"), "no chunk row after a failed raw create: {recs:?}");
+    assert!(!dir.join(FILE_NAME).exists(), "partial jsonl cleaned up when raw create_new fails");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -378,7 +388,7 @@ fn hand_files_are_mode_0600_on_unix() {
     tl.finish(CHUNK_US + SEAL_GRACE_US + 1).unwrap();
     let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode(&dir.join(FILE_NAME)), 0o600, "jsonl");
-    assert_eq!(mode(&dir.join(RAW_DIR).join("w0000000000.bin")), 0o600, "raw companion");
+    assert_eq!(mode(&dir.join(RAW_FILE)), 0o600, "raw companion");
     assert_eq!(mode(&dir.join(SUMMARY_FILE)), 0o600, "summary");
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -432,4 +442,221 @@ fn open_denied_is_not_recorded_as_missing() {
     assert!(recs.iter().any(|r| r["type"] == "hb" && r["pad_connected"] == false));
     assert!(check_dir(&dir).unwrap().pass());
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn rehash_timeline_for_test(dir: &PathBuf, mut edit: impl FnMut(&mut Value)) {
+    let path = dir.join(FILE_NAME);
+    let rows: Vec<Value> = std::fs::read_to_string(&path)
+        .unwrap()
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    let mut rebuilt = String::new();
+    let mut pending: Vec<Value> = Vec::new();
+    let mut head = GENESIS.to_string();
+    for mut row in rows {
+        edit(&mut row);
+        if row["type"] != "chunk" {
+            pending.push(row);
+            continue;
+        }
+        let seq = row["seq"].as_u64().unwrap();
+        let recs = std::mem::take(&mut pending);
+        let sha = ev::try_jcs_sha(&Value::Array(recs.clone())).unwrap();
+        let new_head = ev::link(&head, seq, &sha);
+        row["sha256"] = serde_json::json!(sha);
+        row["prev"] = serde_json::json!(head);
+        row["head"] = serde_json::json!(new_head);
+        head = new_head;
+        for r in recs.iter().chain(std::iter::once(&row)) {
+            rebuilt.push_str(&ev::jcs(r).unwrap());
+            rebuilt.push('\n');
+        }
+    }
+    std::fs::write(&path, rebuilt).unwrap();
+}
+
+#[test]
+fn imu_noise_does_not_create_in_rows_while_sticks_triggers_buttons_paddles_do() {
+    let dir = tmp("imu-noise");
+    let mut tl = HandTimeline::open(cfg(&dir, true, Some(edge()))).unwrap();
+    // 250 reports across 1 s where gyro, accel, sensor_ts, and counter change every 4 ms,
+    // while sticks, triggers, buttons, and paddles stay idle.
+    for i in 0..250u64 {
+        let mut p = Pad::neutral();
+        p.counter = i as u8;
+        p.sensor_ts = (i as u32) * 1_000;
+        p.gyro = [(i as i16) * 3, -(i as i16) * 5, (i as i16) * 7];
+        p.accel = [100 + (i as i16), -200 - (i as i16), 8192 + (i as i16)];
+        tl.on_report(10_000 + i * 4_000, Some(100_000 + i * 40_000), &hid::pack_usb(&p));
+    }
+    // Now change stick, trigger, face button, and Edge paddle past ANALOG_MIN_GAP_US.
+    let mut p_stick = Pad::neutral();
+    p_stick.counter = 250;
+    p_stick.lx = 210;
+    tl.on_report(1_100_000, Some(11_000_000), &hid::pack_usb(&p_stick));
+
+    let mut p_trig = p_stick.clone();
+    p_trig.counter = 251;
+    p_trig.l2 = 180;
+    tl.on_report(1_200_000, Some(12_000_000), &hid::pack_usb(&p_trig));
+
+    let mut p_btn = p_trig.clone();
+    p_btn.counter = 252;
+    p_btn.buttons = CROSS;
+    tl.on_report(1_210_000, Some(12_100_000), &hid::pack_usb(&p_btn));
+
+    let mut p_pad = p_btn.clone();
+    p_pad.counter = 253;
+    p_pad.buttons = CROSS | BACK_RIGHT;
+    tl.on_report(1_220_000, Some(12_200_000), &hid::pack_usb(&p_pad));
+
+    let fin = tl.finish(2_500_000).unwrap();
+    let recs = lines(&dir);
+    let ins: Vec<&Value> = recs.iter().filter(|r| r["type"] == "in").collect();
+    // 1 initial row during the 250 noisy IMU frames + 4 input changes = 5 `in` rows total.
+    assert_eq!(ins.len(), 5, "IMU noise must not create extra in rows: {ins:?}");
+    assert_eq!(fin.raw_bytes, 254 * RAW_RECORD_BYTES as u64, "raw file still holds all 254 reports");
+    assert!(check_dir(&dir).unwrap().pass());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn checker_rejects_truncation_missing_raw_offset_gap_overlap_layout_and_t_us_rollback() {
+    let make_valid = |tag: &str| -> PathBuf {
+        let dir = tmp(tag);
+        let mut tl = HandTimeline::open(cfg(&dir, true, Some(edge()))).unwrap();
+        for i in 0..550u64 {
+            let b = if i % 100 == 0 { CROSS } else { 0 };
+            tl.on_report(1_000 + i * 4_000, Some(10_000 + i * 40_000), &report(i as u8, b, 128, i as u32));
+        }
+        tl.finish(2_500_000).unwrap();
+        assert!(check_dir(&dir).unwrap().pass());
+        dir
+    };
+
+    // 1. Truncated raw file
+    let d_trunc = make_valid("v1-trunc");
+    let rp = d_trunc.join(RAW_FILE);
+    let orig = std::fs::read(&rp).unwrap();
+    std::fs::write(&rp, &orig[..orig.len() - 12]).unwrap();
+    let rep = check_dir(&d_trunc).unwrap();
+    assert!(rep.errors.iter().any(|e| e.contains("truncated")), "{:?}", rep.errors);
+
+    // 2. Missing raw file
+    let d_miss = make_valid("v1-miss");
+    std::fs::remove_file(d_miss.join(RAW_FILE)).unwrap();
+    let rep = check_dir(&d_miss).unwrap();
+    assert!(rep.raw_missing);
+    assert!(rep.errors.iter().any(|e| e.contains("missing")), "{:?}", rep.errors);
+
+    // 3. Offset gap (re-linked JSONL chain)
+    let d_gap = make_valid("v1-gap");
+    rehash_timeline_for_test(&d_gap, |row| {
+        if row["type"] == "raw_bind" && row["chunk_seq"] == 1 {
+            row["offset"] = serde_json::json!(row["offset"].as_u64().unwrap() + RAW_RECORD_BYTES as u64);
+        } else if row["type"] == "chunk" && row["seq"] == 1 {
+            row["raw_offset"] = serde_json::json!(row["raw_offset"].as_u64().unwrap() + RAW_RECORD_BYTES as u64);
+        }
+    });
+    let rep = check_dir(&d_gap).unwrap();
+    assert!(rep.errors.iter().any(|e| e.contains("leaves a gap")), "{:?}", rep.errors);
+
+    // 4. Offset overlap (re-linked JSONL chain)
+    let d_ov = make_valid("v1-overlap");
+    rehash_timeline_for_test(&d_ov, |row| {
+        if row["type"] == "raw_bind" && row["chunk_seq"] == 1 {
+            row["offset"] = serde_json::json!(row["offset"].as_u64().unwrap() - RAW_RECORD_BYTES as u64);
+        } else if row["type"] == "chunk" && row["seq"] == 1 {
+            row["raw_offset"] = serde_json::json!(row["raw_offset"].as_u64().unwrap() - RAW_RECORD_BYTES as u64);
+        }
+    });
+    let rep = check_dir(&d_ov).unwrap();
+    assert!(rep.errors.iter().any(|e| e.contains("overlaps")), "{:?}", rep.errors);
+
+    // 5. Wrong/v0 layout (72 B / v0 rejected by check-hand)
+    let d_lay = make_valid("v1-bad-layout");
+    rehash_timeline_for_test(&d_lay, |row| {
+        if row["type"] == "header" {
+            row["raw_layout"] = serde_json::json!("v0");
+            row["raw_record_bytes"] = serde_json::json!(72);
+        }
+    });
+    let rep = check_dir(&d_lay).unwrap();
+    assert!(rep.errors.iter().any(|e| e.contains("unsupported raw layout")), "{:?}", rep.errors);
+
+    // 6. Backwards t_us inside raw file (with matching slice sha256 + re-linked chain)
+    let d_tus = make_valid("v1-t-backwards");
+    let mut raw_bytes = std::fs::read(d_tus.join(RAW_FILE)).unwrap();
+    // Overwrite record 1's t_us (bytes 80+8..80+16) to 500 (< record 0's 1_000).
+    let rec1_off = RAW_RECORD_BYTES;
+    raw_bytes[rec1_off + 8..rec1_off + 16].copy_from_slice(&500u64.to_le_bytes());
+    std::fs::write(d_tus.join(RAW_FILE), &raw_bytes).unwrap();
+    let chunk0_len = 250 * RAW_RECORD_BYTES;
+    let new_sha0 = ev::sha256_hex(&raw_bytes[..chunk0_len]);
+    rehash_timeline_for_test(&d_tus, |row| {
+        if row["type"] == "raw_bind" && row["chunk_seq"] == 0 {
+            row["sha256"] = serde_json::json!(new_sha0);
+        } else if row["type"] == "chunk" && row["seq"] == 0 {
+            row["raw_sha256"] = serde_json::json!(new_sha0);
+        }
+    });
+    let rep = check_dir(&d_tus).unwrap();
+    assert!(rep.errors.iter().any(|e| e.contains("decreases below previous")), "{:?}", rep.errors);
+
+    for d in [d_trunc, d_miss, d_gap, d_ov, d_lay, d_tus] {
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+#[test]
+fn checker_resolves_off_bundle_hand_dir_from_checkpoints() {
+    let bundle = tmp("off-bundle-b");
+    let hand = tmp("off-bundle-h");
+    std::fs::create_dir_all(&bundle).unwrap();
+    let mut c = cfg(&hand, true, Some(edge()));
+    c.hand_dir_source = "override".into();
+    let mut tl = HandTimeline::open(c).unwrap();
+    for i in 0..300u64 {
+        tl.on_report(1_000 + i * 4_000, Some(10_000 + i * 40_000), &report(i as u8, 0, 128, i as u32));
+    }
+    let fin = tl.finish(1_500_000).unwrap();
+    let mut chain = ev::CheckpointChain::default();
+    let cp_start = chain.next(100, serde_json::json!({
+        "trigger": "start",
+        "hand_timeline_dir": hand.to_string_lossy(),
+        "hand_timeline_dir_actual": hand.to_string_lossy(),
+        "hand_dir_source": "override",
+        "hand_dir_fallback_reason": Value::Null,
+        "hand_timeline_file": FILE_NAME,
+        "hand_raw_file": RAW_FILE,
+    })).unwrap();
+    let cp_stop = chain.next(200, serde_json::json!({
+        "trigger": "stop",
+        "hand_timeline_dir": hand.to_string_lossy(),
+        "hand_timeline_dir_actual": hand.to_string_lossy(),
+        "hand_dir_source": "override",
+        "hand_dir_fallback_reason": Value::Null,
+        "hand_timeline_file": fin.file,
+        "hand_timeline_sha256": fin.file_sha256,
+        "hand_timeline_head": fin.head,
+        "hand_timeline_chunks": fin.chunks,
+        "hand_raw_file": fin.raw_file,
+        "hand_raw_bytes": fin.raw_bytes,
+    })).unwrap();
+    std::fs::write(
+        bundle.join("checkpoints.jsonl"),
+        format!("{}\n{}\n", ev::jcs(&cp_start).unwrap(), ev::jcs(&cp_stop).unwrap()),
+    ).unwrap();
+
+    assert!(!bundle.join(FILE_NAME).exists());
+    assert_eq!(RAW_LAYOUT, "v1");
+    let rep = check_dir(&bundle).unwrap();
+    assert!(rep.pass(), "{:?}", rep.errors);
+    assert!(rep.stop_bound);
+    assert_eq!(rep.hand_dir.as_deref(), Some(hand.as_path()));
+    assert_eq!(rep.hand_dir_source.as_deref(), Some("override"));
+    let _ = std::fs::remove_dir_all(&bundle);
+    let _ = std::fs::remove_dir_all(&hand);
 }

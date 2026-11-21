@@ -1,6 +1,7 @@
 //! `qorcap-hand-timeline/v0` writer: 1 s windows on the engine clock, each sealed as one JCS no-float
-//! SHA-256 chain link, plus a full-rate raw companion file per window. Platform-neutral (no OS calls besides
-//! plain file writes), so every rule here runs in the Linux and Windows unit tests.
+//! SHA-256 chain link, plus ONE append-only raw USB report file (`hand_raw.v0.bin`) per session.
+//! Platform-neutral (no OS calls besides plain file writes), so every rule here runs in the Linux and
+//! Windows unit tests.
 //!
 //! Window `k` holds every record whose time is in `[k * 1_000_000, (k + 1) * 1_000_000)` us. A window is sealed
 //! once the logger's clock is `SEAL_GRACE_US` past its end (frame arrivals come from the capture thread over
@@ -8,11 +9,13 @@
 //! arrives for an already sealed window goes into the oldest open window with `late: true`, never into a
 //! sealed one, and is counted in that window's `hb`.
 //!
-//! Seal of window `k` (in this order): the `hb` row and the `raw_bind` row are appended to the window's
-//! records; the raw file (if any) is written and synced; then `records_sha256 = SHA-256(JCS([records...]))`,
-//! `head_k = SHA-256(JCS({prev, seq: k, sha256}))`; the records and the `chunk` row are appended to the JSONL
-//! and synced. If that write fails, the file is cut back to its last durable length and the head does not
-//! move: the chain never names bytes that are not on disk.
+//! Seal of window `k` (in this order): the `hb` row and the `raw_bind` row (naming the slice
+//! `raw_file`, `raw_offset`, `raw_len`, `raw_sha256` in `hand_raw.v0.bin`) are appended to the window's
+//! records; the raw slice (if non-empty) is appended to `hand_raw.v0.bin` and synced; then
+//! `records_sha256 = SHA-256(JCS([records...]))`, `head_k = SHA-256(JCS({prev, seq: k, sha256}))`; the
+//! records and the `chunk` row are appended to the JSONL and synced. If either write fails, both files
+//! are cut back to their last durable lengths and the head does not move: the chain never names bytes
+//! that are not on disk.
 
 use super::device::{DeviceInfo, DeviceModel, USB_REPORT_LEN};
 use crate::evidence::{self as ev, GENESIS};
@@ -42,12 +45,16 @@ pub const SCHEMA: &str = "qorcap-hand-timeline/v0";
 pub const SUMMARY_SCHEMA: &str = "qorcap-hand-timeline-summary/v0";
 pub const FILE_NAME: &str = "hand_timeline.v0.jsonl";
 pub const SUMMARY_FILE: &str = "hand_timeline_summary.v0.json";
-pub const RAW_DIR: &str = "hand_raw";
+/// Single append-only raw USB report file per session (no binary header; pure 80 B v1 fixed records from offset 0).
+pub const RAW_FILE: &str = "hand_raw.v0.bin";
+pub const RAW_FILE_HEADER_BYTES: u64 = 0;
 pub const CHUNK_US: u64 = 1_000_000;
 pub const SEAL_GRACE_US: u64 = 250_000;
-/// One raw record: the 64 B report exactly as read, then the QPC tick count at the read (u64 LE, 0 = UNMEASURED).
-pub const RAW_RECORD_BYTES: usize = USB_REPORT_LEN + 8;
-pub const RAW_LAYOUT: &str = "64 B USB input report 0x01 as read, then u64 LE QPC ticks at the read (0 = UNMEASURED)";
+/// One raw record (v1, 80 B): u64_le qpc_ticks (0 = UNMEASURED) + u64_le t_us (engine Instant) + 64 B 0x01 report.
+/// Storing t_us alongside QPC ticks enables measuring the Instant-vs-QPC residual once benchmarked (until then UNMEASURED).
+pub const RAW_RECORD_BYTES: usize = 8 + 8 + USB_REPORT_LEN;
+pub const RAW_LAYOUT: &str = "v1";
+pub const RAW_LAYOUT_SPEC: &str = "u64_le qpc_ticks (0 = UNMEASURED) + u64_le t_us + 64 B USB input report 0x01; 0 B file header";
 pub const STALE_GAP_US: u64 = crate::inputs::STALE_RX_GAP_US;
 pub const STALL_US: u64 = 2_000_000;
 pub const ANALOG_MIN_GAP_US: u64 = crate::inputs::ANALOG_MIN_GAP_US;
@@ -66,6 +73,9 @@ pub struct Qpc { pub freq_hz: u64, pub origin_ticks: u64, pub origin_t_us: u64 }
 #[derive(Debug, Clone)]
 pub struct Config {
     pub dir: PathBuf,
+    /// `"default_d"` | `"override"` | `"fallback_bundle"` | `"direct"` (tests).
+    pub hand_dir_source: String,
+    pub hand_dir_fallback_reason: Option<String>,
     pub raw_usb: bool,
     /// Raw logging pauses for the rest of the session when free space drops below this (checked every 30 windows).
     pub raw_min_free_bytes: Option<u64>,
@@ -100,6 +110,8 @@ pub struct Finish {
     pub chunks: u64,
     pub summary_sha256: Option<String>,
     pub raw_usb: bool,
+    pub raw_file: Option<String>,
+    pub raw_bytes: u64,
     pub frame_drops: u64,
 }
 
@@ -108,6 +120,8 @@ pub struct HandTimeline {
     path: PathBuf,
     file: File,
     durable_len: u64,
+    raw_file: Option<File>,
+    raw_offset: u64,
     open: BTreeMap<u64, Window>,
     next_seal: u64,
     first_seq: u64,
@@ -148,10 +162,21 @@ impl HandTimeline {
         let path = cfg.dir.join(FILE_NAME);
         let file = open_private_new(&path, true)
             .map_err(|e| format!("hand timeline: cannot create {}: {e}", path.display()))?;
-        if cfg.raw_usb { std::fs::create_dir_all(cfg.dir.join(RAW_DIR)).map_err(|e| format!("hand timeline: cannot create {RAW_DIR}: {e}"))?; }
+        let raw_file = if cfg.raw_usb {
+            let rp = cfg.dir.join(RAW_FILE);
+            match open_private_new(&rp, true) {
+                Ok(f) => Some(f),
+                Err(e) => {
+                    let _ = std::fs::remove_file(&path);
+                    return Err(format!("hand raw file {RAW_FILE}: cannot create {}: {e}", rp.display()));
+                }
+            }
+        } else {
+            None
+        };
         let first = cfg.start_t_us / CHUNK_US;
         let mut me = Self {
-            path, file, durable_len: 0, open: BTreeMap::new(), next_seal: first, first_seq: first, head: GENESIS.to_string(),
+            path, file, durable_len: 0, raw_file, raw_offset: 0, open: BTreeMap::new(), next_seal: first, first_seq: first, head: GENESIS.to_string(),
             last_sealed: None, chunks: 0, epoch: 0, device: None, connected: false, connected_at: 0, stalled: false,
             last_rx: None, last_counter: None, last_hw: None, last_in_t: None, last_in_key: None, prev_combos: 0,
             disk_faults: 0, raw_pause: None, latest_t: cfg.start_t_us, closed: false, models_seen: vec![], reports: 0, in_rows: 0, frames: 0, last_state: String::new(), last_detail: String::new(), frame_drops: 0,
@@ -177,8 +202,13 @@ impl HandTimeline {
             "clock_note": "t_us is the QorCap engine Instant (Windows: QueryPerformanceCounter), the same clock as inputs.jsonl t_us and frame_clock.jsonl t_mono_us. wall_anchor_ms is a label only.",
             "qpc": qpc, "wall_anchor_ms": n(c.wall_anchor_ms), "chunk_duration_us": CHUNK_US, "seal_grace_us": SEAL_GRACE_US,
             "lane": "practice", "transport": "usb-hid", "report_id": 1, "report_bytes": USB_REPORT_LEN as u64,
-            "raw_usb": c.raw_usb, "raw_dir": if c.raw_usb { json!(RAW_DIR) } else { Value::Null },
-            "raw_record_bytes": RAW_RECORD_BYTES as u64, "raw_layout": RAW_LAYOUT,
+            "raw_usb": c.raw_usb,
+            "raw_file": if c.raw_usb { json!(RAW_FILE) } else { Value::Null },
+            "raw_file_header_bytes": RAW_FILE_HEADER_BYTES,
+            "raw_record_bytes": RAW_RECORD_BYTES as u64, "raw_layout": RAW_LAYOUT, "raw_layout_spec": RAW_LAYOUT_SPEC,
+            "hand_dir": c.dir.to_string_lossy(),
+            "hand_dir_source": if c.hand_dir_source.is_empty() { "direct" } else { c.hand_dir_source.as_str() },
+            "hand_dir_fallback_reason": c.hand_dir_fallback_reason,
             "in_rows": "change-logged: every button change, analog changes at most every analog_min_gap_us; the raw file has every report",
             "analog_min_gap_us": ANALOG_MIN_GAP_US,
             "frame_clock": if c.frame_clock_on { "on" } else { "off: frame alignment UNMEASURED" },
@@ -298,8 +328,9 @@ impl HandTimeline {
         {
             let w = self.window(t).0;
             if raw_on {
-                w.raw.extend_from_slice(raw);
                 w.raw.extend_from_slice(&ticks.unwrap_or(0).to_le_bytes());
+                w.raw.extend_from_slice(&t.to_le_bytes());
+                w.raw.extend_from_slice(raw);
                 w.raw_n += 1;
             }
             let hb = &mut w.hb;
@@ -416,6 +447,8 @@ impl HandTimeline {
             raw_usb: self.cfg.raw_usb && self.raw_pause.is_none(),
             epoch: self.epoch,
             frame_drops: self.frame_drops,
+            hand_dir: Some(self.cfg.dir.to_string_lossy().into_owned()),
+            hand_dir_source: Some(if self.cfg.hand_dir_source.is_empty() { "direct".into() } else { self.cfg.hand_dir_source.clone() }),
         }
     }
     pub fn disk_faults(&self) -> u64 { self.disk_faults }
@@ -448,43 +481,82 @@ impl HandTimeline {
             "in_rows": hb.in_rows, "frames_in_chunk": hb.frames, "pes_reads": hb.pes_reads, "late_records": hb.late,
             "frame_drops": hb.frame_drops, "raw_reports": w.raw_n, "disk_faults_total": self.disk_faults,
             "counter_note": "seq_breaks / hw_stalls are diagnostic only, not packet-loss evidence on their own"});
-        let fname = format!("w{seq:010}.bin");
-        let (raw_file, raw_sha) = if self.cfg.raw_usb && w.raw_n > 0 {
-            let p = self.cfg.dir.join(RAW_DIR).join(&fname);
-            let written = open_private_new(&p, false).and_then(|mut f| { f.write_all(&w.raw)?; f.sync_all() });
-            if let Err(e) = written {
-                self.disk_faults += 1;
-                self.open.insert(seq, w);
-                return Err(format!("hand raw file {fname}: {e}"));
+        let prev_raw_offset = self.raw_offset;
+        let active_raw = self.cfg.raw_usb && (pause.is_none() || w.raw_n > 0);
+        let (raw_file_name, raw_offset, raw_len, raw_sha) = if active_raw {
+            let len = w.raw.len() as u64;
+            if len > 0 {
+                let Some(rf) = self.raw_file.as_mut() else {
+                    self.disk_faults += 1;
+                    self.open.insert(seq, w);
+                    return Err(format!("hand raw file {RAW_FILE}: handle not open"));
+                };
+                let written = rf.write_all(&w.raw).and_then(|_| rf.flush()).and_then(|_| rf.sync_data());
+                if let Err(e) = written {
+                    self.disk_faults += 1;
+                    let _ = rf.set_len(prev_raw_offset);
+                    self.open.insert(seq, w);
+                    return Err(format!("hand raw file {RAW_FILE}: {e}"));
+                }
             }
-            (Some(format!("{RAW_DIR}/{fname}")), Some(ev::sha256_hex(&w.raw)))
-        } else { (None, None) };
-        let raw_bind = json!({"type": "raw_bind", "chunk_seq": seq, "raw_usb": self.cfg.raw_usb, "paused": pause,
-            "file": raw_file, "sha256": raw_sha, "n_reports": w.raw_n, "bytes": w.raw.len() as u64, "record_bytes": RAW_RECORD_BYTES as u64});
+            (Some(RAW_FILE), Some(prev_raw_offset), Some(len), Some(ev::sha256_hex(&w.raw)))
+        } else {
+            (None, None, None, None)
+        };
+        let raw_bind = json!({
+            "type": "raw_bind", "chunk_seq": seq, "raw_usb": self.cfg.raw_usb, "paused": pause,
+            "file": raw_file_name, "offset": raw_offset, "len": raw_len, "sha256": raw_sha,
+            "n_reports": w.raw_n, "bytes": w.raw.len() as u64, "record_bytes": RAW_RECORD_BYTES as u64, "layout": RAW_LAYOUT,
+        });
         let mut records = w.records.clone();
         records.push(hb_rec);
         records.push(raw_bind);
         let sha = match ev::try_jcs_sha(&Value::Array(records.clone())) {
             Ok(s) => s,
-            Err(e) => { self.disk_faults += 1; self.open.insert(seq, w); return Err(format!("hand window {seq} not JCS-safe: {e}")); }
+            Err(e) => {
+                self.disk_faults += 1;
+                if raw_len.unwrap_or(0) > 0 {
+                    if let Some(rf) = self.raw_file.as_mut() { let _ = rf.set_len(prev_raw_offset); let _ = rf.sync_data(); }
+                }
+                self.open.insert(seq, w);
+                return Err(format!("hand window {seq} not JCS-safe: {e}"));
+            }
         };
         let prev = self.head.clone();
         let head = ev::link(&prev, seq, &sha);
-        let chunk = json!({"type": "chunk", "seq": seq, "t_start_us": seq * CHUNK_US, "t_end_us": (seq + 1) * CHUNK_US, "n": records.len() as u64,
+        let chunk = json!({
+            "type": "chunk", "seq": seq, "t_start_us": seq * CHUNK_US, "t_end_us": (seq + 1) * CHUNK_US, "n": records.len() as u64,
             "sha256": sha, "prev": prev, "head": head, "partial": partial, "device_model": model, "fallback": fallback,
-            "raw_file": raw_file, "raw_sha256": raw_sha,
+            "raw_file": raw_file_name, "raw_offset": raw_offset, "raw_len": raw_len, "raw_sha256": raw_sha,
             "health": {"pad_connected": pad_connected, "epoch": self.epoch, "rx_delta": w.hb.rx_delta, "max_rx_gap_us": w.hb.max_gap,
-                "faults": faults, "frame_clock_present": self.cfg.frame_clock_on, "frames_count": w.hb.frames, "frame_drops": w.hb.frame_drops}});
+                "faults": faults, "frame_clock_present": self.cfg.frame_clock_on, "frames_count": w.hb.frames, "frame_drops": w.hb.frame_drops}
+        });
         let mut text = String::new();
         for r in records.iter().chain(std::iter::once(&chunk)) {
-            match ev::jcs(r) { Ok(s) => { text.push_str(&s); text.push('\n'); } Err(e) => { self.disk_faults += 1; self.open.insert(seq, w); return Err(e); } }
+            match ev::jcs(r) {
+                Ok(s) => { text.push_str(&s); text.push('\n'); }
+                Err(e) => {
+                    self.disk_faults += 1;
+                    if raw_len.unwrap_or(0) > 0 {
+                        if let Some(rf) = self.raw_file.as_mut() { let _ = rf.set_len(prev_raw_offset); let _ = rf.sync_data(); }
+                    }
+                    self.open.insert(seq, w);
+                    return Err(e);
+                }
+            }
         }
         let written = self.file.write_all(text.as_bytes()).and_then(|_| self.file.flush()).and_then(|_| self.file.sync_data());
         if let Err(e) = written {
             self.disk_faults += 1;
             let _ = self.file.set_len(self.durable_len);
+            if raw_len.unwrap_or(0) > 0 {
+                if let Some(rf) = self.raw_file.as_mut() { let _ = rf.set_len(prev_raw_offset); let _ = rf.sync_data(); }
+            }
             self.open.insert(seq, w);
             return Err(format!("hand timeline write: {e}"));
+        }
+        if let Some(len) = raw_len {
+            self.raw_offset = prev_raw_offset + len;
         }
         self.durable_len += text.len() as u64;
         self.head = head;
@@ -506,8 +578,13 @@ impl HandTimeline {
         self.closed = true;
         let bytes = std::fs::read(&self.path).map_err(|e| format!("hand timeline re-read: {e}"))?;
         let file_sha256 = ev::sha256_hex(&bytes);
+        let raw_file_str = if self.cfg.raw_usb { Some(RAW_FILE.to_string()) } else { None };
         let summary = json!({"schema": SUMMARY_SCHEMA, "file": FILE_NAME, "sha256": file_sha256, "head": self.head,
             "first_seq": self.first_seq, "last_seq": self.last_sealed, "chunks": self.chunks, "raw_usb": self.cfg.raw_usb, "raw_paused": self.raw_pause,
+            "raw_file": raw_file_str, "raw_bytes": self.raw_offset, "raw_record_bytes": RAW_RECORD_BYTES as u64, "raw_layout": RAW_LAYOUT,
+            "hand_dir": self.cfg.dir.to_string_lossy(),
+            "hand_dir_source": if self.cfg.hand_dir_source.is_empty() { "direct" } else { self.cfg.hand_dir_source.as_str() },
+            "hand_dir_fallback_reason": self.cfg.hand_dir_fallback_reason,
             "device_models_seen": self.models_seen, "fallback": self.models_seen.contains(&"dualsense"), "epochs": self.epoch,
             "reports": self.reports, "in_rows": self.in_rows, "frames": self.frames, "frame_drops": self.frame_drops, "disk_faults": self.disk_faults,
             "frame_clock": if self.cfg.frame_clock_on { "on" } else { "off: frame alignment UNMEASURED" },
@@ -518,6 +595,6 @@ impl HandTimeline {
             .ok().map(|_| ev::sha256_hex(text.as_bytes()));
         Ok(Finish { file: FILE_NAME.into(), file_sha256, head: self.head.clone(), first_seq: Some(self.first_seq).filter(|_| self.chunks > 0),
             last_seq: self.last_sealed, chunks: self.chunks, summary_sha256, raw_usb: self.cfg.raw_usb && self.raw_pause.is_none(),
-            frame_drops: self.frame_drops })
+            raw_file: raw_file_str, raw_bytes: self.raw_offset, frame_drops: self.frame_drops })
     }
 }
