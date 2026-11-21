@@ -21,6 +21,8 @@ pub struct Report {
     pub raw_files: u64,
     pub segment_bindings: u64,
     pub stop_bound: bool,
+    /// True when checkpoints record `hand_timeline: false` and there is no file (a normal off session).
+    pub off: bool,
     pub errors: Vec<String>,
     pub warnings: Vec<String>,
 }
@@ -28,8 +30,35 @@ impl Report { pub fn pass(&self) -> bool { self.errors.is_empty() } }
 
 fn t_of(r: &Value) -> Option<u64> { r.get("t_us").and_then(Value::as_u64).or_else(|| r.get("t_arrival_us").and_then(Value::as_u64)) }
 
+/// Flags recorded on checkpoints in `dir`: `(hand_timeline == false, raw_usb == false, a stop sha is bound)`.
+pub fn checkpoint_flags(dir: &Path) -> (bool, bool, bool) {
+    let mut hand_off = false;
+    let mut raw_off = false;
+    let mut has_sha = false;
+    let Ok(cps) = std::fs::read_to_string(dir.join("checkpoints.jsonl")) else { return (false, false, false) };
+    for line in cps.lines().filter(|l| !l.trim().is_empty()) {
+        let Ok(cp) = serde_json::from_str::<Value>(line) else { continue };
+        let q = &cp["qorcap"];
+        if q.get("hand_timeline") == Some(&Value::Bool(false)) { hand_off = true; }
+        if q.get("raw_usb") == Some(&Value::Bool(false)) { raw_off = true; }
+        if q["hand_timeline_sha256"].is_string() { has_sha = true; }
+    }
+    (hand_off, raw_off, has_sha)
+}
+
 pub fn check_dir(dir: &Path) -> Result<Report, String> {
     let path = dir.join(FILE_NAME);
+    if !path.exists() {
+        let (hand_off, _, has_sha) = checkpoint_flags(dir);
+        if hand_off && !has_sha {
+            // A normal off session: no file, and the stop/start checkpoint says so. Not tampered, not a failure.
+            return Ok(Report { off: true, ..Default::default() });
+        }
+        if hand_off && has_sha {
+            return Ok(Report { off: true, errors: vec!["checkpoints mark hand_timeline false but also bind a file that is missing".into()], ..Default::default() });
+        }
+        return Err(format!("{FILE_NAME}: not found"));
+    }
     let bytes = std::fs::read(&path).map_err(|e| format!("{FILE_NAME}: {e}"))?;
     let mut r = Report { file_sha256: ev::sha256_hex(&bytes), head: GENESIS.to_string(), ..Default::default() };
     let text = String::from_utf8(bytes).map_err(|_| format!("{FILE_NAME} is not UTF-8"))?;
@@ -158,6 +187,12 @@ pub fn check_dir(dir: &Path) -> Result<Report, String> {
 
 /// Printable lines and the exit code (0 PASS, 1 FAIL).
 pub fn report_lines(r: &Report) -> (Vec<String>, i32) {
+    if r.off && r.chunks == 0 {
+        let mut out = vec![format!("hand timeline: {} (off for this session; not a failure)", if r.pass() { "PASS" } else { "FAIL" })];
+        out.extend(r.errors.iter().map(|e| format!("  error: {}", crate::bundle::escape_output(e))));
+        out.extend(r.warnings.iter().map(|w| format!("  warning: {}", crate::bundle::escape_output(w))));
+        return (out, if r.pass() { 0 } else { 1 });
+    }
     let mut out = vec![format!("hand timeline: {} chunks={} head={} file_sha256={} raw_files={} segment_bindings={} stop_bound={}{}",
         if r.pass() { "PASS" } else { "FAIL" }, r.chunks, r.head, r.file_sha256, r.raw_files, r.segment_bindings, r.stop_bound,
         if r.fallback { " device=dualsense (fallback)" } else { "" })];

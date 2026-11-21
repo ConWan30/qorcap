@@ -276,3 +276,61 @@ fn logger_thread_with_a_mock_source_reconnects_as_a_new_epoch_and_finishes() {
     assert!(rep.device_models.contains(&"dualsense".to_string()) || rep.fallback);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn check_treats_an_off_session_as_a_pass_not_a_failure() {
+    let dir = tmp("check-off");
+    std::fs::create_dir_all(&dir).unwrap();
+    // Durable off flag on a stop checkpoint (the engine's extra `qorcap` key). No hand file.
+    let cp = ev::jcs(&serde_json::json!({
+        "seq": 0, "t_ms": 1, "frames_hash": "00".repeat(32), "input_hash": null, "prev": ev::GENESIS,
+        "qorcap": {"trigger": "stop", "hand_timeline": false}
+    })).unwrap();
+    // The real checkpoint hash is not needed: the hand checker only reads the qorcap extras.
+    std::fs::write(dir.join("checkpoints.jsonl"), format!("{cp}\n")).unwrap();
+    let rep = check_dir(&dir).unwrap();
+    assert!(rep.pass() && rep.off, "off session must not be treated as tampered or failed: {:?}", rep.errors);
+    let (lines, code) = qorcap::hand::check::report_lines(&rep);
+    assert_eq!(code, 0);
+    assert!(lines[0].contains("off for this session"), "{lines:?}");
+    // A dir with no file and no off flag is still an error (not silently passed).
+    let empty = tmp("check-missing");
+    std::fs::create_dir_all(&empty).unwrap();
+    let err = check_dir(&empty).unwrap_err();
+    assert!(err.contains("not found"), "{err}");
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&empty);
+}
+
+fn spawn_failsoft(name: &str, open: impl Fn() -> OpenOutcome + Send + 'static) -> (PathBuf, qorcap::hand::timeline::Finish, Vec<Value>) {
+    let dir = tmp(&format!("failsoft-{name}"));
+    let clock = Instant::now();
+    let mut c = cfg(&dir, true, None);
+    c.start_t_us = 0;
+    let h = logger::spawn(c, clock, open, || None).unwrap();
+    assert_eq!(h.live().state, name, "{name} is visible on the live status at once");
+    let end = Instant::now() + Duration::from_secs(5);
+    while h.binding().is_none() && Instant::now() < end { std::thread::sleep(Duration::from_millis(20)); }
+    let fin = h.finish(Duration::from_secs(5)).unwrap();
+    let recs = lines(&dir);
+    (dir, fin, recs)
+}
+
+#[test]
+fn missing_or_rejected_device_is_recorded_and_never_blocks_the_session() {
+    let (dir, fin, recs) = spawn_failsoft("missing", || OpenOutcome::Missing("no DualSense on wired USB".into()));
+    assert!(fin.chunks >= 1, "missing still seals so capture can stop");
+    assert!(recs.iter().any(|r| r["type"] == "status" && r["state"] == "missing"), "{recs:?}");
+    assert!(recs.iter().any(|r| r["type"] == "hb" && r["pad_connected"] == false));
+    assert!(check_dir(&dir).unwrap().pass());
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let (dir, fin, recs) = spawn_failsoft("rejected_transport", || OpenOutcome::Rejected {
+        state: "rejected_transport", detail: "dualsense_edge over Bluetooth; wired USB only".into(),
+    });
+    assert!(fin.chunks >= 1, "rejected still seals so capture can stop");
+    assert!(recs.iter().any(|r| r["type"] == "status" && r["state"] == "rejected_transport"), "{recs:?}");
+    assert!(recs.iter().any(|r| r["type"] == "hb" && r["pad_connected"] == false));
+    assert!(check_dir(&dir).unwrap().pass());
+    let _ = std::fs::remove_dir_all(&dir);
+}

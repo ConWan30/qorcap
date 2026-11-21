@@ -591,7 +591,7 @@ fn main() {
             }
             let e = Engine::new(a.clone(), ff);
             if a.no_controller { info!("controller input logging disabled (--no-controller)"); } else { let _ = e.start_input_logger(); }
-            // Practice lane only, default off (--hand-timeline). Refused with a log line otherwise.
+            // Practice lane only, default on. `--no-hand-timeline` switches it off for the session. Refused outside practice.
             let _ = e.start_hand_logger();
             let srv = match api::serve(e.clone(), cli.port) { Ok(h) => h, Err(m) => { error!("{m}"); std::process::exit(2); } };
             { let e = e.clone(); let _ = ctrlc::set_handler(move || { info!("Ctrl+C: stopping"); e.request_stop("ctrl_c"); }); }

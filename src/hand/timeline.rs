@@ -85,6 +85,7 @@ pub struct Finish {
     pub last_seq: Option<u64>,
     pub chunks: u64,
     pub summary_sha256: Option<String>,
+    pub raw_usb: bool,
 }
 
 pub struct HandTimeline {
@@ -117,6 +118,8 @@ pub struct HandTimeline {
     reports: u64,
     in_rows: u64,
     frames: u64,
+    last_state: String,
+    last_detail: String,
 }
 
 fn n(v: u64) -> Value { if v <= JCS_MAX { json!(v) } else { Value::Null } }
@@ -135,7 +138,7 @@ impl HandTimeline {
             path, file, durable_len: 0, open: BTreeMap::new(), next_seal: first, first_seq: first, head: GENESIS.to_string(),
             last_sealed: None, chunks: 0, epoch: 0, device: None, connected: false, connected_at: 0, stalled: false,
             last_rx: None, last_counter: None, last_hw: None, last_in_t: None, last_in_key: None, prev_combos: 0,
-            disk_faults: 0, raw_pause: None, latest_t: cfg.start_t_us, closed: false, models_seen: vec![], reports: 0, in_rows: 0, frames: 0,
+            disk_faults: 0, raw_pause: None, latest_t: cfg.start_t_us, closed: false, models_seen: vec![], reports: 0, in_rows: 0, frames: 0, last_state: String::new(), last_detail: String::new(),
             cfg,
         };
         let header = me.header();
@@ -211,6 +214,8 @@ impl HandTimeline {
             "edge_fields": if d.model.edge_fields_measured() { "MEASURED" } else { UNMEASURED },
             "vid": d.vid, "pid": d.pid, "usb_bcd_device": d.bcd_device, "pad_id": d.pad_id});
         self.device = Some(d);
+        self.last_state = "connected".into();
+        self.last_detail.clear();
         self.push(t, rec);
     }
 
@@ -219,6 +224,8 @@ impl HandTimeline {
         if self.closed { return; }
         self.advance(t);
         if matches!(state, "unplugged" | "missing") { self.connected = false; }
+        self.last_state = state.to_string();
+        self.last_detail = detail.to_string();
         let rec = json!({"type": "status", "t_us": n(t), "epoch": self.epoch, "state": state, "detail": detail});
         self.push(t, rec);
     }
@@ -363,6 +370,18 @@ impl HandTimeline {
 
     /// `(seq, head)` of the newest durable chunk, for segment checkpoints. `None` before the first seal.
     pub fn binding(&self) -> Option<(u64, String)> { self.last_sealed.map(|s| (s, self.head.clone())) }
+
+    /// Live state for `/status` and the log (`connected` / `missing` / `unplugged` / `stalled` / …).
+    pub fn live(&self) -> crate::hand::LiveStatus {
+        crate::hand::LiveStatus {
+            state: if self.last_state.is_empty() { "missing".into() } else { self.last_state.clone() },
+            detail: if self.last_detail.is_empty() { None } else { Some(self.last_detail.clone()) },
+            device_model: self.device.as_ref().map(|d| d.model.label().to_string()),
+            fallback: self.device.as_ref().map(|d| d.model.fallback()).unwrap_or(false),
+            raw_usb: self.cfg.raw_usb && self.raw_pause.is_none(),
+            epoch: self.epoch,
+        }
+    }
     pub fn disk_faults(&self) -> u64 { self.disk_faults }
     pub fn path(&self) -> &Path { &self.path }
 
@@ -460,6 +479,6 @@ impl HandTimeline {
         let text = format!("{}\n", serde_json::to_string_pretty(&summary).unwrap_or_else(|_| "{}".into()));
         let summary_sha256 = std::fs::write(self.cfg.dir.join(SUMMARY_FILE), &text).ok().map(|_| ev::sha256_hex(text.as_bytes()));
         Ok(Finish { file: FILE_NAME.into(), file_sha256, head: self.head.clone(), first_seq: Some(self.first_seq).filter(|_| self.chunks > 0),
-            last_seq: self.last_sealed, chunks: self.chunks, summary_sha256 })
+            last_seq: self.last_sealed, chunks: self.chunks, summary_sha256, raw_usb: self.cfg.raw_usb && self.raw_pause.is_none() })
     }
 }

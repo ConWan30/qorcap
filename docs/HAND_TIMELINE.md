@@ -1,14 +1,29 @@
 # Hand timeline (`qorcap-hand-timeline/v0`), practice lane only
 
-A read-only controller input log clocked to the video. Default **off**. It runs only with
-`--hand-timeline` (or `QORCAP_HAND_TIMELINE=1`) **and** the practice lane (`--practice-lane` or
-`QORCAP_LANE=practice`) **and** a bundle folder **and** the controller on. Outside the practice lane it is refused
-with a log line, and nothing is opened or written. REAL MATCH runs, `receipt.v0`, `contracts/`, `schema/`,
-`seal.rs` and `bundle.rs` are unchanged. Practice still has no referee submit, upload or gold.
+A read-only controller input log clocked to the video. In the **practice lane it is on by default**. Switch it
+off for one session with `--no-hand-timeline` (or `QORCAP_HAND_TIMELINE=0`). `--hand-timeline` (or a true env
+word) is a no-op alias in practice (already on) and is refused outside the practice lane. It also needs a
+bundle folder and the controller on. Outside the practice lane (REAL MATCH and the default lane) nothing is
+opened or written and no checkpoint key is added, so those runs stay byte-identical. `receipt.v0`,
+`contracts/`, `schema/`, `seal.rs` and `bundle.rs` are unchanged. Practice still has no referee submit, upload
+or gold.
+
+An off session is a normal session: the start and stop checkpoints record `hand_timeline: false` (extra
+`qorcap` keys), no hand file is written, and `qorcap check-hand-timeline` and `verify-bundle` treat it as a
+PASS, not as tampered or failed.
+
+Fail-soft: with no pad or the wrong device the logger records `missing` or `rejected_transport` (alignment
+UNMEASURED) and never blocks or voids capture.
+
+Visible status (SCOPE-edge-logger §7.4): the live state (`connected` / `missing` / `unplugged` / `stalled` /
+`rejected_transport` / `off`) is on `GET /status` as `hand` (practice only; the field is omitted outside
+practice, so REAL MATCH `/status` is unchanged) and is written to the log as `HAND TIMELINE: …`. There is no
+silent background run: the logger starts only from an explicit practice capture (`qorcap record --practice-lane`,
+or `QORCAP_LANE=practice`). `qorcap status` against that recorder shows the same object.
 
 Scope documents (QorArch, 2026-11-20): `SCOPE-edge-logger.md` (02144d1c…4cf0), `SCOPE-hand-timeline.md`
 (f0046d44…69de), `ADDENDUM-hand-timeline-qorai-1.md` (46ee68cf…e71e1), `ADDENDUM-hand-network-con-answers-1.md`
-(b8e94883…c9a8).
+(b8e94883…c9a8), `ADDENDUM-hand-network-con-answers-1-amend-1.md` (5084fe59…2d718).
 
 ## Files (beside the bundle)
 
@@ -18,10 +33,10 @@ Scope documents (QorArch, 2026-11-20): `SCOPE-edge-logger.md` (02144d1c…4cf0),
 | `hand_raw/wNNNNNNNNNN.bin` | Raw companion for window N: every USB input report 0x01 (64 B as read) + u64 LE QPC ticks = 72 B per report. Written only when the window has reports. |
 | `hand_timeline_summary.v0.json` | At stop: file SHA-256, last head, chunk count, device models seen, fallback flag. |
 
-Raw logging is **on by default** whenever the hand timeline runs (so in the practice lane only). Switch it off for
-one session with `--no-raw-usb` (or `QORCAP_RAW_USB=0`); the header then says `raw_usb: false` and no `hand_raw/`
-folder is made. Raw logging pauses (`paused: "disk_low"`) if free space drops below `--min-free-gb`. Raw files
-stay on the local PC.
+Raw logging is **on by default** whenever the hand timeline runs. Switch it off for one session with
+`--no-raw-usb` (or `QORCAP_RAW_USB=0`); the header and the stop checkpoint then say `raw_usb: false` and no
+`hand_raw/` folder is made. Raw logging pauses (`paused: "disk_low"`) if free space drops below `--min-free-gb`.
+Raw files stay on the local PC.
 
 ## Windows and the chain
 
@@ -43,7 +58,9 @@ Checkpoints are written by `engine.rs` (`checkpoint_with`), and their `qorcap` o
 - every segment checkpoint: `hand_chunk_seq`, `hand_head` (newest durable window at the segment close; `null`
   before the first window is sealed);
 - the stop checkpoint: `hand_timeline_sha256` (whole file), `hand_timeline_head`, `hand_timeline_file`,
-  `hand_timeline_chunks` (or `hand_timeline_error`).
+  `hand_timeline_chunks`, `raw_usb` (or `hand_timeline_error`);
+- an off session (`--no-hand-timeline`): the start and stop checkpoints carry `hand_timeline: false` only. No
+  file, no `hand_chunk_seq` / `hand_head` / sha keys.
 
 `qorcap check-hand-timeline DIR` re-hashes every window, re-links the chain, re-hashes every raw file, checks that
 each `in` row's `raw_sha256` is in that window's raw file, and compares the checkpoint keys. `verify-bundle` is

@@ -7,6 +7,8 @@ use super::device::DeviceInfo;
 use super::source::{OpenOutcome, ReadOutcome};
 use super::timeline::{Config, Finish, HandTimeline};
 use crate::frameclock::FrameStamp;
+use crate::hand::LiveStatus;
+use log::{info, warn};
 use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -21,6 +23,7 @@ enum Msg { Frames(Vec<FrameStamp>), Stop }
 pub struct HandHandle {
     tx: Sender<Msg>,
     snap: Arc<Mutex<Option<(u64, String)>>>,
+    live: Arc<Mutex<LiveStatus>>,
     join: Mutex<Option<std::thread::JoinHandle<Result<Finish, String>>>>,
     done: Mutex<Option<Result<Finish, String>>>,
 }
@@ -33,6 +36,8 @@ impl HandHandle {
     }
     /// Newest durable hand chunk `(seq, head)` for a segment checkpoint.
     pub fn binding(&self) -> Option<(u64, String)> { self.snap.lock().unwrap_or_else(|e| e.into_inner()).clone() }
+    /// Live logger state for `GET /status` (never waits on disk).
+    pub fn live(&self) -> LiveStatus { self.live.lock().unwrap_or_else(|e| e.into_inner()).clone() }
     /// Stop the logger, seal the trailing window and return the file digest. Bounded wait; idempotent.
     pub fn finish(&self, wait: Duration) -> Result<Finish, String> {
         if let Some(r) = self.done.lock().unwrap_or_else(|e| e.into_inner()).clone() { return r; }
@@ -64,23 +69,46 @@ where O: FnMut() -> OpenOutcome + Send + 'static, Q: Fn() -> Option<u64> + Send 
     }
     let mut tl = HandTimeline::open(cfg)?;
     if let Some((s, d)) = &first_status { tl.on_status(us(), s, d); }
+    log_state(&tl.live());
+    let live = Arc::new(Mutex::new(tl.live()));
+    let live2 = Arc::clone(&live);
     let (tx, rx) = channel::<Msg>();
     let snap = Arc::new(Mutex::new(None));
     let snap2 = Arc::clone(&snap);
     let join = std::thread::Builder::new().name("qorcap-hand".into()).spawn(move || {
         #[cfg(windows)]
         super::win::raise_thread_priority();
-        run(&mut tl, rx, &snap2, us, &mut open, qpc_now, first_src.map(|(s, _)| s), first_status.map(|(s, _)| s))
+        run(&mut tl, rx, &snap2, &live2, us, &mut open, qpc_now, first_src.map(|(s, _)| s), first_status.map(|(s, _)| s))
     }).map_err(|e| format!("hand logger thread: {e}"))?;
-    Ok(HandHandle { tx, snap, join: Mutex::new(Some(join)), done: Mutex::new(None) })
+    Ok(HandHandle { tx, snap, live, join: Mutex::new(Some(join)), done: Mutex::new(None) })
 }
 
-fn run<O, Q, U>(tl: &mut HandTimeline, rx: Receiver<Msg>, snap: &Mutex<Option<(u64, String)>>, us: U, open: &mut O, qpc_now: Q,
+fn log_state(st: &LiveStatus) {
+    let extra = st.detail.as_deref().map(|d| format!(" ({d})")).unwrap_or_default();
+    let msg = format!("HAND TIMELINE: {}{extra}", st.state);
+    if matches!(st.state.as_str(), "connected") { info!("{msg}"); } else { warn!("{msg}"); }
+}
+
+fn publish_live(tl: &HandTimeline, live: &Mutex<LiveStatus>) {
+    let st = tl.live();
+    let mut g = live.lock().unwrap_or_else(|e| e.into_inner());
+    if *g != st {
+        log_state(&st);
+        *g = st;
+    }
+}
+
+fn run<O, Q, U>(tl: &mut HandTimeline, rx: Receiver<Msg>, snap: &Mutex<Option<(u64, String)>>, live: &Mutex<LiveStatus>, us: U, open: &mut O, qpc_now: Q,
     mut src: Option<Box<dyn super::source::ReportSource>>, first_state: Option<&'static str>) -> Result<Finish, String>
 where O: FnMut() -> OpenOutcome, Q: Fn() -> Option<u64>, U: Fn() -> u64 {
     let mut buf = [0u8; 128];
     let mut last_state: Option<String> = first_state.map(str::to_string);
-    let publish = |tl: &HandTimeline| { let b = tl.binding(); let mut g = snap.lock().unwrap_or_else(|e| e.into_inner()); if *g != b { *g = b; } };
+    let publish = |tl: &HandTimeline| {
+        let b = tl.binding();
+        let mut g = snap.lock().unwrap_or_else(|e| e.into_inner());
+        if *g != b { *g = b; }
+        publish_live(tl, live);
+    };
     // Drain frames; Some(true) = stop asked.
     let drain = |tl: &mut HandTimeline, rx: &Receiver<Msg>, wait: Duration| -> bool {
         let mut first = true;
@@ -93,10 +121,10 @@ where O: FnMut() -> OpenOutcome, Q: Fn() -> Option<u64>, U: Fn() -> u64 {
     'outer: loop {
         match src.as_mut() {
             None => match open() {
-                OpenOutcome::Open(s, info) => { tl.on_connected(us(), info); src = Some(s); last_state = Some("connected".into()); }
+                OpenOutcome::Open(s, info) => { tl.on_connected(us(), info); src = Some(s); last_state = Some("connected".into()); publish(tl); }
                 other => {
                     let (state, detail) = match other { OpenOutcome::Missing(e) => ("missing", e), OpenOutcome::Rejected { state, detail } => (state, detail), OpenOutcome::Open(..) => unreachable!() };
-                    if last_state.as_deref() != Some(state) { tl.on_status(us(), state, &detail); last_state = Some(state.into()); }
+                    if last_state.as_deref() != Some(state) { tl.on_status(us(), state, &detail); last_state = Some(state.into()); publish(tl); }
                     let end = Instant::now() + Duration::from_millis(MISSING_RETRY_MS);
                     while Instant::now() < end {
                         if drain(tl, &rx, Duration::from_millis(50)) { break 'outer; }
@@ -112,11 +140,12 @@ where O: FnMut() -> OpenOutcome, Q: Fn() -> Option<u64>, U: Fn() -> u64 {
                     if drain(tl, &rx, Duration::ZERO) { tl.on_report(t, ticks, &buf[..n]); break 'outer; }
                     tl.on_report(t, ticks, &buf[..n]);
                 }
-                ReadOutcome::Timeout => { let t = us(); if drain(tl, &rx, Duration::ZERO) { break 'outer; } tl.on_timeout(t); }
+                ReadOutcome::Timeout => { let t = us(); if drain(tl, &rx, Duration::ZERO) { break 'outer; } tl.on_timeout(t); publish(tl); }
                 ReadOutcome::Disconnected(e) => {
                     let t = us();
                     tl.on_read_error(t, &e);
                     last_state = Some("unplugged".into());
+                    publish(tl);
                     src = None;
                     let end = Instant::now() + Duration::from_millis(UNPLUGGED_RETRY_MS);
                     while Instant::now() < end { if drain(tl, &rx, Duration::from_millis(50)) { break 'outer; } }

@@ -30,5 +30,5 @@ pub mod anchor_seen_at;
 pub mod seal;
 pub mod pad_link;
 pub mod snap;
-/// Hand timeline (practice lane only, default off): read-only controller input log clocked to the video.
+/// Hand timeline (practice lane only, default on; `--no-hand-timeline` to switch off): read-only controller input log clocked to the video.
 pub mod hand;
