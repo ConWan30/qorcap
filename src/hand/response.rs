@@ -15,7 +15,7 @@
 //! whether the sealed pad stream answered the nonce within the bound (MEASURED / UNMEASURED), never who
 //! held the controller.
 
-use super::check::check_dir_heads;
+use super::check::{check_dir_heads, resolve_hand_dir};
 use super::timeline::{CHUNK_US, FILE_NAME as HAND_FILE, SEAL_GRACE_US};
 use crate::evidence::{self as ev, GENESIS};
 use crate::hid;
@@ -84,6 +84,7 @@ impl Report {
                         r.reason.as_str(),
                         "bound_chunk_missing"
                             | "missing_hand_timeline"
+                            | "missing_raw_file"
                             | "missing_challenge_checkpoint"
                             | "missing_checkpoint_window"
                             | "stale_bound_head"
@@ -109,6 +110,8 @@ struct HandStream {
     present: bool,
     ok: bool,
     off: bool,
+    raw_missing: bool,
+    bound_missing: bool,
     wall_anchor_ms: Option<i64>,
     heads: BTreeMap<u64, String>,
     chunks: Vec<ChunkMeta>,
@@ -249,13 +252,16 @@ fn rising_edges_from_rows(rows: &[(u64, u32)], wall_anchor_ms: i64) -> Vec<(i64,
 }
 
 fn load_hand_stream(dir: &Path) -> HandStream {
-    let path = dir.join(HAND_FILE);
+    let resolved = resolve_hand_dir(dir);
+    let path = resolved.hand_dir.join(HAND_FILE);
     if !path.exists() {
         return match check_dir_heads(dir) {
             Ok((rep, _)) if rep.off => HandStream {
                 present: false,
                 ok: rep.pass(),
                 off: true,
+                raw_missing: false,
+                bound_missing: false,
                 wall_anchor_ms: None,
                 heads: BTreeMap::new(),
                 chunks: Vec::new(),
@@ -267,11 +273,17 @@ fn load_hand_stream(dir: &Path) -> HandStream {
                 present: false,
                 ok: false,
                 off: false,
+                raw_missing: false,
+                bound_missing: resolved.bound_in_checkpoints,
                 wall_anchor_ms: None,
                 heads: BTreeMap::new(),
                 chunks: Vec::new(),
                 presses: Vec::new(),
-                errors: Vec::new(),
+                errors: if resolved.bound_in_checkpoints {
+                    vec![format!("{HAND_FILE}: not found at {}", resolved.hand_dir.display())]
+                } else {
+                    Vec::new()
+                },
                 warnings: Vec::new(),
             },
         };
@@ -284,6 +296,8 @@ fn load_hand_stream(dir: &Path) -> HandStream {
                 present: true,
                 ok: false,
                 off: false,
+                raw_missing: false,
+                bound_missing: false,
                 wall_anchor_ms: None,
                 heads: BTreeMap::new(),
                 chunks: Vec::new(),
@@ -304,6 +318,8 @@ fn load_hand_stream(dir: &Path) -> HandStream {
                 present: true,
                 ok: false,
                 off: false,
+                raw_missing: rep.raw_missing,
+                bound_missing: false,
                 wall_anchor_ms: None,
                 heads,
                 chunks: Vec::new(),
@@ -381,6 +397,8 @@ fn load_hand_stream(dir: &Path) -> HandStream {
         present: true,
         ok: errors.is_empty(),
         off: rep.off,
+        raw_missing: rep.raw_missing,
+        bound_missing: false,
         wall_anchor_ms,
         heads,
         chunks,
@@ -649,6 +667,11 @@ fn evaluate_one(
     {
         // Explicit null hand_head before first chunk was sealed.
         bound_head_status = "genesis_before_first_chunk";
+    } else if !hand.present && hand.bound_missing {
+        bound_head_status = "missing_hand_timeline";
+        if unmeasured_reason.is_none() {
+            unmeasured_reason = Some("missing_hand_timeline".into());
+        }
     } else if unmeasured_reason.as_deref() != Some("missing_challenge_checkpoint") {
         bound_head_status = "unbound_no_hand_timeline";
     }
@@ -688,7 +711,12 @@ fn evaluate_one(
         Option<String>,
     ) = if hand.present {
         if !hand.ok {
-            ("hand_timeline", None, Some("tamper_hand_timeline".into()))
+            let rsn = if hand.raw_missing && hand.errors.iter().all(|e| e.contains("missing")) {
+                "missing_raw_file"
+            } else {
+                "tamper_hand_timeline"
+            };
+            ("hand_timeline", None, Some(rsn.into()))
         } else if hand.wall_anchor_ms.is_none() || hand.chunks.is_empty() {
             ("hand_timeline", None, Some("no_sealed_stream".into()))
         } else {
@@ -1110,6 +1138,8 @@ mod tests {
         let received_mono_ms = issued_ms - wall_anchor_ms;
         let cfg = Config {
             dir: dir.to_path_buf(),
+            hand_dir_source: "direct".into(),
+            hand_dir_fallback_reason: None,
             raw_usb: false,
             raw_min_free_bytes: None,
             wall_anchor_ms: wall_anchor_ms as u64,
@@ -1624,5 +1654,241 @@ mod tests {
         assert_eq!(r.bound_head_status, "stale_bound_head");
         assert_ne!(r.outcome, "answered_in_bound");
         assert_ne!(r.in_bound, Some(true));
+    }
+
+    fn make_raw_hand_bundle(
+        bundle_dir: &Path,
+        hand_dir: Option<&Path>,
+        wall_anchor_ms: i64,
+        presses: &[(u64, &str)],
+        challenge_nonce: &str,
+        issued_ms: i64,
+    ) -> (u64, String) {
+        let target_hand_dir = hand_dir.unwrap_or(bundle_dir);
+        let deadline_ms = issued_ms + PRACTICE_DEADLINE_MS as i64;
+        let received_mono_ms = issued_ms - wall_anchor_ms;
+        let cfg = Config {
+            dir: target_hand_dir.to_path_buf(),
+            hand_dir_source: if hand_dir.is_some() { "override".into() } else { "direct".into() },
+            hand_dir_fallback_reason: None,
+            raw_usb: true,
+            raw_min_free_bytes: None,
+            wall_anchor_ms: wall_anchor_ms as u64,
+            qpc: None,
+            frame_clock_on: false,
+            initial_device: None,
+            start_t_us: 0,
+        };
+        let mut tl = HandTimeline::open(cfg).unwrap();
+        tl.on_connected(10_000, test_device());
+        tl.tick(1_300_000);
+        let (bind_seq, bind_head) = tl.binding().unwrap();
+
+        let mut ctr = 1u8;
+        for &(t_us, btn) in presses {
+            let down = usb_report(Some(btn), ctr);
+            ctr = ctr.wrapping_add(1);
+            tl.on_report(t_us, Some(t_us * 10), &down);
+            let up = usb_report(None, ctr);
+            ctr = ctr.wrapping_add(1);
+            tl.on_report(t_us + 20_000, Some((t_us + 20_000) * 10), &up);
+        }
+        let finish_us = presses.iter().map(|(t, _)| *t).max().unwrap_or(0).saturating_add(2_000_000).max(4_600_000);
+        let fin = tl.finish(finish_us).unwrap();
+
+        let pattern = ev::pattern_for(challenge_nonce).unwrap();
+        let ch = json!({
+            "id": &challenge_nonce[..8],
+            "role": "home",
+            "phase": "practice",
+            "practice": true,
+            "game": "cod",
+            "nonce": challenge_nonce,
+            "pattern": pattern,
+            "issued_ms": issued_ms,
+            "deadline_ms": deadline_ms,
+            "received_wall_ms": issued_ms,
+            "received_mono_ms": received_mono_ms,
+            "hand_chunk_seq": bind_seq,
+            "hand_head": bind_head,
+        });
+        std::fs::write(
+            bundle_dir.join(PRACTICE_CHALLENGES_FILE),
+            format!("{}\n", serde_json::to_string(&ch).unwrap()),
+        )
+        .unwrap();
+
+        let mut chain = ev::CheckpointChain::default();
+        let ptr = crate::hand::bundle_pointer(bundle_dir, target_hand_dir);
+        let cp0 = chain
+            .next(
+                1000,
+                json!({
+                    "trigger": "challenge",
+                    "nonce": challenge_nonce,
+                    "practice": true,
+                    "game": "cod",
+                    "issued_ms": issued_ms,
+                    "deadline_ms": deadline_ms,
+                    "received_wall_ms": issued_ms,
+                    "received_mono_ms": received_mono_ms,
+                    "hand_chunk_seq": bind_seq,
+                    "hand_head": bind_head,
+                    "hand_timeline_dir": ptr,
+                    "hand_timeline_dir_actual": target_hand_dir.to_string_lossy(),
+                    "hand_dir_source": if hand_dir.is_some() { "override" } else { "direct" },
+                    "hand_dir_fallback_reason": Value::Null,
+                    "hand_raw_file": fin.raw_file,
+                }),
+            )
+            .unwrap();
+        let cp1 = chain
+            .next(
+                2000,
+                json!({
+                    "trigger": "stop",
+                    "practice": true,
+                    "hand_timeline_dir": ptr,
+                    "hand_timeline_dir_actual": target_hand_dir.to_string_lossy(),
+                    "hand_dir_source": if hand_dir.is_some() { "override" } else { "direct" },
+                    "hand_dir_fallback_reason": Value::Null,
+                    "hand_timeline": true,
+                    "hand_timeline_file": fin.file,
+                    "hand_timeline_sha256": fin.file_sha256,
+                    "hand_timeline_head": fin.head,
+                    "hand_timeline_chunks": fin.chunks,
+                    "hand_raw_file": fin.raw_file,
+                    "hand_raw_bytes": fin.raw_bytes,
+                }),
+            )
+            .unwrap();
+        std::fs::write(
+            bundle_dir.join("checkpoints.jsonl"),
+            format!(
+                "{}\n{}\n",
+                serde_json::to_string(&cp0).unwrap(),
+                serde_json::to_string(&cp1).unwrap()
+            ),
+        )
+        .unwrap();
+        (bind_seq, bind_head)
+    }
+
+    #[test]
+    fn raw_slice_sha_mismatch_truncated_missing_and_offset_tamper_give_unmeasured() {
+        let nonce = "ffffffffffffffffffffffffffffffff";
+        let pat = ev::pattern_for(nonce).unwrap();
+        let anchor: i64 = 1_700_000_000_000;
+        let presses = [
+            (1_300_000, pat[0]),
+            (1_400_000, pat[1]),
+            (1_500_000, pat[2]),
+            (1_600_000, pat[3]),
+            (1_700_000, pat[4]),
+        ];
+
+        // Baseline valid single-file raw bundle (off-bundle dir) passes and measures answered_in_bound.
+        let d_ok = tmp_dir("raw-ok-bundle");
+        let h_ok = tmp_dir("raw-ok-hand");
+        make_raw_hand_bundle(&d_ok, Some(&h_ok), anchor, &presses, nonce, anchor + 1_200);
+        assert!(!d_ok.join(HAND_FILE).exists());
+        assert!(h_ok.join(crate::hand::timeline::RAW_FILE).exists());
+        let rep_ok = evaluate_dir(&d_ok).unwrap();
+        assert!(!rep_ok.has_tamper(), "{:?}", rep_ok.integrity_errors);
+        assert_eq!(rep_ok.records[0].status, "MEASURED");
+        assert_eq!(rep_ok.records[0].outcome, "answered_in_bound");
+
+        // 1. Slice SHA mismatch (flip 1 byte inside hand_raw.v0.bin).
+        let d_sha = tmp_dir("raw-sha");
+        make_raw_hand_bundle(&d_sha, None, anchor, &presses, nonce, anchor + 1_200);
+        let raw_path = d_sha.join(crate::hand::timeline::RAW_FILE);
+        let mut raw = std::fs::read(&raw_path).unwrap();
+        raw[5] ^= 0x01;
+        std::fs::write(&raw_path, &raw).unwrap();
+        let rep_sha = evaluate_dir(&d_sha).unwrap();
+        assert!(rep_sha.has_tamper());
+        assert_eq!(rep_sha.records[0].status, "UNMEASURED");
+        assert_eq!(rep_sha.records[0].reason, "tamper_hand_timeline");
+        assert_ne!(rep_sha.records[0].outcome, "answered_in_bound");
+
+        // 2. Truncated raw file.
+        let d_trunc = tmp_dir("raw-trunc");
+        make_raw_hand_bundle(&d_trunc, None, anchor, &presses, nonce, anchor + 1_200);
+        let raw_trunc_path = d_trunc.join(crate::hand::timeline::RAW_FILE);
+        let orig_raw = std::fs::read(&raw_trunc_path).unwrap();
+        std::fs::write(&raw_trunc_path, &orig_raw[..orig_raw.len() - 10]).unwrap();
+        let rep_trunc = evaluate_dir(&d_trunc).unwrap();
+        assert!(rep_trunc.has_tamper());
+        assert_eq!(rep_trunc.records[0].status, "UNMEASURED");
+        assert_eq!(rep_trunc.records[0].reason, "tamper_hand_timeline");
+        assert_ne!(rep_trunc.records[0].outcome, "answered_in_bound");
+
+        // 3. Missing raw file gives UNMEASURED (missing_raw_file).
+        let d_miss = tmp_dir("raw-missing");
+        make_raw_hand_bundle(&d_miss, None, anchor, &presses, nonce, anchor + 1_200);
+        std::fs::remove_file(d_miss.join(crate::hand::timeline::RAW_FILE)).unwrap();
+        let rep_miss = evaluate_dir(&d_miss).unwrap();
+        assert!(rep_miss.has_tamper());
+        assert_eq!(rep_miss.records[0].status, "UNMEASURED");
+        assert_eq!(rep_miss.records[0].reason, "missing_raw_file");
+        assert_ne!(rep_miss.records[0].outcome, "answered_in_bound");
+
+        // 3b. Missing off-bundle hand timeline gives UNMEASURED (missing_hand_timeline).
+        let d_off_miss = tmp_dir("raw-off-missing-bundle");
+        let h_off_miss = tmp_dir("raw-off-missing-hand");
+        make_raw_hand_bundle(&d_off_miss, Some(&h_off_miss), anchor, &presses, nonce, anchor + 1_200);
+        std::fs::remove_dir_all(&h_off_miss).unwrap();
+        let rep_off_miss = evaluate_dir(&d_off_miss).unwrap();
+        assert!(rep_off_miss.has_tamper());
+        assert_eq!(rep_off_miss.records[0].status, "UNMEASURED");
+        assert_eq!(rep_off_miss.records[0].reason, "missing_hand_timeline");
+
+        // 4. Offset gap (re-hashed chain with raw_offset gap) gives UNMEASURED tamper.
+        let d_gap = tmp_dir("raw-gap");
+        make_raw_hand_bundle(&d_gap, None, anchor, &presses, nonce, anchor + 1_200);
+        let tl_path = d_gap.join(HAND_FILE);
+        let tl_lines: Vec<Value> = std::fs::read_to_string(&tl_path)
+            .unwrap()
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let mut rebuilt = String::new();
+        let mut pending: Vec<Value> = Vec::new();
+        let mut head = ev::GENESIS.to_string();
+        for mut row in tl_lines {
+            if row["type"] != "chunk" {
+                if row["type"] == "raw_bind" && row["chunk_seq"] == 1 {
+                    row["offset"] = json!(row["offset"].as_u64().unwrap() + 80);
+                }
+                pending.push(row);
+                continue;
+            }
+            let seq = row["seq"].as_u64().unwrap();
+            let recs = std::mem::take(&mut pending);
+            let sha = ev::try_jcs_sha(&Value::Array(recs.clone())).unwrap();
+            let new_head = ev::link(&head, seq, &sha);
+            row["sha256"] = json!(sha);
+            row["prev"] = json!(head);
+            row["head"] = json!(new_head);
+            if seq == 1 {
+                row["raw_offset"] = json!(row["raw_offset"].as_u64().unwrap() + 80);
+            }
+            head = new_head;
+            for r in recs.iter().chain(std::iter::once(&row)) {
+                rebuilt.push_str(&ev::jcs(r).unwrap());
+                rebuilt.push('\n');
+            }
+        }
+        std::fs::write(&tl_path, rebuilt).unwrap();
+        let rep_gap = evaluate_dir(&d_gap).unwrap();
+        assert!(rep_gap.has_tamper());
+        assert_eq!(rep_gap.records[0].status, "UNMEASURED");
+        assert_eq!(rep_gap.records[0].reason, "tamper_hand_timeline");
+        assert_ne!(rep_gap.records[0].outcome, "answered_in_bound");
+
+        for d in [d_ok, h_ok, d_sha, d_trunc, d_miss, d_off_miss, d_gap] {
+            let _ = std::fs::remove_dir_all(&d);
+        }
     }
 }
