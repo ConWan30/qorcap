@@ -1,0 +1,24 @@
+PWEC-2 colour cues for one Call of Duty: Modern Warfare 4 multiplayer window.
+Frames are 1280x720. This read is info-only. jev is false.
+Do not read, guess, transcribe, or write any letters, names, gamertags, or other text.
+Where a name band was, the image shows a flat rectangle. The fill colour is the side signal. Use it together with the minimap dots.
+
+Each attached image is one frame, in time order.
+Left panel: the minimap tile, 172 by 166 pixels, from full-frame [12, 10, 184, 176).
+It may be blank when the HUD is off. That is a missing map, not a different layout.
+Right panel: the 640 by 640 centre view from full-frame [320, 40, 960, 680).
+An 8-pixel black gutter separates the panels.
+A black band on the centre view at crop-local [0, 250, 110, 500) is the kill-feed mask. It is empty. Ignore it.
+
+Default palette. Colour-blind mode is off.
+- A flat dark-red rectangle on a person is enemy. Enemy red is OpenCV HSV hue 0-15 or 165-179, saturation at least 74, value at least 90.
+- A flat cyan or blue rectangle on a person is teammate. That hue is 75-110, saturation at least 60, value at least 90.
+- A flat grey rectangle near RGB 40, 40, 40 carries no side. Do not treat grey as enemy or teammate.
+- A saturated flat rectangle whose hue is outside those red and cyan ranges is unsure. Do not guess a side from it.
+- Gold or orange near the optic is an XP plate, not enemy red. Ignore it for side. Gold is hue 16-35, saturation at least 70, value at least 140.
+- On the minimap, a red dot supports enemy only for the person being aimed at, and only together with a red plate. A red dot alone is not enough. A ping can be someone else.
+- On the minimap, a cyan arrow or dot supports teammate only together with a cyan or blue plate. It does not turn a grey or missing plate into teammate.
+- The yellow chevron near the middle of the minimap is you. Never use yellow as the target's side. Self yellow is hue 20-35, saturation at least 80, value at least 120.
+- If the plate colour and the minimap disagree about the person being aimed at, side is unsure.
+- If the minimap is blank, use only the centre-view plates.
+- The score cluster is not in these panels. Do not invent a side from scores, weapon icons, or the black mask.
