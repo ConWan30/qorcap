@@ -112,6 +112,9 @@ pub struct Engine {
     /// Practice lane only (src/capstop.rs): one stop record per capture writer, bound into the stop
     /// checkpoint. None (REAL MATCH and every non-practice run): nothing is recorded or written.
     pub capture_stop: Option<Mutex<CaptureStopState>>,
+    /// Practice-lane hand timeline (src/hand). Unset (REAL MATCH and every run without --hand-timeline): nothing
+    /// is opened or written and no checkpoint changes.
+    pub hand: std::sync::OnceLock<Arc<crate::hand::logger::HandHandle>>,
 }
 
 /// Per-writer stop records for `capture_stop.v0.json` (practice lane only).
@@ -458,11 +461,35 @@ impl Engine {
             stop_reason: Mutex::new(None), bundle_write: Mutex::new(()), bundle_finalized: AtomicBool::new(false),
             persist_fault: Mutex::new(None), ckpt_durable_len: Mutex::new(None),
             capture_stop: crate::capstop::enabled(args.practice_lane, std::env::var(crate::livetap::ENV_LANE).ok().as_deref()).then(|| Mutex::new(CaptureStopState::default())),
+            hand: std::sync::OnceLock::new(),
             args })
     }
     fn ms(&self) -> u64 { self.started.elapsed().as_millis() as u64 }
     /// The monotonic clock behind every mono_ms (manifest, checkpoints) and inputs.jsonl t_us.
     pub fn clock(&self) -> Instant { self.started }
+    /// Start the practice-lane hand timeline logger (src/hand). Returns false (and opens nothing) unless
+    /// --hand-timeline (or QORCAP_HAND_TIMELINE) AND the practice lane AND a bundle folder AND the controller on.
+    pub fn start_hand_logger(&self) -> bool {
+        if self.hand.get().is_some() { return true; }
+        let practice = crate::capstop::enabled(self.args.practice_lane, std::env::var(crate::livetap::ENV_LANE).ok().as_deref());
+        let (on, why) = crate::hand::enabled(self.args.hand_timeline, std::env::var(crate::hand::ENV).ok().as_deref(), practice, self.args.no_controller);
+        if let Some(w) = why { warn!("{w}"); }
+        if !on { return false; }
+        let Some(dir) = self.bundle_dir() else { warn!("hand timeline needs --bundle (it writes beside the bundle); not started"); return false; };
+        let raw_usb = crate::hand::raw_enabled(self.args.no_raw_usb, std::env::var(crate::hand::ENV_RAW).ok().as_deref());
+        let wall_anchor_ms = self.ev.lock().unwrap_or_else(|e| e.into_inner()).started_wall_ms;
+        let cfg = crate::hand::timeline::Config { dir, raw_usb, raw_min_free_bytes: self.args.min_free_bytes(), wall_anchor_ms,
+            qpc: crate::hand::logger::platform_qpc_origin(self.started), frame_clock_on: self.frame_clock.enabled(), initial_device: None,
+            start_t_us: self.started.elapsed().as_micros() as u64 };
+        match crate::hand::logger::spawn(cfg, self.started, crate::hand::logger::platform_open, crate::hand::logger::platform_qpc_now) {
+            Ok(h) => {
+                info!("hand timeline on (practice lane): {} raw_usb={raw_usb}", crate::hand::timeline::FILE_NAME);
+                let _ = self.hand.set(Arc::new(h));
+                true
+            }
+            Err(e) => { error!("hand timeline not started: {e}"); false }
+        }
+    }
     /// Start the USB HID controller logger (no-op with --no-controller).
     pub fn start_input_logger(&self) -> Option<std::thread::JoinHandle<()>> {
         if self.args.no_controller { return None; }
@@ -647,7 +674,9 @@ impl Engine {
                 // Only bytes that reached the recording. The capture command itself is unchanged.
                 if written && frame_clock.enabled() {
                     let file = Path::new(&r.path).file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-                    frame_clock.observe(slice, t_us, &file);
+                    let stamps = frame_clock.observe(slice, t_us, &file);
+                    // Practice hand timeline: an unbounded channel send, never a wait on its disk writes.
+                    if let Some(h) = self.hand.get() { h.frames(stamps); }
                 }
                 // Practice live tap: the same bytes that reached the recording, never anything else.
                 if written && self.live_tap.enabled() {
@@ -857,6 +886,18 @@ impl Engine {
                     extra.insert("capture_stop_file".into(), json!(crate::capstop::FILE_NAME));
                 }
                 Err(e) => { error!("capture stop record not written: {e}"); extra.insert("capture_stop_error".into(), json!(e)); }
+            }
+        }
+        // Practice hand timeline only: seal the trailing window and bind the whole file. Off: unchanged.
+        if let Some(h) = self.hand.get() {
+            match h.finish(Duration::from_secs(5)) {
+                Ok(f) => {
+                    extra.insert("hand_timeline_sha256".into(), json!(f.file_sha256));
+                    extra.insert("hand_timeline_head".into(), json!(f.head));
+                    extra.insert("hand_timeline_file".into(), json!(f.file));
+                    extra.insert("hand_timeline_chunks".into(), json!(f.chunks));
+                }
+                Err(e) => { error!("hand timeline not sealed: {e}"); extra.insert("hand_timeline_error".into(), json!(e)); }
             }
         }
         let cp = self.checkpoint("stop", Value::Object(extra));
@@ -2321,6 +2362,56 @@ esac
         assert_eq!(stamps[0].file, "video.mp4");
         let _ = std::fs::remove_dir_all(&dir2);
     }
+
+    /// Hand timeline: practice lane + --hand-timeline only. On: segment checkpoints carry hand_chunk_seq /
+    /// hand_head, the stop checkpoint binds the file, and check-hand-timeline passes. Off (no flag, or not the
+    /// practice lane): no file and no hand key in any checkpoint.
+    #[test]
+    fn hand_timeline_is_practice_only_and_binds_segments_and_stop() {
+        use clap::Parser;
+        let base = std::env::temp_dir().join(format!("qorcap-hand-engine-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        for (practice, flag) in [(true, true), (false, true), (true, false)] {
+            let dir = base.join(format!("{practice}-{flag}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            let d = dir.to_string_lossy().into_owned();
+            let mut a = vec!["q", "record", "--device", "testpattern", "--audio", "none", "--bundle", &d, "--match-id", "m-hand"];
+            if flag { a.push("--hand-timeline"); }
+            if practice { a.push("--practice-lane"); }
+            let crate::cli::Cmd::Record(r) = crate::cli::Cli::try_parse_from(a).unwrap().cmd else { panic!() };
+            let e = Engine::new(r, dir.join("no-such-ffmpeg").to_string_lossy().into_owned());
+            let on = e.start_hand_logger();
+            assert_eq!(on, practice && flag, "practice={practice} flag={flag}");
+            e.on_segment("video.mp4", 0, b"\0\0\0\x10ftypisom\0\0\0\0");
+            if on {
+                let end = Instant::now() + Duration::from_secs(10);
+                while e.hand.get().unwrap().binding().is_none() && Instant::now() < end { std::thread::sleep(Duration::from_millis(20)); }
+            }
+            e.on_segment("video.mp4", 16, b"\0\0\0\x10moofmoof\0\0\0\0");
+            e.seal_and_wait_countersign(Duration::from_secs(1)).unwrap();
+            let cps = e.ev.lock().unwrap().checkpoints.clone();
+            let segs: Vec<&Value> = cps.iter().filter(|c| c["qorcap"]["trigger"] == "segment").collect();
+            let stop = cps.last().unwrap();
+            let file = dir.join(crate::hand::timeline::FILE_NAME);
+            if on {
+                assert!(segs[0]["qorcap"]["hand_head"].is_null(), "no hand chunk sealed yet at the first segment");
+                assert!(segs[1]["qorcap"]["hand_chunk_seq"].is_u64() && segs[1]["qorcap"]["hand_head"].is_string(), "{}", segs[1]);
+                let bytes = std::fs::read(&file).unwrap();
+                assert_eq!(stop["qorcap"]["hand_timeline_sha256"], crate::evidence::sha256_hex(&bytes));
+                assert_eq!(stop["qorcap"]["hand_timeline_file"], crate::hand::timeline::FILE_NAME);
+                let rep = crate::hand::check::check_dir(&dir).unwrap();
+                assert!(rep.pass(), "{:?}", rep.errors);
+                assert!(rep.stop_bound && rep.segment_bindings == 1, "{rep:?}");
+                assert_eq!(stop["qorcap"]["hand_timeline_head"], rep.head);
+                // verify-bundle is unchanged and still reads these checkpoints.
+                if let Ok(vb) = crate::bundle::verify(&dir) { assert!(!vb.errors.iter().any(|m| m.contains("hand")), "{:?}", vb.errors); }
+            } else {
+                assert!(!file.exists() && !dir.join(crate::hand::timeline::RAW_DIR).exists());
+                assert!(cps.iter().all(|c| !c.to_string().contains("hand_")), "no hand key when off");
+            }
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
 }
 
 impl Engine {
@@ -2361,8 +2452,15 @@ impl Engine {
         // The fsync runs outside the input-log mutex (HID logger and /status keep going); this still returns
         // only once the chunk is durable, so the checkpoint below is written after it.
         let (ih, ihead, n) = crate::inputs::seal_shared(&self.input, seq, || self.started.elapsed().as_micros() as u64);
-        if self.args.no_controller { self.checkpoint("segment", json!({})); }
-        else { self.checkpoint_with("segment", json!({"input_seg": seq, "input_n": n, "input_head": ihead}), Some(ih)); }
+        let mut ext = if self.args.no_controller { json!({}) } else { json!({"input_seg": seq, "input_n": n, "input_head": ihead}) };
+        // Practice hand timeline only: the newest durable 1 s hand chunk at this segment close (extra `qorcap` keys).
+        if let Some(h) = self.hand.get() {
+            let (s, head) = match h.binding() { Some((s, head)) => (json!(s), json!(head)), None => (Value::Null, Value::Null) };
+            ext["hand_chunk_seq"] = s;
+            ext["hand_head"] = head;
+        }
+        if self.args.no_controller { self.checkpoint("segment", ext); }
+        else { self.checkpoint_with("segment", ext, Some(ih)); }
     }
 
     /// Append a QorTime-shaped checkpoint binding the current chain head + score/clock state.

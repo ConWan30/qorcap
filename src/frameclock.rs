@@ -80,10 +80,12 @@ impl FrameClock {
     pub fn enabled(&self) -> bool { self.enabled }
 
     /// `data` is the TS bytes just written to the recording. `t_mono_us` is `Instant` elapsed at the read.
-    pub fn observe(&self, data: &[u8], t_mono_us: u64, file: &str) {
-        if !self.enabled { return; }
+    /// Returns the frames stamped from this read (empty when off), for the practice hand timeline.
+    pub fn observe(&self, data: &[u8], t_mono_us: u64, file: &str) -> Vec<FrameStamp> {
+        let mut stamped = vec![];
+        if !self.enabled { return stamped; }
         let mut g = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        if g.out.is_none() { return; }
+        if g.out.is_none() { return stamped; }
         // A device reopen continues in a new part file whose frame 0 is its own first frame.
         if g.file.as_deref() != Some(file) { g.file = Some(file.to_string()); g.next_frame = 0; g.last_pts = None; }
         let mut lines = String::new();
@@ -102,14 +104,16 @@ impl FrameClock {
             g.next_frame += 1;
             g.frames += 1;
             let rec = json!({"type": "frame", "file": file, "frame": frame, "t_mono_us": t_mono_us, "pts_90k": pts});
+            stamped.push(FrameStamp { file: file.to_string(), frame, t_mono_us, pts_90k: pts });
             lines.push_str(&rec.to_string());
             lines.push('\n');
         }
-        if lines.is_empty() { return; }
+        if lines.is_empty() { return stamped; }
         if let Some(out) = g.out.as_mut() {
             let _ = out.write_all(lines.as_bytes());
             let _ = out.flush();
         }
+        stamped
     }
 }
 
