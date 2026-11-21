@@ -80,6 +80,7 @@ LINUX_FILES = (
     "tools/pwec2/test_pwec2.py",
     "sidecar/test_qorcap_reader.py",
     "sidecar/test_c11_snapshot_inputs_timeout.py",
+    "sidecar/test_presign_followups.py",
     "sidecar/test_qorcap_match.py::test_refresh_off_the_frame_thread_keeps_four_hertz",
     "sidecar/test_qorcap_match.py::test_incremental_tail_matches_full_parse",
     "sidecar/test_qorcap_match.py::test_tail_reparse_when_the_window_before_the_offset_changes",
@@ -159,6 +160,7 @@ WINDOWS_FILES = (
     "tools/pwec2/test_pwec2.py",
     "sidecar/test_qorcap_reader.py",
     "sidecar/test_c11_snapshot_inputs_timeout.py",
+    "sidecar/test_presign_followups.py",
     "sidecar/test_qorcap_match.py::test_refresh_off_the_frame_thread_keeps_four_hertz",
     "sidecar/test_qorcap_match.py::test_incremental_tail_matches_full_parse",
     "sidecar/test_qorcap_match.py::test_tail_reparse_when_the_window_before_the_offset_changes",
@@ -231,9 +233,10 @@ WINDOWS_FILES = (
 # pytest --collect-only -q of each --list, QORTIME pin 0204e6d8082f8c40ea1fe5e09bf16402aaee3ff2:
 # 1306 linux / 1287 windows. Previous floors were 1288 / 1269; this change adds
 # 18 collected tests on both lists.
-# Merged origin/main (1306 linux / 1287 windows) with sidecar/test_qorcap_clock_vote.py.
-LINUX_MIN_COLLECTED = 1385
-WINDOWS_MIN_COLLECTED = 1366
+# Merged origin/main 617efff (#103, floors 1313/1294) with sidecar/test_qorcap_clock_vote.py.
+# Re-collected with QORTIME pin; 1313+79 / 1294+79.
+LINUX_MIN_COLLECTED = 1392
+WINDOWS_MIN_COLLECTED = 1373
 
 # Absent from both sidecar suites. A reason is required; whitespace does not count.
 EXCLUDED_TEST_FILES = {
