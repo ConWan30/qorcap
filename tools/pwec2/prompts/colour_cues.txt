@@ -1,5 +1,5 @@
 PWEC-2 colour cues for one Call of Duty: Modern Warfare 4 multiplayer window.
-Frames are 1280x720. This read is info-only. jev is false.
+Each image is an 820 by 640 panel: a 172 by 166 minimap, an 8-pixel black gutter, and the 640 by 640 centre view. This read is info-only. jev is false.
 Do not read, guess, transcribe, or write any letters, names, gamertags, or other text.
 Where a name band was, the image shows a flat rectangle. The fill colour is the side signal. Use it together with the minimap dots.
 
