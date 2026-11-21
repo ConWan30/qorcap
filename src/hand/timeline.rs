@@ -58,6 +58,8 @@ pub const RAW_LAYOUT_SPEC: &str = "u64_le qpc_ticks (0 = UNMEASURED) + u64_le t_
 pub const STALE_GAP_US: u64 = crate::inputs::STALE_RX_GAP_US;
 pub const STALL_US: u64 = 2_000_000;
 pub const ANALOG_MIN_GAP_US: u64 = crate::inputs::ANALOG_MIN_GAP_US;
+/// Per-epoch cap on `bytes_42_43_change` rows (each change emits one `in` + one `status` row) so a flapping byte cannot flood the JSONL.
+pub const BYTES_42_43_CHANGE_CAP_PER_EPOCH: u64 = 16;
 pub const UNMEASURED: &str = "UNMEASURED";
 pub const UNKNOWN: &str = "UNKNOWN";
 pub const CLAIMS: &str = "Read-only controller input log clocked to the video: host-observed USB HID input reports and capture frame arrivals on one monotonic clock. It does not identify who held the controller.";
@@ -92,7 +94,7 @@ struct Hb {
     short_reads: u64, parse_faults: u64, bt_reports: u64, timeouts: u64, read_errors: u64,
     seq0: Option<u8>, seq1: Option<u8>, seq_steps: u64, seq_breaks: u64,
     hw0: Option<u32>, hw1: Option<u32>, hw_advance: u64, hw_stalls: u64,
-    in_rows: u64, frames: u64, pes_reads: u64, late: u64, frame_drops: u64, models: Vec<&'static str>,
+    in_rows: u64, frames: u64, pes_reads: u64, late: u64, frame_drops: u64, bytes_42_43_suppressed: u64, models: Vec<&'static str>,
 }
 
 #[derive(Debug)]
@@ -137,7 +139,10 @@ pub struct HandTimeline {
     last_counter: Option<u8>,
     last_hw: Option<u32>,
     last_in_t: Option<u64>,
-    last_in_key: Option<(u32, [u8; 6])>,
+    last_in_key: Option<(u32, Option<u8>, [u8; 6])>,
+    last_bytes_42_43: Option<[u8; 2]>,
+    bytes_42_43_changes_epoch: u64,
+    bytes_42_43_changes_suppressed: u64,
     prev_combos: u32,
     disk_faults: u64,
     raw_pause: Option<&'static str>,
@@ -178,7 +183,8 @@ impl HandTimeline {
         let mut me = Self {
             path, file, durable_len: 0, raw_file, raw_offset: 0, open: BTreeMap::new(), next_seal: first, first_seq: first, head: GENESIS.to_string(),
             last_sealed: None, chunks: 0, epoch: 0, device: None, connected: false, connected_at: 0, stalled: false,
-            last_rx: None, last_counter: None, last_hw: None, last_in_t: None, last_in_key: None, prev_combos: 0,
+            last_rx: None, last_counter: None, last_hw: None, last_in_t: None, last_in_key: None,
+            last_bytes_42_43: None, bytes_42_43_changes_epoch: 0, bytes_42_43_changes_suppressed: 0, prev_combos: 0,
             disk_faults: 0, raw_pause: None, latest_t: cfg.start_t_us, closed: false, models_seen: vec![], reports: 0, in_rows: 0, frames: 0, last_state: String::new(), last_detail: String::new(), frame_drops: 0,
             cfg,
         };
@@ -196,7 +202,7 @@ impl HandTimeline {
             Some(q) => json!({"status": "MEASURED", "freq_hz": n(q.freq_hz), "origin_ticks": n(q.origin_ticks), "origin_t_us": n(q.origin_t_us)}),
             None => json!({"status": UNMEASURED}),
         };
-        json!({
+        let mut h = json!({
             "type": "header", "schema": SCHEMA, "chunk_seq": c.start_t_us / CHUNK_US, "t_us": n(c.start_t_us),
             "clock_domain": "qorcap-engine-instant-us",
             "clock_note": "t_us is the QorCap engine Instant (Windows: QueryPerformanceCounter), the same clock as inputs.jsonl t_us and frame_clock.jsonl t_mono_us. wall_anchor_ms is a label only.",
@@ -224,7 +230,19 @@ impl HandTimeline {
             "listen_only": {"access": "GENERIC_READ", "reads": "input report 0x01 via overlapped ReadFile", "output_reports": false,
                 "feature_reports": false, "firmware": false, "audio": false},
             "claims": CLAIMS,
-        })
+        });
+        let physical_face_status = match c.initial_device.as_ref() {
+            Some(d) if d.model.edge_fields_measured() => "ESTIMATED",
+            Some(_) => UNMEASURED,
+            None => UNKNOWN,
+        };
+        h["physical_face_status"] = json!(physical_face_status);
+        h["physical_face_note"] = json!("On device_model dualsense_edge, raw full byte 51 of USB report 0x01 on in rows (ESTIMATED; low nibble mirrors the d-pad, consumers must mask 0xF0 for face buttons; buttons stays unmodified post-remap). On device_model dualsense, physical_face is UNMEASURED.");
+        h["bytes_42_43_raw"] = json!(UNKNOWN);
+        h["bytes_42_43_status"] = json!("ESTIMATED");
+        h["bytes_42_43_change_cap_per_epoch"] = json!(BYTES_42_43_CHANGE_CAP_PER_EPOCH);
+        h["bytes_42_43_note"] = json!("raw bytes 42-43 of USB report 0x01 (n=1 hypothesis: trigger-setting snapshot, ESTIMATED); UNKNOWN before the first report after connect, snapshotted on the first in row and emitted on change (in + status rows, capped per epoch); adaptive_trigger_state stays UNMEASURED");
+        h
     }
 
     /// The window a record at `t` belongs to, and whether it is late (its own window is already sealed).
@@ -254,11 +272,14 @@ impl HandTimeline {
         self.last_counter = None;
         self.last_hw = None;
         self.last_in_key = None;
+        self.last_bytes_42_43 = None;
+        self.bytes_42_43_changes_epoch = 0;
         self.prev_combos = 0;
         if !self.models_seen.contains(&d.model.label()) { self.models_seen.push(d.model.label()); }
         let rec = json!({"type": "status", "t_us": n(t), "epoch": self.epoch, "state": "connected",
             "device_model": d.model.label(), "fallback": d.model.fallback(),
             "edge_fields": if d.model.edge_fields_measured() { "MEASURED" } else { UNMEASURED },
+            "bytes_42_43_raw": UNKNOWN, "bytes_42_43_status": "ESTIMATED",
             "vid": d.vid, "pid": d.pid, "usb_bcd_device": d.bcd_device, "pad_id": d.pad_id});
         self.device = Some(d);
         self.last_state = "connected".into();
@@ -349,11 +370,32 @@ impl HandTimeline {
         self.last_rx = Some(t);
         self.last_counter = Some(p.counter);
         self.last_hw = Some(p.sensor_ts);
-        // Change-logged `in` row. Edge-only bits are UNMEASURED (not zero) on a standard DualSense.
+        // Change-logged `in` row. Edge-only bits and `physical_face` are UNMEASURED (not zero) on a standard DualSense.
+        // `buttons` is never rewritten; `physical_face` carries full raw byte 51 on Edge (ESTIMATED; low nibble mirrors
+        // the d-pad, mask 0xF0 for face buttons) and is excluded from the change key when `!edge`.
+        // `bytes_42_43_raw` carries raw bytes 42-43 (ESTIMATED, n=1 trigger-setting hypothesis; change emissions capped per
+        // epoch; `adaptive_trigger_state` stays UNMEASURED).
         let buttons = if edge { p.buttons } else { p.buttons & !EDGE_BITS };
-        let key = (buttons, [p.lx, p.ly, p.rx, p.ry, p.l2, p.r2]);
-        let emit = match (self.last_in_key, self.last_in_t) {
-            (Some(k), Some(t0)) => k.0 != key.0 || (k.1 != key.1 && t.saturating_sub(t0) >= ANALOG_MIN_GAP_US),
+        let physical_face: Option<u8> = edge.then_some(raw[51]);
+        let b42_43 = [raw[42], raw[43]];
+        let prev_b42_43 = self.last_bytes_42_43;
+        let raw_b42_43_changed = prev_b42_43.is_some_and(|old| old != b42_43);
+        self.last_bytes_42_43 = Some(b42_43);
+        let b42_43_change_emit = if raw_b42_43_changed {
+            if self.bytes_42_43_changes_epoch < BYTES_42_43_CHANGE_CAP_PER_EPOCH {
+                self.bytes_42_43_changes_epoch += 1;
+                true
+            } else {
+                self.bytes_42_43_changes_suppressed += 1;
+                self.window(t).0.hb.bytes_42_43_suppressed += 1;
+                false
+            }
+        } else {
+            false
+        };
+        let key = (buttons, physical_face, [p.lx, p.ly, p.rx, p.ry, p.l2, p.r2]);
+        let emit = b42_43_change_emit || match (self.last_in_key, self.last_in_t) {
+            (Some(k), Some(t0)) => k.0 != key.0 || k.1 != key.1 || (k.2 != key.2 && t.saturating_sub(t0) >= ANALOG_MIN_GAP_US),
             _ => true,
         };
         if emit {
@@ -363,18 +405,33 @@ impl HandTimeline {
                 let y = (u64::from(raw[o + 2]) >> 4) | (u64::from(raw[o + 3]) << 4);
                 json!([u64::from(c & 0x80 == 0), u64::from(c & 0x7F), x, y])
             }).collect();
-            let rec = json!({"type": "in", "epoch": self.epoch, "t_us": n(t), "t_qpc_ticks": opt(ticks), "rx_gap_us": opt(gap),
+            let mut rec = json!({"type": "in", "epoch": self.epoch, "t_us": n(t), "t_qpc_ticks": opt(ticks), "rx_gap_us": opt(gap),
                 "report_id": 1, "counter": p.counter, "sensor_ts": p.sensor_ts,
                 "lx": p.lx, "ly": p.ly, "rx": p.rx, "ry": p.ry, "l2": p.l2, "r2": p.r2, "buttons": buttons,
                 "edge_bits": if edge { json!((p.buttons & EDGE_BITS) >> 19) } else { json!(UNMEASURED) },
                 "gyro": p.gyro, "accel": p.accel, "touch": touch,
                 "trigger_fx_status": {"l2_raw": raw[42], "r2_raw": raw[43], "status": UNMEASURED},
                 "battery_raw": raw[53], "device_model": label, "raw_sha256": ev::sha256_hex(raw)});
+            rec["physical_face"] = physical_face.map(|v| json!(v)).unwrap_or_else(|| json!(UNMEASURED));
+            rec["bytes_42_43_raw"] = json!([b42_43[0], b42_43[1]]);
             self.push(t, rec);
             self.window(t).0.hb.in_rows += 1;
             self.in_rows += 1;
             self.last_in_key = Some(key);
             self.last_in_t = Some(t);
+        }
+        if b42_43_change_emit {
+            if let Some(old) = prev_b42_43 {
+                let rec = json!({
+                    "type": "status", "t_us": n(t), "epoch": self.epoch, "state": "bytes_42_43_change",
+                    "bytes_42_43_raw": [b42_43[0], b42_43[1]], "prev_bytes_42_43_raw": [old[0], old[1]],
+                    "epoch_change_seq": self.bytes_42_43_changes_epoch,
+                    "epoch_change_cap": BYTES_42_43_CHANGE_CAP_PER_EPOCH,
+                    "status": "ESTIMATED", "adaptive_trigger_state": UNMEASURED,
+                    "detail": "USB 0x01 bytes 42-43 changed (ESTIMATED; n=1 trigger-setting hypothesis; adaptive_trigger_state stays UNMEASURED)"
+                });
+                self.push(t, rec);
+            }
         }
         // Profile-swap candidate: Fn held with a face button (rising edge only). Edge only; which profile became
         // active is UNKNOWN (it lives in feature reports this logger never reads).
@@ -472,7 +529,7 @@ impl HandTimeline {
         let model = match hb.models.len() { 0 => if self.connected { self.model_label() } else { "none" }, 1 => hb.models[0], _ => "mixed" };
         let fallback = hb.models.contains(&"dualsense") || (hb.models.is_empty() && self.connected && model == "dualsense");
         let faults = hb.timeouts + hb.read_errors;
-        let hb_rec = json!({"type": "hb", "chunk_seq": seq, "hb_seq": seq, "epoch": self.epoch, "device_model": model, "fallback": fallback,
+        let mut hb_rec = json!({"type": "hb", "chunk_seq": seq, "hb_seq": seq, "epoch": self.epoch, "device_model": model, "fallback": fallback,
             "pad_connected": pad_connected, "rx_delta": hb.rx_delta, "first_rx_t_us": opt(hb.first_rx), "last_rx_t_us": opt(hb.last_rx),
             "max_rx_gap_us": hb.max_gap, "stale_over_50ms": hb.stale, "short_reads": hb.short_reads, "parse_faults": hb.parse_faults,
             "bt_reports": hb.bt_reports, "faults": faults, "timeouts": hb.timeouts, "read_errors": hb.read_errors,
@@ -481,6 +538,7 @@ impl HandTimeline {
             "in_rows": hb.in_rows, "frames_in_chunk": hb.frames, "pes_reads": hb.pes_reads, "late_records": hb.late,
             "frame_drops": hb.frame_drops, "raw_reports": w.raw_n, "disk_faults_total": self.disk_faults,
             "counter_note": "seq_breaks / hw_stalls are diagnostic only, not packet-loss evidence on their own"});
+        hb_rec["bytes_42_43_suppressed"] = json!(hb.bytes_42_43_suppressed);
         let prev_raw_offset = self.raw_offset;
         let active_raw = self.cfg.raw_usb && (pause.is_none() || w.raw_n > 0);
         let (raw_file_name, raw_offset, raw_len, raw_sha) = if active_raw {
@@ -579,7 +637,7 @@ impl HandTimeline {
         let bytes = std::fs::read(&self.path).map_err(|e| format!("hand timeline re-read: {e}"))?;
         let file_sha256 = ev::sha256_hex(&bytes);
         let raw_file_str = if self.cfg.raw_usb { Some(RAW_FILE.to_string()) } else { None };
-        let summary = json!({"schema": SUMMARY_SCHEMA, "file": FILE_NAME, "sha256": file_sha256, "head": self.head,
+        let mut summary = json!({"schema": SUMMARY_SCHEMA, "file": FILE_NAME, "sha256": file_sha256, "head": self.head,
             "first_seq": self.first_seq, "last_seq": self.last_sealed, "chunks": self.chunks, "raw_usb": self.cfg.raw_usb, "raw_paused": self.raw_pause,
             "raw_file": raw_file_str, "raw_bytes": self.raw_offset, "raw_record_bytes": RAW_RECORD_BYTES as u64, "raw_layout": RAW_LAYOUT,
             "hand_dir": self.cfg.dir.to_string_lossy(),
@@ -589,6 +647,9 @@ impl HandTimeline {
             "reports": self.reports, "in_rows": self.in_rows, "frames": self.frames, "frame_drops": self.frame_drops, "disk_faults": self.disk_faults,
             "frame_clock": if self.cfg.frame_clock_on { "on" } else { "off: frame alignment UNMEASURED" },
             "adaptive_trigger_state": UNMEASURED, "report_rate_hz": UNMEASURED, "claims": CLAIMS});
+        summary["bytes_42_43_raw_last"] = self.last_bytes_42_43.map(|s| json!([s[0], s[1]])).unwrap_or_else(|| json!(UNKNOWN));
+        summary["bytes_42_43_status"] = json!("ESTIMATED");
+        summary["bytes_42_43_changes_suppressed"] = json!(self.bytes_42_43_changes_suppressed);
         let text = format!("{}\n", serde_json::to_string_pretty(&summary).unwrap_or_else(|_| "{}".into()));
         let summary_path = self.cfg.dir.join(SUMMARY_FILE);
         let summary_sha256 = open_private_new(&summary_path, false).and_then(|mut f| { f.write_all(text.as_bytes())?; f.sync_all() })

@@ -7,8 +7,8 @@ use qorcap::hand::check::check_dir;
 use qorcap::hand::device::{DeviceInfo, DeviceModel};
 use qorcap::hand::logger;
 use qorcap::hand::source::{MockSource, MockStep, OpenOutcome, ReadOutcome, ReportSource};
-use qorcap::hand::timeline::{Config, HandTimeline, CHUNK_US, FILE_NAME, RAW_FILE, RAW_LAYOUT, RAW_RECORD_BYTES, SEAL_GRACE_US, SUMMARY_FILE};
-use qorcap::hid::{self, Pad, CROSS, FN_LEFT, BACK_RIGHT, R2};
+use qorcap::hand::timeline::{Config, HandTimeline, BYTES_42_43_CHANGE_CAP_PER_EPOCH, CHUNK_US, FILE_NAME, RAW_FILE, RAW_LAYOUT, RAW_RECORD_BYTES, SEAL_GRACE_US, SUMMARY_FILE};
+use qorcap::hid::{self, Pad, CIRCLE, CROSS, FN_LEFT, BACK_RIGHT, R2};
 use serde_json::Value;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -705,4 +705,216 @@ fn checker_treats_mid_record_unsealed_tail_as_unmeasured_warning() {
     assert!(!rep.errors.iter().any(|e| e.contains("SHA-256 does not match") || e.contains("exceeds file length")), "sealed slices should still hash and fit the file: {:?}", rep.errors);
     assert!(rep.warnings.iter().any(|w| w.contains("UNMEASURED unsealed tail") && w.contains("never padded") && w.contains("40 trailing")), "{:?}", rep.warnings);
     let _ = std::fs::remove_dir_all(&d_mid);
+}
+
+#[test]
+fn physical_face_records_raw_byte_51_for_physical_vs_paddle_without_rewriting_buttons() {
+    let dir = tmp("physical-face");
+    let mut tl = HandTimeline::open(cfg(&dir, true, Some(edge()))).unwrap();
+
+    let make = |counter: u8, buttons: u32, byte51: u8| -> Vec<u8> {
+        let mut r = report(counter, buttons, 128, u32::from(counter) * 100);
+        r[51] = byte51;
+        r
+    };
+
+    // Idle -> physical CROSS (b51=0x28) -> idle -> paddle CROSS (b51=0x08) ->
+    // physical CROSS while still held (b51=0x28, buttons unchanged) -> idle ->
+    // physical CIRCLE (b51=0x48) -> idle -> paddle CIRCLE (b51=0x08).
+    let seq: &[(u64, u32, u8)] = &[
+        (10_000, 0, 0x08),
+        (20_000, CROSS, 0x28),
+        (30_000, 0, 0x08),
+        (40_000, CROSS, 0x08),
+        (41_000, CROSS, 0x28),
+        (50_000, 0, 0x08),
+        (60_000, CIRCLE, 0x48),
+        (70_000, 0, 0x08),
+        (80_000, CIRCLE, 0x08),
+    ];
+    for (idx, &(t, btns, b51)) in seq.iter().enumerate() {
+        tl.on_report(t, Some(t * 10), &make(idx as u8, btns, b51));
+    }
+    tl.finish(1_500_000).unwrap();
+
+    let recs = lines(&dir);
+    assert_eq!(recs[0]["physical_face_status"], "ESTIMATED");
+    let ins: Vec<&Value> = recs.iter().filter(|r| r["type"] == "in").collect();
+    assert_eq!(ins.len(), seq.len(), "each button or physical_face change emits an in row: {ins:?}");
+
+    let observed: Vec<(u64, u64, u64)> = ins
+        .iter()
+        .map(|r| (r["t_us"].as_u64().unwrap(), r["buttons"].as_u64().unwrap(), r["physical_face"].as_u64().unwrap()))
+        .collect();
+    let expected: Vec<(u64, u64, u64)> = seq.iter().map(|&(t, b, b51)| (t, u64::from(b), u64::from(b51))).collect();
+    assert_eq!(observed, expected, "buttons stays unmodified post-remap and physical_face records raw byte 51");
+
+    let rep = check_dir(&dir).unwrap();
+    assert!(rep.pass(), "{:?}", rep.errors);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn dualsense_fallback_keeps_physical_face_unmeasured_and_out_of_change_key() {
+    let dir = tmp("ds-physical-face");
+    let mut tl = HandTimeline::open(cfg(&dir, true, Some(dualsense()))).unwrap();
+
+    // Standard DualSense (0x0CE6): changing byte 51 across reports with identical controls
+    // must keep physical_face == "UNMEASURED" and must not emit extra in rows.
+    for (idx, &b51) in [0x08u8, 0x28, 0x48, 0x88].iter().enumerate() {
+        let mut r = report(idx as u8, CROSS, 128, (idx as u32) * 100);
+        r[51] = b51;
+        tl.on_report(10_000 + (idx as u64) * 4_000, Some((idx as u64 + 1) * 100_000), &r);
+    }
+    tl.finish(1_500_000).unwrap();
+
+    let recs = lines(&dir);
+    assert_eq!(recs[0]["physical_face_status"], "UNMEASURED");
+    let ins: Vec<&Value> = recs.iter().filter(|r| r["type"] == "in").collect();
+    assert_eq!(ins.len(), 1, "byte 51 must stay out of the change key on standard DualSense: {ins:?}");
+    assert_eq!(ins[0]["physical_face"], "UNMEASURED");
+    assert_eq!(ins[0]["edge_bits"], "UNMEASURED");
+    assert_eq!(ins[0]["device_model"], "dualsense");
+
+    let rep = check_dir(&dir).unwrap();
+    assert!(rep.pass() && rep.fallback, "{:?}", rep.errors);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn bytes_42_43_raw_snapshots_at_connect_and_logs_change_while_keeping_adaptive_unmeasured() {
+    let dir = tmp("bytes-42-43");
+    let mut tl = HandTimeline::open(cfg(&dir, true, Some(edge()))).unwrap();
+
+    let make = |counter: u8, b42: u8, b43: u8| -> Vec<u8> {
+        let mut r = report(counter, 0, 128, u32::from(counter) * 100);
+        r[42] = b42;
+        r[43] = b43;
+        r[51] = 0x08;
+        r
+    };
+
+    // Initial connect snapshot [0, 0], unchanged follow-up, then mid-epoch change to [9, 9] within < ANALOG_MIN_GAP_US,
+    // unchanged follow-up at [9, 9], then new epoch reconnect with [0, 0].
+    tl.on_report(10_000, Some(100_000), &make(0, 0, 0));
+    tl.on_report(11_000, Some(110_000), &make(1, 0, 0));
+    tl.on_report(12_000, Some(120_000), &make(2, 9, 9));
+    tl.on_report(13_000, Some(130_000), &make(3, 9, 9));
+    assert_eq!(tl.live().state, "connected", "bytes_42_43_change status must not clobber live connected state");
+
+    tl.on_connected(200_000, edge());
+    tl.on_report(201_000, Some(2_010_000), &make(4, 0, 0));
+    tl.finish(1_500_000).unwrap();
+
+    let recs = lines(&dir);
+    let header = &recs[0];
+    assert_eq!(header["bytes_42_43_raw"], "UNKNOWN");
+    assert_eq!(header["bytes_42_43_status"], "ESTIMATED");
+    assert_eq!(header["bytes_42_43_change_cap_per_epoch"], BYTES_42_43_CHANGE_CAP_PER_EPOCH);
+    assert_eq!(header["adaptive_trigger_state"], "UNMEASURED");
+
+    let conn_rows: Vec<&Value> = recs.iter().filter(|r| r["type"] == "status" && r["state"] == "connected").collect();
+    assert_eq!(conn_rows.len(), 2);
+    assert!(conn_rows.iter().all(|r| r["bytes_42_43_raw"] == "UNKNOWN" && r["bytes_42_43_status"] == "ESTIMATED"));
+
+    let ins: Vec<&Value> = recs.iter().filter(|r| r["type"] == "in").collect();
+    assert_eq!(ins.len(), 3, "connect snapshot [0,0], mid-epoch change [9,9], reconnect snapshot [0,0]: {ins:?}");
+    assert_eq!(ins[0]["bytes_42_43_raw"], serde_json::json!([0, 0]));
+    assert_eq!(ins[1]["bytes_42_43_raw"], serde_json::json!([9, 9]));
+    assert_eq!(ins[1]["t_us"], 12_000);
+    assert_eq!(ins[2]["bytes_42_43_raw"], serde_json::json!([0, 0]));
+
+    let b_status: Vec<&Value> = recs.iter().filter(|r| r["type"] == "status" && r["state"] == "bytes_42_43_change").collect();
+    assert_eq!(b_status.len(), 1, "status entry emitted on mid-epoch change only: {b_status:?}");
+    assert_eq!(b_status[0]["bytes_42_43_raw"], serde_json::json!([9, 9]));
+    assert_eq!(b_status[0]["prev_bytes_42_43_raw"], serde_json::json!([0, 0]));
+    assert_eq!(b_status[0]["epoch_change_seq"], 1);
+    assert_eq!(b_status[0]["epoch_change_cap"], BYTES_42_43_CHANGE_CAP_PER_EPOCH);
+    assert_eq!(b_status[0]["status"], "ESTIMATED");
+    assert_eq!(b_status[0]["adaptive_trigger_state"], "UNMEASURED");
+
+    let summary: Value = serde_json::from_str(&std::fs::read_to_string(dir.join(SUMMARY_FILE)).unwrap()).unwrap();
+    assert_eq!(summary["bytes_42_43_raw_last"], serde_json::json!([0, 0]));
+    assert_eq!(summary["bytes_42_43_status"], "ESTIMATED");
+    assert_eq!(summary["bytes_42_43_changes_suppressed"], 0);
+    assert_eq!(summary["adaptive_trigger_state"], "UNMEASURED");
+
+    let rep = check_dir(&dir).unwrap();
+    assert!(rep.pass(), "{:?}", rep.errors);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn bytes_42_43_flapping_is_bounded_by_per_epoch_cap() {
+    let dir = tmp("bytes-42-43-flap");
+    let mut tl = HandTimeline::open(cfg(&dir, true, Some(edge()))).unwrap();
+
+    let cap = BYTES_42_43_CHANGE_CAP_PER_EPOCH;
+    let total_reports: u64 = cap + 40; // 1 initial + (cap + 39) flapping transitions
+    for i in 0..total_reports {
+        let mut r = report(i as u8, 0, 128, (i as u32) * 100);
+        let v = if i % 2 == 0 { 0u8 } else { 9u8 };
+        r[42] = v;
+        r[43] = v;
+        r[51] = 0x08;
+        tl.on_report(10_000 + i * 4_000, Some((i + 1) * 40_000), &r);
+    }
+    // Normal button press after hitting the cap still emits an `in` row with the current bytes 42-43.
+    let last_v = if (total_reports - 1) % 2 == 0 { 0u8 } else { 9u8 };
+    let mut btn = report(total_reports as u8, CROSS, 128, (total_reports as u32) * 100);
+    btn[42] = last_v;
+    btn[43] = last_v;
+    btn[51] = 0x28;
+    tl.on_report(10_000 + total_reports * 4_000, Some((total_reports + 1) * 40_000), &btn);
+
+    // Reconnect (epoch 2) resets the per-epoch cap so new changes are logged again.
+    tl.on_connected(500_000, edge());
+    let mut r2a = report(0, 0, 128, 1);
+    r2a[42] = 1;
+    r2a[43] = 1;
+    r2a[51] = 0x08;
+    tl.on_report(504_000, Some(5_040_000), &r2a);
+    let mut r2b = report(1, 0, 128, 2);
+    r2b[42] = 2;
+    r2b[43] = 3;
+    r2b[51] = 0x08;
+    tl.on_report(508_000, Some(5_080_000), &r2b);
+
+    tl.finish(1_500_000).unwrap();
+
+    let recs = lines(&dir);
+    let ep1_changes: Vec<&Value> = recs
+        .iter()
+        .filter(|r| r["type"] == "status" && r["state"] == "bytes_42_43_change" && r["epoch"] == 1)
+        .collect();
+    assert_eq!(ep1_changes.len() as u64, cap, "flapping status rows must stay capped per epoch");
+
+    let ep1_ins: Vec<&Value> = recs.iter().filter(|r| r["type"] == "in" && r["epoch"] == 1).collect();
+    // 1 initial snapshot + `cap` change-triggered rows + 1 normal CROSS press = cap + 2.
+    assert_eq!(ep1_ins.len() as u64, cap + 2, "flapping in rows must stay capped while normal button edges still log");
+    assert_eq!(ep1_ins.last().unwrap()["buttons"], CROSS);
+    assert_eq!(ep1_ins.last().unwrap()["bytes_42_43_raw"], serde_json::json!([last_v, last_v]));
+
+    let ep2_changes: Vec<&Value> = recs
+        .iter()
+        .filter(|r| r["type"] == "status" && r["state"] == "bytes_42_43_change" && r["epoch"] == 2)
+        .collect();
+    assert_eq!(ep2_changes.len(), 1, "reconnect resets the per-epoch cap");
+    assert_eq!(ep2_changes[0]["bytes_42_43_raw"], serde_json::json!([2, 3]));
+
+    let expected_suppressed = (total_reports - 1) - cap;
+    let hb_suppressed: u64 = recs
+        .iter()
+        .filter(|r| r["type"] == "hb")
+        .filter_map(|r| r["bytes_42_43_suppressed"].as_u64())
+        .sum();
+    assert_eq!(hb_suppressed, expected_suppressed);
+
+    let summary: Value = serde_json::from_str(&std::fs::read_to_string(dir.join(SUMMARY_FILE)).unwrap()).unwrap();
+    assert_eq!(summary["bytes_42_43_changes_suppressed"], expected_suppressed);
+    assert_eq!(summary["bytes_42_43_raw_last"], serde_json::json!([2, 3]));
+
+    let rep = check_dir(&dir).unwrap();
+    assert!(rep.pass(), "{:?}", rep.errors);
+    let _ = std::fs::remove_dir_all(&dir);
 }
