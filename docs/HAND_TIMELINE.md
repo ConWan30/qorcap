@@ -43,6 +43,14 @@ and falls back to the session bundle folder (`hand_dir_source: "fallback_bundle"
 `raw_layout: "v1"` (`raw_record_bytes: 80`) stores `t_us` next to `qpc_ticks` so the `Instant`-vs-QPC residual can
 be measured later; the residual itself stays `UNMEASURED` until benchmarked.
 
+The `.bin` is not self-describing: v1 files are headerless (`raw_file_header_bytes: 0`) and have no magic, version,
+or record-size header. Readers and verifiers MUST take `raw_layout`, `raw_record_bytes`, and `raw_file_header_bytes`
+from the sealed `hand_timeline.v0.jsonl` header, and `raw_offset` / `raw_len` / `raw_sha256` from each sealed
+`raw_bind` / `chunk` row, before interpreting any bytes. Do not infer layout from file length alone. Do not pad a
+short or mid-record tail. A future self-describing header must bump `raw_layout` to `"v2"`; the checker must keep
+accepting already-written v1 headerless files (`raw_layout: "v1"`, `raw_file_header_bytes: 0`, first `raw_offset` 0).
+Do not rewrite existing bins.
+
 Raw logging is **on by default** whenever the hand timeline runs. Switch it off for one session with
 `--no-raw-usb` (or `QORCAP_RAW_USB=0`); `raw_file`, `raw_offset`, `raw_len`, and `raw_sha256` are then `null`
 on `raw_bind` and `chunk` rows, and no `hand_raw.v0.bin` is created. Raw logging pauses (`paused: "disk_low"`)
