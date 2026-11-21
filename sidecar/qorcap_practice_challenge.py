@@ -52,15 +52,16 @@ def pattern_for(nonce_hex: str) -> list[str]:
 def build_practice_challenge(
     *,
     role: str = "home",
-    issued_ms: int | None = None,
-    window_ms: int = DEFAULT_WINDOW_MS,
     nonce: str | None = None,
 ) -> dict:
-    """Build a local CoD practice challenge payload for `POST /challenge`."""
+    """Build a local CoD practice challenge payload for `POST /challenge`.
+
+    The server sets the answer window: `issued_ms` is `received_wall_ms`, and
+    `deadline_ms` is `issued_ms + 90_000` (`PRACTICE_DEADLINE_MS`). Client
+    `issued_ms` / `deadline_ms` are not sent and would be ignored if present.
+    """
     tok = nonce or secrets.token_hex(16)
     pat = pattern_for(tok)
-    start_ms = int(time.time() * 1000) if issued_ms is None else int(issued_ms)
-    end_ms = start_ms + int(window_ms)
     return {
         "id": tok[:8],
         "role": role,
@@ -69,14 +70,17 @@ def build_practice_challenge(
         "game": "cod",
         "nonce": tok,
         "pattern": pat,
-        "issued_ms": start_ms,
-        "deadline_ms": end_ms,
     }
 
 
 def prompt_lines(payload: dict) -> list[str]:
     pat = " -> ".join(payload.get("pattern") or [])
-    secs = max(1, (int(payload["deadline_ms"]) - int(payload["issued_ms"])) // 1000)
+    issued = payload.get("issued_ms")
+    deadline = payload.get("deadline_ms")
+    if issued is not None and deadline is not None:
+        secs = max(1, (int(deadline) - int(issued)) // 1000)
+    else:
+        secs = DEFAULT_WINDOW_MS // 1000
     return [
         f"PRACTICE RESPONSE BOUND ({payload['id']}): press {pat} within {secs}s.",
         "Advisory only (practice lane); never changes receipt status and does not identify who held the controller.",
@@ -94,13 +98,11 @@ class PracticeChallengePrompter:
         console=None,
         say: Callable[[str], None] = print,
         delay_s: float | None = None,
-        window_ms: int = DEFAULT_WINDOW_MS,
     ) -> None:
         self.api = api
         self.role = role
         self.console = console
         self.say = say
-        self.window_ms = int(window_ms)
         if delay_s is None:
             raw = os.environ.get("QORCAP_PRACTICE_CHALLENGE_DELAY_S", "")
             try:
@@ -112,13 +114,8 @@ class PracticeChallengePrompter:
         self.posted: dict | None = None
         self._thread: threading.Thread | None = None
 
-    def trigger(self, *, nonce: str | None = None, issued_ms: int | None = None) -> dict | None:
-        payload = build_practice_challenge(
-            role=self.role,
-            issued_ms=issued_ms,
-            window_ms=self.window_ms,
-            nonce=nonce,
-        )
+    def trigger(self, *, nonce: str | None = None) -> dict | None:
+        payload = build_practice_challenge(role=self.role, nonce=nonce)
         try:
             resp = self.api.post("/challenge", payload, timeout=2.0)
         except Exception as exc:
@@ -128,22 +125,29 @@ class PracticeChallengePrompter:
             return None
         self.posted = resp.get("challenge") if isinstance(resp.get("challenge"), dict) else payload
         shown = False
+        ch = self.posted if isinstance(self.posted, dict) else payload
+        issued = ch.get("issued_ms")
+        deadline = ch.get("deadline_ms")
+        if issued is None or deadline is None:
+            # Display-only fallback; the bound itself is the server window in the checkpoint.
+            issued = int(time.time() * 1000)
+            deadline = int(issued) + DEFAULT_WINDOW_MS
         if self.console is not None:
             try:
                 shown = bool(
                     self.console.show_challenge(
                         phase="practice",
                         label="cod practice",
-                        pattern=list(payload["pattern"]),
-                        issued_ms=int(payload["issued_ms"]),
-                        deadline_ms=int(payload["deadline_ms"]),
+                        pattern=list(ch.get("pattern") or payload["pattern"]),
+                        issued_ms=int(issued),
+                        deadline_ms=int(deadline),
                         practice=True,
                     )
                 )
             except Exception:
                 shown = False
         if not shown:
-            for line in prompt_lines(payload):
+            for line in prompt_lines(ch):
                 self.say(line)
         return resp
 

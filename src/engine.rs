@@ -2518,12 +2518,25 @@ esac
         }
         let (expected_seq, expected_head) = e.hand.get().unwrap().binding().expect("chunk 0 sealed");
         let nonce = "0123456789abcdef0123456789abcdef";
-        let resp = e.challenge(&json!({"nonce": nonce, "phase": "practice", "practice": true, "game": "cod"})).unwrap();
+        let past = 1_000_000_000_000u64;
+        let resp = e.challenge(&json!({"nonce": nonce, "phase": "practice", "practice": true, "game": "cod",
+            "issued_ms": past, "deadline_ms": past + 1_000})).unwrap();
         assert_eq!(resp["challenge"]["hand_chunk_seq"], expected_seq);
         assert_eq!(resp["challenge"]["hand_head"], expected_head);
         assert_eq!(resp["checkpoint"]["qorcap"]["hand_chunk_seq"], expected_seq);
         assert_eq!(resp["checkpoint"]["qorcap"]["hand_head"], expected_head);
         assert_eq!(resp["checkpoint"]["qorcap"]["practice"], true);
+        // Server sets the practice window; a backdated POST body is ignored.
+        let issued = resp["challenge"]["issued_ms"].as_u64().unwrap();
+        let received_wall = resp["challenge"]["received_wall_ms"].as_u64().unwrap();
+        let deadline = resp["challenge"]["deadline_ms"].as_u64().unwrap();
+        assert_eq!(issued, received_wall, "practice issued_ms is received_wall_ms");
+        assert_eq!(deadline, issued + crate::hand::response::PRACTICE_DEADLINE_MS);
+        assert_ne!(issued, past, "client issued_ms is ignored");
+        assert_eq!(resp["checkpoint"]["qorcap"]["issued_ms"], issued);
+        assert_eq!(resp["checkpoint"]["qorcap"]["deadline_ms"], deadline);
+        assert_eq!(resp["checkpoint"]["qorcap"]["received_wall_ms"], received_wall);
+        assert_eq!(resp["checkpoint"]["qorcap"]["received_mono_ms"], resp["challenge"]["received_mono_ms"]);
         assert!(!pdir.join("stamp.txt").exists());
         assert!(pdir.join(crate::hand::response::PRACTICE_CHALLENGES_FILE).exists());
         assert!(!pdir.join("challenges.jsonl").exists());
@@ -2674,7 +2687,17 @@ impl Engine {
         let nonce = b["nonce"].as_str().ok_or("missing nonce")?;
         let pattern = ev::pattern_for(nonce)?;
         let now = wall_ms();
-        let issued = b["issued_ms"].as_u64().unwrap_or(now);
+        let received_mono_ms = self.ms();
+        // Practice window is server-set: issued_ms = received_wall_ms, deadline_ms = issued_ms +
+        // PRACTICE_DEADLINE_MS (90_000). Client issued_ms / deadline_ms are ignored (the sidecar
+        // does not send them; this response carries the server values). Official challenges still
+        // take issued_ms / deadline_ms from the POST body.
+        let (issued, deadline) = if practice_req {
+            (now, now + crate::hand::response::PRACTICE_DEADLINE_MS)
+        } else {
+            let issued = b["issued_ms"].as_u64().unwrap_or(now);
+            (issued, b["deadline_ms"].as_u64().unwrap_or(issued + 90_000))
+        };
         let (seq, head) = { let st = self.ev.lock().unwrap_or_else(|e| e.into_inner()); (st.seg.seq, st.seg.head.clone()) };
         let hand_bind = self.hand.get().map(|h| match h.binding() {
             Some((s, head)) => (json!(s), json!(head)),
@@ -2683,8 +2706,8 @@ impl Engine {
         let mut c = json!({"id": b["id"].as_str().map(String::from).unwrap_or_else(|| nonce[..8].to_string()),
             "role": b["role"].as_str().unwrap_or(&self.args.role),
             "phase": b["phase"].as_str().unwrap_or(if practice_req { "practice" } else { "kickoff" }),
-            "nonce": nonce, "pattern": pattern, "issued_ms": issued, "deadline_ms": b["deadline_ms"].as_u64().unwrap_or(issued + 90_000),
-            "received_wall_ms": now, "received_mono_ms": self.ms(), "segment_seq_at_receipt": seq, "chain_head_at_receipt": head});
+            "nonce": nonce, "pattern": pattern, "issued_ms": issued, "deadline_ms": deadline,
+            "received_wall_ms": now, "received_mono_ms": received_mono_ms, "segment_seq_at_receipt": seq, "chain_head_at_receipt": head});
         let mut cp_extra = json!({"nonce": nonce});
         if let Some((hs, hh)) = &hand_bind {
             c["hand_chunk_seq"] = hs.clone();
@@ -2695,6 +2718,10 @@ impl Engine {
         if practice_req {
             c["practice"] = json!(true);
             cp_extra["practice"] = json!(true);
+            cp_extra["issued_ms"] = json!(issued);
+            cp_extra["deadline_ms"] = json!(deadline);
+            cp_extra["received_wall_ms"] = json!(now);
+            cp_extra["received_mono_ms"] = json!(received_mono_ms);
             if let Some(g) = b["game"].as_str() {
                 c["game"] = json!(g);
                 cp_extra["game"] = json!(g);

@@ -5,12 +5,18 @@
 //! hand head was bound), and checks the challenge-time hand-chunk head binding (`hand_chunk_seq`,
 //! `hand_head`) committed in `checkpoints.jsonl`.
 //!
+//! Practice window is server-set and taken only from the challenge checkpoint: `issued_ms` equals
+//! `received_wall_ms`, `deadline_ms` equals `issued_ms + PRACTICE_DEADLINE_MS` (90_000 ms). A row that
+//! disagrees, a missing checkpoint, a stale (older-than-receipt) head, or a press before
+//! `received_mono_ms` cannot produce `answered_in_bound`. Official challenge rows keep the previous
+//! behaviour (window from the row; official POST body is unchanged).
+//!
 //! Advisory only: never alters `receipt.draft.json`, `bundle.json`, or `receipt.json`. Reports only
 //! whether the sealed pad stream answered the nonce within the bound (MEASURED / UNMEASURED), never who
 //! held the controller.
 
 use super::check::check_dir_heads;
-use super::timeline::{CHUNK_US, FILE_NAME as HAND_FILE};
+use super::timeline::{CHUNK_US, FILE_NAME as HAND_FILE, SEAL_GRACE_US};
 use crate::evidence::{self as ev, GENESIS};
 use crate::hid;
 use crate::inputs;
@@ -23,6 +29,10 @@ pub const FILE_NAME: &str = "hand_challenge.jsonl";
 pub const SCHEMA: &str = "qorcap-hand-response-bound/v0-info";
 pub const PRACTICE_CHALLENGES_FILE: &str = "practice_challenges.jsonl";
 pub const CHALLENGES_FILE: &str = "challenges.jsonl";
+/// Fixed practice-lane answer window, set by the server at `POST /challenge`.
+/// `issued_ms` is the server's `received_wall_ms`; `deadline_ms` is `issued_ms + PRACTICE_DEADLINE_MS`.
+/// Client `issued_ms` / `deadline_ms` are ignored. Official challenges are unchanged (still 90 s from the POST body).
+pub const PRACTICE_DEADLINE_MS: u64 = 90_000;
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ChallengeBound {
@@ -70,8 +80,14 @@ impl Report {
         !self.integrity_errors.is_empty()
             || self.records.iter().any(|r| {
                 r.reason.starts_with("tamper_")
-                    || r.reason == "bound_chunk_missing"
-                    || r.reason == "missing_hand_timeline"
+                    || matches!(
+                        r.reason.as_str(),
+                        "bound_chunk_missing"
+                            | "missing_hand_timeline"
+                            | "missing_challenge_checkpoint"
+                            | "missing_checkpoint_window"
+                            | "stale_bound_head"
+                    )
             })
     }
 }
@@ -132,13 +148,18 @@ fn read_jsonl_values(path: &Path) -> Result<Vec<Value>, String> {
 
 fn load_challenges(dir: &Path) -> Result<Vec<ChallengeEntry>, String> {
     let mut out = Vec::new();
-    for (fname, src) in [(PRACTICE_CHALLENGES_FILE, "practice"), (CHALLENGES_FILE, "challenge")] {
+    for (fname, src) in [
+        (PRACTICE_CHALLENGES_FILE, "practice"),
+        (CHALLENGES_FILE, "challenge"),
+    ] {
         let p = dir.join(fname);
         if !p.exists() {
             continue;
         }
         for v in read_jsonl_values(&p)? {
-            let source = if v["practice"].as_bool() == Some(true) || v["phase"].as_str() == Some("practice") {
+            let source = if v["practice"].as_bool() == Some(true)
+                || v["phase"].as_str() == Some("practice")
+            {
                 "practice".to_string()
             } else {
                 src.to_string()
@@ -152,7 +173,11 @@ fn load_challenges(dir: &Path) -> Result<Vec<ChallengeEntry>, String> {
 fn load_checkpoints(dir: &Path) -> CheckpointInfo {
     let p = dir.join("checkpoints.jsonl");
     if !p.exists() {
-        return CheckpointInfo { ok: true, by_nonce: HashMap::new(), errors: Vec::new() };
+        return CheckpointInfo {
+            ok: true,
+            by_nonce: HashMap::new(),
+            errors: Vec::new(),
+        };
     }
     let text = match std::fs::read_to_string(&p) {
         Ok(t) => t,
@@ -198,7 +223,11 @@ fn load_checkpoints(dir: &Path) -> CheckpointInfo {
             }
         }
     }
-    CheckpointInfo { ok: errors.is_empty(), by_nonce, errors }
+    CheckpointInfo {
+        ok: errors.is_empty(),
+        by_nonce,
+        errors,
+    }
 }
 
 fn rising_edges_from_rows(rows: &[(u64, u32)], wall_anchor_ms: i64) -> Vec<(i64, &'static str)> {
@@ -308,18 +337,27 @@ fn load_hand_stream(dir: &Path) -> HandStream {
         };
         let recs = std::mem::take(&mut pending);
         if wall_anchor_ms.is_none() {
-            wall_anchor_ms = recs
-                .iter()
-                .find(|r| r["type"] == "header")
-                .and_then(|h| h["wall_anchor_ms"].as_i64().or_else(|| h["wall_anchor_ms"].as_u64().and_then(|u| i64::try_from(u).ok())));
+            wall_anchor_ms = recs.iter().find(|r| r["type"] == "header").and_then(|h| {
+                h["wall_anchor_ms"].as_i64().or_else(|| {
+                    h["wall_anchor_ms"]
+                        .as_u64()
+                        .and_then(|u| i64::try_from(u).ok())
+                })
+            });
         }
         let hb = recs.iter().rev().find(|r| r["type"] == "hb");
-        let pad_connected = hb.and_then(|h| h["pad_connected"].as_bool()).unwrap_or(false);
+        let pad_connected = hb
+            .and_then(|h| h["pad_connected"].as_bool())
+            .unwrap_or(false);
         if let Some(anchor) = wall_anchor_ms {
             let chunk_ms = (CHUNK_US / 1000) as i64;
             let lo_ms = anchor + (seq as i64) * chunk_ms;
             let hi_ms = anchor + (seq as i64 + 1) * chunk_ms;
-            chunks.push(ChunkMeta { lo_ms, hi_ms, pad_connected });
+            chunks.push(ChunkMeta {
+                lo_ms,
+                hi_ms,
+                pad_connected,
+            });
         }
         sealed_records.extend(recs);
     }
@@ -392,9 +430,11 @@ fn load_inputs_stream(dir: &Path) -> InputsStream {
     let header = recs.iter().find(|r| r["type"] == "header");
     let enabled = header.and_then(|h| h["enabled"].as_bool()).unwrap_or(true);
     let wall_anchor_ms = header.and_then(|h| {
-        h["wall_anchor_ms"]
-            .as_i64()
-            .or_else(|| h["wall_anchor_ms"].as_u64().and_then(|u| i64::try_from(u).ok()))
+        h["wall_anchor_ms"].as_i64().or_else(|| {
+            h["wall_anchor_ms"]
+                .as_u64()
+                .and_then(|u| i64::try_from(u).ok())
+        })
     });
     let mut in_rows: Vec<(u64, usize, u32)> = Vec::new();
     if ok {
@@ -432,7 +472,29 @@ fn statement_for(outcome: &str, reason: &str) -> String {
 }
 
 fn opt_i64(v: &Value) -> Option<i64> {
-    v.as_i64().or_else(|| v.as_u64().and_then(|u| i64::try_from(u).ok()))
+    v.as_i64()
+        .or_else(|| v.as_u64().and_then(|u| i64::try_from(u).ok()))
+}
+
+fn is_practice_entry(entry: &ChallengeEntry) -> bool {
+    entry.source == "practice"
+        || entry.val["practice"].as_bool() == Some(true)
+        || entry.val["phase"].as_str() == Some("practice")
+}
+
+/// Latest 1 s window that must already have been sealed at `received_mono_us` (tick rule, not stop/partial).
+fn latest_sealed_seq_at(received_mono_us: u64, first_seq: u64) -> Option<u64> {
+    let min_t = (first_seq + 1)
+        .saturating_mul(CHUNK_US)
+        .saturating_add(SEAL_GRACE_US);
+    if received_mono_us < min_t {
+        return None;
+    }
+    Some((received_mono_us - SEAL_GRACE_US) / CHUNK_US - 1)
+}
+
+fn field_mismatch(row: &Value, key: &str, want: i64) -> bool {
+    row.get(key).is_some() && opt_i64(&row[key]) != Some(want)
 }
 
 fn evaluate_one(
@@ -450,8 +512,10 @@ fn evaluate_one(
     let phase = v["phase"].as_str().unwrap_or("practice").to_string();
     let role = v["role"].as_str().unwrap_or("home").to_string();
     let game = v["game"].as_str().map(String::from);
-    let issued_ms = opt_i64(&v["issued_ms"]).unwrap_or(0);
-    let deadline_ms = opt_i64(&v["deadline_ms"]).unwrap_or(issued_ms);
+    let practice = is_practice_entry(entry);
+    let mut issued_ms = opt_i64(&v["issued_ms"]).unwrap_or(0);
+    let mut deadline_ms = opt_i64(&v["deadline_ms"]).unwrap_or(issued_ms);
+    let mut received_mono_ms: Option<i64> = opt_i64(&v["received_mono_ms"]);
 
     let derived = match ev::pattern_for(&nonce) {
         Ok(p) => p,
@@ -495,20 +559,68 @@ fn evaluate_one(
     let c_seq = v["hand_chunk_seq"].as_u64();
     let c_head = v["hand_head"].as_str().map(String::from);
     let (cp_hand_seq, cp_hand_head) = match cp_match {
-        Some((_, q)) => (q["hand_chunk_seq"].as_u64(), q["hand_head"].as_str().map(String::from)),
+        Some((_, q)) => (
+            q["hand_chunk_seq"].as_u64(),
+            q["hand_head"].as_str().map(String::from),
+        ),
         None => (None, None),
     };
 
-    let bound_chunk_seq = c_seq.or(cp_hand_seq);
-    let bound_head = c_head.clone().or_else(|| cp_hand_head.clone());
+    // Practice: the bound head is the checkpoint's latest sealed head at receipt. Official rows may
+    // still fall back to the row when no head was bound.
+    let bound_chunk_seq = if practice {
+        cp_hand_seq
+    } else {
+        c_seq.or(cp_hand_seq)
+    };
+    let bound_head = if practice {
+        cp_hand_head.clone()
+    } else {
+        c_head.clone().or_else(|| cp_hand_head.clone())
+    };
 
     let mut unmeasured_reason: Option<String> = None;
-    let bound_head_status: &'static str;
+    let mut bound_head_status: &'static str = "unbound_no_hand_timeline";
+
+    if practice && cp_match.is_none() {
+        bound_head_status = "unbound_no_checkpoint";
+        unmeasured_reason = Some("missing_challenge_checkpoint".into());
+    } else if practice {
+        let q = &cp_match.unwrap().1;
+        match (
+            opt_i64(&q["issued_ms"]),
+            opt_i64(&q["deadline_ms"]),
+            opt_i64(&q["received_wall_ms"]),
+            opt_i64(&q["received_mono_ms"]),
+        ) {
+            (Some(i), Some(d), Some(w), Some(m)) => {
+                if field_mismatch(v, "issued_ms", i)
+                    || field_mismatch(v, "deadline_ms", d)
+                    || field_mismatch(v, "received_wall_ms", w)
+                    || field_mismatch(v, "received_mono_ms", m)
+                {
+                    unmeasured_reason = Some("tamper_window_mismatch".into());
+                } else if i != w || d != i + PRACTICE_DEADLINE_MS as i64 {
+                    unmeasured_reason = Some("tamper_window_mismatch".into());
+                } else {
+                    issued_ms = i;
+                    deadline_ms = d;
+                    received_mono_ms = Some(m);
+                }
+            }
+            _ => {
+                unmeasured_reason = Some("missing_checkpoint_window".into());
+            }
+        }
+    }
 
     if !cps.ok {
         bound_head_status = "tamper_checkpoint_chain";
         unmeasured_reason = Some("tamper_checkpoint_chain".into());
-    } else if cp_match.is_some() && (v.get("hand_head").is_some() || cp_match.unwrap().1.get("hand_head").is_some())
+    } else if unmeasured_reason.as_deref() == Some("missing_challenge_checkpoint") {
+        // Already set: a practice row with no checkpoint is never "matched".
+    } else if cp_match.is_some()
+        && (v.get("hand_head").is_some() || cp_match.unwrap().1.get("hand_head").is_some())
         && (c_seq != cp_hand_seq || c_head != cp_hand_head)
     {
         bound_head_status = "tamper_challenge_vs_checkpoint";
@@ -532,11 +644,27 @@ fn evaluate_one(
                 }
             }
         }
-    } else if v.get("hand_head").is_some() || cp_match.is_some_and(|(_, q)| q.get("hand_head").is_some()) {
+    } else if v.get("hand_head").is_some()
+        || cp_match.is_some_and(|(_, q)| q.get("hand_head").is_some())
+    {
         // Explicit null hand_head before first chunk was sealed.
         bound_head_status = "genesis_before_first_chunk";
-    } else {
+    } else if unmeasured_reason.as_deref() != Some("missing_challenge_checkpoint") {
         bound_head_status = "unbound_no_hand_timeline";
+    }
+
+    // Practice: reject a head older than the latest window that must already have been sealed at receipt.
+    if practice && unmeasured_reason.is_none() && bound_head_status == "matched" {
+        if let (Some(mono), Some(bound_seq)) = (received_mono_ms, bound_chunk_seq) {
+            let first = hand.heads.keys().next().copied().unwrap_or(0);
+            let mono_us = (mono.max(0) as u64).saturating_mul(1_000);
+            if let Some(expected) = latest_sealed_seq_at(mono_us, first) {
+                if bound_seq < expected {
+                    bound_head_status = "stale_bound_head";
+                    unmeasured_reason = Some("stale_bound_head".into());
+                }
+            }
+        }
     }
 
     // Check if stored pattern matches derived pattern.
@@ -554,32 +682,35 @@ fn evaluate_one(
     }
 
     // Select sealed stream: hand_timeline.v0.jsonl first, or inputs.jsonl only if no hand head was bound and hand_timeline is not present.
-    let (stream_source, presses_opt, stream_err): (&'static str, Option<&[(i64, &'static str)]>, Option<String>) =
-        if hand.present {
-            if !hand.ok {
-                ("hand_timeline", None, Some("tamper_hand_timeline".into()))
-            } else if hand.wall_anchor_ms.is_none() || hand.chunks.is_empty() {
-                ("hand_timeline", None, Some("no_sealed_stream".into()))
+    let (stream_source, presses_opt, stream_err): (
+        &'static str,
+        Option<&[(i64, &'static str)]>,
+        Option<String>,
+    ) = if hand.present {
+        if !hand.ok {
+            ("hand_timeline", None, Some("tamper_hand_timeline".into()))
+        } else if hand.wall_anchor_ms.is_none() || hand.chunks.is_empty() {
+            ("hand_timeline", None, Some("no_sealed_stream".into()))
+        } else {
+            ("hand_timeline", Some(&hand.presses), None)
+        }
+    } else if bound_head_status == "unbound_no_hand_timeline" || hand.off {
+        if inp.present {
+            if !inp.ok {
+                ("inputs", None, Some("tamper_inputs_chain".into()))
+            } else if !inp.enabled {
+                ("inputs", None, Some("pad_not_connected".into()))
+            } else if inp.wall_anchor_ms.is_none() {
+                ("inputs", None, Some("missing_wall_anchor".into()))
             } else {
-                ("hand_timeline", Some(&hand.presses), None)
-            }
-        } else if bound_head_status == "unbound_no_hand_timeline" || hand.off {
-            if inp.present {
-                if !inp.ok {
-                    ("inputs", None, Some("tamper_inputs_chain".into()))
-                } else if !inp.enabled {
-                    ("inputs", None, Some("pad_not_connected".into()))
-                } else if inp.wall_anchor_ms.is_none() {
-                    ("inputs", None, Some("missing_wall_anchor".into()))
-                } else {
-                    ("inputs", Some(&inp.presses), None)
-                }
-            } else {
-                ("none", None, Some("no_sealed_stream".into()))
+                ("inputs", Some(&inp.presses), None)
             }
         } else {
-            ("none", None, Some("missing_hand_timeline".into()))
-        };
+            ("none", None, Some("no_sealed_stream".into()))
+        }
+    } else {
+        ("none", None, Some("missing_hand_timeline".into()))
+    };
 
     if unmeasured_reason.is_none() {
         unmeasured_reason = stream_err;
@@ -617,6 +748,15 @@ fn evaluate_one(
     }
 
     let presses = presses_opt.unwrap_or(&[]);
+    let wall_anchor = if stream_source == "hand_timeline" {
+        hand.wall_anchor_ms
+    } else {
+        inp.wall_anchor_ms
+    };
+    let after_receipt = |t: i64| match (received_mono_ms, wall_anchor) {
+        (Some(m), Some(a)) => t.saturating_sub(a) >= m,
+        _ => true,
+    };
 
     // For hand_timeline, check sealed chunk coverage in [issued_ms, deadline_ms].
     let hand_window_gap: Option<&'static str> = if stream_source == "hand_timeline" {
@@ -640,7 +780,7 @@ fn evaluate_one(
     let in_window: Vec<(i64, &'static str)> = presses
         .iter()
         .copied()
-        .filter(|&(t, _)| t >= issued_ms && t <= deadline_ms)
+        .filter(|&(t, _)| t >= issued_ms && t <= deadline_ms && after_receipt(t))
         .collect();
     let m_in = ev::match_pattern(&derived, &in_window);
     if m_in.matched {
@@ -746,7 +886,7 @@ fn evaluate_one(
     let after_issued: Vec<(i64, &'static str)> = presses
         .iter()
         .copied()
-        .filter(|&(t, _)| t >= issued_ms)
+        .filter(|&(t, _)| t >= issued_ms && after_receipt(t))
         .collect();
     let m_after = ev::match_pattern(&derived, &after_issued);
     if m_after.matched {
@@ -902,7 +1042,8 @@ mod tests {
     use std::time::Duration;
 
     fn tmp_dir(name: &str) -> std::path::PathBuf {
-        let d = std::env::temp_dir().join(format!("qorcap-respbound-{name}-{}", std::process::id()));
+        let d =
+            std::env::temp_dir().join(format!("qorcap-respbound-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
@@ -963,9 +1104,10 @@ mod tests {
         presses: &[(u64, &str)],
         challenge_nonce: &str,
         issued_ms: i64,
-        deadline_ms: i64,
         bind_after_chunk0: bool,
     ) -> (u64, String) {
+        let deadline_ms = issued_ms + PRACTICE_DEADLINE_MS as i64;
+        let received_mono_ms = issued_ms - wall_anchor_ms;
         let cfg = Config {
             dir: dir.to_path_buf(),
             raw_usb: false,
@@ -978,6 +1120,10 @@ mod tests {
         };
         let mut tl = HandTimeline::open(cfg).unwrap();
         tl.on_connected(10_000, test_device());
+        // Seal and capture chunk 0 before later reports, so bind_after_chunk0 stays chunk 0
+        // even when the fixture's presses (and receipt) are several seconds later.
+        tl.tick(1_300_000);
+        let chunk0_binding = tl.binding().unwrap();
 
         let mut ctr = 1u8;
         for &(t_us, btn) in presses {
@@ -988,10 +1134,14 @@ mod tests {
             ctr = ctr.wrapping_add(1);
             tl.on_report(t_us + 20_000, None, &up);
         }
-        // Seal chunks 0..3 cleanly (seal grace is 150ms, so on_report/on_timeout at 4.5s seals up to chunk 3).
-        tl.tick(1_300_000);
-        let chunk0_binding = tl.binding().unwrap();
-        let f = tl.finish(4_600_000).unwrap();
+        let finish_us = presses
+            .iter()
+            .map(|(t, _)| *t)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(2_000_000)
+            .max(4_600_000);
+        let f = tl.finish(finish_us).unwrap();
 
         let (bind_seq, bind_head) = if bind_after_chunk0 {
             chunk0_binding
@@ -1010,6 +1160,8 @@ mod tests {
             "pattern": pattern,
             "issued_ms": issued_ms,
             "deadline_ms": deadline_ms,
+            "received_wall_ms": issued_ms,
+            "received_mono_ms": received_mono_ms,
             "hand_chunk_seq": bind_seq,
             "hand_head": bind_head,
         });
@@ -1028,6 +1180,10 @@ mod tests {
                     "nonce": challenge_nonce,
                     "practice": true,
                     "game": "cod",
+                    "issued_ms": issued_ms,
+                    "deadline_ms": deadline_ms,
+                    "received_wall_ms": issued_ms,
+                    "received_mono_ms": received_mono_ms,
                     "hand_chunk_seq": bind_seq,
                     "hand_head": bind_head,
                 }),
@@ -1066,7 +1222,7 @@ mod tests {
         let nonce = "0123456789abcdef0123456789abcdef";
         let pat = ev::pattern_for(nonce).unwrap();
 
-        // 1. Answered within bound [anchor+1200, anchor+2500]
+        // 1. Answered within the server window [issued, issued + PRACTICE_DEADLINE_MS]
         let d_ok = tmp_dir("in-bound");
         let presses_ok = [
             (1_300_000, pat[0]),
@@ -1075,7 +1231,7 @@ mod tests {
             (1_600_000, pat[3]),
             (1_700_000, pat[4]),
         ];
-        make_hand_bundle(&d_ok, anchor, &presses_ok, nonce, anchor + 1200, anchor + 2500, true);
+        make_hand_bundle(&d_ok, anchor, &presses_ok, nonce, anchor + 1200, true);
         let rep_ok = write_dir(&d_ok).unwrap();
         assert!(!rep_ok.has_tamper());
         assert_eq!(rep_ok.records.len(), 1);
@@ -1094,28 +1250,28 @@ mod tests {
         assert!(!d_ok.join("receipt.draft.json").exists());
         let _ = std::fs::remove_dir_all(&d_ok);
 
-        // 2. Late: starts at 1300ms, finishes at 2600ms > deadline 2000ms
+        // 2. Late: starts after the 90 s server deadline (issued at +1200 ms, deadline +91_200 ms)
         let d_late = tmp_dir("late");
         let presses_late = [
-            (1_300_000, pat[0]),
-            (1_600_000, pat[1]),
-            (1_900_000, pat[2]),
-            (2_200_000, pat[3]),
-            (2_600_000, pat[4]),
+            (91_300_000, pat[0]),
+            (91_600_000, pat[1]),
+            (91_900_000, pat[2]),
+            (92_200_000, pat[3]),
+            (92_600_000, pat[4]),
         ];
-        make_hand_bundle(&d_late, anchor, &presses_late, nonce, anchor + 1200, anchor + 2000, true);
+        make_hand_bundle(&d_late, anchor, &presses_late, nonce, anchor + 1200, true);
         let rep_late = evaluate_dir(&d_late).unwrap();
         assert_eq!(rep_late.records[0].status, "MEASURED");
         assert_eq!(rep_late.records[0].outcome, "late");
         assert_eq!(rep_late.records[0].in_bound, Some(false));
-        assert_eq!(rep_late.records[0].late_by_ms, Some(600));
+        assert_eq!(rep_late.records[0].late_by_ms, Some(1400));
         let _ = std::fs::remove_dir_all(&d_late);
 
         // 3. Absent: wrong button after OPTIONS
         let d_abs = tmp_dir("absent");
         let wrong = if pat[1] == "CROSS" { "CIRCLE" } else { "CROSS" };
         let presses_abs = [(1_300_000, pat[0]), (1_400_000, wrong)];
-        make_hand_bundle(&d_abs, anchor, &presses_abs, nonce, anchor + 1200, anchor + 2500, true);
+        make_hand_bundle(&d_abs, anchor, &presses_abs, nonce, anchor + 1200, true);
         let rep_abs = evaluate_dir(&d_abs).unwrap();
         assert_eq!(rep_abs.records[0].status, "MEASURED");
         assert_eq!(rep_abs.records[0].outcome, "absent");
@@ -1137,7 +1293,7 @@ mod tests {
             (1_600_000, pat[3]),
             (1_700_000, pat[4]),
         ];
-        make_hand_bundle(&d, anchor, &presses, nonce, anchor + 1200, anchor + 2500, true);
+        make_hand_bundle(&d, anchor, &presses, nonce, anchor + 1200, true);
 
         // Tamper the bound head in practice_challenges.jsonl (checkpoint still has the real one -> mismatch).
         let mut ch: Value = serde_json::from_str(
@@ -1200,12 +1356,19 @@ mod tests {
         let nonce = "11112222333344445555666677778888";
         let pat = ev::pattern_for(nonce).unwrap();
         let d = tmp_dir("inputs-fallback");
-        let log = Arc::new(Mutex::new(inputs::InputLog::new(Some(d.join("inputs.jsonl")), true, anchor)));
+        let log = Arc::new(Mutex::new(inputs::InputLog::new(
+            Some(d.join("inputs.jsonl")),
+            true,
+            anchor,
+        )));
         {
             let mut g = log.lock().unwrap();
             for (i, &btn) in pat.iter().enumerate() {
                 let t_us = 1_300_000 + (i as u64) * 100_000;
-                let p = hid::Pad { buttons: button_bits(&[btn]), ..hid::Pad::neutral() };
+                let p = hid::Pad {
+                    buttons: button_bits(&[btn]),
+                    ..hid::Pad::neutral()
+                };
                 g.on_report(t_us, &p);
                 let z = hid::Pad::neutral();
                 g.on_report(t_us + 20_000, &z);
@@ -1213,6 +1376,8 @@ mod tests {
         }
         inputs::seal_shared(&log, 0, || 2_000_000);
 
+        let issued = (anchor as i64) + 1200;
+        let deadline = issued + PRACTICE_DEADLINE_MS as i64;
         let ch = json!({
             "id": &nonce[..8],
             "role": "home",
@@ -1221,12 +1386,35 @@ mod tests {
             "game": "cod",
             "nonce": nonce,
             "pattern": pat,
-            "issued_ms": (anchor as i64) + 1200,
-            "deadline_ms": (anchor as i64) + 2500,
+            "issued_ms": issued,
+            "deadline_ms": deadline,
+            "received_wall_ms": issued,
+            "received_mono_ms": 1200,
         });
         std::fs::write(
             d.join(PRACTICE_CHALLENGES_FILE),
             format!("{}\n", serde_json::to_string(&ch).unwrap()),
+        )
+        .unwrap();
+        let mut chain = ev::CheckpointChain::default();
+        let cp0 = chain
+            .next(
+                1000,
+                json!({
+                    "trigger": "challenge",
+                    "nonce": nonce,
+                    "practice": true,
+                    "game": "cod",
+                    "issued_ms": issued,
+                    "deadline_ms": deadline,
+                    "received_wall_ms": issued,
+                    "received_mono_ms": 1200,
+                }),
+            )
+            .unwrap();
+        std::fs::write(
+            d.join("checkpoints.jsonl"),
+            format!("{}\n", serde_json::to_string(&cp0).unwrap()),
         )
         .unwrap();
 
@@ -1280,7 +1468,7 @@ mod tests {
         // 1a. Mid-session crash (no stop checkpoint/summary yet) with unsealed chunk-5 answer rows after chunk 4:
         //     check_dir passes with an unsealed-tail warning, and unsealed rows must NOT answer the nonce.
         let d = tmp_dir("unsealed-tail");
-        make_hand_bundle(&d, anchor, &[], nonce, anchor + 1200, anchor + 5500, true);
+        make_hand_bundle(&d, anchor, &[], nonce, anchor + 1200, true);
         let _ = std::fs::remove_file(d.join(crate::hand::timeline::SUMMARY_FILE));
         let cp0_line = std::fs::read_to_string(d.join("checkpoints.jsonl"))
             .unwrap()
@@ -1298,21 +1486,34 @@ mod tests {
         std::fs::write(d.join(HAND_FILE), raw).unwrap();
         let rep = evaluate_dir(&d).unwrap();
         assert_eq!(rep.records[0].status, "MEASURED");
-        assert_eq!(rep.records[0].outcome, "absent", "unsealed tail rows must not answer the nonce");
+        assert_eq!(
+            rep.records[0].outcome, "absent",
+            "unsealed tail rows must not answer the nonce"
+        );
         assert_eq!(rep.records[0].in_bound, Some(false));
         let _ = std::fs::remove_dir_all(&d);
 
         // 2. If hand_head was bound at challenge time and hand_timeline.v0.jsonl is deleted, do NOT
         //    silently fall back to inputs.jsonl to invent a pass.
         let d2 = tmp_dir("missing-bound-hand");
-        let (_, bound_head) = make_hand_bundle(&d2, anchor, &[], nonce, anchor + 1200, anchor + 2500, true);
+        let (_, bound_head) = make_hand_bundle(&d2, anchor, &[], nonce, anchor + 1200, true);
         assert!(!bound_head.is_empty());
-        let log = Arc::new(Mutex::new(inputs::InputLog::new(Some(d2.join("inputs.jsonl")), true, anchor as u64)));
+        let log = Arc::new(Mutex::new(inputs::InputLog::new(
+            Some(d2.join("inputs.jsonl")),
+            true,
+            anchor as u64,
+        )));
         {
             let mut g = log.lock().unwrap();
             for (i, &btn) in pat.iter().enumerate() {
                 let t_us = 1_300_000 + (i as u64) * 100_000;
-                g.on_report(t_us, &hid::Pad { buttons: button_bits(&[btn]), ..hid::Pad::neutral() });
+                g.on_report(
+                    t_us,
+                    &hid::Pad {
+                        buttons: button_bits(&[btn]),
+                        ..hid::Pad::neutral()
+                    },
+                );
                 g.on_report(t_us + 20_000, &hid::Pad::neutral());
             }
         }
@@ -1325,5 +1526,103 @@ mod tests {
         assert_eq!(rep2.records[0].bound_head_status, "missing_hand_timeline");
         assert_eq!(rep2.records[0].reason, "missing_hand_timeline");
         let _ = std::fs::remove_dir_all(&d2);
+    }
+
+    #[test]
+    fn backdated_presses_before_receipt_are_not_answered_in_bound() {
+        // Server issued at +2.1 s (chunk 0 is still the latest sealed head). Presses exist only
+        // in the first two seconds — the window a client would have claimed by backdating issued_ms.
+        let nonce = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let pat = ev::pattern_for(nonce).unwrap();
+        let d = tmp_dir("backdated-presses");
+        let anchor: i64 = 1_700_000_000_000;
+        let presses = [
+            (1_300_000, pat[0]),
+            (1_600_000, pat[1]),
+            (1_900_000, pat[2]),
+            (2_200_000, pat[3]),
+            (2_600_000, pat[4]),
+        ];
+        make_hand_bundle(&d, anchor, &presses, nonce, anchor + 2_100, true);
+        let r = &evaluate_dir(&d).unwrap().records[0];
+        assert_ne!(r.outcome, "answered_in_bound");
+        assert_eq!(r.in_bound, Some(false));
+        assert_eq!(r.outcome, "absent");
+        assert_eq!(r.issued_ms, anchor + 2_100);
+        assert_eq!(r.deadline_ms, anchor + 2_100 + PRACTICE_DEADLINE_MS as i64);
+    }
+
+    #[test]
+    fn edited_row_window_is_tamper_not_answered_in_bound() {
+        let nonce = "cccccccccccccccccccccccccccccccc";
+        let pat = ev::pattern_for(nonce).unwrap();
+        let d = tmp_dir("edited-row");
+        let anchor: i64 = 1_700_000_000_000;
+        let presses = [
+            (1_300_000, pat[0]),
+            (1_600_000, pat[1]),
+            (1_900_000, pat[2]),
+            (2_200_000, pat[3]),
+            (2_600_000, pat[4]),
+        ];
+        make_hand_bundle(&d, anchor, &presses, nonce, anchor + 1_200, true);
+        let path = d.join(PRACTICE_CHALLENGES_FILE);
+        let mut row: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        row["deadline_ms"] = json!(anchor + 1_200 + 5_000); // disagrees with the 90 s checkpoint window
+        std::fs::write(&path, format!("{}\n", serde_json::to_string(&row).unwrap())).unwrap();
+        let r = &evaluate_dir(&d).unwrap().records[0];
+        assert_eq!(r.status, "UNMEASURED");
+        assert_eq!(r.reason, "tamper_window_mismatch");
+        assert_ne!(r.outcome, "answered_in_bound");
+        assert_ne!(r.in_bound, Some(true));
+    }
+
+    #[test]
+    fn practice_row_with_no_checkpoint_is_unmeasured_not_matched() {
+        let nonce = "dddddddddddddddddddddddddddddddd";
+        let pat = ev::pattern_for(nonce).unwrap();
+        let d = tmp_dir("no-checkpoint");
+        let anchor: i64 = 1_700_000_000_000;
+        let presses = [
+            (1_300_000, pat[0]),
+            (1_600_000, pat[1]),
+            (1_900_000, pat[2]),
+            (2_200_000, pat[3]),
+            (2_600_000, pat[4]),
+        ];
+        make_hand_bundle(&d, anchor, &presses, nonce, anchor + 1_200, true);
+        std::fs::remove_file(d.join("checkpoints.jsonl")).unwrap();
+        let r = &evaluate_dir(&d).unwrap().records[0];
+        assert_eq!(r.status, "UNMEASURED");
+        assert_eq!(r.reason, "missing_challenge_checkpoint");
+        assert_eq!(r.bound_head_status, "unbound_no_checkpoint");
+        assert_ne!(r.outcome, "answered_in_bound");
+        assert_ne!(r.bound_head_status, "matched");
+        assert_ne!(r.in_bound, Some(true));
+    }
+
+    #[test]
+    fn stale_bound_head_is_not_answered_in_bound() {
+        // Receipt at +5.2 s, when later chunks must already have been sealed, but the bound
+        // head is still chunk 0. Even if the pattern is pressed after receipt, this is not in-bound.
+        let nonce = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+        let pat = ev::pattern_for(nonce).unwrap();
+        let d = tmp_dir("stale-head");
+        let anchor: i64 = 1_700_000_000_000;
+        let presses = [
+            (5_300_000, pat[0]),
+            (5_600_000, pat[1]),
+            (5_900_000, pat[2]),
+            (6_200_000, pat[3]),
+            (6_600_000, pat[4]),
+        ];
+        make_hand_bundle(&d, anchor, &presses, nonce, anchor + 5_200, true);
+        let r = &evaluate_dir(&d).unwrap().records[0];
+        assert_eq!(r.status, "UNMEASURED");
+        assert_eq!(r.reason, "stale_bound_head");
+        assert_eq!(r.bound_head_status, "stale_bound_head");
+        assert_ne!(r.outcome, "answered_in_bound");
+        assert_ne!(r.in_bound, Some(true));
     }
 }

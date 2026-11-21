@@ -34,7 +34,26 @@ class _StubApi:
 
     def post(self, path: str, body: dict, timeout: float = 2.0):
         self.posts.append((path, dict(body)))
-        return {"ok": True, "challenge": dict(body), "checkpoint": {"seq": 1}}
+        # Server sets the practice window; any client issued/deadline would be ignored.
+        received_wall = 1_700_000_000_000
+        ch = dict(body)
+        ch["issued_ms"] = received_wall
+        ch["deadline_ms"] = received_wall + 90_000
+        ch["received_wall_ms"] = received_wall
+        ch["received_mono_ms"] = 5_000
+        return {
+            "ok": True,
+            "challenge": ch,
+            "checkpoint": {
+                "seq": 1,
+                "qorcap": {
+                    "issued_ms": received_wall,
+                    "deadline_ms": received_wall + 90_000,
+                    "received_wall_ms": received_wall,
+                    "received_mono_ms": 5_000,
+                },
+            },
+        }
 
 
 class _StubConsole:
@@ -81,7 +100,7 @@ def test_practice_prompt_posts_locally_and_renders_non_referee_card():
     con = _StubConsole(branded=True)
     said: list[str] = []
     prompter = qpc.PracticeChallengePrompter(api, role="home", console=con, say=said.append, delay_s=0.0)
-    resp = prompter.trigger(nonce="0123456789abcdef0123456789abcdef", issued_ms=1_700_000_000_000)
+    resp = prompter.trigger(nonce="0123456789abcdef0123456789abcdef")
     assert resp is not None and resp["ok"] is True
     assert len(api.posts) == 1
     path, body = api.posts[0]
@@ -89,21 +108,27 @@ def test_practice_prompt_posts_locally_and_renders_non_referee_card():
     assert body["practice"] is True
     assert body["phase"] == "practice"
     assert body["game"] == "cod"
-    assert body["issued_ms"] == 1_700_000_000_000
-    assert body["deadline_ms"] == 1_700_000_090_000
+    assert "issued_ms" not in body
+    assert "deadline_ms" not in body
+    ch = resp["challenge"]
+    assert ch["issued_ms"] == 1_700_000_000_000
+    assert ch["deadline_ms"] == 1_700_000_090_000
+    assert ch["received_wall_ms"] == ch["issued_ms"]
     assert len(con.calls) == 1
     assert con.calls[0]["practice"] is True
+    assert con.calls[0]["issued_ms"] == ch["issued_ms"]
+    assert con.calls[0]["deadline_ms"] == ch["deadline_ms"]
     assert said == []
 
     card = qc.ChallengeCard(
         phase="practice",
         label="cod practice",
-        pattern=body["pattern"],
-        issued_ms=body["issued_ms"],
-        deadline_ms=body["deadline_ms"],
+        pattern=ch["pattern"],
+        issued_ms=ch["issued_ms"],
+        deadline_ms=ch["deadline_ms"],
         practice=True,
     )
-    rendered = qc.grid_text(qc.layout_challenge(card, now_ms=body["issued_ms"] + 5000))
+    rendered = qc.grid_text(qc.layout_challenge(card, now_ms=ch["issued_ms"] + 5000))
     assert "PRACTICE RESPONSE BOUND" in rendered
     assert "REFEREE CHALLENGE" not in rendered
     _assert_no_banned_words(rendered)
@@ -111,7 +136,7 @@ def test_practice_prompt_posts_locally_and_renders_non_referee_card():
     card.result = "pass"
     card.referee_verified = True  # Even if set, practice layout must never emit referee wording.
     card.note = "Got it. Buttons matched on this pad. Not a referee result."
-    settled = qc.grid_text(qc.layout_challenge(card, now_ms=body["issued_ms"] + 6000))
+    settled = qc.grid_text(qc.layout_challenge(card, now_ms=ch["issued_ms"] + 6000))
     assert "Referee" not in settled
     _assert_no_banned_words(settled)
 
