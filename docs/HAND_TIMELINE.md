@@ -107,6 +107,32 @@ no truncation, verifies each slice's SHA-256 and each `in` row's `raw_sha256`, a
 - Anything else fails closed. Bluetooth (BTHENUM path or 78 B reports) is `rejected_transport`. A failed
   `GENERIC_READ` open of a gated pad is `open_denied`.
 
+## Physical face nibble (`physical_face`) and trigger-setting snapshot (`trigger_setting_raw`)
+
+- **`physical_face` (`in` rows, `ESTIMATED`):** Raw byte 51 of the 64-byte USB `0x01` input report, recorded as an
+  integer (`0..=255`, same integer style as `buttons` and `battery_raw`). The `buttons` bitfield is never rewritten
+  or reinterpreted.
+  - **Remapped paddle note:** Under a DualSense Edge profile remap (for example, mapping back paddles to `CROSS` and
+    `CIRCLE`), the Edge firmware sets the remapped face-button bit in byte 8 (`buttons`) and may leave byte 10's
+    `BACK_L` / `BACK_R` bits clear. Consequently, `CROSS` or `CIRCLE` in `buttons` can come from back paddles rather
+    than physical face buttons — an intended accessibility/remap configuration, not an anomaly.
+  - In controlled wired Edge bench checks (`054c:0df2`, `bcdDevice 0x0100`), byte 51's high nibble carried the
+    physically pressed face buttons (set on physical `CROSS`/`CIRCLE` taps, clear on remapped back-paddle taps;
+    20/20 separation). It remains labelled `ESTIMATED` because remap tables live in unread feature reports and
+    behavior on non-face targets or standard DualSense (`054c:0ce6`) is not established.
+- **`trigger_setting_raw` (`header`, `status`, `in`, and `summary`, `ESTIMATED`):** Raw bytes 42–43 of USB report
+  `0x01` as `[b42, b43]`.
+  - In `header` and `status` (`state: "connected"`), `trigger_setting_raw` is `"UNKNOWN"` because no USB report has
+    been read yet when the handle opens (listen-only never reads feature reports).
+  - The first `in` row emitted after connect snapshots `[b42, b43]` for that epoch, and every subsequent `in` row
+    carries the current `[b42, b43]`.
+  - Whenever `[b42, b43]` changes mid-epoch, the logger emits both an `in` row and a `status` row
+    (`state: "trigger_setting"`, `trigger_setting_raw: [b42, b43]`, `prev_trigger_setting_raw: [old42, old43]`,
+    `status: "ESTIMATED"`, `adaptive_trigger_state: "UNMEASURED"`).
+  - Bench sessions observed `[0, 0]` vs. `[9, 9]` across two sessions while remaining constant during pulls (`n=1`),
+    suggesting a static trigger-effect setting snapshot rather than live force state. It stays labelled `ESTIMATED`,
+    and **`adaptive_trigger_state` stays `UNMEASURED`**.
+
 ## Listen-only
 
 - Enumeration: SetupAPI over the HID class GUID only, Sony paths only, query-only handles (access 0) for
@@ -135,7 +161,8 @@ stay on the local PC unless the operator copies them.
 
 - Real-device report rate on MyTurn and raw disk use per hour: UNMEASURED (needs a separately approved device check).
 - `Instant`-vs-QPC residual between `t_us` and `qpc_ticks` inside `hand_raw.v0.bin`: UNMEASURED until benchmarked.
-- Adaptive-trigger resistance state: UNMEASURED (`trigger_fx_status` keeps bytes 42/43 raw, `status: UNMEASURED`).
+- Adaptive-trigger resistance state: UNMEASURED (`trigger_fx_status` keeps bytes 42/43 raw with `status: UNMEASURED`; `trigger_setting_raw` logs `[b42, b43]` as an ESTIMATED snapshot/change indicator only).
+- Physical face-button mirror (`physical_face`, raw byte 51): ESTIMATED (`buttons` stays unmodified post-remap; `CROSS`/`CIRCLE` in `buttons` can come from back paddles under an Edge remap).
 - Edge profile, dead zones, curves, remap table, stick modules, patch firmware: UNKNOWN (feature reports, never read).
 - Which profile a `profile_swap_candidate` selected: UNKNOWN (the candidate itself is ESTIMATED).
 - Capture pipeline latency in `frame` rows: UNMEASURED. Without `--frame-clock` there are no `frame` rows and

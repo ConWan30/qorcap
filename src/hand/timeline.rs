@@ -137,7 +137,8 @@ pub struct HandTimeline {
     last_counter: Option<u8>,
     last_hw: Option<u32>,
     last_in_t: Option<u64>,
-    last_in_key: Option<(u32, [u8; 6])>,
+    last_in_key: Option<(u32, u8, [u8; 6])>,
+    last_trigger_setting: Option<[u8; 2]>,
     prev_combos: u32,
     disk_faults: u64,
     raw_pause: Option<&'static str>,
@@ -178,7 +179,7 @@ impl HandTimeline {
         let mut me = Self {
             path, file, durable_len: 0, raw_file, raw_offset: 0, open: BTreeMap::new(), next_seal: first, first_seq: first, head: GENESIS.to_string(),
             last_sealed: None, chunks: 0, epoch: 0, device: None, connected: false, connected_at: 0, stalled: false,
-            last_rx: None, last_counter: None, last_hw: None, last_in_t: None, last_in_key: None, prev_combos: 0,
+            last_rx: None, last_counter: None, last_hw: None, last_in_t: None, last_in_key: None, last_trigger_setting: None, prev_combos: 0,
             disk_faults: 0, raw_pause: None, latest_t: cfg.start_t_us, closed: false, models_seen: vec![], reports: 0, in_rows: 0, frames: 0, last_state: String::new(), last_detail: String::new(), frame_drops: 0,
             cfg,
         };
@@ -219,6 +220,11 @@ impl HandTimeline {
             "edge_metadata": {"active_profile": UNKNOWN, "dead_zones": UNKNOWN, "sensitivity_curves": UNKNOWN, "remaps": UNKNOWN,
                 "stick_modules": UNKNOWN, "firmware_patch": UNKNOWN, "usb_bcd_device": "MEASURED in status rows"},
             "adaptive_trigger_state": UNMEASURED,
+            "physical_face_status": "ESTIMATED",
+            "physical_face_note": "raw byte 51 of USB report 0x01 on in rows (ESTIMATED pre-remap face-button nibble; buttons stays unmodified post-remap)",
+            "trigger_setting_raw": UNKNOWN,
+            "trigger_setting_status": "ESTIMATED",
+            "trigger_setting_note": "raw bytes 42-43 of USB report 0x01; UNKNOWN before the first report after connect, snapshotted on the first in row and emitted on change (in row and status row); adaptive_trigger_state stays UNMEASURED",
             "report_rate_hz": "UNMEASURED (per-window rx_delta is the count actually seen)",
             "clock_uncertainty_us": {"status": "ESTIMATED", "bound_us": 1000, "basis": "usb_polling_plus_thread_wake"},
             "listen_only": {"access": "GENERIC_READ", "reads": "input report 0x01 via overlapped ReadFile", "output_reports": false,
@@ -254,11 +260,13 @@ impl HandTimeline {
         self.last_counter = None;
         self.last_hw = None;
         self.last_in_key = None;
+        self.last_trigger_setting = None;
         self.prev_combos = 0;
         if !self.models_seen.contains(&d.model.label()) { self.models_seen.push(d.model.label()); }
         let rec = json!({"type": "status", "t_us": n(t), "epoch": self.epoch, "state": "connected",
             "device_model": d.model.label(), "fallback": d.model.fallback(),
             "edge_fields": if d.model.edge_fields_measured() { "MEASURED" } else { UNMEASURED },
+            "trigger_setting_raw": UNKNOWN, "trigger_setting_status": "ESTIMATED",
             "vid": d.vid, "pid": d.pid, "usb_bcd_device": d.bcd_device, "pad_id": d.pad_id});
         self.device = Some(d);
         self.last_state = "connected".into();
@@ -350,10 +358,17 @@ impl HandTimeline {
         self.last_counter = Some(p.counter);
         self.last_hw = Some(p.sensor_ts);
         // Change-logged `in` row. Edge-only bits are UNMEASURED (not zero) on a standard DualSense.
+        // `buttons` is never rewritten; `physical_face` carries raw byte 51 (ESTIMATED pre-remap face nibble)
+        // and `trigger_setting_raw` carries raw bytes 42-43 (ESTIMATED; adaptive_trigger_state stays UNMEASURED).
         let buttons = if edge { p.buttons } else { p.buttons & !EDGE_BITS };
-        let key = (buttons, [p.lx, p.ly, p.rx, p.ry, p.l2, p.r2]);
-        let emit = match (self.last_in_key, self.last_in_t) {
-            (Some(k), Some(t0)) => k.0 != key.0 || (k.1 != key.1 && t.saturating_sub(t0) >= ANALOG_MIN_GAP_US),
+        let physical_face = raw[51];
+        let trig = [raw[42], raw[43]];
+        let prev_trig = self.last_trigger_setting;
+        let trig_changed = prev_trig.is_some_and(|old| old != trig);
+        self.last_trigger_setting = Some(trig);
+        let key = (buttons, physical_face, [p.lx, p.ly, p.rx, p.ry, p.l2, p.r2]);
+        let emit = trig_changed || match (self.last_in_key, self.last_in_t) {
+            (Some(k), Some(t0)) => k.0 != key.0 || k.1 != key.1 || (k.2 != key.2 && t.saturating_sub(t0) >= ANALOG_MIN_GAP_US),
             _ => true,
         };
         if emit {
@@ -366,8 +381,10 @@ impl HandTimeline {
             let rec = json!({"type": "in", "epoch": self.epoch, "t_us": n(t), "t_qpc_ticks": opt(ticks), "rx_gap_us": opt(gap),
                 "report_id": 1, "counter": p.counter, "sensor_ts": p.sensor_ts,
                 "lx": p.lx, "ly": p.ly, "rx": p.rx, "ry": p.ry, "l2": p.l2, "r2": p.r2, "buttons": buttons,
+                "physical_face": physical_face,
                 "edge_bits": if edge { json!((p.buttons & EDGE_BITS) >> 19) } else { json!(UNMEASURED) },
                 "gyro": p.gyro, "accel": p.accel, "touch": touch,
+                "trigger_setting_raw": [trig[0], trig[1]],
                 "trigger_fx_status": {"l2_raw": raw[42], "r2_raw": raw[43], "status": UNMEASURED},
                 "battery_raw": raw[53], "device_model": label, "raw_sha256": ev::sha256_hex(raw)});
             self.push(t, rec);
@@ -375,6 +392,15 @@ impl HandTimeline {
             self.in_rows += 1;
             self.last_in_key = Some(key);
             self.last_in_t = Some(t);
+        }
+        if let Some(old) = prev_trig.filter(|&o| o != trig) {
+            let rec = json!({
+                "type": "status", "t_us": n(t), "epoch": self.epoch, "state": "trigger_setting",
+                "trigger_setting_raw": [trig[0], trig[1]], "prev_trigger_setting_raw": [old[0], old[1]],
+                "status": "ESTIMATED", "adaptive_trigger_state": UNMEASURED,
+                "detail": "USB 0x01 bytes 42-43 changed (ESTIMATED trigger-setting snapshot; adaptive_trigger_state stays UNMEASURED)"
+            });
+            self.push(t, rec);
         }
         // Profile-swap candidate: Fn held with a face button (rising edge only). Edge only; which profile became
         // active is UNKNOWN (it lives in feature reports this logger never reads).
@@ -588,7 +614,10 @@ impl HandTimeline {
             "device_models_seen": self.models_seen, "fallback": self.models_seen.contains(&"dualsense"), "epochs": self.epoch,
             "reports": self.reports, "in_rows": self.in_rows, "frames": self.frames, "frame_drops": self.frame_drops, "disk_faults": self.disk_faults,
             "frame_clock": if self.cfg.frame_clock_on { "on" } else { "off: frame alignment UNMEASURED" },
-            "adaptive_trigger_state": UNMEASURED, "report_rate_hz": UNMEASURED, "claims": CLAIMS});
+            "adaptive_trigger_state": UNMEASURED,
+            "trigger_setting_raw": self.last_trigger_setting.map(|s| json!([s[0], s[1]])).unwrap_or_else(|| json!(UNKNOWN)),
+            "trigger_setting_status": "ESTIMATED",
+            "report_rate_hz": UNMEASURED, "claims": CLAIMS});
         let text = format!("{}\n", serde_json::to_string_pretty(&summary).unwrap_or_else(|_| "{}".into()));
         let summary_path = self.cfg.dir.join(SUMMARY_FILE);
         let summary_sha256 = open_private_new(&summary_path, false).and_then(|mut f| { f.write_all(text.as_bytes())?; f.sync_all() })
