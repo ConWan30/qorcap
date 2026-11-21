@@ -6,8 +6,8 @@ use qorcap::frameclock::FrameStamp;
 use qorcap::hand::check::check_dir;
 use qorcap::hand::device::{DeviceInfo, DeviceModel};
 use qorcap::hand::logger;
-use qorcap::hand::source::{MockSource, MockStep, OpenOutcome};
-use qorcap::hand::timeline::{Config, HandTimeline, CHUNK_US, FILE_NAME, RAW_DIR, RAW_RECORD_BYTES, SEAL_GRACE_US};
+use qorcap::hand::source::{MockSource, MockStep, OpenOutcome, ReadOutcome, ReportSource};
+use qorcap::hand::timeline::{Config, HandTimeline, CHUNK_US, FILE_NAME, RAW_DIR, RAW_RECORD_BYTES, SEAL_GRACE_US, SUMMARY_FILE};
 use qorcap::hid::{self, Pad, CROSS, FN_LEFT, BACK_RIGHT, R2};
 use serde_json::Value;
 use std::path::PathBuf;
@@ -330,6 +330,105 @@ fn missing_or_rejected_device_is_recorded_and_never_blocks_the_session() {
     });
     assert!(fin.chunks >= 1, "rejected still seals so capture can stop");
     assert!(recs.iter().any(|r| r["type"] == "status" && r["state"] == "rejected_transport"), "{recs:?}");
+    assert!(recs.iter().any(|r| r["type"] == "hb" && r["pad_connected"] == false));
+    assert!(check_dir(&dir).unwrap().pass());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+
+#[test]
+fn clock_rollback_is_a_first_class_status() {
+    let dir = tmp("rollback");
+    let mut tl = HandTimeline::open(cfg(&dir, false, Some(edge()))).unwrap();
+    tl.on_report(10_000, Some(1), &report(0, 0, 128, 1));
+    tl.on_report(5_000, Some(2), &report(1, 0, 128, 2));
+    assert_eq!(tl.live().state, "clock_rollback");
+    let fin = tl.finish(CHUNK_US + SEAL_GRACE_US + 1).unwrap();
+    let recs = lines(&dir);
+    assert!(recs.iter().any(|r| r["type"] == "status" && r["state"] == "clock_rollback"), "{recs:?}");
+    assert!(fin.chunks >= 1);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn refuses_to_overwrite_an_existing_raw_companion() {
+    let dir = tmp("raw-exists");
+    let mut tl = HandTimeline::open(cfg(&dir, true, Some(edge()))).unwrap();
+    let raw_dir = dir.join(RAW_DIR);
+    std::fs::create_dir_all(&raw_dir).unwrap();
+    let p = raw_dir.join("w0000000000.bin");
+    std::fs::write(&p, b"KEEP-ME-DO-NOT-OVERWRITE").unwrap();
+    tl.on_report(1_000, Some(10), &report(0, 0, 128, 1));
+    let err = tl.finish(CHUNK_US + SEAL_GRACE_US + 1).unwrap_err();
+    assert!(err.contains("hand raw file") || err.contains("already exists") || err.contains("w0000000000"), "{err}");
+    assert_eq!(std::fs::read(&p).unwrap(), b"KEEP-ME-DO-NOT-OVERWRITE");
+    assert!(tl.binding().is_none(), "seal fails closed: head must not move");
+    let recs = lines(&dir);
+    assert!(recs.iter().all(|r| r["type"] != "chunk"), "no chunk row after a failed raw create: {recs:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn hand_files_are_mode_0600_on_unix() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tmp("mode");
+    let mut tl = HandTimeline::open(cfg(&dir, true, Some(edge()))).unwrap();
+    tl.on_report(1_000, Some(10), &report(0, 0, 128, 1));
+    tl.finish(CHUNK_US + SEAL_GRACE_US + 1).unwrap();
+    let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode(&dir.join(FILE_NAME)), 0o600, "jsonl");
+    assert_eq!(mode(&dir.join(RAW_DIR).join("w0000000000.bin")), 0o600, "raw companion");
+    assert_eq!(mode(&dir.join(SUMMARY_FILE)), 0o600, "summary");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+struct SlowSource;
+impl ReportSource for SlowSource {
+    fn read(&mut self, _buf: &mut [u8], _timeout_ms: u32) -> ReadOutcome {
+        std::thread::sleep(Duration::from_millis(400));
+        ReadOutcome::Timeout
+    }
+}
+
+#[test]
+fn bounded_frame_queue_counts_drops_and_never_blocks_capture() {
+    let dir = tmp("drops");
+    let clock = Instant::now();
+    let mut c = cfg(&dir, false, None);
+    c.start_t_us = 0;
+    let h = logger::spawn_with_queue(c, clock, || logger::opened(Box::new(SlowSource), edge()), || None, 1).unwrap();
+    let stamp = || FrameStamp { file: "video.ts".into(), frame: 0, t_mono_us: clock.elapsed().as_micros() as u64, pts_90k: 0 };
+    let start = Instant::now();
+    const N: usize = 64;
+    const BATCH: usize = 3;
+    for _ in 0..N {
+        h.frames(vec![stamp(), stamp(), stamp()]);
+    }
+    let elapsed = start.elapsed();
+    assert!(elapsed < Duration::from_millis(200), "capture must not block on a full queue: {elapsed:?}");
+    let drops_after_pump = h.frame_drops();
+    assert!(drops_after_pump >= BATCH as u64, "cap=1 must drop some of {N} batches of {BATCH}: {drops_after_pump}");
+    assert_eq!(h.live().frame_drops, drops_after_pump);
+    let fin = h.finish(Duration::from_secs(5)).unwrap();
+    assert_eq!(fin.frame_drops, h.frame_drops(), "finish samples remaining drops into the timeline");
+    assert!(fin.frame_drops >= drops_after_pump);
+    let summary: Value = serde_json::from_str(&std::fs::read_to_string(dir.join(SUMMARY_FILE)).unwrap()).unwrap();
+    assert_eq!(summary["frame_drops"], fin.frame_drops);
+    let recs = lines(&dir);
+    let in_windows: u64 = recs.iter().filter(|r| r["type"] == "hb").filter_map(|r| r["frame_drops"].as_u64()).sum();
+    assert_eq!(in_windows, fin.frame_drops, "hb.frame_drops must sum to the session total");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn open_denied_is_not_recorded_as_missing() {
+    let (dir, fin, recs) = spawn_failsoft("open_denied", || OpenOutcome::Rejected {
+        state: "open_denied", detail: "GENERIC_READ open failed (win32 5)".into(),
+    });
+    assert!(fin.chunks >= 1, "open_denied still seals so capture can stop");
+    assert!(recs.iter().any(|r| r["type"] == "status" && r["state"] == "open_denied"), "{recs:?}");
+    assert!(recs.iter().all(|r| r["type"] != "status" || r["state"] != "missing"), "must not be labelled missing: {recs:?}");
     assert!(recs.iter().any(|r| r["type"] == "hb" && r["pad_connected"] == false));
     assert!(check_dir(&dir).unwrap().pass());
     let _ = std::fs::remove_dir_all(&dir);

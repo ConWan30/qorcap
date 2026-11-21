@@ -4,7 +4,9 @@
 //! 2. Every OS function the module declares is on the allowlist, and only win.rs declares any.
 //! 3. The one CreateFileW call takes its access mask from `device::access_mask`, which yields 0 or GENERIC_READ.
 //! 4. Windows only: a handle opened through the module's own `open_path(.., Access::Read)` is refused a write
-//!    by the OS (ERROR_ACCESS_DENIED), using the exact flags the pad reader uses.
+//!    by the OS (ERROR_ACCESS_DENIED), using the exact flags the pad reader uses. This test opens a regular
+//!    file, not a HID handle, and does not call HidD_Set*. There is no PE import-table check (hidapi is
+//!    already linked into the same binary for the existing pad path).
 
 use std::path::{Path, PathBuf};
 
@@ -12,6 +14,7 @@ const DENY: &[&str] = &[
     "GENERIC_WRITE", "GENERIC_ALL", "FILE_WRITE_DATA", "FILE_APPEND_DATA", "FILE_ALL_ACCESS", "WriteFile", "DeviceIoControl",
     "HidD_SetOutputReport", "HidD_SetFeature", "HidD_GetFeature", "HidD_GetInputReport", "HidD_SetNumInputBuffers", "HidD_SetConfiguration",
     "HidD_FlushQueue", "IOCTL_HID_SET_", "IOCTL_HID_GET_FEATURE", "send_feature_report", "get_feature_report", "hidapi",
+    "hid_write", "LoadLibrary", "GetProcAddress",
     "waveIn", "WASAPI", "IMMDeviceEnumerator", "IAudioClient", "DirectSound", "mmdevapi", "winmm",
 ];
 
@@ -128,6 +131,7 @@ mod kernel {
     }
     #[test]
     fn os_refuses_a_write_on_a_handle_from_open_path_read() {
+        // Regular file, not a HID handle. Does not call HidD_Set*. Confirms the access mask only.
         let dir = std::env::temp_dir().join(format!("qorcap-hand-ro-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("target.bin");

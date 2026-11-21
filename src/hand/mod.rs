@@ -18,15 +18,15 @@
 //! (extra `qorcap` keys; no seal.rs / bundle.rs / receipt.v0 / contracts change), writes no hand file, and
 //! is never treated as tampered or failed.
 //!
-//! Fail-soft: with no pad or the wrong device the logger records `missing` / `rejected_transport` (alignment
-//! UNMEASURED) and capture continues.
+//! Fail-soft: with no pad or the wrong device the logger records `missing` / `rejected_transport` / `open_denied`
+//! (alignment UNMEASURED) and capture continues. A failed `GENERIC_READ` open is `open_denied`, not `missing`.
 //!
 //! Listen-only: the Windows reader opens the HID gamepad collection with `GENERIC_READ` only and reads input
 //! reports with overlapped `ReadFile`. It never sends output or feature reports, never touches firmware or
 //! settings, and never opens an audio endpoint. `tests/hand_listen_only.rs` audits this module's source.
 //!
 //! Visible status (SCOPE-edge-logger §7.4): the live state (`connected` / `missing` / `unplugged` /
-//! `stalled` / `rejected_transport` / `off`) is on `GET /status` as `hand` (practice lane only; omitted
+//! `stalled` / `rejected_transport` / `open_denied` / `clock_rollback` / `off`) is on `GET /status` as `hand` (practice lane only; omitted
 //! outside practice so REAL MATCH /status is unchanged) and is written to the log as `HAND TIMELINE: …`.
 //! There is no silent background run: the logger starts only from an explicit practice capture.
 //!
@@ -56,7 +56,7 @@ fn env_is_on(env_val: Option<&str>) -> bool {
 }
 
 /// Live logger state for `GET /status` and the log. `state` is `off`, `connected`, `missing`,
-/// `unplugged`, `stalled`, `rejected_transport` or `rejected_device`.
+/// `unplugged`, `stalled`, `rejected_transport`, `open_denied`, `clock_rollback` or `rejected_device`.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct LiveStatus {
     pub state: String,
@@ -67,6 +67,8 @@ pub struct LiveStatus {
     pub fallback: bool,
     pub raw_usb: bool,
     pub epoch: u64,
+    /// Frame arrivals dropped because the bounded hand-logger queue was full or the logger had stopped.
+    pub frame_drops: u64,
 }
 
 impl LiveStatus {
@@ -79,6 +81,7 @@ impl LiveStatus {
             fallback: false,
             raw_usb: false,
             epoch: 0,
+            frame_drops: 0,
         }
     }
 }

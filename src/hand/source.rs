@@ -29,6 +29,18 @@ pub enum OpenOutcome {
     Rejected { state: &'static str, detail: String },
 }
 
+/// Outcome when enumeration found no usable open handle. A failed `GENERIC_READ` open of a gated
+/// pad is `open_denied`, not `missing`. Bluetooth-only is `rejected_transport`. No candidate is `missing`.
+pub fn classify_no_open(transport: Option<String>, open_denied: Option<String>) -> OpenOutcome {
+    if let Some(detail) = open_denied {
+        return OpenOutcome::Rejected { state: "open_denied", detail };
+    }
+    match transport {
+        Some(why) => OpenOutcome::Rejected { state: "rejected_transport", detail: why },
+        None => OpenOutcome::Missing("no DualSense Edge (054c:0df2) or DualSense (054c:0ce6) on wired USB".into()),
+    }
+}
+
 /// Scripted source for tests: plays back reports, timeouts and disconnects in order, then times out.
 pub struct MockSource {
     pub script: VecDeque<MockStep>,
@@ -65,5 +77,21 @@ mod tests {
         assert_eq!(&b[..3], &[1, 2, 3]);
         assert_eq!(m.read(&mut b, 1), ReadOutcome::Disconnected("gone".into()));
         assert_eq!(m.read(&mut b, 1), ReadOutcome::Timeout);
+    }
+
+    #[test]
+    fn classify_no_open_prefers_open_denied_over_transport_or_missing() {
+        match classify_no_open(Some("bt".into()), Some("GENERIC_READ failed".into())) {
+            OpenOutcome::Rejected { state, detail } => { assert_eq!(state, "open_denied"); assert!(detail.contains("GENERIC_READ")); }
+            _other => panic!("unexpected outcome"),
+        }
+        match classify_no_open(Some("bluetooth".into()), None) {
+            OpenOutcome::Rejected { state, .. } => assert_eq!(state, "rejected_transport"),
+            _other => panic!("unexpected outcome"),
+        }
+        match classify_no_open(None, None) {
+            OpenOutcome::Missing(_) => {}
+            _other => panic!("unexpected outcome"),
+        }
     }
 }

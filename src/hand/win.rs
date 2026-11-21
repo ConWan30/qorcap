@@ -155,17 +155,24 @@ pub fn open_pad() -> OpenOutcome {
         }
     }
     found.sort_by_key(|(_, m)| if m.fallback() { 1 } else { 0 });
+    let mut open_denied: Option<String> = None;
     for (c, m) in found {
-        let Ok(h) = open_path(&c.path, Access::Read) else { continue };
-        let ev = unsafe { CreateEventW(null(), 1, 0, null()) };
-        if ev == 0 { continue; }
-        let src = WinSource { h, ev: Handle(ev), ov: Box::new(zero_ov()), buf: Box::new([0u8; USB_REPORT_LEN]), pending: false };
-        return OpenOutcome::Open(Box::new(src), DeviceInfo::from_candidate(&c, m));
+        match open_path(&c.path, Access::Read) {
+            Ok(h) => {
+                let ev = unsafe { CreateEventW(null(), 1, 0, null()) };
+                if ev == 0 {
+                    open_denied.get_or_insert_with(|| format!("CreateEventW failed for {}", c.path));
+                    continue;
+                }
+                let src = WinSource { h, ev: Handle(ev), ov: Box::new(zero_ov()), buf: Box::new([0u8; USB_REPORT_LEN]), pending: false };
+                return OpenOutcome::Open(Box::new(src), DeviceInfo::from_candidate(&c, m));
+            }
+            Err(e) => {
+                open_denied.get_or_insert_with(|| format!("GENERIC_READ open failed for {} (win32 {e})", c.path));
+            }
+        }
     }
-    match transport {
-        Some(why) => OpenOutcome::Rejected { state: "rejected_transport", detail: why },
-        None => OpenOutcome::Missing("no DualSense Edge (054c:0df2) or DualSense (054c:0ce6) on wired USB".into()),
-    }
+    super::source::classify_no_open(transport, open_denied)
 }
 
 fn zero_ov() -> OVERLAPPED { OVERLAPPED { internal: 0, internal_high: 0, offset: 0, offset_high: 0, h_event: 0 } }

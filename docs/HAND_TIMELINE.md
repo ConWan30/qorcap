@@ -12,11 +12,13 @@ An off session is a normal session: the start and stop checkpoints record `hand_
 `qorcap` keys), no hand file is written, and `qorcap check-hand-timeline` and `verify-bundle` treat it as a
 PASS, not as tampered or failed.
 
-Fail-soft: with no pad or the wrong device the logger records `missing` or `rejected_transport` (alignment
-UNMEASURED) and never blocks or voids capture.
+Fail-soft: with no pad or the wrong device the logger records `missing`, `rejected_transport`, or `open_denied`
+(alignment UNMEASURED) and never blocks or voids capture. A failed `GENERIC_READ` open of a gated pad is
+`open_denied`, not plain `missing`. A report whose `t_us` is before the previous report is recorded as
+`clock_rollback` (first-class status), then capture continues.
 
 Visible status (SCOPE-edge-logger §7.4): the live state (`connected` / `missing` / `unplugged` / `stalled` /
-`rejected_transport` / `off`) is on `GET /status` as `hand` (practice only; the field is omitted outside
+`rejected_transport` / `open_denied` / `clock_rollback` / `off`) is on `GET /status` as `hand` (practice only; the field is omitted outside
 practice, so REAL MATCH `/status` is unchanged) and is written to the log as `HAND TIMELINE: …`. There is no
 silent background run: the logger starts only from an explicit practice capture (`qorcap record --practice-lane`,
 or `QORCAP_LANE=practice`). `qorcap status` against that recorder shows the same object.
@@ -45,10 +47,18 @@ Window `k` holds records with time in `[k * 1_000_000, (k + 1) * 1_000_000)` us 
 250 ms after its end (frame arrivals can trail on the capture thread), or at stop (`partial: true`). A record for an
 already sealed window goes into the oldest open window marked `late: true` and is counted in `hb.late_records`.
 
-Each window ends with an `hb` row (health counters) and a `raw_bind` row (raw file name, SHA-256, report count).
-Then `sha256 = SHA-256(JCS([records...]))` and `head = SHA-256(JCS({prev, seq, sha256}))` from 64 x `0`, the
-`inputs.rs` rule. So the raw file's SHA-256 is inside the chain, and the `chunk` row repeats it. A failed write cuts
-the file back to its last durable length and the head does not move.
+Each window ends with an `hb` row (health counters, including `frame_drops`) and a `raw_bind` row (raw file name,
+SHA-256, report count). Then `sha256 = SHA-256(JCS([records...]))` and `head = SHA-256(JCS({prev, seq, sha256}))`
+from 64 x `0`, the `inputs.rs` rule. So the raw file's SHA-256 is inside the chain, and the `chunk` row repeats it.
+A failed write cuts the file back to its last durable length and the head does not move.
+
+Empty windows still include the trailing `hb` and `raw_bind` rows, so they hash `JCS([hb, raw_bind])` (`n = 2`),
+not the SCOPE-hand-timeline §2.2 empty-window sentinel `SHA-256(JCS([]))`. That is deliberate: the health and
+raw-bind rows stay in the chain even when no reports or frames arrived.
+
+Frame arrivals travel from the capture thread over a bounded channel (`try_send`, cap 32 batches). Capture never
+blocks on the logger. Drops are counted into the window's `hb.frame_drops`, the session total, the summary, and
+`GET /status` as `hand.frame_drops`.
 
 ## Checkpoint binding (no seal.rs / bundle.rs change)
 
@@ -70,9 +80,11 @@ unchanged.
 
 - `054c:0df2` DualSense Edge: primary. `FN_L/R`, `BACK_L/R` (`edge_bits`) and `profile_swap_candidate` are MEASURED.
 - `054c:0ce6` DualSense: accepted and labelled `device_model: "dualsense"`, `fallback: true` in the header, status
-  rows, every `in`, `hb` and `chunk` row. Edge-only fields are `UNMEASURED` (left out of `buttons`, never written
-  as false or zero). Never relabelled as an Edge.
-- Anything else fails closed. Bluetooth (BTHENUM path or 78 B reports) is `rejected_transport`.
+  rows, every `in`, `hb` and `chunk` row. Edge-only fields are `UNMEASURED`. The FN/BACK bits are cleared out of
+  `buttons` on this fallback and must be treated as UNMEASURED, not as measured-off. Read `edge_bits` (which is
+  the string `"UNMEASURED"` on DualSense), not those bit positions in `buttons`. Never relabelled as an Edge.
+- Anything else fails closed. Bluetooth (BTHENUM path or 78 B reports) is `rejected_transport`. A failed
+  `GENERIC_READ` open of a gated pad is `open_denied`.
 
 ## Listen-only
 
@@ -84,8 +96,19 @@ unchanged.
 - Interface number note: on a wired DualSense / DualSense Edge the HID gamepad collection is USB interface 3, so its
   HID path contains `MI_03`; the audio functions are interfaces 0-2 and are not HID-class devices. The gate is the
   HID class GUID plus UsagePage 0x01 / Usage 0x05 / 64 B input reports, so audio is never enumerated or opened.
-- `tests/hand_listen_only.rs`: denylist scan of `src/hand/` code, extern allowlist, the single `CreateFileW` call's
-  access mask, a one-method `ReportSource`, and (Windows CI) an OS refusal of a write on a handle from `open_path`.
+- `tests/hand_listen_only.rs`: denylist scan of `src/hand/` code (includes `LoadLibrary`, `GetProcAddress`, and
+  `hid_write`), extern allowlist, the single `CreateFileW` call's access mask, a one-method `ReportSource`, and
+  (Windows CI) an OS refusal of a write on a handle from `open_path`. That OS test opens a regular file, not a
+  HID handle, and does not call `HidD_Set*`. There is no PE import-table check.
+
+
+## Privacy (SCOPE-edge-logger §7.2)
+
+`pad_id` (`serial:…` or a Windows device-instance path) is written into the local JSONL (header and status /
+connected rows) so a single session can tell pads apart. It contains hardware serial numbers and local OS
+paths. Before any share, upload to QorStream, public match page, or model-sharing export, `pad_id` must be
+stripped or redacted, following SCOPE-edge-logger §7.2 (`qor_receipt/hands/sidecar.py::sanitize`). These files
+stay on the local PC unless the operator copies them.
 
 ## What stays UNMEASURED / UNKNOWN
 

@@ -696,7 +696,7 @@ impl Engine {
                 if written && frame_clock.enabled() {
                     let file = Path::new(&r.path).file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
                     let stamps = frame_clock.observe(slice, t_us, &file);
-                    // Practice hand timeline: an unbounded channel send, never a wait on its disk writes.
+                    // Practice hand timeline: bounded try_send, never a wait on its disk writes; drops are counted.
                     if let Some(h) = self.hand.get() { h.frames(stamps); }
                 }
                 // Practice live tap: the same bytes that reached the recording, never anything else.
