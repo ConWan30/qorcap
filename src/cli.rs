@@ -39,6 +39,14 @@ pub enum Cmd {
     /// Re-hash a practice bundle's hand_timeline.v0.jsonl: every 1 s window, the chain, each raw file, and the
     /// checkpoints that bind it. Read-only.
     CheckHandTimeline { dir: String },
+    /// Info-only, practice-only response bound: check sealed hand/input stream against challenge nonces and
+    /// bound chunk heads. Advisory only; never changes receipt status.
+    CheckResponseBound {
+        dir: String,
+        /// Write hand_challenge.jsonl beside the bundle.
+        #[arg(long)]
+        write: bool,
+    },
     /// Offline: run QorTime's scorebug reader over a recorded bundle's video.mp4, write score
     /// checkpoints + final detection and sign receipt.json (self-attested local referee).
     /// Runs sidecar/qorcap_match.py finalize (needs Python with numpy, opencv, cryptography).
@@ -546,6 +554,7 @@ mod tests {
             assert!(r.hand_timeline && r.practice_lane && !r.no_hand_timeline, "alias still parses");
         } else { panic!() }
         assert!(matches!(Cli::try_parse_from(["qorcap", "check-hand-timeline", "b"]).unwrap().cmd, Cmd::CheckHandTimeline { .. }));
+        assert!(matches!(Cli::try_parse_from(["qorcap", "check-response-bound", "b", "--write"]).unwrap().cmd, Cmd::CheckResponseBound { write: true, .. }));
         if let Cmd::Record(r) = Cli::try_parse_from(["qorcap", "record", "--frame-clock"]).unwrap().cmd { assert!(r.frame_clock); assert!(r.live_tap.is_none() && !r.practice_lane); } else { panic!() }
         if let Cmd::Record(r) = Cli::try_parse_from(["qorcap", "record", "--live-tap", "udp://127.0.0.1:1937", "--practice-lane", "--live-tap-every", "5"]).unwrap().cmd { assert_eq!(r.live_tap.as_deref(), Some("udp://127.0.0.1:1937")); assert!(r.practice_lane); assert_eq!(r.live_tap_every, Some(5)); } else { panic!() }
         assert!(matches!(Cli::try_parse_from(["qorcap", "align-ab", "b", "--no-video"]).unwrap().cmd, Cmd::AlignAb { no_video: true, frames: 15, rumble_echo: false, .. }));

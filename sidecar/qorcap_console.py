@@ -276,6 +276,7 @@ class ChallengeCard:
     edges: bool = False
     _last_t_ms: int | None = None
     _last_dpad: str = ""
+    practice: bool = False
 
     def text(self) -> str:
         parts = [self.label, self.result or "pending", self.note, " ".join(self.pattern)]
@@ -789,14 +790,16 @@ def layout_challenge(card: ChallengeCard, *, width: int = 78, height: int = 36, 
     title = phase if card.result is None else {"pass": "PASS", "fail": "FAIL", "expired": "EXPIRED"}[card.result]
     title_lines = [title] if compact else (big(title) if card.result is None else emphasize(title, width))
     title_color = _title_color(card)
-    specs: list[tuple] = [("center", "REFEREE CHALLENGE", "pink"), ("gap",)]
+    badge = "PRACTICE RESPONSE BOUND" if card.practice else "REFEREE CHALLENGE"
+    specs: list[tuple] = [("center", badge, "pink"), ("gap",)]
     for line in title_lines:
         specs.append(("center", line, title_color))
     if card.result is None:
-        specs.append(("center", "At the line, before the snap. Then resume.", "ink"))
+        prompt = "Press OPTIONS then the shown buttons (advisory only)." if card.practice else "At the line, before the snap. Then resume."
+        specs.append(("center", prompt, "ink"))
     else:
-        note = "Referee verified." if card.referee_verified else card.note
-        specs.append(("center", _clip(note, width - 6), REFEREE_CHALLENGE_COLOR if card.referee_verified else "ink"))
+        note = "Referee verified." if (card.referee_verified and not card.practice) else card.note
+        specs.append(("center", _clip(note, width - 6), REFEREE_CHALLENGE_COLOR if (card.referee_verified and not card.practice) else "ink"))
     specs.append(("gap",))
     specs.append(("glyphs",))
     if card.result is None:
@@ -820,9 +823,11 @@ def layout_challenge(card: ChallengeCard, *, width: int = 78, height: int = 36, 
         fb = press_feedback(card)
         if fb:
             specs.append(("center", _clip(fb[0], width - 6), fb[1]))
-        specs.append(("center", "If the snap comes first, do it at the next play.", "dim"))
+        hint = "Practice lane only; receipt status is unchanged." if card.practice else "If the snap comes first, do it at the next play."
+        specs.append(("center", hint, "dim"))
     else:
-        specs.append(("center", "The referee reads the controller log and the pause.", "dim"))
+        foot = "Advisory only; sealed pad stream checked after stop." if card.practice else "The referee reads the controller log and the pause."
+        specs.append(("center", foot, "dim"))
     glyph_h = _pattern_rows(card.pattern, width) * 6
 
     def spec_height(spec: tuple) -> int:
@@ -1007,9 +1012,9 @@ class MatchConsole:
             self._snap = dict(snap)
         self._wake.set()
 
-    def show_challenge(self, *, phase: str, label: str, pattern: list[str], issued_ms: int, deadline_ms: int) -> bool:
+    def show_challenge(self, *, phase: str, label: str, pattern: list[str], issued_ms: int, deadline_ms: int, practice: bool = False) -> bool:
         card = ChallengeCard(phase=phase, label=label, pattern=list(pattern),
-                             issued_ms=int(issued_ms), deadline_ms=int(deadline_ms))
+                             issued_ms=int(issued_ms), deadline_ms=int(deadline_ms), practice=bool(practice))
         with self._lock:
             self._card = card
             self._banner = ""
