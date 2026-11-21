@@ -14,7 +14,7 @@ that QorTime's referee can verify. Nothing in this repo calls Meta model APIs.
 **Meta models are used in QorTime**, not here. See
 [`ConWan30/qortime` `HACKATHON.md`](https://github.com/ConWan30/qortime/blob/main/HACKATHON.md) for the
 pre-existing vs built-during split, Muse Spark / SAM 3.1 / Muse Voice Transcribe usage, and the demo framing
-(anti-cheat and verified skill, not a coach).
+(fair-proof and skill-proof match records, not a coach).
 
 ## Pull requests merged on/after kickoff (non-Meta bugfixes / release)
 These landed after Mon Oct 26 2026, 11:00 AM CT / 12:00 PM ET. They are recorder correctness and release packaging only — they
