@@ -2231,7 +2231,7 @@ esac
             std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
             let d = dir.to_string_lossy().into_owned();
             let mut a = vec!["q", "record", "--device", "testpattern", "--audio", "none", "--bundle", &d, "--no-controller", "--watchdog", "30"];
-            if practice { a.push("--practice-lane"); a.push("--hand-dir"); a.push(&d); }
+            if practice { a.push("--practice-lane"); }
             let crate::cli::Cmd::Record(r) = crate::cli::Cli::try_parse_from(a).unwrap().cmd else { panic!() };
             std::fs::write(dir.join("manifest.jsonl"), "").unwrap();
             Engine::new(r, script.to_string_lossy().into_owned())
@@ -2469,7 +2469,7 @@ esac
             std::fs::create_dir_all(&dir).unwrap();
             let d = dir.to_string_lossy().into_owned();
             let mut a = vec!["q", "record", "--device", "testpattern", "--audio", "none", "--bundle", &d, "--match-id", "m-hand"];
-            if practice { a.push("--practice-lane"); }
+            if practice { a.push("--practice-lane"); a.push("--hand-dir"); a.push(&d); }
             if alias { a.push("--hand-timeline"); }
             if off { a.push("--no-hand-timeline"); }
             if raw_off { a.push("--no-raw-usb"); }
