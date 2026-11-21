@@ -542,7 +542,7 @@ fn checker_rejects_truncation_missing_raw_offset_gap_overlap_layout_and_t_us_rol
     let orig = std::fs::read(&rp).unwrap();
     std::fs::write(&rp, &orig[..orig.len() - 12]).unwrap();
     let rep = check_dir(&d_trunc).unwrap();
-    assert!(rep.errors.iter().any(|e| e.contains("truncated")), "{:?}", rep.errors);
+    assert!(rep.errors.iter().any(|e| e.contains("truncated (slice") || e.contains("exceeds file length")), "{:?}", rep.errors);
 
     // 2. Missing raw file
     let d_miss = make_valid("v1-miss");
@@ -659,4 +659,50 @@ fn checker_resolves_off_bundle_hand_dir_from_checkpoints() {
     assert_eq!(rep.hand_dir_source.as_deref(), Some("override"));
     let _ = std::fs::remove_dir_all(&bundle);
     let _ = std::fs::remove_dir_all(&hand);
+}
+
+/// A crash mid-write of the next (not-yet-sealed) raw slice can leave leftover bytes after
+/// the last sealed offset that are not a multiple of 80. Those bytes are an UNMEASURED
+/// unsealed tail (warning, never padded). Sealed slices still have to hash. A 12-byte cut
+/// from a fully sealed file remains an error (see checker_rejects_truncation_...).
+#[test]
+fn checker_treats_mid_record_unsealed_tail_as_unmeasured_warning() {
+    let make = |tag: &str| -> (PathBuf, u64) {
+        let dir = tmp(tag);
+        let mut tl = HandTimeline::open(cfg(&dir, true, Some(edge()))).unwrap();
+        for i in 0..300u64 {
+            tl.on_report(1_000 + i * 4_000, Some(10_000 + i * 40_000), &report(i as u8, 0, 128, i as u32));
+        }
+        let fin = tl.finish(1_500_000).unwrap();
+        assert!(check_dir(&dir).unwrap().pass());
+        (dir, fin.raw_bytes)
+    };
+
+    // Contrast: a complete-record unsealed tail (80 B) already passes with a warning.
+    let (d_full, sealed_len) = make("crash-tail-full-rec");
+    let rp_full = d_full.join(RAW_FILE);
+    let mut raw_full = std::fs::read(&rp_full).unwrap();
+    assert_eq!(raw_full.len() as u64, sealed_len);
+    raw_full.extend_from_slice(&[0xAAu8; RAW_RECORD_BYTES]);
+    std::fs::write(&rp_full, &raw_full).unwrap();
+    let rep_full = check_dir(&d_full).unwrap();
+    assert!(rep_full.pass(), "complete-record unsealed tail should pass: {:?}", rep_full.errors);
+    assert!(rep_full.warnings.iter().any(|w| w.contains("unsealed tail")), "{:?}", rep_full.warnings);
+    let _ = std::fs::remove_dir_all(&d_full);
+
+    // Mid-record unsealed tail (40 B): must pass; sealed slices still hash; never padded.
+    let (d_mid, sealed_len) = make("crash-tail-mid-rec");
+    let rp = d_mid.join(RAW_FILE);
+    let mut raw = std::fs::read(&rp).unwrap();
+    assert_eq!(raw.len() as u64, sealed_len);
+    assert_eq!(raw.len() % RAW_RECORD_BYTES, 0);
+    raw.extend_from_slice(&[0xAAu8; 40]);
+    std::fs::write(&rp, &raw).unwrap();
+    assert_eq!(raw.len() % RAW_RECORD_BYTES, 40);
+    let rep = check_dir(&d_mid).unwrap();
+    assert!(rep.pass(), "mid-record unsealed tail must not fail once sealed slices hash: {:?}", rep.errors);
+    assert!(rep.errors.iter().all(|e| !e.contains("not a multiple of")), "{:?}", rep.errors);
+    assert!(!rep.errors.iter().any(|e| e.contains("SHA-256 does not match") || e.contains("exceeds file length")), "sealed slices should still hash and fit the file: {:?}", rep.errors);
+    assert!(rep.warnings.iter().any(|w| w.contains("UNMEASURED unsealed tail") && w.contains("never padded") && w.contains("40 trailing")), "{:?}", rep.warnings);
+    let _ = std::fs::remove_dir_all(&d_mid);
 }
