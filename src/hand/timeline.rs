@@ -197,7 +197,7 @@ impl HandTimeline {
             Some(q) => json!({"status": "MEASURED", "freq_hz": n(q.freq_hz), "origin_ticks": n(q.origin_ticks), "origin_t_us": n(q.origin_t_us)}),
             None => json!({"status": UNMEASURED}),
         };
-        json!({
+        let mut h = json!({
             "type": "header", "schema": SCHEMA, "chunk_seq": c.start_t_us / CHUNK_US, "t_us": n(c.start_t_us),
             "clock_domain": "qorcap-engine-instant-us",
             "clock_note": "t_us is the QorCap engine Instant (Windows: QueryPerformanceCounter), the same clock as inputs.jsonl t_us and frame_clock.jsonl t_mono_us. wall_anchor_ms is a label only.",
@@ -220,17 +220,18 @@ impl HandTimeline {
             "edge_metadata": {"active_profile": UNKNOWN, "dead_zones": UNKNOWN, "sensitivity_curves": UNKNOWN, "remaps": UNKNOWN,
                 "stick_modules": UNKNOWN, "firmware_patch": UNKNOWN, "usb_bcd_device": "MEASURED in status rows"},
             "adaptive_trigger_state": UNMEASURED,
-            "physical_face_status": "ESTIMATED",
-            "physical_face_note": "raw byte 51 of USB report 0x01 on in rows (ESTIMATED pre-remap face-button nibble; buttons stays unmodified post-remap)",
-            "trigger_setting_raw": UNKNOWN,
-            "trigger_setting_status": "ESTIMATED",
-            "trigger_setting_note": "raw bytes 42-43 of USB report 0x01; UNKNOWN before the first report after connect, snapshotted on the first in row and emitted on change (in row and status row); adaptive_trigger_state stays UNMEASURED",
             "report_rate_hz": "UNMEASURED (per-window rx_delta is the count actually seen)",
             "clock_uncertainty_us": {"status": "ESTIMATED", "bound_us": 1000, "basis": "usb_polling_plus_thread_wake"},
             "listen_only": {"access": "GENERIC_READ", "reads": "input report 0x01 via overlapped ReadFile", "output_reports": false,
                 "feature_reports": false, "firmware": false, "audio": false},
             "claims": CLAIMS,
-        })
+        });
+        h["physical_face_status"] = json!("ESTIMATED");
+        h["physical_face_note"] = json!("raw byte 51 of USB report 0x01 on in rows (ESTIMATED pre-remap face-button nibble; buttons stays unmodified post-remap)");
+        h["trigger_setting_raw"] = json!(UNKNOWN);
+        h["trigger_setting_status"] = json!("ESTIMATED");
+        h["trigger_setting_note"] = json!("raw bytes 42-43 of USB report 0x01; UNKNOWN before the first report after connect, snapshotted on the first in row and emitted on change (in row and status row); adaptive_trigger_state stays UNMEASURED");
+        h
     }
 
     /// The window a record at `t` belongs to, and whether it is late (its own window is already sealed).
@@ -378,15 +379,15 @@ impl HandTimeline {
                 let y = (u64::from(raw[o + 2]) >> 4) | (u64::from(raw[o + 3]) << 4);
                 json!([u64::from(c & 0x80 == 0), u64::from(c & 0x7F), x, y])
             }).collect();
-            let rec = json!({"type": "in", "epoch": self.epoch, "t_us": n(t), "t_qpc_ticks": opt(ticks), "rx_gap_us": opt(gap),
+            let mut rec = json!({"type": "in", "epoch": self.epoch, "t_us": n(t), "t_qpc_ticks": opt(ticks), "rx_gap_us": opt(gap),
                 "report_id": 1, "counter": p.counter, "sensor_ts": p.sensor_ts,
                 "lx": p.lx, "ly": p.ly, "rx": p.rx, "ry": p.ry, "l2": p.l2, "r2": p.r2, "buttons": buttons,
-                "physical_face": physical_face,
                 "edge_bits": if edge { json!((p.buttons & EDGE_BITS) >> 19) } else { json!(UNMEASURED) },
                 "gyro": p.gyro, "accel": p.accel, "touch": touch,
-                "trigger_setting_raw": [trig[0], trig[1]],
                 "trigger_fx_status": {"l2_raw": raw[42], "r2_raw": raw[43], "status": UNMEASURED},
                 "battery_raw": raw[53], "device_model": label, "raw_sha256": ev::sha256_hex(raw)});
+            rec["physical_face"] = json!(physical_face);
+            rec["trigger_setting_raw"] = json!([trig[0], trig[1]]);
             self.push(t, rec);
             self.window(t).0.hb.in_rows += 1;
             self.in_rows += 1;
@@ -605,7 +606,7 @@ impl HandTimeline {
         let bytes = std::fs::read(&self.path).map_err(|e| format!("hand timeline re-read: {e}"))?;
         let file_sha256 = ev::sha256_hex(&bytes);
         let raw_file_str = if self.cfg.raw_usb { Some(RAW_FILE.to_string()) } else { None };
-        let summary = json!({"schema": SUMMARY_SCHEMA, "file": FILE_NAME, "sha256": file_sha256, "head": self.head,
+        let mut summary = json!({"schema": SUMMARY_SCHEMA, "file": FILE_NAME, "sha256": file_sha256, "head": self.head,
             "first_seq": self.first_seq, "last_seq": self.last_sealed, "chunks": self.chunks, "raw_usb": self.cfg.raw_usb, "raw_paused": self.raw_pause,
             "raw_file": raw_file_str, "raw_bytes": self.raw_offset, "raw_record_bytes": RAW_RECORD_BYTES as u64, "raw_layout": RAW_LAYOUT,
             "hand_dir": self.cfg.dir.to_string_lossy(),
@@ -614,10 +615,9 @@ impl HandTimeline {
             "device_models_seen": self.models_seen, "fallback": self.models_seen.contains(&"dualsense"), "epochs": self.epoch,
             "reports": self.reports, "in_rows": self.in_rows, "frames": self.frames, "frame_drops": self.frame_drops, "disk_faults": self.disk_faults,
             "frame_clock": if self.cfg.frame_clock_on { "on" } else { "off: frame alignment UNMEASURED" },
-            "adaptive_trigger_state": UNMEASURED,
-            "trigger_setting_raw": self.last_trigger_setting.map(|s| json!([s[0], s[1]])).unwrap_or_else(|| json!(UNKNOWN)),
-            "trigger_setting_status": "ESTIMATED",
-            "report_rate_hz": UNMEASURED, "claims": CLAIMS});
+            "adaptive_trigger_state": UNMEASURED, "report_rate_hz": UNMEASURED, "claims": CLAIMS});
+        summary["trigger_setting_raw"] = self.last_trigger_setting.map(|s| json!([s[0], s[1]])).unwrap_or_else(|| json!(UNKNOWN));
+        summary["trigger_setting_status"] = json!("ESTIMATED");
         let text = format!("{}\n", serde_json::to_string_pretty(&summary).unwrap_or_else(|_| "{}".into()));
         let summary_path = self.cfg.dir.join(SUMMARY_FILE);
         let summary_sha256 = open_private_new(&summary_path, false).and_then(|mut f| { f.write_all(text.as_bytes())?; f.sync_all() })
