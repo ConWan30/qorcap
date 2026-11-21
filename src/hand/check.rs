@@ -47,15 +47,19 @@ pub fn checkpoint_flags(dir: &Path) -> (bool, bool, bool) {
 }
 
 pub fn check_dir(dir: &Path) -> Result<Report, String> {
+    check_dir_heads(dir).map(|(r, _)| r)
+}
+
+pub fn check_dir_heads(dir: &Path) -> Result<(Report, BTreeMap<u64, String>), String> {
     let path = dir.join(FILE_NAME);
     if !path.exists() {
         let (hand_off, _, has_sha) = checkpoint_flags(dir);
         if hand_off && !has_sha {
             // A normal off session: no file, and the stop/start checkpoint says so. Not tampered, not a failure.
-            return Ok(Report { off: true, ..Default::default() });
+            return Ok((Report { off: true, ..Default::default() }, BTreeMap::new()));
         }
         if hand_off && has_sha {
-            return Ok(Report { off: true, errors: vec!["checkpoints mark hand_timeline false but also bind a file that is missing".into()], ..Default::default() });
+            return Ok((Report { off: true, errors: vec!["checkpoints mark hand_timeline false but also bind a file that is missing".into()], ..Default::default() }, BTreeMap::new()));
         }
         return Err(format!("{FILE_NAME}: not found"));
     }
@@ -182,7 +186,7 @@ pub fn check_dir(dir: &Path) -> Result<Report, String> {
             }
         }
     }
-    Ok(r)
+    Ok((r, heads))
 }
 
 /// Printable lines and the exit code (0 PASS, 1 FAIL).

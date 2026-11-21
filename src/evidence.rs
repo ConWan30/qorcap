@@ -81,6 +81,40 @@ pub fn pattern_for(nonce_hex: &str) -> Result<Vec<&'static str>, String> {
     Ok(p)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PatternMatch {
+    pub matched: bool,
+    pub reason: &'static str,
+    pub start_ms: Option<i64>,
+    pub done_ms: Option<i64>,
+}
+
+/// First `OPTIONS` press followed by `pattern` as the exact next presses (`qor_receipt.challenge.response_start`).
+pub fn response_start(pattern: &[&str], presses: &[(i64, &str)]) -> Option<usize> {
+    let mut first = None;
+    for (i, (_, b)) in presses.iter().enumerate() {
+        if *b != "OPTIONS" { continue; }
+        if first.is_none() { first = Some(i); }
+        let seq: Vec<&str> = presses.iter().skip(i).take(pattern.len()).map(|(_, b)| *b).collect();
+        if seq == pattern { return Some(i); }
+    }
+    first
+}
+
+/// Match `pattern` against rising-edge presses `(t_ms, button_name)`.
+pub fn match_pattern(pattern: &[&str], presses: &[(i64, &str)]) -> PatternMatch {
+    let Some(start) = response_start(pattern, presses) else {
+        return PatternMatch { matched: false, reason: "no_pause_press", start_ms: None, done_ms: None };
+    };
+    let seq: Vec<&str> = presses.iter().skip(start).take(pattern.len()).map(|(_, b)| *b).collect();
+    if seq != pattern {
+        return PatternMatch { matched: false, reason: "pattern_mismatch", start_ms: Some(presses[start].0), done_ms: None };
+    }
+    let start_ms = presses[start].0;
+    let done_ms = presses[start + pattern.len() - 1].0;
+    PatternMatch { matched: true, reason: "ok", start_ms: Some(start_ms), done_ms: Some(done_ms) }
+}
+
 #[derive(Debug, Clone)]
 pub struct SegmentChain { pub seq: u64, pub head: String }
 impl Default for SegmentChain { fn default() -> Self { Self { seq: 0, head: GENESIS.into() } } }

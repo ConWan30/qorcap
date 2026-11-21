@@ -695,12 +695,9 @@ struct Cr { ok: bool, reason: &'static str, latency_ms: Option<i64> }
 
 /// Same shape as QorTime `verify_response` with the rule v2 ceiling passed in.
 fn verify_response(pattern: &[&str], presses: &[(i64, &str)], pause_seen_ms: Option<i64>, max_latency_ms: i64) -> Cr {
-    let Some(start) = response_start(pattern, presses) else {
-        return Cr { ok: false, reason: "no_pause_press", latency_ms: None };
-    };
-    let seq: Vec<&str> = presses.iter().skip(start).take(pattern.len()).map(|(_, b)| *b).collect();
-    if seq != pattern { return Cr { ok: false, reason: "pattern_mismatch", latency_ms: None }; }
-    let p_ms = presses[start].0;
+    let m = ev::match_pattern(pattern, presses);
+    if !m.matched { return Cr { ok: false, reason: m.reason, latency_ms: None }; }
+    let p_ms = m.start_ms.unwrap();
     let Some(seen) = pause_seen_ms else {
         return Cr { ok: false, reason: "pause_not_seen_on_video", latency_ms: None };
     };
@@ -708,17 +705,6 @@ fn verify_response(pattern: &[&str], presses: &[(i64, &str)], pause_seen_ms: Opt
     if lat < 0 { return Cr { ok: false, reason: "video_before_input", latency_ms: Some(lat) }; }
     if lat > max_latency_ms { return Cr { ok: false, reason: "video_latency_too_high", latency_ms: Some(lat) }; }
     Cr { ok: true, reason: "ok", latency_ms: Some(lat) }
-}
-
-fn response_start(pattern: &[&str], presses: &[(i64, &str)]) -> Option<usize> {
-    let mut first = None;
-    for (i, (_, b)) in presses.iter().enumerate() {
-        if *b != "OPTIONS" { continue; }
-        if first.is_none() { first = Some(i); }
-        let seq: Vec<&str> = presses.iter().skip(i).take(pattern.len()).map(|(_, b)| *b).collect();
-        if seq == pattern { return Some(i); }
-    }
-    first
 }
 
 fn median_ms(values: &[i64]) -> f64 {

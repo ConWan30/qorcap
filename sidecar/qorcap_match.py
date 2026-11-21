@@ -1997,6 +1997,13 @@ def main(argv=None) -> int:
             start_official_live(live, stop)
         except Exception as e:
             say(f"(official referee link unavailable: {e})")
+    if not a.test_pattern:
+        try:
+            from qorcap_practice_challenge import PracticeChallengePrompter, enabled as _practice_chal_enabled
+            if _practice_chal_enabled(game, os.environ):
+                PracticeChallengePrompter(api, role=a.role, console=ui, say=say).start(stop)
+        except Exception:
+            pass
 
     reported = {"seq": -1}
 
@@ -2219,6 +2226,13 @@ def main(argv=None) -> int:
             if end_stop is not None:
                 end_stop.record(bundle, stop_reason=stop_reason, stop_wall_ms=state.get("tail_stop_wall_ms"),
                                 fired=bool(state.get("cod_end_stop_fired")))
+        except Exception:
+            pass
+        # Practice CoD local response bound: info-only sidecar summary (never alters receipt).
+        try:
+            from qorcap_practice_challenge import read_hand_challenge_summary
+            for _hc_line in read_hand_challenge_summary(bundle):
+                note(_hc_line)
         except Exception:
             pass
 
