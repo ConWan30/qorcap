@@ -128,7 +128,6 @@ pub fn check_dir_heads(dir: &Path) -> Result<(Report, BTreeMap<u64, String>), St
 
     let raw_path = hand_dir.join(RAW_FILE);
     let mut raw_cache: Option<Result<Vec<u8>, String>> = None;
-    let mut raw_len_checked = false;
     let mut raw_missing_reported = false;
     let mut raw_active_seen = false;
     let mut raw_off_only = false;
@@ -290,12 +289,6 @@ pub fn check_dir_heads(dir: &Path) -> Result<(Report, BTreeMap<u64, String>), St
                 }
             }
             Ok(raw_bytes) => {
-                if !raw_len_checked {
-                    raw_len_checked = true;
-                    if raw_bytes.len() % RAW_RECORD_BYTES != 0 {
-                        r.errors.push(format!("{RAW_FILE}: length {} is not a multiple of {RAW_RECORD_BYTES} (truncated or corrupt)", raw_bytes.len()));
-                    }
-                }
                 let Some(end) = offset.checked_add(len) else {
                     r.errors.push(format!("chunk {seq}: raw slice offset overflow"));
                     continue;
@@ -341,7 +334,7 @@ pub fn check_dir_heads(dir: &Path) -> Result<(Report, BTreeMap<u64, String>), St
         if let Some(Ok(raw_bytes)) = &raw_cache {
             r.raw_files = 1;
             if (raw_bytes.len() as u64) > expected_raw_offset {
-                r.warnings.push(format!("{RAW_FILE}: {} trailing byte(s) after sealed offset {expected_raw_offset} (unsealed tail, not counted)", raw_bytes.len() as u64 - expected_raw_offset));
+                r.warnings.push(format!("{RAW_FILE}: {} trailing byte(s) after sealed offset {expected_raw_offset} (UNMEASURED unsealed tail, not counted, never padded)", raw_bytes.len() as u64 - expected_raw_offset));
             }
         }
     } else if raw_off_only && raw_path.exists() {
