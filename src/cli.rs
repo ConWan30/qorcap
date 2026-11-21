@@ -473,10 +473,14 @@ pub struct RecordArgs {
     /// both this and --hand-timeline are set.
     #[arg(long)]
     pub no_hand_timeline: bool,
-    /// Hand timeline: do not keep the full-rate raw USB reports (hand_raw/) for this session. Raw logging is on
+    /// Hand timeline: do not keep the full-rate raw USB reports (hand_raw.v0.bin) for this session. Raw logging is on
     /// by default when the hand timeline runs; an off session is recorded as raw_usb: false. Also QORCAP_RAW_USB=0.
     #[arg(long)]
     pub no_raw_usb: bool,
+    /// PRACTICE lane only. Override the hand and raw output folder (defaults to D:\QorCap\practice-hand\<session>\
+    /// on Windows, failing soft to the session bundle folder). Also QORCAP_HAND_DIR.
+    #[arg(long)]
+    pub hand_dir: Option<String>,
 }
 
 impl RecordArgs {
@@ -551,7 +555,10 @@ mod tests {
             assert!(r.no_hand_timeline && r.practice_lane && r.no_raw_usb && !r.hand_timeline);
         } else { panic!() }
         if let Cmd::Record(r) = Cli::try_parse_from(["qorcap", "record", "--hand-timeline", "--practice-lane"]).unwrap().cmd {
-            assert!(r.hand_timeline && r.practice_lane && !r.no_hand_timeline, "alias still parses");
+            assert!(r.hand_timeline && r.practice_lane && !r.no_hand_timeline && r.hand_dir.is_none(), "alias still parses");
+        } else { panic!() }
+        if let Cmd::Record(r) = Cli::try_parse_from(["qorcap", "record", "--practice-lane", "--hand-dir", "/tmp/h"]).unwrap().cmd {
+            assert_eq!(r.hand_dir.as_deref(), Some("/tmp/h"));
         } else { panic!() }
         assert!(matches!(Cli::try_parse_from(["qorcap", "check-hand-timeline", "b"]).unwrap().cmd, Cmd::CheckHandTimeline { .. }));
         assert!(matches!(Cli::try_parse_from(["qorcap", "check-response-bound", "b", "--write"]).unwrap().cmd, Cmd::CheckResponseBound { write: true, .. }));

@@ -10,9 +10,15 @@
 //! (0x0CE6) USB input reports (report id 0x01, 64 B) and capture-frame arrivals, on the same engine clock as
 //! `inputs.jsonl` and `frame_clock.jsonl`, cut into fixed 1 s windows. Each window is sealed as a JCS no-float
 //! SHA-256 chain link (`head_k = SHA-256(JCS({prev, seq, sha256}))` from 64 x "0", the `inputs.rs` rule).
-//! Every report is also kept, full rate, in a per-window raw companion file (`hand_raw/`) whose SHA-256 is
-//! bound inside the sealed window. Raw logging is on by default when the logger runs and can be switched off
-//! per session with `--no-raw-usb` (recorded as `raw_usb: false`).
+//! Every report is also kept, full rate, in one append-only raw file per session (`hand_raw.v0.bin`) whose
+//! per-window byte slices (`raw_file`, `raw_offset`, `raw_len`, `raw_sha256`) are bound inside the sealed
+//! window. Raw logging is on by default when the logger runs and can be switched off per session with
+//! `--no-raw-usb` (recorded as `raw_usb: false`).
+//!
+//! Storage routing (practice only): defaults to `D:\QorCap\practice-hand\<session>\` on Windows, with
+//! `--hand-dir` / `QORCAP_HAND_DIR` override and fail-soft fallback to the session's bundle folder when `D:`
+//! (or the override) is missing or unwritable. The actual directory used and any fallback reason are bound
+//! in `checkpoints.jsonl` and in the sealed `hand_timeline.v0.jsonl` header.
 //!
 //! An off session is a normal session: it records `hand_timeline: false` on the start and stop checkpoints
 //! (extra `qorcap` keys; no seal.rs / bundle.rs / receipt.v0 / contracts change), writes no hand file, and
@@ -44,10 +50,17 @@ pub mod response;
 #[cfg(windows)]
 pub mod win;
 
+use std::fs::OpenOptions;
+use std::path::{Path, PathBuf};
+
 /// `--hand-timeline` / `QORCAP_HAND_TIMELINE`. A true word is a no-op alias in practice; a false word is the off switch.
 pub const ENV: &str = "QORCAP_HAND_TIMELINE";
 /// `QORCAP_RAW_USB=0|false|no|off` switches raw logging off for one session (same as `--no-raw-usb`).
 pub const ENV_RAW: &str = "QORCAP_RAW_USB";
+/// `QORCAP_HAND_DIR` overrides the practice hand + raw output directory (CLI `--hand-dir` wins if both are set).
+pub const ENV_HAND_DIR: &str = "QORCAP_HAND_DIR";
+/// Default Windows root for practice hand and raw output (`D:\QorCap\practice-hand\<session>\`).
+pub const DEFAULT_WIN_HAND_ROOT: &str = r"D:\QorCap\practice-hand";
 
 fn env_is_off(env_val: Option<&str>) -> bool {
     matches!(env_val.map(|s| s.trim().to_ascii_lowercase()).as_deref(), Some("0" | "false" | "no" | "off"))
@@ -70,6 +83,10 @@ pub struct LiveStatus {
     pub epoch: u64,
     /// Frame arrivals dropped because the bounded hand-logger queue was full or the logger had stopped.
     pub frame_drops: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hand_dir: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hand_dir_source: Option<String>,
 }
 
 impl LiveStatus {
@@ -83,7 +100,127 @@ impl LiveStatus {
             raw_usb: false,
             epoch: 0,
             frame_drops: 0,
+            hand_dir: None,
+            hand_dir_source: None,
         }
+    }
+}
+
+/// Where practice hand and raw files are stored for a session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HandDirChoice {
+    pub dir: PathBuf,
+    /// `"override"` | `"default_d"` | `"fallback_bundle"`
+    pub source: &'static str,
+    pub fallback_reason: Option<String>,
+}
+
+/// Derive a safe `<session>` folder name from the bundle directory (fallback to `match_id`).
+pub fn session_name(bundle_dir: &Path, match_id: &str) -> String {
+    if let Some(name) = bundle_dir.file_name().and_then(|s| s.to_str()) {
+        let trimmed = name.trim();
+        if !trimmed.is_empty() && trimmed != "." && trimmed != ".." {
+            return trimmed.to_string();
+        }
+    }
+    let clean: String = match_id
+        .trim()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') { c } else { '_' })
+        .collect();
+    if clean.is_empty() { "session".into() } else { clean }
+}
+
+/// Format the bundle-relative pointer if `hand_dir` is the bundle dir (or inside it), else the full path.
+pub fn bundle_pointer(bundle_dir: &Path, hand_dir: &Path) -> String {
+    if hand_dir == bundle_dir {
+        return ".".to_string();
+    }
+    if let Ok(rel) = hand_dir.strip_prefix(bundle_dir) {
+        let s = rel.to_string_lossy();
+        if !s.is_empty() {
+            return s.into_owned();
+        }
+    }
+    hand_dir.to_string_lossy().into_owned()
+}
+
+fn ensure_writable_dir(dir: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    let probe = dir.join(format!(".qorcap-probe-{}-{:?}", std::process::id(), std::thread::current().id()));
+    let f = OpenOptions::new().create_new(true).write(true).open(&probe).map_err(|e| e.to_string())?;
+    drop(f);
+    let _ = std::fs::remove_file(&probe);
+    Ok(())
+}
+
+/// Resolve the practice hand/raw output directory for this OS.
+/// Windows defaults to `D:\QorCap\practice-hand\<session>\`; non-Windows has no `D:` drive and falls back
+/// to `bundle_dir` unless `--hand-dir` or `QORCAP_HAND_DIR` is set.
+pub fn resolve_hand_dir(bundle_dir: &Path, session: &str, flag: Option<&str>, env: Option<&str>) -> HandDirChoice {
+    #[cfg(windows)]
+    {
+        resolve_hand_dir_with_anchor(
+            bundle_dir,
+            session,
+            flag,
+            env,
+            Some(Path::new(r"D:\")),
+            Some(Path::new(DEFAULT_WIN_HAND_ROOT)),
+        )
+    }
+    #[cfg(not(windows))]
+    {
+        resolve_hand_dir_with_anchor(bundle_dir, session, flag, env, None, None)
+    }
+}
+
+/// Testable resolver parameterized by drive anchor (`D:\`) and default root (`D:\QorCap\practice-hand`).
+pub fn resolve_hand_dir_with_anchor(
+    bundle_dir: &Path,
+    session: &str,
+    flag: Option<&str>,
+    env: Option<&str>,
+    drive_anchor: Option<&Path>,
+    default_root: Option<&Path>,
+) -> HandDirChoice {
+    let ov = flag.map(str::trim).filter(|s| !s.is_empty())
+        .or_else(|| env.map(str::trim).filter(|s| !s.is_empty()));
+    if let Some(raw) = ov {
+        let cand = PathBuf::from(raw);
+        return match ensure_writable_dir(&cand) {
+            Ok(()) => HandDirChoice { dir: cand, source: "override", fallback_reason: None },
+            Err(why) => HandDirChoice {
+                dir: bundle_dir.to_path_buf(),
+                source: "fallback_bundle",
+                fallback_reason: Some(format!("override {} is not writable ({why}); using bundle folder", cand.display())),
+            },
+        };
+    }
+    let Some(root) = default_root else {
+        return HandDirChoice {
+            dir: bundle_dir.to_path_buf(),
+            source: "fallback_bundle",
+            fallback_reason: Some("D:\\ drive is unavailable on non-Windows host; using bundle folder".into()),
+        };
+    };
+    if let Some(anchor) = drive_anchor {
+        if !anchor.is_dir() {
+            return HandDirChoice {
+                dir: bundle_dir.to_path_buf(),
+                source: "fallback_bundle",
+                fallback_reason: Some(format!("{} is missing or not a directory; using bundle folder", anchor.display())),
+            };
+        }
+    }
+    let cand = root.join(session);
+    match ensure_writable_dir(&cand) {
+        Ok(()) => HandDirChoice { dir: cand, source: "default_d", fallback_reason: None },
+        Err(why) => HandDirChoice {
+            dir: bundle_dir.to_path_buf(),
+            source: "fallback_bundle",
+            fallback_reason: Some(format!("{} is not writable ({why}); using bundle folder", cand.display())),
+        },
     }
 }
 
@@ -139,5 +276,62 @@ mod tests {
         assert!(raw_enabled(false, Some("1")));
         assert!(!raw_enabled(true, None));
         for off in ["0", "false", "NO", " off "] { assert!(!raw_enabled(false, Some(off)), "{off}"); }
+    }
+    #[test]
+    fn d_drive_routing_override_and_fail_soft_fallback() {
+        let base = std::env::temp_dir().join(format!("qorcap-hand-dir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let bundle = base.join("matches").join("sess-1");
+        std::fs::create_dir_all(&bundle).unwrap();
+
+        // 1. Default D: anchor present and writable -> routes to <root>/<session>.
+        let d_drive = base.join("fake-d");
+        std::fs::create_dir_all(&d_drive).unwrap();
+        let d_root = d_drive.join("QorCap").join("practice-hand");
+        let c1 = resolve_hand_dir_with_anchor(&bundle, "sess-1", None, None, Some(&d_drive), Some(&d_root));
+        assert_eq!(c1.dir, d_root.join("sess-1"));
+        assert_eq!(c1.source, "default_d");
+        assert!(c1.fallback_reason.is_none());
+
+        // 2. D: anchor missing -> fail-soft fallback to bundle dir.
+        let missing_drive = base.join("missing-d");
+        let c2 = resolve_hand_dir_with_anchor(&bundle, "sess-1", None, None, Some(&missing_drive), Some(&missing_drive.join("QorCap").join("practice-hand")));
+        assert_eq!(c2.dir, bundle);
+        assert_eq!(c2.source, "fallback_bundle");
+        assert!(c2.fallback_reason.as_deref().unwrap().contains("missing"));
+
+        // 3. D: anchor exists but default root is unwritable (occupied by a regular file) -> fallback to bundle dir.
+        let ro_drive = base.join("ro-d");
+        std::fs::create_dir_all(&ro_drive).unwrap();
+        let blocked_root = ro_drive.join("QorCap");
+        std::fs::write(&blocked_root, b"not-a-dir").unwrap();
+        let c3 = resolve_hand_dir_with_anchor(&bundle, "sess-1", None, None, Some(&ro_drive), Some(&blocked_root.join("practice-hand")));
+        assert_eq!(c3.dir, bundle);
+        assert_eq!(c3.source, "fallback_bundle");
+        assert!(c3.fallback_reason.as_deref().unwrap().contains("not writable"));
+
+        // 4. Override via env and CLI flag (CLI wins over env).
+        let env_dir = base.join("env-hand");
+        let cli_dir = base.join("cli-hand");
+        let env_s = env_dir.to_string_lossy().into_owned();
+        let cli_s = cli_dir.to_string_lossy().into_owned();
+        let c4 = resolve_hand_dir_with_anchor(&bundle, "sess-1", None, Some(&env_s), Some(&missing_drive), Some(&d_root));
+        assert_eq!(c4.dir, env_dir);
+        assert_eq!(c4.source, "override");
+        assert!(c4.fallback_reason.is_none());
+        let c5 = resolve_hand_dir_with_anchor(&bundle, "sess-1", Some(&cli_s), Some(&env_s), Some(&missing_drive), Some(&d_root));
+        assert_eq!(c5.dir, cli_dir);
+        assert_eq!(c5.source, "override");
+
+        // 5. Unwritable override falls back to bundle dir.
+        let bad_ov = blocked_root.join("sub");
+        let c6 = resolve_hand_dir_with_anchor(&bundle, "sess-1", Some(&bad_ov.to_string_lossy()), None, Some(&d_drive), Some(&d_root));
+        assert_eq!(c6.dir, bundle);
+        assert_eq!(c6.source, "fallback_bundle");
+        assert!(c6.fallback_reason.as_deref().unwrap().contains("override"));
+
+        assert_eq!(bundle_pointer(&bundle, &bundle), ".");
+        assert_eq!(bundle_pointer(&bundle, &d_root.join("sess-1")), d_root.join("sess-1").to_string_lossy());
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

@@ -27,18 +27,26 @@ Scope documents (QorArch, 2026-11-20): `SCOPE-edge-logger.md` (02144d1c…4cf0),
 (f0046d44…69de), `ADDENDUM-hand-timeline-qorai-1.md` (46ee68cf…e71e1), `ADDENDUM-hand-network-con-answers-1.md`
 (b8e94883…c9a8), `ADDENDUM-hand-network-con-answers-1-amend-1.md` (5084fe59…2d718).
 
-## Files (beside the bundle)
+## Files and `D:` routing (practice lane only)
+
+On Windows in the practice lane, hand and raw output defaults to `D:\QorCap\practice-hand\<session>\`
+(where `<session>` is the bundle folder name, or `--match-id` if needed). Override with `--hand-dir <DIR>`
+(CLI wins) or `QORCAP_HAND_DIR=<DIR>`. If `D:` (or the override) is missing or unwritable, the logger fails soft
+and falls back to the session bundle folder (`hand_dir_source: "fallback_bundle"` with `hand_dir_fallback_reason`).
 
 | File | What |
 |---|---|
 | `hand_timeline.v0.jsonl` | One JCS object per line: `header`, `status`, `in`, `frame`, `profile_swap_candidate`, `hb`, `raw_bind`, `chunk`. |
-| `hand_raw/wNNNNNNNNNN.bin` | Raw companion for window N: every USB input report 0x01 (64 B as read) + u64 LE QPC ticks = 72 B per report. Written only when the window has reports. |
-| `hand_timeline_summary.v0.json` | At stop: file SHA-256, last head, chunk count, device models seen, fallback flag. |
+| `hand_raw.v0.bin` | ONE append-only raw file per session (`create_new`, `0600` on Unix, 0 B binary header). Fixed 80 B `v1` records: `u64_le qpc_ticks` (`0` = UNMEASURED) + `u64_le t_us` (engine `Instant`) + `64 B` USB input report `0x01`. |
+| `hand_timeline_summary.v0.json` | At stop: file SHA-256, last head, chunk count, `raw_file`, `raw_bytes`, `raw_layout`, `raw_record_bytes`, `hand_dir`, `hand_dir_source`, `hand_dir_fallback_reason`, device models seen, fallback flag. |
+
+`raw_layout: "v1"` (`raw_record_bytes: 80`) stores `t_us` next to `qpc_ticks` so the `Instant`-vs-QPC residual can
+be measured later; the residual itself stays `UNMEASURED` until benchmarked.
 
 Raw logging is **on by default** whenever the hand timeline runs. Switch it off for one session with
-`--no-raw-usb` (or `QORCAP_RAW_USB=0`); the header and the stop checkpoint then say `raw_usb: false` and no
-`hand_raw/` folder is made. Raw logging pauses (`paused: "disk_low"`) if free space drops below `--min-free-gb`.
-Raw files stay on the local PC.
+`--no-raw-usb` (or `QORCAP_RAW_USB=0`); `raw_file`, `raw_offset`, `raw_len`, and `raw_sha256` are then `null`
+on `raw_bind` and `chunk` rows, and no `hand_raw.v0.bin` is created. Raw logging pauses (`paused: "disk_low"`)
+if free space drops below `--min-free-gb`. Raw files stay on the local PC.
 
 ## Windows and the chain
 
@@ -47,9 +55,10 @@ Window `k` holds records with time in `[k * 1_000_000, (k + 1) * 1_000_000)` us 
 250 ms after its end (frame arrivals can trail on the capture thread), or at stop (`partial: true`). A record for an
 already sealed window goes into the oldest open window marked `late: true` and is counted in `hb.late_records`.
 
-Each window ends with an `hb` row (health counters, including `frame_drops`) and a `raw_bind` row (raw file name,
-SHA-256, report count). Then `sha256 = SHA-256(JCS([records...]))` and `head = SHA-256(JCS({prev, seq, sha256}))`
-from 64 x `0`, the `inputs.rs` rule. So the raw file's SHA-256 is inside the chain, and the `chunk` row repeats it.
+Each window ends with an `hb` row (health counters, including `frame_drops`) and a `raw_bind` row (`file`,
+`offset`, `len`, `sha256`, `n_reports`, `bytes`, `record_bytes`, `layout`). Then `sha256 = SHA-256(JCS([records...]))`
+and `head = SHA-256(JCS({prev, seq, sha256}))` from 64 x `0`, the `inputs.rs` rule. So each slice's byte range and
+exact SHA-256 are inside the chain, and the `chunk` row repeats `raw_file`, `raw_offset`, `raw_len`, and `raw_sha256`.
 A failed write cuts the file back to its last durable length and the head does not move.
 
 Empty windows still include the trailing `hb` and `raw_bind` rows, so they hash `JCS([hb, raw_bind])` (`n = 2`),
@@ -67,14 +76,18 @@ Checkpoints are written by `engine.rs` (`checkpoint_with`), and their `qorcap` o
 
 - every segment checkpoint: `hand_chunk_seq`, `hand_head` (newest durable window at the segment close; `null`
   before the first window is sealed);
-- the stop checkpoint: `hand_timeline_sha256` (whole file), `hand_timeline_head`, `hand_timeline_file`,
-  `hand_timeline_chunks`, `raw_usb` (or `hand_timeline_error`);
+- the start and stop checkpoints: `hand_timeline_dir` (bundle-relative pointer or off-bundle path),
+  `hand_timeline_dir_actual`, `hand_dir_source`, `hand_dir_fallback_reason`, `hand_timeline_file`, `hand_raw_file`;
+- the stop checkpoint also binds: `hand_timeline_sha256` (whole file), `hand_timeline_head`,
+  `hand_timeline_chunks`, `raw_usb`, `hand_raw_bytes` (or `hand_timeline_error`);
 - an off session (`--no-hand-timeline`): the start and stop checkpoints carry `hand_timeline: false` only. No
   file, no `hand_chunk_seq` / `hand_head` / sha keys.
 
-`qorcap check-hand-timeline DIR` re-hashes every window, re-links the chain, re-hashes every raw file, checks that
-each `in` row's `raw_sha256` is in that window's raw file, and compares the checkpoint keys. `verify-bundle` is
-unchanged.
+`qorcap check-hand-timeline DIR` (and `check-response-bound DIR`) resolves `hand_timeline_dir` from `checkpoints.jsonl`
+when `hand_timeline.v0.jsonl` is stored off-bundle (or uses `DIR` directly if present), enforces `raw_layout: "v1"`
+(`80 B` records), checks non-decreasing `t_us` in `hand_raw.v0.bin`, enforces contiguous non-overlapping offsets and
+no truncation, verifies each slice's SHA-256 and each `in` row's `raw_sha256`, and compares the checkpoint keys.
+`verify-bundle` is unchanged.
 
 ## Devices
 
@@ -113,6 +126,7 @@ stay on the local PC unless the operator copies them.
 ## What stays UNMEASURED / UNKNOWN
 
 - Real-device report rate on MyTurn and raw disk use per hour: UNMEASURED (needs a separately approved device check).
+- `Instant`-vs-QPC residual between `t_us` and `qpc_ticks` inside `hand_raw.v0.bin`: UNMEASURED until benchmarked.
 - Adaptive-trigger resistance state: UNMEASURED (`trigger_fx_status` keeps bytes 42/43 raw, `status: UNMEASURED`).
 - Edge profile, dead zones, curves, remap table, stick modules, patch firmware: UNKNOWN (feature reports, never read).
 - Which profile a `profile_swap_candidate` selected: UNKNOWN (the candidate itself is ESTIMATED).

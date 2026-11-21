@@ -118,6 +118,7 @@ pub struct Engine {
     /// Practice-lane hand timeline (src/hand). Unset outside the practice lane (REAL MATCH / default lane):
     /// nothing is opened or written and no checkpoint key is added, so those runs stay byte-identical.
     pub hand: std::sync::OnceLock<Arc<crate::hand::logger::HandHandle>>,
+    pub hand_choice: std::sync::OnceLock<crate::hand::HandDirChoice>,
     /// Set when this is a practice session and the logger is off for the session (`--no-hand-timeline`,
     /// a false env word, or `--no-controller`). The start and stop checkpoints then record `hand_timeline: false`.
     pub hand_off: AtomicBool,
@@ -468,6 +469,7 @@ impl Engine {
             persist_fault: Mutex::new(None), ckpt_durable_len: Mutex::new(None),
             capture_stop: crate::capstop::enabled(args.practice_lane, std::env::var(crate::livetap::ENV_LANE).ok().as_deref()).then(|| Mutex::new(CaptureStopState::default())),
             hand: std::sync::OnceLock::new(),
+            hand_choice: std::sync::OnceLock::new(),
             hand_off: AtomicBool::new(false),
             args })
     }
@@ -487,15 +489,40 @@ impl Engine {
             if practice { self.hand_off.store(true, Ordering::SeqCst); }
             return false;
         }
-        let Some(dir) = self.bundle_dir() else { warn!("hand timeline needs --bundle (it writes beside the bundle); not started"); return false; };
+        let Some(bundle_dir) = self.bundle_dir() else { warn!("hand timeline needs --bundle (it writes beside the bundle); not started"); return false; };
+        let session = crate::hand::session_name(&bundle_dir, &self.args.match_id);
+        let choice = crate::hand::resolve_hand_dir(
+            &bundle_dir,
+            &session,
+            self.args.hand_dir.as_deref(),
+            std::env::var(crate::hand::ENV_HAND_DIR).ok().as_deref(),
+        );
+        if let Some(reason) = &choice.fallback_reason {
+            warn!("hand timeline falling back to bundle dir {}: {reason}", choice.dir.display());
+        }
         let raw_usb = crate::hand::raw_enabled(self.args.no_raw_usb, std::env::var(crate::hand::ENV_RAW).ok().as_deref());
         let wall_anchor_ms = self.ev.lock().unwrap_or_else(|e| e.into_inner()).started_wall_ms;
-        let cfg = crate::hand::timeline::Config { dir, raw_usb, raw_min_free_bytes: self.args.min_free_bytes(), wall_anchor_ms,
-            qpc: crate::hand::logger::platform_qpc_origin(self.started), frame_clock_on: self.frame_clock.enabled(), initial_device: None,
-            start_t_us: self.started.elapsed().as_micros() as u64 };
+        let cfg = crate::hand::timeline::Config {
+            dir: choice.dir.clone(),
+            hand_dir_source: choice.source.to_string(),
+            hand_dir_fallback_reason: choice.fallback_reason.clone(),
+            raw_usb,
+            raw_min_free_bytes: self.args.min_free_bytes(),
+            wall_anchor_ms,
+            qpc: crate::hand::logger::platform_qpc_origin(self.started),
+            frame_clock_on: self.frame_clock.enabled(),
+            initial_device: None,
+            start_t_us: self.started.elapsed().as_micros() as u64,
+        };
         match crate::hand::logger::spawn(cfg, self.started, crate::hand::logger::platform_open, crate::hand::logger::platform_qpc_now) {
             Ok(h) => {
-                info!("hand timeline on (practice lane): {} raw_usb={raw_usb}", crate::hand::timeline::FILE_NAME);
+                info!(
+                    "hand timeline on (practice lane): {} dir={} source={} raw_usb={raw_usb}",
+                    crate::hand::timeline::FILE_NAME,
+                    choice.dir.display(),
+                    choice.source
+                );
+                let _ = self.hand_choice.set(choice);
                 let _ = self.hand.set(Arc::new(h));
                 true
             }
@@ -560,7 +587,17 @@ impl Engine {
         if let Some(game) = &self.args.game { start_extra.insert("game".into(), json!(game)); }
         if let Some(profile) = &self.args.scorebug_profile { start_extra.insert("scorebug_profile".into(), json!(profile)); }
         // Practice off session only: a durable `hand_timeline: false`. No key is added outside practice.
-        if self.hand_off.load(Ordering::SeqCst) { start_extra.insert("hand_timeline".into(), json!(false)); }
+        if let Some(choice) = self.hand_choice.get() {
+            if let Some(bundle_dir) = self.bundle_dir() {
+                start_extra.insert("hand_timeline_dir".into(), json!(crate::hand::bundle_pointer(&bundle_dir, &choice.dir)));
+            }
+            start_extra.insert("hand_timeline_dir_actual".into(), json!(choice.dir.to_string_lossy()));
+            start_extra.insert("hand_dir_source".into(), json!(choice.source));
+            start_extra.insert("hand_dir_fallback_reason".into(), json!(choice.fallback_reason));
+            start_extra.insert("hand_timeline_file".into(), json!(crate::hand::timeline::FILE_NAME));
+            let raw_usb = self.hand.get().map(|h| h.live().raw_usb).unwrap_or(false);
+            start_extra.insert("hand_raw_file".into(), if raw_usb { json!(crate::hand::timeline::RAW_FILE) } else { Value::Null });
+        } else if self.hand_off.load(Ordering::SeqCst) { start_extra.insert("hand_timeline".into(), json!(false)); }
         self.checkpoint("start", Value::Object(start_extra));
         // Until the first video segment exists (device open, audio fallbacks, encoder warm-up), keep the
         // referee fed every 4 s. Stops for good at the first segment, so mid-match gaps are still gaps.
@@ -919,6 +956,16 @@ impl Engine {
                     extra.insert("hand_timeline_file".into(), json!(f.file));
                     extra.insert("hand_timeline_chunks".into(), json!(f.chunks));
                     extra.insert("raw_usb".into(), json!(f.raw_usb));
+                    if let Some(choice) = self.hand_choice.get() {
+                        if let Some(bundle_dir) = self.bundle_dir() {
+                            extra.insert("hand_timeline_dir".into(), json!(crate::hand::bundle_pointer(&bundle_dir, &choice.dir)));
+                        }
+                        extra.insert("hand_timeline_dir_actual".into(), json!(choice.dir.to_string_lossy()));
+                        extra.insert("hand_dir_source".into(), json!(choice.source));
+                        extra.insert("hand_dir_fallback_reason".into(), json!(choice.fallback_reason));
+                    }
+                    extra.insert("hand_raw_file".into(), json!(f.raw_file));
+                    extra.insert("hand_raw_bytes".into(), json!(f.raw_bytes));
                 }
                 Err(e) => { error!("hand timeline not sealed: {e}"); extra.insert("hand_timeline_error".into(), json!(e)); }
             }
@@ -2184,7 +2231,7 @@ esac
             std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
             let d = dir.to_string_lossy().into_owned();
             let mut a = vec!["q", "record", "--device", "testpattern", "--audio", "none", "--bundle", &d, "--no-controller", "--watchdog", "30"];
-            if practice { a.push("--practice-lane"); }
+            if practice { a.push("--practice-lane"); a.push("--hand-dir"); a.push(&d); }
             let crate::cli::Cmd::Record(r) = crate::cli::Cli::try_parse_from(a).unwrap().cmd else { panic!() };
             std::fs::write(dir.join("manifest.jsonl"), "").unwrap();
             Engine::new(r, script.to_string_lossy().into_owned())
@@ -2466,7 +2513,7 @@ esac
                 assert!(recs.iter().any(|r| r["type"] == "hb" && r["pad_connected"] == false), "{name} no pad is not invented as connected");
                 if raw_off {
                     assert_eq!(recs[0]["raw_usb"], false, "{name} header records raw_usb: false");
-                    assert!(!dir.join(crate::hand::timeline::RAW_DIR).exists() || std::fs::read_dir(dir.join(crate::hand::timeline::RAW_DIR)).map(|rd| rd.count()).unwrap_or(0) == 0);
+                    assert!(!dir.join(crate::hand::timeline::RAW_FILE).exists());
                 }
                 let rep = crate::hand::check::check_dir(&dir).unwrap();
                 assert!(rep.pass(), "{name} {:?}", rep.errors);
@@ -2475,14 +2522,14 @@ esac
                 assert_eq!(stop["qorcap"]["hand_timeline_head"], rep.head);
                 if let Ok(vb) = crate::bundle::verify(&dir) { assert!(!vb.errors.iter().any(|m| m.contains("hand")), "{name} {:?}", vb.errors); }
             } else if practice && off {
-                assert!(!file.exists() && !dir.join(crate::hand::timeline::RAW_DIR).exists(), "{name} no file");
+                assert!(!file.exists() && !dir.join(crate::hand::timeline::RAW_FILE).exists(), "{name} no file");
                 assert_eq!(stop["qorcap"]["hand_timeline"], false, "{name} off is recorded on the stop checkpoint");
                 assert!(stop["qorcap"].get("hand_timeline_sha256").is_none() && segs.iter().all(|c| c["qorcap"].get("hand_chunk_seq").is_none()), "{name} no binding keys");
                 let rep = crate::hand::check::check_dir(&dir).unwrap();
                 assert!(rep.pass() && rep.off, "{name} off session is a PASS, not a failure: {:?}", rep.errors);
                 if let Ok(vb) = crate::bundle::verify(&dir) { assert!(!vb.errors.iter().any(|m| m.contains("hand")), "{name} {:?}", vb.errors); }
             } else {
-                assert!(!file.exists() && !dir.join(crate::hand::timeline::RAW_DIR).exists(), "{name} no file");
+                assert!(!file.exists() && !dir.join(crate::hand::timeline::RAW_FILE).exists(), "{name} no file");
                 assert!(cps.iter().all(|c| !c.to_string().contains("hand_")), "{name} no hand key outside practice: {}", cps.last().unwrap());
             }
         }
@@ -2508,7 +2555,7 @@ esac
         let pdir = dir.join("practice");
         std::fs::create_dir_all(&pdir).unwrap();
         let pd = pdir.to_string_lossy().into_owned();
-        let Cmd::Record(r_prac) = Cli::try_parse_from(["q", "record", "--device", "testpattern", "--audio", "none", "--bundle", &pd, "--match-id", "m-prac", "--practice-lane", "--no-raw-usb"]).unwrap().cmd else { panic!() };
+        let Cmd::Record(r_prac) = Cli::try_parse_from(["q", "record", "--device", "testpattern", "--audio", "none", "--bundle", &pd, "--match-id", "m-prac", "--practice-lane", "--no-raw-usb", "--hand-dir", &pd]).unwrap().cmd else { panic!() };
         let e = Engine::new(r_prac, pdir.join("no-ffmpeg").to_string_lossy().into_owned());
         assert!(e.start_hand_logger());
         e.on_segment("video.mp4", 0, b"\0\0\0\x10ftypisom\0\0\0\0");
@@ -2559,6 +2606,107 @@ esac
         assert_eq!(hc_lines[0]["receipt_status_changed"], false);
         assert_eq!(hc_lines[0]["advisory_only"], true);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn practice_hand_routes_off_bundle_falls_back_softly_and_keeps_real_match_untouched() {
+        use clap::Parser;
+        use crate::cli::{Cli, Cmd};
+        let base = std::env::temp_dir().join(format!("qorcap-hand-route-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+
+        // 1. Off-bundle --hand-dir writes hand files outside the bundle, binds pointer in checkpoints, and passes check_dir + response::evaluate_dir + bundle::verify.
+        let b1 = base.join("bundle-off");
+        let h1 = base.join("off-hand-root");
+        std::fs::create_dir_all(&b1).unwrap();
+        let b1s = b1.to_string_lossy().into_owned();
+        let h1s = h1.to_string_lossy().into_owned();
+        let Cmd::Record(r1) = Cli::try_parse_from([
+            "q", "record", "--device", "testpattern", "--audio", "none",
+            "--bundle", &b1s, "--match-id", "m-off", "--practice-lane", "--hand-dir", &h1s,
+        ]).unwrap().cmd else { panic!() };
+        let e1 = Engine::new(r1, base.join("no-ffmpeg").to_string_lossy().into_owned());
+        assert!(e1.start_hand_logger());
+        let st1 = serde_json::to_value(e1.status()).unwrap();
+        assert_eq!(st1["hand"]["hand_dir_source"], "override");
+        assert_eq!(st1["hand"]["hand_dir"], h1s);
+        e1.on_segment("video.mp4", 0, b"\0\0\0\x10ftypisom\0\0\0\0");
+        let end = Instant::now() + Duration::from_secs(10);
+        while e1.hand.get().unwrap().binding().is_none() && Instant::now() < end { std::thread::sleep(Duration::from_millis(20)); }
+        e1.on_segment("video.mp4", 16, b"\0\0\0\x10moofmoof\0\0\0\0");
+        e1.seal_and_wait_countersign(Duration::from_secs(1)).unwrap();
+
+        assert!(!b1.join(crate::hand::timeline::FILE_NAME).exists(), "hand_timeline must live off-bundle");
+        assert!(!b1.join(crate::hand::timeline::RAW_FILE).exists(), "hand_raw must live off-bundle");
+        assert!(h1.join(crate::hand::timeline::FILE_NAME).exists());
+        assert!(h1.join(crate::hand::timeline::RAW_FILE).exists());
+        let cps1 = e1.ev.lock().unwrap().checkpoints.clone();
+        let stop1 = cps1.last().unwrap();
+        assert_eq!(stop1["qorcap"]["hand_dir_source"], "override");
+        assert_eq!(stop1["qorcap"]["hand_timeline_dir_actual"], h1s);
+        assert_eq!(stop1["qorcap"]["hand_raw_file"], crate::hand::timeline::RAW_FILE);
+
+        let rep1 = crate::hand::check::check_dir(&b1).unwrap();
+        assert!(rep1.pass(), "off-bundle check_dir failed: {:?}", rep1.errors);
+        assert_eq!(rep1.hand_dir_source.as_deref(), Some("override"));
+        assert!(rep1.stop_bound && rep1.segment_bindings == 1);
+        if let Ok(vb) = crate::bundle::verify(&b1) {
+            assert!(!vb.errors.iter().any(|m| m.contains("hand")), "{:?}", vb.errors);
+        }
+
+        // 2. Unwritable / file-blocked --hand-dir falls back softly to the bundle folder and records fallback_reason.
+        let b2 = base.join("bundle-fallback");
+        let bad_file = base.join("not-a-dir");
+        std::fs::create_dir_all(&b2).unwrap();
+        std::fs::write(&bad_file, b"blocker").unwrap();
+        let b2s = b2.to_string_lossy().into_owned();
+        let bads = bad_file.to_string_lossy().into_owned();
+        let Cmd::Record(r2) = Cli::try_parse_from([
+            "q", "record", "--device", "testpattern", "--audio", "none",
+            "--bundle", &b2s, "--match-id", "m-fb", "--practice-lane", "--hand-dir", &bads,
+        ]).unwrap().cmd else { panic!() };
+        let e2 = Engine::new(r2, base.join("no-ffmpeg").to_string_lossy().into_owned());
+        assert!(e2.start_hand_logger());
+        e2.on_segment("video.mp4", 0, b"\0\0\0\x10ftypisom\0\0\0\0");
+        let end2 = Instant::now() + Duration::from_secs(10);
+        while e2.hand.get().unwrap().binding().is_none() && Instant::now() < end2 { std::thread::sleep(Duration::from_millis(20)); }
+        e2.seal_and_wait_countersign(Duration::from_secs(1)).unwrap();
+
+        assert!(b2.join(crate::hand::timeline::FILE_NAME).exists(), "fallback writes into bundle dir");
+        assert!(b2.join(crate::hand::timeline::RAW_FILE).exists());
+        let cps2 = e2.ev.lock().unwrap().checkpoints.clone();
+        let stop2 = cps2.last().unwrap();
+        assert_eq!(stop2["qorcap"]["hand_dir_source"], "fallback_bundle");
+        assert!(stop2["qorcap"]["hand_dir_fallback_reason"].as_str().is_some());
+        assert_eq!(stop2["qorcap"]["hand_timeline_dir"], ".");
+        let rep2 = crate::hand::check::check_dir(&b2).unwrap();
+        assert!(rep2.pass(), "fallback check_dir failed: {:?}", rep2.errors);
+        assert_eq!(rep2.hand_dir_source.as_deref(), Some("fallback_bundle"));
+        assert!(rep2.hand_dir_fallback_reason.is_some());
+
+        // 3. REAL MATCH ignores --hand-dir completely and writes zero hand files or checkpoint keys.
+        let b3 = base.join("bundle-real");
+        let h3 = base.join("real-should-not-exist");
+        std::fs::create_dir_all(&b3).unwrap();
+        let b3s = b3.to_string_lossy().into_owned();
+        let h3s = h3.to_string_lossy().into_owned();
+        let Cmd::Record(r3) = Cli::try_parse_from([
+            "q", "record", "--device", "testpattern", "--audio", "none",
+            "--bundle", &b3s, "--match-id", "m-real", "--hand-dir", &h3s,
+        ]).unwrap().cmd else { panic!() };
+        let e3 = Engine::new(r3, base.join("no-ffmpeg").to_string_lossy().into_owned());
+        assert!(!e3.start_hand_logger());
+        assert!(serde_json::to_value(e3.status()).unwrap().get("hand").is_none());
+        e3.on_segment("video.mp4", 0, b"\0\0\0\x10ftypisom\0\0\0\0");
+        e3.seal_and_wait_countersign(Duration::from_secs(1)).unwrap();
+        assert!(!h3.exists());
+        assert!(!b3.join(crate::hand::timeline::FILE_NAME).exists());
+        assert!(!b3.join(crate::hand::timeline::RAW_FILE).exists());
+        let cps3 = e3.ev.lock().unwrap().checkpoints.clone();
+        assert!(cps3.iter().all(|c| !c.to_string().contains("hand_")));
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
 
