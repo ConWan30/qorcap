@@ -77,6 +77,7 @@ LINUX_FILES = (
     "tools/test_frame_clock_ab.py",
     "tools/test_encoder_pace.py",
     "tools/test_assert_pytest_skips.py",
+    "tools/pwec2/test_pwec2.py",
     "sidecar/test_qorcap_reader.py",
     "sidecar/test_c11_snapshot_inputs_timeout.py",
     "sidecar/test_qorcap_match.py::test_refresh_off_the_frame_thread_keeps_four_hertz",
@@ -154,6 +155,7 @@ WINDOWS_FILES = (
     "tools/test_frame_clock_ab.py",
     "tools/test_encoder_pace.py",
     "tools/test_assert_pytest_skips.py",
+    "tools/pwec2/test_pwec2.py",
     "sidecar/test_qorcap_reader.py",
     "sidecar/test_c11_snapshot_inputs_timeout.py",
     "sidecar/test_qorcap_match.py::test_refresh_off_the_frame_thread_keeps_four_hertz",
@@ -223,10 +225,12 @@ WINDOWS_FILES = (
 # not re-collected; CI's collected total is authoritative. Re-collect after any list or test change.
 # sidecar/test_qorcap_engagement.py (PWEC) adds 27 non-parametrized tests on both lists: linux
 # re-collected locally at 1228 (main 0932fe8 + this file); windows set by count to 1209.
-# sidecar/test_qorcap_practice_challenge.py adds 6 tests on both lists:
-# re-collected locally at 1234 linux / 1215 windows against pinned qortime 0204e6d8.
-LINUX_MIN_COLLECTED = 1234
-WINDOWS_MIN_COLLECTED = 1215
+# Re-collected after the QorProof #183 follow-up fixes, on main 365e54f (#187).
+# pytest --collect-only -q of each --list, QORTIME pin 0204e6d8082f8c40ea1fe5e09bf16402aaee3ff2:
+# 1306 linux / 1287 windows. Previous floors were 1288 / 1269; this change adds
+# 18 collected tests on both lists.
+LINUX_MIN_COLLECTED = 1306
+WINDOWS_MIN_COLLECTED = 1287
 
 # Absent from both sidecar suites. A reason is required; whitespace does not count.
 EXCLUDED_TEST_FILES = {
