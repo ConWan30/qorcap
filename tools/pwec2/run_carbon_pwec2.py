@@ -300,15 +300,22 @@ def parse_read(text: str, expected_n: int) -> dict | None:
 
 
 def _prompt_invariants_hold(window: dict) -> bool:
-    """read_window.txt: side is none iff target_present is no.
+    """read_window.txt invariants.
 
-    Otherwise side is enemy, teammate, or unsure.
+    side is none iff target_present is no; otherwise side is enemy,
+    teammate, or unsure. kill_confirmed=yes and escaped=yes cannot
+    stand together (escaped is no when a red X is shown).
     """
     present = window["target_present"]
     side = window["side"]
     if present == "no":
-        return side == "none"
-    return side in {"enemy", "teammate", "unsure"}
+        if side != "none":
+            return False
+    elif side not in {"enemy", "teammate", "unsure"}:
+        return False
+    if window["kill_confirmed"] == "yes" and window["escaped"] == "yes":
+        return False
+    return True
 
 
 def _under(root: Path, rel: str) -> Path:
@@ -328,8 +335,15 @@ def load_windows(data: Path) -> list[tuple[int, str, list[dict]]]:
         raise StopRun("MANIFEST.json does not parse", 6) from exc
     if not isinstance(manifest, dict):
         raise StopRun("MANIFEST.json is not an object", 6)
+    frames = manifest.get("frames")
+    if frames is None:
+        frames = []
+    if not isinstance(frames, list):
+        raise StopRun("MANIFEST.json frames is not a list", 6)
     groups: dict[str, list[dict]] = {}
-    for frame in manifest.get("frames") or []:
+    for frame in frames:
+        if not isinstance(frame, dict):
+            raise StopRun("a MANIFEST.json frame is not an object", 6)
         if frame.get("set") != "window":
             continue
         wid = frame.get("window_id")
@@ -339,10 +353,12 @@ def load_windows(data: Path) -> list[tuple[int, str, list[dict]]]:
     ordered = []
     for wid, items in groups.items():
         items = sorted(items, key=lambda row: (row.get("t_us") or 0, ROLE_ORDER.get(row.get("role"), 99), row.get("id") or ""))
-        order = items[0].get("window_order")
-        if type(order) is not int:
+        orders = [item.get("window_order") for item in items]
+        if any(type(item) is not int for item in orders):
             raise StopRun("a window has no integer window_order", 6)
-        ordered.append((order, wid, items))
+        if len(set(orders)) != 1:
+            raise StopRun("a window has inconsistent window_order values", 6)
+        ordered.append((orders[0], wid, items))
     ordered.sort(key=lambda row: (row[0], row[1]))
     return ordered
 
@@ -355,7 +371,10 @@ def _load_frame(data: Path, row: dict) -> np.ndarray:
     if not path.is_file():
         raise StopRun("a frame file is missing", 6)
     expect = row.get("sha256")
-    if not isinstance(expect, str) or len(expect) != 64:
+    if not isinstance(expect, str):
+        raise StopRun("a frame has no sha256", 6)
+    expect = expect.strip().lower()
+    if len(expect) != 64:
         raise StopRun("a frame has no sha256", 6)
     got = file_sha256(path)
     if got != expect:
@@ -385,19 +404,34 @@ def build_contents(order: int, frames: list[tuple[str, bytes]]) -> list[dict]:
 
 
 def response_text(body: dict) -> tuple[str, str | None]:
-    candidates = body.get("candidates") or []
-    if not candidates or not isinstance(candidates[0], dict):
+    if not isinstance(body, dict):
+        return "", None
+    candidates = body.get("candidates")
+    if not isinstance(candidates, list) or not candidates:
         return "", None
     cand = candidates[0]
+    if not isinstance(cand, dict):
+        return "", None
     finish = cand.get("finishReason")
-    parts = ((cand.get("content") or {}).get("parts")) or []
+    finish_label = finish if isinstance(finish, str) else None
+    content = cand.get("content")
+    if content is None:
+        parts = []
+    elif not isinstance(content, dict):
+        return "", finish_label
+    else:
+        parts = content.get("parts")
+        if parts is None:
+            parts = []
+        elif not isinstance(parts, list):
+            return "", finish_label
     texts = []
     for part in parts:
         if not isinstance(part, dict) or part.get("thought"):
             continue
         if isinstance(part.get("text"), str):
             texts.append(part["text"])
-    return "\n".join(texts), finish if isinstance(finish, str) else None
+    return "\n".join(texts), finish_label
 
 
 def _thinking_rejected(status: int, payload: str) -> bool:
@@ -449,12 +483,68 @@ def running_total(path: Path) -> Decimal:
                 raise StopRun("LEDGER.jsonl has a truncated or invalid line", 5)
             cost = rec.get("cost_usd")
             if cost not in (None, ""):
-                total += Decimal(str(cost))
+                amount = Decimal(str(cost))
+                if not amount.is_finite() or amount < 0:
+                    raise StopRun("LEDGER.jsonl has a truncated or invalid line", 5)
+                total += amount
     except StopRun:
         raise
     except (json.JSONDecodeError, ValueError, TypeError, ArithmeticError) as exc:
         raise StopRun("LEDGER.jsonl has a truncated or invalid line", 5) from exc
     return total
+
+
+_BLOCKING_LEDGER = {"PWEC-CALL", "PWEC-CAP", "PWEC-FREEZE", "PWEC-STOP"}
+
+
+def _call_id(order: int, digest: str, attempt: str) -> str:
+    return f"w{order:04d}-{digest}-{attempt}"
+
+
+def blocking_ledger_calls(path: Path) -> set[str]:
+    """Call ids that already have a non-seed CALL/CAP/FREEZE/STOP line.
+
+    A seed row used only to pre-load the running total has no `call` field
+    and is ignored, so test_seeded_ledger_is_part_of_the_running_total still
+    reaches countTokens and the cap check.
+    """
+    found: set[str] = set()
+    if not path.is_file():
+        return found
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            rec = json.loads(line)
+            if not isinstance(rec, dict):
+                raise StopRun("LEDGER.jsonl has a truncated or invalid line", 5)
+            if rec.get("event_code") not in _BLOCKING_LEDGER:
+                continue
+            call = rec.get("call")
+            if isinstance(call, str) and call:
+                found.add(call)
+    except StopRun:
+        raise
+    except (json.JSONDecodeError, ValueError, TypeError) as exc:
+        raise StopRun("LEDGER.jsonl has a truncated or invalid line", 5) from exc
+    return found
+
+
+def _guard_fresh_out(out: Path, windows: list[tuple[int, str, list[dict]]], ledger: Path) -> None:
+    """Refuse a re-run before any network call, including countTokens."""
+    blocked = blocking_ledger_calls(ledger)
+    for order, wid, _rows in windows:
+        digest = hashlib.sha256(wid.encode("utf-8")).hexdigest()[:8]
+        read_path = out / "reads" / f"w{order:04d}-{digest}.json"
+        if read_path.exists():
+            raise StopRun("refusing to overwrite an existing output", 5)
+        for attempt in ("a0", "a1"):
+            call = _call_id(order, digest, attempt)
+            raw_path = out / "raw" / f"{call}.json"
+            if raw_path.exists():
+                raise StopRun("refusing to overwrite an existing output", 5)
+            if call in blocked:
+                raise StopRun("LEDGER.jsonl already has a result for this call", 5)
 
 
 def _write_once(path: Path, text: str) -> None:
@@ -517,6 +607,7 @@ def _run_reads(data: Path, out: Path, *, transport, api_key: str, expect_sha: li
     windows = load_windows(data)
     ledger = out / "LEDGER.jsonl"
     running = running_total(ledger)
+    _guard_fresh_out(out, windows, ledger)
 
     def emit(msg: str) -> None:
         print(scrub(msg, api_key), flush=True)
@@ -535,8 +626,9 @@ def _run_reads(data: Path, out: Path, *, transport, api_key: str, expect_sha: li
         read_path = out / "reads" / f"w{order:04d}-{digest}.json"
         parsed = None
         final_disposition = "UNMEASURED"
+        final_reason = None
         for attempt in ("a0", "a1"):
-            call = f"w{order:04d}-{digest}-{attempt}"
+            call = _call_id(order, digest, attempt)
             counted = _count_tokens(transport, api_key, contents, call, log, emit)
             worst = worst_case_usd(counted)
             if would_exceed(running, counted):
@@ -572,11 +664,15 @@ def _run_reads(data: Path, out: Path, *, transport, api_key: str, expect_sha: li
             elif finish == "MAX_TOKENS":
                 retry = attempt == "a0"
                 disposition = "RETRY" if retry else "UNMEASURED"
+                if not retry:
+                    final_reason = "MAX_TOKENS"
             elif finish == "STOP":
                 parsed = parse_read(text, order)
                 if parsed is None:
                     retry = attempt == "a0"
                     disposition = "RETRY" if retry else "UNMEASURED"
+                    if not retry:
+                        final_reason = "no_parse"
                 else:
                     disposition = "PARSED"
             else:
@@ -585,6 +681,7 @@ def _run_reads(data: Path, out: Path, *, transport, api_key: str, expect_sha: li
                 parsed = None
                 retry = False
                 disposition = "UNMEASURED"
+                final_reason = finish if isinstance(finish, str) and finish else "missing finish"
             record = {
                 **_base_record(call, attempt),
                 "event_code": "PWEC-FREEZE" if status == 429 else ("PWEC-STOP" if disposition == "STOP" else "PWEC-CALL"),
@@ -619,7 +716,7 @@ def _run_reads(data: Path, out: Path, *, transport, api_key: str, expect_sha: li
                 final_disposition = "UNMEASURED"
                 parsed = None
                 break
-        _write_read(read_path, wid, order, final_disposition, parsed, None, api_key)
+        _write_read(read_path, wid, order, final_disposition, parsed, final_reason, api_key)
     return 0
 
 

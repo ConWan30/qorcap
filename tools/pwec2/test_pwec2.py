@@ -798,6 +798,7 @@ def test_non_stop_finish_is_unmeasured_with_no_retry(tmp_path, reason):
     saved = json.loads(next((out / "reads").glob("*.json")).read_text(encoding="utf-8"))
     assert saved["status"] == "UNMEASURED"
     assert saved["read"] is None
+    assert saved["reason"] == (reason if reason is not None else "missing finish")
     row = [item for item in _ledger(out) if item["event_code"] == "PWEC-CALL"][0]
     assert row["disposition"] == "UNMEASURED"
     assert row["finish_reason"] == reason
@@ -827,3 +828,108 @@ def test_truncated_ledger_stops_with_no_call(tmp_path):
     code = carbon.run_reads(data, out, transport=fake, api_key=KEY)
     assert code == 5
     assert fake.calls == []
+
+
+
+def _window_call_id(order=7, window_id="synthetic-window", attempt="a0"):
+    digest = hashlib.sha256(window_id.encode("utf-8")).hexdigest()[:8]
+    return f"w{order:04d}-{digest}-{attempt}", digest
+
+
+def test_rerun_on_existing_out_makes_no_network_calls(tmp_path):
+    first = Fake([(200, _read_ok())])
+    code1, out = _run(tmp_path, first)
+    assert code1 == 0
+    assert first.calls
+    second = Fake([(200, _read_ok())])
+    code2 = carbon.run_reads(tmp_path / "data", out, transport=second, api_key=KEY)
+    assert code2 == 5
+    assert second.calls == []
+    assert carbon.running_total(out / "LEDGER.jsonl") == Decimal("0.003500")
+
+
+@pytest.mark.parametrize("kind", ["read", "raw", "ledger-CALL", "ledger-CAP", "ledger-FREEZE", "ledger-STOP"])
+def test_existing_read_raw_or_ledger_makes_no_network_calls(tmp_path, kind):
+    data = _package(tmp_path)
+    out = tmp_path / "out"
+    call, digest = _window_call_id()
+    if kind == "read":
+        path = out / "reads" / f"w0007-{digest}.json"
+        path.parent.mkdir(parents=True)
+        path.write_text("{}" + "\n", encoding="utf-8")
+    elif kind == "raw":
+        path = out / "raw" / f"{call}.json"
+        path.parent.mkdir(parents=True)
+        path.write_text("{}" + "\n", encoding="utf-8")
+    else:
+        out.mkdir()
+        code = kind.split("-", 1)[1]
+        rec = {"event_code": f"PWEC-{code}", "call": call, "cost_usd": "0.003500"}
+        (out / "LEDGER.jsonl").write_text(json.dumps(rec) + "\n", encoding="utf-8")
+    fake = Fake([(200, _read_ok())])
+    status = carbon.run_reads(data, out, transport=fake, api_key=KEY)
+    assert status == 5
+    assert fake.calls == []
+
+
+def test_parse_rejects_kill_confirmed_yes_with_escaped_yes():
+    assert carbon.parse_read(_window("yes", "enemy", kill_confirmed="yes", escaped="yes"), 7) is None
+    assert carbon.parse_read(_window("yes", "enemy", kill_confirmed="yes", escaped="no"), 7) is not None
+    assert carbon.parse_read(_window("yes", "enemy", kill_confirmed="no", escaped="yes"), 7) is not None
+    assert carbon.parse_read(_window("yes", "enemy", kill_confirmed="unsure", escaped="yes"), 7) is not None
+
+
+@pytest.mark.parametrize("cost", ["-0.000001", -1, "NaN", "Infinity", "-Infinity"])
+def test_running_total_rejects_non_finite_or_negative_cost(tmp_path, cost):
+    path = tmp_path / "LEDGER.jsonl"
+    path.write_text(json.dumps({"event_code": "PWEC-CALL", "cost_usd": cost}) + "\n", encoding="utf-8")
+    with pytest.raises(carbon.StopRun) as exc:
+        carbon.running_total(path)
+    assert exc.value.code == 5
+
+
+@pytest.mark.parametrize("frames", [{"not": "a list"}, ["not-an-object"]])
+def test_malformed_manifest_frames_stop_with_no_call(tmp_path, frames):
+    data = _package(tmp_path)
+    (data / "MANIFEST.json").write_text(json.dumps({"schema": "synthetic", "frames": frames}), encoding="utf-8")
+    fake = Fake([(200, _read_ok())])
+    code = carbon.run_reads(data, tmp_path / "out", transport=fake, api_key=KEY)
+    assert code == 6
+    assert fake.calls == []
+
+
+def test_response_text_guards_malformed_containers():
+    assert carbon.response_text("not-an-object") == ("", None)
+    assert carbon.response_text({"candidates": {"finishReason": "STOP"}}) == ("", None)
+    text, finish = carbon.response_text({"candidates": [{"finishReason": "STOP", "content": ["bad"]}]})
+    assert text == "" and finish == "STOP"
+    text, finish = carbon.response_text({"candidates": [{"finishReason": "SAFETY", "content": {"parts": "bad"}}]})
+    assert text == "" and finish == "SAFETY"
+    text, finish = carbon.response_text({"candidates": [{"finishReason": "OTHER"}]})
+    assert text == "" and finish == "OTHER"
+
+
+def test_inconsistent_window_order_sends_nothing(tmp_path):
+    data = _package(tmp_path)
+    manifest = json.loads((data / "MANIFEST.json").read_text(encoding="utf-8"))
+    extra = dict(manifest["frames"][0])
+    extra["id"] = "synth2"
+    extra["window_order"] = 8
+    extra["t_us"] = 11
+    manifest["frames"].append(extra)
+    (data / "MANIFEST.json").write_text(json.dumps(manifest), encoding="utf-8")
+    fake = Fake([(200, _read_ok())])
+    code = carbon.run_reads(data, tmp_path / "out", transport=fake, api_key=KEY)
+    assert code == 6
+    assert fake.calls == []
+
+
+def test_frame_sha_is_compared_case_insensitively(tmp_path):
+    data = _package(tmp_path)
+    manifest = json.loads((data / "MANIFEST.json").read_text(encoding="utf-8"))
+    manifest["frames"][0]["sha256"] = manifest["frames"][0]["sha256"].upper()
+    (data / "MANIFEST.json").write_text(json.dumps(manifest), encoding="utf-8")
+    fake = Fake([(200, _read_ok())])
+    code = carbon.run_reads(data, tmp_path / "out", transport=fake, api_key=KEY)
+    assert code == 0
+    assert fake.generated()
