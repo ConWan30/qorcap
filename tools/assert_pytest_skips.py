@@ -80,6 +80,7 @@ LINUX_FILES = (
     "tools/pwec2/test_pwec2.py",
     "sidecar/test_qorcap_reader.py",
     "sidecar/test_c11_snapshot_inputs_timeout.py",
+    "sidecar/test_presign_followups.py",
     "sidecar/test_qorcap_match.py::test_refresh_off_the_frame_thread_keeps_four_hertz",
     "sidecar/test_qorcap_match.py::test_incremental_tail_matches_full_parse",
     "sidecar/test_qorcap_match.py::test_tail_reparse_when_the_window_before_the_offset_changes",
@@ -105,6 +106,7 @@ LINUX_FILES = (
     "sidecar/test_qorcap_match.py::test_live_save_tail_never_adds_the_late_sign_note",
     "sidecar/test_qorcap_standard.py",
     "sidecar/test_qorcap_score_grammar.py",
+    "sidecar/test_qorcap_clock_vote.py",
     "sidecar/test_qorcap_hl170123.py",
     "sidecar/test_qorcap_seq125430.py",
     "sidecar/test_qorcap_tnp.py",
@@ -158,6 +160,7 @@ WINDOWS_FILES = (
     "tools/pwec2/test_pwec2.py",
     "sidecar/test_qorcap_reader.py",
     "sidecar/test_c11_snapshot_inputs_timeout.py",
+    "sidecar/test_presign_followups.py",
     "sidecar/test_qorcap_match.py::test_refresh_off_the_frame_thread_keeps_four_hertz",
     "sidecar/test_qorcap_match.py::test_incremental_tail_matches_full_parse",
     "sidecar/test_qorcap_match.py::test_tail_reparse_when_the_window_before_the_offset_changes",
@@ -183,6 +186,7 @@ WINDOWS_FILES = (
     "sidecar/test_qorcap_match.py::test_live_save_tail_never_adds_the_late_sign_note",
     "sidecar/test_qorcap_standard.py",
     "sidecar/test_qorcap_score_grammar.py",
+    "sidecar/test_qorcap_clock_vote.py",
     "sidecar/test_qorcap_tnp.py",
     "sidecar/test_qorcap_snp.py",
     "sidecar/test_qorcap_mnp.py",
@@ -220,14 +224,14 @@ WINDOWS_FILES = (
 # The floor is a minimum. A PR that adds tests, and any merge resolution, must
 # re-collect and set both floors to those exact counts. Leaving the old floor
 # keeps a dropped test green.
-# Re-collected after the #97 revival onto main 6ff3d64.
-# pytest --collect-only -q of sidecar/test_qorcap_challenge.py, QORTIME at
-# qortime #80 4dd61a9 (pin 0204e6d8082f8c40ea1fe5e09bf16402aaee3ff2 remains the
-# runtime verifier pin): this file went from 7 collected tests on main to 49
-# (+42). Windows does not run this file, so only the Linux floor rises.
-# Previous floors on main were 1306 / 1287.
-LINUX_MIN_COLLECTED = 1348
-WINDOWS_MIN_COLLECTED = 1287
+# Merged origin/main 6caa9a1 (#81 / #103; floors 1392 linux / 1373 windows)
+# with the #97 sidecar/test_qorcap_challenge.py additions.
+# Full-suite collect-only was not re-run here (no fastapi install on this box).
+# pytest --collect-only -q sidecar/test_qorcap_challenge.py, QORTIME at the
+# revived qortime #80 tree, still collects 49 tests (7 on main, +42).
+# Windows does not run this file, so only the Linux floor rises: 1392+42 / 1373.
+LINUX_MIN_COLLECTED = 1434
+WINDOWS_MIN_COLLECTED = 1373
 
 # Absent from both sidecar suites. A reason is required; whitespace does not count.
 EXCLUDED_TEST_FILES = {

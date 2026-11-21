@@ -91,6 +91,10 @@ INPUTS_LOCK_TIMEOUT_S = 2.0
 # A pause counts as progress for at most this long. After that, a detector
 # stuck on paused is a silent reader again.
 PAUSE_PROGRESS_CAP_MS = 300_000
+# One frame of "not paused" does not clear that clock. A blip every minute
+# would otherwise restart the cap forever. Continuous play this long does
+# clear it, and so does a scorebug read or a new timeline row on that frame.
+PAUSE_PLAY_RESET_MS = 5_000
 
 
 def _seconds_text(ms: float) -> str:
@@ -492,8 +496,8 @@ class ScoreClockLock:
     def offer(self, read, *, clock_ns: int):
         from types import SimpleNamespace
         from qor_receipt._vendor.qoresence.sync.digit_integrity import implausible_transition_reason
-        from qor_receipt._vendor.qoresence.vision.local_scorebug.agreement import AgreementConfig
-        cfg = AgreementConfig()
+        from qorcap_score_grammar import lock_agreement_config
+        cfg = lock_agreement_config()
         pair = getattr(read, "pair", None)
         if pair is None:
             self.samples, self.key = [], None
@@ -1009,6 +1013,9 @@ class ReaderCore:
         self._last_progress_ms: int | None = None
         self._stall_open = False
         self._pause_since: int | None = None
+        self._play_since: int | None = None
+        # Set by seal_reader. A late frame must not replace the final or append a note.
+        self._frozen = False
 
     def note_options(self, presses_ms) -> None:
         """Remember OPTIONS press times (wall ms). Repeating a time is a no-op."""
@@ -1131,8 +1138,14 @@ class ReaderCore:
                     self._pause_since = t_ms
                 if t_ms - self._pause_since < PAUSE_PROGRESS_CAP_MS:
                     self.note_progress(t_ms)
+                self._play_since = None
                 return
-        self._pause_since = None
+        # A non-paused frame. One blip does not clear the pause cap.
+        play_token = (self.stats.get("agreed", 0), len(self.timeline))
+        if self._pause_since is None:
+            self._play_since = None
+        elif self._play_since is None:
+            self._play_since = t_ms
         if self.gate is not None:
             pc = False
             if self.playcall is not None:
@@ -1155,8 +1168,10 @@ class ReaderCore:
         except Exception as e:  # never silent
             self.stats["errors"] += 1
             print(f"scorebug reader error: {type(e).__name__}: {e}", file=sys.stderr)
+            self._end_play_frame(t_ms, play_token)
             return
         self._note_reanchor(t_ms, fr)
+        fr = self._strip_inferred_quarter(fr)
         fr = self._hold_quarter(fr, t_ms)
         absent = (not fr.ok) and fr.reason in NOT_VISIBLE
         self._observe(t_ms, img, absent)
@@ -1172,6 +1187,7 @@ class ReaderCore:
         except Exception as e:  # never silent
             self.stats["errors"] += 1
             print(f"score agreement error: {type(e).__name__}: {e}", file=sys.stderr)
+            self._end_play_frame(t_ms, play_token)
             return
         self._note_agreement(t_ms, fr, absent, res)
         if res.agreed and res.read is not None:
@@ -1179,10 +1195,35 @@ class ReaderCore:
                 self.touchdown.reset()
         elif self.touchdown is not None:
             self.touchdown.offer(fr, t_ms, self.last_scorebug(), self._max_quarter)
+            self._end_play_frame(t_ms, play_token)
             return
         else:
+            self._end_play_frame(t_ms, play_token)
             return
         self._post_agreed(t_ms, res.read, soft)
+        self._end_play_frame(t_ms, play_token)
+
+    def freeze(self) -> None:
+        """After the seal. Later frames must not replace the final or append a reanchor note."""
+        self._frozen = True
+
+    def _end_play_frame(self, t_ms: int, token: tuple) -> None:
+        """Clear the pause cap only for real play, not a one-frame blip.
+
+        A scorebug read or a new timeline row on this non-paused frame clears it
+        immediately. Otherwise it clears once play has been continuous for
+        PAUSE_PLAY_RESET_MS. A scorebug-basis final does not clear it by itself.
+        """
+        if self._pause_since is None:
+            self._play_since = None
+            return
+        agreed0, rows0 = token
+        progressed = self.stats.get("agreed", 0) != agreed0 or len(self.timeline) != rows0
+        if progressed or (
+            self._play_since is not None and int(t_ms) - int(self._play_since) >= PAUSE_PLAY_RESET_MS
+        ):
+            self._pause_since = None
+            self._play_since = None
 
     def note_progress(self, t_ms: int) -> None:
         """A timeline row or a reader_lag / score_unagreed row was written.
@@ -1427,26 +1468,51 @@ class ReaderCore:
         ``score_timeline.v0`` has no field for these flags, and the checkpoint evidence
         is the existing score object. The note stays out of both.
         """
+        if self._frozen:
+            return
         detail = getattr(fr, "detail", None) or {}
         grammar = detail.get("grammar_reanchor") is True
         clock = detail.get("clock_reanchor") is True
-        if not grammar and not clock:
+        rule = detail.get("clock_rule")
+        inferred = detail.get("quarter_inferred") is True
+        if not grammar and not clock and not rule and not inferred:
             return
         row = {
             "t_ms": int(t_ms),
             "away": getattr(fr, "left_score", None),
             "home": getattr(fr, "right_score", None),
         }
+        # An inferred quarter is not an observed quarter. It stays out of this key.
         quarter = getattr(fr, "quarter", None)
-        if quarter is not None:
+        if quarter is not None and not inferred:
             row["quarter"] = quarter
         if grammar:
             row["grammar_reanchor"] = True
         if clock:
             row["clock_reanchor"] = True
+            kind = detail.get("clock_reanchor_kind")
+            if kind:
+                row["clock_reanchor_kind"] = kind
+        if rule:
+            row["clock_rule"] = rule
+        if inferred:
+            row["quarter_inferred"] = True
+            row["inferred_quarter"] = detail.get("inferred_quarter")
         note = getattr(self, "reanchor_note", None)
         if note is not None:
             note(row)
+
+    def _strip_inferred_quarter(self, fr):
+        """A carried quarter must not enter the agreement window or a lock."""
+        detail = getattr(fr, "detail", None) or {}
+        if not detail.get("quarter_inferred") or getattr(fr, "quarter", None) is None:
+            return fr
+        try:
+            from dataclasses import replace
+            return replace(fr, quarter=None)
+        except TypeError:
+            fr.quarter = None
+            return fr
 
     def _post_agreed(self, t_ms: int, read, soft: bool, *, touchdown_hold: bool = False) -> None:
         from types import SimpleNamespace
@@ -1460,8 +1526,9 @@ class ReaderCore:
         elif not soft:
             self.score_lock.remember(getattr(res.read, "pair", None), t_ms * 1_000_000)
         self.stats["agreed"] += 1
+        from qorcap_clock import posted_quarter
         rd = {"t_ms": t_ms, "away": res.read.left_score, "home": res.read.right_score,  # Madden: AWAY on the LEFT
-              "quarter": res.read.quarter, "clock_s": res.read.clock_seconds,
+              "quarter": posted_quarter(res.read), "clock_s": res.read.clock_seconds,
               "clock_red": bool(getattr(res.read, "clock_red", False))}
         prev = next((r for r in reversed(self.timeline) if "obs" not in r), None)
         key = lambda r: (r["home"], r["away"], r["quarter"], r["clock_s"])  # noqa: E731
@@ -1646,6 +1713,8 @@ class ReaderCore:
 
     def _end_menu(self, t_ms: int, img) -> None:
         """Read the end-menu score panel; once stable over consecutive frames, post it as the final."""
+        if self._frozen:
+            return
         if self.end_menu_reader is None:
             return
         try:
@@ -1771,7 +1840,7 @@ class ReaderCore:
         count. Otherwise the note is the previous sentence, with no claim that a
         scorebug returned.
         """
-        if getattr(self, "_end_menu_disputed", False):
+        if getattr(self, "_frozen", False) or getattr(self, "_end_menu_disputed", False):
             return
         self._end_menu_disputed = True
         if not isinstance(self.final, dict):
@@ -1813,7 +1882,7 @@ class ReaderCore:
                            [dict(side=k, source="corroborated", xcheck="n/a", **v) for k, v in c["sides"].items()])
 
     def _check_final(self, t_ms: int) -> None:
-        if self.final is not None:
+        if self._frozen or self.final is not None:
             return
         last = self.last_scorebug()
         if last is not None and last.get("quarter") is None:
@@ -2209,7 +2278,8 @@ def main(argv=None) -> int:
     from qorcap_endmenu import EndMenuReader
     from qorcap_mnp import AutoProfileReader
     from qorcap_standard import standard_reader
-    core = ReaderCore(lambda b: http_post(a.qorcap, b), AutoProfileReader(standard_reader(), prep=prep), AgreementWindow(),
+    from qorcap_score_grammar import lock_agreement_config
+    core = ReaderCore(lambda b: http_post(a.qorcap, b), AutoProfileReader(standard_reader(), prep=prep), AgreementWindow(lock_agreement_config()),
                       PauseDetector(), detect_final,
                       final_screen_detector=madden_final_screen, end_menu_reader=EndMenuReader())
     last, period, t_print = None, 1.0 / a.hz, time.monotonic()
