@@ -373,3 +373,49 @@ def test_new_text_avoids_banned_status_words():
     src = (HERE / "qorcap_ai_loop.py").read_text(encoding="utf-8")
     for needle in ("SendOutputReport", "set_output_report", "write_feature", "hid_write"):
         assert needle not in src
+
+
+@pytest.mark.parametrize("value", [
+    {"away": 7, "home": 14},
+    {"game": "cod", "kills": 12, "deaths": 3, "outcome": "victory"},
+])
+def test_structured_review_adapter_confirms_and_contradicts(value):
+    proposal = _proposal("confirmed")
+    proposal["value"] = value
+    review = {"checks": {"final_reread": {"state": "pass", "detail": "not parsed", "value": value}}}
+    view = loop.referee_label_view(proposal["match_id"], review)
+    assert loop.join_outcomes([proposal], referee=view)[0]["outcome"] == "confirmed"
+    key = "kills" if value.get("game") == "cod" else "away"
+    proposal["value"] = {**value, key: value[key] + 1}
+    assert loop.join_outcomes([proposal], referee=view)[0]["reason"] == "value_mismatch"
+    review["checks"]["final_reread"].pop("value")
+    view = loop.referee_label_view(proposal["match_id"], review)
+    assert loop.join_outcomes([proposal], referee=view)[0]["outcome"] == "unverifiable"
+
+
+@pytest.mark.parametrize("bad", [True, -1, "12", 12.0, None])
+def test_bad_cod_counts_cannot_label(bad):
+    proposal = _proposal("confirmed")
+    proposal["value"] = {"game": "cod", "kills": 12, "deaths": 3, "outcome": "victory"}
+    review = {"checks": {"final_reread": {"state": "pass", "value": {**proposal["value"], "kills": bad}}}}
+    view = loop.referee_label_view(proposal["match_id"], review)
+    assert loop.join_outcomes([proposal], referee=view)[0]["outcome"] == "unverifiable"
+
+
+def test_optional_score_reads_are_not_false_mismatches():
+    proposal = _proposal("confirmed")
+    proposal["value"] = {"away": 7, "home": 14}
+    view = loop.referee_label_view(proposal["match_id"], {"checks": {
+        "final_reread": {"state": "pass", "value": {"away": 7, "home": 14, "quarter": 4}}}})
+    assert loop.join_outcomes([proposal], referee=view)[0]["outcome"] == "confirmed"
+    proposal["value"]["quarter"] = 3
+    assert loop.join_outcomes([proposal], referee=view)[0]["outcome"] == "contradicted"
+    view["checks"]["final_reread"]["value"].pop("quarter")
+    assert loop.join_outcomes([proposal], referee=view)[0]["outcome"] == "unverifiable"
+    proposal["value"]["quarter"] = True
+    assert loop.join_outcomes([proposal], referee=view)[0]["outcome"] == "unverifiable"
+
+
+def test_review_adapter_rejects_model_verdict():
+    with pytest.raises(loop.OwnOutputRejected):
+        loop.referee_label_view("synthetic-match", {"schema": "qortime-referee-verdict/v0", "checks": {}})

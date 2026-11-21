@@ -6,7 +6,6 @@
 //! `verify-bundle` is clean. A FAIL receipt is not signed. This module does not download QorTime
 //! and does not add fields to `receipt.json`.
 
-use crate::align::FPS;
 use crate::bundle;
 use crate::credentials::{self, MatchReceipt, SignRequest};
 use crate::evidence;
@@ -115,8 +114,6 @@ pub struct Span {
     pub end_mono_ms: u64,
     pub start_frame: i64,
     pub end_frame: i64,
-    pub start_sec: f64,
-    pub dur_sec: f64,
     pub video_span_sha256: String,
     pub video_segment_seqs: Vec<u64>,
     pub video_chain_head: String,
@@ -160,7 +157,11 @@ pub fn export(req: &ExportRequest) -> Result<ExportDone, ExportError> {
         std::process::id(),
         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0)
     ));
-    let transcoded = cut_span(&req.ffmpeg, &span.source, span.start_sec, span.dur_sec, &tmp).map_err(|e| {
+    // The cut window is in seconds of the file, so it needs the file's own frame rate. Unknown, or
+    // stream and frame_clock disagreeing, refuses the cut (fail closed); 30/1 is byte-identical to before.
+    let rate = clip_rate(&req.ffmpeg, &req.bundle, &span.source).map_err(ExportError::Other)?;
+    let (start_sec, dur_sec) = span.cut_window(rate.fps());
+    let transcoded = cut_span(&req.ffmpeg, &span.source, start_sec, dur_sec, &tmp).map_err(|e| {
         let _ = std::fs::remove_file(&tmp);
         ExportError::Other(e)
     })?;
@@ -339,7 +340,7 @@ fn judge_bundle(dir: &Path, qortime: Option<&Path>, python: Option<&str>) -> Res
     if qt_status.is_empty() {
         return Err("QorTime verifier returned no status".into());
     }
-    let report = bundle::verify(dir)?;
+    let report = verify_bundle(dir)?;
     let bundle_ok = report.errors.is_empty();
     if !bundle_ok {
         eprint_bundle_errors(&report.errors);
@@ -360,16 +361,26 @@ fn judge_bundle(dir: &Path, qortime: Option<&Path>, python: Option<&str>) -> Res
     })
 }
 
+fn verify_bundle(dir: &Path) -> Result<bundle::Report, String> {
+    bundle::verify(dir).map_err(|e| bundle::escape_output(&e))
+}
+
+/// Lines clip export / sign print on stderr for a failed `verify-bundle`. File names
+/// and other untrusted text go through the same helper as verify-bundle itself.
+fn format_bundle_error_lines(errors: &[String]) -> Vec<String> {
+    errors.iter().map(|e| format!("verify-bundle: {}", bundle::escape_output(e))).collect()
+}
+
 fn eprint_bundle(dir: &Path) -> Result<(), String> {
-    let report = bundle::verify(dir)?;
+    let report = verify_bundle(dir)?;
     eprint_bundle_errors(&report.errors);
     Ok(())
 }
 
 fn eprint_bundle_errors(errors: &[String]) {
-    for e in errors {
+    for line in format_bundle_error_lines(errors) {
         // verify-bundle messages can contain file names. They stay on stderr, never in the manifest.
-        eprintln!("verify-bundle: {e}");
+        eprintln!("{line}");
     }
 }
 
@@ -567,19 +578,16 @@ fn load_span(dir: &Path, start: u64, end: u64) -> Result<Span, String> {
     }).collect();
     let video_span_sha256 = sha256_concat(&parts)?;
     let (start_frame, end_frame) = frames_for(&segs, start, end)?;
-    let (start_sec, dur_sec) = cut_window(start_frame, end_frame, start, end);
-    if dur_sec <= 0.0 {
+    if end_frame <= start_frame && end <= start {
         return Err("clip duration is zero".into());
     }
-    let report = bundle::verify(dir)?;
+    let report = verify_bundle(dir)?;
     let input_span_sha256 = input_span_hash(dir, start, end)?;
     Ok(Span {
         start_mono_ms: start,
         end_mono_ms: end,
         start_frame,
         end_frame,
-        start_sec,
-        dur_sec,
         video_span_sha256,
         video_segment_seqs: chosen.iter().map(|s| s.seq).collect(),
         video_chain_head: report.chain_head,
@@ -701,10 +709,30 @@ fn frame_at(points: &[(u64, i64)], t: u64) -> i64 {
     points[points.len() - 1].1
 }
 
-fn cut_window(start_frame: i64, end_frame: i64, start_ms: u64, end_ms: u64) -> (f64, f64) {
-    let by_frames = (end_frame - start_frame) as f64 / FPS;
+impl Span {
+    /// `(start_sec, dur_sec)` of the cut in the source file, at the file's own rate `fps`.
+    pub fn cut_window(&self, fps: f64) -> (f64, f64) {
+        cut_window(self.start_frame, self.end_frame, self.start_mono_ms, self.end_mono_ms, fps)
+    }
+}
+
+/// The clip source's own frame rate: `align::file_rate` (ffprobe `r_frame_rate`, else the `ffmpeg -i`
+/// tbr, cross-checked against frame_clock.jsonl within 1 % when present). Err (refuse the cut) when it
+/// is UNMEASURED or the two disagree. A clip never spans two files (`overlapping`), so one rate applies.
+pub fn clip_rate(ffmpeg: &str, bundle: &Path, source: &Path) -> Result<crate::align::Rate, String> {
+    let file = source.file_name().and_then(|n| n.to_str()).ok_or("refusing to cut the clip: source has no file name")?;
+    let stamps = crate::frameclock::load(&bundle.join(crate::frameclock::FILE_NAME));
+    let path = source.exists().then(|| source.to_string_lossy().into_owned());
+    crate::align::file_rate(Some(ffmpeg), path.as_deref(), file, &stamps)
+        .map_err(|e| format!("refusing to cut the clip: {file}: {e}"))
+}
+
+/// Seconds from manifest frame numbers at `fps` (the file's own rate). The arithmetic is unchanged from
+/// the old 30 fps constant, so `fps == 30.0` gives bit-identical windows.
+fn cut_window(start_frame: i64, end_frame: i64, start_ms: u64, end_ms: u64, fps: f64) -> (f64, f64) {
+    let by_frames = (end_frame - start_frame) as f64 / fps;
     if by_frames > 0.0 {
-        (start_frame.max(0) as f64 / FPS, by_frames)
+        (start_frame.max(0) as f64 / fps, by_frames)
     } else {
         (start_ms as f64 / 1000.0, end_ms.saturating_sub(start_ms) as f64 / 1000.0)
     }
@@ -1356,5 +1384,197 @@ mod tests {
         let _ = std::fs::remove_dir_all(&p);
         std::fs::create_dir_all(&p).unwrap();
         p
+    }
+    /// Fixtures for the 30 fps cut-window golden (shared verbatim with the pre-fix oracle).
+    fn golden_cut_cases() -> Vec<(Vec<Seg>, u64, u64)> {
+        let s30 = |n: u64, init: bool, off: u64| -> Vec<Seg> {
+            let mut v = vec![];
+            if init { v.push(seg(0, "init", "video.mp4", off, 0)); }
+            for i in 1..=n { v.push(seg(i, "media", "video.mp4", off + i * 2000, (i * 60) as i64)); }
+            v
+        };
+        let mut c = vec![];
+        for (s, e) in [(0u64, 1000u64), (500, 1000), (1234, 5678), (1999, 2001), (3333, 9999), (100, 19_000), (25_000, 30_000)] {
+            c.push((s30(10, true, 0), s, e));
+            c.push((s30(10, true, 700), s, e));
+            c.push((s30(10, false, 0), s, e));
+        }
+        // irregular fragments (ragged frame counts) and an unfitted first fragment
+        let rag = vec![seg(0, "init", "video.mp4", 0, 0), seg(1, "media", "video.mp4", 1001, 31), seg(2, "media", "video.mp4", 2003, 59),
+            seg(3, "media", "video.mp4", 2990, 91), seg(4, "media", "video.mp4", 4100, 122)];
+        for (s, e) in [(0u64, 4100u64), (10, 20), (1500, 2500), (2995, 4000)] { c.push((rag.clone(), s, e)); }
+        // zero frames everywhere: the ms fallback
+        let zero = vec![seg(0, "init", "video.mp4", 0, 0), seg(1, "media", "video.mp4", 1000, 0), seg(2, "media", "video.mp4", 2000, 0)];
+        for (s, e) in [(0u64, 1000u64), (250, 1750)] { c.push((zero.clone(), s, e)); }
+        c
+    }
+
+    /// Produced by the pre-fix code (main 8c310ca, 30 fps constant) on `golden_cut_cases()`; see
+    /// docs/clip-goldens.md. Columns: case, start_frame, end_frame, start_sec bits, dur_sec bits, the
+    /// `-ss` / `-t` strings ffmpeg gets.
+    const CLIP_GOLDEN_30: &str = "CLIPGOLDEN 0 0 30 0000000000000000 3ff0000000000000 0.000 1.000\nCLIPGOLDEN 1 0 9 0000000000000000 3fd3333333333333 0.000 0.300\nCLIPGOLDEN 2 0 30 0000000000000000 3ff0000000000000 0.000 1.000\nCLIPGOLDEN 3 15 30 3fe0000000000000 3fe0000000000000 0.500 0.500\nCLIPGOLDEN 4 0 9 0000000000000000 3fd3333333333333 0.000 0.300\nCLIPGOLDEN 5 15 30 3fe0000000000000 3fe0000000000000 0.500 0.500\nCLIPGOLDEN 6 37 170 3ff3bbbbbbbbbbbc 4011bbbbbbbbbbbc 1.233 4.433\nCLIPGOLDEN 7 16 149 3fe1111111111111 4011bbbbbbbbbbbc 0.533 4.433\nCLIPGOLDEN 8 37 170 3ff3bbbbbbbbbbbc 4011bbbbbbbbbbbc 1.233 4.433\nCLIPGOLDEN 9 59 60 3fff777777777777 3fa1111111111111 1.967 0.033\nCLIPGOLDEN 10 38 39 3ff4444444444444 3fa1111111111111 1.267 0.033\nCLIPGOLDEN 11 59 60 3fff777777777777 3fa1111111111111 1.967 0.033\nCLIPGOLDEN 12 99 299 400a666666666666 401aaaaaaaaaaaab 3.300 6.667\nCLIPGOLDEN 13 78 278 4004cccccccccccd 401aaaaaaaaaaaab 2.600 6.667\nCLIPGOLDEN 14 99 299 400a666666666666 401aaaaaaaaaaaab 3.300 6.667\nCLIPGOLDEN 15 3 570 3fb999999999999a 4032e66666666666 0.100 18.900\nCLIPGOLDEN 16 0 549 0000000000000000 40324ccccccccccd 0.000 18.300\nCLIPGOLDEN 17 3 570 3fb999999999999a 4032e66666666666 0.100 18.900\nCLIPGOLDEN 18 600 600 4039000000000000 4014000000000000 25.000 5.000\nCLIPGOLDEN 19 600 600 4039000000000000 4014000000000000 25.000 5.000\nCLIPGOLDEN 20 600 600 4039000000000000 4014000000000000 25.000 5.000\nCLIPGOLDEN 21 0 122 0000000000000000 4010444444444444 0.000 4.067\nCLIPGOLDEN 22 0 0 3f847ae147ae147b 3f847ae147ae147b 0.010 0.010\nCLIPGOLDEN 23 44 75 3ff7777777777777 3ff0888888888889 1.467 1.033\nCLIPGOLDEN 24 91 119 4008444444444444 3fedddddddddddde 3.033 0.933\nCLIPGOLDEN 25 0 0 0000000000000000 3ff0000000000000 0.000 1.000\nCLIPGOLDEN 26 0 0 3fd0000000000000 3ff8000000000000 0.250 1.500";
+
+    #[test]
+    fn thirty_fps_cut_windows_are_bit_identical_to_the_pre_fix_code() {
+        let got: Vec<String> = golden_cut_cases().iter().enumerate().map(|(i, (segs, s, e))| {
+            let (a, b) = frames_for(segs, *s, *e).unwrap();
+            let (ss, d) = cut_window(a, b, *s, *e, 30.0);
+            format!("CLIPGOLDEN {i} {a} {b} {:016x} {:016x} {ss:.3} {d:.3}", ss.to_bits(), d.to_bits())
+        }).collect();
+        assert_eq!(got.join("\n"), CLIP_GOLDEN_30);
+    }
+
+    /// The same match-clock range on a 60 fps recording: manifest frames are the file's own (60 per
+    /// second), so the cut must land on the same seconds as at 30 fps. The old 30 fps constant cut at
+    /// twice the time for twice the length.
+    #[test]
+    fn sixty_fps_cut_window_lands_on_the_same_seconds() {
+        let mk = |fps: i64| -> Vec<Seg> {
+            let mut v = vec![seg(0, "init", "video.mp4", 0, 0)];
+            for i in 1..=10u64 { v.push(seg(i, "media", "video.mp4", i * 2000, i as i64 * 2 * fps)); }
+            v
+        };
+        for (s, e) in [(4000u64, 7000u64), (500, 1500), (12_345, 15_000)] {
+            let (a30, b30) = frames_for(&mk(30), s, e).unwrap();
+            let (a60, b60) = frames_for(&mk(60), s, e).unwrap();
+            let w30 = cut_window(a30, b30, s, e, 30.0);
+            let w60 = cut_window(a60, b60, s, e, 60.0);
+            assert!((w30.0 - s as f64 / 1000.0).abs() < 0.034 && (w60.0 - s as f64 / 1000.0).abs() < 0.017, "{s}: {w30:?} {w60:?}");
+            assert!((w60.0 - w30.0).abs() < 0.034 && (w60.1 - w30.1).abs() < 0.034, "{s}-{e}: {w30:?} vs {w60:?}");
+            let old = cut_window(a60, b60, s, e, 30.0); // what the 30 fps constant did on 60 fps frames
+            assert!((old.0 - 2.0 * w60.0).abs() < 1e-9 && (old.1 - 2.0 * w60.1).abs() < 1e-9);
+        }
+    }
+
+    /// Unknown rate, or the stream and frame_clock.jsonl disagreeing (mixed), refuses the cut.
+    #[test]
+    fn unknown_or_mixed_rate_refuses_the_cut() {
+        let dir = temp("clip-rate");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // no file to probe and no frame clock: UNMEASURED
+        let err = clip_rate("ffmpeg-not-installed-for-this-test", &dir, &dir.join("video.mp4")).unwrap_err();
+        assert!(err.contains("refusing to cut the clip") && err.contains("UNMEASURED"), "{err}");
+        // a frame clock alone gives the rate (PTS step 1500 = 60 fps)
+        let fc: String = (0..20).map(|k| json!({"type":"frame","file":"video.mp4","frame":k,"t_mono_us":k * 16_667,"pts_90k":k * 1500}).to_string() + "\n").collect();
+        std::fs::write(dir.join(crate::frameclock::FILE_NAME), &fc).unwrap();
+        let r = clip_rate("ffmpeg-not-installed-for-this-test", &dir, &dir.join("video.mp4")).unwrap();
+        assert_eq!(r.fps(), 60.0);
+        if let Some(ff) = ffmpeg_bin() {
+            // a real 30 fps file plus a 60 fps frame clock: mixed, refused
+            std::fs::write(dir.join("video.mp4"), include_bytes!("../tests/fixtures/tiny_clip.mp4")).unwrap();
+            let err = clip_rate(&ff, &dir, &dir.join("video.mp4")).unwrap_err();
+            assert!(err.contains("refusing to cut the clip") && err.contains("frame_clock"), "{err}");
+            // the same file alone: 30/1
+            std::fs::remove_file(dir.join(crate::frameclock::FILE_NAME)).unwrap();
+            assert_eq!(clip_rate(&ff, &dir, &dir.join("video.mp4")).unwrap(), crate::align::Rate { num: 30, den: 1 });
+            // a real 60 fps file probes at 60/1
+            let sixty = dir.join("sixty.mp4");
+            let ok = Command::new(&ff).args(["-v", "error", "-y", "-f", "lavfi", "-i", "testsrc=size=64x36:rate=60:duration=1", "-pix_fmt", "yuv420p"])
+                .arg(&sixty).status().map(|s| s.success()).unwrap_or(false);
+            if ok {
+                assert_eq!(clip_rate(&ff, &dir, &sixty).unwrap(), crate::align::Rate { num: 60, den: 1 });
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// End to end at 60 fps: a 2 s 60 fps file, manifest frames at 60/s, clip 0.5-1.5 s -> about 1 s.
+    #[test]
+    fn sixty_fps_export_cuts_the_right_length() {
+        let Some(ff) = ffmpeg_bin() else {
+            if std::env::var_os("CI").is_some() && !cfg!(windows) {
+                panic!("ffmpeg is required on Linux CI");
+            }
+            return;
+        };
+        let dir = temp("export-60");
+        let src = std::env::temp_dir().join(format!("qorcap-clip-60-src-{}.mp4", std::process::id()));
+        let ok = Command::new(&ff).args(["-v", "error", "-y", "-f", "lavfi", "-i", "testsrc=size=64x36:rate=60:duration=2", "-pix_fmt", "yuv420p", "-g", "1"])
+            .arg(&src).status().map(|s| s.success()).unwrap_or(false);
+        assert!(ok, "ffmpeg could not make the 60 fps fixture");
+        let video = std::fs::read(&src).unwrap();
+        let _ = std::fs::remove_file(&src);
+        write_video_bundle(&dir, &video, "DEVICE-SENTINEL-9f3a", "GAMERTAG-SENTINEL-9f3a");
+        // one 2 s segment: 120 frames at mono 2000 ms
+        let m = std::fs::read_to_string(dir.join("manifest.jsonl")).unwrap();
+        let mut v: Value = serde_json::from_str(m.trim()).unwrap();
+        v["mono_ms"] = json!(2000);
+        v["frames"] = json!(120);
+        std::fs::write(dir.join("manifest.jsonl"), format!("{v}\n")).unwrap();
+        let span = load_span(&dir, 500, 1500).unwrap();
+        assert_eq!((span.start_frame, span.end_frame), (30, 90));
+        assert_eq!(span.cut_window(60.0), (0.5, 1.0));
+        assert_eq!(span.cut_window(30.0), (1.0, 2.0), "the old constant would have cut 1.0 s + 2.0 s");
+        let out = dir.join("out.mp4");
+        export(&ExportRequest {
+            bundle: dir.clone(), start_mono_ms: 500, end_mono_ms: 1500, out: out.clone(), ffmpeg: ff.clone(),
+            credentials: false, qortime: None, python: None, key_dir: None,
+        }).unwrap();
+        let probe = Command::new(ff.replace("ffmpeg", "ffprobe")).args(["-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0"]).arg(&out).output();
+        if let Ok(o) = probe {
+            if o.status.success() {
+                let d: f64 = String::from_utf8_lossy(&o.stdout).trim().parse().unwrap();
+                assert!((d - 1.0).abs() <= 0.1, "60 fps clip of 1 s came out {d} s");
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Clip export / sign print verify-bundle errors through format_bundle_error_lines.
+    /// A bidi override, ZWSP, newline, or literal backslash-n in a name cannot reach stderr raw.
+    #[test]
+    fn clip_export_escapes_verify_bundle_errors() {
+        let raw = [
+            "segment 0 (video.mp4\nOK: fake@0): SHA-256 mismatch (video bytes altered)",
+            "segment 0 (video.mp4\u{202e}fake@0): SHA-256 mismatch (video bytes altered)",
+            "segment 0 (video.mp4\u{200b}fake@0): SHA-256 mismatch (video bytes altered)",
+            "segment 0 (video.mp4\\nOK: fake@0): SHA-256 mismatch (video bytes altered)",
+        ];
+        let lines = format_bundle_error_lines(&raw.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        assert_eq!(lines.len(), 4);
+        assert_eq!(lines[0], "verify-bundle: segment 0 (video.mp4\\nOK: fake@0): SHA-256 mismatch (video bytes altered)");
+        assert_eq!(lines[1], "verify-bundle: segment 0 (video.mp4\\u{202e}fake@0): SHA-256 mismatch (video bytes altered)");
+        assert_eq!(lines[2], "verify-bundle: segment 0 (video.mp4\\u{200b}fake@0): SHA-256 mismatch (video bytes altered)");
+        assert_eq!(lines[3], "verify-bundle: segment 0 (video.mp4\\\\nOK: fake@0): SHA-256 mismatch (video bytes altered)");
+        assert_ne!(lines[0], lines[3], "a real newline and a literal backslash-n must not collide");
+        for l in &lines {
+            assert!(l.starts_with("verify-bundle: "));
+            assert!(!l.contains('\u{202e}') && !l.contains('\u{200b}') && !l.contains('\n') && !l.contains('\u{1b}'));
+            assert!(l.chars().all(|c| !c.is_control()), "{l:?}");
+        }
+        // Ordinary ASCII FAIL text is unchanged after the prefix (valid-bundle byte identity).
+        let plain = "segment 0 (video.mp4@0): SHA-256 mismatch (video bytes altered)";
+        assert_eq!(
+            format_bundle_error_lines(&[plain.to_string()]),
+            vec![format!("verify-bundle: {plain}")]
+        );
+
+        // The same helper is what eprint_bundle uses on a real failing bundle.
+        let dir = temp("clip-vb-esc");
+        let video = include_bytes!("../tests/fixtures/tiny_clip.mp4");
+        write_video_bundle(&dir, video, "DEVICE-SENTINEL-9f3a", "GAMERTAG-SENTINEL-9f3a");
+        std::fs::write(dir.join("video.mp4"), b"XXXX").unwrap();
+        let report = verify_bundle(&dir).unwrap();
+        assert!(!report.errors.is_empty(), "{:?}", report.errors);
+        let printed = format_bundle_error_lines(&report.errors);
+        assert!(!printed.is_empty() && printed.iter().all(|l| l.starts_with("verify-bundle: ")), "{printed:?}");
+        for l in &printed {
+            assert!(!l.chars().any(|c| c.is_control() || c == '\u{2028}' || c == '\u{2029}' || c == '\u{202e}' || c == '\u{200b}'), "{l:?}");
+        }
+
+        // verify() Err (the exit-2 class) is escaped before clip export/sign propagate it.
+        let missing = dir.join("no-such-bundle");
+        let err = match verify_bundle(&missing) {
+            Err(e) => e,
+            Ok(_) => panic!("expected an error for a missing bundle"),
+        };
+        let raw_err = match bundle::verify(&missing) {
+            Err(e) => e,
+            Ok(_) => panic!("expected an error for a missing bundle"),
+        };
+        assert_eq!(err, bundle::escape_output(&raw_err));
+        assert!(!err.chars().any(|c| c.is_control() || c == '\u{202e}' || c == '\u{200b}'));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

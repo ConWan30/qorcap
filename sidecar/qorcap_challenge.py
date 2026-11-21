@@ -249,7 +249,7 @@ def pad_connected_through(records: list, *, issued_ms: int, deadline_ms: int, an
     so the check runs 2.5 s past the deadline. A status row whose ``t_us`` is not an
     integer, or whose ``state`` is not a string, fails closed even outside that span.
     Times are the same wall clock as ``press_events`` (header ``wall_anchor_ms`` plus
-    ``t_us``).
+    ``t_us // 1000``).
     """
     events: list[tuple[int, str]] = []
     for r in records:
@@ -280,7 +280,7 @@ def chunks_cover(records: list, *, issued_ms: int, deadline_ms: int, anchor_ms: 
     through a chunk at or after ``deadline_ms``. A last chunk before the deadline does not
     cover, even when the deadline is within that bound. The step from the opening chunk
     already requires ``issued_ms - prev`` to be inside the bound, so that gap is not checked
-    on its own. Times are header ``wall_anchor_ms`` plus ``t_us``.
+    on its own. Times are header ``wall_anchor_ms`` plus ``t_us // 1000``.
     """
     times = sorted({
         anchor_ms + r["t_us"] // 1000

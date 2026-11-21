@@ -1,0 +1,4 @@
+{"type": "header", "schema": "qorcap-inputs/v0", "t_us": 0, "transport": "usb-hid", "clock": "synthetic", "synthetic": "injected test values, not a player measurement", "seg": 0}
+{"type": "status", "t_us": 10, "state": "connected", "detail": "synthetic", "seg": 0}
+{"type": "status", "t_us": 20, "state": "missing", "detail": "synthetic", "seg": 0}
+{"type": "chunk", "seq": 0, "seg": 0, "n": 3, "sha256": "f5957108b4b2583b5196e55347b1e1876920e2e025255232bd22800c93dc32ec", "prev": "0000000000000000000000000000000000000000000000000000000000000000", "head": "1111111111111111111111111111111111111111111111111111111111111111", "t_us": 0}

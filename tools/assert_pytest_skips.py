@@ -64,15 +64,20 @@ WINDOWS_SKIP_REASONS = {
 LINUX_FILES = (
     "sidecar/test_pairing.py",
     "sidecar/test_qorcap_highlights.py",
+    "sidecar/test_highlights_overlay_colors.py",
     "sidecar/test_auto_highlights.py",
+    "sidecar/test_highlights_frame_rate.py",
     "sidecar/test_final_screen_pause.py",
     "sidecar/test_post_final_tail.py",
     "sidecar/test_start_match_glimpse.py",
+    "sidecar/test_start_match_frame_clock.py",
     "sidecar/test_qorcap_ai_loop.py",
     "sidecar/test_qorcap_console.py",
     "sidecar/test_qorcap_release.py",
     "tools/test_frame_clock_ab.py",
+    "tools/test_encoder_pace.py",
     "tools/test_assert_pytest_skips.py",
+    "tools/pwec2/test_pwec2.py",
     "sidecar/test_qorcap_reader.py",
     "sidecar/test_c11_snapshot_inputs_timeout.py",
     "sidecar/test_qorcap_match.py::test_refresh_off_the_frame_thread_keeps_four_hertz",
@@ -93,6 +98,11 @@ LINUX_FILES = (
     "sidecar/test_qorcap_match.py::test_hung_on_frame_is_noticed_from_the_status_loop",
     "sidecar/test_qorcap_match.py::test_hung_refresh_shows_refresh_age_ms",
     "sidecar/test_qorcap_match.py::test_reader_timing_log_names_the_three_clocks",
+    "sidecar/test_qorcap_match.py::test_late_sign_with_live_countersignatures_adds_a_signed_note_and_json",
+    "sidecar/test_qorcap_match.py::test_late_sign_with_offline_countersignatures_names_the_recording_clock",
+    "sidecar/test_qorcap_match.py::test_late_sign_note_is_covered_by_both_signatures",
+    "sidecar/test_qorcap_match.py::test_not_late_leaves_the_draft_unchanged_and_writes_nothing",
+    "sidecar/test_qorcap_match.py::test_live_save_tail_never_adds_the_late_sign_note",
     "sidecar/test_qorcap_standard.py",
     "sidecar/test_qorcap_score_grammar.py",
     "sidecar/test_qorcap_hl170123.py",
@@ -101,6 +111,16 @@ LINUX_FILES = (
     "sidecar/test_qorcap_snp.py",
     "sidecar/test_qorcap_mnp.py",
     "sidecar/test_qorcap_endmenu.py",
+    "sidecar/test_qorcap_games.py",
+    "sidecar/test_qorcap_cod_no_side.py",
+    "sidecar/test_qorcap_cod_agreement.py",
+    "sidecar/test_qorcap_cod_killfeed.py",
+    "sidecar/test_qorcap_cod_calib.py",
+    "sidecar/test_qorcap_cod_endstop.py",
+    "sidecar/test_qorcap_cod_rowdigits.py",
+    "sidecar/test_qorcap_void_201029.py",
+    "sidecar/test_qordata_fixtures.py",
+    "sidecar/test_qordata_product.py",
     "sidecar/test_qorcap_touchdown.py",
     "sidecar/test_qorcap_td_glimpse.py",
     "sidecar/test_qorcap_playcall.py",
@@ -113,18 +133,29 @@ LINUX_FILES = (
     "sidecar/test_qorcap_glimpse_watch.py",
     "sidecar/test_qorcap_glimpse_witness.py",
     "sidecar/test_qorcap_submit.py",
+    "sidecar/test_qorcap_rlr_stage_a.py",
+    "sidecar/test_qorcap_engagement.py",
+    "sidecar/test_qorcap_practice_challenge.py",
+    "tools/s2s_bodycue/test_bodycue_core.py",
+    "tools/s2s_bodycue/test_fusion_core.py",
+    "tools/s2s_bodycue/test_pins.py",
 )
 WINDOWS_FILES = (
     "sidecar/test_pairing.py",
+    "sidecar/test_highlights_overlay_colors.py",
     "sidecar/test_auto_highlights.py",
+    "sidecar/test_highlights_frame_rate.py",
     "sidecar/test_final_screen_pause.py",
     "sidecar/test_post_final_tail.py",
     "sidecar/test_start_match_glimpse.py",
+    "sidecar/test_start_match_frame_clock.py",
     "sidecar/test_qorcap_ai_loop.py",
     "sidecar/test_qorcap_console.py",
     "sidecar/test_qorcap_release.py",
     "tools/test_frame_clock_ab.py",
+    "tools/test_encoder_pace.py",
     "tools/test_assert_pytest_skips.py",
+    "tools/pwec2/test_pwec2.py",
     "sidecar/test_qorcap_reader.py",
     "sidecar/test_c11_snapshot_inputs_timeout.py",
     "sidecar/test_qorcap_match.py::test_refresh_off_the_frame_thread_keeps_four_hertz",
@@ -145,12 +176,27 @@ WINDOWS_FILES = (
     "sidecar/test_qorcap_match.py::test_hung_on_frame_is_noticed_from_the_status_loop",
     "sidecar/test_qorcap_match.py::test_hung_refresh_shows_refresh_age_ms",
     "sidecar/test_qorcap_match.py::test_reader_timing_log_names_the_three_clocks",
+    "sidecar/test_qorcap_match.py::test_late_sign_with_live_countersignatures_adds_a_signed_note_and_json",
+    "sidecar/test_qorcap_match.py::test_late_sign_with_offline_countersignatures_names_the_recording_clock",
+    "sidecar/test_qorcap_match.py::test_late_sign_note_is_covered_by_both_signatures",
+    "sidecar/test_qorcap_match.py::test_not_late_leaves_the_draft_unchanged_and_writes_nothing",
+    "sidecar/test_qorcap_match.py::test_live_save_tail_never_adds_the_late_sign_note",
     "sidecar/test_qorcap_standard.py",
     "sidecar/test_qorcap_score_grammar.py",
     "sidecar/test_qorcap_tnp.py",
     "sidecar/test_qorcap_snp.py",
     "sidecar/test_qorcap_mnp.py",
     "sidecar/test_qorcap_endmenu.py",
+    "sidecar/test_qorcap_games.py",
+    "sidecar/test_qorcap_cod_no_side.py",
+    "sidecar/test_qorcap_cod_agreement.py",
+    "sidecar/test_qorcap_cod_killfeed.py",
+    "sidecar/test_qorcap_cod_calib.py",
+    "sidecar/test_qorcap_cod_endstop.py",
+    "sidecar/test_qorcap_cod_rowdigits.py",
+    "sidecar/test_qorcap_void_201029.py",
+    "sidecar/test_qordata_fixtures.py",
+    "sidecar/test_qordata_product.py",
     "sidecar/test_qorcap_touchdown.py",
     "sidecar/test_qorcap_td_glimpse.py",
     "sidecar/test_qorcap_playcall.py",
@@ -162,23 +208,37 @@ WINDOWS_FILES = (
     "sidecar/test_qorcap_glimpse_watch.py",
     "sidecar/test_qorcap_glimpse_witness.py",
     "sidecar/test_qorcap_submit.py",
+    "sidecar/test_qorcap_rlr_stage_a.py",
+    "sidecar/test_qorcap_engagement.py",
+    "sidecar/test_qorcap_practice_challenge.py",
+    "tools/s2s_bodycue/test_bodycue_core.py",
+    "tools/s2s_bodycue/test_fusion_core.py",
+    "tools/s2s_bodycue/test_pins.py",
 )
 # pytest --collect-only -q of each --list with QORTIME importable. Pin the same
 # numbers in tools/test_assert_pytest_skips.py. See README "Sidecar CI suite list".
 # The floor is a minimum. A PR that adds tests, and any merge resolution, must
 # re-collect and set both floors to those exact counts. Leaving the old floor
 # keeps a dropped test green.
-# Re-collected after rebasing onto main e00d374, QORTIME pin 0204e6d.
-# Linux includes sidecar/test_qorcap_challenge.py (638). Windows does not run
-# that file, so its count stays 578. #96's suite, before the guard tests,
-# collected 580 linux / 562 windows. Re-collect after any list or test change.
-LINUX_MIN_COLLECTED = 638
-WINDOWS_MIN_COLLECTED = 578
+# Re-collected after the #97 revival onto main 6ff3d64.
+# pytest --collect-only -q of sidecar/test_qorcap_challenge.py, QORTIME at
+# qortime #80 4dd61a9 (pin 0204e6d8082f8c40ea1fe5e09bf16402aaee3ff2 remains the
+# runtime verifier pin): this file went from 7 collected tests on main to 49
+# (+42). Windows does not run this file, so only the Linux floor rises.
+# Previous floors on main were 1306 / 1287.
+LINUX_MIN_COLLECTED = 1348
+WINDOWS_MIN_COLLECTED = 1287
 
 # Absent from both sidecar suites. A reason is required; whitespace does not count.
 EXCLUDED_TEST_FILES = {
     "sidecar/test_contracts.py": (
         "the contracts job runs this against unpinned qortime main, not the sidecar suite"
+    ),
+    "sidecar/test_qorcap_cod_endstop_box.py": (
+        "build-box-only sampled CoD frames that show other players' gamertags; not committed, run locally"
+    ),
+    "tools/s2s_bodycue/test_bodycue_runtime.py": (
+        "needs optional onnxruntime/openvino/matplotlib and local model files that are never committed; run locally"
     ),
 }
 

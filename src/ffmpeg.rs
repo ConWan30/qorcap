@@ -28,6 +28,64 @@ pub fn command(ffmpeg: &str) -> Command {
     c
 }
 
+/// Windows ABOVE_NORMAL_PRIORITY_CLASS. The capture ffmpeg reads the card's real-time buffers; on a
+/// loaded PC (practice match-20261111-183311: 97% CPU) it fell behind and dshow dropped frames.
+pub const ABOVE_NORMAL_PRIORITY_CLASS: u32 = 0x0000_8000;
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+/// The capture process command: `command` plus AboveNormal priority on Windows (no-op elsewhere).
+/// The arguments, and so the recording, are the same as with `command`.
+pub fn capture_command(ffmpeg: &str) -> Command {
+    #[allow(unused_mut)]
+    let mut c = Command::new(ffmpeg);
+    #[cfg(windows)]
+    { use std::os::windows::process::CommandExt; c.creation_flags(CREATE_NO_WINDOW | ABOVE_NORMAL_PRIORITY_CLASS); }
+    #[cfg(not(windows))]
+    { let _ = (CREATE_NO_WINDOW, ABOVE_NORMAL_PRIORITY_CLASS); }
+    c
+}
+
+/// One argument as it goes into qorcap.log. Capture arguments carry no secrets today; this keeps
+/// it that way if one is ever added: a `key=` / `token=` / `secret=` / `password=` value, a
+/// `scheme://user:pass@` login, a URL query string, and token-shaped words are replaced by `<redacted>`.
+pub fn redact_arg(a: &str) -> String {
+    let mut out = a.to_string();
+    // scheme://user:pass@host -> scheme://<redacted>@host
+    if let Some(i) = out.find("://") {
+        let rest = &out[i + 3..];
+        let end = rest.find('/').unwrap_or(rest.len());
+        if let Some(at) = rest[..end].rfind('@') {
+            out = format!("{}<redacted>{}", &out[..i + 3], &rest[at..]);
+        }
+        if let Some(q) = out.find('?') { out = format!("{}?<redacted>", &out[..q]); }
+    }
+    let lower = out.to_ascii_lowercase();
+    for k in ["key=", "token=", "secret=", "password=", "passwd=", "auth="] {
+        if let Some(i) = lower.find(k) {
+            let v0 = i + k.len();
+            let v1 = out[v0..].find(|c: char| c == ':' || c == '&' || c == ' ' || c == ',').map(|n| v0 + n).unwrap_or(out.len());
+            if v1 > v0 { out = format!("{}<redacted>{}", &out[..v0], &out[v1..]); }
+            break;
+        }
+    }
+    for p in ["ghp_", "gho_", "ghu_", "ghs_", "ghr_", "github_pat_", "sk_live_", "sk_test_"] {
+        while let Some(i) = out.find(p) {
+            let tail = &out[i..];
+            let n = tail.find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '-')).unwrap_or(tail.len());
+            out = format!("{}<redacted>{}", &out[..i], &tail[n..]);
+        }
+    }
+    out
+}
+
+/// The full ffmpeg command line for qorcap.log: program and every argument, in order, each one
+/// redacted (see `redact_arg`) and double-quoted when it has a space or is empty.
+pub fn argv_for_log(program: &str, args: &[String]) -> String {
+    std::iter::once(program.to_string()).chain(args.iter().cloned())
+        .map(|a| { let r = redact_arg(&a); if r.is_empty() || r.contains(' ') { format!("\"{r}\"") } else { r } })
+        .collect::<Vec<_>>().join(" ")
+}
+
 /// Parse `ffmpeg -list_devices true -f dshow -i dummy` stderr (old and new formats).
 pub fn parse_dshow_list(s: &str) -> Vec<Device> {
     let mut out: Vec<Device> = Vec::new();
@@ -173,6 +231,9 @@ pub enum Failure { AudioOpen, VideoNotFound, FormatUnsupported, Busy, Snapshot, 
 pub fn classify_failure(tail: &str) -> Failure {
     let t = tail.to_lowercase();
     // Snapshot/image2 path gone (TEMP cleared) — must not burn reopen budget when video is fine.
+    if t.contains("failed to rename") || t.contains("error renaming") || (t.contains("atomic") && t.contains("rename")) {
+        return Failure::Snapshot;
+    }
     if (t.contains("snapshot") || t.contains("image2") || t.contains(".jpg"))
         && (t.contains("no such file") || t.contains("error opening output") || t.contains("permission denied") || t.contains("failed to open"))
     {
@@ -230,6 +291,9 @@ pub fn capture_args(a: &RecordArgs, input_format: &str, audio: Option<&str>, sna
     capture_args_with(a, input_format, spec.as_ref(), snapshot, stamp_file)
 }
 
+/// Real-time buffer for the separate dshow audio input (video keeps 512M).
+pub const AUDIO_RTBUFSIZE: &str = "64M";
+
 pub fn capture_args_with(a: &RecordArgs, input_format: &str, audio: Option<&AudioSpec>, snapshot: &str, stamp_file: Option<&str>) -> Vec<String> {
     let (w, h) = a.res;
     let fps = a.fps.to_string();
@@ -257,7 +321,10 @@ pub fn capture_args_with(a: &RecordArgs, input_format: &str, audio: Option<&Audi
             }
             Some(au) => {
                 push(&mut v, &["-i", &format!("video={}", a.device)]);
-                push(&mut v, &["-f", "dshow", "-thread_queue_size", "1024", "-use_wallclock_as_timestamps", "1"]);
+                // The audio input gets its own real-time buffer. Without it dshow used its ~3 MB default
+                // (3041280 bytes) and dropped ~2,850 audio frames in practice match-20261111-183311.
+                // -rtbufsize is per input, so it must come before this input's -i.
+                push(&mut v, &["-f", "dshow", "-rtbufsize", AUDIO_RTBUFSIZE, "-thread_queue_size", "1024", "-use_wallclock_as_timestamps", "1"]);
                 let name = match (au.strategy, &au.alt) {
                     (AudioStrategy::SeparateAlt, Some(alt)) => alt.clone(),
                     _ => { push(&mut v, &["-audio_buffer_size", "50"]); au.name.clone() }
@@ -286,8 +353,9 @@ pub fn capture_args_with(a: &RecordArgs, input_format: &str, audio: Option<&Audi
     push(&mut v, &["-b:v", &a.bitrate, "-maxrate", &a.bitrate, "-bufsize", &a.bitrate, "-g", &fps, "-bf", "0"]);
     if has_audio { push(&mut v, &["-c:a", "aac", "-b:a", "160k", "-ar", "48000", "-af", "aresample=async=1000:first_pts=0"]); }
     push(&mut v, &["-f", "mpegts", "-mpegts_flags", "+resend_headers", "-pat_period", "0.2", "-muxdelay", "0", "pipe:1"]);
-    // Snapshot output (4 fps, atomic rewrite so readers never see a partial JPEG)
-    push(&mut v, &["-map", "0:v", "-vf", "fps=4", "-q:v", "3", "-f", "image2", "-update", "1", "-atomic_writing", "1", "-y", snapshot]);
+    // Snapshot output (4 fps). No atomic rename: Windows fails that rename when the reader
+    // has snapshot.jpg open. QorCap publishes a complete JPEG itself (see snap.rs).
+    push(&mut v, &["-map", "0:v", "-vf", "fps=4", "-q:v", "3", "-f", "image2", "-update", "1", "-y", snapshot]);
     v
 }
 
@@ -373,6 +441,72 @@ dummy: Immediate exit requested"#;
         assert!(alt.contains("-i audio=@device_cm_X") && !alt.contains("-audio_buffer_size") && alt.contains("-map 1:a"), "{alt}");
     }
     #[test]
+    fn audio_input_gets_its_own_rtbufsize_and_the_output_is_unchanged() {
+        use clap::Parser;
+        let c = crate::cli::Cli::try_parse_from(["q", "record", "--fps", "60"]).unwrap();
+        let crate::cli::Cmd::Record(r) = c.cmd else { panic!() };
+        for strat in [AudioStrategy::Separate, AudioStrategy::SeparateAlt] {
+            let spec = AudioSpec { name: "Elgato Game Capture Neo".into(), alt: Some("@device_cm_X".into()), strategy: strat };
+            let a = capture_args_with(&r, "auto", Some(&spec), "snap.jpg", None);
+            let j = a.join(" ");
+            let vi = j.find("-i video=").unwrap();
+            let ai = j.find("-i audio=").unwrap();
+            // Per-input options sit between the previous -i and this input's -i.
+            let video_opts = &j[..vi];
+            let audio_opts = &j[vi..ai];
+            assert!(video_opts.contains("-f dshow -rtbufsize 512M -thread_queue_size 1024"), "{j}");
+            assert!(audio_opts.contains(&format!("-f dshow -rtbufsize {AUDIO_RTBUFSIZE} -thread_queue_size 1024")), "{j}");
+            assert_eq!(j.matches("-rtbufsize").count(), 2, "{j}");
+            assert_eq!(j.matches("-thread_queue_size 1024").count(), 2, "{j}");
+            // Everything after the inputs (filters, encoder, -g/-bf, bitrate, muxer) is what it was.
+            let out = &j[j.find("-map 0:v").unwrap()..];
+            assert_eq!(out, "-map 0:v -map 1:a -vf fps=60,format=nv12 -fps_mode cfr -r 60 -c:v h264_mf -hw_encoding 1 -rate_control cbr \
+-scenario live_streaming -b:v 8M -maxrate 8M -bufsize 8M -g 60 -bf 0 -c:a aac -b:a 160k -ar 48000 -af aresample=async=1000:first_pts=0 \
+-f mpegts -mpegts_flags +resend_headers -pat_period 0.2 -muxdelay 0 pipe:1 -map 0:v -vf fps=4 -q:v 3 -f image2 -update 1 -y snap.jpg");
+        }
+        // Combined (one dshow graph) keeps the single 512M buffer.
+        let spec = AudioSpec { name: "A".into(), alt: None, strategy: AudioStrategy::Combined };
+        assert_eq!(capture_args_with(&r, "auto", Some(&spec), "s.jpg", None).join(" ").matches("-rtbufsize").count(), 1);
+    }
+    #[test]
+    fn capture_argv_log_has_every_audio_input_argument_in_order() {
+        use clap::Parser;
+        let c = crate::cli::Cli::try_parse_from(["q", "record", "--fps", "60"]).unwrap();
+        let crate::cli::Cmd::Record(mut r) = c.cmd else { panic!() };
+        r.device = "Elgato Game Capture Neo".into();
+        let name = "Elgato Game Capture Neo (Elgato Game Capture Neo)";
+        let spec = AudioSpec { name: name.into(), alt: None, strategy: AudioStrategy::Separate };
+        let a = capture_args_with(&r, "nv12", Some(&spec), "C:\\Q P\\snap.jpg", None);
+        let line = argv_for_log("C:\\QorCap\\ffmpeg.exe", &a);
+        // Video input, then the audio input with its own options before its -i, then the maps.
+        let want = "-f dshow -rtbufsize 512M -thread_queue_size 1024 -use_wallclock_as_timestamps 1 -video_size 1280x720 -framerate 60 \
+-pixel_format nv12 -i \"video=Elgato Game Capture Neo\" \
+-f dshow -rtbufsize 64M -thread_queue_size 1024 -use_wallclock_as_timestamps 1 -audio_buffer_size 50 \
+-i \"audio=Elgato Game Capture Neo (Elgato Game Capture Neo)\" -map 0:v -map 1:a ";
+        assert!(line.starts_with("C:\\QorCap\\ffmpeg.exe -hide_banner "), "{line}");
+        assert!(line.contains(want), "{line}");
+        assert!(line.ends_with("-y \"C:\\Q P\\snap.jpg\""), "{line}");
+        // Exactly one audio input, and it is input #1 (what -map 1:a and audio_check read).
+        assert_eq!(line.matches("-i \"audio=").count(), 1, "{line}");
+        assert_eq!(a.iter().filter(|x| x.as_str() == "-i").count(), 2);
+    }
+    #[test]
+    fn argv_log_redacts_secrets() {
+        assert_eq!(redact_arg("-map"), "-map");
+        assert_eq!(redact_arg("audio=Elgato Game Capture Neo (Elgato Game Capture Neo)"), "audio=Elgato Game Capture Neo (Elgato Game Capture Neo)");
+        assert_eq!(redact_arg("rtmp://live.example/app/stream?key=abc123"), "rtmp://live.example/app/stream?<redacted>");
+        assert_eq!(redact_arg("srt://user:hunter2@host:9000"), "srt://<redacted>@host:9000");
+        assert_eq!(redact_arg("drawtext=token=abc:x=1"), "drawtext=token=<redacted>:x=1");
+        assert_eq!(redact_arg("x ghp_ABCdef123456 y"), "x <redacted> y");
+        let line = argv_for_log("ffmpeg", &["-i".into(), "udp://127.0.0.1:1937?pkt_size=1316".into(), "".into()]);
+        assert_eq!(line, "ffmpeg -i udp://127.0.0.1:1937?<redacted> \"\"");
+    }
+    #[test]
+    fn capture_command_runs_the_same_program() {
+        assert_eq!(capture_command("ffmpeg-x").get_program(), command("ffmpeg-x").get_program());
+        assert_eq!(ABOVE_NORMAL_PRIORITY_CLASS, 0x8000);
+    }
+    #[test]
     fn args_shape() {
         use clap::Parser;
         let c = crate::cli::Cli::try_parse_from(["q", "record", "--fps", "60"]).unwrap();
@@ -391,6 +525,7 @@ dummy: Immediate exit requested"#;
         assert!(a.contains("-g 60"));
         assert!(a.contains(r"drawtext=textfile='C\:/t/s.txt':reload=1"), "{a}");
         assert!(a.contains("-f mpegts"));
+        assert!(!a.contains("atomic_writing"), "snapshot rename stays in QorCap, not ffmpeg: {a}");
         assert!(frag_mp4_args().join(" ").contains("+frag_keyframe+empty_moov"));
     }
 
@@ -425,6 +560,7 @@ video=USB3.0 Video: Immediate exit requested"#;
         assert_eq!(classify_failure("The device is busy"), Failure::Busy);
         assert_eq!(classify_failure("Could not run graph (sometimes caused by a device already in use by other application)"), Failure::Other);
         assert_eq!(classify_failure("Could not find video device with name [X] among source devices of type video."), Failure::VideoNotFound);
+        assert_eq!(classify_failure("Failed to rename 'snapshot.jpg.tmp' to 'snapshot.jpg'"), Failure::Snapshot);
         assert_eq!(classify_failure("Could not open file : C:\\Users\\x\\AppData\\Local\\Temp\\qorcap-1\\snapshot.jpg: No such file or directory"), Failure::Snapshot);
         assert_eq!(classify_failure("Error opening output file snapshot.jpg."), Failure::Snapshot);
         assert!(failure_hint(Failure::Busy, true).contains("Close OBS. It's using the capture card"));

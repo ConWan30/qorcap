@@ -113,7 +113,12 @@ def side_glyphs(img, side: str) -> list[np.ndarray]:
         out.append((x, (lab[y:y + h, x:x + w] == i).astype(np.uint8) * 255, False))
     clean = [g for _, g, _ in out if g is not None]
     if len(clean) >= 2:
-        out = [t for t in out if not t[2]]
+        # Two interior digit glyphs already exist. Drop every clipped/None placeholder and
+        # non-digit edge blob (online FINISH GAME logo fringe next to home "13" on
+        # match-20261026-205511 kept a clipped w=11 as None and failed home_glyph_count).
+        # Fail closed: fewer than 2 clean glyphs still stays unreadable so a covered
+        # online score cannot be guessed from one partial digit.
+        out = [t for t in out if t[1] is not None]
     return [g for _, g, _ in sorted(out, key=lambda t: t[0])]
 
 
