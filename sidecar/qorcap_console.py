@@ -4,8 +4,12 @@ The capture agent, the HID reader, the referee protocol, and the receipt are unt
 This module paints the interactive console. It never writes a controller report, never
 writes a receipt, and never decides a referee result.
 
-Gold is drawn only when a caller sets ``referee_verified`` on a card. The live match
-path never sets it. Local button observation is labeled as a pad read. The words
+Gold is drawn only on a referee VERIFIED match banner (``tint_verified_banner``), and
+only when the caller passes the typed verdict ``VERIFIED``. A missing or unknown verdict
+is not gold, even if the line text starts with ``RESULT: VERIFIED``. A
+challenge card with ``referee_verified`` is drawn in neutral white (``REFEREE_CHALLENGE_COLOR``),
+not gold: a confirmed challenge is not a verified match (Con's card t3229s12405). The live
+match path never sets ``referee_verified``. Local button observation is labeled as a pad read. The words
 attested, attestation, and hardware-verified are not printed. A device row is not
 shown; if one is added later its strongest wording is tpm_claimed.
 
@@ -104,6 +108,11 @@ _BUTTON_COLOR = {
     "RIGHT": "ink",
 }
 
+# A referee-confirmed challenge card is neutral white, never gold. Gold marks only a
+# referee VERIFIED match (tint_verified_banner), and only when the typed verdict is
+# VERIFIED (QorProof N2, Con's card t3230s12414). Con's card t3229s12405.
+REFEREE_CHALLENGE_COLOR = "hot"
+
 _SPINNER = "|/-\\"
 _HOLD_S = 8.0
 # The pattern is pressed in the order on the card. CIRCLE closes Madden's pause
@@ -146,7 +155,7 @@ def set_say_hook(fn) -> None:
     _SAY_HOOK = fn
 
 
-def emit(msg: str = "") -> None:
+def emit(msg: str = "", *, verdict: str | None = None) -> None:
     """Print to the interactive console. A live dashboard may hold the line and reprint it later."""
     hook = _SAY_HOOK
     if hook is not None:
@@ -156,19 +165,27 @@ def emit(msg: str = "") -> None:
         except Exception:
             pass
     try:
-        msg = tint_verified_banner(msg)
+        msg = tint_verified_banner(msg, verdict=verdict)
     except Exception:
         pass
     print(msg, flush=True)
 
 
-def tint_verified_banner(msg: str, env: dict | None = None, stream=None) -> str:
-    """Gold on a referee VERIFIED banner only. Other results stay uncolored."""
+def tint_verified_banner(msg: str, env: dict | None = None, stream=None, *, verdict: str | None = None) -> str:
+    """Gold only when the typed verdict is VERIFIED. A missing or unknown verdict stays uncolored.
+
+    The banner line is still selected by its usual wording so an unrelated ``say()`` that
+    accidentally carries ``verdict="VERIFIED"`` is not painted. The text prefix alone is
+    never enough: ``RESULT: VERIFIED`` with no verdict, or with any other status, stays plain.
+    """
     env = os.environ if env is None else env
     stream = sys.stdout if stream is None else stream
     if _color_level(env) == "none":
         return msg
     if not _isatty(stream):
+        return msg
+    # Fail closed: gold only on the typed VERIFIED verdict, never on a text prefix alone.
+    if verdict != "VERIFIED":
         return msg
     stripped = msg.strip()
     if stripped.startswith("RESULT: VERIFIED") or stripped.startswith("OFFICIAL RESULT: VERIFIED"):
@@ -249,25 +266,128 @@ class ChallengeCard:
     settled_at: float | None = None
     unhealthy: bool = False
     saw_trusted: bool = False
+    # Per-press feedback (0.3.37). ``last`` is the newest press, ``wrong`` the button that broke the current try.
+    last: str = ""
+    last_ok: bool = False
+    wrong: str = ""
+    rolled: bool = False
+    tries_broken: int = 0
+    edge_seq: int | None = None
+    edges: bool = False
+    _last_t_ms: int | None = None
+    _last_dpad: str = ""
+    practice: bool = False
 
     def text(self) -> str:
         parts = [self.label, self.result or "pending", self.note, " ".join(self.pattern)]
         return " ".join(parts)
 
 
+# The buttons the referee reads from inputs.jsonl (qor_receipt.review.bundle.BUTTON_BITS). Edge-only names such
+# as MUTE or the back paddles are not presses to the referee, so they do not break a try on this card either.
+REFEREE_BUTTONS = frozenset({
+    "CROSS", "CIRCLE", "SQUARE", "TRIANGLE", "L1", "R1", "L2", "R2", "CREATE", "OPTIONS", "L3", "R3",
+    "UP", "DOWN", "LEFT", "RIGHT", "PS", "TOUCHPAD",
+})
+_DPAD = frozenset({"UP", "DOWN", "LEFT", "RIGHT"})
+# Two d-pad edges this close together are one rolled thumb, not two deliberate presses.
+_ROLL_MS = 60
+_PAUSE = "OPTIONS"
+
+
+def note_press(card: ChallengeCard, button: str, t_ms: int | None = None) -> None:
+    """One rising edge, judged the way the referee judges the window.
+
+    The referee answer is the first OPTIONS press followed by exactly the pattern as the very next presses
+    (``qor_receipt.challenge.response_start``). Any other press in between breaks that try. The pattern body
+    never contains OPTIONS, so a wrong press resets the count to 0, or to 1 when it is OPTIONS itself. Once the
+    pattern is complete the referee has its answer and later presses cannot change it, so the card stops
+    counting. This only mirrors the rule for display; nothing here is recorded or sent.
+    """
+    b = str(button).upper()
+    if card.result or b not in REFEREE_BUTTONS:
+        return
+    if t_ms is not None and not (int(card.issued_ms) <= int(t_ms) <= int(card.deadline_ms)):
+        return
+    if card.matched >= len(card.pattern) > 0:
+        return
+    rolled = (b in _DPAD and card._last_dpad and card._last_dpad != b and t_ms is not None
+              and card._last_t_ms is not None and int(t_ms) - card._last_t_ms <= _ROLL_MS)
+    card.presses.append(b)
+    card.last = b
+    if card.matched < len(card.pattern) and b == card.pattern[card.matched]:
+        card.matched += 1
+        card.last_ok = True
+        card.wrong = ""
+        card.rolled = False
+    else:
+        if card.matched > 0:
+            card.tries_broken += 1
+            card.wrong = b
+            card.rolled = bool(rolled)
+        card.last_ok = False
+        card.matched = 1 if (b == _PAUSE and card.pattern and card.pattern[0] == _PAUSE) else 0
+        if card.matched:
+            card.last_ok = True
+    card._last_t_ms = int(t_ms) if t_ms is not None else None
+    card._last_dpad = b if b in _DPAD else ""
+
+
 def note_held(card: ChallengeCard, held: list[str], *, trusted: bool) -> None:
-    """Rising edges only. A button counts once per press, in the order this sample listed new holds."""
+    """Fallback for a QorCap without ``recent_presses``: rising edges of the held set at each poll.
+
+    A tap shorter than the poll can fall between two samples and never show. ``note_edges`` does not have
+    that gap; this path stays for older binaries and marks the card ``unhealthy`` the same way as before.
+    """
     if card.result:
         return
     prev = set(card.prev)
     fresh = [b for b in held if b not in prev]
     card.prev = list(held)
-    for b in fresh:
-        card.presses.append(b)
-        if card.matched < len(card.pattern) and b == card.pattern[card.matched]:
-            card.matched += 1
+    if not card.edges:
+        for b in fresh:
+            note_press(card, b)
     if trusted:
         card.saw_trusted = True
+
+
+def note_edges(card: ChallengeCard, recent: list, *, trusted: bool) -> bool:
+    """Rising edges from ``/status`` ``input.recent_presses`` (QorCap 0.3.37+). Returns False when absent.
+
+    Each edge has a ``seq``; only edges newer than the last one seen are applied, so a tap is counted once
+    whatever the poll rate. A gap in ``seq`` (more edges than the ring holds between two polls) marks the
+    card unhealthy, the same honest fallback as a slow poll on the held path.
+    """
+    if not isinstance(recent, list):
+        return False
+    card.edges = True
+    if card.result:
+        return True
+    rows = []
+    for e in recent:
+        if not isinstance(e, dict):
+            continue
+        seq, t_ms, button = e.get("seq"), e.get("t_ms"), e.get("button")
+        if isinstance(seq, bool) or not isinstance(seq, int) or not isinstance(button, str):
+            continue
+        if isinstance(t_ms, bool) or not isinstance(t_ms, int):
+            t_ms = None
+        rows.append((seq, t_ms, button))
+    rows.sort(key=lambda r: r[0])
+    if card.edge_seq is not None and rows and rows[0][0] > card.edge_seq + 1:
+        card.unhealthy = True
+    for seq, t_ms, button in rows:
+        if card.edge_seq is not None and seq <= card.edge_seq:
+            continue
+        card.edge_seq = seq
+        if t_ms is None:
+            continue
+        note_press(card, button, t_ms)
+    if card.edge_seq is None:
+        card.edge_seq = 0
+    if trusted:
+        card.saw_trusted = True
+    return True
 
 
 def settle(card: ChallengeCard, now_ms: int, *, trusted: bool, now_s: float) -> None:
@@ -278,7 +398,7 @@ def settle(card: ChallengeCard, now_ms: int, *, trusted: bool, now_s: float) -> 
     open_window = now_ms < card.deadline_ms
     if complete:
         card.result = "pass"
-        card.note = "Buttons matched on this pad. Not a referee result."
+        card.note = "Got it. Buttons matched on this pad. Not a referee result."
         card.settled_at = now_s
         return
     if open_window:
@@ -329,6 +449,7 @@ def console_snapshot(st: dict, info: dict, signed: int, live) -> dict:
         "anchors": anchors,
         "retries": failures if live is not None else 0,
         "res": st.get("res") or "",
+        "seal_line": str(inp.get("seal_line") or ""),
     }
 
 
@@ -597,6 +718,9 @@ def layout_dashboard(snap: dict, *, width: int = 78, height: int = 24, tick: int
     hid = _HID.get(str(snap.get("hid_state") or "off"), str(snap.get("hid_state") or "off"))
     dev = str(snap.get("hid_device") or "").strip()
     hid_line = f"HID     {hid}" + (f"    {dev}" if dev else "")
+    seal = str(snap.get("seal_line") or "").strip()
+    if seal:
+        hid_line += "    " + seal
     hid_color = "cyan" if hid == "connected" else "mute" if hid in {"off", "searching"} else "red"
     _put(grid, top + 6, 4, _clip(hid_line, width - 6), hid_color)
     _put(grid, top + 6, 4, "HID", "mute")
@@ -618,7 +742,7 @@ def layout_dashboard(snap: dict, *, width: int = 78, height: int = 24, tick: int
     if last:
         label, result, verified = last
         word = {"pass": "PASS", "fail": "FAIL", "expired": "EXPIRED"}.get(result, str(result).upper())
-        color = "gold" if verified else "cyan" if result == "pass" else "red" if result == "fail" else "mute"
+        color = REFEREE_CHALLENGE_COLOR if verified else "cyan" if result == "pass" else "red" if result == "fail" else "mute"
         tail = "referee verified" if verified else "buttons on this pad" if result == "pass" else "window closed"
         _put(grid, y, 4, _clip(f"last challenge   {label}   {word}   {tail}", width - 6), color)
         y += 2
@@ -666,14 +790,16 @@ def layout_challenge(card: ChallengeCard, *, width: int = 78, height: int = 36, 
     title = phase if card.result is None else {"pass": "PASS", "fail": "FAIL", "expired": "EXPIRED"}[card.result]
     title_lines = [title] if compact else (big(title) if card.result is None else emphasize(title, width))
     title_color = _title_color(card)
-    specs: list[tuple] = [("center", "REFEREE CHALLENGE", "pink"), ("gap",)]
+    badge = "PRACTICE RESPONSE BOUND" if card.practice else "REFEREE CHALLENGE"
+    specs: list[tuple] = [("center", badge, "pink"), ("gap",)]
     for line in title_lines:
         specs.append(("center", line, title_color))
     if card.result is None:
-        specs.append(("center", "At the line, before the snap. Then resume.", "ink"))
+        prompt = "Press OPTIONS then the shown buttons (advisory only)." if card.practice else "At the line, before the snap. Then resume."
+        specs.append(("center", prompt, "ink"))
     else:
-        note = "Referee verified." if card.referee_verified else card.note
-        specs.append(("center", _clip(note, width - 6), "gold" if card.referee_verified else "ink"))
+        note = "Referee verified." if (card.referee_verified and not card.practice) else card.note
+        specs.append(("center", _clip(note, width - 6), REFEREE_CHALLENGE_COLOR if (card.referee_verified and not card.practice) else "ink"))
     specs.append(("gap",))
     specs.append(("glyphs",))
     if card.result is None:
@@ -694,9 +820,14 @@ def layout_challenge(card: ChallengeCard, *, width: int = 78, height: int = 36, 
         specs.append(("center", on * filled + off * (bar_w - filled), clock_color))
         left = f"{remain} seconds left    entered {card.matched} of {len(card.pattern)}"
         specs.append(("center", left, "red" if remain <= 10 else "mute"))
-        specs.append(("center", "If the snap comes first, do it at the next play.", "dim"))
+        fb = press_feedback(card)
+        if fb:
+            specs.append(("center", _clip(fb[0], width - 6), fb[1]))
+        hint = "Practice lane only; receipt status is unchanged." if card.practice else "If the snap comes first, do it at the next play."
+        specs.append(("center", hint, "dim"))
     else:
-        specs.append(("center", "The referee reads the controller log and the pause.", "dim"))
+        foot = "Advisory only; sealed pad stream checked after stop." if card.practice else "The referee reads the controller log and the pause."
+        specs.append(("center", foot, "dim"))
     glyph_h = _pattern_rows(card.pattern, width) * 6
 
     def spec_height(spec: tuple) -> int:
@@ -735,9 +866,24 @@ def layout_challenge(card: ChallengeCard, *, width: int = 78, height: int = 36, 
     return grid
 
 
+def press_feedback(card: ChallengeCard) -> tuple[str, str] | None:
+    """One line for the newest press: it counted, or it broke the try and what to do next."""
+    if card.result is not None or not card.last:
+        return None
+    if card.wrong:
+        extra = f"Extra {card.wrong} (d-pad roll)" if card.rolled else f"Extra {card.wrong}"
+        if card.matched:
+            return (f"{extra}: not counted. New try started at OPTIONS.", "red")
+        return (f"{extra}: not counted. Redo OPTIONS + all at next snap.", "red")
+    if card.last_ok and card.matched:
+        nxt = card.pattern[card.matched] if card.matched < len(card.pattern) else ""
+        return (f"Got {card.last}. Next: {nxt}. Press each button once." if nxt else f"Got {card.last}.", "ok")
+    return None
+
+
 def _frame_color(card: ChallengeCard) -> str:
     if card.referee_verified:
-        return "gold"
+        return REFEREE_CHALLENGE_COLOR
     if card.result == "fail":
         return "red"
     if card.result == "expired":
@@ -747,7 +893,7 @@ def _frame_color(card: ChallengeCard) -> str:
 
 def _title_color(card: ChallengeCard) -> str:
     if card.referee_verified:
-        return "gold"
+        return REFEREE_CHALLENGE_COLOR
     if card.result == "pass":
         return "cyan"
     if card.result == "fail":
@@ -866,20 +1012,22 @@ class MatchConsole:
             self._snap = dict(snap)
         self._wake.set()
 
-    def show_challenge(self, *, phase: str, label: str, pattern: list[str], issued_ms: int, deadline_ms: int) -> bool:
+    def show_challenge(self, *, phase: str, label: str, pattern: list[str], issued_ms: int, deadline_ms: int, practice: bool = False) -> bool:
         card = ChallengeCard(phase=phase, label=label, pattern=list(pattern),
-                             issued_ms=int(issued_ms), deadline_ms=int(deadline_ms))
+                             issued_ms=int(issued_ms), deadline_ms=int(deadline_ms), practice=bool(practice))
         with self._lock:
             self._card = card
             self._banner = ""
         self._wake.set()
         return bool(self.branded)
 
-    def observe_buttons(self, held, *, trusted: bool = False) -> None:
+    def observe_buttons(self, held, *, trusted: bool = False, recent=None) -> None:
+        """``recent`` is ``/status`` ``input.recent_presses`` when this QorCap has it; otherwise held-state edges."""
         with self._lock:
             card = self._card
             if card is None or card.result:
                 return
+            note_edges(card, recent, trusted=trusted)
             note_held(card, [str(b) for b in held], trusted=trusted)
         self._wake.set()
 
@@ -1000,13 +1148,15 @@ class MatchConsole:
                 continue
             try:
                 st = self._status_getter()
-                held = ((st or {}).get("input") or {}).get("buttons") or []
-                self.observe_buttons(held, trusted=False)
+                inp = (st or {}).get("input") or {}
+                held = inp.get("buttons") or []
+                self.observe_buttons(held, trusted=False, recent=inp.get("recent_presses"))
                 self._sampler_ready = True
-                # A slow or stalled read can miss a tap. Count the whole poll, not just the gap before it.
+                # A slow or stalled read can miss a tap on the held path. The edge ring does not miss one;
+                # its own seq gap check covers an overflow.
                 if time.monotonic() - last_ok > 0.45:
                     with self._lock:
-                        if self._card is not None:
+                        if self._card is not None and not self._card.edges:
                             self._card.unhealthy = True
                 last_ok = time.monotonic()
             except Exception:
@@ -1060,7 +1210,7 @@ def sample_card(result: str | None = None, *, verified: bool = False, matched: i
         card.matched = len(pattern)
         card.presses = list(pattern)
         card.result = "pass"
-        card.note = "Buttons matched on this pad. Not a referee result."
+        card.note = "Got it. Buttons matched on this pad. Not a referee result."
     elif result == "fail":
         card.matched = 2
         card.presses = ["OPTIONS", "CROSS", "UP"]

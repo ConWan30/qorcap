@@ -53,6 +53,61 @@ Record two matches on the same card, the same fps, and a controller QorCap is al
 
 You can also re-score a single flag-on bundle without a second match: `fit_alignment` is the flag-off score, `measured_alignment` is the flag-on score, on the same decode. That is the comparison to write down. It is still one match.
 
+## Measured-clock latency (one-sided search, lower-only)
+
+A `frame_clock.jsonl` stamp is when a frame *arrived* on this machine, after game render, HDMI, the capture card, USB, and the encoder. That pipeline latency is roughly constant within a session. The measured path estimates it once per session and reports it as `measured_alignment.latency`:
+
+- The offset search on the measured clock is one-sided: 0 to 1500 ms in one-frame steps (the fit path keeps its +/-3 s search in 3-frame steps). The picture of a press cannot arrive before the press. A negative offset on this clock lands on screen changes that came before the press, such as a player reacting to a menu or a whistle.
+- Only presses with a stamp within 500 ms are scored on the measured clock. Presses without one are skipped rather than placed on the manifest fit, which sits about half a second away from the stamps on a real card. Mixing the two clocks in one offset search smears the offset.
+- `latency.latency_ms` is the median of the held-out matched press-to-screen anchors (calibration offset + response lag), with the same sign as `offset_ms` on the fit path. Picture time = `t_mono_us` - `latency_ms`. `latency.iqr_ms` is their spread, and `latency.halves_apart_ms` is how far apart the two calibration halves landed.
+- `latency.status` is `unscorable` with fewer than 3 anchors, an IQR above 100 ms, or halves more than 100 ms apart.
+
+In `input_proof.json` (flag on only), the fit is still the default. The measured score replaces it only when its latency is scorable and its z is not above the fit's, so the frame clock can lower the alignment and cannot raise it. Both scores and the latency are under `alignment.frame_clock`. The receipt fields and `receipt.v0.json` do not change. The flag stays off by default.
+
+`measured.vs_fit_signed_p50_ms` (Rust and `tools/frame_clock_ab.py`) gives the sign of the arrival-vs-fit gap. Negative means arrivals sit before the fragment-close line.
+
+Practice session match-20261025-101040 (13 min, before this change): fit residual 253 / 516 / 718 ms (n=392); arrivals vs fit 522 / 549 / 573 ms; arrival jitter 4 / 33 / 116 ms. `fit_alignment` 738 vs chance 345 permille (z 4.92, offset 767 ms, IQR 167, halves 500 / 600 ms). `measured_alignment` 655 vs chance 361 (z 3.68, offset 0 ms, IQR 600, halves -100 / -800 ms). The two halves landed 700 ms apart, one of them on a negative offset. With the arrivals about 0.5 s ahead of the fit line, the measured offset should sit near 767 - 522, about 250 ms. Re-run `qorcap align-ab` on that bundle to get the post-change numbers. The synthetic tests are not a measurement.
+
+## Rumble Echo (third clock, advisory)
+
+```text
+qorcap align-ab PATH/TO/BUNDLE --rumble-echo
+```
+
+Game rumble is sent by the console at about the time it renders the hit. QorCap already sees the pad shake through the IMU in the USB input reports it reads (`haptics.jsonl`, see docs/HAPTICS.md). Nothing is sent to the controller. Rumble Echo pairs high-confidence rumble onsets (after one quiet second) with sharp visual spikes 0 to 1500 ms later. The peak of the lag histogram is the capture latency, with no human in the loop. With `frame_clock.jsonl` present it uses the measured arrivals, and otherwise the manifest fit.
+
+It writes `rumble_echo.json` (schema `qorcap-rumble-echo/v0`): `n_onsets`, `n_paired`, `chance_paired` (onsets shifted 4.1 s), `latency_ms`, `iqr_ms`, `press_offset_ms`, `agree_with_press_offset`, and `status`:
+
+- `ok`: at least 3 pairs, an IQR of 100 ms or less, at least 30 % of onsets paired, at least twice the chance pairs, and within 100 ms of the press offset.
+- `partial`: scorable but more than 100 ms from the press offset. The press offset also includes the game's response to a button, so some gap is expected.
+- `unscorable`: anything else.
+
+It is not in the receipt, the input proof, or the hash chain, and it cannot raise or fail anything. The IMU detector's own delay (32 ms window, actuator rise) makes it read slightly short.
+
+### Tuning Rumble Echo (v0.3.36)
+
+```text
+qorcap align-ab PATH/TO/BUNDLE --rumble-echo --re-hist --re-sweep
+```
+
+`--re-hist` prints the lag histogram to stderr. It counts every spike 0 to max_lag after every onset in 33 ms bins, next to the same count for onsets shifted 4.1 s (chance). A real latency shows up as one bin clearly above its neighbours and above the chance column.
+
+`--re-sweep` also prints one row per combination of pair tolerance 50/100/150 ms, quiet 500/1000 ms, and spike percentile 90/95/98, in both modes. Each row lists onsets, spikes, paired, chance, latency, IQR, and status. Sweep rows go to stderr and to `rumble_echo_sweep` in the JSON. They are never written to `rumble_echo.json`, which always holds the selected parameters.
+
+Selected parameters (defaults are the v0.3.35 behaviour):
+
+| flag | default | meaning |
+|---|---|---|
+| `--re-pair-tol-ms` | 50 | pair tolerance around the lag peak. 50 ms is 1.5 frames, and wider tolerances add chance pairs as fast as real ones. |
+| `--re-max-lag-ms` | 1500 | longest rumble-to-picture lag searched |
+| `--re-quiet-ms` | 1000 | time with no haptic event before an onset |
+| `--re-onset-threshold` | 500 | minimum haptic confidence (0-1000) |
+| `--re-spike-threshold` | 4.0 | spike when 2-frame energy is at least this multiple of the 10-frame median |
+| `--re-spike-pct` | off | keep only spikes at or above this strength percentile |
+| `--re-mode` | `hist` | `hist`: every spike in the window and the histogram peak across onsets. `strongest`: only the strongest spike per onset. |
+
+The gates do not change: at least 3 pairs, an IQR of 100 ms or less, at least 30 % of onsets paired, at least twice the chance pairs, and within 100 ms of the press offset for `ok`. A sweep is many tries on one match, so a single `ok` row among 36 is weak evidence. Look for a histogram peak and rows that agree.
+
 ## What this machine cannot show
 
 No capture card, no DualSense, and no copy of match-20261020-171032 were available here. The 33 ms figure is not measured. Encode delay (the frame is stamped when its PES arrives, after `-bf 0` encode) and several frames sharing one read are inside the stamp. Those have not been measured on the MS2131.

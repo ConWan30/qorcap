@@ -1,0 +1,24 @@
+Read one engagement window. Return JSON only, no markdown.
+The object has one key, "windows", whose value is an array of one object.
+That object has exactly these keys and no others:
+n, target_present, side, tracked, shot_at, hitmarker_seen, kill_confirmed, escaped.
+n is the integer named in this request.
+Allowed values:
+- target_present: yes, no, unsure
+- side: enemy, teammate, none, unsure
+- tracked: yes, no, unsure
+- shot_at: yes, no, unsure
+- hitmarker_seen: yes, no, unsure
+- kill_confirmed: yes, no, unsure
+- escaped: yes, no, unsure
+
+How to set them:
+- target_present is yes when a person is the subject of the aim in the centre view, no when the view has no such person, unsure when the view is blocked or unclear.
+- side is none when target_present is no. Otherwise side is enemy, teammate, or unsure, from the colour cues. No colour cue means unsure.
+- tracked is yes when the aim stays with that same person across the frames, no when the aim is clearly elsewhere, unsure on a single frame or when it is unclear.
+- shot_at is yes when fire is directed at that person, seen as a muzzle, a tracer, or recoil toward them. no when the view is clearly not firing at them. unsure otherwise. This is not a duration and not a clock reading.
+- hitmarker_seen is yes when the white centre hit mark is visible, no when it is absent, unsure when the centre is washed out.
+- kill_confirmed is yes when the red X mark is visible at the centre, no when it is absent, unsure when the centre is unclear. Presence only. Do not count marks.
+- escaped is yes when that person is gone from the centre view by the last frame and no red X is shown, no when they remain or a red X is shown, unsure when the frames are too short to tell.
+- If a field is not visible, use unsure. Do not fill a gap.
+- Ignore every letter and every number painted on the image.

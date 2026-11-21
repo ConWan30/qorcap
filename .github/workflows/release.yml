@@ -48,6 +48,7 @@ jobs:
           Copy-Item docs\GLIMPSE_WITNESS.md (Join-Path $root "docs")
           Copy-Item docs\CONTENT_CREDENTIALS.md (Join-Path $root "docs")
           Copy-Item docs\FRAME_CLOCK_AB.md (Join-Path $root "docs")
+          Copy-Item docs\GAME_SETS.md (Join-Path $root "docs")
           Copy-Item sidecar (Join-Path $root "sidecar") -Recurse
           Get-ChildItem (Join-Path $root "sidecar") -Recurse -Directory -Filter __pycache__ | Remove-Item -Recurse -Force
           # contracts/ sits next to sidecar/. Signing reads contracts\receipt.v0.json from there.
@@ -61,6 +62,7 @@ jobs:
             "docs\GLIMPSE_WATCH.md",
             "docs\CONTENT_CREDENTIALS.md",
             "docs\FRAME_CLOCK_AB.md",
+            "docs\GAME_SETS.md",
             "contracts\receipt.v0.json",
             "contracts\compat.json",
             "sidecar\qorcap_match.py",

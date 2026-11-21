@@ -1,0 +1,1502 @@
+{
+ "073204_L0_assists.png": {
+  "board": "073204",
+  "class": "plain",
+  "value": "2"
+ },
+ "073204_L0_deaths.png": {
+  "board": "073204",
+  "class": "plain",
+  "value": "12"
+ },
+ "073204_L0_kills.png": {
+  "board": "073204",
+  "class": "plain",
+  "value": "20"
+ },
+ "073204_L0_score.png": {
+  "board": "073204",
+  "class": "plain",
+  "value": "2880"
+ },
+ "073204_L1_assists.png": {
+  "board": "073204",
+  "class": "plain",
+  "value": "1"
+ },
+ "073204_L1_deaths.png": {
+  "board": "073204",
+  "class": "plain",
+  "value": "18"
+ },
+ "073204_L1_kills.png": {
+  "board": "073204",
+  "class": "plain",
+  "value": "14"
+ },
+ "073204_L1_score.png": {
+  "board": "073204",
+  "class": "plain",
+  "value": "1975"
+ },
+ "073204_L2_assists.png": {
+  "board": "073204",
+  "class": "plain",
+  "value": "5"
+ },
+ "073204_L2_deaths.png": {
+  "board": "073204",
+  "class": "plain",
+  "value": "12"
+ },
+ "073204_L2_kills.png": {
+  "board": "073204",
+  "class": "plain",
+  "value": "13"
+ },
+ "073204_L2_score.png": {
+  "board": "073204",
+  "class": "plain",
+  "value": "1905"
+ },
+ "073204_L3_assists.png": {
+  "board": "073204",
+  "class": "plain",
+  "value": "2"
+ },
+ "073204_L3_deaths.png": {
+  "board": "073204",
+  "class": "plain",
+  "value": "21"
+ },
+ "073204_L3_kills.png": {
+  "board": "073204",
+  "class": "plain",
+  "value": "14"
+ },
+ "073204_L3_score.png": {
+  "board": "073204",
+  "class": "plain",
+  "value": "1855"
+ },
+ "073204_L4_assists.png": {
+  "board": "073204",
+  "class": "owner",
+  "value": "2"
+ },
+ "073204_L4_deaths.png": {
+  "board": "073204",
+  "class": "owner",
+  "value": "21"
+ },
+ "073204_L4_kills.png": {
+  "board": "073204",
+  "class": "owner",
+  "value": "9"
+ },
+ "073204_L4_score.png": {
+  "board": "073204",
+  "class": "owner",
+  "value": "1250"
+ },
+ "073204_L5_assists.png": {
+  "board": "073204",
+  "class": "plain",
+  "value": "2"
+ },
+ "073204_L5_deaths.png": {
+  "board": "073204",
+  "class": "plain",
+  "value": "10"
+ },
+ "073204_L5_kills.png": {
+  "board": "073204",
+  "class": "plain",
+  "value": "8"
+ },
+ "073204_L5_score.png": {
+  "board": "073204",
+  "class": "plain",
+  "value": "1160"
+ },
+ "073204_R0_assists.png": {
+  "board": "073204",
+  "class": "plain",
+  "value": "5"
+ },
+ "073204_R0_deaths.png": {
+  "board": "073204",
+  "class": "plain",
+  "value": "12"
+ },
+ "073204_R0_kills.png": {
+  "board": "073204",
+  "class": "plain",
+  "value": "27"
+ },
+ "073204_R0_score.png": {
+  "board": "073204",
+  "class": "plain",
+  "value": "3605"
+ },
+ "073204_R1_assists.png": {
+  "board": "073204",
+  "class": "plain",
+  "value": "3"
+ },
+ "073204_R1_deaths.png": {
+  "board": "073204",
+  "class": "plain",
+  "value": "13"
+ },
+ "073204_R1_kills.png": {
+  "board": "073204",
+  "class": "plain",
+  "value": "22"
+ },
+ "073204_R1_score.png": {
+  "board": "073204",
+  "class": "plain",
+  "value": "3040"
+ },
+ "073204_R2_assists.png": {
+  "board": "073204",
+  "class": "plain",
+  "value": "8"
+ },
+ "073204_R2_deaths.png": {
+  "board": "073204",
+  "class": "plain",
+  "value": "14"
+ },
+ "073204_R2_kills.png": {
+  "board": "073204",
+  "class": "plain",
+  "value": "16"
+ },
+ "073204_R2_score.png": {
+  "board": "073204",
+  "class": "plain",
+  "value": "2505"
+ },
+ "073204_R3_assists.png": {
+  "board": "073204",
+  "class": "plain",
+  "value": "1"
+ },
+ "073204_R3_deaths.png": {
+  "board": "073204",
+  "class": "plain",
+  "value": "5"
+ },
+ "073204_R3_kills.png": {
+  "board": "073204",
+  "class": "plain",
+  "value": "16"
+ },
+ "073204_R3_score.png": {
+  "board": "073204",
+  "class": "plain",
+  "value": "2125"
+ },
+ "073204_R4_assists.png": {
+  "board": "073204",
+  "class": "plain",
+  "value": "5"
+ },
+ "073204_R4_deaths.png": {
+  "board": "073204",
+  "class": "plain",
+  "value": "19"
+ },
+ "073204_R4_kills.png": {
+  "board": "073204",
+  "class": "plain",
+  "value": "11"
+ },
+ "073204_R4_score.png": {
+  "board": "073204",
+  "class": "plain",
+  "value": "1810"
+ },
+ "073204_R5_assists.png": {
+  "board": "073204",
+  "class": "plain",
+  "value": "2"
+ },
+ "073204_R5_deaths.png": {
+  "board": "073204",
+  "class": "plain",
+  "value": "16"
+ },
+ "073204_R5_kills.png": {
+  "board": "073204",
+  "class": "plain",
+  "value": "8"
+ },
+ "073204_R5_score.png": {
+  "board": "073204",
+  "class": "plain",
+  "value": "1110"
+ },
+ "073204_card0_deaths.png": {
+  "board": "073204",
+  "class": "card",
+  "value": "21"
+ },
+ "073204_card0_elims.png": {
+  "board": "073204",
+  "class": "card",
+  "value": "11"
+ },
+ "092413_L0_confirms.png": {
+  "board": "092413",
+  "class": "plain",
+  "value": "0"
+ },
+ "092413_L0_kills.png": {
+  "board": "092413",
+  "class": "plain",
+  "value": "40"
+ },
+ "092413_L0_score.png": {
+  "board": "092413",
+  "class": "plain",
+  "value": "6105"
+ },
+ "092413_L1_confirms.png": {
+  "board": "092413",
+  "class": "plain",
+  "value": "2"
+ },
+ "092413_L1_kills.png": {
+  "board": "092413",
+  "class": "plain",
+  "value": "26"
+ },
+ "092413_L1_score.png": {
+  "board": "092413",
+  "class": "plain",
+  "value": "4180"
+ },
+ "092413_L2_confirms.png": {
+  "board": "092413",
+  "class": "owner",
+  "value": "1"
+ },
+ "092413_L2_kills.png": {
+  "board": "092413",
+  "class": "owner",
+  "value": "25"
+ },
+ "092413_L2_score.png": {
+  "board": "092413",
+  "class": "owner",
+  "value": "4130"
+ },
+ "092413_L3_confirms.png": {
+  "board": "092413",
+  "class": "plain",
+  "value": "3"
+ },
+ "092413_L3_kills.png": {
+  "board": "092413",
+  "class": "plain",
+  "value": "20"
+ },
+ "092413_L3_score.png": {
+  "board": "092413",
+  "class": "plain",
+  "value": "3845"
+ },
+ "092413_R0_confirms.png": {
+  "board": "092413",
+  "class": "plain",
+  "value": "2"
+ },
+ "092413_R0_kills.png": {
+  "board": "092413",
+  "class": "plain",
+  "value": "56"
+ },
+ "092413_R0_score.png": {
+  "board": "092413",
+  "class": "plain",
+  "value": "8995"
+ },
+ "092413_R1_confirms.png": {
+  "board": "092413",
+  "class": "plain",
+  "value": "4"
+ },
+ "092413_R1_kills.png": {
+  "board": "092413",
+  "class": "plain",
+  "value": "46"
+ },
+ "092413_R1_score.png": {
+  "board": "092413",
+  "class": "plain",
+  "value": "8395"
+ },
+ "092413_R2_confirms.png": {
+  "board": "092413",
+  "class": "plain",
+  "value": "5"
+ },
+ "092413_R2_kills.png": {
+  "board": "092413",
+  "class": "plain",
+  "value": "36"
+ },
+ "092413_R2_score.png": {
+  "board": "092413",
+  "class": "plain",
+  "value": "7320"
+ },
+ "092413_R3_confirms.png": {
+  "board": "092413",
+  "class": "plain",
+  "value": "2"
+ },
+ "092413_R3_kills.png": {
+  "board": "092413",
+  "class": "plain",
+  "value": "35"
+ },
+ "092413_R3_score.png": {
+  "board": "092413",
+  "class": "plain",
+  "value": "5995"
+ },
+ "092413_R4_confirms.png": {
+  "board": "092413",
+  "class": "plain",
+  "value": "1"
+ },
+ "092413_R4_kills.png": {
+  "board": "092413",
+  "class": "plain",
+  "value": "43"
+ },
+ "092413_R4_score.png": {
+  "board": "092413",
+  "class": "plain",
+  "value": "5855"
+ },
+ "092413_R5_confirms.png": {
+  "board": "092413",
+  "class": "plain",
+  "value": "0"
+ },
+ "092413_R5_kills.png": {
+  "board": "092413",
+  "class": "plain",
+  "value": "33"
+ },
+ "092413_R5_score.png": {
+  "board": "092413",
+  "class": "plain",
+  "value": "5495"
+ },
+ "092413_card0_deaths.png": {
+  "board": "092413",
+  "class": "card",
+  "value": "54"
+ },
+ "092413_card0_elims.png": {
+  "board": "092413",
+  "class": "card",
+  "value": "47"
+ },
+ "162225_L0_assists.png": {
+  "board": "162225",
+  "class": "plain",
+  "value": "2"
+ },
+ "162225_L0_deaths.png": {
+  "board": "162225",
+  "class": "plain",
+  "value": "14"
+ },
+ "162225_L0_kills.png": {
+  "board": "162225",
+  "class": "plain",
+  "value": "23"
+ },
+ "162225_L0_score.png": {
+  "board": "162225",
+  "class": "plain",
+  "value": "3055"
+ },
+ "162225_L1_assists.png": {
+  "board": "162225",
+  "class": "plain",
+  "value": "3"
+ },
+ "162225_L1_deaths.png": {
+  "board": "162225",
+  "class": "plain",
+  "value": "18"
+ },
+ "162225_L1_kills.png": {
+  "board": "162225",
+  "class": "plain",
+  "value": "12"
+ },
+ "162225_L1_score.png": {
+  "board": "162225",
+  "class": "plain",
+  "value": "1750"
+ },
+ "162225_L2_assists.png": {
+  "board": "162225",
+  "class": "plain",
+  "value": "1"
+ },
+ "162225_L2_deaths.png": {
+  "board": "162225",
+  "class": "plain",
+  "value": "15"
+ },
+ "162225_L2_kills.png": {
+  "board": "162225",
+  "class": "plain",
+  "value": "13"
+ },
+ "162225_L2_score.png": {
+  "board": "162225",
+  "class": "plain",
+  "value": "1740"
+ },
+ "162225_L3_assists.png": {
+  "board": "162225",
+  "class": "plain",
+  "value": "4"
+ },
+ "162225_L3_deaths.png": {
+  "board": "162225",
+  "class": "plain",
+  "value": "12"
+ },
+ "162225_L3_kills.png": {
+  "board": "162225",
+  "class": "plain",
+  "value": "10"
+ },
+ "162225_L3_score.png": {
+  "board": "162225",
+  "class": "plain",
+  "value": "1670"
+ },
+ "162225_L4_assists.png": {
+  "board": "162225",
+  "class": "owner",
+  "value": "1"
+ },
+ "162225_L4_deaths.png": {
+  "board": "162225",
+  "class": "owner",
+  "value": "20"
+ },
+ "162225_L4_kills.png": {
+  "board": "162225",
+  "class": "owner",
+  "value": "10"
+ },
+ "162225_L4_score.png": {
+  "board": "162225",
+  "class": "owner",
+  "value": "1350"
+ },
+ "162225_L5_assists.png": {
+  "board": "162225",
+  "class": "plain",
+  "value": "4"
+ },
+ "162225_L5_deaths.png": {
+  "board": "162225",
+  "class": "plain",
+  "value": "19"
+ },
+ "162225_L5_kills.png": {
+  "board": "162225",
+  "class": "plain",
+  "value": "9"
+ },
+ "162225_L5_score.png": {
+  "board": "162225",
+  "class": "plain",
+  "value": "1295"
+ },
+ "162225_R0_assists.png": {
+  "board": "162225",
+  "class": "plain",
+  "value": "0"
+ },
+ "162225_R0_deaths.png": {
+  "board": "162225",
+  "class": "plain",
+  "value": "14"
+ },
+ "162225_R0_kills.png": {
+  "board": "162225",
+  "class": "plain",
+  "value": "24"
+ },
+ "162225_R0_score.png": {
+  "board": "162225",
+  "class": "plain",
+  "value": "3255"
+ },
+ "162225_R1_assists.png": {
+  "board": "162225",
+  "class": "plain",
+  "value": "1"
+ },
+ "162225_R1_deaths.png": {
+  "board": "162225",
+  "class": "plain",
+  "value": "15"
+ },
+ "162225_R1_kills.png": {
+  "board": "162225",
+  "class": "plain",
+  "value": "20"
+ },
+ "162225_R1_score.png": {
+  "board": "162225",
+  "class": "plain",
+  "value": "2880"
+ },
+ "162225_R2_assists.png": {
+  "board": "162225",
+  "class": "plain",
+  "value": "1"
+ },
+ "162225_R2_deaths.png": {
+  "board": "162225",
+  "class": "plain",
+  "value": "11"
+ },
+ "162225_R2_kills.png": {
+  "board": "162225",
+  "class": "plain",
+  "value": "19"
+ },
+ "162225_R2_score.png": {
+  "board": "162225",
+  "class": "plain",
+  "value": "2600"
+ },
+ "162225_R3_assists.png": {
+  "board": "162225",
+  "class": "plain",
+  "value": "1"
+ },
+ "162225_R3_deaths.png": {
+  "board": "162225",
+  "class": "plain",
+  "value": "14"
+ },
+ "162225_R3_kills.png": {
+  "board": "162225",
+  "class": "plain",
+  "value": "19"
+ },
+ "162225_R3_score.png": {
+  "board": "162225",
+  "class": "plain",
+  "value": "2520"
+ },
+ "162225_R4_assists.png": {
+  "board": "162225",
+  "class": "plain",
+  "value": "11"
+ },
+ "162225_R4_deaths.png": {
+  "board": "162225",
+  "class": "plain",
+  "value": "13"
+ },
+ "162225_R4_kills.png": {
+  "board": "162225",
+  "class": "plain",
+  "value": "9"
+ },
+ "162225_R4_score.png": {
+  "board": "162225",
+  "class": "plain",
+  "value": "1695"
+ },
+ "162225_R5_assists.png": {
+  "board": "162225",
+  "class": "plain",
+  "value": "2"
+ },
+ "162225_R5_deaths.png": {
+  "board": "162225",
+  "class": "plain",
+  "value": "10"
+ },
+ "162225_R5_kills.png": {
+  "board": "162225",
+  "class": "plain",
+  "value": "9"
+ },
+ "162225_R5_score.png": {
+  "board": "162225",
+  "class": "plain",
+  "value": "1235"
+ },
+ "162225_card0_deaths.png": {
+  "board": "162225",
+  "class": "card",
+  "value": "20"
+ },
+ "162225_card0_elims.png": {
+  "board": "162225",
+  "class": "card",
+  "value": "11"
+ },
+ "173922_L0_confirms.png": {
+  "board": "173922",
+  "class": "plain",
+  "value": "20"
+ },
+ "173922_L0_kills.png": {
+  "board": "173922",
+  "class": "plain",
+  "value": "19"
+ },
+ "173922_L0_score.png": {
+  "board": "173922",
+  "class": "plain",
+  "value": "4080"
+ },
+ "173922_L1_confirms.png": {
+  "board": "173922",
+  "class": "plain",
+  "value": "17"
+ },
+ "173922_L1_kills.png": {
+  "board": "173922",
+  "class": "plain",
+  "value": "17"
+ },
+ "173922_L1_score.png": {
+  "board": "173922",
+  "class": "plain",
+  "value": "3635"
+ },
+ "173922_L2_confirms.png": {
+  "board": "173922",
+  "class": "plain",
+  "value": "10"
+ },
+ "173922_L2_kills.png": {
+  "board": "173922",
+  "class": "plain",
+  "value": "17"
+ },
+ "173922_L2_score.png": {
+  "board": "173922",
+  "class": "plain",
+  "value": "3040"
+ },
+ "173922_L3_confirms.png": {
+  "board": "173922",
+  "class": "plain",
+  "value": "16"
+ },
+ "173922_L3_kills.png": {
+  "board": "173922",
+  "class": "plain",
+  "value": "13"
+ },
+ "173922_L3_score.png": {
+  "board": "173922",
+  "class": "plain",
+  "value": "2800"
+ },
+ "173922_L4_confirms.png": {
+  "board": "173922",
+  "class": "owner",
+  "value": "7"
+ },
+ "173922_L4_kills.png": {
+  "board": "173922",
+  "class": "owner",
+  "value": "13"
+ },
+ "173922_L4_score.png": {
+  "board": "173922",
+  "class": "owner",
+  "value": "2245"
+ },
+ "173922_L5_confirms.png": {
+  "board": "173922",
+  "class": "plain",
+  "value": "5"
+ },
+ "173922_L5_kills.png": {
+  "board": "173922",
+  "class": "plain",
+  "value": "12"
+ },
+ "173922_L5_score.png": {
+  "board": "173922",
+  "class": "plain",
+  "value": "2045"
+ },
+ "173922_R0_confirms.png": {
+  "board": "173922",
+  "class": "plain",
+  "value": "4"
+ },
+ "173922_R0_kills.png": {
+  "board": "173922",
+  "class": "plain",
+  "value": "26"
+ },
+ "173922_R0_score.png": {
+  "board": "173922",
+  "class": "plain",
+  "value": "3595"
+ },
+ "173922_R1_confirms.png": {
+  "board": "173922",
+  "class": "plain",
+  "value": "7"
+ },
+ "173922_R1_kills.png": {
+  "board": "173922",
+  "class": "plain",
+  "value": "12"
+ },
+ "173922_R1_score.png": {
+  "board": "173922",
+  "class": "plain",
+  "value": "2170"
+ },
+ "173922_R2_confirms.png": {
+  "board": "173922",
+  "class": "plain",
+  "value": "12"
+ },
+ "173922_R2_kills.png": {
+  "board": "173922",
+  "class": "plain",
+  "value": "8"
+ },
+ "173922_R2_score.png": {
+  "board": "173922",
+  "class": "plain",
+  "value": "1885"
+ },
+ "173922_R3_confirms.png": {
+  "board": "173922",
+  "class": "plain",
+  "value": "8"
+ },
+ "173922_R3_kills.png": {
+  "board": "173922",
+  "class": "plain",
+  "value": "9"
+ },
+ "173922_R3_score.png": {
+  "board": "173922",
+  "class": "plain",
+  "value": "1770"
+ },
+ "173922_R4_confirms.png": {
+  "board": "173922",
+  "class": "plain",
+  "value": "10"
+ },
+ "173922_R4_kills.png": {
+  "board": "173922",
+  "class": "plain",
+  "value": "8"
+ },
+ "173922_R4_score.png": {
+  "board": "173922",
+  "class": "plain",
+  "value": "1700"
+ },
+ "173922_R5_confirms.png": {
+  "board": "173922",
+  "class": "plain",
+  "value": "7"
+ },
+ "173922_R5_kills.png": {
+  "board": "173922",
+  "class": "plain",
+  "value": "9"
+ },
+ "173922_R5_score.png": {
+  "board": "173922",
+  "class": "plain",
+  "value": "1600"
+ },
+ "173922_card0_deaths.png": {
+  "board": "173922",
+  "class": "card",
+  "value": "13"
+ },
+ "173922_card0_elims.png": {
+  "board": "173922",
+  "class": "card",
+  "value": "17"
+ },
+ "183311_L0_captures.png": {
+  "board": "183311",
+  "class": "plain",
+  "value": "0"
+ },
+ "183311_L0_data.png": {
+  "board": "183311",
+  "class": "plain",
+  "value": "2"
+ },
+ "183311_L0_kills.png": {
+  "board": "183311",
+  "class": "plain",
+  "value": "25"
+ },
+ "183311_L0_score.png": {
+  "board": "183311",
+  "class": "plain",
+  "value": "3810"
+ },
+ "183311_L1_captures.png": {
+  "board": "183311",
+  "class": "plain",
+  "value": "0"
+ },
+ "183311_L1_data.png": {
+  "board": "183311",
+  "class": "plain",
+  "value": "0"
+ },
+ "183311_L1_kills.png": {
+  "board": "183311",
+  "class": "plain",
+  "value": "18"
+ },
+ "183311_L1_score.png": {
+  "board": "183311",
+  "class": "plain",
+  "value": "2890"
+ },
+ "183311_L2_captures.png": {
+  "board": "183311",
+  "class": "owner",
+  "value": "0"
+ },
+ "183311_L2_data.png": {
+  "board": "183311",
+  "class": "owner",
+  "value": "0"
+ },
+ "183311_L2_kills.png": {
+  "board": "183311",
+  "class": "owner",
+  "value": "21"
+ },
+ "183311_L2_score.png": {
+  "board": "183311",
+  "class": "owner",
+  "value": "2770"
+ },
+ "183311_L3_captures.png": {
+  "board": "183311",
+  "class": "plain",
+  "value": "0"
+ },
+ "183311_L3_data.png": {
+  "board": "183311",
+  "class": "plain",
+  "value": "0"
+ },
+ "183311_L3_kills.png": {
+  "board": "183311",
+  "class": "plain",
+  "value": "11"
+ },
+ "183311_L3_score.png": {
+  "board": "183311",
+  "class": "plain",
+  "value": "1335"
+ },
+ "183311_R0_captures.png": {
+  "board": "183311",
+  "class": "plain",
+  "value": "4"
+ },
+ "183311_R0_data.png": {
+  "board": "183311",
+  "class": "plain",
+  "value": "182"
+ },
+ "183311_R0_kills.png": {
+  "board": "183311",
+  "class": "plain",
+  "value": "32"
+ },
+ "183311_R0_score.png": {
+  "board": "183311",
+  "class": "plain",
+  "value": "5575"
+ },
+ "183311_R1_captures.png": {
+  "board": "183311",
+  "class": "plain",
+  "value": "0"
+ },
+ "183311_R1_data.png": {
+  "board": "183311",
+  "class": "plain",
+  "value": "0"
+ },
+ "183311_R1_kills.png": {
+  "board": "183311",
+  "class": "plain",
+  "value": "31"
+ },
+ "183311_R1_score.png": {
+  "board": "183311",
+  "class": "plain",
+  "value": "3925"
+ },
+ "183311_R2_captures.png": {
+  "board": "183311",
+  "class": "plain",
+  "value": "1"
+ },
+ "183311_R2_data.png": {
+  "board": "183311",
+  "class": "plain",
+  "value": "35"
+ },
+ "183311_R2_kills.png": {
+  "board": "183311",
+  "class": "plain",
+  "value": "24"
+ },
+ "183311_R2_score.png": {
+  "board": "183311",
+  "class": "plain",
+  "value": "3830"
+ },
+ "183311_R3_captures.png": {
+  "board": "183311",
+  "class": "plain",
+  "value": "1"
+ },
+ "183311_R3_data.png": {
+  "board": "183311",
+  "class": "plain",
+  "value": "33"
+ },
+ "183311_R3_kills.png": {
+  "board": "183311",
+  "class": "plain",
+  "value": "29"
+ },
+ "183311_R3_score.png": {
+  "board": "183311",
+  "class": "plain",
+  "value": "3705"
+ },
+ "183311_R4_captures.png": {
+  "board": "183311",
+  "class": "plain",
+  "value": "1"
+ },
+ "183311_R4_data.png": {
+  "board": "183311",
+  "class": "plain",
+  "value": "50"
+ },
+ "183311_R4_kills.png": {
+  "board": "183311",
+  "class": "plain",
+  "value": "21"
+ },
+ "183311_R4_score.png": {
+  "board": "183311",
+  "class": "plain",
+  "value": "2930"
+ },
+ "183311_R5_captures.png": {
+  "board": "183311",
+  "class": "plain",
+  "value": "0"
+ },
+ "183311_R5_data.png": {
+  "board": "183311",
+  "class": "plain",
+  "value": "0"
+ },
+ "183311_R5_kills.png": {
+  "board": "183311",
+  "class": "plain",
+  "value": "13"
+ },
+ "183311_R5_score.png": {
+  "board": "183311",
+  "class": "plain",
+  "value": "1655"
+ },
+ "183311_card0_deaths.png": {
+  "board": "183311",
+  "class": "card",
+  "value": "34"
+ },
+ "183311_card0_elims.png": {
+  "board": "183311",
+  "class": "card",
+  "value": "24"
+ },
+ "194037_L0_captures.png": {
+  "board": "194037",
+  "class": "plain",
+  "value": "0"
+ },
+ "194037_L0_data.png": {
+  "board": "194037",
+  "class": "plain",
+  "value": "0"
+ },
+ "194037_L0_kills.png": {
+  "board": "194037",
+  "class": "plain",
+  "value": "24"
+ },
+ "194037_L0_score.png": {
+  "board": "194037",
+  "class": "plain",
+  "value": "3165"
+ },
+ "194037_L1_captures.png": {
+  "board": "194037",
+  "class": "plain",
+  "value": "0"
+ },
+ "194037_L1_data.png": {
+  "board": "194037",
+  "class": "plain",
+  "value": "0"
+ },
+ "194037_L1_kills.png": {
+  "board": "194037",
+  "class": "plain",
+  "value": "25"
+ },
+ "194037_L1_score.png": {
+  "board": "194037",
+  "class": "plain",
+  "value": "2885"
+ },
+ "194037_L2_captures.png": {
+  "board": "194037",
+  "class": "plain",
+  "value": "0"
+ },
+ "194037_L2_data.png": {
+  "board": "194037",
+  "class": "plain",
+  "value": "0"
+ },
+ "194037_L2_kills.png": {
+  "board": "194037",
+  "class": "plain",
+  "value": "16"
+ },
+ "194037_L2_score.png": {
+  "board": "194037",
+  "class": "plain",
+  "value": "2620"
+ },
+ "194037_L3_captures.png": {
+  "board": "194037",
+  "class": "plain",
+  "value": "1"
+ },
+ "194037_L3_data.png": {
+  "board": "194037",
+  "class": "plain",
+  "value": "36"
+ },
+ "194037_L3_kills.png": {
+  "board": "194037",
+  "class": "plain",
+  "value": "13"
+ },
+ "194037_L3_score.png": {
+  "board": "194037",
+  "class": "plain",
+  "value": "1725"
+ },
+ "194037_L4_captures.png": {
+  "board": "194037",
+  "class": "owner",
+  "value": "0"
+ },
+ "194037_L4_data.png": {
+  "board": "194037",
+  "class": "owner",
+  "value": "0"
+ },
+ "194037_L4_kills.png": {
+  "board": "194037",
+  "class": "owner",
+  "value": "13"
+ },
+ "194037_L4_score.png": {
+  "board": "194037",
+  "class": "owner",
+  "value": "1515"
+ },
+ "194037_L5_captures.png": {
+  "board": "194037",
+  "class": "plain",
+  "value": "0"
+ },
+ "194037_L5_data.png": {
+  "board": "194037",
+  "class": "plain",
+  "value": "0"
+ },
+ "194037_L5_kills.png": {
+  "board": "194037",
+  "class": "plain",
+  "value": "6"
+ },
+ "194037_L5_score.png": {
+  "board": "194037",
+  "class": "plain",
+  "value": "825"
+ },
+ "194037_R0_captures.png": {
+  "board": "194037",
+  "class": "plain",
+  "value": "0"
+ },
+ "194037_R0_data.png": {
+  "board": "194037",
+  "class": "plain",
+  "value": "0"
+ },
+ "194037_R0_kills.png": {
+  "board": "194037",
+  "class": "plain",
+  "value": "26"
+ },
+ "194037_R0_score.png": {
+  "board": "194037",
+  "class": "plain",
+  "value": "3555"
+ },
+ "194037_R1_captures.png": {
+  "board": "194037",
+  "class": "plain",
+  "value": "0"
+ },
+ "194037_R1_data.png": {
+  "board": "194037",
+  "class": "plain",
+  "value": "0"
+ },
+ "194037_R1_kills.png": {
+  "board": "194037",
+  "class": "plain",
+  "value": "20"
+ },
+ "194037_R1_score.png": {
+  "board": "194037",
+  "class": "plain",
+  "value": "2865"
+ },
+ "194037_R2_captures.png": {
+  "board": "194037",
+  "class": "plain",
+  "value": "2"
+ },
+ "194037_R2_data.png": {
+  "board": "194037",
+  "class": "plain",
+  "value": "96"
+ },
+ "194037_R2_kills.png": {
+  "board": "194037",
+  "class": "plain",
+  "value": "14"
+ },
+ "194037_R2_score.png": {
+  "board": "194037",
+  "class": "plain",
+  "value": "2250"
+ },
+ "194037_R3_captures.png": {
+  "board": "194037",
+  "class": "plain",
+  "value": "0"
+ },
+ "194037_R3_data.png": {
+  "board": "194037",
+  "class": "plain",
+  "value": "0"
+ },
+ "194037_R3_kills.png": {
+  "board": "194037",
+  "class": "plain",
+  "value": "17"
+ },
+ "194037_R3_score.png": {
+  "board": "194037",
+  "class": "plain",
+  "value": "1865"
+ },
+ "194037_R4_captures.png": {
+  "board": "194037",
+  "class": "plain",
+  "value": "0"
+ },
+ "194037_R4_data.png": {
+  "board": "194037",
+  "class": "plain",
+  "value": "0"
+ },
+ "194037_R4_kills.png": {
+  "board": "194037",
+  "class": "plain",
+  "value": "13"
+ },
+ "194037_R4_score.png": {
+  "board": "194037",
+  "class": "plain",
+  "value": "1785"
+ },
+ "194037_R5_captures.png": {
+  "board": "194037",
+  "class": "plain",
+  "value": "1"
+ },
+ "194037_R5_data.png": {
+  "board": "194037",
+  "class": "plain",
+  "value": "54"
+ },
+ "194037_R5_kills.png": {
+  "board": "194037",
+  "class": "plain",
+  "value": "10"
+ },
+ "194037_R5_score.png": {
+  "board": "194037",
+  "class": "plain",
+  "value": "1350"
+ },
+ "194037_card0_deaths.png": {
+  "board": "194037",
+  "class": "card",
+  "value": "21"
+ },
+ "194037_card0_elims.png": {
+  "board": "194037",
+  "class": "card",
+  "value": "18"
+ },
+ "202724_L0_confirms.png": {
+  "board": "202724",
+  "class": "plain",
+  "value": "18"
+ },
+ "202724_L0_kills.png": {
+  "board": "202724",
+  "class": "plain",
+  "value": "18"
+ },
+ "202724_L0_score.png": {
+  "board": "202724",
+  "class": "plain",
+  "value": "4665"
+ },
+ "202724_L1_confirms.png": {
+  "board": "202724",
+  "class": "plain",
+  "value": "16"
+ },
+ "202724_L1_kills.png": {
+  "board": "202724",
+  "class": "plain",
+  "value": "16"
+ },
+ "202724_L1_score.png": {
+  "board": "202724",
+  "class": "plain",
+  "value": "3495"
+ },
+ "202724_L2_confirms.png": {
+  "board": "202724",
+  "class": "plain",
+  "value": "8"
+ },
+ "202724_L2_kills.png": {
+  "board": "202724",
+  "class": "plain",
+  "value": "17"
+ },
+ "202724_L2_score.png": {
+  "board": "202724",
+  "class": "plain",
+  "value": "2900"
+ },
+ "202724_L3_confirms.png": {
+  "board": "202724",
+  "class": "owner",
+  "value": "8"
+ },
+ "202724_L3_kills.png": {
+  "board": "202724",
+  "class": "owner",
+  "value": "20"
+ },
+ "202724_L3_score.png": {
+  "board": "202724",
+  "class": "owner",
+  "value": "2875"
+ },
+ "202724_L4_confirms.png": {
+  "board": "202724",
+  "class": "plain",
+  "value": "12"
+ },
+ "202724_L4_kills.png": {
+  "board": "202724",
+  "class": "plain",
+  "value": "11"
+ },
+ "202724_L4_score.png": {
+  "board": "202724",
+  "class": "plain",
+  "value": "2525"
+ },
+ "202724_L5_confirms.png": {
+  "board": "202724",
+  "class": "plain",
+  "value": "3"
+ },
+ "202724_L5_kills.png": {
+  "board": "202724",
+  "class": "plain",
+  "value": "9"
+ },
+ "202724_L5_score.png": {
+  "board": "202724",
+  "class": "plain",
+  "value": "1505"
+ },
+ "202724_R0_confirms.png": {
+  "board": "202724",
+  "class": "plain",
+  "value": "30"
+ },
+ "202724_R0_kills.png": {
+  "board": "202724",
+  "class": "plain",
+  "value": "22"
+ },
+ "202724_R0_score.png": {
+  "board": "202724",
+  "class": "plain",
+  "value": "5155"
+ },
+ "202724_R1_confirms.png": {
+  "board": "202724",
+  "class": "plain",
+  "value": "13"
+ },
+ "202724_R1_kills.png": {
+  "board": "202724",
+  "class": "plain",
+  "value": "22"
+ },
+ "202724_R1_score.png": {
+  "board": "202724",
+  "class": "plain",
+  "value": "3770"
+ },
+ "202724_R2_confirms.png": {
+  "board": "202724",
+  "class": "plain",
+  "value": "16"
+ },
+ "202724_R2_kills.png": {
+  "board": "202724",
+  "class": "plain",
+  "value": "16"
+ },
+ "202724_R2_score.png": {
+  "board": "202724",
+  "class": "plain",
+  "value": "3485"
+ },
+ "202724_R3_confirms.png": {
+  "board": "202724",
+  "class": "plain",
+  "value": "4"
+ },
+ "202724_R3_kills.png": {
+  "board": "202724",
+  "class": "plain",
+  "value": "14"
+ },
+ "202724_R3_score.png": {
+  "board": "202724",
+  "class": "plain",
+  "value": "2185"
+ },
+ "202724_R4_confirms.png": {
+  "board": "202724",
+  "class": "plain",
+  "value": "3"
+ },
+ "202724_R4_kills.png": {
+  "board": "202724",
+  "class": "plain",
+  "value": "8"
+ },
+ "202724_R4_score.png": {
+  "board": "202724",
+  "class": "plain",
+  "value": "1430"
+ },
+ "202724_R5_confirms.png": {
+  "board": "202724",
+  "class": "plain",
+  "value": "4"
+ },
+ "202724_R5_kills.png": {
+  "board": "202724",
+  "class": "plain",
+  "value": "8"
+ },
+ "202724_R5_score.png": {
+  "board": "202724",
+  "class": "plain",
+  "value": "1340"
+ },
+ "202724_card0_deaths.png": {
+  "board": "202724",
+  "class": "card",
+  "value": "21"
+ },
+ "202724_card0_elims.png": {
+  "board": "202724",
+  "class": "card",
+  "value": "22"
+ }
+}

@@ -30,6 +30,14 @@ QorCap's own recording time, and the referee ``key_kind`` says ``local-self-atte
 recorder was killed before it could write them. Bytes after the last hashed segment are excluded.
 ``post_final_tail.json`` is left as it was.
 
+Late finalize: when the bundle has no receipt.json yet (the live save stopped before signing), finalize adds
+one ``result.notes`` line before signing, so both signatures cover it: when the receipt was signed offline
+(local time with zone, and UTC ms), the gap after the recording ended (``ended_ms``), the reason, and whether
+the checkpoint countersignatures are the live ones or were re-signed offline on the recording clock. The same
+facts go to ``late_finalize.json`` (info only). A receipt signed late must never read as signed at match time.
+Live-only files (``post_final_tail.json``, ``cod_end_stop.json``) are not rebuilt; any reconstruction would
+have to cite the qorcap.log lines it used and must never take the live file names.
+
 Trust: both keys live on this PC, so the result is SELF-ATTESTED. The receipt's computed QorTime tier is
 ``single-attested`` and ``referee.key_kind`` is ``local-self-attested`` so any reader can see that the
 "referee" is this machine, not an independent server. Keys are never printed.
@@ -49,7 +57,7 @@ from pathlib import Path
 
 QORTIME_PIN = "0204e6d8082f8c40ea1fe5e09bf16402aaee3ff2"
 QORTIME_ZIP = f"https://github.com/ConWan30/qortime/archive/{QORTIME_PIN}.zip"
-VERIFY_URL = "https://conwan30.github.io/qortime/verify/"
+VERIFY_URL = "https://qortime.com/verify/"
 REFEREE_KIND = "local-self-attested"
 REFEREE_KIND_OFFLINE = "local-self-attested-offline"
 CAPTURE_APPS = ("obs64.exe", "obs32.exe", "obs.exe")
@@ -57,9 +65,9 @@ HERE = Path(__file__).resolve().parent
 WIN = sys.platform == "win32"
 
 
-def say(msg: str = "") -> None:
+def say(msg: str = "", *, verdict: str | None = None) -> None:
     from qorcap_console import emit
-    emit(msg)
+    emit(msg, verdict=verdict)
 
 
 def data_dir() -> Path:
@@ -331,6 +339,123 @@ def note_reader_final(state: dict, body: dict) -> bool:
     return True
 
 
+def run_with_reader_stats(body, persist):
+    """Run capture and receipt save, then best-effort reader stats.
+
+    ``persist`` runs on the way out, including when ``body`` raises. Exceptions
+    from ``persist`` are discarded so optional diagnostics cannot replace the
+    save result or hide ``body``'s exception. ``persist`` runs after ``body``
+    returns, so a slow stats write does not run before the save.
+    """
+    try:
+        return body()
+    finally:
+        try:
+            persist()
+        except Exception:
+            pass
+
+
+def _reader_thread_alive(state) -> bool:
+    thread = state.get("reader_thread") if isinstance(state, dict) else None
+    alive = getattr(thread, "is_alive", None)
+    if not callable(alive):
+        return False
+    try:
+        return bool(alive())
+    except Exception:
+        return False
+
+
+def maybe_write_cod_reader_stats(bundle: Path, state: dict, game: str, *,
+                                 practice: bool = False, reader_joined: bool | None = None) -> bool:
+    """Write Call of Duty reader counts when this stop passes ``practice=True``.
+
+    This sidecar has no flag that inspects another installed build. Passing
+    ``practice=True`` is the caller's explicit gate for this process. Madden,
+    any other game, ``practice`` other than True, or a missing reader returns
+    without creating a file. The signal log is not appended.
+
+    ``reader_joined`` True reads the runner only when its thread is not alive
+    and records ``joined``. False keeps the last published copy and records
+    ``timed_out``, including when that thread has since exited. None records
+    ``not_joined`` and keeps the published copy even if the thread is still
+    alive. True while the thread is still alive is not a finished join: the
+    published copy is kept and the label is ``timed_out``. A missing copy does
+    not invent zero counts.
+    """
+    if practice is not True or game != "cod":
+        return False
+    try:
+        from qorcap_cod import observation_from_runner, write_reader_stats
+        core = state.get("core") if isinstance(state, dict) else None
+        if core is None or not isinstance(getattr(core, "stats", None), dict):
+            return False
+        alive = _reader_thread_alive(state)
+        if reader_joined is True and not alive:
+            observation = observation_from_runner(
+                core,
+                reader_error=state.get("reader_error"),
+                cod_signal_error=state.get("cod_signal_error"),
+                reader_tick=state.get("reader_tick"),
+            )
+            join = "joined"
+        else:
+            published = None
+            getter = getattr(core, "published_reader_observation", None)
+            if callable(getter):
+                published = getter()
+            observation = published if isinstance(published, dict) else None
+            if observation is None:
+                from qorcap_cod import _blank_observation
+                observation = _blank_observation()
+            # None is a missing join even when the thread is still alive.
+            # False is a timeout. True only reaches here when the thread is
+            # still alive, so that claim is a timeout, not a finished join.
+            join = "not_joined" if reader_joined is None else "timed_out"
+        write_reader_stats(bundle, observation, reader_join=join)
+    except Exception as e:
+        try:
+            say(f"  Call of Duty reader counts were not written: {type(e).__name__}")
+        except Exception:
+            pass
+        return False
+    return True
+
+
+def maybe_write_engagement_windows(bundle: Path, game: str, *, environ=None, out_root=None) -> bool:
+    """Info-only engagement window index (PWEC) after the stop. Never Counted; never raises.
+
+    Off unless ``QORCAP_LANE=practice`` and Call of Duty (``QORCAP_PWEC=0`` turns it off there).
+    It reads ``inputs.jsonl`` and ``frame_clock.jsonl`` and writes only outside the match folder
+    (``%LOCALAPPDATA%\\QorCapEngagement\\<match>\\``). The bundle, the seal and the receipt are not
+    touched. See ``qorcap_engagement``.
+    """
+    try:
+        env = os.environ if environ is None else environ
+        # Gate before any import or sys.path change, so a Madden, REAL MATCH, or no-lane
+        # stop does not load the module. QORCAP_PWEC=0/false/no/off is off on the practice lane.
+        lane = env.get("QORCAP_LANE")
+        flag = env.get("QORCAP_PWEC")
+        if (
+            game != "cod"
+            or not (isinstance(lane, str) and lane.strip().lower() == "practice")
+            or (isinstance(flag, str) and flag.strip().lower() in ("0", "false", "no", "off"))
+        ):
+            return False
+        here = str(HERE)
+        if here not in sys.path:
+            sys.path.insert(0, here)
+        from qorcap_engagement import maybe_write_engagement_windows as _pwec
+        return bool(_pwec(bundle, game, environ=env, out_root=out_root, say=say))
+    except Exception as e:
+        try:
+            say(f"  Engagement windows were not written (info only; the match is unaffected): {type(e).__name__}: {e}")
+        except Exception:
+            pass
+        return False
+
+
 def mark_health_sealed(state: dict) -> None:
     """Drop later reader_health rows. The receipt is about to be signed."""
     state["health_sealed"] = True
@@ -442,7 +567,12 @@ def wait_and_countersign(proc, path: Path, cs: "Countersigner", timeout: float =
             except Exception:
                 pass
         if on_tick is not None:
-            on_tick()
+            # Progress messages only. An error here must not end the wait before the
+            # stop checkpoints are countersigned or skip what save_tail does after it.
+            try:
+                on_tick()
+            except Exception:
+                pass
         if time.monotonic() > deadline:
             proc.kill()
             break
@@ -492,13 +622,18 @@ def closed_match(match: dict) -> dict:
     return {k: match[k] for k in match if k in allowed}
 
 
+def receipt_ended_ms(cps: list[dict], started_ms: int) -> int:
+    """``match.ended_ms`` of the receipt: the last checkpoint countersign time, never before the start."""
+    return max(cps[-1]["referee_ts_ms"] if cps else started_ms, started_ms)
+
+
 def build_receipt(draft: dict, cps: list[dict], device, referee, *, match_id: str, role: str, started_ms: int,
                   referee_kind: str = REFEREE_KIND) -> dict:
     """QorTime's receipt.build + sign_referee + sign_player on what QorCap observed."""
     from qor_receipt import receipt as R
 
     m = dict(closed_match(draft["match"]), match_id=match_id, started_ms=started_ms,
-             ended_ms=max(cps[-1]["referee_ts_ms"] if cps else started_ms, started_ms))
+             ended_ms=receipt_ended_ms(cps, started_ms))
     player = dict(draft["players"][0], role=role, pubkey=device.pubkey_hex, key_kind=device.kind)
     rec = R.build(match=m, result=closed_result(draft["result"]), players=[player],
                   referee={"pubkey": referee.pubkey_hex, "key_id": referee.key_id, "key_kind": referee_kind},
@@ -718,6 +853,322 @@ def start_reader(api: Api, stop: threading.Event, state: dict, bundle: Path | No
     return t
 
 
+SNAPSHOT_API_VERSION = 1
+SNAPSHOT_SCHEMA = "qorcap-snapshot/v1"
+# The engine stamps HID t_us and snapshot mono_us from one Instant. Its origin is
+# written on both the snapshot headers and the inputs.jsonl header.
+ENGINE_CLOCK_SOURCE = "engine_monotonic_ns"
+CLOCK_SOURCES = {ENGINE_CLOCK_SOURCE}
+
+
+def _plain_int(value):
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value
+
+
+def split_clocks(*, wall_ms, pts_us, anchor_wall_ms) -> dict:
+    """Wall time stays wall time. It is not a monotonic capture clock.
+
+    A wall anchor does not unlock ``mono_us``. Producer mono comes from a
+    bound snapshot header, not from ``wall_ms * 1000`` or wall subtraction.
+    """
+    return {
+        "wall_ms": _plain_int(wall_ms),
+        "pts_us": _plain_int(pts_us),
+        "mono_us": None,
+        "clock": "unbound",
+        "anchor_wall_ms": _plain_int(anchor_wall_ms),
+    }
+
+
+def order_captures(doc: dict) -> dict:
+    from qorcap_qordata import order_captures as _order
+    return _order(doc)
+
+
+def snapshot_submission(api_version, epoch, seq, pts_us, body_hash, seen):
+    """One capture generation. A missing API version is an incompatibility, not a skip.
+
+    Wall time is not an argument. A repeated epoch and sequence is not a new frame.
+    Media PTS may be absent. It is not the capture identity, so several completions
+    may share one PTS.
+    """
+    version = _plain_int(api_version)
+    if version != SNAPSHOT_API_VERSION:
+        return {"error": "snapshot_api_incompatible", "api_version": version}
+    epoch_n, seq_n = _plain_int(epoch), _plain_int(seq)
+    pts_n = _plain_int(pts_us)
+    if epoch_n is None or seq_n is None or epoch_n < 0 or seq_n < 0:
+        return {"error": "snapshot_provenance_missing"}
+    if pts_us is not None and (pts_n is None or pts_n < 0):
+        return {"error": "snapshot_provenance_missing"}
+    if not isinstance(body_hash, str) or not body_hash or not isinstance(seen, set):
+        return {"error": "snapshot_provenance_missing"}
+    for prev_epoch, prev_seq, _prev_pts, _prev_hash in seen:
+        # Media PTS can stay on one progress line while several JPEGs complete.
+        # The capture sequence is the frame identity. PTS is not.
+        if prev_epoch == epoch_n and seq_n <= prev_seq:
+            return {"error": "snapshot_repeated", "epoch": epoch_n, "seq": seq_n}
+    seen.add((epoch_n, seq_n, pts_n, body_hash))
+    return {
+        "ok": True,
+        "epoch": epoch_n,
+        "seq": seq_n,
+        "pts_us": pts_n,
+        "frame_id": body_hash,
+        "clock": "capture_pts",
+    }
+
+
+def cod_capture_step(headers, body, seen, anchor_wall_ms, decoded):
+    """Turn one CoD snapshot response into a frame or an explicit chain reason.
+
+    The API version and the schema have to match this sidecar. A missing clock
+    binding is a failure. ``anchor_wall_ms`` is not a substitute for that binding.
+    """
+    import hashlib
+
+    del anchor_wall_ms  # wall subtraction is not capture mono
+    if _header_text(headers, "X-Qorcap-Snapshot-State") == "stale":
+        # The producer stopped completing frames. The bytes are the last frame
+        # and carry no capture id, so they are not a new observation.
+        return {"error": "stale_snapshot", "age_us": _header_int(headers, "X-Qorcap-Snapshot-Age-Us")}
+    schema = _header_text(headers, "X-Qorcap-Snapshot-Schema")
+    api_version = _header_int(headers, "X-Qorcap-Snapshot-Api")
+    if api_version != SNAPSHOT_API_VERSION or schema != SNAPSHOT_SCHEMA:
+        return {"error": "version_mismatch", "api_version": api_version, "schema": schema}
+    session_id = _header_text(headers, "X-Qorcap-Snapshot-Session")
+    clock_id = _header_text(headers, "X-Qorcap-Snapshot-Clock")
+    clock_source = _header_text(headers, "X-Qorcap-Snapshot-Clock-Source")
+    origin = _header_int(headers, "X-Qorcap-Snapshot-Mono-Origin-Ns")
+    capture_id = _header_text(headers, "X-Qorcap-Snapshot-Capture-Id")
+    generation = _header_int(headers, "X-Qorcap-Snapshot-Generation")
+    mono_us = _header_int(headers, "X-Qorcap-Snapshot-Mono-Us")
+    producer_start_us = _header_int(headers, "X-Qorcap-Snapshot-Producer-Start-Us")
+    if (
+        not session_id or not clock_id or clock_source not in CLOCK_SOURCES or origin is None
+        or origin <= 0 or not capture_id or generation is None or mono_us is None
+    ):
+        return {"error": "clock_binding_missing"}
+    epoch = _header_int(headers, "X-Qorcap-Snapshot-Epoch")
+    if epoch is not None and generation != epoch:
+        # Generation is the producer epoch. A per-frame counter in this header
+        # would read as a new epoch on every frame.
+        return {"error": "provenance_generation_mismatch", "generation": generation, "epoch": epoch}
+    seq = _header_int(headers, "X-Qorcap-Snapshot-Seq")
+    pts_us = _header_int(headers, "X-Qorcap-Snapshot-Pts-Us")
+    if isinstance(body, (bytes, bytearray)) and body:
+        body_hash = hashlib.sha256(body).hexdigest()
+    else:
+        body_hash = ""
+    sub = snapshot_submission(api_version, epoch, seq, pts_us, body_hash, seen)
+    if sub.get("error"):
+        return sub
+    if not decoded:
+        return {"error": "snapshot_decode", "epoch": sub["epoch"], "seq": sub["seq"]}
+    if capture_id == body_hash:
+        # Pixel identity is not the capture id. A header that only echoes the
+        # body hash has not named a producer capture.
+        return {"error": "missing_provenance"}
+    return {
+        "ok": True,
+        "t_ms": mono_us // 1000,
+        "source": {
+            "frame_id": capture_id,
+            "capture_id": capture_id,
+            "seq": sub["seq"],
+            "epoch": sub["epoch"],
+            "capture_generation": generation,
+            "session_id": session_id,
+            "clock_id": clock_id,
+            "clock_source": clock_source,
+            "mono_origin_ns": origin,
+            "pts_us": sub["pts_us"],
+            "mono_us": mono_us,
+            "producer_start_us": producer_start_us,
+            "clock": clock_source,
+            "captured_us": mono_us,
+        },
+    }
+
+
+def _header_text(headers, name):
+    if headers is None or not hasattr(headers, "get"):
+        return None
+    raw = headers.get(name)
+    if not isinstance(raw, str) or not raw:
+        return None
+    return raw
+
+
+def _header_int(headers, name):
+    raw = _header_text(headers, name)
+    if raw is None:
+        return None
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return value
+
+
+_SIDE_FROM_BUNDLE = object()  # legacy: read the side from side_choice.json in the bundle
+
+
+def attach_cod_end_stop(state: dict, game, *, environ=None, say=None):
+    """Create the practice CoD auto-stop watcher when its gate is on. Returns it, or None."""
+    if game != "cod":
+        return None
+    try:
+        sys.path.insert(0, str(HERE))
+        import qorcap_cod_endstop as es_mod
+        if not es_mod.enabled(game, environ):
+            return None
+        es = es_mod.EndStop(es_mod.config_from_env(environ))
+    except Exception as e:
+        if say is not None:
+            say(f"Practice auto stop is off ({type(e).__name__}). Press ENTER after the match.")
+        return None
+    state["cod_end_stop"] = es
+    if say is not None:
+        c = es.cfg
+        if c.best_play:
+            say(f"Practice auto stop is on: after a confirmed VICTORY or DEFEAT end screen, capture runs until the "
+                f"BEST PLAY replay title is read (at most {c.best_play_max_s:g} s) and then stops the same way as "
+                f"Enter (armed after {c.arm_ms // 1000} s).")
+        else:
+            say(f"Practice auto stop is on: after a confirmed VICTORY or DEFEAT end screen, capture runs "
+                f"{c.tail_s:g} s more and then stops the same way as Enter (armed after {c.arm_ms // 1000} s).")
+    return es
+
+
+def start_cod_reader(api: Api, stop: threading.Event, state: dict, bundle: Path | None = None,
+                     side=_SIDE_FROM_BUNDLE) -> threading.Thread:
+    """Call of Duty frame loop. Does not start the Madden scorebug reader.
+
+    The end word plus Qortrola30's scoreboard row can post a final. Home and away stay unread on that path.
+    Controller and frame-clock rows are refreshed about once a second. No frame
+    clock means those signals are not Counted.
+
+    ``side`` is the side chosen at the start for the scored-end check (a read that already has home and away).
+    ``main()`` passes ``side=None`` for Call of Duty, because Call of Duty has no home/away pick. A
+    ``side_choice.json`` or ``next-side.txt`` already sitting in a reused match folder is then not read, so it
+    cannot turn the scored-end side check back on. The file is left in place (prior evidence is not deleted).
+    Leaving ``side`` out keeps the older behavior of reading ``side_choice.json`` from the bundle.
+    ``state["cod_end_stop"]`` (practice auto stop, ``qorcap_cod_endstop``), when set, sees each frame's
+    end and owner-row reads.
+    """
+    sys.path.insert(0, str(HERE))
+    from qorcap_cod import CodSetRunner, load_signal_files, side_from_bundle
+
+    def post(b):
+        try:
+            r = api.post("/events", b)
+        except Exception:
+            r = {}
+        if isinstance(b, dict) and b.get("type") == "final":
+            state["final"] = b
+        return r
+
+    runner = CodSetRunner(
+        post,
+        log_path=(bundle / "cod_signals.jsonl") if bundle is not None else None,
+        side=side_from_bundle(bundle) if side is _SIDE_FROM_BUNDLE else side,
+    )
+    es = state.get("cod_end_stop")
+    runner.end_watch = getattr(es, "observe", None) if es is not None else None
+    state["core"] = runner
+    # Leave the Madden pause gate unset. Official challenges stay closed.
+    state["gate"] = None
+
+    def refresh():
+        if bundle is None:
+            return
+        try:
+            loaded = load_signal_files(bundle)
+            runner.set_signals(loaded["inputs"], loaded["frame_stamps"], loaded["haptics"], loaded["wall_anchor_ms"])
+        except Exception as e:
+            state["cod_signal_error"] = f"{type(e).__name__}: {e}"
+
+    def publish():
+        try:
+            runner.publish_reader_observation(
+                reader_error=state.get("reader_error"),
+                cod_signal_error=state.get("cod_signal_error"),
+                reader_tick=state.get("reader_tick"),
+            )
+        except Exception:
+            pass
+
+    def loop():
+        try:
+            import cv2
+            import numpy as np
+        except Exception as e:
+            state["reader_error"] = f"cod_reader_unavailable: {type(e).__name__}"
+            publish()
+            return
+        last_refresh = 0.0
+        seen = set()
+        try:
+            while not stop.is_set():
+                state["reader_tick"] = int(time.time() * 1000)
+                now = time.monotonic()
+                if now - last_refresh >= 1.0:
+                    refresh()
+                    last_refresh = now
+                try:
+                    with urllib.request.urlopen(api.base + "/snapshot.jpg", timeout=3) as r:
+                        data = r.read()
+                        headers = r.headers
+                except Exception as e:
+                    status = getattr(e, "code", None)
+                    if isinstance(status, str) and status.isdigit():
+                        status = int(status)
+                    if isinstance(status, bool) or not isinstance(status, int):
+                        status = None
+                    runner.note_capture_gap(
+                        f"snapshot_http:{type(e).__name__}",
+                        http_status=status,
+                        observed_mono_us=time.monotonic_ns() // 1000,
+                    )
+                    if stop.wait(0.5):
+                        break
+                    publish()
+                    continue
+                try:
+                    img = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
+                except Exception:
+                    img = None
+                step = cod_capture_step(headers, data, seen, runner.wall_anchor_ms, img is not None)
+                if step.get("error"):
+                    runner.note_capture_gap(step["error"])
+                else:
+                    try:
+                        runner.on_frame(step["t_ms"], img, source=step["source"])
+                    except Exception as e:
+                        state["reader_error"] = f"{type(e).__name__}: {e}"
+                        runner.note_capture_gap(f"frame_hook:{type(e).__name__}")
+                if stop.wait(0.25):
+                    break
+                publish()
+        finally:
+            try:
+                publish()
+            except Exception:
+                pass
+            try:
+                runner.close_signals()
+            except Exception:
+                pass
+
+    t = threading.Thread(target=loop, name="qorcap-cod-reader", daemon=True)
+    state["reader_thread"] = t
+    t.start()
+    return t
+
+
 def start_fake_scores(api: Api, stop: threading.Event, state: dict, secs: float) -> threading.Thread:
     """--test-pattern: plays a short scripted game into /events (no card, no PS5)."""
     script = [(0, 0, 1, 900), (7, 0, 1, 600), (7, 3, 2, 300), (14, 3, 3, 120), (14, 10, 4, 30), (14, 10, 4, 0)]
@@ -908,6 +1359,8 @@ def audio_silence_hint(res: dict | None, *, when: str) -> list[str]:
     return ["",
             "  !" * 21,
             f"  WARNING: the capture card's audio is SILENT {when} ({lvl}).",
+            "  Recording audio is silent; check that console audio goes to HDMI, not only the headset.",
+            "  (Not fatal: recording continues, and audio is not used by the proof.)",
             *first,
             "  The match video will have NO GAME SOUND. Usual causes, in order:",
             "   1. PS5: Settings > Sound > Audio Output > Output Device = your TV/HDMI device, and",
@@ -964,8 +1417,12 @@ def spawn_qorcap(cmd: list[str], stdout):
         return subprocess.Popen(cmd, stdout=stdout, stderr=subprocess.STDOUT, creationflags=flags)
 
 
-def shutdown_body(reason: str) -> dict:
-    return {"reason": reason}
+def shutdown_body(reason: str, note: str | None = None) -> dict:
+    """``/shutdown`` body. ``note`` is one info-only line QorCap writes to qorcap.log; it is not stored."""
+    body = {"reason": reason}
+    if isinstance(note, str) and note:
+        body["note"] = note
+    return body
 
 
 def key_watcher(stop: threading.Event, state: dict) -> None:
@@ -994,10 +1451,14 @@ def fmt_clock(s) -> str:
     return "--:--" if s is None else f"{int(s) // 60}:{int(s) % 60:02d}"
 
 
-def status_line(st: dict, cps: dict, signed: int) -> str:
+def status_line(st: dict, cps: dict, signed: int, *, game: str = "madden") -> str:
     sc = cps.get("score") or {}
-    score = (f"AWAY {sc.get('away')} - HOME {sc.get('home')}  Q{sc.get('quarter')} {fmt_clock(sc.get('clock_s'))}"
-             if sc else "score: waiting for scorebug")
+    if sc:
+        score = f"AWAY {sc.get('away')} - HOME {sc.get('home')}  Q{sc.get('quarter')} {fmt_clock(sc.get('clock_s'))}"
+    elif game == "cod":
+        score = "HUD: hitmarker / killfeed / end screen not Counted"
+    else:
+        score = "score: waiting for scorebug"
     state = {"capturing": "REC", "waiting_for_device": "NO SIGNAL (check card/PS5)", "reopening": "reconnecting",
              "disk_full": "DISK FULL"}.get(st.get("state"), st.get("state", "?"))
     warn = st.get("warning") or ""
@@ -1006,7 +1467,15 @@ def status_line(st: dict, cps: dict, signed: int) -> str:
     disk_bit = f" | disk {disk}MB" if isinstance(disk, int) else ""
     return (f"[{state}] {int(st.get('recording_secs') or 0) // 60:02d}:{int(st.get('recording_secs') or 0) % 60:02d}"
             f" | {score} | segments {cps.get('segments', 0)} | signed {signed} | clips {cps.get('clips', 0)}"
-            f"{disk_bit}{warn_bit}")
+            f"{disk_bit}{warn_bit}{_seal_suffix(st)}")
+
+
+def _seal_suffix(st: dict) -> str:
+    inp = st.get("input") if isinstance(st.get("input"), dict) else {}
+    line = str((inp or {}).get("seal_line") or "").strip()
+    if not line:
+        return ""
+    return " | " + line
 
 
 def run_cmd(cmd: list[str], env=None) -> tuple[int, str]:
@@ -1049,6 +1518,9 @@ _BIG = {  # 5-row block letters for the prompt banner
     "A": [" ### ", "#   #", "#####", "#   #", "#   #"], "W": ["#   #", "#   #", "# # #", "## ##", "#   #"],
     "Y": ["#   #", " # # ", "  #  ", "  #  ", "  #  "], "=": ["     ", "#####", "     ", "#####", "     "],
     " ": ["   ", "   ", "   ", "   ", "   "],
+    "C": [" ### ", "#    ", "#    ", "#    ", " ### "],
+    "D": ["#### ", "#   #", "#   #", "#   #", "#### "],
+    "N": ["#   #", "##  #", "# # #", "#  ##", "#   #"],
 }
 
 
@@ -1096,13 +1568,22 @@ def take_side_file(path: Path, *, now: float | None = None) -> tuple[str | None,
     return side, f"side from {path.name}: {side.upper()}"
 
 
-def prompt_side(read_key, out=None, *, clock=time.monotonic, remind_s: float = SIDE_REMIND_S) -> str | None:
+def prompt_side(read_key, out=None, *, clock=time.monotonic, remind_s: float = SIDE_REMIND_S,
+                lines=None, label_for=None) -> str | None:
     """Show the side prompt and wait (no timeout) for H or A, then Enter. Re-shows the prompt with a beep every
     ``remind_s`` seconds. ``read_key(timeout)`` returns one character, "\n" for Enter, "" on timeout, None on EOF.
-    Returns "home" | "away", or None when input is closed (no console)."""
+    Returns "home" | "away", or None when input is closed (no console).
+
+    ``lines`` and ``label_for`` default to the Madden scorebug wording. Call of Duty passes its own.
+    """
     out = out or sys.stdout
+    lines = lines or side_prompt_lines
+    def label(choice):
+        if label_for is not None:
+            return label_for(choice)
+        return "HOME (right team)" if choice == "home" else "AWAY (left / first-listed team)"
     def show():
-        out.write("\a" + "\n".join(side_prompt_lines()) + "\n")
+        out.write("\a" + "\n".join(lines()) + "\n")
         out.flush()
     show()
     choice, next_remind = None, clock() + remind_s
@@ -1120,8 +1601,7 @@ def prompt_side(read_key, out=None, *, clock=time.monotonic, remind_s: float = S
         c = k.lower()
         if c in ("h", "a"):
             choice = "home" if c == "h" else "away"
-            label = "HOME (right team)" if choice == "home" else "AWAY (left / first-listed team)"
-            out.write(f"\n  You picked {label}.\n  Press Enter to start recording, or press {'A' if c == 'h' else 'H'} to switch.\n")
+            out.write(f"\n  You picked {label(choice)}.\n  Press Enter to start recording, or press {'A' if c == 'h' else 'H'} to switch.\n")
             out.flush()
         elif c in ("\r", "\n") and choice:
             out.write("\n" + "\n".join("  " + l for l in big_text(choice)) + "\n\n")
@@ -1168,9 +1648,105 @@ def drain_console_keys() -> None:
             msvcrt.getwch()
 
 
-def resolve_side(a, *, side_file: Path, read_key=None, out=None) -> tuple[str | None, str | None]:
+def cod_side_prompt_lines() -> list[str]:
+    """Receipt side for Call of Duty. Not a Madden scorebug position."""
+    return ["", "=" * 64, "  WHICH SIDE ARE YOU?      press  H  or  A", "=" * 64, "",
+            *("  " + l for l in big_text("H = HOME")), "",
+            *("  " + l for l in big_text("A = AWAY")), "",
+            "  This is your side on the receipt.",
+            "  Call of Duty reads its own end screen.",
+            "  H = HOME.  A = AWAY.",
+            "",
+            "  Nothing is recorded until you choose. Then press Enter.", "=" * 64]
+
+
+def cod_side_label(choice: str) -> str:
+    if choice == "home":
+        return "HOME (your side on the receipt)"
+    return "AWAY (your side on the receipt)"
+
+
+def game_prompt_lines() -> list[str]:
+    return ["", "=" * 64, "  WHICH GAME?      press  M  or  C", "=" * 64, "",
+            *("  " + l for l in big_text("M = MADDEN")), "",
+            "  Home and away. Madden scorebug and the end-of-game menu.",
+            "",
+            *("  " + l for l in big_text("C = COD")), "",
+            "  Call of Duty (MW4 / modern).",
+            "  Hitmarker, kill popup, killfeed, pause, and the end scoreboard.",
+            "  A count is Counted when the controller and the video agree on the frame clock.",
+            "  Otherwise it is flagged a mismatch, or it is not Counted.",
+            "  The match ends when the end screen is read.",
+            "",
+            "  Nothing is recorded until you choose. Then press Enter.", "=" * 64]
+
+
+def prompt_game(read_key, out=None, *, clock=time.monotonic, remind_s: float = SIDE_REMIND_S) -> str | None:
+    """Wait for M or C, then Enter. No timeout and no silent Madden."""
+    out = out or sys.stdout
+    def show():
+        out.write("\a" + "\n".join(game_prompt_lines()) + "\n")
+        out.flush()
+    show()
+    choice, next_remind = None, clock() + remind_s
+    while True:
+        k = read_key(min(1.0, max(0.05, next_remind - clock())))
+        if k is None:
+            return None
+        if k == "":
+            if clock() >= next_remind:
+                show()
+                if choice:
+                    out.write(f"  Picked {choice.upper()}. Press Enter to continue (or the other letter to switch).\n")
+                next_remind = clock() + remind_s
+            continue
+        c = k.lower()
+        if c in ("m", "c"):
+            choice = "madden" if c == "m" else "cod"
+            label = "MADDEN" if choice == "madden" else "CALL OF DUTY"
+            other = "C" if c == "m" else "M"
+            out.write(f"\n  You picked {label}.\n  Press Enter to continue, or press {other} to switch.\n")
+            out.flush()
+        elif c in ("\r", "\n") and choice:
+            word = "MADDEN" if choice == "madden" else "COD"
+            out.write("\n" + "\n".join("  " + l for l in big_text(word)) + "\n\n")
+            out.flush()
+            return choice
+
+
+def resolve_game(a, *, game_file: Path, read_key=None, out=None) -> tuple[str | None, str | None]:
+    """(madden|cod, source). Omitted ``--game`` stays Madden, the same way omitted ``--side`` stays home."""
+    if a.game in ("madden", "cod"):
+        return a.game, "flag"
+    if a.game == "ask":
+        from qorcap_games import take_game_file
+        game, note = take_game_file(game_file)
+        if note:
+            say(note)
+        if game:
+            return game, "file"
+        game = prompt_game(read_key or console_key_reader(), out)
+        drain_console_keys()
+        return (game, "prompt") if game else (None, None)
+    return "madden", None
+
+
+def resolve_side(a, *, side_file: Path, read_key=None, out=None, game: str = "madden") -> tuple[str | None, str | None]:
     """(side, source). source: flag | file | prompt; (home, None) is the legacy default for direct CLI runs without
-    --side (tests); (None, None) = no answer possible (no console)."""
+    --side (tests); (None, None) = no answer possible (no console).
+
+    Call of Duty has no home/away pick: no prompt, no next-side.txt, no flag. It returns the same (home, None)
+    as the default path above, so this run writes no side_choice.json and passes no --side-source.
+
+    "home" is not a typed N/A. receipt.v0 requires the player role and allows only home or away, so "home" is
+    the legacy signing-role bucket that the receipt and the recorder (--role home) need. An explicit Call of
+    Duty --side away or --role away is ignored and ends up as home. main() also passes side=None to the Call
+    of Duty reader, so a side_choice.json or next-side.txt left from an earlier run is not read and the
+    scored-end side check (a read that already has home and away) stays off: VICTORY and DEFEAT on that path
+    are not confirmed by a side. The owner-row final agreement is a separate path with its own gates and is
+    not changed here. How later consumers should read this "home" is a separate, later plan."""
+    if game == "cod":
+        return "home", None
     if a.side in ("home", "away"):
         return a.side, "flag"
     if a.role in ("home", "away"):
@@ -1181,7 +1757,10 @@ def resolve_side(a, *, side_file: Path, read_key=None, out=None) -> tuple[str | 
             say(note)
         if side:
             return side, "file"
-        side = prompt_side(read_key or console_key_reader(), out)
+        if game == "cod":
+            side = prompt_side(read_key or console_key_reader(), out, lines=cod_side_prompt_lines, label_for=cod_side_label)
+        else:
+            side = prompt_side(read_key or console_key_reader(), out)
         drain_console_keys()
         return (side, "prompt") if side else (None, None)
     return "home", None
@@ -1227,6 +1806,10 @@ def main(argv=None) -> int:
     ap.add_argument("--out", help="folder for match bundles (default: Documents/QorCap Matches)")
     ap.add_argument("--key-dir", help="where the device/referee keys live (default: user QorCap data folder)")
     ap.add_argument("--port", type=int, default=8788)
+    ap.add_argument("--game", choices=["madden", "cod", "ask"], default=None,
+                    help="which game set to load: madden or cod (Call of Duty MW4 / modern). "
+                         "'ask' shows the M/C prompt unless a fresh one-shot next-game.txt is in the QorCap data folder. "
+                         "Start Match.cmd passes 'ask' unless --game is given. Omitted stays Madden.")
     ap.add_argument("--side", choices=["home", "away", "ask"], default=None,
                     help="your side: home or away (AWAY = left / first-listed team on the Madden scorebug); 'ask' shows the H/A prompt unless a fresh one-shot next-side.txt is in the QorCap data folder. Start Match.cmd passes 'ask' unless --side is given.")
     ap.add_argument("--role", choices=["home", "away"], default=None, help="same as --side home|away (older name)")
@@ -1282,18 +1865,30 @@ def main(argv=None) -> int:
         for line in mic_hint(mic_privacy_blocked()):
             say(line)
 
-    side, side_source = resolve_side(a, side_file=data_dir() / SIDE_FILE_NAME)
+    game, game_source = resolve_game(a, game_file=data_dir() / "next-game.txt")
+    if game is None:
+        say("No game chosen and no keyboard to ask on. Start again with --game madden or --game cod"
+            f" (or put madden/cod in {data_dir() / 'next-game.txt'}).")
+        return 6
+    side, side_source = resolve_side(a, side_file=data_dir() / SIDE_FILE_NAME, game=game)
     if side is None:
         say("No side chosen and no keyboard to ask on. Start again with --side home or --side away"
             f" (or put home/away in {data_dir() / SIDE_FILE_NAME}).")
         return 6
     a.role = side
-    say(f"Side: {side.upper()}" + (f"  (from {side_source})" if side_source else "  (default; pass --side home|away)"))
+    say(f"Game: {'CALL OF DUTY' if game == 'cod' else 'MADDEN'}"
+        + (f"  (from {game_source})" if game_source else "  (default; pass --game madden|cod)"))
+    if game == "cod":
+        say("Side: not used for Call of Duty (no home/away pick).")
+    else:
+        say(f"Side: {side.upper()}" + (f"  (from {side_source})" if side_source else "  (default; pass --side home|away)"))
 
     root = Path(a.out) if a.out else Path.home() / "Documents" / "QorCap Matches"
     stamp = time.strftime("%Y%m%d-%H%M%S")
     bundle = (root / f"match-{stamp}").resolve()
     bundle.mkdir(parents=True, exist_ok=True)
+    if game == "cod" and (bundle / "side_choice.json").exists():
+        say(f"Note: {bundle / 'side_choice.json'} is from an earlier run. Call of Duty does not read it; it is left in place.")
     match_id = f"local-{stamp}"
     api = Api(a.port)
     try:
@@ -1342,6 +1937,11 @@ def main(argv=None) -> int:
         cmd += ["--side-source", side_source]
         (bundle / "side_choice.json").write_text(json.dumps({"role": side, "source": side_source,
                                                              "chosen_at": time.strftime("%Y-%m-%dT%H:%M:%S%z")}, indent=2), encoding="utf-8")
+    from qorcap_games import set_for, write_game_set
+    spec = set_for(game)
+    write_game_set(bundle / "game_set.json", spec, game_source)
+    if spec.game and spec.profile:
+        cmd += ["--game", spec.game, "--scorebug-profile", spec.profile]
     if a.encoder or a.test_pattern:
         cmd += ["--encoder", a.encoder or "libx264"]
     if a.test_pattern:
@@ -1389,12 +1989,22 @@ def main(argv=None) -> int:
         return 5
 
     say(f"Recording to: {bundle}")
-    say("Play your game. Recording stops by itself after the end screen.")
+    if game == "cod":
+        say("Play the match. It ends when the Call of Duty end screen is read, not when you stop QorCap.")
+        say("Stopping early leaves the score not Counted.")
+    else:
+        say("Play your game. Recording stops by itself after the end screen.")
     say("Press ENTER (or Q) to stop early. Keep this window open until it says RESULT.")
     say("(Ctrl+C also stops it; if Windows then asks 'Terminate batch job (Y/N)?', answer N.)\n")
     stop, state = threading.Event(), {}
     cs = Countersigner(referee, match_id, a.role, sink=bundle / "countersigned.jsonl")
-    if a.test_pattern:
+    # No home/away pick for Call of Duty: pass no side, so an old side_choice.json in this folder is not read.
+    # Practice lane + QORCAP_AUTOCLOSE=1 + Call of Duty only: stop after a confirmed VICTORY / DEFEAT
+    # end screen. Sets state["cod_end_stop"]; start_cod_reader hands it the frame loop's reads.
+    attach_cod_end_stop(state, game, say=say)
+    if game == "cod":
+        start_cod_reader(api, stop, state, bundle=bundle, side=None)
+    elif a.test_pattern:
         start_fake_scores(api, stop, state, a.test_secs)
     else:
         start_reader(api, stop, state, bundle=bundle)
@@ -1410,13 +2020,17 @@ def main(argv=None) -> int:
     if not a.no_anchors or a.official_challenges:
         try:
             from qorcap_submit import OFFICIAL_URL, OfficialLive, start_official_live
-            live = OfficialLive(a.referee_url or OFFICIAL_URL, bundle, match_id, a.role, api, challenges=a.official_challenges,
+            live = OfficialLive(a.referee_url or OFFICIAL_URL, bundle, match_id, a.role, api,
+                                challenges=a.official_challenges and game != "cod",
                                 gate=lambda: state.get("gate"), console=ui)
-            if a.official_challenges:
+            if a.official_challenges and game != "cod":
                 say("Official QorTime challenges are ON (3 per game: game start, second half, 4th quarter).")
                 say("A CHALLENGE line appears only when Madden lets you pause: after the kickoff, once a play is called.")
                 say("Then, at the line before the snap, press OPTIONS and the shown buttons (90 seconds; if the snap")
                 say("comes first, do it at the next play). Kickoffs never count: you cannot pause during them.\n")
+            elif a.official_challenges and game == "cod":
+                say("Official challenges stay closed. No Call of Duty pause moment is wired for them.")
+                say("Anchors can still run. A challenge is not opened from the CoD pause menu.\n")
         except Exception as e:  # never block a recording on the network helper
             say(f"(official referee link unavailable: {e})")
             live = None
@@ -1430,6 +2044,13 @@ def main(argv=None) -> int:
             start_official_live(live, stop)
         except Exception as e:
             say(f"(official referee link unavailable: {e})")
+    if not a.test_pattern:
+        try:
+            from qorcap_practice_challenge import PracticeChallengePrompter, enabled as _practice_chal_enabled
+            if _practice_chal_enabled(game, os.environ):
+                PracticeChallengePrompter(api, role=a.role, console=ui, say=say).start(stop)
+        except Exception:
+            pass
 
     reported = {"seq": -1}
 
@@ -1451,6 +2072,22 @@ def main(argv=None) -> int:
                 pass
         return got
 
+    # practice=True is this sidecar's explicit stop gate. This process does not
+    # read another installed build. Other games still write nothing.
+    # joined stays None until save_tail seals, which is after countersign.
+    # persist_stats must not join: that stamp lands before wait_and_countersign.
+    stop_box = {"joined": None}
+    capture_fault = None
+
+    def persist_stats():
+        maybe_write_cod_reader_stats(
+            bundle, state, game, practice=True, reader_joined=stop_box["joined"])
+        # Info-only PWEC index: practice lane + CoD only, written outside the match folder.
+        try:
+            maybe_write_engagement_windows(bundle, game)
+        except Exception:
+            pass
+
     tail_s = post_final_tail_s()
     stop_reason = "final"
     try:
@@ -1470,13 +2107,14 @@ def main(argv=None) -> int:
             info = {"segments": (got or {}).get("segments", 0),
                     "score": (tl.get("score") if isinstance(tl, dict) else None),
                     "clips": len(tl.get("clips", [])) if isinstance(tl, dict) else 0}
-            line = status_line(st, info, len(cs.signed))
+            line = status_line(st, info, len(cs.signed), game=game)
             if ui is not None and ui.branded:
                 try:
                     from qorcap_console import console_snapshot
                     ui.update(console_snapshot(st, info, len(cs.signed), live))
-                    held = ((st.get("input") or {}).get("buttons")) or []
-                    ui.observe_buttons(held, trusted=False)
+                    inp = st.get("input") or {}
+                    held = inp.get("buttons") or []
+                    ui.observe_buttons(held, trusted=False, recent=inp.get("recent_presses"))
                 except Exception:
                     ui.disable()
                     sys.stdout.write("\r" + line.ljust(110))
@@ -1495,8 +2133,12 @@ def main(argv=None) -> int:
                 if tail_s > 0:
                     saving = (f"Saving final clip. Capture continues for the usual hold and for {tail_s:g} s "
                               "after the end screen, whichever is later. Leave that menu up.")
-                say(f"\n\nFINAL (end-of-game menu): AWAY {f['away']} - HOME {f['home']}. {saving}"
-                    + (f"\n  note: {f['notes'][0]}" if f.get("notes") else ""))
+                if game == "cod":
+                    say(f"\n\nFINAL (Call of Duty end screen): AWAY {f['away']} - HOME {f['home']}. {saving}"
+                        + (f"\n  note: {f['notes'][0]}" if f.get("notes") else ""))
+                else:
+                    say(f"\n\nFINAL (end-of-game menu): AWAY {f['away']} - HOME {f['home']}. {saving}"
+                        + (f"\n  note: {f['notes'][0]}" if f.get("notes") else ""))
             elif f and state.get("final_seen_at") is None:
                 state["final_seen_at"] = now_mono
                 say(f"\n\nFINAL on the scorebug ({f['basis']}): AWAY {f['away']} - HOME {f['home']}. Waiting up to "
@@ -1507,6 +2149,7 @@ def main(argv=None) -> int:
                 state["source_error"] = "disk_full"
             now_mono = time.monotonic()
             reason = capture_stop_reason(state, now_mono, tail_s=tail_s)
+            reason = cod_end_stop_reason(state, reason, say=say)
             if reason == "enter":
                 stop_reason = "enter"
                 _remember_tail_stop(state, now_mono, int(time.time() * 1000))
@@ -1536,110 +2179,199 @@ def main(argv=None) -> int:
             _remember_tail_stop(state, now_mono, int(time.time() * 1000))
     except KeyboardInterrupt:
         stop_reason = "ctrl_c"
-        _remember_tail_stop(state, time.monotonic(), int(time.time() * 1000))
-        say("\n\nStopping (Ctrl+C) ...")
+        try:
+            _remember_tail_stop(state, time.monotonic(), int(time.time() * 1000))
+        except Exception:
+            pass
+        try:
+            say("\n\nStopping (Ctrl+C) ...")
+        except Exception:
+            pass
+    except Exception:
+        # The match save still runs. Joining or persisting here would seal the
+        # reader before wait_and_countersign and could skip the receipt.
+        capture_fault = sys.exc_info()[1]
+        stop_reason = "capture_error"
+        try:
+            _remember_tail_stop(state, time.monotonic(), int(time.time() * 1000))
+        except Exception:
+            pass
+        try:
+            say("\n\nStopping after a capture error. The match save still runs.")
+        except Exception:
+            pass
     finally:
         if ui is not None:
             try:
                 ui.close()
             except Exception:
                 pass
-    stop.set()
-    # Do not join the reader here. Checkpoints are still landing about every 2 s,
-    # and a multi-second join stamps them late enough for verify_chain's clock_skew.
-    # The join is after wait_and_countersign, in short slices that keep sweeping.
-    ignore_ctrl_c()  # from here on, a Ctrl+C must not abort signing (it caused 'receipt failed' + Y/N prompt)
-    say("\n\nStopping QorCap: sealing and countersigning the final checkpoints ...")
-    sweep()
-    try:
-        api.post("/shutdown", shutdown_body(stop_reason))
-    except Exception:
-        pass
-    # Countersign the stop checkpoints over the API while QorCap is still up; QorCap waits for our report
-    # before the input-proof analysis (v0.3.2 stamped the tail ~105 s late: gap_too_long + clock_skew).
-    phase = {"last": None}
-
-    def tick():
-        try:
-            st = api.get("/status", timeout=1)
-        except Exception:
-            return
-        s_ = st.get("state")
-        if s_ != phase["last"]:
-            phase["last"] = s_
-            msg = {"countersigning": "  final checkpoints: countersigning ...",
-                   "finishing": f"  final checkpoints countersigned ({len(cs.signed)}). Checking controller input against the video (1-2 minutes, please wait) ...",
-                   "stopped": "  QorCap finished the match bundle."}.get(s_)
-            if msg:
+    def save_tail():
+        def note(msg: str = "") -> None:
+            try:
                 say(msg)
-    wait_and_countersign(proc, bundle / "checkpoints.jsonl", cs, timeout=SHUTDOWN_TIMEOUT_S, sweep=sweep, on_tick=tick)
-    log.close()
-    # Sidecar file only. Not a bundle.json field and not a receipt field.
-    if state.get("tail_stop_wall_ms") is None:
-        _remember_tail_stop(state, time.monotonic(), int(time.time() * 1000))
-    record_post_final_tail(
-        bundle,
-        configured_s=tail_s,
-        start_reason=state.get("final_screen_start_reason"),
-        start_t_ms=state.get("final_screen_wall_ms"),
-        stop_t_ms=state.get("tail_stop_wall_ms"),
-        actual_s=state.get("tail_actual_s"))
+            except Exception:
+                pass
 
-    # Countersign anything QorCap wrote while shutting down (still within seconds of t_ms).
-    for line in (bundle / "checkpoints.jsonl").read_text(encoding="utf-8").splitlines() if (bundle / "checkpoints.jsonl").exists() else []:
-        if line.strip():
-            c = json.loads(line)
-            if c["seq"] >= len(cs.signed):
-                cs.offer(c)
+        stop.set()
+        # Do not join the reader here. Checkpoints are still landing about every 2 s,
+        # and a multi-second join stamps them late enough for verify_chain's clock_skew.
+        # The join is after wait_and_countersign, in short slices that keep sweeping.
+        ignore_ctrl_c()  # from here on, a Ctrl+C must not abort signing (it caused 'receipt failed' + Y/N prompt)
+        note("\n\nStopping QorCap: sealing and countersigning the final checkpoints ...")
+        try:
+            sweep()
+        except Exception:
+            pass
+        end_stop = state.get("cod_end_stop")
+        # Named stop_note, not note: rebinding note here made tick() call a string (or None) and
+        # raise out of wait_and_countersign, so cod_end_stop.json was never written (#153 match
+        # 20261111-183311). The file is written before /shutdown whenever the stop note fires.
+        stop_note = cod_end_stop_before_shutdown(state, bundle, stop_reason, say=note)
+        try:
+            api.post("/shutdown", shutdown_body(stop_reason, stop_note))
+        except Exception:
+            pass
+        # Countersign the stop checkpoints over the API while QorCap is still up; QorCap waits for our report
+        # before the input-proof analysis (v0.3.2 stamped the tail ~105 s late: gap_too_long + clock_skew).
+        phase = {"last": None}
 
-    # The chain is countersigned. Join the reader in slices so a checkpoint that
-    # arrives during the join is still stamped, then the final check may append
-    # one notice. The health file stays open until mark_health_sealed.
-    seal_reader(stop, state, sweep=sweep)
+        def tick():
+            try:
+                st = api.get("/status", timeout=1)
+            except Exception:
+                return
+            s_ = st.get("state")
+            if s_ != phase["last"]:
+                phase["last"] = s_
+                msg = {"countersigning": "  final checkpoints: countersigning ...",
+                       "finishing": f"  final checkpoints countersigned ({len(cs.signed)}). Checking controller input against the video (1-2 minutes, please wait) ...",
+                       "stopped": "  QorCap finished the match bundle."}.get(s_)
+                if msg:
+                    note(msg)
+        wait_and_countersign(proc, bundle / "checkpoints.jsonl", cs, timeout=SHUTDOWN_TIMEOUT_S, sweep=sweep, on_tick=tick)
+        try:
+            log.close()
+        except Exception:
+            pass
+        # Sidecar file only. Not a bundle.json field and not a receipt field.
+        # A failure here must not skip the seal or the receipt.
+        try:
+            if state.get("tail_stop_wall_ms") is None:
+                _remember_tail_stop(state, time.monotonic(), int(time.time() * 1000))
+            record_post_final_tail(
+                bundle,
+                configured_s=tail_s,
+                start_reason=state.get("final_screen_start_reason"),
+                start_t_ms=state.get("final_screen_wall_ms"),
+                stop_t_ms=state.get("tail_stop_wall_ms"),
+                actual_s=state.get("tail_actual_s"))
+        except Exception:
+            pass
+        # Practice CoD auto stop: sidecar file only, same rule as post_final_tail.json.
+        try:
+            if end_stop is not None:
+                end_stop.record(bundle, stop_reason=stop_reason, stop_wall_ms=state.get("tail_stop_wall_ms"),
+                                fired=bool(state.get("cod_end_stop_fired")))
+        except Exception:
+            pass
+        # Practice CoD local response bound: info-only sidecar summary (never alters receipt).
+        try:
+            from qorcap_practice_challenge import read_hand_challenge_summary
+            for _hc_line in read_hand_challenge_summary(bundle):
+                note(_hc_line)
+        except Exception:
+            pass
 
-    say("\nFinishing up: signing the receipt ...")
-    draft_p = bundle / "receipt.draft.json"
-    if not draft_p.exists():
+        # Countersign anything QorCap wrote while shutting down (still within seconds of t_ms).
+        try:
+            cp_path = bundle / "checkpoints.jsonl"
+            cp_lines = cp_path.read_text(encoding="utf-8").splitlines() if cp_path.is_file() else []
+        except Exception:
+            cp_lines = []
+        for line in cp_lines:
+            if not line.strip():
+                continue
+            try:
+                c = json.loads(line)
+                if c["seq"] >= len(cs.signed):
+                    cs.offer(c)
+            except Exception:
+                continue
+
+        # The chain is countersigned. Join the reader in slices so a checkpoint that
+        # arrives during the join is still stamped, then the final check may append
+        # one notice. The health file stays open until mark_health_sealed.
+        try:
+            stop_box["joined"] = bool(seal_reader(stop, state, sweep=sweep))
+        except Exception:
+            stop_box["joined"] = False
+
+        note("\nFinishing up: signing the receipt ...")
+        draft_p = bundle / "receipt.draft.json"
+        if not draft_p.exists():
+            mark_health_sealed(state)
+            note(f"FAIL: QorCap did not write the bundle. See {bundle / 'qorcap.log'}")
+            return 2, None, None
+        draft = json.loads(draft_p.read_text(encoding="utf-8"))
+        from qorcap_games import recorded_set, stamp_draft, uses_madden_reader
+        spec = recorded_set(bundle)
+        # Same abstain rule as offline finalize. An end-menu final is kept. The rule is on, not behind a flag.
+        live_fin = state.get("final")
+        unresolved = _grammar_unresolved(state.get("core")) if uses_madden_reader(spec) else False
+        if live_fin and is_end_menu_final(live_fin):
+            draft = apply_stopped_match_final(draft, live_fin, grammar_unresolved=unresolved)
+        elif unresolved:
+            draft = apply_stopped_match_final(draft, None, grammar_unresolved=True)
+        if uses_madden_reader(spec) and not a.test_pattern and draft["result"].get("method") != "end_menu_read" and a.ffmpeg:
+            draft = tail_final_check(bundle, draft, ffmpeg=a.ffmpeg, grammar_unresolved=unresolved, live_final=live_fin)
+        elif uses_madden_reader(spec) and not a.test_pattern and draft["result"].get("method") == "end_menu_read" and draft["result"].get("final_confirmed") is not True and a.ffmpeg:
+            # Stop-time fallback: re-read with bundle haptics/clips so a live-uncorroborated delta can still confirm.
+            # A disputed end menu is not re-read: the first agreeing frame would exact-match and upgrade it.
+            draft = tail_final_check(bundle, draft, ffmpeg=a.ffmpeg, grammar_unresolved=unresolved, live_final=live_fin)
+        draft = stamp_draft(draft, spec)
+        from qorcap_reanchor_notes import record_unresolved_final
+        record_unresolved_final(bundle, draft.get("result"))
+        if not a.test_pattern and a.audio != "none":
+            report_recording_audio(bundle, a.ffmpeg or next((str(c) for c in [HERE.parent / ("ffmpeg.exe" if WIN else "ffmpeg")]
+                                                             if c.exists()), None) or shutil.which("ffmpeg"))
+        # After the final check's notice, before the signature. A late health row is dropped.
         mark_health_sealed(state)
-        say(f"FAIL: QorCap did not write the bundle. See {bundle / 'qorcap.log'}")
-        return 2
-    draft = json.loads(draft_p.read_text(encoding="utf-8"))
-    # Same abstain rule as offline finalize. An end-menu final is kept. The rule is on, not behind a flag.
-    live_fin = state.get("final")
-    unresolved = _grammar_unresolved(state.get("core"))
-    if live_fin and is_end_menu_final(live_fin):
-        draft = apply_stopped_match_final(draft, live_fin, grammar_unresolved=unresolved)
-    elif unresolved:
-        draft = apply_stopped_match_final(draft, None, grammar_unresolved=True)
-    if not a.test_pattern and draft["result"].get("method") != "end_menu_read" and a.ffmpeg:
-        draft = tail_final_check(bundle, draft, ffmpeg=a.ffmpeg, grammar_unresolved=unresolved, live_final=live_fin)
-    elif not a.test_pattern and draft["result"].get("method") == "end_menu_read" and draft["result"].get("final_confirmed") is not True and a.ffmpeg:
-        # Stop-time fallback: re-read with bundle haptics/clips so a live-uncorroborated delta can still confirm.
-        # A disputed end menu is not re-read: the first agreeing frame would exact-match and upgrade it.
-        draft = tail_final_check(bundle, draft, ffmpeg=a.ffmpeg, grammar_unresolved=unresolved, live_final=live_fin)
-    from qorcap_reanchor_notes import record_unresolved_final
-    record_unresolved_final(bundle, draft.get("result"))
-    if not a.test_pattern and a.audio != "none":
-        report_recording_audio(bundle, a.ffmpeg or next((str(c) for c in [HERE.parent / ("ffmpeg.exe" if WIN else "ffmpeg")]
-                                                         if c.exists()), None) or shutil.which("ffmpeg"))
-    # After the final check's notice, before the signature. A late health row is dropped.
-    mark_health_sealed(state)
-    code = sign_and_report(bundle, draft, cs.signed, device, referee, match_id=match_id, role=a.role,
-                           started_ms=started_ms, qt=qt, qorcap=qorcap, no_open=a.no_open)
-    if live is not None:
-        say(f"  Official anchors: {live.anchors} (link failures: {live.failures})")
-    ff = a.ffmpeg or next((str(c) for c in [HERE.parent / ("ffmpeg.exe" if WIN else "ffmpeg")] if c.exists()), None) or shutil.which("ffmpeg") or "ffmpeg"
+        code = sign_and_report(bundle, draft, cs.signed, device, referee, match_id=match_id, role=a.role,
+                               started_ms=started_ms, qt=qt, qorcap=qorcap, no_open=a.no_open)
+        if spec.set_id == "cod":
+            try:
+                from qorcap_cod import attach_session
+                attach_session(bundle)
+            except Exception as e:
+                note(f"  Call of Duty session tags were not written: {type(e).__name__}: {e}")
+        if live is not None:
+            note(f"  Official anchors: {live.anchors} (link failures: {live.failures})")
+        ff = a.ffmpeg or next((str(c) for c in [HERE.parent / ("ffmpeg.exe" if WIN else "ffmpeg")] if c.exists()), None) or shutil.which("ffmpeg") or "ffmpeg"
 
-    def _highlights():
-        # After sign_and_report only. The recorder has stopped; a fresh marker still skips this.
-        post_match_highlights(bundle, ff, qorcap=qorcap, qortime=qt)
+        def _highlights():
+            # After sign_and_report only. The recorder has stopped; a fresh marker still skips this.
+            post_match_highlights(bundle, ff, qorcap=qorcap, qortime=qt)
 
-    def _submit():
-        if code != 2 and (a.submit or not a.no_submit_prompt) and not a.test_pattern:
-            offer_submit(bundle, a.referee_url, auto=a.submit, ask=ask_with_timeout)
+        def _submit():
+            if code != 2 and (a.submit or not a.no_submit_prompt) and not a.test_pattern:
+                offer_submit(bundle, a.referee_url, auto=a.submit, ask=ask_with_timeout)
 
+        return code, _highlights, _submit
+
+    try:
+        code, highlights, submit = run_with_reader_stats(save_tail, persist_stats)
+    except Exception as save_exc:
+        if capture_fault is not None:
+            raise save_exc from capture_fault
+        raise
+    if capture_fault is not None:
+        try:
+            say(f"  Capture loop error ({type(capture_fault).__name__}) did not skip the match save.")
+        except Exception:
+            pass
     return after_receipt(code, auto_highlights=a.auto_highlights and not a.no_auto_highlights,
-                         highlights=_highlights, submit=_submit)
+                         highlights=highlights, submit=submit)
 
 
 SUBMIT_PROMPT_TIMEOUT_S = 600
@@ -1897,7 +2629,7 @@ def sign_and_report(bundle: Path, draft: dict, cps: list[dict], device, referee,
 
     r = rec["result"]
     say("\n" + "=" * 64)
-    say(f"  RESULT: {result}")
+    say(f"  RESULT: {result}", verdict=result)
     say("=" * 64)
     unconfirmed = no_final or draft["result"].get("final_confirmed") is not True
     score_txt = ("not read (no scorebug read during the match)" if r.get("home_score") is None else
@@ -2578,6 +3310,62 @@ def capture_stop_reason(state: dict, now: float, *, tail_s: float) -> str | None
     return "final"
 
 
+def cod_end_stop_before_shutdown(state: dict, bundle, stop_reason: str | None, *, say=None) -> str | None:
+    """When the practice CoD auto stop fired: write ``cod_end_stop.json`` now, then return the stop note.
+
+    Runs before ``/shutdown``, so the file exists even if anything later in the save fails. The file
+    is info only (not bundle.json, not the receipt). It is written again after the countersign with the
+    same fields. Returns None (no note, nothing written) when the auto stop did not fire.
+    """
+    end_stop = state.get("cod_end_stop")
+    if end_stop is None or not state.get("cod_end_stop_fired"):
+        return None
+    try:
+        stop_note = end_stop.log_note(stop_reason)
+    except Exception:
+        stop_note = None
+    try:
+        end_stop.record(bundle, stop_reason=stop_reason, stop_wall_ms=state.get("tail_stop_wall_ms"), fired=True)
+    except Exception as e:  # noqa: BLE001
+        if say is not None:
+            try:
+                say(f"  cod_end_stop.json was not written: {type(e).__name__}: {e}")
+            except Exception:
+                pass
+    return stop_note
+
+
+def cod_end_stop_reason(state: dict, reason: str | None, *, now: float | None = None, say=None) -> str | None:
+    """Apply the practice CoD auto stop (``qorcap_cod_endstop``) on top of ``capture_stop_reason``.
+
+    Off (no watcher in ``state``): ``reason`` is returned unchanged. On:
+
+    - Enter/Q and capture errors are unchanged and still stop at once.
+    - A confirmed end screen whose tail has run out stops with ``final`` when a final was posted,
+      otherwise ``post_final_tail`` (both existing stop reasons; no new receipt value).
+    - The tail only adds time: an older ``final`` stop that is due before the tail ends waits for it.
+    """
+    es = state.get("cod_end_stop")
+    if es is None:
+        return reason
+    if es.confirmed is not None and not state.get("cod_end_stop_said"):
+        state["cod_end_stop_said"] = True
+        if say is not None:
+            try:
+                say(f"\n\n{es.describe()} {es.stop_plan()}")
+            except Exception:
+                pass
+    due = es.stop_due(now)
+    if reason in ("final", "post_final_tail") and es.confirmed is not None and not due:
+        return None
+    if reason is None and due:
+        state["cod_end_stop_fired"] = True
+        return "final" if _final_was_posted(state) else "post_final_tail"
+    if reason in ("final", "post_final_tail") and due:
+        state["cod_end_stop_fired"] = True
+    return reason
+
+
 def died_during_post_final_tail(state: dict, now: float, tail_s: float) -> bool:
     """The recorder process exited during the tail, before that auto-stop."""
     screen_at = _mono(state.get("final_screen_mono"))
@@ -2695,6 +3483,33 @@ def _disputed_final_result(draft: dict, live_final: dict, *, grammar_unresolved:
     return dict(draft, result=result)
 
 
+def _scorebug_returned_after_final(fin, rows) -> bool:
+    """True when live posted an unconfirmed end-menu final and a real scorebug row is later.
+
+    Later evidence must not upgrade that final. A row at the menu's end is not after it.
+    An observation, a row with no home score, and a flushed touchdown hold are not a return.
+    """
+    if not isinstance(fin, dict) or fin.get("final_confirmed") is True:
+        return False
+    if not is_end_menu_final(fin):
+        return False
+    menu = fin.get("end_menu") if isinstance(fin.get("end_menu"), dict) else {}
+    start = menu.get("until_ms")
+    if isinstance(start, bool) or not isinstance(start, int):
+        start = fin.get("t_ms")
+    if isinstance(start, bool) or not isinstance(start, int):
+        return False
+    for r in rows or []:
+        if not isinstance(r, dict) or "obs" in r or "home" not in r or r.get("touchdown_hold") is True:
+            continue
+        t = r.get("t_ms")
+        if isinstance(t, bool) or not isinstance(t, int):
+            continue
+        if t > start:
+            return True
+    return False
+
+
 def tail_final_check(bundle: Path, draft: dict, *, ffmpeg: str, secs: int = TAIL_SECS, hz: float = TAIL_HZ,
                      core_factory=None, frames=None, grammar_unresolved: bool = False,
                      live_final=None) -> dict:
@@ -2703,20 +3518,51 @@ def tail_final_check(bundle: Path, draft: dict, *, ffmpeg: str, secs: int = TAIL
     and final.tail.json. Checkpoints are untouched (the chain is sealed at stop); only the draft result changes.
 
     The live post-final tail (``post_final_tail_s``) only keeps the recorder running before this. It does not
-    change the result written here. ``hz`` stays ``TAIL_HZ``.
+    change the result written here. ``hz`` stays ``TAIL_HZ``. The look-back stays ``secs``
+    (``TAIL_SECS``, 240). It is not shortened.
 
-    A disputed live final is not re-read. The re-read stops at the first end-menu agreement, so a
-    later disagreeing menu is invisible and the first score would be posted again as an exact match.
+    The window is decoded before any end menu is considered (``list`` of the frame generator).
+    Reading past the first menu does not decode more video. It only runs the reader on frames
+    that were already decoded.
+
+    A disputed live final is not re-read. Every other tail is fed through the last frame, on one
+    ``ReaderCore``. The tail inherits live's quarter floor: the highest integer quarter on the
+    live rows, and only a quarter of 1 or higher. Bool, None, zero, negative, and anything else
+    are not a quarter. A read below that floor is dropped, the same as live. Without the floor a
+    trailing Q3 misread is kept, the first menu fails the Q4 gate, and a later showing can confirm.
+
+    The tail also inherits live's first end-screen time. Frames already decoded in this window
+    that fall at or before the last live row are not read again. An end-screen picture among
+    them is recorded with ``_note_end_screen_time``, the memory live keeps after a scorebug
+    return. Evidence from that screen through the scorebug does not confirm a later menu.
+    No extra video is decoded.
+
+    An unconfirmed live final stays unconfirmed when a scorebug read returned after it. Later
+    evidence must not upgrade that final. The tail does not confirm what live would not.
+
+    A later menu that disagrees keeps the first score, with ``final_confirmed``
+    false and ``end_menu_disputed`` true. The note is the one ``_note_end_menu_disagreement``
+    writes: a scorebug between the menus is named only when a real scorebug row lies strictly
+    between them. Stopping at the first agreement would sign that first score confirmed.
     """
     if end_menu_was_disputed(live_final):
         return _disputed_final_result(draft, live_final, grammar_unresolved=grammar_unresolved)
     live = [r for r in read_jsonl(bundle / "timeline.jsonl") if "obs" not in r and "home" in r]
     if not live:
         return draft
+    hold_unconfirmed = _scorebug_returned_after_final(live_final, live)
+
+    def unchanged(current):
+        if not hold_unconfirmed:
+            return current
+        result = dict(current.get("result") or {})
+        result["final_confirmed"] = False
+        return dict(current, result=result)
+
     vids = video_files(bundle)
     manifest = [m for m in read_jsonl(bundle / "manifest.jsonl") if m.get("type") == "segment"]
     if not vids or not manifest:
-        return draft
+        return unchanged(draft)
     end_ms = int(manifest[-1]["wall_ms"])
     say(f"Final not seen live; checking the last {secs // 60} minutes of the recording for the end-of-game screen ...")
     events: list[dict] = []
@@ -2724,6 +3570,16 @@ def tail_final_check(bundle: Path, draft: dict, *, ffmpeg: str, secs: int = TAIL
     from qorcap_reanchor_notes import append_note
     core.reanchor_note = lambda row, bundle=bundle: append_note(bundle, row)
     core.timeline = [dict(r) for r in live]
+    # Highest quarter live posted, and only a quarter of 1 or higher. Zero and negative
+    # are not a floor. Set the attribute directly: a hasattr guard would skip the seed
+    # on a rename and the tail would confirm a later showing.
+    floor = None
+    for r in live:
+        q = r.get("quarter") if isinstance(r, dict) else None
+        if isinstance(q, bool) or not isinstance(q, int) or q < 1:
+            continue
+        floor = q if floor is None else max(floor, q)
+    core._max_quarter = floor
     # One deadline for every lock on this path: the inputs view, and the manifest
     # and haptics tails inside the bundle snapshot. A refresh stuck in any of
     # those reads must not hang the receipt. Fail closed: unconfirmed final,
@@ -2773,16 +3629,22 @@ def tail_final_check(bundle: Path, draft: dict, *, ffmpeg: str, secs: int = TAIL
         frames = decode_frames_tail(ffmpeg, vids[-1], secs, hz)
     pts = list(frames)
     if not pts:
-        return draft
+        return unchanged(draft)
     span = pts[-1][0]
+    from qorcap_reader import prep
+    det = getattr(core, "final_screen_detector", None)
     for vms, img in pts:
         t = end_ms - span + vms
         if t <= last_t:
+            # Already decoded. Remember the end screen live saw. Do not read the score again.
+            if det is not None and det(prep(img)):
+                core._note_end_screen_time(t)
             continue
         core.on_frame(t, img)
-        if getattr(core, "end_menu", None) is not None:
-            break
     fin = core.final
+    if hold_unconfirmed and isinstance(fin, dict):
+        fin = dict(fin)
+        fin["final_confirmed"] = False
     out = {"final": fin, "end_menu": getattr(core, "end_menu", None), "end_menu_rejected": getattr(core, "end_menu_rejected", None),
            "frames": core.stats, "window_secs": secs, "video": vids[-1].name,
            "method": "tail: QorCap end-of-game menu score reader (authoritative) + QorTime detect_final over the recorded last minutes, seeded with the live timeline"}
@@ -2790,8 +3652,8 @@ def tail_final_check(bundle: Path, draft: dict, *, ffmpeg: str, secs: int = TAIL
     if not fin:
         say("  no end-of-game screen in the recording's last minutes; final stays NOT confirmed.")
         if grammar_unresolved and draft.get("result", {}).get("method") != "end_menu_read":
-            return dict(draft, result=apply_final(draft["result"], None, grammar_unresolved=True))
-        return draft
+            return unchanged(dict(draft, result=apply_final(draft["result"], None, grammar_unresolved=True)))
+        return unchanged(draft)
     still = bool(grammar_unresolved) or _grammar_unresolved(core)
     if is_end_menu_final(fin):
         say(f"  FINAL (end-of-game menu, from recorded frames): AWAY {fin['away']} - HOME {fin['home']}")
@@ -2813,7 +3675,11 @@ def tail_final_check(bundle: Path, draft: dict, *, ffmpeg: str, secs: int = TAIL
         say(f"  (final clip not saved: {e})")
     # The tail reader starts with a fresh grammar, so a live disagreement stays in force.
     # An end-menu final is kept inside apply_final. A scorebug final does not clear it.
-    return dict(draft, result=apply_final(draft["result"], fin, grammar_unresolved=still))
+    # A scorebug that returned after an unconfirmed live final blocks the upgrade.
+    result = apply_final(draft["result"], fin, grammar_unresolved=still)
+    if hold_unconfirmed:
+        result["final_confirmed"] = False
+    return dict(draft, result=result)
 
 
 def decode_frames_tail(ffmpeg: str, video: Path, secs: int, hz: float, size=(1280, 720)):
@@ -3147,10 +4013,87 @@ def correct_role(bundle: Path, meta: dict, *, recorded: str, role: str, reason: 
     return meta
 
 
+LATE_FINALIZE_NAME = "late_finalize.json"
+LATE_FINALIZE_SCHEMA = "qorcap-late-finalize/v0"
+LATE_REASON = "the live save stopped before the receipt was signed"
+
+
+def _local_time(ms: int) -> str:
+    """Local wall time with its zone and UTC offset, e.g. ``2026-11-11 19:40:00 CST (UTC-0600)``."""
+    from datetime import datetime
+    dt = datetime.fromtimestamp(ms / 1000).astimezone()
+    return dt.strftime("%Y-%m-%d %H:%M:%S %Z (UTC%z)")
+
+
+def late_finalize_note(*, signed_ms: int, ended_ms: int, countersignatures: str) -> str:
+    """The ``result.notes`` line a late finalize adds. Both receipt signatures cover it.
+
+    It says the receipt was signed offline after the fact, when, how long after the recording ended,
+    why, and what the checkpoint countersignatures are. It never reads as a live signature.
+    """
+    gap_s = max(0, int(signed_ms) - int(ended_ms)) // 1000
+    h, rem = divmod(gap_s, 3600)
+    m, sec = divmod(rem, 60)
+    if countersignatures == "live":
+        cs = "checkpoint countersignatures are the live ones recorded during the match"
+    else:
+        cs = ("checkpoint countersignatures were re-signed offline; their times are the recording clock, "
+              "not observed live")
+    return (f"late sign: receipt signed offline at {_local_time(signed_ms)} (UTC ms {int(signed_ms)}), "
+            f"{h}h {m:02d}m {sec:02d}s after the recording ended (ended_ms {int(ended_ms)}); "
+            f"reason: {LATE_REASON}; {cs}. Not signed at match time.")
+
+
+def late_sign(draft: dict, cps: list[dict], started_ms: int, kind: str, *, late: bool, meta: dict | None = None,
+              now_ms: int | None = None) -> tuple[dict, dict | None]:
+    """Late finalize only: add the late-sign note to ``result.notes`` before signing.
+
+    Returns the draft and the ``late_finalize.json`` document, or the draft unchanged and None when the
+    bundle already had a receipt (a normal re-finalize). Live Start Match signing never calls this.
+    """
+    if not late:
+        return draft, None
+    from qorcap_submit import CLIENT_VERSION
+    signed_ms = int(time.time() * 1000) if now_ms is None else int(now_ms)
+    ended_ms = int(receipt_ended_ms(cps, started_ms))
+    countersignatures = "live" if kind == REFEREE_KIND else "offline"
+    note = late_finalize_note(signed_ms=signed_ms, ended_ms=ended_ms, countersignatures=countersignatures)
+    res = dict(draft.get("result") or {})
+    res["notes"] = list(res.get("notes") or []) + [note]
+    doc = {
+        "schema": LATE_FINALIZE_SCHEMA,
+        "info_only": True,
+        "signed_ms": signed_ms,
+        "signed_local": _local_time(signed_ms),
+        "ended_ms": ended_ms,
+        "gap_s": round(max(0, signed_ms - ended_ms) / 1000, 3),
+        "reason": LATE_REASON,
+        "countersignatures": countersignatures,
+        "referee_key_kind": kind,
+        "qorcap_version": CLIENT_VERSION,
+        "recorded_with": (meta or {}).get("qorcap_version"),
+        "note": note,
+    }
+    return dict(draft, result=res), doc
+
+
+def record_late_finalize(bundle: Path, doc: dict | None) -> None:
+    """Write ``late_finalize.json`` beside the bundle (tmp + rename) once receipt.json exists."""
+    if doc is None or not (Path(bundle) / "receipt.json").exists():
+        return
+    path = Path(bundle) / LATE_FINALIZE_NAME
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(doc, indent=2) + "\n", encoding="utf-8")
+    os.replace(tmp, path)
+    say(f"  Late sign:    {doc['note']}")
+
+
 def finalize(bundle: Path, *, qt: Path, qorcap: str, ffmpeg: str, key_dir: Path, no_open: bool = True,
              core_factory=None, hz: float = FIN_HZ, recover: bool = False, role: str | None = None,
              role_reason: str | None = None) -> int:
     bundle = bundle.resolve()
+    # Late finalize: no receipt was signed when the match was saved. The receipt then says so (late_sign).
+    late = not (bundle / "receipt.json").exists()
     vids = video_files(bundle)
     if not vids:
         say(f"No video.mp4 in {bundle}")
@@ -3178,6 +4121,61 @@ def finalize(bundle: Path, *, qt: Path, qorcap: str, ffmpeg: str, key_dir: Path,
         match_id = f"local-{bundle.name.removeprefix('match-')}"
     started_ms = int(draft["match"]["started_ms"])
     device, referee = load_keys(key_dir)
+
+    from qorcap_games import recorded_set, stamp_draft, uses_madden_reader
+    spec = recorded_set(bundle)
+    if not uses_madden_reader(spec):
+        if spec.set_id == "closed":
+            say("Game set file could not be read. No score was Counted.")
+        else:
+            say("Call of Duty set. The Madden scorebug is not read.")
+            try:
+                from qorcap_cod import END_PROBE_TAIL_S, record_end_probe
+                frames = list(decode_frames_tail(ffmpeg, vids[-1], END_PROBE_TAIL_S, FIN_HZ)) if vids else []
+                probe = record_end_probe(bundle, frames)
+                say(f"End probe used the last {probe['frames']} frame(s). It does not scan a long window.")
+                if not probe["posted"]:
+                    say(f"  {probe['reason']}. The score stays not Counted unless the match already posted an end screen.")
+            except Exception as e:
+                say(f"  Call of Duty end probe was not written: {type(e).__name__}: {e}")
+                say("The score stays Counted only when the match already posted an end screen.")
+        draft = stamp_draft(draft, spec)
+        if role != rec_role:
+            corr = meta.get("role_correction") if isinstance(meta.get("role_correction"), dict) else {}
+            res = dict(draft.get("result") or {})
+            res["notes"] = list(res.get("notes") or []) + [
+                f"side corrected after recording: QorCap was set to {rec_role}, signed as {role}"
+                + (f" ({corr['reason']})" if corr.get("reason") else "")
+                + f"; checkpoints and challenges keep the recorded side {rec_role}"]
+            draft = dict(draft, result=res)
+        live = read_jsonl(bundle / "countersigned.jsonl")
+        side_changed = role != rec_role
+        if live and not side_changed and len(live) >= len(qcps) and all(a["hash"] == b["hash"] for a, b in zip(live, qcps)):
+            cps, kind = live[:len(qcps)], REFEREE_KIND
+            note = "scores were not read from the Madden scorebug; checkpoint signatures are the live ones from Start Match."
+        else:
+            cs = Countersigner(referee, match_id, role)
+            cs.ts_of = lambda cp: int(cp["t_ms"])
+            for c in qcps:
+                cs.offer(c)
+            cps, kind = cs.signed, REFEREE_KIND_OFFLINE
+            note = "the local referee signed QorCap's checkpoints after the fact. The Madden scorebug was not read."
+        if side_changed:
+            say("NOT SUBMITTABLE")
+        say("\nSigning the receipt ...")
+        draft, late_doc = late_sign(draft, cps, started_ms, kind, late=late, meta=meta)
+        code = sign_and_report(bundle, draft, cps, device, referee, match_id=match_id, role=role,
+                               started_ms=started_ms, qt=qt, qorcap=qorcap, no_open=no_open,
+                               referee_kind=kind, note=note, submittable=not side_changed)
+        record_late_finalize(bundle, late_doc)
+        set_bundle_submittable(bundle, not side_changed)
+        if spec.set_id == "cod":
+            try:
+                from qorcap_cod import attach_session
+                attach_session(bundle)
+            except Exception as e:
+                say(f"  Call of Duty session tags were not written: {type(e).__name__}: {e}")
+        return code
 
     say(f"Reading the scorebug from {', '.join(v.name for v in vids)} ({hz:g} frames/s) ...")
     t0 = time.monotonic()
@@ -3291,9 +4289,11 @@ def finalize(bundle: Path, *, qt: Path, qorcap: str, ffmpeg: str, key_dir: Path,
         say("NOT SUBMITTABLE")
     report_recording_audio(bundle, ffmpeg)
     say("\nSigning the receipt ...")
+    draft, late_doc = late_sign(draft, cps, started_ms, kind, late=late, meta=meta)
     code = sign_and_report(bundle, draft, cps, device, referee, match_id=match_id, role=role, started_ms=started_ms,
                            qt=qt, qorcap=qorcap, no_open=no_open, referee_kind=kind, note=note,
                            submittable=not side_changed)
+    record_late_finalize(bundle, late_doc)
     # After sign_and_report: it may rewrite bundle.json (challenge rule). The mark is the last write.
     # Restoring the recorded side clears it and reuses the live signatures already on disk.
     set_bundle_submittable(bundle, not side_changed)

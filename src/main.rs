@@ -342,13 +342,31 @@ fn main() {
         Cmd::Status => print_resp(api::call(cli.port, "GET", "/status", "")),
         Cmd::VerifyBundle { dir } => match qorcap::bundle::verify(std::path::Path::new(&dir)) {
             Ok(r) => {
-                println!("segments={} bytes={} checkpoints={} chain_head={}", r.segments, r.bytes, r.checkpoints, r.chain_head);
-                if let Some(h) = &r.input_head { println!("controller input chunks={} inputs_chain_head={h}", r.input_chunks); }
-                for e in &r.errors { println!("FAIL: {e}"); }
-                println!("{}", if r.errors.is_empty() { "OK: video bytes match the hash chain; checkpoints link. (Integrity + timing only; does not prove who played.)" } else { "FAILED" });
-                if r.errors.is_empty() { 0 } else { 1 }
+                let (lines, code) = qorcap::bundle::report_lines(&r);
+                for l in &lines { println!("{l}"); }
+                code
             }
-            Err(e) => { eprintln!("error: {e}"); 2 }
+            Err(e) => { eprintln!("error: {}", qorcap::bundle::escape_output(&e)); 2 }
+        },
+        Cmd::CheckHandTimeline { dir } => match qorcap::hand::check::check_dir(std::path::Path::new(&dir)) {
+            Ok(r) => {
+                let (lines, code) = qorcap::hand::check::report_lines(&r);
+                for l in &lines { println!("{l}"); }
+                code
+            }
+            Err(e) => { eprintln!("error: {}", qorcap::bundle::escape_output(&e)); 2 }
+        },
+        Cmd::CheckResponseBound { dir, write } => {
+            let p = std::path::Path::new(&dir);
+            let res = if write { qorcap::hand::response::write_dir(p) } else { qorcap::hand::response::evaluate_dir(p) };
+            match res {
+                Ok(r) => {
+                    let (lines, code) = qorcap::hand::response::report_lines(&r);
+                    for l in &lines { println!("{l}"); }
+                    code
+                }
+                Err(e) => { eprintln!("error: {}", qorcap::bundle::escape_output(&e)); 2 }
+            }
         },
         Cmd::Finalize { bundle, python, recover, mut rest } => {
             if recover { rest.insert(0, "--recover".into()); }
@@ -394,9 +412,44 @@ fn main() {
             sidecar("psn-names", bundle, python, vec!["--samples".to_string(), samples.to_string()], &ff)
         }
         Cmd::InputTest { secs } => input_test(secs),
-        Cmd::AlignAb { dir, frames, no_video } => {
+        Cmd::S2sCounted { input, out, session_id, config, seal_status, disposition, in_calibration_set, holdout_reused } => {
+            // Offline, read-only on the bundle. The report goes to --out only (refused inside the bundle).
+            let cfg = match config {
+                None => qorcap::s2s::Config::standby_a(),
+                Some(p) => match std::fs::read_to_string(&p).map_err(|e| e.to_string()).and_then(|t| serde_json::from_str(&t).map_err(|e| e.to_string())) {
+                    Ok(c) => c,
+                    Err(e) => { eprintln!("error: --config {p}: {e}"); std::process::exit(2); }
+                },
+            };
+            if let Err(e) = cfg.validate() { eprintln!("error: {e}"); std::process::exit(2); }
+            // Canonical spellings (clap accepts any case). Both stay caller claims.
+            let seal_status = seal_status.to_ascii_lowercase();
+            let disposition = ["ok", "UNKNOWN", "VOID", "FAIL"].iter().find(|d| d.eq_ignore_ascii_case(&disposition)).map(|d| d.to_string()).unwrap_or(disposition);
+            let meta = qorcap::s2s::SessionMeta { session_id, seal_status, disposition, in_calibration_set, holdout_reused };
+            match qorcap::s2s::run(std::path::Path::new(&input), std::path::Path::new(&out), &meta, &cfg) {
+                Ok(r) => { eprintln!("wrote {out}: status {} tier {}", r["status"], r["tier"]); 0 }
+                Err(e) => { eprintln!("error: {e}"); 2 }
+            }
+        }
+        Cmd::AlignAb { dir, frames, no_video, rumble_echo, re_pair_tol_ms, re_max_lag_ms, re_quiet_ms, re_onset_threshold,
+                       re_spike_threshold, re_spike_pct, re_mode, re_sweep, re_hist } => {
             // Prints both clocks. Does not write the receipt, the proof, or the hash chain.
-            let report = qorcap::align::ab_report(std::path::Path::new(&dir), if no_video { None } else { Some(ff.as_str()) }, frames);
+            // --rumble-echo writes only the rumble_echo.json sidecar (selected params; never the sweep).
+            let mode: qorcap::rumble_echo::Mode = match re_mode.parse() { Ok(m) => m, Err(e) => { eprintln!("error: --re-mode {e}"); std::process::exit(2); } };
+            let opts = qorcap::rumble_echo::Opts {
+                params: qorcap::rumble_echo::Params {
+                    pair_tol_ms: re_pair_tol_ms as f64, max_lag_ms: re_max_lag_ms as f64, quiet_ms: re_quiet_ms as u64,
+                    onset_min_conf: re_onset_threshold as u64, spike_ratio: re_spike_threshold, spike_pct: re_spike_pct, mode,
+                },
+                sweep: re_sweep, histogram: re_hist,
+            };
+            let re = if rumble_echo || re_sweep || re_hist { Some(&opts) } else { None };
+            let report = qorcap::align::ab_report_with(std::path::Path::new(&dir), if no_video { None } else { Some(ff.as_str()) }, frames, re);
+            if let Some(rows) = report["rumble_echo_histogram"].as_array() {
+                let rows: Vec<[i64; 3]> = rows.iter().filter_map(|r| Some([r[0].as_i64()?, r[1].as_i64()?, r[2].as_i64()?])).collect();
+                eprint!("{}", qorcap::rumble_echo::histogram_text(&rows));
+            }
+            if let Some(rows) = report["rumble_echo_sweep"].as_array() { eprint!("{}", qorcap::rumble_echo::sweep_text(rows)); }
             println!("{}", serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".into()));
             0
         }
@@ -550,6 +603,8 @@ fn main() {
             }
             let e = Engine::new(a.clone(), ff);
             if a.no_controller { info!("controller input logging disabled (--no-controller)"); } else { let _ = e.start_input_logger(); }
+            // Practice lane only, default on. `--no-hand-timeline` switches it off for the session. Refused outside practice.
+            let _ = e.start_hand_logger();
             let srv = match api::serve(e.clone(), cli.port) { Ok(h) => h, Err(m) => { error!("{m}"); std::process::exit(2); } };
             { let e = e.clone(); let _ = ctrlc::set_handler(move || { info!("Ctrl+C: stopping"); e.request_stop("ctrl_c"); }); }
             ignore_parent_hangup();

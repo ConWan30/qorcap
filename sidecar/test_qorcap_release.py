@@ -63,6 +63,7 @@ def test_release_workflow_copies_contracts_and_fails_when_one_is_missing():
         "sidecar\\qorcap_console.py",
         "sidecar\\qorcap_ai_loop.py",
         "sidecar\\qorcap_challenge.py",
+        "docs\\GAME_SETS.md",
     ):
         assert rel_path in text
     assert 'throw "package missing $need"' in text

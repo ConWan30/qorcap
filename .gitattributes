@@ -5,3 +5,12 @@
 # contracts/* covers files directly in contracts/; contracts/** covers nested paths.
 contracts/* text eol=lf
 contracts/** text eol=lf
+# Byte-pinned test goldens (sha256 checked in the test): no CRLF conversion on Windows checkouts.
+sidecar/fixtures/highlights_golden_*.txt -text
+# Byte-pinned encoder pace fixture (sha256 checked in tools/test_encoder_pace.py): no CRLF conversion either.
+tools/fixtures/encoder_pace/** -text
+# Byte-pinned S2S body cue files (FROZEN-fusion-params.json sha256 is a code constant; the frozen file
+# records the sha256 of models.manifest.json and the fusion code): keep Windows checkouts equal to the git blob.
+tools/s2s_bodycue/** text eol=lf
+# PWEC reduced fixtures (gzip) and golden: binary / no CRLF conversion on Windows checkouts.
+sidecar/fixtures/pwec/** -text
