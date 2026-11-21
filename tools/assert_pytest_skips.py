@@ -225,12 +225,14 @@ WINDOWS_FILES = (
 # not re-collected; CI's collected total is authoritative. Re-collect after any list or test change.
 # sidecar/test_qorcap_engagement.py (PWEC) adds 27 non-parametrized tests on both lists: linux
 # re-collected locally at 1228 (main 0932fe8 + this file); windows set by count to 1209.
-# Merge of main 527296c (#186, 1234 linux / 1215 windows) with this branch's
-# tools/pwec2/test_pwec2.py (41 tests on both lists). Neither side's floor was
-# kept. Provisional 1275 / 1256 = 1234+41 / 1215+41, to be re-collected after
-# the review fixes add tests.
-LINUX_MIN_COLLECTED = 1275
-WINDOWS_MIN_COLLECTED = 1256
+# Re-collected after merging main 527296c (#186) and the QorEng review fixes.
+# pytest --collect-only -q of each --list, QORTIME pin 0204e6d8082f8c40ea1fe5e09bf16402aaee3ff2:
+# 1288 linux / 1269 windows. Before the review tests the merged tree was 1275 / 1256
+# (main 1234/1215 plus the original 41 PWEC-2 tests). The review adds 13 collected
+# tests on both lists (10 functions, one parametrized over 4 finish reasons).
+# Neither side's pre-merge floor (1269/1250 or 1234/1215) was kept.
+LINUX_MIN_COLLECTED = 1288
+WINDOWS_MIN_COLLECTED = 1269
 
 # Absent from both sidecar suites. A reason is required; whitespace does not count.
 EXCLUDED_TEST_FILES = {

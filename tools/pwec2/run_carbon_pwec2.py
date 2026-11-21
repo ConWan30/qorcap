@@ -199,9 +199,11 @@ def billed_usd(usage: object) -> tuple[Decimal | None, str]:
     return _q(raw), "ESTIMATED"
 
 
-def now_cst() -> str:
-    """Ledger clock. America/Chicago wall time, labeled CST, as the earlier lines were."""
-    return datetime.now(_CST).strftime("%Y-%m-%d %H:%M:%S CST")
+def now_cst(when: datetime | None = None) -> str:
+    """Ledger clock. America/Chicago wall time, labeled CST or CDT from tzname()."""
+    now = when.astimezone(_CST) if when is not None else datetime.now(_CST)
+    zone = now.tzname() or ("CDT" if now.dst() else "CST")
+    return f"{now.strftime('%Y-%m-%d %H:%M:%S')} {zone}"
 
 
 def file_sha256(path: Path) -> str:
@@ -238,12 +240,21 @@ def check_expected_shas(specs: list[str]) -> None:
 
 
 def compose_panel(bgr: np.ndarray) -> np.ndarray:
-    """Left: minimap tile. Right: centre crop. 8 px black gutter. No burned-in text."""
+    """Left: minimap tile. Right: centre crop. 8 px black gutter. No burned-in text.
+
+    The centre crop is a copy. The kill-feed residual, weapon overlap, and
+    compass leak are zeroed the same way classify_frame zeros them, before
+    the crop is stitched, so a red plate in those bands never reaches the
+    panel Carbon sees.
+    """
     side_hsv._require_frame(bgr)
     mx0, my0, mx1, my1 = side_hsv.MINIMAP_TILE
     cx0, cy0, cx1, cy1 = side_hsv.CENTRE_CROP
     mini = bgr[my0:my1, mx0:mx1]
-    crop = bgr[cy0:cy1, cx0:cx1]
+    crop = bgr[cy0:cy1, cx0:cx1].copy()
+    side_hsv._zero(crop, side_hsv.CROP_FEED_MASK)
+    side_hsv._zero(crop, side_hsv.CROP_WEAPON)
+    side_hsv._zero(crop, side_hsv.CROP_COMPASS_LEAK)
     panel = np.zeros((crop.shape[0], mini.shape[1] + GUTTER + crop.shape[1], 3), np.uint8)
     panel[0:mini.shape[0], 0:mini.shape[1]] = mini
     panel[:, mini.shape[1] + GUTTER:] = crop
@@ -283,7 +294,21 @@ def parse_read(text: str, expected_n: int) -> dict | None:
     for key, allowed in ENUMS.items():
         if window[key] not in allowed:
             return None
+    if not _prompt_invariants_hold(window):
+        return None
     return obj
+
+
+def _prompt_invariants_hold(window: dict) -> bool:
+    """read_window.txt: side is none iff target_present is no.
+
+    Otherwise side is enemy, teammate, or unsure.
+    """
+    present = window["target_present"]
+    side = window["side"]
+    if present == "no":
+        return side == "none"
+    return side in {"enemy", "teammate", "unsure"}
 
 
 def _under(root: Path, rel: str) -> Path:
@@ -415,13 +440,20 @@ def running_total(path: Path) -> Decimal:
     if not path.is_file():
         return Decimal("0")
     total = Decimal("0")
-    for line in path.read_text(encoding="utf-8").splitlines():
-        if not line.strip():
-            continue
-        rec = json.loads(line)
-        cost = rec.get("cost_usd")
-        if cost not in (None, ""):
-            total += Decimal(str(cost))
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            rec = json.loads(line)
+            if not isinstance(rec, dict):
+                raise StopRun("LEDGER.jsonl has a truncated or invalid line", 5)
+            cost = rec.get("cost_usd")
+            if cost not in (None, ""):
+                total += Decimal(str(cost))
+    except StopRun:
+        raise
+    except (json.JSONDecodeError, ValueError, TypeError, ArithmeticError) as exc:
+        raise StopRun("LEDGER.jsonl has a truncated or invalid line", 5) from exc
     return total
 
 
@@ -540,13 +572,19 @@ def _run_reads(data: Path, out: Path, *, transport, api_key: str, expect_sha: li
             elif finish == "MAX_TOKENS":
                 retry = attempt == "a0"
                 disposition = "RETRY" if retry else "UNMEASURED"
-            else:
-                parsed = parse_read(text, order) if finish == "STOP" else None
+            elif finish == "STOP":
+                parsed = parse_read(text, order)
                 if parsed is None:
                     retry = attempt == "a0"
                     disposition = "RETRY" if retry else "UNMEASURED"
                 else:
                     disposition = "PARSED"
+            else:
+                # SAFETY, RECITATION, OTHER, a missing finish, or any other
+                # reason. Do not parse the body and do not retry.
+                parsed = None
+                retry = False
+                disposition = "UNMEASURED"
             record = {
                 **_base_record(call, attempt),
                 "event_code": "PWEC-FREEZE" if status == 429 else ("PWEC-STOP" if disposition == "STOP" else "PWEC-CALL"),

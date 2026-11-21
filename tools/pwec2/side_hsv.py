@@ -18,7 +18,12 @@ a 4-count margin and then stopped:
 
 Every other floor stayed on the Step-0 band. Flat cal_* cores sat inside
 it. Self-yellow chevron medians on those frames sat inside H 20-35,
-S >= 80, V >= 120. Grey fills are RGB 40,40,40. Window frames were not used.
+S >= 80, V >= 120. That band overlaps XP gold (H 16-35, S >= 70, V >= 140)
+at H 20-35, S >= 80, V >= 140. The overlap is kept: measured chevron
+medians (the fixture is H 23, S 198, V 212) also meet the gold floors, so
+excluding gold from yellow would reject the self chevron. Gold XP plates
+are a centre-view cue and are not used to call a side from the disc.
+Grey fills are RGB 40,40,40. Window frames were not used.
 
 The map is read. It does not call a side by itself, and it does not override
 a plate. A missing self chevron means map cues are unavailable (not a second
@@ -43,8 +48,21 @@ CENTRE_CROP = (320, 40, 960, 680)
 MINIMAP_TILE = (12, 10, 184, 176)
 MINIMAP_DISC = (19, 18, 175, 167)
 KILLFEED_MASK = (0, 290, 430, 540)
-# Crop-local residual of the kill-feed mask: [0, 250, 110, 500).
-CROP_FEED_MASK = (0, 250, 110, 500)
+
+
+def crop_local(box, crop=CENTRE_CROP):
+    """Intersect a full-frame box with the centre crop; return crop-local coords."""
+    bx0, by0, bx1, by1 = box
+    cx0, cy0, cx1, cy1 = crop
+    x0, y0 = max(bx0, cx0), max(by0, cy0)
+    x1, y1 = min(bx1, cx1), min(by1, cy1)
+    if x0 >= x1 or y0 >= y1:
+        raise ValueError("box does not intersect the centre crop")
+    return (x0 - cx0, y0 - cy0, x1 - cx0, y1 - cy0)
+
+
+# Crop-local residual of KILLFEED_MASK: [0, 250, 110, 500).
+CROP_FEED_MASK = crop_local(KILLFEED_MASK)
 # Weapon / ammo intersects the centre crop at crop-local [600, 560, 640, 640).
 CROP_WEAPON = (600, 560, 640, 640)
 # Compass can leak into the first rows of the centre crop.

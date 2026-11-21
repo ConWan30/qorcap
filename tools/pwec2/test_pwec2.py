@@ -22,6 +22,10 @@ import side_hsv  # noqa: E402
 
 KEY = "unit-test-key"
 BANNED = ("verified", "proven", "skill", "reaction time", "anti-cheat", "anticheat")
+# Words the colour-cue prompt must use in its "do not read" sentence.
+# "gamertags" is required here; it is not a BANNED bar word, because the
+# prompt itself has to name it.
+LANGUAGE_GATE = ("letters", "names", "gamertags")
 
 
 def _bgr_hsv(h, s, v):
@@ -346,6 +350,8 @@ def test_prompts_name_the_frozen_bands_and_the_tiles():
         assert phrase in text
     for word in BANNED:
         assert word not in text
+    for word in LANGUAGE_GATE:
+        assert word in text
 
 
 def test_reader_sources_do_not_use_the_bar_words():
@@ -399,9 +405,17 @@ def test_chicago_clock_needs_no_tzdata():
     fall = datetime(2026, 11, 1, 7, 0, tzinfo=timezone.utc).astimezone(carbon._CST)
     assert (fall.hour, fall.minute) == (1, 0)
     assert fall.utcoffset() == timedelta(hours=-6)
+    assert winter.tzname() == "CST"
+    assert summer.tzname() == "CDT"
+    winter_stamp = carbon.now_cst(datetime(2026, 11, 21, 7, 45, tzinfo=timezone.utc))
+    assert winter_stamp == "2026-11-21 01:45:00 CST"
+    summer_stamp = carbon.now_cst(datetime(2026, 7, 15, 18, 0, tzinfo=timezone.utc))
+    assert summer_stamp == "2026-07-15 13:00:00 CDT"
     stamp = carbon.now_cst()
-    assert stamp.endswith(" CST")
-    datetime.strptime(stamp, "%Y-%m-%d %H:%M:%S CST")
+    assert stamp.endswith(" CST") or stamp.endswith(" CDT")
+    wall, zone = stamp.rsplit(" ", 1)
+    datetime.strptime(wall, "%Y-%m-%d %H:%M:%S")
+    assert zone in {"CST", "CDT"}
 
 
 def test_generation_config_is_carbon_and_keeps_thinking_budget():
@@ -642,3 +656,174 @@ def test_parse_rejects_extra_keys_and_markdown_is_accepted():
     }
     parsed = carbon.parse_read("```json\n" + json.dumps(inner) + "\n```", 7)
     assert parsed["windows"][0]["side"] == "none"
+
+
+
+def test_killfeed_mask_residual_is_the_crop_feed_mask():
+    assert side_hsv.CROP_FEED_MASK == (0, 250, 110, 500)
+    assert side_hsv.crop_local(side_hsv.KILLFEED_MASK) == side_hsv.CROP_FEED_MASK
+
+
+def test_compose_panel_zeros_feed_weapon_and_compass_residuals():
+    img = _blank()
+    red = _bgr_hsv(4, 180, 150)
+    # Full-frame kill-feed residual inside the centre crop: [320, 290, 430, 540).
+    _paint(img, (340, 400, 420, 430), red)
+    # Weapon overlap [920, 600, 960, 680).
+    _paint(img, (920, 600, 960, 680), red)
+    # Compass leak [320, 40, 960, 44).
+    _paint(img, (320, 40, 960, 44), red)
+    keep = _bgr_hsv(6, 160, 140)
+    _paint(img, (600, 330, 680, 350), keep)
+    panel = carbon.compose_panel(img)
+    origin = side_hsv.MINIMAP_TILE[2] - side_hsv.MINIMAP_TILE[0] + carbon.GUTTER
+    feed = panel[250:500, origin:origin + 110]
+    assert int(feed.sum()) == 0
+    weapon = panel[560:640, origin + 600:origin + 640]
+    assert int(weapon.sum()) == 0
+    compass = panel[0:4, origin:origin + 640]
+    assert int(compass.sum()) == 0
+    # The kept plate is crop-local (280, 290).
+    assert tuple(int(v) for v in panel[290, origin + 280]) == keep
+    # compose_panel must not mutate the source frame.
+    assert tuple(int(v) for v in img[400, 340]) == red
+
+
+def test_plate_inside_the_weapon_overlap_is_cleared():
+    img = _blank()
+    _plate(img, _bgr_hsv(4, 180, 150), (920, 600, 960, 680))
+    assert side_hsv.classify_frame(img)["c_red"] is False
+
+
+def test_compass_leak_pixels_are_cleared_from_the_centre_crop():
+    img = _blank()
+    _paint(img, (320, 40, 960, 44), _bgr_hsv(4, 180, 150))
+    cue = side_hsv.classify_frame(img)
+    assert cue["c_red"] is False
+    origin = side_hsv.MINIMAP_TILE[2] - side_hsv.MINIMAP_TILE[0] + carbon.GUTTER
+    panel = carbon.compose_panel(img)
+    assert int(panel[0:4, origin:origin + 640].sum()) == 0
+
+
+def test_gold_overlap_at_disc_centre_stays_the_measured_chevron():
+    """Self-yellow and XP gold share H 20-35; measured chevrons sit in both.
+
+    The fixture is H 23, S 198, V 212, which also meets gold (S >= 70, V >= 140).
+    Tightening yellow to exclude gold would reject that chevron, so the overlap
+    is kept. A gold-only hue (H 16-19) at the disc centre is not the chevron.
+    """
+    img = _blank()
+    _chevron(img)
+    pix = img[90, 96]
+    hsv = cv2.cvtColor(np.uint8([[pix]]), cv2.COLOR_BGR2HSV)[0, 0]
+    h, s, v = int(hsv[0]), int(hsv[1]), int(hsv[2])
+    assert side_hsv.YELLOW_H[0] <= h <= side_hsv.YELLOW_H[1]
+    assert side_hsv.GOLD_H[0] <= h <= side_hsv.GOLD_H[1]
+    assert s >= side_hsv.YELLOW_S_MIN and s >= side_hsv.GOLD_S_MIN
+    assert v >= side_hsv.YELLOW_V_MIN and v >= side_hsv.GOLD_V_MIN
+    cue = side_hsv.classify_frame(img)
+    assert cue["self_yellow"] is True
+    assert cue["map_available"] is True
+    gold_only = _blank()
+    _paint(gold_only, (93, 88, 101, 96), _bgr_hsv(16, 198, 212))
+    assert side_hsv.classify_frame(gold_only)["self_yellow"] is False
+
+
+def _window(present, side, **extra):
+    row = {
+        "n": 7,
+        "target_present": present,
+        "side": side,
+        "tracked": "unsure",
+        "shot_at": "unsure",
+        "hitmarker_seen": "no",
+        "kill_confirmed": "no",
+        "escaped": "unsure",
+    }
+    row.update(extra)
+    return json.dumps({"windows": [row]})
+
+
+def test_parse_rejects_every_forbidden_side_present_combo():
+    # prompt: side is none when target_present is no; otherwise not none.
+    forbidden = [
+        ("no", "enemy"),
+        ("no", "teammate"),
+        ("no", "unsure"),
+        ("yes", "none"),
+        ("unsure", "none"),
+    ]
+    for present, side in forbidden:
+        assert carbon.parse_read(_window(present, side), 7) is None, (present, side)
+    allowed = [
+        ("no", "none"),
+        ("yes", "enemy"),
+        ("yes", "teammate"),
+        ("yes", "unsure"),
+        ("unsure", "enemy"),
+        ("unsure", "teammate"),
+        ("unsure", "unsure"),
+    ]
+    for present, side in allowed:
+        parsed = carbon.parse_read(_window(present, side), 7)
+        assert parsed is not None, (present, side)
+        assert parsed["windows"][0]["side"] == side
+
+
+def test_frame_path_escape_sends_nothing(tmp_path):
+    fake = Fake([(200, _read_ok())])
+    data = _package(tmp_path)
+    outside = tmp_path / "outside.jpg"
+    cv2.imwrite(str(outside), np.zeros((720, 1280, 3), np.uint8))
+    manifest = json.loads((data / "MANIFEST.json").read_text(encoding="utf-8"))
+    manifest["frames"][0]["package_path"] = "../outside.jpg"
+    manifest["frames"][0]["sha256"] = hashlib.sha256(outside.read_bytes()).hexdigest()
+    (data / "MANIFEST.json").write_text(json.dumps(manifest), encoding="utf-8")
+    code = carbon.run_reads(data, tmp_path / "out", transport=fake, api_key=KEY)
+    assert code == 6
+    assert fake.calls == []
+
+
+@pytest.mark.parametrize("reason", ["SAFETY", "RECITATION", "OTHER", None])
+def test_non_stop_finish_is_unmeasured_with_no_retry(tmp_path, reason):
+    body = _read_ok()
+    if reason is None:
+        del body["candidates"][0]["finishReason"]
+    else:
+        body["candidates"][0]["finishReason"] = reason
+    fake = Fake([(200, body)])
+    code, out = _run(tmp_path, fake)
+    assert code == 0
+    assert len(fake.generated()) == 1
+    saved = json.loads(next((out / "reads").glob("*.json")).read_text(encoding="utf-8"))
+    assert saved["status"] == "UNMEASURED"
+    assert saved["read"] is None
+    row = [item for item in _ledger(out) if item["event_code"] == "PWEC-CALL"][0]
+    assert row["disposition"] == "UNMEASURED"
+    assert row["finish_reason"] == reason
+
+
+def test_running_total_raises_stoprun_on_truncated_or_invalid_ledger(tmp_path):
+    path = tmp_path / "LEDGER.jsonl"
+    path.write_text('{"event_code":"PWEC-CALL","cost_usd":"1.00"\n', encoding="utf-8")
+    with pytest.raises(carbon.StopRun) as exc:
+        carbon.running_total(path)
+    assert exc.value.code == 5
+    path.write_text("not json\n", encoding="utf-8")
+    with pytest.raises(carbon.StopRun):
+        carbon.running_total(path)
+    path.write_text('["not", "an", "object"]\n', encoding="utf-8")
+    with pytest.raises(carbon.StopRun):
+        carbon.running_total(path)
+    assert carbon.running_total(tmp_path / "missing.jsonl") == Decimal("0")
+
+
+def test_truncated_ledger_stops_with_no_call(tmp_path):
+    data = _package(tmp_path)
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / "LEDGER.jsonl").write_text('{"event_code":"PWEC-CALL","cost_usd":"1.00"\n', encoding="utf-8")
+    fake = Fake([(200, _read_ok())])
+    code = carbon.run_reads(data, out, transport=fake, api_key=KEY)
+    assert code == 5
+    assert fake.calls == []
