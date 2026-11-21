@@ -1,0 +1,1707 @@
+"""Clock rules, the running-clock re-anchor, the lock vote, and inferred quarters.
+
+No clips and no ffmpeg. Both CI jobs run this. Held-out matches are not read here.
+"""
+import json
+import os
+import random
+import sys
+from pathlib import Path
+
+import pytest
+
+HERE = Path(__file__).parent
+sys.path.insert(0, str(HERE))
+sys.path.insert(0, os.environ.get("QORTIME", "/workspace/qortime-src"))
+
+from qor_receipt._vendor.qoresence.vision.local_scorebug.agreement import (  # noqa: E402
+    AgreementConfig, AgreementWindow,
+)
+from qor_receipt._vendor.qoresence.vision.local_scorebug.reader import FrameRead  # noqa: E402
+from qorcap_clock import (  # noqa: E402
+    QUARTER_CLOCK_MAX_S, ClockHistory, apply_inferred_quarter, countdown_run_ok, posted_quarter,
+)
+from qorcap_match import apply_final  # noqa: E402
+from qorcap_reader import ReaderCore  # noqa: E402
+from qorcap_score_grammar import ScoreGrammar, lock_agreement_config  # noqa: E402
+
+
+def _fr(away, home, conf=0.91, margin=0.2, quarter=4, clock=None):
+    return FrameRead(
+        ok=True, reason="ok", profile_id="madden27_standard",
+        left_score=away, right_score=home, quarter=quarter,
+        score_conf=conf, score_margin=margin, clock_seconds=clock,
+    )
+
+
+def _blank():
+    return FrameRead(ok=False, reason="score_shape", profile_id="madden27_standard", quarter=4)
+
+
+def _locked(away, home):
+    g = ScoreGrammar()
+    g.note_lock(0, away, home)
+    return g
+
+
+def _seed(grammar, agree, away, home, quarter, t0=0):
+    locked = False
+    last = t0
+    for i in range(6):
+        t = t0 + i * 200
+        last = t
+        fr = _fr(away, home, quarter=quarter)
+        res = agree.offer(fr, clock_ns=t * 1_000_000, crop_hash="crop", session_id="s")
+        if res.agreed:
+            grammar.note_lock(t, away, home)
+            locked = True
+    assert locked and grammar.locked == (away, home)
+    assert grammar.allows_final_fallback() is True
+    return last
+
+
+def _final_from(grammar, fallback):
+    base = {
+        "home_score": fallback["home"], "away_score": fallback["away"], "quarter": fallback["quarter"],
+        "winner": "home" if fallback["home"] > fallback["away"] else "away",
+        "method": "last_scorebug_read_unconfirmed",
+    }
+    return apply_final(base, None, fallback=fallback, grammar_unresolved=not grammar.allows_final_fallback())
+
+
+# --- clock rules ---
+
+def test_clock_holds_and_counts_down_inside_a_quarter():
+    h = ClockHistory()
+    assert h.filter(63, 1, 0) == 63
+    assert h.filter(63, 1, 500) == 63  # stop
+    assert h.filter(62, 1, 1_000) == 62  # one second in one wall second
+    assert h.rule_note is None and h.last_s == 62
+
+
+def test_clock_increase_inside_a_quarter_blanks_and_is_noted():
+    h = ClockHistory()
+    assert h.filter(60, 1, 0) == 60
+    assert h.filter(61, 1, 1_000) is None
+    assert h.rule_note == "clock_increase" and h.last_s == 60
+    assert h.reanchored is False
+
+
+def test_a_held_increase_voids_on_the_stoppage_bar_and_is_not_adopted():
+    """One higher second does not move the baseline. Held for the stoppage bar, it blanks both.
+
+    While suspended, the stoppage gate does not adopt that higher second. It stays blank
+    until a running clock comes back through the running-clock gate.
+    """
+    h = ClockHistory()
+    assert h.filter(60, 1, 0) == 60
+    assert h.filter(61, 1, 100) is None
+    assert h.filter(61, 1, 800) is None
+    assert h.filter(61, 1, 1_500) is None
+    assert h.last_s == 60 and h.rule_note == "clock_increase" and h.suspended is False
+    assert h.filter(61, 1, 2_100) is None
+    assert h.rule_note == "clock_disagree" and h.suspended and h.last_s is None
+    assert h.reanchor_kind is None
+    for t in (2_200, 2_900, 3_600, 4_200, 8_000):
+        assert h.filter(61, 1, t) is None
+        assert h.last_s is None and h.reanchor_kind is None and h.suspended
+    assert h._published_s == 60
+
+
+def test_clock_resets_at_a_higher_quarter_and_rejects_above_the_cap():
+    h = ClockHistory()
+    assert h.filter(30, 1, 0) == 30
+    assert h.filter(QUARTER_CLOCK_MAX_S, 2, 1_000) == QUARTER_CLOCK_MAX_S
+    assert h.last_q == 2 and h.continuation is False
+    assert h.filter(QUARTER_CLOCK_MAX_S + 1, 3, 2_000) is None
+    assert h.rule_note == "clock_above_max" and h.last_s == QUARTER_CLOCK_MAX_S
+
+
+def test_a_clock_of_905_is_never_published():
+    """H8. Raising the 15:00 cap by 100 s publishes 905, then 900.
+
+    The cap test above uses ``QUARTER_CLOCK_MAX_S + 1``, which moves with the
+    constant. 905 is five seconds past 15:00. Exactly 900 on the same quarter
+    is the cap and is kept.
+    """
+    h = ClockHistory()
+    published = []
+    for t, secs in ((0, 905), (1_000, 900), (2_000, 899)):
+        got = h.filter(secs, 1, t)
+        if got is not None:
+            published.append(got)
+    assert 905 not in published
+    assert published == [900, 899]
+
+
+def test_a_negative_clock_blanks():
+    h = ClockHistory()
+    assert h.filter(10, 1, 0) == 10
+    assert h.filter(-1, 1, 1_000) is None
+    assert h.rule_note == "clock_negative" and h.last_s == 10
+
+
+def test_quarter_going_backwards_is_a_cut():
+    h = ClockHistory()
+    assert h.filter(47, 4, 0) == 47
+    assert h.filter(59, 3, 2_000) == 59
+    assert h.last_q == 3 and h.continuation is False
+
+
+def test_missing_time_and_a_quarterless_start_do_not_lock_the_baseline():
+    h = ClockHistory()
+    assert h.filter(63, 3, None) == 63 and h.last_s is None
+    assert h.filter(61, None, 0) == 61 and h.last_s is None
+    assert h.filter(900, 2, 1_000) == 900
+
+
+def _feed_rate(h, start, t0, ms, step_ms, per_ms):
+    """Countdown that drops one displayed second every ``per_ms`` of wall time."""
+    accepted = []
+    for elapsed in range(0, ms + 1, step_ms):
+        secs = start - elapsed // per_ms
+        got = h.filter(secs, 1, t0 + elapsed)
+        if got is not None:
+            accepted.append((t0 + elapsed, got))
+    return accepted
+
+
+def test_running_clock_reanchor_accepts_a_countdown_that_matches_elapsed():
+    """A downward jump is adopted only when the drop agrees with elapsed time.
+
+    An immediate 90 to 60 countdown is a consistent 1:1 line. It used to be
+    adopted after about 3 s. That drop does not agree with the second that has
+    passed, so nothing is published. A countdown from 85 that starts 10 s after
+    100 was accepted drops about 18 s over 13 s, inside the slope band, and is kept.
+    """
+    h = ClockHistory()
+    assert h.filter(90, 1, 0) == 90
+    assert _feed_rate(h, 60, 100, 8_000, 100, 1_000) == []
+    assert h.last_s == 90 and h.reanchor_kind is None
+
+    matched = ClockHistory()
+    assert matched.filter(100, 1, 0) == 100
+    accepted = _feed_rate(matched, 85, 10_000, 3_000, 100, 1_000)
+    assert accepted, "a countdown inside the slope band must re-anchor"
+    t, secs = accepted[0]
+    assert t - 10_000 >= matched.run_span_ms
+    assert matched.reanchor_kind == "run" and matched.last_run is not None
+    assert countdown_run_ok(matched.last_run, matched.run_tol_s)
+    assert secs == matched.last_run[-1][1]
+    assert matched.filter(secs - 1, 1, t + 1_000) == secs - 1
+    assert matched.reanchor_kind is None
+
+
+def test_minute_digit_read_low_does_not_publish_zero_at_one_minute():
+    """Q4 running down from 2:30. While the minute is 1, that digit is read as 0.
+
+    The running gate used to adopt that line after about 3 s and publish 0:00
+    when the truth was still 1:00. Nothing wrong is published. The true clock
+    returns once the minute digit is 0 again, because that drop matches the
+    elapsed time.
+    """
+    h = ClockHistory()
+    wrong = []
+    zero_early = []
+    recovered = []
+    for t in range(0, 160_000, 100):
+        truth = 150 - t // 1000
+        if truth < 0:
+            break
+        read = truth - 60 if 60 <= truth <= 119 else truth
+        out = h.filter(read, 4, t)
+        if out is not None and out != truth:
+            wrong.append((t, out, truth))
+        if out == 0 and truth != 0:
+            zero_early.append((t, truth))
+        if out == truth and truth <= 59:
+            recovered.append(truth)
+    assert wrong == []
+    assert zero_early == []
+    assert recovered, "the true clock returns once the minute digit is 0"
+
+
+def test_running_clock_reanchor_rejects_drift():
+    h = ClockHistory()
+    assert h.filter(90, 1, 0) == 90
+    # Two game-seconds per wall-second.
+    assert _feed_rate(h, 60, 100, 8_000, 100, 500) == []
+    assert h.last_s == 90 and h.reanchor_kind is None
+    # Half speed after the same jump. A hold is the stoppage path; this is neither.
+    slow = ClockHistory()
+    assert slow.filter(90, 1, 0) == 90
+    assert _feed_rate(slow, 60, 100, 8_000, 100, 2_000) == []
+    assert slow.last_s == 90
+
+
+def test_running_clock_reanchor_rejects_an_increase():
+    h = ClockHistory()
+    assert h.filter(90, 1, 0) == 90
+    assert h.filter(60, 1, 100) is None  # runoff candidate, not yet a run
+    assert h.filter(91, 1, 200) is None
+    assert h.rule_note == "clock_increase" and h.last_s == 90
+    # Counting down from the increased second never keeps a value above the baseline.
+    accepted = _feed_rate(h, 91, 200, 5_000, 100, 1_000)
+    assert all(secs <= 90 for _, secs in accepted)
+    assert h.last_s is not None and h.last_s <= 90
+    assert h.filter(95, 1, 20_000) is None and h.rule_note == "clock_increase"
+
+
+def test_running_gate_rejects_a_mid_run_jump():
+    """(a) The every-sample countdown check. Endpoints sit on 1:1; the middle jumps."""
+    h = ClockHistory()
+    assert h.filter(120, 1, 0) == 120
+    # 80, 79, then 90, then back to 77. First and last are 80 - wall_seconds.
+    for t, secs in ((100, 80), (1_100, 79), (2_100, 90), (3_100, 77)):
+        assert h.filter(secs, 1, t) is None
+    assert h.last_s == 120 and h.reanchor_kind is None
+
+
+def test_running_gate_checks_every_sample_against_tolerance():
+    """(b) Per-sample tolerance. Monotonic, endpoints on 1:1, one middle sample 1.5 s off."""
+    h = ClockHistory()
+    assert h.filter(120, 1, 0) == 120
+    # From 80: t=2600 expects 77.5. 79 is 1.5 s high. Endpoints drop 3 s in 3 s.
+    for t, secs in ((100, 80), (1_100, 79), (2_100, 79), (2_600, 79), (3_100, 77)):
+        assert h.filter(secs, 1, t) is None
+    assert h.last_s == 120 and h.reanchor_kind is None
+
+
+def test_running_gate_needs_three_distinct_seconds():
+    """(d) Two displayed seconds over 3 s is not a running clock."""
+    h = ClockHistory()
+    assert h.filter(120, 1, 0) == 120
+    # 80, 80, 77, 77. Each sample is within 1 s of 80 - wall_seconds. Only two seconds.
+    for t, secs in ((100, 80), (1_100, 80), (2_100, 77), (3_100, 77)):
+        assert h.filter(secs, 1, t) is None
+    assert h.last_s == 120 and h.reanchor_kind is None
+
+
+def test_running_gate_does_not_finish_on_two_reads():
+    """(e) The read-count check in the real gate. Two samples cannot show three seconds,
+    so distinct is lowered only to keep that other rule from hiding a broken count."""
+    h = ClockHistory(run_min_distinct=1)
+    assert h.run_reads == 4
+    assert h.filter(120, 1, 0) == 120
+    assert h.filter(80, 1, 100) is None
+    assert h.filter(77, 1, 3_100) is None
+    assert h.last_s == 120 and h.reanchor_kind is None
+
+
+def test_ten_second_low_misread_emits_nothing_wrong_after_disagreement():
+    """A 1:1 track 10 s low does not agree with the elapsed time.
+
+    The running gate does not adopt it in the 8 s window, and nothing wrong is
+    published after that either. The true clock returns by the one-frame rule.
+    """
+    h = ClockHistory()
+    assert h.filter(80, 1, 0) == 80
+    entered = False
+    wrong = []
+    for i in range(1, 70):
+        t = i * 500
+        truth = 80 - t // 1000
+        if t < 8_000:
+            read = truth - 10
+        elif t < 16_000:
+            read = truth
+        else:
+            read = truth - 10
+        got = h.filter(read, 1, t)
+        if t < 8_000 and got is not None and got != truth:
+            entered = True
+        if got is not None and got != truth:
+            wrong.append((t, got, truth))
+    assert entered is False
+    assert wrong == []
+
+
+def test_a_lower_ten_second_misread_blanks_both_once_it_persists():
+    """The other direction: truth is still being read, and a 10 s-low line lasts the run bar."""
+    h = ClockHistory()
+    assert h.filter(80, 1, 0) == 80
+    detected = False
+    wrong = []
+    for i in range(1, 50):
+        t = i * 500
+        truth = 80 - t // 1000
+        read = truth if detected or i % 2 else truth - 10
+        got = h.filter(read, 1, t)
+        if h.rule_note == "clock_disagree":
+            detected = True
+        if detected and got is not None and got != truth:
+            wrong.append((t, got, truth))
+    assert detected and wrong == []
+
+
+def test_stoppage_reanchor_still_accepts_a_held_lower_clock():
+    h = ClockHistory()
+    assert h.filter(90, 1, 0) == 90
+    assert h.filter(60, 1, 100) is None
+    assert h.filter(60, 1, 800) is None
+    assert h.filter(60, 1, 1_500) is None
+    assert h.filter(60, 1, 2_100) == 60
+    assert h.reanchor_kind == "stop"
+    assert h.last_s == 60
+
+
+def _mixq_after_detect(off):
+    """r2_trace pattern: offset while 3 s <= t < 9 s, quarter missing every fourth read."""
+    h = ClockHistory()
+    det = None
+    wrong_after = []
+    wrong_any = []
+    for i, t in enumerate(range(0, 18_000, 100)):
+        truth = 90 - t // 1000
+        read = truth + off if 3_000 <= t < 9_000 else truth
+        q = None if i % 4 == 3 else 1
+        out = h.filter(read, q, t)
+        if h.rule_note == "clock_disagree" and det is None:
+            det = t
+        if out is not None and out != truth:
+            wrong_any.append((t, out, truth, q))
+        if det is not None and t > det and out is not None and out != truth:
+            wrong_after.append((t, out, truth, q))
+    return det, wrong_after, wrong_any
+
+
+def test_mixq_five_high_and_ten_low_emit_nothing_wrong_after_detection():
+    """Quarterless reads used to leave the filter while the clock was suspended.
+
+    +5 still contradicts and stays blank afterwards. A 10 s-low line does not
+    agree with the elapsed time, so it is never adopted and never detected.
+    """
+    det, wrong, any_wrong = _mixq_after_detect(5)
+    assert det is not None and wrong == []
+    det, wrong, any_wrong = _mixq_after_detect(-10)
+    assert det is None and wrong == [] and any_wrong == []
+
+
+def test_held_true_clock_voids_a_ten_second_low_stoppage_and_stays_blank():
+    """A 10 s-low misread can stick on a stoppage. The true second, held, blanks it.
+
+    While that higher second is held, the stoppage gate does not adopt it.
+    Nothing is emitted after the blank.
+    """
+    h = ClockHistory()
+    assert h.filter(90, 1, 0) == 90
+    assert h.filter(80, 1, 100) is None
+    assert h.filter(80, 1, 800) is None
+    assert h.filter(80, 1, 1_500) is None
+    assert h.filter(80, 1, 2_100) == 80
+    assert h.reanchor_kind == "stop"
+    wrong = []
+    detected = None
+    t = 2_200
+    for _ in range(20):
+        got = h.filter(90, 1, t)
+        if h.rule_note == "clock_disagree" and detected is None:
+            detected = t
+            assert got is None and h.last_s is None and h.suspended
+        if detected is not None and got is not None:
+            wrong.append((t, got))
+        t += 700
+    assert detected is not None and wrong == []
+    assert h.last_s is None and h.suspended and h._published_s == 80
+
+
+def test_jump_forward_sixty_to_one_twenty_held_is_never_kept():
+    h = ClockHistory()
+    assert h.filter(60, 1, 0) == 60
+    kept = []
+    for i in range(50):
+        got = h.filter(120, 1, 100 + 100 * i)
+        if got is not None:
+            kept.append(got)
+    assert kept == []
+    assert h.last_s in (None, 60)
+    assert h._published_s == 60
+
+
+def test_held_five_high_stoppage_emits_nothing_wrong_after_detection():
+    """True clock 60 held, misread 65 held from 3 s to 9 s. 65 is never published."""
+    h = ClockHistory()
+    det = None
+    wrong_after = []
+    emitted_high = []
+    for t in range(0, 18_000, 100):
+        truth = 60
+        read = 65 if 3_000 <= t < 9_000 else 60
+        out = h.filter(read, 1, t)
+        if h.rule_note == "clock_disagree" and det is None:
+            det = t
+        if out == 65:
+            emitted_high.append(t)
+        if det is not None and t > det and out is not None and out != truth:
+            wrong_after.append((t, out, truth))
+    assert det is not None and wrong_after == [] and emitted_high == []
+    assert h.last_s == 60  # the same second may return; the higher one does not
+
+
+def test_a_steady_five_high_line_publishes_nothing_wrong_after_detection():
+    """+5 s on every frame for 17 s. After the two lines contradict, neither is published."""
+    h = ClockHistory()
+    det = None
+    wrong_after = []
+    for t in range(0, 17_000 + 1, 100):
+        truth = 90 - t // 1000
+        read = truth if t == 0 else truth + 5
+        out = h.filter(read, 1, t)
+        if h.rule_note == "clock_disagree" and det is None:
+            det = t
+        if det is not None and t > det and out is not None and out != truth:
+            wrong_after.append((t, out, truth))
+    assert det is not None and wrong_after == []
+
+
+def test_plus_five_accepted_first_then_alternating_does_not_return():
+    """The +5 line is accepted first, alternates with the truth, then runs alone.
+
+    The lower-path void has to block that already-accepted line. Dropping it
+    publishes the misread again (170 values on this probe).
+    """
+    h = ClockHistory()
+    det = None
+    wrong = 0
+    for i, t in enumerate(range(0, 24_000, 100)):
+        truth = 250 - t // 1000
+        mis = truth + 5
+        if t == 0:
+            read = mis
+        elif t < 4_000:
+            read = mis if i % 2 == 0 else truth
+        else:
+            read = mis
+        out = h.filter(read, 1, t)
+        if h.rule_note == "clock_disagree" and det is None:
+            det = t
+        if det is not None and t > det and out is not None and out != truth:
+            wrong += 1
+    assert det is not None and wrong == 0
+
+
+def test_a_held_fifty_after_a_rejected_sixty_five_is_not_a_stoppage():
+    """The stoppage trajectory's low edge is the band's top rate, not 1.0x.
+
+    A held 65 is rejected, then 50 is held, then the true 60 returns. Replacing
+    the low edge ``s0 - hi*dt`` with ``s0 - dt`` publishes 10 values of 50
+    (7000 ms through 7900 ms). This window is 3.0 s of 50 and then the true 60.
+    """
+    h = ClockHistory()
+    assert h.filter(60, 1, 0) == 60
+    for t in range(100, 2_200, 100):
+        assert h.filter(65, 1, t) is None
+    assert h.suspended and h._published_s == 60
+    wrong = []
+    for t in range(5_000, 8_000, 100):
+        out = h.filter(50, 1, t)
+        if out is not None and out != 60:
+            wrong.append((t, out))
+    for t in range(8_000, 12_000, 100):
+        out = h.filter(60, 1, t)
+        if out is not None and out != 60:
+            wrong.append((t, out))
+    assert wrong == []
+    assert h.last_s == 60
+
+
+def test_held_misread_continuation_stays_blocked_for_the_quarter():
+    """A +5 misread held through a stoppage, then run, publishes nothing wrong.
+
+    Blocking only the held second lets the running gate adopt the countdown:
+    162 values from 6300 ms through 22400 ms. The accepted 60 was one frame,
+    so a later stoppage of the true countdown stays blocked too.
+    """
+    h = ClockHistory()
+    assert h.filter(60, 1, 0) == 60
+    for t in range(100, 3_000, 100):
+        assert h.filter(65, 1, t) is None
+    assert h.suspended
+    wrong = 0
+    for t in range(3_000, 22_401, 100):
+        truth = 60 - (t - 3_000) // 1000
+        out = h.filter(truth + 5, 1, t)
+        if out is not None and out != truth:
+            wrong += 1
+    assert wrong == 0 and h.last_s is None
+    # The accepted 60 was one frame, not a running-gate confirmation, so a later
+    # stoppage of the true countdown is not exempt. Publishing it was the
+    # stoppage-return path that also republished a rejected misread.
+    for i in range(40):
+        t = 23_000 + i * 100
+        assert h.filter(41, 1, t) is None
+    assert h.last_s is None
+
+
+@pytest.mark.parametrize("rate", [0.85, 1.15])
+def test_held_misread_continuation_stays_blocked_across_the_rate_band(rate):
+    """A held +5 that then runs at a rate inside the running-gate band stays blocked.
+
+    Exact 1:1 from the end of the hold lets 0.85x and 1.15x through that gate.
+    The held countdown has to use the same slope band as a running line.
+    """
+    h = ClockHistory()
+    assert h.filter(60, 1, 0) == 60
+    for t in range(100, 3_000, 100):
+        assert h.filter(65, 1, t) is None
+    assert h.suspended and h._blocked_other is not None
+    assert h._blocked_other[2] == "hold"
+    wrong = 0
+    for t in range(3_000, 23_000, 100):
+        elapsed = (t - 3_000) / 1000.0
+        truth = int(round(60 - rate * elapsed))
+        out = h.filter(truth + 5, 1, t)
+        if out is not None and out != truth:
+            wrong += 1
+    assert wrong == 0 and h.last_s is None
+
+
+def test_rejected_stoppage_misread_does_not_return_on_a_later_stoppage():
+    """W1. A misread adopted on a stoppage must not come back after it is rejected.
+
+    Truth holds at 60. A misread of 50 holds and is adopted before the
+    disagreement. Truth at 60 then voids both. The clock runs down to 50, a
+    misread of 40 holds, and then the true 50 holds. Exempting the accepted
+    line's projection publishes 40 (60 values) and the true 50 never returns.
+    The accepted 50 was a stoppage, not a running-gate confirmation.
+    """
+    h = ClockHistory()
+    for t in range(0, 3_000, 100):
+        assert h.filter(60, 1, t) == 60
+    adopted = None
+    for t in range(3_000, 6_000, 100):
+        out = h.filter(50, 1, t)
+        if out is not None and adopted is None:
+            adopted = (t, out, h.reanchor_kind)
+    assert adopted is not None and adopted[2] == "stop"
+    detected = None
+    for t in range(6_000, 8_100, 100):
+        assert h.filter(60, 1, t) is None
+        if h.rule_note == "clock_disagree" and detected is None:
+            detected = t
+    assert detected == 8_000
+    accepted = h._blocked_line if h._blocked_line and h._blocked_line[2] != "hold" else h._blocked_other
+    assert accepted is not None and accepted[2] == "run"
+    wrong = []
+    truth_kept = []
+    # 10 s of the true clock, from 60 down to 50. The held line's countdown blocks it.
+    for t in range(8_100, 18_100, 100):
+        truth = 60 - (t - 8_000) // 1000
+        out = h.filter(truth, 1, t)
+        if out is not None and out != truth:
+            wrong.append((t, out, truth))
+        if out == truth:
+            truth_kept.append(t)
+    # 8 s stop. Truth is 50. The read is 40, the same -10 offset as the rejected misread.
+    for t in range(18_100, 26_100, 100):
+        out = h.filter(40, 1, t)
+        if out is not None and out != 50:
+            wrong.append((t, out, 50))
+        if out == 50:
+            truth_kept.append(t)
+    # 10 s of the true 50. It equals the last published second, so it may return.
+    # The misread must not have taken that slot.
+    returned = None
+    for t in range(26_100, 36_100, 100):
+        out = h.filter(50, 1, t)
+        if out is not None and out != 50:
+            wrong.append((t, out, 50))
+        if out == 50:
+            if returned is None:
+                returned = (t, h.reanchor_kind)
+            truth_kept.append(t)
+    assert wrong == []
+    assert len(truth_kept) == 80 and returned == (28_100, "stop")
+
+
+def _running_gate_accept():
+    """The read that completes the running gate. No one-frame tick follows it."""
+    h = ClockHistory()
+    assert h.filter(60, 1, 0) == 60
+    for t in (100, 800, 1_500, 2_100):
+        h.filter(70, 1, t)
+    accepted_t = None
+    for i in range(40):
+        t = 9_000 + i * 100
+        got = h.filter(80 - i // 10, 1, t)
+        if got is not None:
+            accepted_t = t
+            break
+    assert accepted_t is not None
+    assert h.reanchor_kind == "run"
+    return h, accepted_t
+
+
+def _hold_the_frame_after_the_running_gate():
+    """Running-gate accept of 77, then a hold of 89 starting on the next frame."""
+    h, accepted_t = _running_gate_accept()
+    assert accepted_t == 12_000 and h.last_s == 77 and h.reanchor_kind == "run"
+    for t in range(accepted_t + 100, accepted_t + 4_100, 100):
+        assert h.filter(89, 1, t) is None
+    assert h.suspended
+    accepted = h._blocked_line if h._blocked_line and h._blocked_line[2] != "hold" else h._blocked_other
+    hold = h._blocked_other if accepted is h._blocked_line else h._blocked_line
+    assert accepted == (12_000, 77, "run")
+    assert hold == (16_000, 89, "hold")
+    return h
+
+
+def test_hold_on_the_next_frame_uses_the_held_line():
+    """A hold starting the frame after a running-gate accept is a held line.
+
+    The countdown of that held second stays blank. A later stoppage of 76,
+    the second a separate return used to adopt, stays blank too.
+    """
+    h = _hold_the_frame_after_the_running_gate()
+    published = []
+    for i in range(100):
+        t = 16_100 + i * 100
+        read = 89 - (t - 16_000) // 1000
+        out = h.filter(read, 1, t)
+        if out is not None:
+            published.append((t, out))
+    assert published == []
+    h = _hold_the_frame_after_the_running_gate()
+    published = []
+    for i in range(40):
+        out = h.filter(76, 1, 16_100 + i * 100)
+        if out is not None:
+            published.append(out)
+    assert published == []
+
+
+def _w4_wrong_after_detection(off: int, gap_s: int) -> int:
+    """W4. A running-gate open, then a one-frame misread, then that misread returns.
+
+    The open is a countdown whose drop sits in the slope band. Truth then stops
+    at 70. After ``gap_s`` the read is 70−off, which the one-frame rule accepts.
+    The true 70 voids both. The clock runs for 10 s and stops with 70−off's
+    continuation on screen for 8 s.
+    """
+    h = ClockHistory()
+    wrong = 0
+    det = None
+    t = 0
+
+    def step(read, truth):
+        nonlocal t, det, wrong
+        out = h.filter(None if read is None else int(read), 1, t)
+        if h.rule_note == "clock_disagree" and det is None:
+            det = t
+        if det is not None and t > det and out is not None and out != truth:
+            wrong += 1
+        t += 100
+
+    # 100 accepted, then a countdown from 85 starting at 10 s. The drop agrees
+    # with elapsed time, so the running gate confirms it.
+    step(100, 100)
+    t = 10_000
+    opened = False
+    while t < 20_000:
+        secs = 85 - (t - 10_000) // 1000
+        step(secs, secs)
+        if h.reanchor_kind == "run":
+            opened = True
+            break
+    assert opened and h.last_s is not None
+    truth = h.last_s
+    t_phase = t
+    while truth > 70:
+        step(truth, truth)
+        if t > t_phase and (t - t_phase) % 1000 == 0:
+            truth -= 1
+    guard = 0
+    while h.last_s != 70 and guard < 80:
+        step(70, 70)
+        guard += 1
+    assert h.last_s == 70
+    for _ in range(int(gap_s * 10)):
+        step(None, 70)
+    mis = 70 - off
+    for _ in range(30):
+        step(mis, 70)
+    assert h.last_s == mis
+    for _ in range(60):
+        step(70, 70)
+    assert det is not None and h.suspended
+    tr = 70
+    t_run = t
+    for _ in range(100):
+        step(tr, tr)
+        if (t - t_run) % 1000 == 0:
+            tr -= 1
+    for _ in range(80):
+        step(60 - off, 60)
+    return wrong
+
+
+@pytest.mark.parametrize(
+    "off,gap",
+    [(2, 1), (2, 2), (2, 7), (5, 4), (5, 5), (5, 10), (10, 9), (10, 10), (10, 15)],
+)
+def test_one_frame_misread_does_not_return_on_a_later_stoppage(off, gap):
+    """W4. Offsets 2, 5, and 10. The later stoppage of that misread publishes nothing."""
+    assert _w4_wrong_after_detection(off, gap) == 0
+
+
+def test_held_read_above_the_cap_still_advances_the_hold_anchor():
+    """A held 901 is above 15:00. The anchor still moves to the last read of it.
+
+    Measuring the 0.9x continuation from the start of that hold lets the running
+    gate adopt it. From the end of the hold, the continuation stays blocked.
+    """
+    h = ClockHistory()
+    assert h.filter(60, 1, 0) == 60
+    for t in range(100, 12_000, 100):
+        assert h.filter(901, 1, t) is None
+    assert h.suspended
+    hold = h._blocked_other if h._blocked_other and h._blocked_other[2] == "hold" else h._blocked_line
+    assert hold is not None and hold[1] == 901 and hold[0] >= 11_000
+    wrong = 0
+    for i, t in enumerate(range(12_000, 32_000, 100)):
+        elapsed = i / 10.0
+        read = int(round(901 - 0.9 * elapsed))
+        if read > 900:
+            assert h.filter(read, 1, t) is None
+            continue
+        out = h.filter(read, 1, t)
+        if out is not None:
+            wrong += 1
+    assert wrong == 0
+
+
+def test_increase_void_blocks_the_running_dispute_not_the_held_second():
+    """R5-h. A higher line that completes as a run is blocked from its own origin.
+
+    Storing the last held second instead lets a 0.66x continuation back in:
+    68 wrong values on this window, for each of the four higher offsets.
+    """
+    for offset in (3, 5, 10, 30):
+        h = ClockHistory()
+        det = None
+        wrong = 0
+        for t in range(0, 20_001, 100):
+            truth = int(600 - 0.66 * t / 1000.0)
+            read = truth if t < 3_000 else truth + offset
+            out = h.filter(read, 1, t)
+            if h.rule_note == "clock_disagree" and det is None:
+                det = t
+                other = h._blocked_other
+                assert other is not None and other[2] == "run"
+            if det is not None and t > det and out is not None and out != truth:
+                wrong += 1
+        assert det is not None and wrong == 0, (offset, det, wrong)
+
+
+def test_forward_quarter_after_a_recovery_clears_both_lines():
+    """R7-n. After an in-quarter recovery, a new quarter forgets the held line.
+
+    Keeping the lines leaves them set after the quarter change. The old held
+    countdown is far below the new clock, so it is not adopted either way.
+    """
+    h = ClockHistory()
+    assert h.filter(60, 1, 0) == 60
+    for t in range(100, 2_200, 100):
+        assert h.filter(65, 1, t) is None
+    assert h.suspended and h._blocked_other is not None and h._blocked_other[2] == "hold"
+    kind = None
+    for i in range(40):
+        got = h.filter(40 - i // 10, 1, 8_000 + i * 100)
+        if got is not None and kind is None:
+            kind = h.reanchor_kind
+    assert kind == "run" and h.suspended is False
+    assert h._blocked_line is not None and h._blocked_other is not None
+    assert h.filter(200, 2, 13_000) == 200
+    # The quarter change is what forgets both lines. Leaving them set keeps the
+    # old held countdown blocked. The countdown itself is far below 200, so it
+    # is not adopted either way: the drop does not agree with the elapsed time.
+    assert h._blocked_line is None and h._blocked_other is None
+    stale = []
+    for i in range(40):
+        t = 14_000 + i * 100
+        out = h.filter(65 - (t - 100) // 1000, 2, t)
+        if out is not None:
+            stale.append((t, out))
+    assert stale == []
+    assert h.filter(199, 2, 15_000) == 199
+
+
+def test_low_misread_then_true_countdown_stays_blank():
+    """E4. After a low stoppage is voided by the true second, that countdown stays blank.
+
+    The blank is the whole countdown, not only the time the higher second is held.
+    """
+    h = ClockHistory()
+    assert h.filter(120, 1, 0) == 120
+    for t in (100, 800, 1_500, 2_100):
+        h.filter(110, 1, t)
+    assert h.last_s == 110 and h.reanchor_kind == "stop"
+    detected = None
+    for t in range(2_200, 5_000, 100):
+        h.filter(120, 1, t)
+        if h.rule_note == "clock_disagree" and detected is None:
+            detected = t
+    assert detected is not None and h.suspended
+    published = []
+    for i in range(200):
+        t = 5_000 + i * 100
+        truth = 120 - (t - 5_000) // 1000
+        out = h.filter(truth, 1, t)
+        if out is not None:
+            published.append((t, out))
+    assert published == [] and h.last_s is None
+
+
+def test_quarter_change_clears_a_held_line():
+    """A new quarter forgets both contradicted lines, including the held one.
+
+    Keeping either line blocks that line's countdown after the change. The first
+    frame of the new quarter is accepted either way. A countdown far below that
+    frame does not agree with the elapsed time, so it stays blank. The lines
+    are still cleared.
+    """
+    h = ClockHistory()
+    assert h.filter(60, 1, 0) == 60
+    for t in range(100, 2_200, 100):
+        assert h.filter(65, 1, t) is None
+    assert h.suspended and h._blocked_other is not None and h._blocked_other[2] == "hold"
+    assert h.filter(400, 2, 3_000) == 400
+    assert h._blocked_line is None and h._blocked_other is None and h.suspended is False
+    held_kept = []
+    for i in range(40):
+        t = 3_100 + i * 100
+        out = h.filter(64 - i // 10, 2, t)
+        if out is not None:
+            held_kept.append(out)
+    assert held_kept == []
+
+    h = ClockHistory()
+    assert h.filter(60, 1, 0) == 60
+    for t in range(100, 2_200, 100):
+        h.filter(65, 1, t)
+    assert h.filter(400, 2, 3_000) == 400
+    accepted_kept = []
+    for i in range(40):
+        t = 3_100 + i * 100
+        out = h.filter(57 - i // 10, 2, t)
+        if out is not None:
+            accepted_kept.append(out)
+    assert accepted_kept == []
+
+
+def test_held_pre_kickoff_fifteen_does_not_return_when_it_runs():
+    """A new quarter accepts the clock still on screen. A held 15:00 against it
+    is a contradicted held line, and that countdown stays blocked.
+    """
+    h = ClockHistory()
+    assert h.filter(5, 1, 0) == 5
+    assert h.filter(5, 2, 1_000) == 5
+    for t in range(1_100, 4_000, 100):
+        assert h.filter(900, 2, t) is None
+    assert h.suspended
+    assert h._blocked_other is not None
+    assert h._blocked_other[1] == 900 and h._blocked_other[2] == "hold"
+    published = []
+    for t in range(4_000, 20_000, 100):
+        secs = 900 - (t - 4_000) // 1000
+        out = h.filter(secs, 2, t)
+        if out is not None:
+            published.append((t, out))
+    assert published == [] and h.last_s is None
+
+
+def test_stoppage_does_not_keep_a_second_the_blocked_line_already_showed():
+    """A hold of a second on the contradicted line stays blank past the 1.0x crossing.
+
+    The stoppage bar is 2 s. A 1.0x projection only overlaps a held second for about
+    that long. The refusal has to cover the second after the projection has moved on.
+    """
+    h = ClockHistory()
+    det = None
+    for t in range(0, 5_000, 100):
+        truth = 200 - t // 1000
+        h.filter(truth if t == 0 else truth + 5, 1, t)
+        if h.suspended and det is None:
+            det = t
+    assert det is not None and h._blocked_line is not None
+    t0, s0 = int(h._blocked_line[0]), int(h._blocked_line[1])
+    held = 189
+    t_cross = t0 + (s0 - held) * 1000
+    assert t_cross > det
+    # Past the ~2 s 1.0x overlap and past the 0.7x–1.3x band of both blocked
+    # lines, so a check that only fires while this second is still on a projection
+    # does not pass.
+    adopted = []
+    for t in range(t_cross - 3_000, t_cross + 22_000, 100):
+        out = h.filter(held, 1, t)
+        if out is not None:
+            adopted.append((t, out))
+    assert adopted == [] and h.last_s is None
+
+
+def test_a_held_void_does_not_anchor_the_second_line_on_a_stale_dispute():
+    """Accepted ticks leave a parallel dispute in place. A later hold must not use it."""
+    h = ClockHistory()
+    assert h.filter(100, 1, 0) == 100
+    assert h.filter(90, 1, 100) is None
+    assert h._dispute and h._dispute[0][1] == 90
+    assert h.filter(99, 1, 2_000) == 99
+    assert h._dispute, "an ordinary accept keeps the parallel dispute running"
+    for t in range(3_000, 5_200, 100):
+        assert h.filter(110, 1, t) is None
+    assert h.suspended
+    assert h._blocked_other is not None
+    assert h._blocked_other[1] == 110 and h._blocked_other[2] == "hold"
+    assert h._blocked_other[1] != 90
+
+
+def test_stoppage_on_the_second_blocked_line_stays_blank():
+    """H2. The stoppage check has to see both contradicted lines.
+
+    A lower line voids against the accepted clock. That accepted clock is stored
+    second. Checking only the first line adopts a later stoppage of 196: 59
+    values from 5200 ms. 196 sits on the accepted clock and not on the lower line.
+    """
+    h = ClockHistory()
+    det = None
+    for t in range(0, 20_000, 100):
+        truth = 200 - t // 1000
+        read = truth if (t // 100) % 2 == 0 else truth - 60
+        h.filter(read, 1, t)
+        if h.suspended and det is None:
+            det = t
+            break
+    assert det == 3_100
+    assert h._blocked_line is not None and h._blocked_line[1] == 140
+    assert h._blocked_other is not None and h._blocked_other[1] == 197
+    adopted = []
+    for t in range(det + 100, det + 8_000, 100):
+        out = h.filter(196, 1, t)
+        if out is not None:
+            adopted.append((t, out))
+    assert adopted == [] and h.last_s is None
+
+
+def test_stoppage_does_not_adopt_a_higher_second_off_the_contradicted_line():
+    """The published-second ceiling is what refuses a higher hold that is not either blocked line."""
+    h = ClockHistory()
+    assert h.filter(60, 1, 0) == 60
+    for t in (100, 800, 1_500, 2_100):
+        assert h.filter(70, 1, t) is None
+    assert h.suspended and h._published_s == 60
+    adopted = []
+    for t in range(8_000, 12_000, 100):
+        out = h.filter(90, 1, t)
+        if out is not None:
+            adopted.append((t, out))
+    assert adopted == [] and h.last_s is None
+
+
+@pytest.mark.parametrize("rate", [0.85, 0.9, 1.0, 1.1, 1.15])
+def test_blocked_line_holds_across_the_running_gate_rate_band(rate):
+    """A contradicted misread at a rate the running gate accepts stays blocked."""
+    h = ClockHistory()
+    det = None
+    wrong = 0
+    for t in range(0, 17_001, 100):
+        truth = int(120 - t / 1000.0)
+        mis = int(round(125 - rate * t / 1000.0))
+        out = h.filter(truth if t == 0 else mis, 1, t)
+        if h.rule_note == "clock_disagree" and det is None:
+            det = t
+        if det is not None and t > det and out is not None and out != truth:
+            wrong += 1
+    assert det is not None and wrong == 0
+
+
+def test_a_third_line_can_reanchor_after_both_contradicted_lines_are_blocked():
+    """A countdown on neither contradicted line may still complete the running gate."""
+    h = ClockHistory()
+    assert h.filter(90, 1, 0) == 90
+    for t in range(100, 4_000, 100):
+        h.filter((90 - t // 1000) + 5, 1, t)
+    assert h.suspended and h._blocked_line is not None and h._blocked_other is not None
+    accepted = []
+    kind = None
+    for i in range(40):
+        t = 8_000 + i * 100
+        secs = 40 - i // 10
+        got = h.filter(secs, 1, t)
+        if got is not None:
+            if kind is None:
+                kind = h.reanchor_kind
+            accepted.append(got)
+    assert accepted and kind == "run"
+    assert accepted[0] <= 40
+
+
+def test_a_higher_countdown_returns_only_through_the_running_gate():
+    h = ClockHistory()
+    assert h.filter(60, 1, 0) == 60
+    for t in (100, 800, 1_500, 2_100):
+        assert h.filter(70, 1, t) is None
+    assert h.suspended and h.last_s is None and h._published_s == 60
+    assert h.filter(70, 1, 8_000) is None
+    assert h.last_s is None and h.reanchor_kind is None
+    accepted = []
+    kind = None
+    for i in range(40):
+        t = 9_000 + i * 100
+        secs = 80 - i // 10
+        got = h.filter(secs, 1, t)
+        if got is not None:
+            if kind is None:
+                kind = h.reanchor_kind
+            accepted.append((t, got))
+    assert accepted and kind == "run"
+    assert accepted[0][1] > 60 and h.last_s == accepted[-1][1] > 60
+
+
+def test_quarter_change_while_suspended_starts_a_new_baseline():
+    """A new quarter while suspended is a fresh baseline, even above the old clock."""
+    h = ClockHistory()
+    assert h.filter(80, 1, 0) == 80
+    for t in (100, 800, 1_500, 2_100):
+        h.filter(90, 1, t)
+    assert h.suspended and h.last_s is None
+    assert h.filter(400, 2, 3_000) == 400
+    assert h.last_q == 2 and h.suspended is False and h.last_s == 400
+
+
+def test_fuzz_suspended_emits_only_through_a_reanchor():
+    """While suspended, the only emitted read is the one that completes a fresh re-anchor."""
+    for seed in range(400):
+        rng = random.Random(seed)
+        h = ClockHistory()
+        true = rng.randint(40, 110)
+        off = rng.choice((5, -10, 8, -4))
+        t = 0
+        h.filter(true, 1, t)
+        for i in range(160):
+            t += rng.choice((100, 100, 200, 500))
+            if rng.randrange(3) == 0:
+                true = max(0, true - 1)
+            read = true + off if 30 <= i < 110 else true
+            if read < 0:
+                read = 0
+            q = None if rng.randrange(4) == 0 else 1
+            was = h.suspended
+            out = h.filter(read, q, t)
+            if not was or out is None:
+                continue
+            assert h.reanchored, (seed, t, out, read)
+            assert out == read
+            assert h.reanchor_kind in ("stop", "run")
+
+
+# --- vote ---
+
+def test_lock_vote_matches_the_agreement_window():
+    cfg = lock_agreement_config()
+    assert cfg == AgreementConfig()
+    assert cfg.need == 3 and cfg.min_span_ns == 400_000_000
+    assert cfg.need_suspicious == 9 and cfg.min_span_suspicious_ns == 2_000_000_000
+
+
+def test_vote_gap_restarts_an_unpersisted_disagreement():
+    """(c) Samples more than 2 s apart do not add up to a persisted disagreement."""
+    g = _locked(7, 14)
+    assert g.filter(_fr(11, 14), 1_000, None).left_score is None
+    assert g.filter(_fr(12, 14), 1_200, None).left_score is None
+    assert g.disagreeing is False
+    # The two new-score reads are still inside the gap, so the fallback stays off.
+    assert g.allows_final_fallback() is False
+    # 3.3 s after the previous illegal read. A gap restarts the count at 1.
+    assert g.filter(_fr(16, 14), 4_500, None).left_score is None
+    assert g.disagreeing is False and g._vote_n == 1
+    assert g.filter(_fr(11, 14), 4_700, None).left_score is None
+    assert g.disagreeing is False and g._vote_n == 2
+
+
+def test_one_outlier_does_not_move_the_lock_or_the_final():
+    g = _locked(7, 14)
+    out = g.filter(_fr(7, 7), 5_000, None)
+    assert (out.left_score, out.right_score) == (None, None)
+    assert g.locked == (7, 14)
+    assert g.allows_final_fallback() is True
+    published = _final_from(g, {"home": 14, "away": 7, "quarter": 4, "t_ms": 5_000})
+    assert (published["away_score"], published["home_score"]) == (7, 14)
+    assert published["final_confirmed"] is False
+
+
+def test_a_persistent_disagreement_abstains_and_a_gap_does_not_clear_it():
+    g = _locked(7, 14)
+    # +4, +5 and +9 are illegal. +2 would be a safety and would clear the vote.
+    assert g.filter(_fr(11, 14), 1_000, None).left_score is None
+    assert g.disagreeing is False and g.allows_final_fallback() is False
+    assert g.filter(_fr(12, 14), 1_200, None).left_score is None
+    assert g.disagreeing is False and g.allows_final_fallback() is False
+    assert g.filter(_fr(16, 14), 1_400, None).left_score is None
+    assert g.locked == (7, 14) and g.allows_final_fallback() is False
+    # Three seconds of silence, then one more illegal frame. The vote count restarts.
+    # The disagreement that already persisted stays. The pairs differ, so this is not a re-anchor.
+    assert g.filter(_blank(), 2_000, None).left_score is None
+    assert g.filter(_fr(11, 14), 4_000, None).left_score is None
+    assert g.locked == (7, 14)
+    assert g.allows_final_fallback() is False
+    published = _final_from(g, {"home": 14, "away": 7, "quarter": 4, "t_ms": 4_000})
+    assert (published["home_score"], published["away_score"], published["winner"]) == (None, None, "unknown")
+    assert published["final_confirmed"] is False
+
+
+def test_a_legal_read_clears_a_disagreement_and_a_close_burst_is_one_sample():
+    g = _locked(7, 14)
+    for t in (0, 50, 100, 150):
+        g.filter(_fr(7, 7), t, None)
+    assert g.allows_final_fallback() is True  # closer than 200 ms: one sample
+    # One read of the locked score does not clear a disagreement that already persisted.
+    g.filter(_fr(11, 14), 1_000, None)
+    g.filter(_fr(12, 14), 1_200, None)
+    g.filter(_fr(16, 14), 1_400, None)
+    assert g.allows_final_fallback() is False
+    assert g.filter(_fr(7, 14), 1_800, None).pair == (7, 14)
+    assert g.locked == (7, 14) and g.allows_final_fallback() is False
+    # Three re-shows while the new score is still inside the 2 s gap do not
+    # restore the lock. The same three, once that gap has passed, do.
+    assert g.filter(_fr(7, 14), 2_000, None).pair == (7, 14)
+    assert g.allows_final_fallback() is False
+    assert g.filter(_fr(7, 14), 2_200, None).pair == (7, 14)
+    assert g.allows_final_fallback() is False
+    assert g.filter(_fr(7, 14), 4_500, None).pair == (7, 14)
+    assert g.allows_final_fallback() is False
+    assert g.filter(_fr(7, 14), 4_700, None).pair == (7, 14)
+    assert g.allows_final_fallback() is False
+    assert g.filter(_fr(7, 14), 4_900, None).pair == (7, 14)
+    assert g.allows_final_fallback() is True
+
+
+def test_forged_frames_do_not_name_7_7():
+    """F1, F1b, F2, and F4 from the 9d86d04 report. F1b may keep 7-14. None may name 7-7."""
+    fallback = {"home": 14, "away": 7, "quarter": 4, "t_ms": 1}
+
+    def fresh():
+        g = ScoreGrammar()
+        agree = AgreementWindow(lock_agreement_config())
+        end = _seed(g, agree, 7, 14, 4, t0=0)
+        return g, agree, end
+
+    # F1b: one forged frame as the last read. The final keeps 7-14.
+    g, agree, end = fresh()
+    t = end + 1_000
+    forged = g.filter(_fr(7, 7), t, None)
+    res = agree.offer(forged, clock_ns=t * 1_000_000, crop_hash="crop", session_id="s")
+    assert res.agreed is False and g.locked == (7, 14)
+    assert g.allows_final_fallback() is True
+    kept = _final_from(g, fallback)
+    assert (kept["away_score"], kept["home_score"]) == (7, 14)
+
+    # F1: that forged frame, then the true 7-14.
+    true = g.filter(_fr(7, 14), t + 500, None)
+    assert true.pair == (7, 14) and g.locked == (7, 14) and g.allows_final_fallback() is True
+
+    # F4: 7-7 sustained for 3 s. Re-anchor may fire. The final must not name 7-7.
+    g, agree, end = fresh()
+    published = None
+    for i in range(31):
+        t = end + 1_000 + i * 100
+        fr = g.filter(_fr(7, 7), t, None)
+        res = agree.offer(fr, clock_ns=t * 1_000_000, crop_hash="crop", session_id="s")
+        if res.agreed and fr.pair is not None:
+            g.note_lock(t, fr.pair[0], fr.pair[1])
+            published = fr.pair
+    assert published is None
+    assert g.allows_final_fallback() is False
+    blocked = _final_from(g, fallback)
+    assert (blocked["home_score"], blocked["away_score"]) == (None, None)
+    assert blocked["winner"] == "unknown"
+
+    # F2: four forged reads over 2.1 s with blanks between. Still not a confirmed 7-7.
+    g, agree, end = fresh()
+    published = None
+    for i, step in enumerate((0, 700, 1_400, 2_100)):
+        t = end + 1_000 + step
+        g.filter(_blank(), t - 50, None)
+        fr = g.filter(_fr(7, 7), t, None)
+        res = agree.offer(fr, clock_ns=t * 1_000_000, crop_hash="crop", session_id="s")
+        if res.agreed and fr.pair is not None:
+            g.note_lock(t, fr.pair[0], fr.pair[1])
+            published = fr.pair
+    assert published is None and g.allows_final_fallback() is False
+    assert _final_from(g, fallback)["winner"] == "unknown"
+
+
+def test_mirror_f3_true_final_interleaved_with_stale_reshows_does_not_publish_the_stale_lock():
+    """Stale re-shows of the lock, interleaved with a true new final, last read true.
+
+    One matching read must not clear the disagreement. The published result is an abstain
+    or the true final, never the stale lock: those two re-shows did not persist.
+    """
+    g = ScoreGrammar()
+    agree = AgreementWindow(lock_agreement_config())
+    end = _seed(g, agree, 7, 7, 4, t0=0)
+    # Far enough from the seed that the agreement window does not still be holding 7-7.
+    t0 = end + 3_000
+    for i, pair in enumerate(((7, 11), (7, 12), (7, 16))):
+        t = t0 + i * 200
+        fr = g.filter(_fr(*pair), t, None)
+        agree.offer(fr, clock_ns=t * 1_000_000, crop_hash="crop", session_id="s")
+    assert g.locked == (7, 7) and g.allows_final_fallback() is False
+    published = None
+    # True 7-14 (+7, abstain) interleaved with the stale 7-7. Last read is the true final.
+    seq = ((7, 14), (7, 7), (7, 14), (7, 7), (7, 14))
+    for i, pair in enumerate(seq):
+        t = t0 + 1_000 + i * 400
+        fr = g.filter(_fr(*pair), t, None)
+        res = agree.offer(fr, clock_ns=t * 1_000_000, crop_hash="crop", session_id="s")
+        if res.agreed and fr.pair is not None:
+            g.note_lock(t, fr.pair[0], fr.pair[1])
+            published = fr.pair
+    assert g.allows_final_fallback() is False
+    final = _final_from(g, {"home": 7, "away": 7, "quarter": 4, "t_ms": t0})
+    assert published in (None, (7, 14))
+    assert (final["away_score"], final["home_score"]) != (7, 7)
+    assert final["winner"] == "unknown" or (final["away_score"], final["home_score"]) == (7, 14)
+
+
+def _offer_pair(grammar, agree, pair, t):
+    fr = grammar.filter(_fr(*pair), t, None)
+    res = agree.offer(fr, clock_ns=t * 1_000_000, crop_hash="crop", session_id="s")
+    published = None
+    if res.agreed and fr.pair is not None:
+        grammar.note_lock(t, fr.pair[0], fr.pair[1])
+        published = fr.pair
+    return published
+
+
+def test_clear_vote_gap_does_not_let_earlier_matching_reads_count():
+    """The clear vote has the same 2 s gap as the disagreement vote.
+
+    Two matching reads, then one more after the gap, must not clear. Dropping the gap
+    check would let those three reads add up.
+    """
+    g = _locked(7, 14)
+    g.filter(_fr(11, 14), 1_000, None)
+    g.filter(_fr(12, 14), 1_200, None)
+    g.filter(_fr(16, 14), 1_400, None)
+    assert g.allows_final_fallback() is False
+    assert g.filter(_fr(7, 14), 2_000, None).pair == (7, 14)
+    assert g.filter(_fr(7, 14), 2_200, None).pair == (7, 14)
+    assert g.allows_final_fallback() is False
+    # 2.1 s after the previous matching read. The count restarts at 1.
+    assert g.filter(_fr(7, 14), 4_300, None).pair == (7, 14)
+    assert g.allows_final_fallback() is False
+    assert g._clear_n == 1
+    assert g.filter(_fr(7, 14), 4_500, None).pair == (7, 14)
+    assert g.allows_final_fallback() is False
+    assert g.filter(_fr(7, 14), 4_700, None).pair == (7, 14)
+    assert g.allows_final_fallback() is True
+
+
+def test_matching_read_does_not_reset_a_pending_new_score():
+    """r3_trace: true 7-24 on even frames, stale 7-14 between. The count must not bounce."""
+    g = _locked(7, 14)
+    saw = []
+    for i in range(12):
+        t = 2_000 + 200 * i
+        pair = (7, 24) if i % 2 == 0 else (7, 14)
+        g.filter(_fr(*pair), t, None)
+        saw.append(g._vote_n)
+        if pair == (7, 14):
+            assert g._vote_n == saw[-2] if saw else g._vote_n
+    assert saw[0] == 1
+    assert 0 not in saw[1:]  # a stale re-show used to zero this
+    assert g.disagreeing is True
+    assert g.allows_final_fallback() is False
+    final = _final_from(g, {"home": 14, "away": 7, "quarter": 4, "t_ms": 4_200})
+    assert (final["away_score"], final["home_score"], final["winner"]) == (None, None, "unknown")
+
+
+def test_interleaved_from_the_start_true_final_does_not_publish_the_stale_lock():
+    """Stale 7-14 re-shows from the first frame, not after a disagreement was already set.
+
+    The result is an abstain or the true final. It is never the stale lock. Covers the
+    mirror-F3 patterns: 1 true per 2, 3, or 4 frames, and a true read every 700 ms.
+    """
+    stale = {"home": 14, "away": 7, "quarter": 4, "t_ms": 0}
+
+    def finish(g, true):
+        if g.allows_final_fallback():
+            assert g.locked == true
+            final = _final_from(g, {"home": true[1], "away": true[0], "quarter": 4, "t_ms": 0})
+            assert (final["away_score"], final["home_score"]) == true
+        else:
+            final = _final_from(g, stale)
+            assert (final["away_score"], final["home_score"], final["winner"]) == (None, None, "unknown")
+        assert (final["away_score"], final["home_score"]) != (7, 14)
+
+    for true in ((7, 24), (7, 21)):
+        for k in (2, 3, 4):
+            g = ScoreGrammar()
+            agree = AgreementWindow(lock_agreement_config())
+            end = _seed(g, agree, 7, 14, 4, t0=0)
+            t = end + 1_000
+            limit = t + 6_000
+            while t < limit:
+                _offer_pair(g, agree, true, t)
+                t += 200
+                for _ in range(k - 1):
+                    if t >= limit:
+                        break
+                    _offer_pair(g, agree, (7, 14), t)
+                    t += 200
+            _offer_pair(g, agree, true, t)  # last read is the true final
+            finish(g, true)
+            # The same pattern ending on the stale re-shows must not publish them either.
+            g = ScoreGrammar()
+            agree = AgreementWindow(lock_agreement_config())
+            end = _seed(g, agree, 7, 14, 4, t0=0)
+            t = end + 1_000
+            limit = t + 6_000
+            while t < limit:
+                _offer_pair(g, agree, true, t)
+                t += 200
+                for _ in range(k - 1):
+                    if t >= limit:
+                        break
+                    _offer_pair(g, agree, (7, 14), t)
+                    t += 200
+            finish(g, true)
+
+        g = ScoreGrammar()
+        agree = AgreementWindow(lock_agreement_config())
+        end = _seed(g, agree, 7, 14, 4, t0=0)
+        for i, dt in enumerate(range(0, 6_000, 100)):
+            t = end + 1_000 + dt
+            if dt % 700 == 0:
+                _offer_pair(g, agree, true, t)
+            else:
+                g.filter(_blank(), t, None)
+        finish(g, true)
+
+        g = ScoreGrammar()
+        agree = AgreementWindow(lock_agreement_config())
+        end = _seed(g, agree, 7, 14, 4, t0=0)
+        for i, dt in enumerate((0, 200, 400)):
+            _offer_pair(g, agree, true, end + 1_000 + dt)
+        finish(g, true)
+
+
+def test_f5_forged_seven_seven_for_one_and_a_half_seconds_does_not_name_it():
+    g = ScoreGrammar()
+    agree = AgreementWindow(lock_agreement_config())
+    end = _seed(g, agree, 7, 14, 4, t0=0)
+    published = None
+    for i in range(16):
+        t = end + 1_000 + i * 100
+        published = _offer_pair(g, agree, (7, 7), t) or published
+    assert published != (7, 7)
+    assert g.locked == (7, 14) and g.allows_final_fallback() is False
+    blocked = _final_from(g, {"home": 14, "away": 7, "quarter": 4, "t_ms": end})
+    assert (blocked["away_score"], blocked["home_score"], blocked["winner"]) == (None, None, "unknown")
+
+
+def test_two_new_score_frames_at_the_end_do_not_publish_the_stale_lock():
+    """Two frames of a new score do not meet the vote, and they must not publish the lock."""
+    g = _locked(7, 14)
+    assert g.filter(_fr(7, 24), 2_000, None).left_score is None
+    assert g.filter(_fr(7, 24), 2_200, None).left_score is None
+    assert g.disagreeing is False and g._vote_n == 2
+    assert g.allows_final_fallback() is False
+    published = _final_from(g, {"home": 14, "away": 7, "quarter": 4, "t_ms": 2_200})
+    assert (published["home_score"], published["away_score"], published["winner"]) == (None, None, "unknown")
+    # A single forged decrease still publishes the lock (FU2).
+    down = _locked(7, 14)
+    assert down.filter(_fr(7, 7), 2_000, None).left_score is None
+    assert down.filter(_fr(7, 7), 2_200, None).left_score is None
+    assert down.disagreeing is False and down.allows_final_fallback() is True
+    kept = _final_from(down, {"home": 14, "away": 7, "quarter": 4, "t_ms": 2_200})
+    assert (kept["away_score"], kept["home_score"]) == (7, 14)
+
+
+def test_two_new_score_frames_then_blanks_do_not_publish_the_stale_lock():
+    """Blank frames must not age a pending new score out of the fallback."""
+    g = _locked(7, 14)
+    assert g.filter(_fr(7, 24), 0, None).left_score is None
+    assert g.filter(_fr(7, 24), 200, None).left_score is None
+    for i in range(30):
+        g.filter(_blank(), 400 + 100 * i, None)
+    assert g.disagreeing is False and g.allows_final_fallback() is False
+    published = _final_from(g, {"home": 14, "away": 7, "quarter": 4, "t_ms": 3_400})
+    assert (published["home_score"], published["away_score"], published["winner"]) == (None, None, "unknown")
+    # A later non-blank run of the lock can resolve it. A decrease still publishes.
+    shown = _locked(7, 14)
+    shown.filter(_fr(7, 24), 0, None)
+    shown.filter(_fr(7, 24), 200, None)
+    for i in range(30):
+        shown.filter(_fr(7, 14), 400 + 100 * i, None)
+    assert shown.allows_final_fallback() is True
+    down = _locked(7, 14)
+    down.filter(_fr(7, 7), 0, None)
+    down.filter(_fr(7, 7), 200, None)
+    for i in range(30):
+        down.filter(_blank(), 400 + 100 * i, None)
+    assert down.disagreeing is False and down.allows_final_fallback() is True
+
+
+def test_a_new_disagreeing_read_resets_the_clear_streak():
+    """A new disagreeing read breaks the clear streak before it can restore the lock."""
+    g = _locked(7, 14)
+    g.filter(_fr(11, 14), 1_000, None)
+    g.filter(_fr(12, 14), 1_200, None)
+    g.filter(_fr(16, 14), 1_400, None)
+    assert g.disagreeing is True
+    assert g.filter(_fr(7, 14), 4_000, None).pair == (7, 14)
+    assert g.filter(_fr(7, 14), 4_200, None).pair == (7, 14)
+    assert g.disagreeing is True and g._clear_n == 2
+    assert g.filter(_fr(11, 14), 4_400, None).left_score is None
+    assert g._vote_n == 1 and g.disagreeing is True and g._clear_n == 0
+    assert g.filter(_fr(7, 14), 4_600, None).pair == (7, 14)
+    assert g.filter(_fr(7, 14), 4_800, None).pair == (7, 14)
+    assert g._clear_n == 2 and g.disagreeing is True
+
+
+def test_interleaved_true_frames_do_not_lock_the_forgery():
+    g = ScoreGrammar()
+    agree = AgreementWindow(lock_agreement_config())
+    end = _seed(g, agree, 7, 14, 4, t0=0)
+    published = None
+    for i in range(8):
+        t = end + 1_000 + i * 400
+        pair = (7, 7) if i % 2 == 0 else (7, 14)
+        fr = g.filter(_fr(*pair), t, None)
+        res = agree.offer(fr, clock_ns=t * 1_000_000, crop_hash="crop", session_id="s")
+        if res.agreed and fr.pair is not None:
+            g.note_lock(t, fr.pair[0], fr.pair[1])
+            published = fr.pair
+    assert g.locked == (7, 14)
+    assert published in (None, (7, 14))
+    assert g.allows_final_fallback() is True
+
+
+# --- inferred quarter ---
+
+def test_inferred_quarter_is_labelled_and_never_used_for_a_final_or_a_lock():
+    h = ClockHistory()
+    assert h.filter(100, 2, 0) == 100
+    assert h.filter(99, None, 1_000) == 99
+    assert h.continuation is True and h.accepted_now is True and h.last_q == 2
+    fr = FrameRead(
+        ok=False, reason="quarter_unsure", profile_id="madden27_standard",
+        left_score=3, right_score=0, quarter=None, clock_seconds=99, score_conf=0.9,
+    )
+    out = apply_inferred_quarter(fr, h)
+    assert out.quarter is None
+    assert out.detail["quarter_inferred"] is True and out.detail["inferred_quarter"] == 2
+    assert posted_quarter(out) is None
+    agree = AgreementWindow(lock_agreement_config())
+    res = agree.offer(out, clock_ns=1_000_000_000, crop_hash="crop", session_id="s")
+    assert res.agreed is False
+
+    # A higher clock with no quarter glyph is a reset we can see. Do not carry Q2.
+    assert h.filter(400, None, 2_000) is None
+    assert h.rule_note == "clock_increase" and h.accepted_now is False
+    jumped = apply_inferred_quarter(FrameRead(
+        ok=False, reason="quarter_unsure", profile_id="madden27_standard",
+        left_score=3, right_score=0, quarter=None, clock_seconds=None,
+    ), h)
+    assert jumped.detail.get("quarter_inferred") is not True
+    assert jumped.quarter is None
+
+    # Even if a caller copies the carried value onto the quarter field, the post strips it.
+    hostile = FrameRead(
+        ok=True, reason="ok", profile_id="madden27_standard",
+        left_score=3, right_score=0, quarter=2, clock_seconds=99,
+        detail={"quarter_inferred": True, "inferred_quarter": 2},
+    )
+    assert posted_quarter(hostile) is None
+    def detect(timeline):
+        raise AssertionError("inferred quarter reached detect_final")
+
+    core = ReaderCore(lambda body: None, None, None, None, detect)
+    core._post_agreed(1_000, hostile, False)
+    assert core.timeline[-1]["quarter"] is None
+    assert core._max_quarter is None and core.final is None
+    stripped = core._strip_inferred_quarter(hostile)
+    assert stripped.quarter is None
+    notes = []
+    core.reanchor_note = notes.append
+    core._note_reanchor(1_000, out)
+    assert notes == [{
+        "t_ms": 1000, "away": 3, "home": 0,
+        "quarter_inferred": True, "inferred_quarter": 2,
+    }]
+    assert "quarter" not in notes[0]
+
+    receipt = (HERE.parent / "contracts" / "receipt.v0.json").read_text(encoding="utf-8")
+    timeline = (HERE.parent / "contracts" / "score_timeline.v0.json").read_text(encoding="utf-8")
+    assert "quarter_inferred" not in receipt and "inferred_quarter" not in receipt
+    assert "quarter_inferred" not in timeline and "clock_rule" not in timeline
+
+
+def test_frame_loop_strips_an_inferred_quarter_before_agreement():
+    """I5. Deleting the strip call lets a copied quarter into the agreement window.
+
+    ``posted_quarter`` already hides the flag on a timeline row. The frame loop
+    has to clear ``quarter`` before ``agree.offer``, and that call stays before
+    ``_hold_quarter``.
+    """
+    seen = []
+
+    class Agree:
+        def offer(self, fr, **_):
+            seen.append(fr.quarter)
+            return type("Res", (), {"agreed": False, "read": None})()
+
+    class Reader:
+        def read(self, _img):
+            return FrameRead(
+                ok=True, reason="ok", profile_id="madden27_standard",
+                left_score=3, right_score=0, quarter=4, clock_seconds=90,
+                detail={"quarter_inferred": True, "inferred_quarter": 4},
+            )
+
+    core = ReaderCore(lambda body: None, Reader(), Agree(), None, lambda timeline: None)
+    core.on_frame(1_000, None)
+    assert seen == [None]
+    assert all(row.get("quarter") is None for row in core.timeline)
+
+
+def test_only_lowers_and_a_running_clock_obeys_the_countdown():
+    rng = random.Random(0)
+    h = ClockHistory()
+    for _ in range(20_000):
+        secs = rng.randint(-1, 20 * 60)
+        quarter = rng.choice([None, 1, 2, 3, 4, 5])
+        t_ms = None if rng.randrange(12) == 0 else rng.randint(0, 80_000)
+        prev_s, prev_q, prev_t = h.last_s, h.last_q, h.last_t
+        out = h.filter(secs, quarter, t_ms)
+        if secs is None or t_ms is None:
+            assert out == secs
+            continue
+        assert out is None or out == secs
+        if h.reanchor_kind == "run":
+            assert h.last_run and countdown_run_ok(h.last_run, h.run_tol_s)
+            assert h.last_run[-1][1] == out
+            assert h.last_run[0][1] > out
+        if out is None or prev_s is None or prev_t is None or t_ms < prev_t:
+            continue
+        q = quarter if isinstance(quarter, int) and not isinstance(quarter, bool) else None
+        if q is not None and prev_q is not None and q != prev_q:
+            continue
+        assert out <= prev_s
+
+    g = ScoreGrammar()
+    g.note_lock(0, 0, 0)
+    for i in range(20_000):
+        away, home = rng.randint(0, 48), rng.randint(0, 48)
+        conf = rng.choice([0.4, 0.72, 0.95])
+        fr = _fr(away, home, conf=conf, quarter=rng.choice([1, 2, 3, 4]), clock=rng.randint(0, 900))
+        out = g.filter(fr, 10_000 + i * 50, rng.choice([None, None, "fg", "td"]))
+        assert out.left_score in (None, away) and out.right_score in (None, home)
+        assert out.quarter == fr.quarter and out.clock_seconds == fr.clock_seconds
+        assert out.ok is False or fr.ok is True
+        if fr.score_conf is not None and out.score_conf is not None:
+            assert out.score_conf <= fr.score_conf
+        assert not (out.score_conf is not None and fr.score_conf is None)
+        assert out.score_margin is None or fr.score_margin is None or out.score_margin <= fr.score_margin
+
+
+def _assert_increase_blanks(history):
+    history.filter(60, 1, 0)
+    assert history.filter(61, 1, 1_000) is None
+    assert history.last_s == 60
+
+
+def _assert_drift_rejected(history):
+    history.filter(90, 1, 0)
+    assert _feed_rate(history, 60, 100, 12_000, 100, 500) == []
+    assert history.last_s == 90
+
+
+def _assert_run_needs_the_full_window(history):
+    """One second of a countdown while suspended is not a running clock.
+
+    A zero span completes on the second sample. The real gate still needs 3 s.
+    """
+    history.filter(60, 1, 0)
+    for t in (100, 800, 1_500, 2_100):
+        history.filter(70, 1, t)
+    assert history.suspended and history.last_s is None
+    early = _feed_rate(history, 80, 9_000, 1_000, 100, 1_000)
+    assert early == []
+
+
+def _assert_one_frame_does_not_abstain(grammar):
+    grammar.filter(_fr(7, 7), 5_000, None)
+    assert grammar.locked == (7, 14)
+    assert grammar.allows_final_fallback() is True
+
+
+def _assert_inferred_is_not_posted(fr):
+    assert fr.detail.get("quarter_inferred") is True
+    assert posted_quarter(fr) is None
+
+
+def test_each_new_rule_fails_when_the_rule_is_mutated():
+    """The strict predicates go red if the rule is replaced by a pass. CI stays green."""
+
+    class AcceptsIncrease(ClockHistory):
+        def filter(self, secs, quarter, t_ms):
+            if secs is None or t_ms is None:
+                return secs
+            self.last_s = int(secs)
+            return int(secs)
+
+    with pytest.raises(AssertionError):
+        _assert_increase_blanks(AcceptsIncrease())
+
+    with pytest.raises(AssertionError):
+        _assert_drift_rejected(ClockHistory(run_tol_s=10))
+
+    with pytest.raises(AssertionError):
+        _assert_run_needs_the_full_window(ClockHistory(run_reads=1, run_span_ms=0, run_min_distinct=1))
+
+    class OneFrameVeto(ScoreGrammar):
+        def filter(self, fr, t_ms, banner=None):
+            out = super().filter(fr, t_ms, banner)
+            if getattr(out, "reason", None) == "score_transition":
+                self.disagreeing = True
+            return out
+
+    _assert_increase_blanks(ClockHistory())
+    _assert_drift_rejected(ClockHistory())
+    _assert_run_needs_the_full_window(ClockHistory())
+    veto = OneFrameVeto()
+    veto.note_lock(0, 7, 14)
+    with pytest.raises(AssertionError):
+        _assert_one_frame_does_not_abstain(veto)
+    _assert_one_frame_does_not_abstain(_locked(7, 14))
+
+    carried = FrameRead(
+        ok=False, reason="quarter_unsure", profile_id="madden27_standard",
+        quarter=None, detail={"quarter_inferred": True, "inferred_quarter": 2},
+    )
+    _assert_inferred_is_not_posted(carried)
+
+    def posts_the_carried_value(fr):
+        return fr.detail.get("inferred_quarter")
+
+    with pytest.raises(AssertionError):
+        assert posts_the_carried_value(carried) is None
+
+
+def test_clock_rule_note_stays_off_the_timeline_schema():
+    from qorcap_reader import ReaderCore
+    notes = []
+    core = ReaderCore(lambda b: None, None, None, None, None)
+    core.reanchor_note = notes.append
+    fr = FrameRead(
+        ok=False, reason="ok", profile_id="madden27_standard",
+        left_score=0, right_score=0, quarter=1, clock_seconds=None,
+        detail={"clock_rule": "clock_increase"},
+    )
+    core._note_reanchor(800, fr)
+    assert notes == [{"t_ms": 800, "away": 0, "home": 0, "quarter": 1, "clock_rule": "clock_increase"}]
+    schema = json.loads((HERE.parent / "contracts" / "score_timeline.v0.json").read_text(encoding="utf-8"))
+    props = schema["properties"]["signals"]["properties"]["score_timeline"]["properties"]["events"]["items"]["properties"]
+    assert "clock_rule" not in props and "quarter_inferred" not in props

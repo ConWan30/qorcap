@@ -106,6 +106,7 @@ LINUX_FILES = (
     "sidecar/test_qorcap_match.py::test_live_save_tail_never_adds_the_late_sign_note",
     "sidecar/test_qorcap_standard.py",
     "sidecar/test_qorcap_score_grammar.py",
+    "sidecar/test_qorcap_clock_vote.py",
     "sidecar/test_qorcap_hl170123.py",
     "sidecar/test_qorcap_seq125430.py",
     "sidecar/test_qorcap_tnp.py",
@@ -185,6 +186,7 @@ WINDOWS_FILES = (
     "sidecar/test_qorcap_match.py::test_live_save_tail_never_adds_the_late_sign_note",
     "sidecar/test_qorcap_standard.py",
     "sidecar/test_qorcap_score_grammar.py",
+    "sidecar/test_qorcap_clock_vote.py",
     "sidecar/test_qorcap_tnp.py",
     "sidecar/test_qorcap_snp.py",
     "sidecar/test_qorcap_mnp.py",
@@ -231,9 +233,10 @@ WINDOWS_FILES = (
 # pytest --collect-only -q of each --list, QORTIME pin 0204e6d8082f8c40ea1fe5e09bf16402aaee3ff2:
 # 1306 linux / 1287 windows. Previous floors were 1288 / 1269; this change adds
 # 18 collected tests on both lists.
-# Merged origin/main (1306 linux / 1287 windows) with sidecar/test_presign_followups.py.
-LINUX_MIN_COLLECTED = 1313
-WINDOWS_MIN_COLLECTED = 1294
+# Merged origin/main 617efff (#103, floors 1313/1294) with sidecar/test_qorcap_clock_vote.py.
+# Re-collected with QORTIME pin; 1313+79 / 1294+79.
+LINUX_MIN_COLLECTED = 1392
+WINDOWS_MIN_COLLECTED = 1373
 
 # Absent from both sidecar suites. A reason is required; whitespace does not count.
 EXCLUDED_TEST_FILES = {
