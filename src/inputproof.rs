@@ -337,6 +337,38 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Same screen and presses as above, recorded at 60 fps (sight-to-shot PLAN-r10 A1 fix).
+    #[test]
+    fn end_to_end_alignment_with_real_video_at_60_fps() {
+        let ok = std::process::Command::new("ffmpeg").arg("-version").stdout(std::process::Stdio::null()).status().map(|s| s.success()).unwrap_or(false);
+        if !ok { eprintln!("ffmpeg not on PATH; skipping"); return; }
+        let dir = std::env::temp_dir().join(format!("qorcap-e2e60-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir); std::fs::create_dir_all(&dir).unwrap();
+        // Screen flips brightness at T = 2, 5, 8, ... (and back at 3, 6, 9, ...). Presses land 200 ms before each flip at 2+3k.
+        let st = std::process::Command::new("ffmpeg").args(["-v", "error", "-y", "-f", "lavfi", "-i",
+            "color=c=gray:s=160x90:r=60,geq=lum='if(gte(mod(T\\,3)\\,2)\\,210\\,40)':cb=128:cr=128", "-t", "30", "-pix_fmt", "yuv420p",
+            dir.join("video.mp4").to_str().unwrap()]).status().unwrap();
+        assert!(st.success());
+        std::fs::write(dir.join("manifest.jsonl"), "{\"type\":\"segment\",\"seq\":0,\"kind\":\"init\",\"file\":\"video.mp4\",\"mono_ms\":0}\n").unwrap();
+        let mut l = InputLog::new(Some(dir.join("inputs.jsonl")), true, 0);
+        l.on_status_with_id(1, "connected", "DualSense (USB)", Some("serial:DS1"));
+        for k in 0..9u64 {
+            let t = (1_800 + 3_000 * k) * 1000;
+            l.on_report(t, &Pad { buttons: hid::CROSS, ..Pad::neutral() });
+            l.on_report(t + 80_000, &Pad::neutral());
+        }
+        l.seal(1, 30_000_000);
+        let p = build(&dir, Some("ffmpeg"), 15);
+        let a = &p["alignment"];
+        assert!(a["presses_tested"].as_i64().unwrap() >= 8, "{p:#}");
+        assert!(a["match_permille"].as_i64().unwrap() >= 875, "{a:#}");
+        assert!(a["chance_permille"].as_i64().unwrap_or(0) <= 500, "{a:#}");
+        assert_eq!(a["fps"], 60, "{a:#}");
+        let off = a["offset_ms"].as_i64().unwrap();
+        assert!((133..=300).contains(&off), "offset {off}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     fn seal_connects(dir: &std::path::Path, legacy: bool, connects: &[(&str, Option<&str>)]) {
         let _ = std::fs::remove_dir_all(dir);
         std::fs::create_dir_all(dir).unwrap();

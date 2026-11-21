@@ -100,14 +100,17 @@ def test_recorder_pause_caps_match_vendored_rule_v2():
     assert bundle["properties"]["challenge_rule"]["enum"] == [1, 2]
     assert set(versions) == {"1", "2"}
     motion = COMPAT["motion_rules"]
-    assert motion["current"] == 3
+    # qortime #106 (motion rule v4): 48-segment deterministic sample, median of 3 draws.
+    # Floor, bin and lag limits are unchanged from v3; v3 stays listed for older reviews.
+    assert motion["current"] == 4
     assert motion["floor_permille"] == 300
     assert motion["min_bins"] == 20
     assert motion["max_lag_bins"] == 3
-    assert motion["sample_max_segments"] == 24
+    assert motion["sample_max_segments"] == 48
+    assert motion["median_draws"] == 3
     assert motion["sample_hz"] == 10
     assert motion["sample_size"] == [640, 360]
-    assert set(motion["rule_versions"]) == {"3"}
+    assert set(motion["rule_versions"]) == {"3", "4"}
     assert COMPAT["checkpoint_timing"]["max_gap_ms"] == 10000
     assert COMPAT["checkpoint_timing"]["max_skew_ms"] == 3000
     leave = COMPAT["challenge_rules"]["menu_leave_buttons"]

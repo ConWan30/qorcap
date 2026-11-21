@@ -1,6 +1,7 @@
 """Snapshots and fallbacks for the Start Match console. Presentation only."""
 import io
 import json
+import os
 import subprocess
 import sys
 import threading
@@ -138,7 +139,7 @@ def test_short_console_keeps_the_pattern_and_the_seconds():
     assert "┌" not in packed
 
 
-def test_gold_is_only_the_referee_verified_card():
+def test_no_card_is_gold_not_even_a_referee_verified_one():
     def painted(card, level="truecolor"):
         grid = qc.layout_challenge(card, width=78, height=30, tick=1, now_ms=19_000)
         return qc.paint(grid, level)
@@ -148,7 +149,8 @@ def test_gold_is_only_the_referee_verified_card():
         assert GOLD not in blob
         assert "38;2" in blob
     verified = painted(qc.sample_card("pass", verified=True))
-    assert GOLD in verified
+    assert GOLD not in verified  # neutral since Con's card t3229s12405 (was gold)
+    assert "38;2;255;255;255" in verified
     assert "Referee verified." in qc.grid_text(qc.layout_challenge(
         qc.sample_card("pass", verified=True), width=78, height=30, tick=1, now_ms=19_000))
     none = painted(qc.sample_card("pass"), "none")
@@ -161,10 +163,10 @@ def test_gold_is_only_the_referee_verified_card():
     assert frame(qc.sample_card("pass")) == "cyan"
     assert frame(qc.sample_card("fail")) == "red"
     assert frame(qc.sample_card("expired")) == "mute"
-    assert frame(qc.sample_card("pass", verified=True)) == "gold"
+    assert frame(qc.sample_card("pass", verified=True)) == "hot"
 
 
-def test_dashboard_footer_uses_gold_only_when_verified():
+def test_dashboard_footer_is_never_gold():
     plain = qc.layout_dashboard(qc.sample_snap(), width=78, height=18, last=("game start", "pass", False))
     text = qc.grid_text(plain)
     assert "buttons on this pad" in text and "referee verified" not in text
@@ -172,7 +174,282 @@ def test_dashboard_footer_uses_gold_only_when_verified():
     assert "gold" not in colors
     verified = qc.layout_dashboard(qc.sample_snap(), width=78, height=18, last=("game start", "pass", True))
     assert "referee verified" in qc.grid_text(verified)
-    assert any(color == "gold" for row in verified for _, color in row)
+    assert all(color != "gold" for row in verified for _, color in row)  # neutral since t3229s12405
+    assert any(color == "hot" for row in verified for _, color in row)
+
+
+# The gold escape at each colour level the console can paint.
+_GOLD_ESC = {"truecolor": "38;2;255;194;61", "256": "38;5;220", "16": "\x1b[93m"}
+# Pinned literal VERIFIED-banner bytes (QorProof G2). Not taken from paint_inline.
+_GOLD_BANNER = {
+    "truecolor": lambda msg: "\x1b[38;2;255;194;61m\x1b[48;2;4;5;10m" + msg + "\x1b[0m",
+    "256": lambda msg: "\x1b[38;5;220m\x1b[48;5;16m" + msg + "\x1b[0m",
+    "16": lambda msg: "\x1b[93m\x1b[40m" + msg + "\x1b[0m",
+}
+
+
+@pytest.mark.parametrize("level", ["truecolor", "256", "16"])
+def test_referee_verified_challenge_card_emits_no_gold_escape(level):
+    """Con's card t3229s12405: a referee-confirmed challenge is not a verified match, so it is never gold."""
+    gold = _GOLD_ESC[level]
+    assert gold in qc.paint_inline("x", "gold", level)  # the probe matches what gold paints at this level
+    card = qc.sample_card("pass", verified=True)
+    for tick in (0, 1, 2):
+        blob = qc.paint(qc.layout_challenge(card, width=78, height=30, tick=tick, now_ms=19_000), level)
+        assert gold not in blob, (level, tick)
+    for last in (("game start", "pass", True), ("game start", "pass", False), ("kickoff", "fail", False)):
+        dash = qc.paint(qc.layout_dashboard(qc.sample_snap(), width=78, height=18, last=last), level)
+        assert gold not in dash, (level, last)
+    assert qc.REFEREE_CHALLENGE_COLOR != "gold"
+
+
+@pytest.mark.parametrize("level,env", [("truecolor", {"COLORTERM": "truecolor"}), ("256", {"TERM": "xterm-256color"}),
+                                       ("16", {"QORCAP_COLOR": "16"})])
+def test_verified_match_banner_is_still_gold(level, env):
+    """Gold stays only where it marks a referee VERIFIED match, byte-identical to the previous paint."""
+    assert qc._color_level(env) == level
+    for msg in ("RESULT: VERIFIED", "  OFFICIAL RESULT: VERIFIED"):
+        painted = qc.tint_verified_banner(msg, env, Tty(), verdict="VERIFIED")
+        assert painted == _GOLD_BANNER[level](msg)
+        assert _GOLD_ESC[level] in painted
+    # An unrelated line is not gold even when the typed verdict is VERIFIED.
+    assert _GOLD_ESC[level] not in qc.tint_verified_banner("Challenge kickoff PASSED", env, Tty(), verdict="VERIFIED")
+
+
+_BANNER_LEVELS = (("truecolor", {"COLORTERM": "truecolor"}), ("256", {"TERM": "xterm-256color"}),
+                  ("16", {"QORCAP_COLOR": "16"}))
+
+
+def _prefix_only_tint(msg, env, stream):
+    """The prefix-only gate from main 19992a2 (#165). Used to show where the new tests would fail on it."""
+    if qc._color_level(env) == "none" or not qc._isatty(stream):
+        return msg
+    stripped = msg.strip()
+    if stripped.startswith("RESULT: VERIFIED") or stripped.startswith("OFFICIAL RESULT: VERIFIED"):
+        return qc.paint_inline(msg, "gold", qc._color_level(env))
+    return msg
+
+
+@pytest.mark.parametrize("level,env", _BANNER_LEVELS)
+@pytest.mark.parametrize(
+    "msg,verdict",
+    [
+        ("RESULT: SELF_ATTESTED", "SELF_ATTESTED"),
+        ("  RESULT: SELF_ATTESTED", "SELF_ATTESTED"),  # practice / local-self-attested finalize
+        ("RESULT: PARTIAL", "PARTIAL"),
+        ("  RESULT: PARTIAL", "PARTIAL"),
+        ("RESULT: FAIL", "FAIL"),
+        ("  RESULT: FAIL", "FAIL"),
+        ("  OFFICIAL RESULT: SELF_ATTESTED", "SELF_ATTESTED"),
+        ("  OFFICIAL RESULT: PARTIAL", "PARTIAL"),
+        ("  OFFICIAL RESULT: FAIL", "FAIL"),
+    ],
+)
+def test_self_attested_partial_fail_and_practice_banners_are_never_gold(level, env, msg, verdict):
+    """QorProof N3: SELF_ATTESTED (including practice), PARTIAL and FAIL stay plain at every colour level."""
+    assert qc._color_level(env) == level
+    gold = _GOLD_ESC[level]
+    assert gold in qc.paint_inline("x", "gold", level)
+    assert gold not in qc.tint_verified_banner(msg, env, Tty(), verdict=verdict)
+    assert gold not in qc.tint_verified_banner(msg, env, Tty())
+    # Practice finalize uses the local self-attested key, so its result is SELF_ATTESTED, never gold.
+    if verdict == "SELF_ATTESTED":
+        assert qm.REFEREE_KIND == "local-self-attested"
+
+
+@pytest.mark.parametrize("level,env", _BANNER_LEVELS)
+def test_gold_is_gated_on_the_typed_verdict_not_a_text_prefix(level, env):
+    """QorProof N2: a missing or unknown verdict is not gold, even when the line looks like a VERIFIED banner.
+
+    The prefix-only gate from #165 would paint several of these cases gold; the typed gate must not.
+    """
+    assert qc._color_level(env) == level
+    gold = _GOLD_ESC[level]
+    tty = Tty()
+    lookalike = "RESULT: VERIFIED-LOOKING"
+    assert gold in _prefix_only_tint(lookalike, env, tty)
+    assert gold not in qc.tint_verified_banner(lookalike, env, tty, verdict="SELF_ATTESTED")
+    assert gold not in qc.tint_verified_banner(lookalike, env, tty)
+    banner = "RESULT: VERIFIED"
+    official = "  OFFICIAL RESULT: VERIFIED"
+    for msg in (banner, official):
+        assert gold in _prefix_only_tint(msg, env, tty)
+        assert gold not in qc.tint_verified_banner(msg, env, tty)  # missing verdict, fail closed
+        assert gold not in qc.tint_verified_banner(msg, env, tty, verdict=None)
+        assert gold not in qc.tint_verified_banner(msg, env, tty, verdict="")
+        assert gold not in qc.tint_verified_banner(msg, env, tty, verdict="FAIL")
+        assert gold not in qc.tint_verified_banner(msg, env, tty, verdict="PARTIAL")
+        assert gold not in qc.tint_verified_banner(msg, env, tty, verdict="SELF_ATTESTED")
+        assert gold not in qc.tint_verified_banner(msg, env, tty, verdict="verified")
+        assert gold not in qc.tint_verified_banner(msg, env, tty, verdict="VERIFIED ")
+        assert gold not in qc.tint_verified_banner(msg, env, tty, verdict="UNKNOWN")
+    # Existing VERIFIED-banner output is pinned to the literal gold escape at this level (QorProof G2).
+    assert qc.tint_verified_banner(banner, env, tty, verdict="VERIFIED") == _GOLD_BANNER[level](banner)
+    assert qc.tint_verified_banner(official, env, tty, verdict="VERIFIED") == _GOLD_BANNER[level](official)
+
+
+def test_match_and_submit_result_lines_pass_the_typed_verdict(capsys):
+    """The RESULT / OFFICIAL RESULT callers pass the typed status into tint_verified_banner."""
+    seen = []
+
+    def fake_tint(msg, env=None, stream=None, *, verdict=None):
+        seen.append((msg, verdict))
+        return msg
+
+    orig = qc.tint_verified_banner
+    qc.tint_verified_banner = fake_tint
+    try:
+        qc.emit("  RESULT: SELF_ATTESTED", verdict="SELF_ATTESTED")
+        assert seen[-1] == ("  RESULT: SELF_ATTESTED", "SELF_ATTESTED")
+        qm.say("  RESULT: PARTIAL", verdict="PARTIAL")
+        assert seen[-1] == ("  RESULT: PARTIAL", "PARTIAL")
+        qs.say("  OFFICIAL RESULT: FAIL", verdict="FAIL")
+        assert seen[-1] == ("  OFFICIAL RESULT: FAIL", "FAIL")
+        qc.emit("hello")
+        assert seen[-1] == ("hello", None)
+    finally:
+        qc.tint_verified_banner = orig
+
+
+def _qortime():
+    for p in (os.getenv("QORTIME") or "", HERE.parent / "qortime", HERE.parent.parent / "qortime"):
+        if p and (Path(p) / "qor_receipt").exists():
+            return Path(p)
+    return None
+
+
+def _keys_and_cps(tmp_path):
+    """Synthetic device, referee and two countersigned checkpoints. Needs a qortime checkout."""
+    qt = _qortime()
+    if qt is None:
+        pytest.skip("no qortime checkout")
+    if str(qt) not in sys.path:
+        sys.path.insert(0, str(qt))
+    from qor_receipt.checkpoints import Chain
+
+    dev, ref = qm.load_keys(tmp_path / "keys")
+    t = [1000]
+    cs = qm.Countersigner(ref, "local-1", "home", clock=lambda: t[0] + 50)
+    ch = Chain()
+    for _ in range(2):
+        cp = ch.next(t[0], "a" * 64, "b" * 64)
+        cp["qorcap"] = {"trigger": "segment"}
+        assert cs.offer(cp)
+        t[0] += 2000
+    draft = {
+        "schema": "qor-receipt/v0",
+        "match": {"match_id": "local-1", "game": "madden27", "platform": "ps5",
+                  "scorebug_profile": "madden27_standard", "mode": "single",
+                  "started_ms": 0, "ended_ms": 0},
+        "result": {"home_score": 14, "away_score": 10, "quarter": 4, "final_t_ms": 5000,
+                   "winner": "home", "method": "agreed_scorebug_final", "final_basis": "clock_zero"},
+        "players": [{"role": "home", "player_id": "psn:me", "pubkey": "0" * 64, "key_kind": "software"}],
+        "referee": {}, "challenges": [], "checkpoints": {},
+        "agreement": {"timelines_agree": None, "mismatches": []},
+        "signals": {"motion_permille": {"home": None}},
+    }
+    return dev, ref, cs.signed, draft, qt
+
+
+def _capture_tints(monkeypatch, level="truecolor"):
+    """Route emit() through a TTY at ``level`` and record every tint_verified_banner call."""
+    env = {"truecolor": {"COLORTERM": "truecolor"}, "256": {"TERM": "xterm-256color"},
+           "16": {"QORCAP_COLOR": "16"}}[level]
+    for key in ("NO_COLOR", "QORCAP_PLAIN", "QORCAP_COLOR", "COLORTERM", "TERM"):
+        monkeypatch.delenv(key, raising=False)
+    for key, val in env.items():
+        monkeypatch.setenv(key, val)
+    monkeypatch.setattr(sys, "stdout", Tty())
+    seen = []
+    orig = qc.tint_verified_banner
+
+    def wrap(msg, env=None, stream=None, *, verdict=None):
+        out = orig(msg, env, stream, verdict=verdict)
+        seen.append((msg, verdict, out))
+        return out
+
+    monkeypatch.setattr(qc, "tint_verified_banner", wrap)
+    return seen
+
+
+def _assert_banner_gold(msg, verdict, painted, status, kind):
+    assert verdict == status, (kind, verdict, status)
+    assert f"{kind}: {status}" in msg
+    if status == "VERIFIED":
+        assert painted == _GOLD_BANNER["truecolor"](msg)
+    else:
+        assert painted == msg
+        assert "\x1b[38;2;255;194;61m" not in painted
+
+
+@pytest.mark.parametrize("status", ["VERIFIED", "SELF_ATTESTED", "PARTIAL", "FAIL"])
+def test_sign_and_report_forwards_the_verifier_status_as_the_typed_verdict(tmp_path, monkeypatch, status):
+    """QorProof G1: sign_and_report (qorcap_match.py) forwards overall(run_cmd status) as the typed verdict."""
+    dev, ref, cps, draft, qt = _keys_and_cps(tmp_path)
+    bundle = tmp_path / "match"
+    bundle.mkdir()
+
+    def fake_run_cmd(cmd, env=None):
+        if "qor_receipt.cli" in cmd:
+            return 0, json.dumps({"status": status, "errors": [], "partial": [], "trust_tier": "t"})
+        if "verify-bundle" in cmd:
+            return 0, "ok"
+        raise AssertionError(cmd)
+
+    monkeypatch.setattr(qm, "run_cmd", fake_run_cmd)
+    seen = _capture_tints(monkeypatch)
+    qm.sign_and_report(
+        bundle, draft, cps, dev, ref, match_id="local-1", role="home", started_ms=900,
+        qt=qt, qorcap="qorcap-stub", no_open=True,
+    )
+    rows = [(m, v, out) for m, v, out in seen if m.strip().startswith("RESULT:")]
+    assert len(rows) == 1, seen
+    _assert_banner_gold(*rows[0], status, "RESULT")
+
+
+@pytest.mark.parametrize("status", ["VERIFIED", "SELF_ATTESTED", "PARTIAL", "FAIL"])
+def test_submit_forwards_verify_receipt_status_as_the_typed_verdict(tmp_path, monkeypatch, status):
+    """QorProof G1: submit (qorcap_submit.py) forwards verify_receipt status as the typed verdict."""
+    dev, ref, cps, draft, qt = _keys_and_cps(tmp_path)
+    rec = qm.build_receipt(draft, cps, dev, ref, match_id="local-1", role="home", started_ms=900)
+    bundle = tmp_path / "match"
+    bundle.mkdir()
+    (bundle / "manifest.jsonl").write_text("", encoding="utf-8")
+    (bundle / "checkpoints.jsonl").write_text("", encoding="utf-8")
+    (bundle / "receipt.json").write_text(json.dumps(rec), encoding="utf-8")
+    (bundle / "bundle.json").write_text(json.dumps({"schema": "qorcap-bundle/v0", "role": "home"}), encoding="utf-8")
+
+    class FakeReferee:
+        def __init__(self):
+            self.token = None
+
+        def call(self, method, path, data=None, ctype="application/json", timeout=None, headers=None):
+            if method == "GET" and path.startswith("/v1/referee"):
+                return {"pubkey": rec["referee"]["pubkey"]}
+            if method == "GET" and "submit/challenge" in path:
+                raise qs.RefereeError(404, {})
+            if method == "POST" and path.startswith("/v1/submissions?"):
+                return {"id": "sub1", "upload_token": "tok", "state": "accepted", "required": [], "commit": "c" * 40}
+            if method == "POST" and str(path).endswith("/review"):
+                return {"state": "awaiting_player_signature", "receipt": rec,
+                        "review": {"scope": "spot-check", "not_proven": [], "checks": {}}}
+            raise AssertionError((method, path))
+
+        def post_json(self, path, body, timeout=None):
+            assert "player-signature" in path
+            return {"receipt": rec}
+
+    import qor_receipt.receipt as receipt_mod
+
+    monkeypatch.setattr(
+        receipt_mod, "verify_receipt",
+        lambda *a, **k: {"status": status, "errors": [], "partial": [], "referee_id": "ref-test"},
+    )
+    seen = _capture_tints(monkeypatch)
+    qs.submit(bundle, base="http://referee.test", client=FakeReferee(), device=dev)
+    rows = [(m, v, out) for m, v, out in seen if "OFFICIAL RESULT:" in m]
+    assert len(rows) == 1, seen
+    _assert_banner_gold(*rows[0], status, "OFFICIAL RESULT")
 
 
 def test_color_and_plain_policy():
@@ -202,12 +479,15 @@ def test_color_and_plain_policy():
 
 def test_tint_only_a_verified_banner():
     env = {"COLORTERM": "truecolor"}
-    assert GOLD in qc.tint_verified_banner("RESULT: VERIFIED\n", env, Tty())
-    assert GOLD in qc.tint_verified_banner("  OFFICIAL RESULT: VERIFIED", env, Tty())
+    assert GOLD in qc.tint_verified_banner("RESULT: VERIFIED\n", env, Tty(), verdict="VERIFIED")
+    assert GOLD in qc.tint_verified_banner("  OFFICIAL RESULT: VERIFIED", env, Tty(), verdict="VERIFIED")
     for msg in ("RESULT: SELF_ATTESTED", "Challenge kickoff PASSED", "RESULT: FAIL", "SELF-ATTESTED"):
+        assert GOLD not in qc.tint_verified_banner(msg, env, Tty(), verdict="VERIFIED")
         assert GOLD not in qc.tint_verified_banner(msg, env, Tty())
-    assert GOLD not in qc.tint_verified_banner("RESULT: VERIFIED", {"NO_COLOR": "1"}, Tty())
-    assert GOLD not in qc.tint_verified_banner("RESULT: VERIFIED", env, io.StringIO())
+    # Fail closed: the same banner text without a typed VERIFIED verdict is not gold.
+    assert GOLD not in qc.tint_verified_banner("RESULT: VERIFIED", env, Tty())
+    assert GOLD not in qc.tint_verified_banner("RESULT: VERIFIED", {"NO_COLOR": "1"}, Tty(), verdict="VERIFIED")
+    assert GOLD not in qc.tint_verified_banner("RESULT: VERIFIED", env, io.StringIO(), verdict="VERIFIED")
 
 
 def test_snapshot_maps_status_without_inventing_a_device_claim():
@@ -245,12 +525,23 @@ def test_snapshot_maps_status_without_inventing_a_device_claim():
         qc.console_snapshot({"state": "waiting_for_device"}, {}, 0, None), width=78, height=18))
 
 
-def test_button_edges_do_not_reset_and_settle_is_honest():
+def test_button_edges_follow_the_referee_rule_and_settle_is_honest():
     def card():
         return qc.ChallengeCard("kickoff", "game start", ["OPTIONS", "CROSS", "CIRCLE"], 0, 5_000)
 
-    done = card()
+    # An extra press inside the pattern breaks the try for the referee, so the card resets too
+    # (it used to skip the stray press and show PASS while the referee said pattern_mismatch).
+    stray = card()
     for press in ("OPTIONS", "UP", "CROSS", "CIRCLE"):
+        qc.note_held(stray, [press], trusted=True)
+        qc.note_held(stray, [], trusted=True)
+    qc.settle(stray, 1_000, trusted=True, now_s=1.0)
+    assert stray.result is None and stray.matched == 0 and stray.wrong == "UP"
+    qc.settle(stray, 9_000, trusted=True, now_s=9.0)
+    assert stray.result == "fail"
+
+    done = card()
+    for press in ("OPTIONS", "CROSS", "CIRCLE"):
         qc.note_held(done, [press], trusted=True)
         qc.note_held(done, [], trusted=True)
     qc.settle(done, 1_000, trusted=True, now_s=1.0)
@@ -477,3 +768,90 @@ def test_plain_flag_parses_for_live_and_finalize():
     final = subprocess.run([sys.executable, str(HERE / "qorcap_match.py"), "finalize", "--plain", "--help"],
                            capture_output=True, text=True, check=False)
     assert final.returncode == 0, final.stderr
+
+
+def _referee_ok(pattern, presses):
+    """Copy of the shape of qor_receipt.challenge.response_start + verify_response's pattern check."""
+    for i, b in enumerate(presses):
+        if b == "OPTIONS" and presses[i:i + len(pattern)] == pattern:
+            return True
+    return False
+
+
+def test_card_pass_matches_the_referee_pattern_rule():
+    import random
+
+    rng = random.Random(20261025)
+    alphabet = ["CROSS", "CIRCLE", "SQUARE", "TRIANGLE", "UP", "DOWN", "LEFT", "RIGHT", "OPTIONS", "R2"]
+    for _ in range(4000):
+        body = [rng.choice(alphabet[:8]) for _ in range(4)]
+        pattern = ["OPTIONS"] + body
+        presses = [rng.choice(alphabet) for _ in range(rng.randint(0, 14))]
+        if rng.random() < 0.3:
+            k = rng.randint(0, len(presses))
+            presses[k:k] = pattern
+        c = qc.ChallengeCard("end", "4th quarter", pattern, 0, 90_000)
+        for n, b in enumerate(presses):
+            qc.note_press(c, b, 1_000 + n * 300)
+        assert (c.matched == len(pattern)) == _referee_ok(pattern, presses), (pattern, presses)
+
+
+# match-20261025-115533 (QorCap 0.3.34), rising edges from inputs.jsonl, ms after issue.
+_HALFTIME = [(835, "OPTIONS"), (3070, "UP"), (3103, "RIGHT"), (3515, "SQUARE"), (3842, "LEFT"),
+             (5121, "LEFT"), (5231, "SQUARE"), (8053, "LEFT"), (8341, "SQUARE"), (11203, "CIRCLE")]
+_KICKOFF = [(1420, "OPTIONS"), (2543, "TRIANGLE"), (3010, "UP"), (3542, "LEFT"), (4271, "SQUARE"),
+            (6595, "LEFT"), (6676, "UP"), (6731, "SQUARE"), (9662, "CIRCLE")]
+
+
+def _edges(rows, issued):
+    return [{"seq": i + 1, "t_ms": issued + t, "button": b} for i, (t, b) in enumerate(rows)]
+
+
+def test_recorded_halftime_shows_the_break_instead_of_pass():
+    issued = 1_792_947_832_685
+    c = qc.ChallengeCard("halftime", "second half", ["OPTIONS", "UP", "SQUARE", "LEFT", "SQUARE"], issued, issued + 90_000)
+    edges = _edges(_HALFTIME, issued)
+    # Delivered in two polls; the second repeats the ring and must not double count.
+    assert qc.note_edges(c, edges[:3], trusted=True)
+    assert c.wrong == "RIGHT" and c.rolled and c.matched == 0
+    line = qc.press_feedback(c)
+    assert line == ("Extra RIGHT (d-pad roll): not counted. Redo OPTIONS + all at next snap.", "red")
+    assert len(line[0]) <= 72, "fits a 78-column card without clipping"
+    qc.note_edges(c, edges, trusted=True)
+    assert c.matched == 0 and c.result is None
+    qc.settle(c, issued + 90_001, trusted=True, now_s=1.0)
+    assert c.result == "fail"
+    assert not _referee_ok(c.pattern, [b for _, b in _HALFTIME])
+
+
+def test_recorded_kickoff_locks_after_the_answer():
+    issued = 1_792_947_450_099
+    c = qc.ChallengeCard("kickoff", "game start", ["OPTIONS", "TRIANGLE", "UP", "LEFT", "SQUARE"], issued, issued + 90_000)
+    qc.note_edges(c, _edges(_KICKOFF, issued), trusted=True)
+    assert c.matched == 5
+    assert c.presses == ["OPTIONS", "TRIANGLE", "UP", "LEFT", "SQUARE"], "presses after the answer are not counted"
+    qc.settle(c, issued + 5_000, trusted=True, now_s=1.0)
+    assert c.result == "pass" and c.note.startswith("Got it.")
+
+
+def test_short_taps_between_polls_still_count_and_old_edges_are_ignored():
+    c = qc.ChallengeCard("end", "4th quarter", ["OPTIONS", "LEFT", "DOWN"], 10_000, 100_000)
+    # A press before issue and an edge-only button do not count; held list is empty at every poll.
+    qc.note_edges(c, [{"seq": 7, "t_ms": 9_000, "button": "OPTIONS"}], trusted=True)
+    qc.note_held(c, [], trusted=True)
+    assert c.matched == 0 and c.edges
+    qc.note_edges(c, [{"seq": 8, "t_ms": 11_000, "button": "OPTIONS"}, {"seq": 9, "t_ms": 11_050, "button": "MUTE"},
+                      {"seq": 10, "t_ms": 11_400, "button": "LEFT"}], trusted=True)
+    qc.note_held(c, ["LEFT"], trusted=True)  # the held path must not count LEFT a second time
+    assert c.matched == 2 and qc.press_feedback(c) == ("Got LEFT. Next: DOWN. Press each button once.", "ok")
+    qc.note_edges(c, [{"seq": 30, "t_ms": 12_000, "button": "DOWN"}], trusted=True)
+    assert c.unhealthy, "a seq gap means the ring overflowed between polls"
+    assert c.matched == 3
+
+
+def test_observe_buttons_prefers_recent_presses():
+    ui = qc.MatchConsole(force=True, out=io.StringIO(), columns=78, rows=24, clock=lambda: 100.0)
+    ui.show_challenge(phase="end", label="4th quarter", pattern=["OPTIONS", "DOWN"], issued_ms=0, deadline_ms=10**12)
+    ui.observe_buttons([], trusted=False, recent=[{"seq": 1, "t_ms": 5, "button": "OPTIONS"},
+                                                 {"seq": 2, "t_ms": 90, "button": "DOWN"}])
+    assert ui._card.matched == 2

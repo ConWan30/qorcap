@@ -1,4 +1,4 @@
-# QorCap one-click match launcher (Windows). Started by "Start Match.cmd".
+﻿# QorCap one-click match launcher (Windows). Started by "Start Match.cmd".
 # Checks ffmpeg, Python 3.11+ and its packages, then runs sidecar\qorcap_match.py.
 $ErrorActionPreference = "Stop"
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -12,7 +12,8 @@ function Find-ThisRunBundle($argList, $since) {
   $valueFlags = @(
     "--out", "--qorcap", "--ffmpeg", "--qortime", "--side", "--role", "--key-dir", "--device",
     "--encoder", "--res", "--fps", "--input-format", "--audio", "--referee-url", "--port",
-    "--player-id", "--test-secs", "--hz", "--role-reason", "--pre", "--post", "--samples"
+    "--player-id", "--test-secs", "--hz", "--role-reason", "--pre", "--post", "--samples",
+    "--game"
   )
   $root = Join-Path ([Environment]::GetFolderPath("MyDocuments")) "QorCap Matches"
   $explicit = $null
@@ -42,6 +43,101 @@ function Find-ThisRunBundle($argList, $since) {
     if ($null -eq $bestT -or $t -gt $bestT) { $bestPath = $d.FullName; $bestT = $t }
   }
   return $bestPath
+}
+
+# Console game cards. DarkRed is the burgundy accent. This screen does not use a gold color.
+# Frame clock default for PRACTICE runs only. A practice run is "Test Without Card.cmd" (--test-pattern)
+# or QORCAP_LANE=practice. It returns the QORCAP_FRAME_CLOCK value to set, or $null to leave it alone.
+# REAL MATCH: always $null, so the environment and the qorcap.exe default (off) are unchanged.
+# An explicit QORCAP_FRAME_CLOCK wins. --no-frame-clock on a practice run turns it off.
+# Offline commands (finalize, highlights, submit, psn-names) do not record, so they are left alone.
+function Get-QorCapPracticeFrameClock($argList, $envVal, $laneVal) {
+  $practice = ($argList -contains "--test-pattern") -or ($laneVal -and $laneVal.Trim().ToLower() -eq "practice")
+  if (-not $practice) { return $null }
+  foreach ($c in @("finalize", "highlights", "submit", "psn-names")) { if ($argList -contains $c) { return $null } }
+  if ($argList -contains "--no-frame-clock") { return "0" }
+  if ($envVal) { return $null }
+  return "1"
+}
+function Test-QorCapFrameClockOn($argList) {
+  if ($argList -contains "--frame-clock") { return $true }
+  $v = $env:QORCAP_FRAME_CLOCK
+  if (-not $v) { return $false }
+  return @("1", "true", "yes", "on") -contains $v.Trim().ToLower()
+}
+function Get-QorCapLastGame($dir) {
+  $p = Join-Path $dir "last-game.txt"
+  if (-not (Test-Path -LiteralPath $p)) { return "madden" }
+  try { $raw = (Get-Content -LiteralPath $p -Raw).Trim().ToLower() } catch { return "madden" }
+  if ($raw -eq "cod") { return "cod" }
+  return "madden"
+}
+function Save-QorCapLastGame($dir, $game) {
+  try {
+    New-Item -ItemType Directory -Force -Path $dir | Out-Null
+    [System.IO.File]::WriteAllText((Join-Path $dir "last-game.txt"), $game)
+  } catch {}
+}
+function Write-QorCapPickerEdge($left, $text, $textColor, $right) {
+  Write-Host "  $left" -ForegroundColor DarkRed -NoNewline
+  Write-Host $text -ForegroundColor $textColor -NoNewline
+  Write-Host $right -ForegroundColor DarkRed
+}
+function Write-QorCapPickerRow($text, $textColor) {
+  $inner = 62
+  if ($text.Length -gt $inner) { $text = $text.Substring(0, $inner) }
+  $pad = " " * ($inner - $text.Length)
+  Write-QorCapPickerEdge "│ " $text $textColor "$pad │"
+}
+function Get-QorCapPickerStatus($argList) {
+  $clock = "frame clock OFF"
+  if (Test-QorCapFrameClockOn $argList) { $clock = "frame clock ON" }
+  if ($argList -contains "--test-pattern") { return "$clock  ·  practice  ·  not sent" }
+  return $clock
+}
+function Show-QorCapGamePicker($dir, $argList) {
+  $default = Get-QorCapLastGame $dir
+  $keep = $(if ($default -eq "cod") { "CALL OF DUTY" } else { "MADDEN" })
+  try { $Host.UI.RawUI.WindowTitle = $(if ($argList -contains "--test-pattern") { "QorCap - Practice" } else { "QorCap - Start Match" }) } catch {}
+  Clear-Host
+  $mark = @(
+    "  █▀█ █▀█ █▀▄ █▀▀ █▀█ █▀█    █▀█ █▀█ █▀▄ ▀█▀  █  █▄█ █▀▀",
+    "  █ █ █ █ █▀▄ █   █▀█ █▀▀    █ █ █ █ █▀▄  █   █  █▀█ █▀▀",
+    "  ▀▀█ ▀▀▀ ▀ ▀ ▀▀▀ ▀ ▀ ▀      ▀▀█ ▀▀▀ ▀ ▀  ▀  ▀▀▀ ▀ ▀ ▀▀▀"
+  )
+  foreach ($ln in $mark) { Write-Host $ln -ForegroundColor DarkRed }
+  Write-Host "  QORCAP" -ForegroundColor White -NoNewline
+  Write-Host "  /  " -ForegroundColor DarkRed -NoNewline
+  Write-Host "QORTIME" -ForegroundColor White
+  Write-Host ""
+  $rule = "─" * 64
+  Write-Host "  ┌$rule┐" -ForegroundColor DarkRed
+  Write-QorCapPickerRow "WHICH GAME" White
+  Write-QorCapPickerRow "" Gray
+  $maddenColor = $(if ($default -eq "madden") { "DarkRed" } else { "White" })
+  $codColor = $(if ($default -eq "cod") { "DarkRed" } else { "White" })
+  Write-QorCapPickerRow "[1]  MADDEN  (scorebug - home/away - end menu)" $maddenColor
+  Write-QorCapPickerRow "" Gray
+  Write-QorCapPickerRow "[2]  CALL OF DUTY  (HUD - killfeed - Qortrola30 end row)" $codColor
+  Write-QorCapPickerRow "" Gray
+  Write-QorCapPickerRow "1 or 2    Enter keeps $keep" Gray
+  Write-Host "  └$rule┘" -ForegroundColor DarkRed
+  Write-Host ("  " + (Get-QorCapPickerStatus $argList)) -ForegroundColor Gray
+  while ($true) {
+    $key = [Console]::ReadKey($true)
+    if ($key.Key -eq "Enter") { return $default }
+    $ch = $key.KeyChar
+    if ($ch -eq "1" -or $key.Key -eq "D1" -or $key.Key -eq "NumPad1") { return "madden" }
+    if ($ch -eq "2" -or $key.Key -eq "D2" -or $key.Key -eq "NumPad2") { return "cod" }
+  }
+}
+function Write-QorCapGameLock($game, $argList) {
+  if ($game -eq "cod") {
+    Write-Host "  Profile locked: CALL OF DUTY  cod_mw4_hud" -ForegroundColor White
+  } else {
+    Write-Host "  Profile locked: MADDEN  madden27_standard" -ForegroundColor White
+  }
+  Write-Host ("  " + (Get-QorCapPickerStatus $argList)) -ForegroundColor Gray
 }
 
 Get-ChildItem -Path $here -Recurse -File -ErrorAction SilentlyContinue | Unblock-File -ErrorAction SilentlyContinue
@@ -110,6 +206,16 @@ $fwd = @($args)
 # finalize is an offline sign of a finished bundle. Live-only flags (side prompt, official challenges)
 # must not be forwarded or argparse rejects the whole finalize before any clip is cut.
 $isFinalize = $fwd -contains "finalize"
+# PRACTICE runs record frame_clock.jsonl by default (qorcap.exe, started by qorcap_match.py, inherits
+# QORCAP_FRAME_CLOCK). A REAL MATCH run gets no change here. --no-frame-clock is a launcher flag only:
+# it is removed in every lane (REAL MATCH, practice, offline) so qorcap_match.py never sees it. On a
+# REAL MATCH it changes nothing (the clock is already off unless QORCAP_FRAME_CLOCK was set by hand).
+# The "--no-frame-clock=<value>" form is stripped as well (any value, any case) and is otherwise ignored.
+$practiceClock = Get-QorCapPracticeFrameClock $fwd $env:QORCAP_FRAME_CLOCK $env:QORCAP_LANE
+if ($null -ne $practiceClock) {
+  $env:QORCAP_FRAME_CLOCK = $practiceClock
+}
+$fwd = @($fwd | Where-Object { $_ -ne "--no-frame-clock" -and $_ -notlike "--no-frame-clock=*" })
 $hasChallengeFlag = $false
 foreach ($x in $fwd) {
   if ($x -eq "--official-challenges" -or $x -eq "--no-official-challenges") { $hasChallengeFlag = $true }
@@ -119,9 +225,32 @@ if (-not $hasChallengeFlag -and -not $isFinalize) { $fwd = @("--official-challen
 # Side pick (v0.3.26): your side is signed into the first checkpoint, so it is chosen before recording starts.
 # "Start Match.cmd --side away" (or home) skips the prompt; so does a one-shot next-side.txt in %LOCALAPPDATA%\QorCap
 # (renamed after use; ignored if older than 4 h). Otherwise qorcap_match.py shows the big H / A prompt and waits.
+# Madden only: for Call of Duty qorcap_match.py skips the H / A prompt (no home/away pick).
 $hasSide = $false
 foreach ($x in $fwd) { if ($x -eq "--side" -or $x -eq "--role" -or $x -like "--side=*" -or $x -like "--role=*") { $hasSide = $true } }
 if (-not $hasSide -and -not $isFinalize) { $fwd = @("--side", "ask") + $fwd }
+
+# Game set, before the side prompt. "Start Match.cmd --game cod" (or madden) skips the cards.
+# A one-shot next-game.txt still passes --game ask so qorcap_match.py consumes it.
+# No console and no --game stays Madden: the flag is omitted, and Python does not ask.
+# Test Without Card.cmd is this script plus --test-pattern, so it draws the same cards.
+$hasGame = $false
+foreach ($x in $fwd) { if ($x -eq "--game" -or $x -like "--game=*") { $hasGame = $true } }
+$offlineGame = $false
+foreach ($c in @("finalize", "highlights", "submit", "psn-names")) { if ($fwd -contains $c) { $offlineGame = $true } }
+if (-not $hasGame -and -not $offlineGame) {
+  $gameFile = Join-Path $data "next-game.txt"
+  $consoleGame = $false
+  try { $consoleGame = -not [Console]::IsInputRedirected } catch { $consoleGame = $false }
+  if (Test-Path -LiteralPath $gameFile) {
+    $fwd = @("--game", "ask") + $fwd
+  } elseif ($consoleGame) {
+    try { $picked = Show-QorCapGamePicker $data $fwd } catch { $picked = "madden" }
+    Save-QorCapLastGame $data $picked
+    Write-QorCapGameLock $picked $fwd
+    $fwd = @("--game", $picked) + $fwd
+  }
+}
 
 # Glimpse defaults (v0.3.28). The default lives in this launcher. qorcap.exe stays default-off:
 # this script does not pass the record frame flag, and the flag-off tests are unchanged.

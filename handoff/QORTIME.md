@@ -1,6 +1,6 @@
 # QorTime
 
-**Repo:** https://github.com/ConWan30/qortime · **Site:** https://conwan30.github.io/qortime/ · **Verifier:** https://conwan30.github.io/qortime/verify/
+**Repo:** https://github.com/ConWan30/qortime · **Site:** https://qortime.com/ · **Verifier:** https://qortime.com/verify/
 
 ## What it is
 QorTime produces a **signed Madden end-of-game receipt**: final score, teams, how the final was decided, and the evidence chain, signed with Ed25519. Anyone can drop the receipt into the public verify page and get **VERIFIED / PARTIAL / FAIL**. Change one number and it fails.
@@ -10,7 +10,7 @@ History: it started as **qor-receipt** (the Python package is still `qor_receipt
 ## Architecture
 - **Signatures:** Ed25519 over **JCS** (RFC 8785 canonical JSON). Code: `qor_receipt/jcs.py`, `keys.py`, `receipt.py`. Spec: `spec/match-receipt-v0.md`. Schema: `schema/receipt.v0.json`.
 - **Checkpoints:** a hash chain (frames_hash + input_hash, each one linked to the previous) that the referee co-signs. Code: `qor_receipt/checkpoints.py` (`make_checkpoint`, `countersign`, `Chain`, `verify_chain`).
-- **Nonce challenges** (proof a human is playing): the referee sends a nonce. The player must pause and press a 4-button pattern derived from it, and both the controller log and the video must show it within the window (about 600 ms). Code: `qor_receipt/challenge.py`. Motion correlation is supporting evidence only, not proof.
+- **Nonce challenges** (timed prompts that check the controller inputs line up with the video; they never prove who is playing): the referee sends a nonce. The player must pause and press a 4-button pattern derived from it, and both the controller log and the video must show it within the window (about 600 ms). Code: `qor_receipt/challenge.py`. Motion correlation is supporting evidence only, not proof.
 - **Referee:** a FastAPI app with in-memory state (`qor_receipt/referee/app.py`): matches, challenges, checkpoints, timeline, finalize, sign, receipt. **It is not hosted anywhere yet.**
 - **Trust tiers:** `compute_tier` in `receipt.py` (DUAL / SINGLE). The verifier returns VERIFIED or PARTIAL. Without an independent hosted referee, receipts are **PARTIAL / self-attested**.
 - **`result.final_basis`:** `clock_zero` | `scorebug_gone` | `final_screen`. **`final_screen` is only a hook.** No final-screen detector exists.

@@ -1,0 +1,11 @@
+{"type": "header", "schema": "qorcap-inputs/v0", "t_us": 0, "transport": "usb-hid", "clock": "synthetic", "synthetic": "injected test values, not a player measurement", "seg": 0}
+{"type": "status", "t_us": 10, "state": "connected", "detail": "synthetic", "seg": 0}
+{"type": "in", "t_us": 1, "b": 0, "lx": 128, "ly": 128, "rx": 128, "ry": 128, "l2": 0, "r2": 0, "c": 1, "hw": 1, "seg": 0}
+{"type": "in", "t_us": 100000, "b": 128, "lx": 128, "ly": 128, "rx": 128, "ry": 128, "l2": 0, "r2": 0, "c": 160, "hw": 100000, "seg": 0}
+{"type": "in", "t_us": 300000, "b": 0, "lx": 128, "ly": 128, "rx": 128, "ry": 128, "l2": 0, "r2": 0, "c": 224, "hw": 300000, "seg": 0}
+{"type": "in", "t_us": 600000, "b": 128, "lx": 128, "ly": 128, "rx": 128, "ry": 128, "l2": 0, "r2": 0, "c": 192, "hw": 600000, "seg": 0}
+{"type": "in", "t_us": 900000, "b": 0, "lx": 128, "ly": 128, "rx": 128, "ry": 128, "l2": 0, "r2": 0, "c": 160, "hw": 900000, "seg": 0}
+{"type": "hb", "t_us": 1000000, "hb_seq": 0, "epoch": 1, "rx_total": 0, "rx_delta": 250, "last_rx_t_us": 999000, "faults": 0, "max_rx_gap_us": 4000, "stale_over_50ms": 0, "short_reads": 0, "parse_faults": 0, "seg": 0}
+{"type": "imu", "t_us": 950000, "present": true, "seg": 0}
+{"type": "haptic", "t_us": 960000, "seg": 0}
+{"type": "chunk", "seq": 0, "seg": 0, "n": 10, "sha256": "f5142e10d2fce0e33e78981b20dfe20fc8d8ab05971ef0fb361ad0a15870d719", "prev": "0000000000000000000000000000000000000000000000000000000000000000", "head": "1111111111111111111111111111111111111111111111111111111111111111", "t_us": 0}

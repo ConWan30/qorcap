@@ -1,0 +1,8 @@
+{"type": "header", "schema": "qorcap-inputs/v0", "t_us": 0, "transport": "usb-hid", "clock": "synthetic", "synthetic": "injected test values, not a player measurement", "seg": 0}
+{"type": "status", "t_us": 10, "state": "connected", "detail": "synthetic", "seg": 0}
+{"type": "in", "t_us": 1, "b": 0, "lx": 128, "ly": 128, "rx": 128, "ry": 128, "l2": 0, "r2": 0, "c": 1, "hw": 1, "seg": 0}
+{"type": "in", "t_us": 100000, "b": 128, "lx": 128, "ly": 128, "rx": 128, "ry": 128, "l2": 0, "r2": 0, "c": 160, "hw": 100000, "seg": 0}
+{"type": "in", "t_us": 300000, "b": 0, "lx": 128, "ly": 128, "rx": 128, "ry": 128, "l2": 0, "r2": 0, "c": 224, "hw": 300000, "seg": 0}
+{"type": "in", "t_us": 600000, "b": 128, "lx": 128, "ly": 128, "rx": 128, "ry": 128, "l2": 0, "r2": 0, "c": 192, "hw": 600000, "seg": 0}
+{"type": "in", "t_us": 900000, "b": 0, "lx": 128, "ly": 128, "rx": 128, "ry": 128, "l2": 0, "r2": 0, "c": 160, "hw": 900000, "seg": 0}
+{"type": "chunk", "seq": 0, "seg": 0, "n": 7, "sha256": "48832b5d294333aa8df508d11ab8527138e9c519ab428e27c428f53cf7eb4656", "prev": "0000000000000000000000000000000000000000000000000000000000000000", "head": "1111111111111111111111111111111111111111111111111111111111111111", "t_us": 0}

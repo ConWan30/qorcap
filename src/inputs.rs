@@ -21,6 +21,25 @@
 //! records), and `{"type":"imu"}` records commit whether IMU data was present and its measured rate. The same
 //! haptic records (with `chunk_index`) are also appended to `haptics.jsonl` next to `inputs.jsonl` for easy
 //! reading; `input_proof.json` records its SHA-256 and checks it against the committed records.
+//!
+//! Since 0.3.39 a `{"type":"hb"}` row is a heartbeat for pad-link continuity (skill-proof join).
+//! The reader loop that receives HID reports writes one every 1000 ms of host monotonic time,
+//! including when buttons and sticks do not change. The row is sealed in the same chunk hash
+//! chain as the other input rows. `receipt.v0` is unchanged.
+//!
+//! Each `hb` row also commits the reports received in that second: `rx_delta`, the first and last
+//! report counter (`seq0`/`seq1`, USB offset 7), how many steps were +1 (`seq_steps`) or not
+//! (`seq_breaks`), the sensor timestamp span (`hw0`/`hw1`/`hw_advance`/`hw_stalls`, USB offset 28),
+//! and `rx_bind` (SHA-256 of those counter and timestamp bytes in receive order). Sticks and
+//! triggers stay raw 0..255 with center 128 and no deadzone. The counter-step rule is PROVISIONAL.
+//! See `pad_link`. A count can support idle only after the interval gates, a neutral span, and a trusted anchor. `rx_bind` is not that anchor. Unknown is not idle.
+//!
+//! `dev_counter` is a diagnostic copy of one raw report byte (USB offset 7). Its semantics are unvalidated.
+//! `max_rx_gap_us` is the largest gap between consecutive received reports in the interval, including the
+//! gap from the previous interval's last report. It is measured before `last_rx_t_us` moves, so a stall
+//! that recovers before the heartbeat stays visible. `stale_over_50ms`, `short_reads`, `parse_faults`,
+//! and `first_rx_t_us` reset every heartbeat. Epoch increments on every HID handle open and on a device
+//! identity change. Stale telemetry resets on reconnect.
 use crate::evidence::{self as ev, GENESIS};
 use crate::haptics::{Detector, HapticLive};
 use crate::hid::{self, Pad, ReportSource};
@@ -35,6 +54,12 @@ use std::time::{Duration, Instant};
 pub const SCHEMA: &str = "qorcap-inputs/v0";
 /// Analog-only changes are logged at most this often (buttons are always logged).
 pub const ANALOG_MIN_GAP_US: u64 = 4_000;
+/// Host monotonic gap between `hb` rows. Independent of whether a button or stick changed.
+pub const HB_INTERVAL_US: u64 = 1_000_000;
+/// An inter-report gap above this counts in `stale_over_50ms`.
+pub const STALE_RX_GAP_US: u64 = 50_000;
+/// USB input report 0x01 is 64 bytes. A shorter read is `short_reads`, not a parse failure.
+const USB_REPORT_LEN: usize = 64;
 
 pub fn empty_hash() -> String { ev::jcs_sha(&json!([])) }
 
@@ -105,6 +130,17 @@ fn append_bytes(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     f.sync_all()
 }
 
+/// How many rising edges `/status` keeps for the challenge card. ~10 s of fast tapping.
+pub const RECENT_PRESSES: usize = 64;
+
+/// One rising edge for the live challenge card. `seq` counts every edge since the log opened.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct LivePress {
+    pub seq: u64,
+    pub t_ms: u64,
+    pub button: String,
+}
+
 /// Live controller state for /status and `input-test`.
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct Live {
@@ -117,14 +153,40 @@ pub struct Live {
     pub reports: u64,
     pub logged: u64,
     pub presses: u64,
+    /// Newest rising edges, oldest first, at most `RECENT_PRESSES` (since 0.3.37). Display only: the console
+    /// reads these so a tap shorter than its /status poll still shows. `t_ms` is the referee's press clock
+    /// (`wall_anchor_ms + t_us / 1000`, the same value `press_events` derives from inputs.jsonl).
+    pub recent_presses: Vec<LivePress>,
     pub buttons: Vec<String>,
     pub l2: u8,
     pub r2: u8,
     pub sticks: [u8; 4],
     pub warning: Option<String>,
     pub last_report_mono_ms: Option<u64>,
+    /// `Seal: waiting`, `Seal: locked`, or `Seal: failed (reason)`. Empty when the seal watch is off.
+    pub seal_line: String,
     /// IMU haptic detector state (since 0.3.1).
     pub haptic: HapticLive,
+}
+
+impl Live {
+    fn presses_seq_next(&self) -> u64 {
+        self.recent_presses.last().map(|p| p.seq + 1).unwrap_or(1)
+    }
+}
+
+#[derive(Default)]
+struct RxSpan {
+    n: u64,
+    seq0: Option<u8>,
+    seq1: Option<u8>,
+    steps: u64,
+    breaks: u64,
+    hw0: Option<u32>,
+    hw1: Option<u32>,
+    stalls: u64,
+    bytes: Vec<u8>,
+    neutral: bool,
 }
 
 pub struct InputLog {
@@ -139,6 +201,91 @@ pub struct InputLog {
     haptic_path: Option<PathBuf>,
     wall_anchor_ms: u64,
     imu_committed: Option<(bool, u32)>,
+    /// Next `hb_seq` to write. Starts at 0. `u64` saturates; it does not wrap.
+    hb_seq: u64,
+    /// Connection epoch. Starts at 0. Increments on every HID handle open and on a device identity change.
+    epoch: u64,
+    last_hb_t_us: Option<u64>,
+    rx_at_last_hb: u64,
+    last_rx_t_us: Option<u64>,
+    /// Raw report counter byte from the newest parsed report. Diagnostic only; semantics are unvalidated.
+    dev_counter: Option<u64>,
+    faults_since_hb: u64,
+    max_rx_gap_us: u64,
+    stale_over_50ms: u64,
+    short_reads: u64,
+    parse_faults: u64,
+    first_rx_t_us: Option<u64>,
+    span: RxSpan,
+    prev_counter: Option<u8>,
+    prev_hw: Option<u32>,
+    seal: crate::seal::SealWatch,
+    /// Short mutex, written by the HID/logger thread, read by the capture thread. Never the input-log lock.
+    weave_snap: Option<std::sync::Arc<std::sync::Mutex<crate::livetap::WeaveCtx>>>,
+    /// Serializes `seal_shared` from prepare to finish, so chunks reach the file in chain order.
+    /// Never held together with a blocking wait on the input-log mutex by anyone else.
+    seal_io: std::sync::Arc<std::sync::Mutex<()>>,
+    /// A chunk was prepared and its bytes are being written outside the input-log lock.
+    seal_in_flight: bool,
+}
+
+/// One input chunk, fixed under the input-log lock and written to disk outside it.
+/// `body` is exactly the bytes `seal` appends; nothing added to the log later can change it.
+pub struct SealJob {
+    sha: String,
+    head: String,
+    n: usize,
+    recs: Vec<Value>,
+    body: String,
+    haptic: String,
+    path: Option<PathBuf>,
+    haptic_path: Option<PathBuf>,
+}
+
+impl SealJob {
+    /// The blocking part: open, append, fsync. Takes no lock. Same calls and bytes as before.
+    pub fn write(&self) -> std::io::Result<()> {
+        if self.n == 0 { return Ok(()); }
+        if let Some(p) = &self.path {
+            if let Some(d) = p.parent() { let _ = std::fs::create_dir_all(d); }
+            if let Err(e) = append_bytes(p, self.body.as_bytes()) {
+                warn!("cannot write {}: {e}; input chunk not sealed (chain unchanged)", p.display());
+                return Err(e);
+            }
+        }
+        if let Some(hp) = &self.haptic_path {
+            if !self.haptic.is_empty() {
+                if let Err(e) = append_bytes(hp, self.haptic.as_bytes()) {
+                    warn!("cannot write {}: {e}", hp.display());
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Seal into chunk `seg` without holding the input-log mutex across disk I/O.
+///
+/// 1. `seal_io` is taken first (never while holding `log`), so two seals cannot interleave.
+/// 2. Under `log`: the pending records are taken and the chunk (bytes, sha256, prev, head) is fixed.
+/// 3. `log` is released; the chunk is appended and fsynced (`append_bytes`, unchanged).
+/// 4. Under `log` again: the chain moves only if step 3 succeeded; otherwise the records go back in
+///    front of anything that arrived meanwhile, exactly where a blocked writer would have put them.
+///
+/// Returns only after the fsync, so the caller's checkpoint is still written after the chunk is durable.
+/// `now_us` is read under the input-log lock, right before the records are taken (as the old
+/// `input.lock().seal(seg, now)` call did), so the chunk `t_us` keeps its meaning.
+pub fn seal_shared(log: &std::sync::Mutex<InputLog>, seg: u64, now_us: impl FnOnce() -> u64) -> (String, String, usize) {
+    seal_shared_with(log, seg, now_us, |job| job.write())
+}
+
+/// `seal_shared` with the disk step injectable (tests).
+pub fn seal_shared_with(log: &std::sync::Mutex<InputLog>, seg: u64, now_us: impl FnOnce() -> u64, write: impl FnOnce(&SealJob) -> std::io::Result<()>) -> (String, String, usize) {
+    let io = log.lock().unwrap_or_else(|e| e.into_inner()).seal_io.clone();
+    let _serial = io.lock().unwrap_or_else(|e| e.into_inner());
+    let job = { let mut g = log.lock().unwrap_or_else(|e| e.into_inner()); let t_us = now_us(); g.seal_prepare(seg, t_us) };
+    let res = write(&job);
+    log.lock().unwrap_or_else(|e| e.into_inner()).seal_finish(job, res)
 }
 
 impl InputLog {
@@ -146,20 +293,174 @@ impl InputLog {
         let haptic_path = path.as_ref().map(|p| p.with_file_name(haptics_file_name(p)));
         let mut l = InputLog { path, pending: vec![], head: GENESIS.into(), chunks: 0, total_records: 0, last_logged: None,
             live: Live { enabled, state: if enabled { "searching".into() } else { "off".into() }, ..Default::default() },
-            detector: Detector::new(wall_anchor_ms), haptic_path, wall_anchor_ms, imu_committed: None };
+            detector: Detector::new(wall_anchor_ms), haptic_path, wall_anchor_ms, imu_committed: None,
+            hb_seq: 0, epoch: 0, last_hb_t_us: None, rx_at_last_hb: 0, last_rx_t_us: None,
+            dev_counter: None, faults_since_hb: 0, max_rx_gap_us: 0, stale_over_50ms: 0,
+            short_reads: 0, parse_faults: 0, first_rx_t_us: None,
+            span: RxSpan::default(), prev_counter: None, prev_hw: None,
+            seal: crate::seal::SealWatch::new(false), weave_snap: None,
+            seal_io: std::sync::Arc::new(std::sync::Mutex::new(())), seal_in_flight: false };
         if enabled {
             l.pending.push(json!({"type": "header", "schema": SCHEMA, "t_us": 0,
                 "clock": "qorcap-mono-us (same Instant as manifest/checkpoint mono_ms)", "wall_anchor_ms": wall_anchor_ms,
                 "transport": "usb-hid", "haptics": Detector::params(),
                 "pad_identity": "required",
-                "limit": "Proves inputs came from the USB-connected controller in sync with the video, not who held it."}));
+                "axes": "raw 0..255, center 128, no deadzone",
+                "report_counter": "usb offset 7, copied, step rule PROVISIONAL",
+                "sensor_timestamp": "usb offset 28, u32 le, 0.33 us ticks, copied from the input report",
+                "limit": "Records the USB controller inputs on the same clock as the video."}));
         }
         l
     }
 
-    /// Feed one parsed report received at `t_us`. Returns true if it was logged.
+    /// Name the engine clock behind `t_us` on the header, before the header is written.
+    /// The snapshot publisher carries the same origin. Zero leaves the header without one.
+    pub fn set_mono_origin_ns(&mut self, origin_ns: u64) {
+        if origin_ns == 0 { return; }
+        if let Some(Value::Object(h)) = self.pending.first_mut() {
+            if h.get("type").and_then(|t| t.as_str()) == Some("header") {
+                h.insert("mono_origin_ns".into(), json!(origin_ns));
+            }
+        }
+    }
+
+    /// The origin on the header that has not been written yet. None after it is written or when absent.
+    pub fn header_mono_origin_ns(&self) -> Option<u64> {
+        self.pending.first()
+            .filter(|h| h.get("type").and_then(|t| t.as_str()) == Some("header"))
+            .and_then(|h| h.get("mono_origin_ns"))
+            .and_then(|v| v.as_u64())
+    }
+
+    /// Call of Duty opening seal. Off for every other game. Console line only; no controller write.
+    pub fn enable_seal(&mut self) {
+        if self.seal.enabled() { return; }
+        self.seal = crate::seal::SealWatch::new(true);
+        self.seal.set_session(&self.wall_anchor_ms.to_string());
+        self.live.seal_line = self.seal.line.clone();
+        info!("{}", self.live.seal_line);
+        self.publish_weave();
+    }
+
+    pub fn close_seal(&mut self) {
+        let before = self.seal.line.clone();
+        self.seal.close_at_stop();
+        self.live.seal_line = self.seal.line.clone();
+        if self.seal.enabled() && self.live.seal_line != before {
+            info!("{}", self.live.seal_line);
+            self.persist_seal();
+        }
+        self.publish_weave();
+    }
+
+    /// Read-only view for the practice live tap (src/livetap.rs). Nothing here touches the controller.
+    pub fn weave_ctx(&self) -> crate::livetap::WeaveCtx {
+        crate::livetap::WeaveCtx {
+            wall_anchor_ms: self.wall_anchor_ms,
+            pad: self.live.state.clone(),
+            seal: if self.seal.enabled() { self.seal.status.clone() } else { "off".into() },
+            seal_hash: self.seal.hash.as_ref().map(|h| h.chars().take(12).collect()),
+            last_press: self.live.recent_presses.last().map(|p| (p.seq, p.t_ms, p.button.clone())),
+        }
+    }
+
+    /// Live tap only. The capture thread reads this snapshot, never `InputLog`'s own mutex.
+    pub fn set_weave_snap(&mut self, snap: std::sync::Arc<std::sync::Mutex<crate::livetap::WeaveCtx>>) {
+        self.weave_snap = Some(snap);
+        self.publish_weave();
+    }
+
+    fn publish_weave(&self) {
+        if let Some(s) = &self.weave_snap {
+            *s.lock().unwrap_or_else(|e| e.into_inner()) = self.weave_ctx();
+        }
+    }
+
+    /// A finalized seal revision. Does not mark it bound.
+    pub fn seal_binding(&self) -> Option<Value> { self.seal.binding() }
+
+    /// After the checkpoint line is durable.
+    pub fn acknowledge_seal(&mut self) -> bool { self.seal.acknowledge() }
+
+    fn persist_seal(&self) {
+        let Some(dir) = self.path.as_ref().and_then(|p| p.parent()) else { return };
+        if let Err(e) = self.seal.write_files(dir) {
+            warn!("cannot write session seal: {e}");
+        }
+    }
+
+    fn observe_seal(&mut self, t_us: u64, buttons: u32, raw: &[u8]) {
+        if !self.seal.enabled() { return; }
+        if self.seal.observe(t_us, buttons, self.epoch, raw) {
+            self.live.seal_line = self.seal.line.clone();
+            info!("{}", self.live.seal_line);
+            self.persist_seal();
+            self.publish_weave();
+        }
+    }
+
+    fn abort_seal(&mut self, reason: &str) {
+        if self.seal.abort_pending(reason) {
+            self.live.seal_line = self.seal.line.clone();
+            info!("{}", self.live.seal_line);
+            self.persist_seal();
+            self.publish_weave();
+        }
+    }
+
+    fn note_span(&mut self, p: &Pad) {
+        let c = p.counter;
+        let hw = p.sensor_ts;
+        let quiet = p.buttons == 0 && p.lx == 128 && p.ly == 128 && p.rx == 128 && p.ry == 128 && p.l2 == 0 && p.r2 == 0;
+        if self.span.n == 0 {
+            self.span.neutral = quiet;
+            if let Some(prev) = self.prev_counter {
+                if c.wrapping_sub(prev) == 1 { self.span.steps = self.span.steps.saturating_add(1); }
+                else { self.span.breaks = self.span.breaks.saturating_add(1); }
+                if let Some(prev_hw) = self.prev_hw {
+                    if hw.wrapping_sub(prev_hw) == 0 { self.span.stalls = self.span.stalls.saturating_add(1); }
+                }
+            }
+            self.span.seq0 = Some(c);
+            self.span.hw0 = Some(hw);
+        } else {
+            let prev = self.span.seq1.unwrap_or(c);
+            let prev_hw = self.span.hw1.unwrap_or(hw);
+            if c.wrapping_sub(prev) == 1 { self.span.steps = self.span.steps.saturating_add(1); }
+            else { self.span.breaks = self.span.breaks.saturating_add(1); }
+            if hw.wrapping_sub(prev_hw) == 0 { self.span.stalls = self.span.stalls.saturating_add(1); }
+            if !quiet { self.span.neutral = false; }
+        }
+        self.span.seq1 = Some(c);
+        self.span.hw1 = Some(hw);
+        self.span.n = self.span.n.saturating_add(1);
+        self.span.bytes.push(c);
+        self.span.bytes.extend_from_slice(&hw.to_le_bytes());
+    }
+
+    fn take_span(&mut self) -> RxSpan {
+        let span = std::mem::take(&mut self.span);
+        if span.n > 0 {
+            self.prev_counter = span.seq1;
+            self.prev_hw = span.hw1;
+        }
+        span
+    }
+
+    /// Feed one parsed report received at `t_us`. Returns true if the change-only logger stored an `in` row.
+    /// A heartbeat is considered here too, so identical reports still advance `hb`.
     pub fn on_report(&mut self, t_us: u64, p: &Pad) -> bool {
+        self.on_report_bytes(t_us, p, &[])
+    }
+
+    /// `raw` is the exact HID input buffer. An empty buffer cannot complete a seal hash.
+    pub fn on_report_bytes(&mut self, t_us: u64, p: &Pad, raw: &[u8]) -> bool {
         self.live.reports += 1;
+        self.observe_rx(t_us);
+        self.note_span(p);
+        self.observe_seal(t_us, p.buttons, raw);
+        // USB 0x01 and Bluetooth 0x31 both carry this byte (offset 7, or +1 on BT). Copied, not interpreted.
+        self.dev_counter = Some(p.counter as u64);
         self.live.last_report_mono_ms = Some(t_us / 1000);
         self.live.l2 = p.l2; self.live.r2 = p.r2; self.live.sticks = [p.lx, p.ly, p.rx, p.ry];
         self.live.buttons = hid::names(p.buttons).into_iter().map(String::from).collect();
@@ -170,7 +471,14 @@ impl InputLog {
             None => true,
             Some((t0, q)) => {
                 if q.buttons != p.buttons {
-                    self.live.presses += (p.buttons & !q.buttons).count_ones() as u64;
+                    let rise = p.buttons & !q.buttons;
+                    self.live.presses += rise.count_ones() as u64;
+                    let t_ms = self.wall_anchor_ms + t_us / 1000;
+                    for name in hid::names(rise) {
+                        self.live.recent_presses.push(LivePress { seq: self.live.presses_seq_next(), t_ms, button: name.to_string() });
+                    }
+                    let n = self.live.recent_presses.len();
+                    if n > RECENT_PRESSES { self.live.recent_presses.drain(..n - RECENT_PRESSES); }
                     true
                 } else {
                     let analog = (q.lx, q.ly, q.rx, q.ry, q.l2, q.r2) != (p.lx, p.ly, p.rx, p.ry, p.l2, p.r2);
@@ -183,11 +491,121 @@ impl InputLog {
             self.last_logged = Some((t_us, *p));
             self.live.logged += 1;
         }
+        self.poll_heartbeat(t_us);
+        self.publish_weave();
         log
+    }
+
+    /// A read timeout or a failed read in the HID loop. Does not invent a received report.
+    pub fn note_fault(&mut self, t_us: u64) {
+        self.faults_since_hb = self.faults_since_hb.saturating_add(1);
+        self.abort_seal("fault_ambiguous");
+        self.poll_heartbeat(t_us);
+    }
+
+    /// `read` returned fewer bytes than a USB 0x01 report.
+    pub fn note_short_read(&mut self, t_us: u64) {
+        self.short_reads = self.short_reads.saturating_add(1);
+        self.abort_seal("fault_ambiguous");
+        self.poll_heartbeat(t_us);
+    }
+
+    /// `read` returned a full-sized buffer that was not a DualSense input report.
+    pub fn note_parse_fault(&mut self, t_us: u64) {
+        self.parse_faults = self.parse_faults.saturating_add(1);
+        self.abort_seal("fault_ambiguous");
+        self.poll_heartbeat(t_us);
+    }
+
+    /// Gap is taken from the previous received report before `last_rx_t_us` is replaced.
+    fn observe_rx(&mut self, t_us: u64) {
+        if let Some(prev) = self.last_rx_t_us {
+            let gap = t_us.saturating_sub(prev);
+            if gap > self.max_rx_gap_us { self.max_rx_gap_us = gap; }
+            if gap > STALE_RX_GAP_US { self.stale_over_50ms = self.stale_over_50ms.saturating_add(1); }
+        }
+        if self.first_rx_t_us.is_none() { self.first_rx_t_us = Some(t_us); }
+        self.last_rx_t_us = Some(t_us);
+    }
+
+    fn reset_stale_telemetry(&mut self) {
+        self.max_rx_gap_us = 0;
+        self.stale_over_50ms = 0;
+        self.short_reads = 0;
+        self.parse_faults = 0;
+        self.faults_since_hb = 0;
+        self.first_rx_t_us = None;
+        self.last_rx_t_us = None;
+        self.dev_counter = None;
+        self.span = RxSpan::default();
+        self.prev_counter = None;
+        self.prev_hw = None;
+    }
+
+    fn poll_heartbeat(&mut self, t_us: u64) {
+        if !self.live.enabled { return; }
+        let due = match self.last_hb_t_us {
+            None => t_us >= HB_INTERVAL_US,
+            Some(prev) => t_us.saturating_sub(prev) >= HB_INTERVAL_US,
+        };
+        if !due { return; }
+        let rx_total = self.live.reports;
+        let rx_delta = rx_total.saturating_sub(self.rx_at_last_hb);
+        let span = self.take_span();
+        let (seq0, seq1, hw0, hw1, hw_advance, rx_bind) = if span.n == 0 {
+            (Value::Null, Value::Null, Value::Null, Value::Null, Value::Null, Value::Null)
+        } else {
+            let advance = span.hw1.unwrap_or(0).wrapping_sub(span.hw0.unwrap_or(0)) as u64;
+            (json!(span.seq0.unwrap_or(0)), json!(span.seq1.unwrap_or(0)),
+             json!(span.hw0.unwrap_or(0)), json!(span.hw1.unwrap_or(0)),
+             json!(advance), json!(ev::sha256_hex(&span.bytes)))
+        };
+        self.pending.push(json!({
+            "type": "hb",
+            "t_us": t_us,
+            "hb_seq": self.hb_seq,
+            "epoch": self.epoch,
+            "rx_total": rx_total,
+            "rx_delta": rx_delta,
+            "last_rx_t_us": self.last_rx_t_us.map(Value::from).unwrap_or(Value::Null),
+            "dev_counter": self.dev_counter.map(Value::from).unwrap_or(Value::Null),
+            "faults": self.faults_since_hb,
+            "max_rx_gap_us": self.max_rx_gap_us,
+            "stale_over_50ms": self.stale_over_50ms,
+            "short_reads": self.short_reads,
+            "parse_faults": self.parse_faults,
+            "first_rx_t_us": self.first_rx_t_us.map(Value::from).unwrap_or(Value::Null),
+            "seq0": seq0,
+            "seq1": seq1,
+            "seq_steps": span.steps,
+            "seq_breaks": span.breaks,
+            "hw0": hw0,
+            "hw1": hw1,
+            "hw_advance": hw_advance,
+            "hw_stalls": span.stalls,
+            "rx_bind": rx_bind,
+            "neutral": span.neutral && span.n > 0,
+        }));
+        self.hb_seq = self.hb_seq.saturating_add(1);
+        self.rx_at_last_hb = rx_total;
+        self.faults_since_hb = 0;
+        self.max_rx_gap_us = 0;
+        self.stale_over_50ms = 0;
+        self.short_reads = 0;
+        self.parse_faults = 0;
+        self.first_rx_t_us = None;
+        self.last_hb_t_us = Some(t_us);
     }
 
     pub fn on_status(&mut self, t_us: u64, state: &str, detail: &str) {
         self.on_status_with_id(t_us, state, detail, None);
+    }
+
+    /// One successful HID `open`, including a reopen that keeps the same id string.
+    pub fn on_handle_open(&mut self, t_us: u64, detail: &str, pad_id: &str) {
+        self.live.state = "opening".into();
+        let id = if pad_id.is_empty() { None } else { Some(pad_id) };
+        self.on_status_with_id(t_us, "connected", detail, id);
     }
 
     /// `pad_id` is the USB serial (`serial:…`), a device instance id (`instance:…`), or a hidraw id
@@ -200,6 +618,14 @@ impl InputLog {
             Some(new) => self.live.pad_id.as_ref() == Some(new),
         };
         if self.live.state == state && same_id { return; }
+        // A stall that recovers on the same handle is not a new epoch: resetting here would hide the gap.
+        let handle_open = state == "connected" && !matches!(self.live.state.as_str(), "connected" | "stalled");
+        let identity = state == "connected" && self.live.state == "connected" && self.live.pad_id.is_some() && !same_id;
+        if handle_open || identity {
+            self.epoch = self.epoch.saturating_add(1);
+            self.reset_stale_telemetry();
+            self.abort_seal("epoch_reset");
+        }
         self.live.state = state.into();
         self.live.warning = match state {
             "connected" => None,
@@ -224,6 +650,7 @@ impl InputLog {
         }
         self.pending.push(rec);
         if state != "connected" { self.last_logged = None; }
+        self.publish_weave();
     }
 
     /// Human-readable connect line. The structured `pad_id` is what the proof compares.
@@ -247,8 +674,26 @@ impl InputLog {
     /// Records not yet sealed (used by `input-test`, which never seals).
     pub fn pending(&self) -> &[Value] { &self.pending }
 
+    pub fn path(&self) -> Option<&Path> { self.path.as_deref() }
+
     /// Seal everything pending into chunk `seg`. Returns (chunk_sha256, chain_head, n_records).
+    /// Single-threaded form (tests, red team, offline tools). The engine uses `seal_shared`, which writes
+    /// the same bytes without holding the input-log mutex across the fsync.
     pub fn seal(&mut self, seg: u64, t_us: u64) -> (String, String, usize) {
+        let job = self.seal_prepare(seg, t_us);
+        let res = job.write();
+        self.seal_finish(job, res)
+    }
+
+    /// Fix the next chunk: take every pending record and compute its bytes and chain link. Moves nothing
+    /// on the chain; `seal_finish` does that once the bytes are durable.
+    pub fn seal_prepare(&mut self, seg: u64, t_us: u64) -> SealJob {
+        let empty = |head: String| SealJob { sha: empty_hash(), head, n: 0, recs: vec![], body: String::new(), haptic: String::new(), path: None, haptic_path: None };
+        if self.seal_in_flight {
+            // Only reachable if a caller skips `seal_io`. Leave everything pending; the next seal takes it.
+            warn!("input seal for segment {seg} skipped: another chunk is still being written (chain unchanged)");
+            return empty(self.head.clone());
+        }
         if self.live.reports > 0 {
             let now = (self.detector.live.imu_present, self.detector.live.imu_rate_hz);
             let changed = match self.imu_committed {
@@ -267,32 +712,34 @@ impl InputLog {
         }
         let sha = ev::jcs_sha(&Value::Array(recs.clone()));
         let n = recs.len();
-        if n == 0 { return (sha, self.head.clone(), 0); }
+        if n == 0 { return SealJob { sha, ..empty(self.head.clone()) }; }
         let prev = self.head.clone();
         let head = ev::link(&prev, self.chunks, &sha);
         let chunk = json!({"type": "chunk", "seq": self.chunks, "seg": seg, "n": n, "sha256": sha, "prev": prev, "head": head, "t_us": t_us});
         let mut body = String::new();
         for r in recs.iter().chain(std::iter::once(&chunk)) { body.push_str(&r.to_string()); body.push('\n'); }
-        if let Some(p) = &self.path {
-            if let Some(d) = p.parent() { let _ = std::fs::create_dir_all(d); }
-            if let Err(e) = append_bytes(p, body.as_bytes()) {
-                // The chunk is not on disk, so the chain must not move. The records stay pending and
-                // the next segment seals them. A checkpoint for this segment then commits the empty hash.
-                warn!("cannot write {}: {e}; input chunk not sealed (chain unchanged)", p.display());
-                self.pending = recs;
-                return (empty_hash(), self.head.clone(), 0);
-            }
+        let haptic: String = if self.haptic_path.is_some() {
+            recs.iter().filter(|r| r["type"] == "haptic").map(|r| format!("{r}\n")).collect()
+        } else { String::new() };
+        self.seal_in_flight = true;
+        SealJob { sha, head, n, recs, body, haptic, path: self.path.clone(), haptic_path: self.haptic_path.clone() }
+    }
+
+    /// Commit a prepared chunk after `SealJob::write`. On a failed write the chain does not move and the
+    /// records go back in front of any record that arrived during the write (same order as before).
+    pub fn seal_finish(&mut self, job: SealJob, written: std::io::Result<()>) -> (String, String, usize) {
+        if job.n == 0 { return (job.sha, job.head, 0); }
+        self.seal_in_flight = false;
+        if written.is_err() {
+            // The chunk is not on disk, so the chain must not move. The records stay pending and
+            // the next segment seals them. A checkpoint for this segment then commits the empty hash.
+            let mut recs = job.recs;
+            recs.append(&mut self.pending);
+            self.pending = recs;
+            return (empty_hash(), self.head.clone(), 0);
         }
-        if let Some(hp) = &self.haptic_path {
-            let hs: String = recs.iter().filter(|r| r["type"] == "haptic").map(|r| format!("{r}\n")).collect();
-            if !hs.is_empty() {
-                if let Err(e) = append_bytes(hp, hs.as_bytes()) {
-                    warn!("cannot write {}: {e}", hp.display());
-                }
-            }
-        }
-        self.head = head.clone(); self.chunks += 1; self.total_records += n as u64;
-        (sha, head, n)
+        self.head = job.head.clone(); self.chunks += 1; self.total_records += job.n as u64;
+        (job.sha, job.head, job.n)
     }
 }
 
@@ -334,7 +781,7 @@ where F: Fn() -> Result<Box<dyn ReportSource>, String> + Send + 'static {
                     let pad_id = dev.pad_id();
                     let detail = InputLog::connect_detail(&name, &pad_id);
                     info!("CONTROLLER: reading {name} id={pad_id} HID reports on the QorCap clock");
-                    log.lock().unwrap_or_else(|e| e.into_inner()).on_status_with_id(us(), "connected", &detail, Some(&pad_id));
+                    log.lock().unwrap_or_else(|e| e.into_inner()).on_handle_open(us(), &detail, &pad_id);
                     let mut last_rx = Instant::now();
                     while !stop.load(Ordering::SeqCst) {
                         match dev.read(&mut buf, 100) {
@@ -343,19 +790,28 @@ where F: Fn() -> Result<Box<dyn ReportSource>, String> + Send + 'static {
                                 if let Some(p) = hid::parse(&buf[..n]) {
                                     let mut l = log.lock().unwrap_or_else(|e| e.into_inner());
                                     if l.live.state != "connected" { l.on_status_with_id(t, "connected", &detail, Some(&pad_id)); }
-                                    l.on_report(t, &p);
+                                    l.on_report_bytes(t, &p, &buf[..n]);
                                     last_rx = Instant::now();
+                                } else {
+                                    let mut l = log.lock().unwrap_or_else(|e| e.into_inner());
+                                    if n < USB_REPORT_LEN { l.note_short_read(t); } else { l.note_parse_fault(t); }
                                 }
                             }
                             Ok(None) => {
-                                if last_rx.elapsed() > Duration::from_secs(2) {
-                                    let mut l = log.lock().unwrap_or_else(|e| e.into_inner());
-                                    if l.live.state == "connected" { warn!("CONTROLLER: no HID reports for 2 s"); l.on_status(us(), "stalled", "no reports for 2 s"); }
+                                let t = us();
+                                let mut l = log.lock().unwrap_or_else(|e| e.into_inner());
+                                l.note_fault(t);
+                                if last_rx.elapsed() > Duration::from_secs(2) && l.live.state == "connected" {
+                                    warn!("CONTROLLER: no HID reports for 2 s");
+                                    l.on_status(t, "stalled", "no reports for 2 s");
                                 }
                             }
                             Err(e) => {
                                 warn!("CONTROLLER: USB HID read failed ({e}); retrying");
-                                log.lock().unwrap_or_else(|e| e.into_inner()).on_status(us(), "unplugged", &e);
+                                let t = us();
+                                let mut l = log.lock().unwrap_or_else(|e| e.into_inner());
+                                l.note_fault(t);
+                                l.on_status(t, "unplugged", &e);
                                 break;
                             }
                         }
@@ -410,6 +866,151 @@ pub fn verify_chunks(recs: &[Value], chunks: &[Value]) -> (std::collections::Has
 mod tests {
     use super::*;
     fn pad(b: u32, l2: u8) -> Pad { Pad { buttons: b, l2, ..Pad::neutral() } }
+    /// Fixed input stream for the seal byte-equality checks. Only uses API that exists at v0.3.43.
+    fn seal_scenario_feed(l: &mut InputLog, from_us: u64, to_us: u64) {
+        let mut t = from_us;
+        let mut k = 0u32;
+        while t < to_us {
+            let b = if (k / 40) & 1 == 0 { 0 } else { hid::CROSS };
+            let mut p = pad(b, ((k * 7) % 200) as u8);
+            p.counter = (k & 0xff) as u8;
+            p.sensor_ts = k.wrapping_mul(12_000);
+            l.on_report(t, &p);
+            t += 4_000;
+            k += 1;
+        }
+    }
+
+    /// v0.3.43 `seal()` on `seal_scenario_feed`: inputs.jsonl sha256 / length and the last chunk's
+    /// (sha, head, n). Captured from the 36debdd tree before the seal was split.
+    const GOLDEN_FILE_SHA: &str = "e577d5af1762d2a21b4fb9102a64b9ce270f76dfa2ee346dbaa9a4859a5d7fc2";
+    const GOLDEN_FILE_LEN: usize = 234_476;
+    const GOLDEN_LAST: (&str, &str, usize) = ("a28c108d1bab80f66a8acccbab3a0bb1ac13f577456e1118b50d1be4b56351f9",
+        "c75e33207c2f632b7f48570258c4ac92c93063fd9f20d63def2f2bcf86392518", 502);
+
+    fn golden_run(tag: &str, shared: bool) -> (Vec<u8>, Vec<(String, String, usize)>) {
+        let dir = std::env::temp_dir().join(format!("qorcap-inputs-golden-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let p = dir.join("inputs.jsonl");
+        let mut l = InputLog::new(Some(p.clone()), true, 1_700_000_000_000);
+        l.set_mono_origin_ns(42);
+        l.on_handle_open(10, "DualSense (USB) serial=T1", "serial:T1");
+        let log = Mutex::new(l);
+        let mut outs = vec![];
+        for seg in 0..4u64 {
+            seal_scenario_feed(&mut log.lock().unwrap(), seg * 2_000_000 + 20, (seg + 1) * 2_000_000);
+            let t = (seg + 1) * 2_000_000 + 5;
+            outs.push(if shared { seal_shared(&log, seg + 1, || t) } else { log.lock().unwrap().seal(seg + 1, t) });
+        }
+        let bytes = std::fs::read(&p).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        (bytes, outs)
+    }
+
+    #[test]
+    fn seal_and_seal_shared_write_the_v0343_bytes() {
+        for shared in [false, true] {
+            let (bytes, outs) = golden_run(if shared { "shared" } else { "direct" }, shared);
+            assert_eq!((ev::sha256_hex(&bytes).as_str(), bytes.len()), (GOLDEN_FILE_SHA, GOLDEN_FILE_LEN), "shared={shared}");
+            let last = outs.last().unwrap();
+            assert_eq!((last.0.as_str(), last.1.as_str(), last.2), GOLDEN_LAST, "shared={shared}");
+        }
+    }
+
+    #[test]
+    fn seal_shared_fsyncs_without_the_input_lock_and_later_records_wait_for_the_next_chunk() {
+        let dir = std::env::temp_dir().join(format!("qorcap-inputs-shared-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let p = dir.join("inputs.jsonl");
+        let log = Mutex::new(InputLog::new(Some(p.clone()), true, 0));
+        log.lock().unwrap().on_status(1, "connected", "DualSense");
+        log.lock().unwrap().on_report(1_000, &pad(0, 0));
+        let mut on_disk_during = 0usize;
+        let (sha, head, n) = seal_shared_with(&log, 1, || 2_000, |job| {
+            // The HID logger can take the lock while the chunk is being written and fsynced...
+            let mut g = log.try_lock().expect("input-log mutex must be free during the disk write");
+            assert_eq!(g.chunks, 0, "chain does not move before the chunk is durable");
+            g.on_report(1_500, &pad(hid::CROSS, 0));
+            drop(g);
+            let r = job.write();
+            on_disk_during = read_file(&p).map(|(recs, _)| recs.len()).unwrap_or(0);
+            r
+        });
+        // ...and what it adds is not in this chunk: header, status, 1 report, imu.
+        assert_eq!((n, on_disk_during), (4, 4));
+        let l = log.lock().unwrap();
+        assert_eq!((l.chunks, l.head.as_str()), (1, head.as_str()));
+        assert_eq!(l.pending().len(), 1);
+        assert_eq!(l.pending()[0]["t_us"], 1_500);
+        drop(l);
+        let (recs, chunks) = read_file(&p).unwrap();
+        let (m, h2, errs) = verify_chunks(&recs, &chunks);
+        assert!(errs.is_empty(), "{errs:?}");
+        assert_eq!((m[&1].as_str(), h2.as_str()), (sha.as_str(), head.as_str()));
+        let (_, _, n2) = seal_shared(&log, 2, || 3_000);
+        assert_eq!(n2, 1, "the record added during the write is sealed next");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn seal_shared_failed_write_keeps_the_chain_and_the_order() {
+        let log = Mutex::new(InputLog::new(Some(std::env::temp_dir().join("unused-qorcap-inputs.jsonl")), true, 0));
+        log.lock().unwrap().on_status(1, "connected", "DualSense");
+        let before: Vec<Value> = log.lock().unwrap().pending().to_vec();
+        let (sha, head, n) = seal_shared_with(&log, 1, || 10, |_| {
+            log.lock().unwrap().on_status(20, "unplugged", "gone");
+            Err(std::io::Error::other("disk full"))
+        });
+        assert_eq!((n, sha.as_str(), head.as_str()), (0, empty_hash().as_str(), GENESIS));
+        let l = log.lock().unwrap();
+        assert_eq!(l.chunks, 0);
+        let types: Vec<(String, u64)> = l.pending().iter().map(|r| (r["type"].as_str().unwrap().to_string(), r["t_us"].as_u64().unwrap())).collect();
+        let want: Vec<(String, u64)> = before.iter().map(|r| (r["type"].as_str().unwrap().to_string(), r["t_us"].as_u64().unwrap()))
+            .chain(std::iter::once(("status".to_string(), 20))).collect();
+        assert_eq!(types, want, "failed chunk first, then what arrived during the write");
+        assert!(!l.seal_in_flight);
+    }
+
+    #[test]
+    fn weave_snapshot_follows_pad_state_and_presses_only_when_attached() {
+        let snap = std::sync::Arc::new(Mutex::new(crate::livetap::WeaveCtx::default()));
+        let mut off = InputLog::new(None, true, 5);
+        off.on_status(1, "connected", "DualSense");
+        assert_eq!(*snap.lock().unwrap(), crate::livetap::WeaveCtx::default(), "no snapshot attached: nothing published");
+        let mut l = InputLog::new(None, true, 5);
+        l.set_weave_snap(snap.clone());
+        assert_eq!(snap.lock().unwrap().pad, "searching");
+        l.on_status(1, "connected", "DualSense");
+        assert_eq!(snap.lock().unwrap().pad, "connected");
+        l.on_report(1_000, &pad(0, 0));
+        l.on_report(9_000, &pad(hid::CROSS, 0));
+        assert_eq!(snap.lock().unwrap().last_press.as_ref().map(|p| p.2.clone()), Some("CROSS".into()));
+        l.on_status(20_000, "unplugged", "gone");
+        assert_eq!(*snap.lock().unwrap(), l.weave_ctx());
+        assert_eq!(snap.lock().unwrap().pad, "unplugged");
+    }
+    #[test]
+    fn recent_presses_keep_short_taps_for_the_console() {
+        let mut l = InputLog::new(None, true, 1_700_000_000_000);
+        l.on_report(1_000, &pad(0, 0));
+        // A 40 ms tap a 125 ms /status poll would miss, then a rolled d-pad (UP then UP+RIGHT).
+        l.on_report(100_000, &pad(hid::LEFT, 0));
+        l.on_report(140_000, &pad(0, 0));
+        l.on_report(300_000, &pad(hid::UP, 0));
+        l.on_report(333_000, &pad(hid::UP | hid::RIGHT, 0));
+        l.on_report(400_000, &pad(0, 0));
+        assert!(l.live.buttons.is_empty(), "nothing held at the end, so held-state polling sees no taps");
+        let got: Vec<(u64, u64, &str)> = l.live.recent_presses.iter().map(|p| (p.seq, p.t_ms, p.button.as_str())).collect();
+        assert_eq!(got, vec![(1, 1_700_000_000_100, "LEFT"), (2, 1_700_000_000_300, "UP"), (3, 1_700_000_000_333, "RIGHT")]);
+        assert_eq!(l.live.presses, 3);
+        for i in 0..(RECENT_PRESSES as u64 + 10) {
+            l.on_report(500_000 + i * 2_000, &pad(hid::CROSS, 0));
+            l.on_report(501_000 + i * 2_000, &pad(0, 0));
+        }
+        assert_eq!(l.live.recent_presses.len(), RECENT_PRESSES);
+        assert_eq!(l.live.recent_presses.last().unwrap().seq, 3 + RECENT_PRESSES as u64 + 10);
+    }
+
     #[test]
     fn seal_hashes_records_and_chains() {
         let dir = std::env::temp_dir().join(format!("qorcap-inputs-{}", std::process::id()));
@@ -517,5 +1118,231 @@ mod tests {
         assert_eq!(connected["pad_id"], "serial:FAKE0001");
         assert!(connected["detail"].as_str().unwrap().contains("serial=FAKE0001"), "{}", connected["detail"]);
         assert!(l.pending.iter().any(|r| r["type"] == "header" && r["pad_identity"] == "required"));
+    }
+
+    #[test]
+    fn heartbeat_follows_received_reports_not_logged_changes() {
+        let dir = std::env::temp_dir().join(format!("qorcap-inputs-hb-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("inputs.jsonl");
+        let mut l = InputLog::new(Some(path.clone()), true, 0);
+        l.on_status_with_id(0, "connected", "DualSense Edge (USB)", Some("serial:EDGE1"));
+        let mut quiet = pad(0, 0);
+        quiet.counter = 9;
+        let mut t = 0u64;
+        while t <= 5 * HB_INTERVAL_US {
+            l.on_report(t, &quiet);
+            t += 4_000;
+        }
+        let hbs: Vec<Value> = l.pending().iter().filter(|r| r["type"] == "hb").cloned().collect();
+        assert_eq!(hbs.len(), 5, "five seconds of unchanged reports still write one hb per second: {hbs:?}");
+        assert!(hbs.iter().all(|h| h["rx_delta"].as_u64().unwrap_or(0) > 0));
+        assert_eq!((hbs[0]["hb_seq"].as_u64(), hbs[4]["hb_seq"].as_u64()), (Some(0), Some(4)));
+        assert_eq!(hbs[0]["epoch"], 1);
+        assert_eq!(hbs[0]["dev_counter"], 9);
+        assert_eq!(l.pending().iter().filter(|r| r["type"] == "in").count(), 1);
+        let last_rx = hbs[4]["last_rx_t_us"].as_u64().unwrap();
+        l.note_fault(last_rx + HB_INTERVAL_US);
+        l.note_fault(last_rx + 2 * HB_INTERVAL_US);
+        let stall = l.pending().iter().rev().find(|r| r["type"] == "hb").unwrap();
+        assert_eq!(stall["rx_delta"], 0);
+        assert_eq!(stall["last_rx_t_us"], last_rx);
+        assert!(stall["t_us"].as_u64().unwrap() > last_rx);
+        assert!(stall["faults"].as_u64().unwrap() >= 1);
+        let epoch_before = stall["epoch"].as_u64().unwrap();
+        let stall_t = stall["t_us"].as_u64().unwrap();
+        l.on_status(stall_t + 1_000, "unplugged", "usb disconnect");
+        l.on_status_with_id(stall_t + 2_000, "connected", "DualSense Edge (USB)", Some("serial:EDGE1"));
+        l.note_fault(stall_t + HB_INTERVAL_US);
+        let rejoined = l.pending().iter().rev().find(|r| r["type"] == "hb").unwrap();
+        assert!(rejoined["epoch"].as_u64().unwrap() > epoch_before, "reconnect bumps epoch");
+        let states: Vec<&str> = l.pending().iter().filter_map(|r| r["state"].as_str()).collect();
+        assert!(states.windows(2).any(|w| w == ["unplugged", "connected"]), "{states:?}");
+        let (sha, head, n) = l.seal(3, stall_t + HB_INTERVAL_US);
+        assert!(n > 5);
+        assert_ne!(sha, empty_hash());
+        let (recs, chunks) = read_file(&path).unwrap();
+        let sealed: Vec<&Value> = recs.iter().filter(|r| r["type"] == "hb").collect();
+        assert!(sealed.len() >= 5);
+        assert!(sealed.iter().all(|r| r["seg"] == 3));
+        let (_, chain, errs) = verify_chunks(&recs, &chunks);
+        assert!(errs.is_empty(), "{errs:?}");
+        assert_eq!(chain, head);
+        for row in sealed.iter().take(3) {
+            println!("{row}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn heartbeat_keeps_a_recovered_gap_and_resets_on_reconnect() {
+        let mut l = InputLog::new(None, true, 0);
+        l.on_handle_open(0, "DualSense Edge (USB)", "serial:EDGE1");
+        assert_eq!(l.epoch, 1);
+        let mut quiet = pad(0, 0);
+        quiet.counter = 9;
+        let mut t = 0u64;
+        while t <= HB_INTERVAL_US {
+            l.on_report(t, &quiet);
+            t += 4_000;
+        }
+        // 300 ms with no reports, then the link recovers inside the next interval.
+        // The gap starts at the previous interval's last report.
+        let resume = HB_INTERVAL_US + 300_000;
+        l.on_report(resume, &quiet);
+        t = resume + 4_000;
+        while t <= 2 * HB_INTERVAL_US {
+            l.on_report(t, &quiet);
+            t += 4_000;
+        }
+        let recovered = l.pending().iter().rev().find(|r| r["type"] == "hb").unwrap().clone();
+        assert_eq!(recovered["t_us"], 2 * HB_INTERVAL_US);
+        assert!(recovered["max_rx_gap_us"].as_u64().unwrap() >= 300_000, "{recovered}");
+        assert!(recovered["stale_over_50ms"].as_u64().unwrap() >= 1, "{recovered}");
+        assert_eq!(recovered["last_rx_t_us"], 2 * HB_INTERVAL_US, "last_rx is fresh and must not hide the gap");
+        assert_eq!(recovered["first_rx_t_us"], resume);
+        assert_eq!(recovered["dev_counter"], 9);
+        assert_eq!(recovered["short_reads"], 0);
+        assert_eq!(recovered["parse_faults"], 0);
+        // Same handle, stalled, then a report: the gap stays. This is not a new epoch.
+        let epoch_at_recovery = l.epoch;
+        l.on_status(2 * HB_INTERVAL_US + 1_000, "stalled", "no reports for 2 s");
+        l.on_status_with_id(2 * HB_INTERVAL_US + 350_000, "connected", "DualSense Edge (USB)", Some("serial:EDGE1"));
+        assert_eq!(l.epoch, epoch_at_recovery, "stall recovery on the same handle does not bump epoch");
+        l.note_short_read(2 * HB_INTERVAL_US + 10);
+        l.note_parse_fault(2 * HB_INTERVAL_US + 20);
+        l.note_fault(2 * HB_INTERVAL_US + 30);
+        l.note_fault(3 * HB_INTERVAL_US);
+        let poisoned = l.pending().iter().rev().find(|r| r["type"] == "hb").unwrap().clone();
+        assert_eq!(poisoned["short_reads"], 1);
+        assert_eq!(poisoned["parse_faults"], 1);
+        assert!(poisoned["faults"].as_u64().unwrap() >= 1);
+        l.on_status(3 * HB_INTERVAL_US + 1_000, "unplugged", "usb disconnect");
+        l.on_handle_open(3 * HB_INTERVAL_US + 2_000, "DualSense Edge (USB)", "serial:EDGE1");
+        assert!(l.epoch > epoch_at_recovery, "reconnect bumps epoch");
+        let after_reopen = l.epoch;
+        l.on_handle_open(3 * HB_INTERVAL_US + 3_000, "DualSense Edge (USB)", "serial:EDGE1");
+        assert!(l.epoch > after_reopen, "a new handle bumps epoch even when the id string is unchanged");
+        let after_same_id = l.epoch;
+        l.on_status_with_id(3 * HB_INTERVAL_US + 4_000, "connected", "DualSense Edge (USB)", Some("serial:EDGE2"));
+        assert!(l.epoch > after_same_id, "a device identity change bumps epoch");
+        let base = 4 * HB_INTERVAL_US;
+        t = base;
+        while t <= base + HB_INTERVAL_US {
+            l.on_report(t, &quiet);
+            t += 4_000;
+        }
+        let after: Vec<Value> = l.pending().iter().filter(|r| r["type"] == "hb" && r["t_us"].as_u64().unwrap_or(0) >= base).cloned().collect();
+        assert!(after.len() >= 2, "{after:?}");
+        assert_eq!(after[0]["t_us"], base);
+        assert_eq!(after[0]["max_rx_gap_us"], 0, "the gap across reconnect is not a stall: {after:?}");
+        assert_eq!(after[0]["first_rx_t_us"], base);
+        assert_eq!(after[0]["short_reads"], 0);
+        assert_eq!(after[0]["parse_faults"], 0);
+        assert_eq!(after[0]["faults"], 0);
+        assert_eq!(after[0]["stale_over_50ms"], 0);
+        let clean = after.last().unwrap();
+        assert_eq!(clean["max_rx_gap_us"], 4_000, "only the post-reconnect report spacing remains: {clean}");
+        assert_eq!(clean["stale_over_50ms"], 0);
+        assert_eq!(clean["short_reads"], 0);
+        assert_eq!(clean["parse_faults"], 0);
+        assert_eq!(clean["faults"], 0);
+        assert_eq!(clean["last_rx_t_us"], base + HB_INTERVAL_US);
+        let first = l.pending().iter().find(|r| r["type"] == "hb" && r["t_us"] == HB_INTERVAL_US).unwrap();
+        println!("{first}");
+        println!("{recovered}");
+        println!("{clean}");
+    }
+
+    #[test]
+    fn quiet_span_with_a_ticking_report_sequence_supports_idle_and_a_zero_does_not() {
+        let mut l = InputLog::new(None, true, 0);
+        l.on_handle_open(0, "DualSense Edge (USB)", "serial:EDGE1");
+        let mut t = 0u64;
+        let mut counter: u8 = 0;
+        let mut hw: u32 = 1_000;
+        while t <= 4 * HB_INTERVAL_US {
+            let mut quiet = pad(0, 0);
+            quiet.counter = counter;
+            quiet.sensor_ts = hw;
+            l.on_report(t, &quiet);
+            counter = counter.wrapping_add(1);
+            hw = hw.wrapping_add(12_000);
+            t += 4_000;
+        }
+        let hbs: Vec<Value> = l.pending().iter().filter(|r| r["type"] == "hb").cloned().collect();
+        assert!(hbs.len() >= 4, "{hbs:?}");
+        assert!(hbs.iter().all(|h| h["rx_bind"].as_str().unwrap_or("").len() == 64));
+        assert!(hbs.iter().all(|h| h["seq_breaks"] == 0), "{hbs:?}");
+        assert!(hbs.iter().all(|h| h["hw_advance"].as_u64().unwrap_or(0) > 0));
+        assert!(hbs.iter().all(|h| h["neutral"] == true), "{hbs:?}");
+        let idle = crate::pad_link::classify_span(&hbs, 1_100_000, 3_800_000, &crate::pad_link::TrustedBoundary::new());
+        assert_eq!(idle.class, "unknown", "{idle:?}");
+        assert_eq!(idle.reason, "no_trusted_anchor");
+        assert!(!idle.is_idle(), "a local digest is not a trusted anchor");
+        l.note_fault(5 * HB_INTERVAL_US);
+        let with_zero: Vec<Value> = l.pending().iter().filter(|r| r["type"] == "hb").cloned().collect();
+        let dropped = crate::pad_link::classify_span(&with_zero, 4_100_000, 5 * HB_INTERVAL_US, &crate::pad_link::TrustedBoundary::new());
+        assert_eq!(dropped.class, "unknown", "{dropped:?}");
+        let unknown = crate::pad_link::classify_span(&hbs, 20 * HB_INTERVAL_US, 21 * HB_INTERVAL_US, &crate::pad_link::TrustedBoundary::new());
+        assert_eq!(unknown.class, "unknown");
+        assert!(!unknown.is_idle());
+        let header = l.pending().iter().find(|r| r["type"] == "header").unwrap();
+        assert!(header["axes"].as_str().unwrap().contains("no deadzone"));
+    }
+
+    #[test]
+    fn trigger_pressure_is_not_neutral() {
+        let mut l = InputLog::new(None, true, 0);
+        l.on_handle_open(0, "DualSense Edge (USB)", "serial:EDGE1");
+        let mut t = 0u64;
+        let mut counter: u8 = 0;
+        let mut hw: u32 = 1_000;
+        while t <= HB_INTERVAL_US {
+            let mut pressed = pad(0, 0);
+            pressed.r2 = 20;
+            pressed.counter = counter;
+            pressed.sensor_ts = hw;
+            l.on_report(t, &pressed);
+            counter = counter.wrapping_add(1);
+            hw = hw.wrapping_add(12_000);
+            t += 4_000;
+        }
+        let hbs: Vec<Value> = l.pending().iter().filter(|r| r["type"] == "hb").cloned().collect();
+        assert!(!hbs.is_empty(), "{hbs:?}");
+        assert!(hbs.iter().all(|h| h["neutral"] == false), "{hbs:?}");
+        let mut held = pad(0, 40);
+        held.counter = counter;
+        held.sensor_ts = hw;
+        l.on_report(t, &held);
+        let later: Vec<Value> = l.pending().iter().filter(|r| r["type"] == "hb").cloned().collect();
+        assert!(later.iter().all(|h| h["neutral"] == false), "{later:?}");
+    }
+
+    #[test]
+    fn cod_seal_binds_once_and_a_solo_hold_does_not() {
+        let dir = std::env::temp_dir().join(format!("qorcap-seal-log-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut l = InputLog::new(Some(dir.join("inputs.jsonl")), true, 0);
+        l.enable_seal();
+        assert_eq!(l.live.seal_line, "Seal: waiting");
+        l.on_report(1_000_000, &pad(hid::OPTIONS, 0));
+        l.on_report(3_200_000, &pad(0, 0));
+        assert!(l.live.seal_line.starts_with("Seal: failed"));
+        assert!(dir.join("session_seal.json").is_file());
+        assert!(dir.join("pad_session.v0.json").is_file());
+        let session: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("session_seal.json")).unwrap()).unwrap();
+        let pad_doc: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("pad_session.v0.json")).unwrap()).unwrap();
+        assert!(session["seal_hash"].is_null());
+        assert_eq!(session["seal_hash"], pad_doc["seal_hash"]);
+        assert!(!crate::seal::dual_bind_passes(&session, &pad_doc, None, None));
+        assert!(l.seal_binding().is_none(), "a retryable failure is not a checkpoint binding");
+        l.close_seal();
+        let bound = l.seal_binding().unwrap();
+        assert!(bound["hash"].is_null());
+        assert!(l.acknowledge_seal());
+        assert!(l.seal_binding().is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
