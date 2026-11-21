@@ -935,6 +935,17 @@ impl Engine {
         let last = cp["seq"].as_u64()?;
         self.status.lock().unwrap_or_else(|e| e.into_inner()).final_checkpoint_seq = Some(last);
         info!("stop checkpoint {last} written; checkpoint chain sealed");
+        if self.capture_stop.is_some() {
+            if let Some(dir) = self.bundle_dir() {
+                if dir.join(crate::hand::response::PRACTICE_CHALLENGES_FILE).exists()
+                    || dir.join(crate::hand::response::CHALLENGES_FILE).exists()
+                {
+                    if let Err(e) = crate::hand::response::write_dir(&dir) {
+                        warn!("practice response bound not written: {e}");
+                    }
+                }
+            }
+        }
         if self.countersigned.load(Ordering::SeqCst) < 0 { return Some(last); }
         self.set_state("countersigning", Some("waiting for the referee to countersign the final checkpoints".into()));
         let end = Instant::now() + wait;
@@ -2477,6 +2488,65 @@ esac
         }
         let _ = std::fs::remove_dir_all(&base);
     }
+
+    #[test]
+    fn practice_challenge_binds_hand_head_and_leaves_receipt_unchanged() {
+        use clap::Parser;
+        use crate::cli::{Cli, Cmd};
+        let dir = std::env::temp_dir().join(format!("qorcap-respbound-eng-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let d = dir.to_string_lossy().into_owned();
+
+        // 1. Non-practice lane rejects practice challenges and leaves REAL MATCH untouched.
+        let Cmd::Record(r_real) = Cli::try_parse_from(["q", "record", "--device", "testpattern", "--audio", "none", "--bundle", &d, "--match-id", "m-real"]).unwrap().cmd else { panic!() };
+        let e_real = Engine::new(r_real, dir.join("no-ffmpeg").to_string_lossy().into_owned());
+        assert!(e_real.challenge(&json!({"nonce": "0123456789abcdef0123456789abcdef", "practice": true})).is_err());
+
+        // 2. Practice lane binds current hand-chunk head on POST /challenge and checkpoint, writes
+        //    practice_challenges.jsonl + hand_challenge.jsonl, and keeps receipt.draft.json challenges empty.
+        let pdir = dir.join("practice");
+        std::fs::create_dir_all(&pdir).unwrap();
+        let pd = pdir.to_string_lossy().into_owned();
+        let Cmd::Record(r_prac) = Cli::try_parse_from(["q", "record", "--device", "testpattern", "--audio", "none", "--bundle", &pd, "--match-id", "m-prac", "--practice-lane", "--no-raw-usb"]).unwrap().cmd else { panic!() };
+        let e = Engine::new(r_prac, pdir.join("no-ffmpeg").to_string_lossy().into_owned());
+        assert!(e.start_hand_logger());
+        e.on_segment("video.mp4", 0, b"\0\0\0\x10ftypisom\0\0\0\0");
+        let end = Instant::now() + Duration::from_secs(10);
+        while e.hand.get().unwrap().binding().is_none() && Instant::now() < end {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let (expected_seq, expected_head) = e.hand.get().unwrap().binding().expect("chunk 0 sealed");
+        let nonce = "0123456789abcdef0123456789abcdef";
+        let resp = e.challenge(&json!({"nonce": nonce, "phase": "practice", "practice": true, "game": "cod"})).unwrap();
+        assert_eq!(resp["challenge"]["hand_chunk_seq"], expected_seq);
+        assert_eq!(resp["challenge"]["hand_head"], expected_head);
+        assert_eq!(resp["checkpoint"]["qorcap"]["hand_chunk_seq"], expected_seq);
+        assert_eq!(resp["checkpoint"]["qorcap"]["hand_head"], expected_head);
+        assert_eq!(resp["checkpoint"]["qorcap"]["practice"], true);
+        assert!(!pdir.join("stamp.txt").exists());
+        assert!(pdir.join(crate::hand::response::PRACTICE_CHALLENGES_FILE).exists());
+        assert!(!pdir.join("challenges.jsonl").exists());
+
+        e.seal_and_wait_countersign(Duration::from_secs(1)).unwrap();
+        e.write_bundle_opts(false).unwrap();
+
+        let draft: Value = serde_json::from_str(&std::fs::read_to_string(pdir.join("receipt.draft.json")).unwrap()).unwrap();
+        assert_eq!(draft["challenges"].as_array().unwrap().len(), 0, "practice challenge must never enter receipt.draft.json");
+        assert!(pdir.join(crate::hand::response::FILE_NAME).exists());
+        let hc_lines: Vec<Value> = std::fs::read_to_string(pdir.join(crate::hand::response::FILE_NAME))
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(hc_lines.len(), 1);
+        assert_eq!(hc_lines[0]["bound_chunk_seq"], expected_seq);
+        assert_eq!(hc_lines[0]["bound_head"], expected_head);
+        assert_eq!(hc_lines[0]["bound_head_status"], "matched");
+        assert_eq!(hc_lines[0]["receipt_status_changed"], false);
+        assert_eq!(hc_lines[0]["advisory_only"], true);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 impl Engine {
@@ -2593,17 +2663,47 @@ impl Engine {
         cp
     }
 
-    /// Referee nonce challenge: record receipt time against the chain and (optionally) stamp it on video.
+    /// Nonce challenge: record receipt time against the chain, bind current hand-chunk head when active,
+    /// and (for official challenges only, when --stamp is set) stamp video. Practice challenges stay out of
+    /// `st.challenges` and `challenges.jsonl` so `receipt.draft.json` / `receipt.json` stay untouched.
     pub fn challenge(&self, b: &Value) -> Result<Value, String> {
+        let practice_req = b["practice"].as_bool().unwrap_or(false) || b["phase"].as_str() == Some("practice");
+        if practice_req && self.capture_stop.is_none() {
+            return Err("practice challenge is allowed in the practice lane only".into());
+        }
         let nonce = b["nonce"].as_str().ok_or("missing nonce")?;
         let pattern = ev::pattern_for(nonce)?;
         let now = wall_ms();
         let issued = b["issued_ms"].as_u64().unwrap_or(now);
         let (seq, head) = { let st = self.ev.lock().unwrap_or_else(|e| e.into_inner()); (st.seg.seq, st.seg.head.clone()) };
-        let c = json!({"id": b["id"].as_str().map(String::from).unwrap_or_else(|| nonce[..8].to_string()),
-            "role": b["role"].as_str().unwrap_or(&self.args.role), "phase": b["phase"].as_str().unwrap_or("kickoff"),
+        let hand_bind = self.hand.get().map(|h| match h.binding() {
+            Some((s, head)) => (json!(s), json!(head)),
+            None => (Value::Null, Value::Null),
+        });
+        let mut c = json!({"id": b["id"].as_str().map(String::from).unwrap_or_else(|| nonce[..8].to_string()),
+            "role": b["role"].as_str().unwrap_or(&self.args.role),
+            "phase": b["phase"].as_str().unwrap_or(if practice_req { "practice" } else { "kickoff" }),
             "nonce": nonce, "pattern": pattern, "issued_ms": issued, "deadline_ms": b["deadline_ms"].as_u64().unwrap_or(issued + 90_000),
             "received_wall_ms": now, "received_mono_ms": self.ms(), "segment_seq_at_receipt": seq, "chain_head_at_receipt": head});
+        let mut cp_extra = json!({"nonce": nonce});
+        if let Some((hs, hh)) = &hand_bind {
+            c["hand_chunk_seq"] = hs.clone();
+            c["hand_head"] = hh.clone();
+            cp_extra["hand_chunk_seq"] = hs.clone();
+            cp_extra["hand_head"] = hh.clone();
+        }
+        if practice_req {
+            c["practice"] = json!(true);
+            cp_extra["practice"] = json!(true);
+            if let Some(g) = b["game"].as_str() {
+                c["game"] = json!(g);
+                cp_extra["game"] = json!(g);
+            }
+            let _ = append_jsonl(&self.ev_path(crate::hand::response::PRACTICE_CHALLENGES_FILE), &c);
+            let cp = self.checkpoint("challenge", cp_extra);
+            info!("practice challenge {nonce} received; pattern {pattern:?}; bound at checkpoint {}", cp["seq"]);
+            return Ok(json!({"ok": true, "challenge": c, "checkpoint": cp}));
+        }
         if self.args.stamp {
             let text = format!("QorCap nonce {}  {}", &nonce[..12], pattern.join(" "));
             let tmp = self.stamp_file.with_extension("tmp");
@@ -2611,7 +2711,7 @@ impl Engine {
         }
         self.ev.lock().unwrap_or_else(|e| e.into_inner()).challenges.push(c.clone());
         let _ = append_jsonl(&self.ev_path("challenges.jsonl"), &c);
-        let cp = self.checkpoint("challenge", json!({"nonce": nonce}));
+        let cp = self.checkpoint("challenge", cp_extra);
         info!("referee challenge {nonce} received; pattern {pattern:?}; bound at checkpoint {}", cp["seq"]);
         Ok(json!({"ok": true, "challenge": c, "checkpoint": cp}))
     }

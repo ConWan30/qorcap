@@ -134,6 +134,7 @@ LINUX_FILES = (
     "sidecar/test_qorcap_submit.py",
     "sidecar/test_qorcap_rlr_stage_a.py",
     "sidecar/test_qorcap_engagement.py",
+    "sidecar/test_qorcap_practice_challenge.py",
     "tools/s2s_bodycue/test_bodycue_core.py",
     "tools/s2s_bodycue/test_fusion_core.py",
     "tools/s2s_bodycue/test_pins.py",
@@ -207,6 +208,7 @@ WINDOWS_FILES = (
     "sidecar/test_qorcap_submit.py",
     "sidecar/test_qorcap_rlr_stage_a.py",
     "sidecar/test_qorcap_engagement.py",
+    "sidecar/test_qorcap_practice_challenge.py",
     "tools/s2s_bodycue/test_bodycue_core.py",
     "tools/s2s_bodycue/test_fusion_core.py",
     "tools/s2s_bodycue/test_pins.py",
@@ -221,8 +223,10 @@ WINDOWS_FILES = (
 # not re-collected; CI's collected total is authoritative. Re-collect after any list or test change.
 # sidecar/test_qorcap_engagement.py (PWEC) adds 27 non-parametrized tests on both lists: linux
 # re-collected locally at 1228 (main 0932fe8 + this file); windows set by count to 1209.
-LINUX_MIN_COLLECTED = 1228
-WINDOWS_MIN_COLLECTED = 1209
+# sidecar/test_qorcap_practice_challenge.py adds 6 tests on both lists:
+# re-collected locally at 1234 linux / 1215 windows against pinned qortime 0204e6d8.
+LINUX_MIN_COLLECTED = 1234
+WINDOWS_MIN_COLLECTED = 1215
 
 # Absent from both sidecar suites. A reason is required; whitespace does not count.
 EXCLUDED_TEST_FILES = {

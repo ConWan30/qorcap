@@ -356,6 +356,18 @@ fn main() {
             }
             Err(e) => { eprintln!("error: {}", qorcap::bundle::escape_output(&e)); 2 }
         },
+        Cmd::CheckResponseBound { dir, write } => {
+            let p = std::path::Path::new(&dir);
+            let res = if write { qorcap::hand::response::write_dir(p) } else { qorcap::hand::response::evaluate_dir(p) };
+            match res {
+                Ok(r) => {
+                    let (lines, code) = qorcap::hand::response::report_lines(&r);
+                    for l in &lines { println!("{l}"); }
+                    code
+                }
+                Err(e) => { eprintln!("error: {}", qorcap::bundle::escape_output(&e)); 2 }
+            }
+        },
         Cmd::Finalize { bundle, python, recover, mut rest } => {
             if recover { rest.insert(0, "--recover".into()); }
             finalize(bundle, python, rest, &ff)
