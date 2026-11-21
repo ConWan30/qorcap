@@ -23,6 +23,22 @@ def append_note(bundle: Path, row: dict) -> None:
         fh.write(json.dumps(row, separators=(",", ":")) + "\n")
 
 
+def record_pre_sign_fail_closed(bundle: Path | None, kind: str, notice: str) -> None:
+    """One sidecar line when the pre-sign check fails closed.
+
+    The signed receipt is unchanged: this is not a ``receipt.v0`` field and it
+    is not added to ``result["notes"]``. ``kind`` is the health-row kind
+    (``inputs_unavailable``, ``haptics_unavailable``, or ``manifest_unavailable``).
+    """
+    if bundle is None:
+        return
+    append_note(Path(bundle), {
+        "kind": "pre_sign_fail_closed",
+        "lock": kind,
+        "notice": notice,
+    })
+
+
 def record_unresolved_final(bundle: Path | None, result: dict | None) -> None:
     """One final line when the published result abstained because the grammar was unresolved."""
     if bundle is None or not isinstance(result, dict):
