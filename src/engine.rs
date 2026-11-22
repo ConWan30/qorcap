@@ -502,6 +502,20 @@ impl Engine {
         }
         let raw_usb = crate::hand::raw_enabled(self.args.no_raw_usb, std::env::var(crate::hand::ENV_RAW).ok().as_deref());
         let wall_anchor_ms = self.ev.lock().unwrap_or_else(|e| e.into_inner()).started_wall_ms;
+        let declared_settings = crate::hand::DeclaredEdgeSettings::from_flags_and_env(
+            self.args.edge_profile.as_deref(),
+            std::env::var(crate::hand::ENV_EDGE_PROFILE).ok().as_deref(),
+            self.args.l2_stop.as_deref(),
+            std::env::var(crate::hand::ENV_L2_STOP).ok().as_deref(),
+            self.args.r2_stop.as_deref(),
+            std::env::var(crate::hand::ENV_R2_STOP).ok().as_deref(),
+            self.args.stick_curve_left.as_deref(),
+            std::env::var(crate::hand::ENV_STICK_CURVE_LEFT).ok().as_deref(),
+            self.args.stick_curve_right.as_deref(),
+            std::env::var(crate::hand::ENV_STICK_CURVE_RIGHT).ok().as_deref(),
+            self.args.in_game_trigger_effect.as_deref(),
+            std::env::var(crate::hand::ENV_IN_GAME_TRIGGER_EFFECT).ok().as_deref(),
+        );
         let cfg = crate::hand::timeline::Config {
             dir: choice.dir.clone(),
             hand_dir_source: choice.source.to_string(),
@@ -513,6 +527,7 @@ impl Engine {
             frame_clock_on: self.frame_clock.enabled(),
             initial_device: None,
             start_t_us: self.started.elapsed().as_micros() as u64,
+            declared_settings,
         };
         match crate::hand::logger::spawn(cfg, self.started, crate::hand::logger::platform_open, crate::hand::logger::platform_qpc_now) {
             Ok(h) => {

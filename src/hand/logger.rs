@@ -191,9 +191,11 @@ where O: FnMut() -> OpenOutcome, Q: Fn() -> Option<u64>, U: Fn() -> u64 {
             },
             Some(s) => match s.read(&mut buf, READ_TIMEOUT_MS) {
                 ReadOutcome::Report(n) => {
-                    // Stamp first, before parsing or any other work.
-                    let t = us();
+                    // Stamp first, before parsing or any other work. When QPC origin is configured and qpc_now()
+                    // returns a sample, derive t_us from that single atomic QPC tick read so userspace preemption
+                    // between two separate clock calls cannot introduce positive skew spikes.
                     let ticks = qpc_now();
+                    let t = ticks.and_then(|tk| tl.qpc().and_then(|q| q.ticks_to_t_us(tk))).unwrap_or_else(&us);
                     if drain(tl, &rx, Duration::ZERO, &mut sampled) { tl.on_report(t, ticks, &buf[..n]); break 'outer; }
                     tl.on_report(t, ticks, &buf[..n]);
                 }

@@ -144,6 +144,21 @@
         "bytes_42_43_note": {
           "type": "string",
           "description": "Note on raw bytes 42-43 (raw[42] = R2 trigger-effect status, raw[43] = L2 per R2 bench match-20261122-155333; adaptive_trigger_state stays UNMEASURED)."
+        },
+        "declared_settings": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["checked", "source", "edge_profile", "l2_stop", "r2_stop", "stick_curve_left", "stick_curve_right", "in_game_trigger_effect"],
+          "properties": {
+            "checked": { "const": false },
+            "source": { "enum": ["user_declared", "none"] },
+            "edge_profile": { "type": "string" },
+            "l2_stop": { "type": "string" },
+            "r2_stop": { "type": "string" },
+            "stick_curve_left": { "type": "string" },
+            "stick_curve_right": { "type": "string" },
+            "in_game_trigger_effect": { "type": "string" }
+          }
         }
       }
     },

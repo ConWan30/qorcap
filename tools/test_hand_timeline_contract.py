@@ -33,6 +33,21 @@ def test_draft2020_12_schemas_valid_and_note_byte42_r2_l2_labels():
     fx_desc = tl_schema["$defs"]["in"]["properties"]["trigger_fx_status"]["description"]
     assert "r2_raw = raw[42]" in fx_desc and "l2_raw = raw[43]" in fx_desc
     assert "[r2_raw, l2_raw]" in tl_schema["$defs"]["in"]["properties"]["bytes_42_43_raw"]["description"]
+    decl_schema = tl_schema["$defs"]["header"]["properties"]["declared_settings"]
+    assert decl_schema["properties"]["checked"]["const"] is False
+
+    sample_header = json.loads((FIX_DIR / "189_edge" / "hand_timeline.v0.jsonl").read_text("utf-8").splitlines()[0])
+    sample_header["declared_settings"] = {
+        "checked": False,
+        "source": "user_declared",
+        "edge_profile": "FN+TRIANGLE",
+        "l2_stop": "short",
+        "r2_stop": "full",
+        "stick_curve_left": "UNKNOWN",
+        "stick_curve_right": "precise",
+        "in_game_trigger_effect": "on",
+    }
+    jsonschema.Draft202012Validator(tl_schema).validate(sample_header)
 
 
 def test_manifest_hashes_and_lf_only():

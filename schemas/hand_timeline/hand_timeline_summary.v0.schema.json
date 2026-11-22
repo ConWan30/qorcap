@@ -72,6 +72,21 @@
       "description": "Last observed [raw[42], raw[43]] pair ([r2_raw, l2_raw] per R2 bench match-20261122-155333), or UNKNOWN if no USB 0x01 report arrived."
     },
     "bytes_42_43_status": { "const": "ESTIMATED" },
-    "bytes_42_43_changes_suppressed": { "type": "integer", "minimum": 0 }
+    "bytes_42_43_changes_suppressed": { "type": "integer", "minimum": 0 },
+    "declared_settings": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["checked", "source", "edge_profile", "l2_stop", "r2_stop", "stick_curve_left", "stick_curve_right", "in_game_trigger_effect"],
+      "properties": {
+        "checked": { "const": false },
+        "source": { "enum": ["user_declared", "none"] },
+        "edge_profile": { "type": "string" },
+        "l2_stop": { "type": "string" },
+        "r2_stop": { "type": "string" },
+        "stick_curve_left": { "type": "string" },
+        "stick_curve_right": { "type": "string" },
+        "in_game_trigger_effect": { "type": "string" }
+      }
+    }
   }
 }

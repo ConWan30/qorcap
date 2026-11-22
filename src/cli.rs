@@ -481,6 +481,24 @@ pub struct RecordArgs {
     /// on Windows, failing soft to the session bundle folder). Also QORCAP_HAND_DIR.
     #[arg(long)]
     pub hand_dir: Option<String>,
+    /// PRACTICE lane only. User-declared DualSense Edge profile label (recorded with checked: false; default UNKNOWN). Also QORCAP_EDGE_PROFILE.
+    #[arg(long)]
+    pub edge_profile: Option<String>,
+    /// PRACTICE lane only. User-declared DualSense Edge L2 physical trigger-stop slider (e.g. full|medium|short; checked: false; default UNKNOWN). Also QORCAP_EDGE_L2_STOP.
+    #[arg(long)]
+    pub l2_stop: Option<String>,
+    /// PRACTICE lane only. User-declared DualSense Edge R2 physical trigger-stop slider (e.g. full|medium|short; checked: false; default UNKNOWN). Also QORCAP_EDGE_R2_STOP.
+    #[arg(long)]
+    pub r2_stop: Option<String>,
+    /// PRACTICE lane only. User-declared DualSense Edge left stick sensitivity curve (e.g. default|quick|precise|steady|digital|dynamic; checked: false; default UNKNOWN). Also QORCAP_EDGE_STICK_CURVE_LEFT.
+    #[arg(long)]
+    pub stick_curve_left: Option<String>,
+    /// PRACTICE lane only. User-declared DualSense Edge right stick sensitivity curve (e.g. default|quick|precise|steady|digital|dynamic; checked: false; default UNKNOWN). Also QORCAP_EDGE_STICK_CURVE_RIGHT.
+    #[arg(long)]
+    pub stick_curve_right: Option<String>,
+    /// PRACTICE lane only. User-declared in-game adaptive trigger effect setting (e.g. on|off; checked: false; default UNKNOWN). Also QORCAP_IN_GAME_TRIGGER_EFFECT.
+    #[arg(long)]
+    pub in_game_trigger_effect: Option<String>,
 }
 
 impl RecordArgs {
