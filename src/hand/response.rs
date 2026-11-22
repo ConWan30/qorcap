@@ -1147,6 +1147,7 @@ mod tests {
             frame_clock_on: false,
             initial_device: None,
             start_t_us: 0,
+            declared_settings: Default::default(),
         };
         let mut tl = HandTimeline::open(cfg).unwrap();
         tl.on_connected(10_000, test_device());
@@ -1678,6 +1679,7 @@ mod tests {
             frame_clock_on: false,
             initial_device: None,
             start_t_us: 0,
+            declared_settings: Default::default(),
         };
         let mut tl = HandTimeline::open(cfg).unwrap();
         tl.on_connected(10_000, test_device());

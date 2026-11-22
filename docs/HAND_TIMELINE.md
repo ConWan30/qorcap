@@ -169,11 +169,18 @@ paths. Before any share, upload to QorStream, public match page, or model-sharin
 stripped or redacted, following SCOPE-edge-logger §7.2 (`qor_receipt/hands/sidecar.py::sanitize`). These files
 stay on the local PC unless the operator copies them.
 
-## What stays UNMEASURED / UNKNOWN
+## What stays UNMEASURED / UNKNOWN (and what benches have measured)
 
-- Real-device report rate on MyTurn and raw disk use per hour: UNMEASURED (needs a separately approved device check).
-- `Instant`-vs-QPC residual between `t_us` and `qpc_ticks` inside `hand_raw.v0.bin`: UNMEASURED until benchmarked.
-- Adaptive-trigger resistance state: UNMEASURED (`trigger_fx_status` keeps bytes 42/43 raw with `status: UNMEASURED`; `bytes_42_43_raw` logs `[b42, b43]` as an ESTIMATED `n=1` snapshot/change indicator capped per epoch, with last value in `summary.bytes_42_43_raw_last`).
+- **Real-device report rate and `Instant`-vs-QPC residual on benchmarked MyTurn sessions (`T-0001`, `T-0002`):**
+  - On bench `match-20261121-031058` (`T-0001`, build `365e54f`, `581,488` reports across `582` chunks): median report rate `1,000.000 Hz` (`0` gaps `> 50 ms`), `hand_raw.v0.bin` rate `288.002 MB/h` (`591.012 MB/h` combined), end-to-end clock residual `+0.000300 ms`, per-record `Instant`-vs-QPC residual range `-0.60` to `+73.90 us`.
+  - On bench `match-20261121-034801` (`T-0002`, build `365e54f`, `796,425` reports across `797` chunks): median report rate `1,000.000 Hz` (`0` gaps `> 50 ms`), combined disk rate `619.118 MB/h`, per-record `Instant`-vs-QPC residual range `-0.30` to `+227.60 us`.
+  - Starting with single-read atomic QPC timestamping (`Qpc::ticks_to_t_us`), `t_us` on Windows is derived directly from the single `qpc_now()` tick sample (`origin_t_us + (ticks - origin_ticks) * 1e6 / freq_hz`), eliminating userspace preemption spikes between two separate clock calls. On non-benchmarked sessions or non-Windows hosts without QPC, residual remains `UNMEASURED`.
+- **User-declared DualSense Edge settings (`declared_settings`, `checked: false`):**
+  - When `--edge-profile` (`QORCAP_EDGE_PROFILE`), `--l2-stop` (`QORCAP_EDGE_L2_STOP`), `--r2-stop` (`QORCAP_EDGE_R2_STOP`), `--stick-curve-left` (`QORCAP_EDGE_STICK_CURVE_LEFT`), `--stick-curve-right` (`QORCAP_EDGE_STICK_CURVE_RIGHT`), or `--in-game-trigger-effect` (`QORCAP_IN_GAME_TRIGGER_EFFECT`) is provided, the header and stop summary record `declared_settings` with `checked: false`, `source: "user_declared"`, and `"UNKNOWN"` for any undeclared field.
+  - Hardware feature reports (`edge_metadata`) are never read by the listen-only logger and remain `UNKNOWN`.
+- **Mid-session USB `D:` / disk fault protection:**
+  - If a write to `hand_raw.v0.bin` or `hand_timeline.v0.jsonl` fails mid-session, `seal()` increments `disk_faults`, sets `raw_pause = Some("disk_fault")`, rewinds any partial write to the last durable offset, and bounds `self.open` to `MAX_OPEN_WINDOWS` (`8`) so a disconnected USB drive never causes unbounded RAM growth.
+- Adaptive-trigger resistance state: UNMEASURED (`trigger_fx_status` maps `r2_raw = raw[42]` and `l2_raw = raw[43]` per R2 bench `match-20261122-155333` with `status: UNMEASURED`; `bytes_42_43_raw` logs `[b42, b43]` as an ESTIMATED snapshot/change indicator with status rows capped at `1024` per epoch and last value in `summary.bytes_42_43_raw_last`).
 - Physical face-button mirror (`physical_face`, full raw byte 51 on Edge; mask `0xF0` for face buttons since low nibble mirrors the d-pad; `UNMEASURED` on standard DualSense): ESTIMATED (`buttons` stays unmodified post-remap; `CROSS`/`CIRCLE` in `buttons` can come from back paddles under an Edge remap).
 - Edge profile, dead zones, curves, remap table, stick modules, patch firmware: UNKNOWN (feature reports, never read).
 - Which profile a `profile_swap_candidate` selected: UNKNOWN (the candidate itself is ESTIMATED).

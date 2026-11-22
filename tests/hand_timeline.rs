@@ -7,7 +7,8 @@ use qorcap::hand::check::check_dir;
 use qorcap::hand::device::{DeviceInfo, DeviceModel};
 use qorcap::hand::logger;
 use qorcap::hand::source::{MockSource, MockStep, OpenOutcome, ReadOutcome, ReportSource};
-use qorcap::hand::timeline::{Config, HandTimeline, BYTES_42_43_CHANGE_CAP_PER_EPOCH, CHUNK_US, FILE_NAME, RAW_FILE, RAW_LAYOUT, RAW_RECORD_BYTES, SEAL_GRACE_US, SUMMARY_FILE};
+use qorcap::hand::timeline::{Config, HandTimeline, Qpc, BYTES_42_43_CHANGE_CAP_PER_EPOCH, CHUNK_US, FILE_NAME, MAX_OPEN_WINDOWS, RAW_FILE, RAW_LAYOUT, RAW_RECORD_BYTES, SEAL_GRACE_US, SUMMARY_FILE};
+use qorcap::hand::DeclaredEdgeSettings;
 use qorcap::hid::{self, Pad, CIRCLE, CROSS, FN_LEFT, BACK_RIGHT, R2};
 use serde_json::Value;
 use std::path::PathBuf;
@@ -21,7 +22,7 @@ fn tmp(name: &str) -> PathBuf {
 fn edge() -> DeviceInfo { DeviceInfo { model: DeviceModel::DualSenseEdge, vid: 0x054C, pid: 0x0DF2, bcd_device: 0x0408, pad_id: "serial:EDGE1".into() } }
 fn dualsense() -> DeviceInfo { DeviceInfo { model: DeviceModel::DualSense, vid: 0x054C, pid: 0x0CE6, bcd_device: 0x0100, pad_id: "serial:DS1".into() } }
 fn cfg(dir: &PathBuf, raw: bool, dev: Option<DeviceInfo>) -> Config {
-    Config { dir: dir.clone(), hand_dir_source: "direct".into(), hand_dir_fallback_reason: None, raw_usb: raw, raw_min_free_bytes: None, wall_anchor_ms: 1_795_144_560_000, qpc: None, frame_clock_on: true, initial_device: dev, start_t_us: 0 }
+    Config { dir: dir.clone(), hand_dir_source: "direct".into(), hand_dir_fallback_reason: None, raw_usb: raw, raw_min_free_bytes: None, wall_anchor_ms: 1_795_144_560_000, qpc: None, frame_clock_on: true, initial_device: dev, start_t_us: 0, declared_settings: Default::default() }
 }
 fn report(counter: u8, buttons: u32, lx: u8, ts: u32) -> Vec<u8> {
     let mut p = Pad::neutral();
@@ -926,5 +927,72 @@ fn bytes_42_43_flapping_is_bounded_by_per_epoch_cap() {
 
     let rep = check_dir(&dir).unwrap();
     assert!(rep.pass(), "{:?}", rep.errors);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn declared_edge_settings_record_with_checked_false_and_unknown_defaults() {
+    let dir = tmp("declared-edge");
+    let mut c = cfg(&dir, false, Some(edge()));
+    c.declared_settings = DeclaredEdgeSettings::from_flags_and_env(
+        Some("FN+TRIANGLE"),
+        Some("env_ignored_when_cli_set"),
+        Some("short"),
+        None,
+        None,
+        Some("full"),
+        None,
+        None,
+        None,
+        Some("precise"),
+        Some("on"),
+        None,
+    );
+    assert!(c.declared_settings.any_set());
+    let mut tl = HandTimeline::open(c).unwrap();
+    tl.on_report(10_000, Some(100_000), &report(0, 0, 128, 1));
+    tl.finish(1_500_000).unwrap();
+
+    let recs = lines(&dir);
+    let ds = &recs[0]["declared_settings"];
+    assert_eq!(ds["checked"], false);
+    assert_eq!(ds["source"], "user_declared");
+    assert_eq!(ds["edge_profile"], "FN+TRIANGLE");
+    assert_eq!(ds["l2_stop"], "short");
+    assert_eq!(ds["r2_stop"], "full");
+    assert_eq!(ds["stick_curve_left"], "UNKNOWN");
+    assert_eq!(ds["stick_curve_right"], "precise");
+    assert_eq!(ds["in_game_trigger_effect"], "on");
+    assert_eq!(recs[0]["edge_metadata"]["active_profile"], "UNKNOWN", "unread hardware feature reports stay UNKNOWN");
+
+    let summary: Value = serde_json::from_str(&std::fs::read_to_string(dir.join(SUMMARY_FILE)).unwrap()).unwrap();
+    assert_eq!(summary["declared_settings"], *ds);
+
+    let rep = check_dir(&dir).unwrap();
+    assert!(rep.pass(), "{:?}", rep.errors);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn qpc_single_read_derives_exact_t_us_without_dual_clock_skew() {
+    let q = Qpc { freq_hz: 10_000_000, origin_ticks: 50_000_000, origin_t_us: 1_000 };
+    assert_eq!(q.ticks_to_t_us(50_000_000), Some(1_000));
+    // +10,000 ticks at 10 MHz = +1,000 us -> 2,000 us
+    assert_eq!(q.ticks_to_t_us(50_010_000), Some(2_000));
+    // +250,000,000 ticks at 10 MHz = +25,000,000 us -> 25,001,000 us
+    assert_eq!(q.ticks_to_t_us(300_000_000), Some(25_001_000));
+    // Ticks slightly before origin saturate cleanly
+    assert_eq!(q.ticks_to_t_us(49_995_000), Some(500));
+    let zero_q = Qpc { freq_hz: 0, origin_ticks: 100, origin_t_us: 0 };
+    assert_eq!(zero_q.ticks_to_t_us(200), None);
+}
+
+#[test]
+fn open_windows_stay_bounded_when_unsealed() {
+    let dir = tmp("bounded-open");
+    let mut tl = HandTimeline::open(cfg(&dir, false, Some(edge()))).unwrap();
+    assert_eq!(MAX_OPEN_WINDOWS, 8);
+    assert!(tl.open_windows_len() <= MAX_OPEN_WINDOWS);
+    tl.finish(500_000).unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }

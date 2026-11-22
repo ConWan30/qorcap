@@ -59,8 +59,73 @@ pub const ENV: &str = "QORCAP_HAND_TIMELINE";
 pub const ENV_RAW: &str = "QORCAP_RAW_USB";
 /// `QORCAP_HAND_DIR` overrides the practice hand + raw output directory (CLI `--hand-dir` wins if both are set).
 pub const ENV_HAND_DIR: &str = "QORCAP_HAND_DIR";
+/// User-declared DualSense Edge settings env vars (CLI flags win if both are set; `checked: false`, default `"UNKNOWN"`).
+pub const ENV_EDGE_PROFILE: &str = "QORCAP_EDGE_PROFILE";
+pub const ENV_L2_STOP: &str = "QORCAP_EDGE_L2_STOP";
+pub const ENV_R2_STOP: &str = "QORCAP_EDGE_R2_STOP";
+pub const ENV_STICK_CURVE_LEFT: &str = "QORCAP_EDGE_STICK_CURVE_LEFT";
+pub const ENV_STICK_CURVE_RIGHT: &str = "QORCAP_EDGE_STICK_CURVE_RIGHT";
+pub const ENV_IN_GAME_TRIGGER_EFFECT: &str = "QORCAP_IN_GAME_TRIGGER_EFFECT";
 /// Default Windows root for practice hand and raw output (`D:\QorCap\practice-hand\<session>\`).
 pub const DEFAULT_WIN_HAND_ROOT: &str = r"D:\QorCap\practice-hand";
+
+/// User-declared (unverified by HID feature reports, `checked: false`) DualSense Edge settings for a practice session.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DeclaredEdgeSettings {
+    pub edge_profile: Option<String>,
+    pub l2_stop: Option<String>,
+    pub r2_stop: Option<String>,
+    pub stick_curve_left: Option<String>,
+    pub stick_curve_right: Option<String>,
+    pub in_game_trigger_effect: Option<String>,
+}
+
+impl DeclaredEdgeSettings {
+    fn clean(v: Option<&str>) -> Option<String> {
+        v.map(str::trim).filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("UNKNOWN")).map(String::from)
+    }
+
+    pub fn from_flags_and_env(
+        edge_profile: Option<&str>, env_edge_profile: Option<&str>,
+        l2_stop: Option<&str>, env_l2_stop: Option<&str>,
+        r2_stop: Option<&str>, env_r2_stop: Option<&str>,
+        stick_curve_left: Option<&str>, env_stick_curve_left: Option<&str>,
+        stick_curve_right: Option<&str>, env_stick_curve_right: Option<&str>,
+        in_game_trigger_effect: Option<&str>, env_in_game_trigger_effect: Option<&str>,
+    ) -> Self {
+        Self {
+            edge_profile: Self::clean(edge_profile).or_else(|| Self::clean(env_edge_profile)),
+            l2_stop: Self::clean(l2_stop).or_else(|| Self::clean(env_l2_stop)),
+            r2_stop: Self::clean(r2_stop).or_else(|| Self::clean(env_r2_stop)),
+            stick_curve_left: Self::clean(stick_curve_left).or_else(|| Self::clean(env_stick_curve_left)),
+            stick_curve_right: Self::clean(stick_curve_right).or_else(|| Self::clean(env_stick_curve_right)),
+            in_game_trigger_effect: Self::clean(in_game_trigger_effect).or_else(|| Self::clean(env_in_game_trigger_effect)),
+        }
+    }
+
+    pub fn any_set(&self) -> bool {
+        self.edge_profile.is_some()
+            || self.l2_stop.is_some()
+            || self.r2_stop.is_some()
+            || self.stick_curve_left.is_some()
+            || self.stick_curve_right.is_some()
+            || self.in_game_trigger_effect.is_some()
+    }
+
+    pub fn to_json(&self) -> serde_json::Value {
+        let u = timeline::UNKNOWN;
+        serde_json::json!({
+            "checked": false,
+            "source": if self.any_set() { "user_declared" } else { "none" },
+            "edge_profile": self.edge_profile.as_deref().unwrap_or(u),
+            "l2_stop": self.l2_stop.as_deref().unwrap_or(u),
+            "r2_stop": self.r2_stop.as_deref().unwrap_or(u),
+            "stick_curve_left": self.stick_curve_left.as_deref().unwrap_or(u),
+            "stick_curve_right": self.stick_curve_right.as_deref().unwrap_or(u),
+            "in_game_trigger_effect": self.in_game_trigger_effect.as_deref().unwrap_or(u),
+        })
+    }
+}
 
 fn env_is_off(env_val: Option<&str>) -> bool {
     matches!(env_val.map(|s| s.trim().to_ascii_lowercase()).as_deref(), Some("0" | "false" | "no" | "off"))

@@ -60,6 +60,8 @@ pub const STALL_US: u64 = 2_000_000;
 pub const ANALOG_MIN_GAP_US: u64 = crate::inputs::ANALOG_MIN_GAP_US;
 /// Per-epoch cap on `bytes_42_43_change` status rows (`in` rows always emit on `raw[42..=43]` change even within `ANALOG_MIN_GAP_US`; status rows past this cap are suppressed and counted in `hb.bytes_42_43_suppressed` and `summary.bytes_42_43_changes_suppressed`).
 pub const BYTES_42_43_CHANGE_CAP_PER_EPOCH: u64 = 1024;
+/// Upper bound on unsealed open 1 s windows retained in RAM if disk writes fail mid-session (e.g. USB `D:` disconnect).
+pub const MAX_OPEN_WINDOWS: usize = 8;
 pub const UNMEASURED: &str = "UNMEASURED";
 pub const UNKNOWN: &str = "UNKNOWN";
 pub const CLAIMS: &str = "Read-only controller input log clocked to the video: host-observed USB HID input reports and capture frame arrivals on one monotonic clock. It does not identify who held the controller.";
@@ -71,6 +73,21 @@ const FN: [(u32, &str); 2] = [(FN_LEFT, "FN_L"), (FN_RIGHT, "FN_R")];
 /// Windows QPC facts taken at one moment together with the engine-clock `t_us` of that moment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Qpc { pub freq_hz: u64, pub origin_ticks: u64, pub origin_t_us: u64 }
+
+impl Qpc {
+    /// Derive monotonic engine microseconds from a single atomic QPC tick sample (`origin_t_us + (ticks - origin_ticks) * 1e6 / freq_hz`),
+    /// eliminating dual-read userspace preemption spikes between `Instant::elapsed()` and `QueryPerformanceCounter`.
+    pub fn ticks_to_t_us(&self, ticks: u64) -> Option<u64> {
+        if self.freq_hz == 0 { return None; }
+        if ticks >= self.origin_ticks {
+            let delta = (u128::from(ticks - self.origin_ticks) * 1_000_000) / u128::from(self.freq_hz);
+            u64::try_from(delta).ok().and_then(|d| self.origin_t_us.checked_add(d))
+        } else {
+            let delta = (u128::from(self.origin_ticks - ticks) * 1_000_000) / u128::from(self.freq_hz);
+            u64::try_from(delta).ok().map(|d| self.origin_t_us.saturating_sub(d))
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -86,6 +103,7 @@ pub struct Config {
     pub frame_clock_on: bool,
     pub initial_device: Option<DeviceInfo>,
     pub start_t_us: u64,
+    pub declared_settings: super::DeclaredEdgeSettings,
 }
 
 #[derive(Debug, Default)]
@@ -242,6 +260,9 @@ impl HandTimeline {
         h["bytes_42_43_status"] = json!("ESTIMATED");
         h["bytes_42_43_change_cap_per_epoch"] = json!(BYTES_42_43_CHANGE_CAP_PER_EPOCH);
         h["bytes_42_43_note"] = json!("raw bytes 42-43 of USB report 0x01 (n=1 hypothesis: trigger-setting snapshot, ESTIMATED); UNKNOWN before the first report after connect, snapshotted on the first in row and emitted on change (in + status rows, capped per epoch); adaptive_trigger_state stays UNMEASURED");
+        if c.declared_settings.any_set() {
+            h["declared_settings"] = c.declared_settings.to_json();
+        }
         h
     }
 
@@ -249,6 +270,11 @@ impl HandTimeline {
     fn window(&mut self, t: u64) -> (&mut Window, bool) {
         let s = t / CHUNK_US;
         let (s, late) = if s < self.next_seal { (self.next_seal, true) } else { (s, false) };
+        if !self.open.contains_key(&s) && self.open.len() >= MAX_OPEN_WINDOWS {
+            if let Some(&highest) = self.open.keys().next_back() {
+                return (self.open.get_mut(&highest).unwrap(), true);
+            }
+        }
         (self.open.entry(s).or_insert_with(|| Window::new(s)), late)
     }
 
@@ -510,6 +536,9 @@ impl HandTimeline {
         }
     }
     pub fn disk_faults(&self) -> u64 { self.disk_faults }
+    pub fn raw_pause(&self) -> Option<&'static str> { self.raw_pause }
+    pub fn open_windows_len(&self) -> usize { self.open.len() }
+    pub fn qpc(&self) -> Option<Qpc> { self.cfg.qpc }
     pub fn path(&self) -> &Path { &self.path }
 
     fn raw_paused_now(&mut self, seq: u64) -> Option<&'static str> {
@@ -547,12 +576,14 @@ impl HandTimeline {
             if len > 0 {
                 let Some(rf) = self.raw_file.as_mut() else {
                     self.disk_faults += 1;
+                    self.raw_pause = Some("disk_fault");
                     self.open.insert(seq, w);
                     return Err(format!("hand raw file {RAW_FILE}: handle not open"));
                 };
                 let written = rf.write_all(&w.raw).and_then(|_| rf.flush()).and_then(|_| rf.sync_data());
                 if let Err(e) = written {
                     self.disk_faults += 1;
+                    self.raw_pause = Some("disk_fault");
                     let _ = rf.set_len(prev_raw_offset);
                     self.open.insert(seq, w);
                     return Err(format!("hand raw file {RAW_FILE}: {e}"));
@@ -607,6 +638,7 @@ impl HandTimeline {
         let written = self.file.write_all(text.as_bytes()).and_then(|_| self.file.flush()).and_then(|_| self.file.sync_data());
         if let Err(e) = written {
             self.disk_faults += 1;
+            self.raw_pause = Some("disk_fault");
             let _ = self.file.set_len(self.durable_len);
             if raw_len.unwrap_or(0) > 0 {
                 if let Some(rf) = self.raw_file.as_mut() { let _ = rf.set_len(prev_raw_offset); let _ = rf.sync_data(); }
@@ -651,6 +683,9 @@ impl HandTimeline {
         summary["bytes_42_43_raw_last"] = self.last_bytes_42_43.map(|s| json!([s[0], s[1]])).unwrap_or_else(|| json!(UNKNOWN));
         summary["bytes_42_43_status"] = json!("ESTIMATED");
         summary["bytes_42_43_changes_suppressed"] = json!(self.bytes_42_43_changes_suppressed);
+        if self.cfg.declared_settings.any_set() {
+            summary["declared_settings"] = self.cfg.declared_settings.to_json();
+        }
         let text = format!("{}\n", serde_json::to_string_pretty(&summary).unwrap_or_else(|_| "{}".into()));
         let summary_path = self.cfg.dir.join(SUMMARY_FILE);
         let summary_sha256 = open_private_new(&summary_path, false).and_then(|mut f| { f.write_all(text.as_bytes())?; f.sync_all() })
