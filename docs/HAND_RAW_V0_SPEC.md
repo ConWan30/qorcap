@@ -41,3 +41,10 @@ Each fixed `80`-byte record has the exact byte layout below:
 1. **`MI_03` is the HID Gamepad Collection:** On wired DualSense (`054C:0CE6`) and DualSense Edge (`054C:0DF2`), USB interface `3` (`MI_03` in the HID device interface path) is the 64-byte HID gamepad top-level collection (`UsagePage = 0x01`, `Usage = 0x05`). Audio lives on interfaces `0–2` (USB Audio class). Enumeration gates on HID interface GUID + UsagePage/Usage/64 B input length, never rejects `MI_03`, and never opens audio endpoints.
 2. **Practice-off / flag-off (`hand_timeline: false`):** Outside practice, or when `--no-hand-timeline` / `QORCAP_HAND_TIMELINE=0` is set, no `hand_timeline.v0.jsonl` or `hand_raw.v0.bin` is written and checkpoints MUST contain **zero** hand chain keys (`hand_chunk_seq`, `hand_head`, `hand_timeline_sha256`, `hand_timeline_head`, `hand_timeline_file`, `hand_raw_file`), carrying only `hand_timeline: false`.
 3. **LF line endings (`\n`, no `\r`):** Every `hand_timeline.v0.jsonl` line MUST be RFC 8785 JCS canonical JSON terminated by a single `\n` (`0x0A`, zero `\r`). Windows CRLF checkouts or writes alter file SHA-256 and fail closed.
+
+---
+
+## 4. Verifier Behavior When Hand Chunks Are Absent (Documentation Only)
+
+- **`qorcap check-hand-timeline` (`src/hand/check.rs::check_dir`):** When neither `hand_timeline.v0.jsonl` nor `checkpoints.jsonl` `"hand_timeline": false` is present, `check_dir` returns an explicit error (`hand_timeline.v0.jsonl: not found`); an off session (`"hand_timeline": false` with zero hand keys) returns `PASS` (`off: true`).
+- **QorStream browser verifier (`web/public/chaincheck.mjs`):** Currently lists `"hand-chunks"` and `"hand-head"` in `OPTIONAL_UNKNOWN_IDS` (`chaincheck.mjs:426`), so absent or unverified hand chunks remain marked `UNKNOWN` without failing an otherwise-intact local video/frame chain. (Documentation note only; neither verifier is changed here.)
