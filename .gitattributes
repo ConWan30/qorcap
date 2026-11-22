@@ -14,3 +14,7 @@ tools/fixtures/encoder_pace/** -text
 tools/s2s_bodycue/** text eol=lf
 # PWEC reduced fixtures (gzip) and golden: binary / no CRLF conversion on Windows checkouts.
 sidecar/fixtures/pwec/** -text
+# Hand timeline v0 schemas, docs, and golden fixtures: keep checkouts byte-identical to git LF blobs.
+schemas/hand_timeline/** text eol=lf
+docs/HAND_RAW_V0_SPEC.md text eol=lf
+tests/fixtures/hand_timeline/** -text
