@@ -1,6 +1,6 @@
 {
   "schema": "qorcap-hand-timeline-fixtures/v0",
-  "note": "Synthetic frozen fixtures only; LF line endings; bytes 42-43 stay neutral [0,0] pending Con's Firing Range bench.",
+  "note": "Synthetic frozen fixtures only; LF line endings; BYTES_42_43_CHANGE_CAP_PER_EPOCH=1024; trigger_fx_status maps r2_raw=raw[42] and l2_raw=raw[43] per R2 bench match-20261122-155333.",
   "fixtures": {
     "187_edge_basic": {
       "mode": "pass",
@@ -15,8 +15,8 @@
       "mode": "pass",
       "off": false,
       "chunks": 2,
-      "head": "75f8903e6c77f322b61284a75d4c6652323445e03e4ddfa182245697b205c8d4",
-      "file_sha256": "5ffd1e51d80642ea2dc9b0d2df49227d4099eebe01fda22359992095c959e542",
+      "head": "5a28fe89e28d30739a5e814ce452c1dfc2ed142e5fd5e7c8a552f6bb5682b33c",
+      "file_sha256": "cf21dfc5118fba845d7593ebb3c11dcfc17b7defde60e3fc785256d279a9fcf6",
       "warnings": 0,
       "errors": 0
     },
@@ -25,8 +25,8 @@
       "off": false,
       "fallback": true,
       "chunks": 2,
-      "head": "e7a4bf1c66631da9f784e553901ef0d05d2a98408c93a6e975b7234a0f619d1a",
-      "file_sha256": "21a043e9058fb4c99a297ecf2858f5f0e643a64fcc8867e911cfb4be7bc9bb0b",
+      "head": "d49090472d8106364b6e2f5a702bda9e9e171939235348607d3d39ed4808ff51",
+      "file_sha256": "923dec7de38993509d31b3fe6cc1577e97ee7b783a7505219f1c94e741bc792e",
       "warnings": 0,
       "errors": 0
     },
@@ -34,8 +34,8 @@
       "mode": "pass",
       "off": false,
       "chunks": 2,
-      "head": "75f8903e6c77f322b61284a75d4c6652323445e03e4ddfa182245697b205c8d4",
-      "file_sha256": "5ffd1e51d80642ea2dc9b0d2df49227d4099eebe01fda22359992095c959e542",
+      "head": "5a28fe89e28d30739a5e814ce452c1dfc2ed142e5fd5e7c8a552f6bb5682b33c",
+      "file_sha256": "cf21dfc5118fba845d7593ebb3c11dcfc17b7defde60e3fc785256d279a9fcf6",
       "warnings_min": 1,
       "errors": 0,
       "warning_contains": "trailing byte(s) after sealed offset"
@@ -81,7 +81,7 @@
     {
       "path": "189_dualsense_fallback/checkpoints.jsonl",
       "bytes": 717,
-      "sha256": "e18df5181f19087208f939ca05b456e30bd86775846b205e88b51acfab0f8ab3"
+      "sha256": "c2648b85a000457bed0b323f3520739b7192c656fd7079030c461153d3108166"
     },
     {
       "path": "189_dualsense_fallback/hand_raw.v0.bin",
@@ -90,18 +90,18 @@
     },
     {
       "path": "189_dualsense_fallback/hand_timeline.v0.jsonl",
-      "bytes": 8767,
-      "sha256": "21a043e9058fb4c99a297ecf2858f5f0e643a64fcc8867e911cfb4be7bc9bb0b"
+      "bytes": 8769,
+      "sha256": "923dec7de38993509d31b3fe6cc1577e97ee7b783a7505219f1c94e741bc792e"
     },
     {
       "path": "189_dualsense_fallback/hand_timeline_summary.v0.json",
       "bytes": 1113,
-      "sha256": "b88bd74fa0ec2ecaff3b6958d90803aacf4f52db2fc883b64498f614084e1620"
+      "sha256": "5cc6929d57545446a17b36661ab0b6072cf410cd54cf232a29e742f1cb2ea21a"
     },
     {
       "path": "189_edge/checkpoints.jsonl",
       "bytes": 717,
-      "sha256": "e059be6405a2d54c1b57e49559a2864c4e78bf24ec9bf260e41de483d72eb14f"
+      "sha256": "e74c426003f0e99f21103a649e783197cfd2dce56e740dd15557c9c13ab5d028"
     },
     {
       "path": "189_edge/hand_raw.v0.bin",
@@ -110,13 +110,13 @@
     },
     {
       "path": "189_edge/hand_timeline.v0.jsonl",
-      "bytes": 8733,
-      "sha256": "5ffd1e51d80642ea2dc9b0d2df49227d4099eebe01fda22359992095c959e542"
+      "bytes": 8735,
+      "sha256": "cf21dfc5118fba845d7593ebb3c11dcfc17b7defde60e3fc785256d279a9fcf6"
     },
     {
       "path": "189_edge/hand_timeline_summary.v0.json",
       "bytes": 1119,
-      "sha256": "0e12f5d220f6ce364b76a9db82a7471a93f4f5e8a6c4f931a8c669a7d69d2e1b"
+      "sha256": "663c144cb3f032a39bb1bf2457e7aa57a36bbdf53d411dce988a241d0709358c"
     },
     {
       "path": "absent_hand_chunks/checkpoints.jsonl",
@@ -126,7 +126,7 @@
     {
       "path": "crash_tail_warning/checkpoints.jsonl",
       "bytes": 717,
-      "sha256": "e059be6405a2d54c1b57e49559a2864c4e78bf24ec9bf260e41de483d72eb14f"
+      "sha256": "e74c426003f0e99f21103a649e783197cfd2dce56e740dd15557c9c13ab5d028"
     },
     {
       "path": "crash_tail_warning/hand_raw.v0.bin",
@@ -135,13 +135,13 @@
     },
     {
       "path": "crash_tail_warning/hand_timeline.v0.jsonl",
-      "bytes": 8733,
-      "sha256": "5ffd1e51d80642ea2dc9b0d2df49227d4099eebe01fda22359992095c959e542"
+      "bytes": 8735,
+      "sha256": "cf21dfc5118fba845d7593ebb3c11dcfc17b7defde60e3fc785256d279a9fcf6"
     },
     {
       "path": "crash_tail_warning/hand_timeline_summary.v0.json",
       "bytes": 1119,
-      "sha256": "0e12f5d220f6ce364b76a9db82a7471a93f4f5e8a6c4f931a8c669a7d69d2e1b"
+      "sha256": "663c144cb3f032a39bb1bf2457e7aa57a36bbdf53d411dce988a241d0709358c"
     },
     {
       "path": "flag_off_zero_hand_keys/checkpoints.jsonl",
@@ -151,7 +151,7 @@
     {
       "path": "truncated_sealed_slice_error/checkpoints.jsonl",
       "bytes": 717,
-      "sha256": "e059be6405a2d54c1b57e49559a2864c4e78bf24ec9bf260e41de483d72eb14f"
+      "sha256": "e74c426003f0e99f21103a649e783197cfd2dce56e740dd15557c9c13ab5d028"
     },
     {
       "path": "truncated_sealed_slice_error/hand_raw.v0.bin",
@@ -160,13 +160,13 @@
     },
     {
       "path": "truncated_sealed_slice_error/hand_timeline.v0.jsonl",
-      "bytes": 8733,
-      "sha256": "5ffd1e51d80642ea2dc9b0d2df49227d4099eebe01fda22359992095c959e542"
+      "bytes": 8735,
+      "sha256": "cf21dfc5118fba845d7593ebb3c11dcfc17b7defde60e3fc785256d279a9fcf6"
     },
     {
       "path": "truncated_sealed_slice_error/hand_timeline_summary.v0.json",
       "bytes": 1119,
-      "sha256": "0e12f5d220f6ce364b76a9db82a7471a93f4f5e8a6c4f931a8c669a7d69d2e1b"
+      "sha256": "663c144cb3f032a39bb1bf2457e7aa57a36bbdf53d411dce988a241d0709358c"
     }
   ]
 }

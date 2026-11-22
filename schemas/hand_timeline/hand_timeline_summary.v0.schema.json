@@ -69,7 +69,7 @@
         { "const": "UNKNOWN" },
         { "type": "array", "minItems": 2, "maxItems": 2, "items": { "type": "integer", "minimum": 0, "maximum": 255 } }
       ],
-      "description": "TODO(con-r2-bench): bytes 42-43 L2-vs-R2 mapping stays UNKNOWN pending Con's Firing Range bench."
+      "description": "Last observed [raw[42], raw[43]] pair ([r2_raw, l2_raw] per R2 bench match-20261122-155333), or UNKNOWN if no USB 0x01 report arrived."
     },
     "bytes_42_43_status": { "const": "ESTIMATED" },
     "bytes_42_43_changes_suppressed": { "type": "integer", "minimum": 0 }

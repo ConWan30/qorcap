@@ -137,13 +137,13 @@
         "physical_face_note": { "type": "string" },
         "bytes_42_43_raw": {
           "const": "UNKNOWN",
-          "description": "TODO(con-r2-bench): bytes 42-43 L2-vs-R2 mapping is UNKNOWN pending Con's listen-only Firing Range A-B-A bench; initial header placeholder stays UNKNOWN before first USB 0x01 report."
+          "description": "Initial header placeholder stays UNKNOWN before first USB 0x01 report; on in/status rows bytes_42_43_raw is [raw[42], raw[43]] ([r2_raw, l2_raw] per R2 bench match-20261122-155333)."
         },
         "bytes_42_43_status": { "const": "ESTIMATED" },
         "bytes_42_43_change_cap_per_epoch": { "$ref": "#/$defs/jcs_u64" },
         "bytes_42_43_note": {
           "type": "string",
-          "description": "TODO(con-r2-bench): n=1 hypothesis only; do not treat bytes 42-43 polarity as validated until Con's Firing Range bench settles L2 vs R2."
+          "description": "Note on raw bytes 42-43 (raw[42] = R2 trigger-effect status, raw[43] = L2 per R2 bench match-20261122-155333; adaptive_trigger_state stays UNMEASURED)."
         }
       }
     },
@@ -215,11 +215,11 @@
         },
         "trigger_fx_status": {
           "type": "object",
-          "description": "TODO(con-r2-bench): legacy #187 keys l2_raw=raw[42] and r2_raw=raw[43] conflict with T-0006 observation of byte 42 moving on R2. Treat L2-vs-R2 assignment of bytes 42-43 as UNKNOWN until Con's Firing Range bench settles polarity. Analog trigger travel stays l2/r2 (hid.rs bytes 5-6).",
+          "description": "Trigger-effect status bytes from USB report 0x01: r2_raw = raw[42] (R2 trigger-effect status, confirmed by R2 bench match-20261122-155333) and l2_raw = raw[43] (L2). Analog trigger travel stays l2/r2 (hid.rs bytes 5-6). Live adaptive-trigger force state stays status=UNMEASURED.",
           "required": ["l2_raw", "r2_raw", "status"],
           "properties": {
-            "l2_raw": { "$ref": "#/$defs/u8" },
-            "r2_raw": { "$ref": "#/$defs/u8" },
+            "l2_raw": { "$ref": "#/$defs/u8", "description": "raw[43] (L2 trigger-effect status byte)." },
+            "r2_raw": { "$ref": "#/$defs/u8", "description": "raw[42] (R2 trigger-effect status byte)." },
             "status": { "const": "UNMEASURED" }
           }
         },
@@ -238,7 +238,7 @@
           "minItems": 2,
           "maxItems": 2,
           "items": { "$ref": "#/$defs/u8" },
-          "description": "TODO(con-r2-bench): raw [byte42, byte43] pair only; which byte maps L2 vs R2 stays UNKNOWN pending Con's Firing Range bench."
+          "description": "Raw [raw[42], raw[43]] pair ([r2_raw, l2_raw] per R2 bench match-20261122-155333)."
         }
       }
     },
