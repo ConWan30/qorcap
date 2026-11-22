@@ -76,6 +76,7 @@ LINUX_FILES = (
     "sidecar/test_qorcap_release.py",
     "tools/test_frame_clock_ab.py",
     "tools/test_encoder_pace.py",
+    "tools/test_hand_timeline_contract.py",
     "tools/test_assert_pytest_skips.py",
     "tools/pwec2/test_pwec2.py",
     "sidecar/test_qorcap_reader.py",
@@ -156,6 +157,7 @@ WINDOWS_FILES = (
     "sidecar/test_qorcap_release.py",
     "tools/test_frame_clock_ab.py",
     "tools/test_encoder_pace.py",
+    "tools/test_hand_timeline_contract.py",
     "tools/test_assert_pytest_skips.py",
     "tools/pwec2/test_pwec2.py",
     "sidecar/test_qorcap_reader.py",
@@ -230,8 +232,9 @@ WINDOWS_FILES = (
 # pytest --collect-only -q sidecar/test_qorcap_challenge.py, QORTIME at the
 # revived qortime #80 tree, still collects 49 tests (7 on main, +42).
 # Windows does not run this file, so only the Linux floor rises: 1392+42 / 1373.
-LINUX_MIN_COLLECTED = 1434
-WINDOWS_MIN_COLLECTED = 1373
+# Updated for tools/test_hand_timeline_contract.py (+5 tests on both suites): 1439 / 1378.
+LINUX_MIN_COLLECTED = 1439
+WINDOWS_MIN_COLLECTED = 1378
 
 # Absent from both sidecar suites. A reason is required; whitespace does not count.
 EXCLUDED_TEST_FILES = {
