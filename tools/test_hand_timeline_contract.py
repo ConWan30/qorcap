@@ -24,15 +24,15 @@ def _sha256_hex(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def test_draft2020_12_schemas_valid_and_note_byte42_hold():
+def test_draft2020_12_schemas_valid_and_note_byte42_r2_l2_labels():
     tl_schema = json.loads((SCHEMA_DIR / "hand_timeline.v0.schema.json").read_text("utf-8"))
     sum_schema = json.loads((SCHEMA_DIR / "hand_timeline_summary.v0.schema.json").read_text("utf-8"))
     jsonschema.Draft202012Validator.check_schema(tl_schema)
     jsonschema.Draft202012Validator.check_schema(sum_schema)
 
-    tl_text = (SCHEMA_DIR / "hand_timeline.v0.schema.json").read_text("utf-8")
-    assert "TODO(con-r2-bench)" in tl_text
-    assert "UNKNOWN" in tl_schema["$defs"]["in"]["properties"]["bytes_42_43_raw"]["description"]
+    fx_desc = tl_schema["$defs"]["in"]["properties"]["trigger_fx_status"]["description"]
+    assert "r2_raw = raw[42]" in fx_desc and "l2_raw = raw[43]" in fx_desc
+    assert "[r2_raw, l2_raw]" in tl_schema["$defs"]["in"]["properties"]["bytes_42_43_raw"]["description"]
 
 
 def test_manifest_hashes_and_lf_only():
@@ -66,9 +66,15 @@ def test_golden_records_validate_against_schema_and_recompute_chains():
             assert _jcs(rec) == line, f"{case}:{i} not JCS"
             tl_val.validate(rec)
             if rec["type"] == "in":
-                assert rec["trigger_fx_status"]["l2_raw"] == 0 and rec["trigger_fx_status"]["r2_raw"] == 0
-                if "bytes_42_43_raw" in rec:
-                    assert rec["bytes_42_43_raw"] == [0, 0]
+                raw_idx = rec["counter"] - 1
+                raw_rec = raw_bytes[raw_idx * 80 : (raw_idx + 1) * 80]
+                usb_rep = raw_rec[16:80]
+                if case == "187_edge_basic":
+                    assert rec["trigger_fx_status"]["l2_raw"] == 0 and rec["trigger_fx_status"]["r2_raw"] == 0
+                else:
+                    assert rec["trigger_fx_status"]["r2_raw"] == usb_rep[42]
+                    assert rec["trigger_fx_status"]["l2_raw"] == usb_rep[43]
+                    assert rec["bytes_42_43_raw"] == [usb_rep[42], usb_rep[43]]
                 if case == "189_dualsense_fallback":
                     assert rec["edge_bits"] == "UNMEASURED"
                     assert rec["physical_face"] == "UNMEASURED"

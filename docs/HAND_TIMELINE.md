@@ -125,20 +125,19 @@ no truncation, verifies each slice's SHA-256 and each `in` row's `raw_sha256`, a
     20/20 separation). It remains labelled `ESTIMATED` because remap tables live in unread feature reports and
     behavior on non-face targets is not established.
 - **`bytes_42_43_raw` (`header`, `status`, `in`, and `summary.bytes_42_43_raw_last`, `ESTIMATED`):** Raw bytes 42–43 of
-  USB report `0x01` as `[b42, b43]` (neutral name; the trigger-setting meaning is an `n=1` hypothesis).
-  - **Why it repeats beside `trigger_fx_status.l2_raw`/`r2_raw`:** `trigger_fx_status` stays unchanged on `in` rows for
-    existing `qorcap-hand-timeline/v0` readers and explicitly keeps `status: "UNMEASURED"` for live adaptive-trigger
+  USB report `0x01` as `[b42, b43]` (`[r2_raw, l2_raw]`; R2 bench `match-20261122-155333` confirmed `raw[42]` = R2 trigger-effect status and `raw[43]` = L2).
+  - **Why it repeats beside `trigger_fx_status.l2_raw`/`r2_raw`:** `trigger_fx_status` on `in` rows maps `r2_raw = raw[42]` and `l2_raw = raw[43]` with `status: "UNMEASURED"` for live adaptive-trigger
     force state, whereas `bytes_42_43_raw` exposes the `[b42, b43]` pair tied to the connect `"UNKNOWN"` placeholder,
-    capped change-triggered `in`/`status` emission, and `summary.bytes_42_43_raw_last`.
+    change-triggered `in` and capped `status` emission, and `summary.bytes_42_43_raw_last`.
   - In `header` and `status` (`state: "connected"`), `bytes_42_43_raw` is `"UNKNOWN"` because no USB report has been
     read yet when the handle opens (listen-only never reads feature reports).
   - The first `in` row emitted after connect snapshots `[b42, b43]` for that epoch, and every subsequent `in` row
     carries the current `[b42, b43]`.
-  - When `[b42, b43]` changes mid-epoch, the logger emits both an `in` row and a `status` row
+  - When `[b42, b43]` changes mid-epoch, the logger always emits an `in` row (even within `analog_min_gap_us`) and emits a `status` row
     (`state: "bytes_42_43_change"`, `bytes_42_43_raw: [b42, b43]`, `prev_bytes_42_43_raw: [old42, old43]`,
     `epoch_change_seq`, `epoch_change_cap`, `status: "ESTIMATED"`, `adaptive_trigger_state: "UNMEASURED"`), bounded to
-    `BYTES_42_43_CHANGE_CAP_PER_EPOCH` (`16`, recorded in `header.bytes_42_43_change_cap_per_epoch`) per connect epoch
-    so a flapping byte cannot flood the JSONL. Changes past the per-epoch cap are counted in `hb.bytes_42_43_suppressed`
+    `BYTES_42_43_CHANGE_CAP_PER_EPOCH` (`1024`, recorded in `header.bytes_42_43_change_cap_per_epoch`) per connect epoch
+    so a flapping byte cannot flood the status lane. Status rows past the per-epoch cap are counted in `hb.bytes_42_43_suppressed`
     and `summary.bytes_42_43_changes_suppressed`.
   - At stop, `hand_timeline_summary.v0.json` records the last observed value as `bytes_42_43_raw_last` (or `"UNKNOWN"`
     if no report arrived).

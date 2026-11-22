@@ -24,7 +24,7 @@ Each fixed `80`-byte record has the exact byte layout below:
 
 - **Self-description rule:** `v1` binary files have zero magic bytes or version header. Readers and verifiers MUST take `raw_layout`, `raw_record_bytes`, and `raw_file_header_bytes` from the sealed `hand_timeline.v0.jsonl` `header` line and slice boundaries (`file`, `offset`, `len`, `sha256`) from each sealed `raw_bind` / `chunk` row.
 - **Analog trigger travel:** Remains `hid.rs` bytes `5` (`L2`, `0..255`) and `6` (`R2`, `0..255`).
-- **`TODO` on bytes `42–43` (`bytes_42_43_raw` / `trigger_fx_status`):** `src/hand/timeline.rs:413` currently names `raw[42]` as `l2_raw` and `raw[43]` as `r2_raw`, whereas `T-0006` (`match-20261121-104657`) saw byte `42` vary on R2 trigger pulls. L2-vs-R2 mapping of bytes `42–43` remains explicitly **`UNKNOWN`** until Con's listen-only Firing Range A-B-A bench settles polarity. No frozen fixture asserts which byte corresponds to L2 vs R2.
+- **Bytes `42–43` (`bytes_42_43_raw` / `trigger_fx_status`):** Confirmed by the listen-only R2 bench (`match-20261122-155333`, `287,080` reports): `raw[42]` = `R2` trigger-effect status (`trigger_fx_status.r2_raw`, varies on R2 under resistance, `0` changes on L2-only pulls) and `raw[43]` = `L2` (`trigger_fx_status.l2_raw`, constant `9`). `bytes_42_43_raw` carries `[raw[42], raw[43]]` (`[r2_raw, l2_raw]`). Whenever `raw[42..=43]` changes, an `in` row is emitted even within `analog_min_gap_us`; `bytes_42_43_change` status rows are bounded per epoch by `BYTES_42_43_CHANGE_CAP_PER_EPOCH` (`1024`, raised from `16`), with any suppressed status-row transitions counted in `hb.bytes_42_43_suppressed` and `summary.bytes_42_43_changes_suppressed`. `adaptive_trigger_state` stays `UNMEASURED`.
 
 ---
 

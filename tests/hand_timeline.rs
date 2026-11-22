@@ -794,12 +794,12 @@ fn bytes_42_43_raw_snapshots_at_connect_and_logs_change_while_keeping_adaptive_u
         r
     };
 
-    // Initial connect snapshot [0, 0], unchanged follow-up, then mid-epoch change to [9, 9] within < ANALOG_MIN_GAP_US,
-    // unchanged follow-up at [9, 9], then new epoch reconnect with [0, 0].
-    tl.on_report(10_000, Some(100_000), &make(0, 0, 0));
-    tl.on_report(11_000, Some(110_000), &make(1, 0, 0));
-    tl.on_report(12_000, Some(120_000), &make(2, 9, 9));
-    tl.on_report(13_000, Some(130_000), &make(3, 9, 9));
+    // Initial connect snapshot [0, 9] (raw[42]=0=R2, raw[43]=9=L2), unchanged follow-up, then mid-epoch change to [25, 9] within < ANALOG_MIN_GAP_US,
+    // unchanged follow-up at [25, 9], then new epoch reconnect with [0, 0].
+    tl.on_report(10_000, Some(100_000), &make(0, 0, 9));
+    tl.on_report(11_000, Some(110_000), &make(1, 0, 9));
+    tl.on_report(12_000, Some(120_000), &make(2, 25, 9));
+    tl.on_report(13_000, Some(130_000), &make(3, 25, 9));
     assert_eq!(tl.live().state, "connected", "bytes_42_43_change status must not clobber live connected state");
 
     tl.on_connected(200_000, edge());
@@ -818,16 +818,20 @@ fn bytes_42_43_raw_snapshots_at_connect_and_logs_change_while_keeping_adaptive_u
     assert!(conn_rows.iter().all(|r| r["bytes_42_43_raw"] == "UNKNOWN" && r["bytes_42_43_status"] == "ESTIMATED"));
 
     let ins: Vec<&Value> = recs.iter().filter(|r| r["type"] == "in").collect();
-    assert_eq!(ins.len(), 3, "connect snapshot [0,0], mid-epoch change [9,9], reconnect snapshot [0,0]: {ins:?}");
-    assert_eq!(ins[0]["bytes_42_43_raw"], serde_json::json!([0, 0]));
-    assert_eq!(ins[1]["bytes_42_43_raw"], serde_json::json!([9, 9]));
+    assert_eq!(ins.len(), 3, "connect snapshot [0,9], mid-epoch change [25,9], reconnect snapshot [0,0]: {ins:?}");
+    assert_eq!(ins[0]["bytes_42_43_raw"], serde_json::json!([0, 9]));
+    assert_eq!(ins[0]["trigger_fx_status"]["r2_raw"], 0, "r2_raw is raw[42]");
+    assert_eq!(ins[0]["trigger_fx_status"]["l2_raw"], 9, "l2_raw is raw[43]");
+    assert_eq!(ins[1]["bytes_42_43_raw"], serde_json::json!([25, 9]));
+    assert_eq!(ins[1]["trigger_fx_status"]["r2_raw"], 25, "r2_raw is raw[42]");
+    assert_eq!(ins[1]["trigger_fx_status"]["l2_raw"], 9, "l2_raw is raw[43]");
     assert_eq!(ins[1]["t_us"], 12_000);
     assert_eq!(ins[2]["bytes_42_43_raw"], serde_json::json!([0, 0]));
 
     let b_status: Vec<&Value> = recs.iter().filter(|r| r["type"] == "status" && r["state"] == "bytes_42_43_change").collect();
     assert_eq!(b_status.len(), 1, "status entry emitted on mid-epoch change only: {b_status:?}");
-    assert_eq!(b_status[0]["bytes_42_43_raw"], serde_json::json!([9, 9]));
-    assert_eq!(b_status[0]["prev_bytes_42_43_raw"], serde_json::json!([0, 0]));
+    assert_eq!(b_status[0]["bytes_42_43_raw"], serde_json::json!([25, 9]));
+    assert_eq!(b_status[0]["prev_bytes_42_43_raw"], serde_json::json!([0, 9]));
     assert_eq!(b_status[0]["epoch_change_seq"], 1);
     assert_eq!(b_status[0]["epoch_change_cap"], BYTES_42_43_CHANGE_CAP_PER_EPOCH);
     assert_eq!(b_status[0]["status"], "ESTIMATED");
@@ -850,37 +854,38 @@ fn bytes_42_43_flapping_is_bounded_by_per_epoch_cap() {
     let mut tl = HandTimeline::open(cfg(&dir, true, Some(edge()))).unwrap();
 
     let cap = BYTES_42_43_CHANGE_CAP_PER_EPOCH;
-    let total_reports: u64 = cap + 40; // 1 initial + (cap + 39) flapping transitions
+    let total_reports: u64 = cap + 40; // 1 initial + (cap + 39) flapping transitions within < ANALOG_MIN_GAP_US (1_000 us step)
     for i in 0..total_reports {
         let mut r = report(i as u8, 0, 128, (i as u32) * 100);
         let v = if i % 2 == 0 { 0u8 } else { 9u8 };
         r[42] = v;
-        r[43] = v;
+        r[43] = 9;
         r[51] = 0x08;
-        tl.on_report(10_000 + i * 4_000, Some((i + 1) * 40_000), &r);
+        tl.on_report(10_000 + i * 1_000, Some((i + 1) * 10_000), &r);
     }
-    // Normal button press after hitting the cap still emits an `in` row with the current bytes 42-43.
+    // Normal button press after hitting the status-row cap still emits an `in` row with the current bytes 42-43.
     let last_v = if (total_reports - 1) % 2 == 0 { 0u8 } else { 9u8 };
     let mut btn = report(total_reports as u8, CROSS, 128, (total_reports as u32) * 100);
     btn[42] = last_v;
-    btn[43] = last_v;
+    btn[43] = 9;
     btn[51] = 0x28;
-    tl.on_report(10_000 + total_reports * 4_000, Some((total_reports + 1) * 40_000), &btn);
+    tl.on_report(10_000 + total_reports * 1_000, Some((total_reports + 1) * 10_000), &btn);
 
     // Reconnect (epoch 2) resets the per-epoch cap so new changes are logged again.
-    tl.on_connected(500_000, edge());
+    let ep2_t0 = 10_000 + (total_reports + 10) * 1_000;
+    tl.on_connected(ep2_t0, edge());
     let mut r2a = report(0, 0, 128, 1);
     r2a[42] = 1;
     r2a[43] = 1;
     r2a[51] = 0x08;
-    tl.on_report(504_000, Some(5_040_000), &r2a);
+    tl.on_report(ep2_t0 + 1_000, Some((ep2_t0 + 1_000) * 10), &r2a);
     let mut r2b = report(1, 0, 128, 2);
     r2b[42] = 2;
     r2b[43] = 3;
     r2b[51] = 0x08;
-    tl.on_report(508_000, Some(5_080_000), &r2b);
+    tl.on_report(ep2_t0 + 2_000, Some((ep2_t0 + 2_000) * 10), &r2b);
 
-    tl.finish(1_500_000).unwrap();
+    tl.finish(ep2_t0 + 500_000).unwrap();
 
     let recs = lines(&dir);
     let ep1_changes: Vec<&Value> = recs
@@ -890,10 +895,12 @@ fn bytes_42_43_flapping_is_bounded_by_per_epoch_cap() {
     assert_eq!(ep1_changes.len() as u64, cap, "flapping status rows must stay capped per epoch");
 
     let ep1_ins: Vec<&Value> = recs.iter().filter(|r| r["type"] == "in" && r["epoch"] == 1).collect();
-    // 1 initial snapshot + `cap` change-triggered rows + 1 normal CROSS press = cap + 2.
-    assert_eq!(ep1_ins.len() as u64, cap + 2, "flapping in rows must stay capped while normal button edges still log");
+    // 1 initial snapshot + (total_reports - 1) raw[42..43] transitions (each emits an `in` row even within analog_min_gap_us) + 1 normal CROSS press = total_reports + 1.
+    assert_eq!(ep1_ins.len() as u64, total_reports + 1, "every raw[42..43] change emits an in row even within analog_min_gap_us");
     assert_eq!(ep1_ins.last().unwrap()["buttons"], CROSS);
-    assert_eq!(ep1_ins.last().unwrap()["bytes_42_43_raw"], serde_json::json!([last_v, last_v]));
+    assert_eq!(ep1_ins.last().unwrap()["bytes_42_43_raw"], serde_json::json!([last_v, 9]));
+    assert_eq!(ep1_ins.last().unwrap()["trigger_fx_status"]["r2_raw"], last_v);
+    assert_eq!(ep1_ins.last().unwrap()["trigger_fx_status"]["l2_raw"], 9);
 
     let ep2_changes: Vec<&Value> = recs
         .iter()
@@ -901,6 +908,9 @@ fn bytes_42_43_flapping_is_bounded_by_per_epoch_cap() {
         .collect();
     assert_eq!(ep2_changes.len(), 1, "reconnect resets the per-epoch cap");
     assert_eq!(ep2_changes[0]["bytes_42_43_raw"], serde_json::json!([2, 3]));
+    let ep2_ins: Vec<&Value> = recs.iter().filter(|r| r["type"] == "in" && r["epoch"] == 2).collect();
+    assert_eq!(ep2_ins.last().unwrap()["trigger_fx_status"]["r2_raw"], 2);
+    assert_eq!(ep2_ins.last().unwrap()["trigger_fx_status"]["l2_raw"], 3);
 
     let expected_suppressed = (total_reports - 1) - cap;
     let hb_suppressed: u64 = recs

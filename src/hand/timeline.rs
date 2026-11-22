@@ -58,8 +58,8 @@ pub const RAW_LAYOUT_SPEC: &str = "u64_le qpc_ticks (0 = UNMEASURED) + u64_le t_
 pub const STALE_GAP_US: u64 = crate::inputs::STALE_RX_GAP_US;
 pub const STALL_US: u64 = 2_000_000;
 pub const ANALOG_MIN_GAP_US: u64 = crate::inputs::ANALOG_MIN_GAP_US;
-/// Per-epoch cap on `bytes_42_43_change` rows (each change emits one `in` + one `status` row) so a flapping byte cannot flood the JSONL.
-pub const BYTES_42_43_CHANGE_CAP_PER_EPOCH: u64 = 16;
+/// Per-epoch cap on `bytes_42_43_change` status rows (`in` rows always emit on `raw[42..=43]` change even within `ANALOG_MIN_GAP_US`; status rows past this cap are suppressed and counted in `hb.bytes_42_43_suppressed` and `summary.bytes_42_43_changes_suppressed`).
+pub const BYTES_42_43_CHANGE_CAP_PER_EPOCH: u64 = 1024;
 pub const UNMEASURED: &str = "UNMEASURED";
 pub const UNKNOWN: &str = "UNKNOWN";
 pub const CLAIMS: &str = "Read-only controller input log clocked to the video: host-observed USB HID input reports and capture frame arrivals on one monotonic clock. It does not identify who held the controller.";
@@ -373,15 +373,16 @@ impl HandTimeline {
         // Change-logged `in` row. Edge-only bits and `physical_face` are UNMEASURED (not zero) on a standard DualSense.
         // `buttons` is never rewritten; `physical_face` carries full raw byte 51 on Edge (ESTIMATED; low nibble mirrors
         // the d-pad, mask 0xF0 for face buttons) and is excluded from the change key when `!edge`.
-        // `bytes_42_43_raw` carries raw bytes 42-43 (ESTIMATED, n=1 trigger-setting hypothesis; change emissions capped per
-        // epoch; `adaptive_trigger_state` stays UNMEASURED).
+        // `bytes_42_43_raw` carries raw bytes 42-43 (`[r2_raw, l2_raw]` per R2 bench match-20261122-155333; `in` rows always
+        // emit on `raw[42..=43]` change even within `ANALOG_MIN_GAP_US`; `bytes_42_43_change` status rows are capped per
+        // epoch at `BYTES_42_43_CHANGE_CAP_PER_EPOCH` with suppressed transitions counted; `adaptive_trigger_state` stays UNMEASURED).
         let buttons = if edge { p.buttons } else { p.buttons & !EDGE_BITS };
         let physical_face: Option<u8> = edge.then_some(raw[51]);
         let b42_43 = [raw[42], raw[43]];
         let prev_b42_43 = self.last_bytes_42_43;
         let raw_b42_43_changed = prev_b42_43.is_some_and(|old| old != b42_43);
         self.last_bytes_42_43 = Some(b42_43);
-        let b42_43_change_emit = if raw_b42_43_changed {
+        let b42_43_status_emit = if raw_b42_43_changed {
             if self.bytes_42_43_changes_epoch < BYTES_42_43_CHANGE_CAP_PER_EPOCH {
                 self.bytes_42_43_changes_epoch += 1;
                 true
@@ -394,7 +395,7 @@ impl HandTimeline {
             false
         };
         let key = (buttons, physical_face, [p.lx, p.ly, p.rx, p.ry, p.l2, p.r2]);
-        let emit = b42_43_change_emit || match (self.last_in_key, self.last_in_t) {
+        let emit = raw_b42_43_changed || match (self.last_in_key, self.last_in_t) {
             (Some(k), Some(t0)) => k.0 != key.0 || k.1 != key.1 || (k.2 != key.2 && t.saturating_sub(t0) >= ANALOG_MIN_GAP_US),
             _ => true,
         };
@@ -410,7 +411,7 @@ impl HandTimeline {
                 "lx": p.lx, "ly": p.ly, "rx": p.rx, "ry": p.ry, "l2": p.l2, "r2": p.r2, "buttons": buttons,
                 "edge_bits": if edge { json!((p.buttons & EDGE_BITS) >> 19) } else { json!(UNMEASURED) },
                 "gyro": p.gyro, "accel": p.accel, "touch": touch,
-                "trigger_fx_status": {"l2_raw": raw[42], "r2_raw": raw[43], "status": UNMEASURED},
+                "trigger_fx_status": {"l2_raw": raw[43], "r2_raw": raw[42], "status": UNMEASURED},
                 "battery_raw": raw[53], "device_model": label, "raw_sha256": ev::sha256_hex(raw)});
             rec["physical_face"] = physical_face.map(|v| json!(v)).unwrap_or_else(|| json!(UNMEASURED));
             rec["bytes_42_43_raw"] = json!([b42_43[0], b42_43[1]]);
@@ -420,7 +421,7 @@ impl HandTimeline {
             self.last_in_key = Some(key);
             self.last_in_t = Some(t);
         }
-        if b42_43_change_emit {
+        if b42_43_status_emit {
             if let Some(old) = prev_b42_43 {
                 let rec = json!({
                     "type": "status", "t_us": n(t), "epoch": self.epoch, "state": "bytes_42_43_change",
