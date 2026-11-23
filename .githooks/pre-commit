@@ -1,0 +1,27 @@
+#!/bin/sh
+# qorcap pre-commit hook (T-0030): runs the zero-dependency guardrails
+# (frozen surface, LF endings, listen-only HID, banned wording).
+#
+# Enable it with:
+#   git config core.hooksPath .githooks
+#
+# The hook fails closed: if python or tools/check_guardrails.py is missing,
+# the commit is blocked with a message instead of silently passing.
+# The full check plus --self-test also runs in CI (.github/workflows/ci.yml,
+# linux job); the hook itself runs only the plain check, nothing heavy.
+
+if command -v python >/dev/null 2>&1; then
+    PY=python
+elif command -v python3 >/dev/null 2>&1; then
+    PY=python3
+else
+    echo "pre-commit: python not found; install Python 3.12+ or run 'python tools/check_guardrails.py' manually" >&2
+    exit 1
+fi
+
+if [ ! -f tools/check_guardrails.py ]; then
+    echo "pre-commit: tools/check_guardrails.py missing (are you at the qorcap repo root?)" >&2
+    exit 1
+fi
+
+exec "$PY" tools/check_guardrails.py
