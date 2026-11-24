@@ -267,6 +267,63 @@ pub enum Cmd {
         #[command(subcommand)]
         action: PairCmd,
     },
+    /// Read-only capture readiness check: disk headroom, writable paths, listen-only controller visibility, and declared Edge settings.
+    Preflight {
+        /// Target session/bundle folder or parent directory to probe.
+        #[arg(long)]
+        bundle_dir: Option<String>,
+        /// Target hand timeline folder or root to probe (default: D:\QorCap\practice-hand on Windows).
+        #[arg(long)]
+        hand_dir: Option<String>,
+        /// Minimum required free space in GiB to pass (default 5.0).
+        #[arg(long, default_value_t = 5.0)]
+        min_free_gb: f64,
+        /// Pass even when no DualSense Edge / DualSense USB controller is attached.
+        #[arg(long)]
+        allow_no_controller: bool,
+        /// Fail unless all 6 DualSense Edge settings are declared via flags or QORCAP_EDGE_* env vars.
+        #[arg(long)]
+        require_declared_edge: bool,
+        #[arg(long)]
+        edge_profile: Option<String>,
+        #[arg(long)]
+        l2_stop: Option<String>,
+        #[arg(long)]
+        r2_stop: Option<String>,
+        #[arg(long)]
+        stick_curve_left: Option<String>,
+        #[arg(long)]
+        stick_curve_right: Option<String>,
+        #[arg(long)]
+        in_game_trigger_effect: Option<String>,
+        /// Emit machine-readable JSON instead of human summary lines.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Opt-in auxiliary QorTime hash stamp: posts ONLY SHA-256 session heads to /aux/v1/hash-stamp,
+    /// verifies the returned Ed25519 signature, and writes or verifies hash_stamp.v1.json.
+    HashStamp {
+        /// Session bundle or hand timeline folder.
+        dir: String,
+        /// QorTime base http:// URL (required unless --verify-only is set).
+        #[arg(long)]
+        url: Option<String>,
+        /// Expected QorTime signer 16-hex key_id or 64-hex public_key.
+        #[arg(long)]
+        trusted_key: Option<String>,
+        /// Custom output/input path for hash_stamp.v1.json.
+        #[arg(long)]
+        out: Option<String>,
+        /// Overwrite an existing hash_stamp.v1.json when requesting a fresh stamp.
+        #[arg(long)]
+        force: bool,
+        /// Offline check of an existing hash_stamp.v1.json against the verified hand timeline.
+        #[arg(long)]
+        verify_only: bool,
+        /// Emit machine-readable JSON report.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand, Debug, Clone)]
@@ -580,6 +637,8 @@ mod tests {
         } else { panic!() }
         assert!(matches!(Cli::try_parse_from(["qorcap", "check-hand-timeline", "b"]).unwrap().cmd, Cmd::CheckHandTimeline { .. }));
         assert!(matches!(Cli::try_parse_from(["qorcap", "check-response-bound", "b", "--write"]).unwrap().cmd, Cmd::CheckResponseBound { write: true, .. }));
+        assert!(matches!(Cli::try_parse_from(["qorcap", "preflight", "--allow-no-controller", "--json"]).unwrap().cmd, Cmd::Preflight { allow_no_controller: true, json: true, .. }));
+        assert!(matches!(Cli::try_parse_from(["qorcap", "hash-stamp", "b", "--verify-only", "--json"]).unwrap().cmd, Cmd::HashStamp { verify_only: true, json: true, .. }));
         if let Cmd::Record(r) = Cli::try_parse_from(["qorcap", "record", "--frame-clock"]).unwrap().cmd { assert!(r.frame_clock); assert!(r.live_tap.is_none() && !r.practice_lane); } else { panic!() }
         if let Cmd::Record(r) = Cli::try_parse_from(["qorcap", "record", "--live-tap", "udp://127.0.0.1:1937", "--practice-lane", "--live-tap-every", "5"]).unwrap().cmd { assert_eq!(r.live_tap.as_deref(), Some("udp://127.0.0.1:1937")); assert!(r.practice_lane); assert_eq!(r.live_tap_every, Some(5)); } else { panic!() }
         assert!(matches!(Cli::try_parse_from(["qorcap", "align-ab", "b", "--no-video"]).unwrap().cmd, Cmd::AlignAb { no_video: true, frames: 15, rumble_echo: false, .. }));
