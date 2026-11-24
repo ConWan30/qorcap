@@ -578,6 +578,86 @@ fn main() {
                 }
             }
         }
+        Cmd::Preflight {
+            bundle_dir,
+            hand_dir,
+            min_free_gb,
+            allow_no_controller,
+            require_declared_edge,
+            edge_profile,
+            l2_stop,
+            r2_stop,
+            stick_curve_left,
+            stick_curve_right,
+            in_game_trigger_effect,
+            json,
+        } => {
+            let declared_settings = qorcap::hand::DeclaredEdgeSettings::from_flags_and_env(
+                edge_profile.as_deref(),
+                std::env::var(qorcap::hand::ENV_EDGE_PROFILE).ok().as_deref(),
+                l2_stop.as_deref(),
+                std::env::var(qorcap::hand::ENV_L2_STOP).ok().as_deref(),
+                r2_stop.as_deref(),
+                std::env::var(qorcap::hand::ENV_R2_STOP).ok().as_deref(),
+                stick_curve_left.as_deref(),
+                std::env::var(qorcap::hand::ENV_STICK_CURVE_LEFT).ok().as_deref(),
+                stick_curve_right.as_deref(),
+                std::env::var(qorcap::hand::ENV_STICK_CURVE_RIGHT).ok().as_deref(),
+                in_game_trigger_effect.as_deref(),
+                std::env::var(qorcap::hand::ENV_IN_GAME_TRIGGER_EFFECT).ok().as_deref(),
+            );
+            let rep = qorcap::preflight::run(&qorcap::preflight::PreflightOpts {
+                bundle_dir: bundle_dir.map(std::path::PathBuf::from),
+                hand_dir: hand_dir.map(std::path::PathBuf::from),
+                min_free_gb,
+                allow_no_controller,
+                require_declared_edge,
+                declared_settings,
+            });
+            if json {
+                println!("{}", serde_json::to_string_pretty(&rep).unwrap());
+            } else {
+                println!("preflight: {}", if rep.pass { "PASS" } else { "FAIL" });
+                for c in &rep.checks {
+                    println!("  {:<7} {:<24} {}", c.status, c.name, c.detail);
+                }
+            }
+            if rep.pass { 0 } else { 1 }
+        }
+        Cmd::HashStamp { dir, url, trusted_key, out, force, verify_only, json } => {
+            match qorcap::hash_stamp::run_stamp(
+                std::path::Path::new(&dir),
+                url.as_deref(),
+                trusted_key.as_deref(),
+                out.as_deref().map(std::path::Path::new),
+                force,
+                verify_only,
+                None,
+            ) {
+                Ok(v) => {
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&v).unwrap());
+                    } else {
+                        println!(
+                            "hash-stamp: PASS stamp_id={} key_id={} seq={} out={}",
+                            v.stamp_id,
+                            v.key_id,
+                            v.ledger_seq,
+                            v.out_path.as_deref().unwrap_or("-")
+                        );
+                    }
+                    0
+                }
+                Err(e) => {
+                    if json {
+                        println!("{}", serde_json::json!({"ok": false, "error": e}));
+                    } else {
+                        eprintln!("hash-stamp: FAIL {e}");
+                    }
+                    1
+                }
+            }
+        }
         Cmd::Record(mut a) => {
             let _lock = match instance_lock(cli.port) {
                 Ok(l) => l,
