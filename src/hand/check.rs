@@ -11,8 +11,9 @@ use super::timeline::{CHUNK_US, FILE_NAME, RAW_FILE, RAW_LAYOUT, RAW_RECORD_BYTE
 use crate::evidence::{self as ev, GENESIS};
 use crate::hid::{BACK_LEFT, BACK_RIGHT, FN_LEFT, FN_RIGHT};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashSet};
-use std::io::ErrorKind;
+use std::io::{BufRead, BufReader, ErrorKind, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 const EDGE_BITS: u64 = (FN_LEFT | FN_RIGHT | BACK_LEFT | BACK_RIGHT) as u64;
@@ -113,21 +114,26 @@ pub fn check_dir_heads(dir: &Path) -> Result<(Report, BTreeMap<u64, String>), St
         }
         return Err(format!("{FILE_NAME}: not found (looked in {})", hand_dir.display()));
     }
-    let bytes = std::fs::read(&path).map_err(|e| format!("{FILE_NAME}: {e}"))?;
+    let file = std::fs::File::open(&path).map_err(|e| format!("{FILE_NAME}: {e}"))?;
+    let mut reader = BufReader::with_capacity(64 * 1024, file);
+    let mut file_hasher = Sha256::new();
     let mut r = Report {
-        file_sha256: ev::sha256_hex(&bytes),
+        file_sha256: String::new(),
         head: GENESIS.to_string(),
         hand_dir: Some(hand_dir.clone()),
         ..Default::default()
     };
-    let text = String::from_utf8(bytes).map_err(|_| format!("{FILE_NAME} is not UTF-8"))?;
     let mut pending: Vec<Value> = vec![];
     let mut last_seq: Option<u64> = None;
     let mut heads: BTreeMap<u64, String> = BTreeMap::new();
     let mut last_in_t: Option<u64> = None;
 
+    struct RawFileHandle {
+        file: std::fs::File,
+        len: u64,
+    }
     let raw_path = hand_dir.join(RAW_FILE);
-    let mut raw_cache: Option<Result<Vec<u8>, String>> = None;
+    let mut raw_handle: Option<Result<RawFileHandle, String>> = None;
     let mut raw_missing_reported = false;
     let mut raw_active_seen = false;
     let mut raw_off_only = false;
@@ -139,18 +145,30 @@ pub fn check_dir_heads(dir: &Path) -> Result<(Report, BTreeMap<u64, String>), St
     let mut header_reason: Value = Value::Null;
     let mut header_raw_file: Value = Value::Null;
 
-    for (i, line) in text.split('\n').enumerate() {
+    let mut line_buf: Vec<u8> = Vec::with_capacity(4096);
+    let mut i: usize = 0;
+    loop {
+        line_buf.clear();
+        let n = reader.read_until(b'\n', &mut line_buf).map_err(|e| format!("{FILE_NAME}: {e}"))?;
+        if n == 0 {
+            break;
+        }
+        file_hasher.update(&line_buf);
+        let raw_line = if line_buf.ends_with(b"\n") { &line_buf[..line_buf.len() - 1] } else { &line_buf[..] };
+        let line_no = i + 1;
+        i += 1;
+        let line = std::str::from_utf8(raw_line).map_err(|_| format!("{FILE_NAME} is not UTF-8"))?;
         if line.is_empty() { continue; }
-        let v: Value = match serde_json::from_str(line) { Ok(v) => v, Err(e) => { r.errors.push(format!("line {}: not JSON ({e})", i + 1)); continue; } };
-        match ev::jcs(&v) { Ok(c) if c == line => {}, Ok(_) => r.errors.push(format!("line {}: not in JCS form", i + 1)), Err(e) => r.errors.push(format!("line {}: {e}", i + 1)) }
+        let v: Value = match serde_json::from_str(line) { Ok(v) => v, Err(e) => { r.errors.push(format!("line {line_no}: not JSON ({e})")); continue; } };
+        match ev::jcs(&v) { Ok(c) if c == line => {}, Ok(_) => r.errors.push(format!("line {line_no}: not in JCS form")), Err(e) => r.errors.push(format!("line {line_no}: {e}")) }
         if v["type"] != "chunk" {
             if v["type"] == "in" {
-                if let Some(t) = t_of(&v) { if last_in_t.is_some_and(|p| t < p) { r.errors.push(format!("line {}: in t_us goes backwards", i + 1)); } last_in_t = Some(t); }
+                if let Some(t) = t_of(&v) { if last_in_t.is_some_and(|p| t < p) { r.errors.push(format!("line {line_no}: in t_us goes backwards")); } last_in_t = Some(t); }
             }
             pending.push(v);
             continue;
         }
-        let Some(seq) = v["seq"].as_u64() else { r.errors.push(format!("line {}: chunk without seq", i + 1)); pending.clear(); continue; };
+        let Some(seq) = v["seq"].as_u64() else { r.errors.push(format!("line {line_no}: chunk without seq")); pending.clear(); continue; };
         let records = std::mem::take(&mut pending);
         match last_seq {
             None => {
@@ -270,8 +288,11 @@ pub fn check_dir_heads(dir: &Path) -> Result<(Report, BTreeMap<u64, String>), St
         }
         expected_raw_offset = offset.saturating_add(len);
 
-        let cached = raw_cache.get_or_insert_with(|| match std::fs::read(&raw_path) {
-            Ok(b) => Ok(b),
+        let cached = raw_handle.get_or_insert_with(|| match std::fs::File::open(&raw_path) {
+            Ok(file) => match file.metadata() {
+                Ok(meta) => Ok(RawFileHandle { file, len: meta.len() }),
+                Err(e) => Err(format!("raw file {RAW_FILE} unreadable ({e})")),
+            },
             Err(e) => {
                 if e.kind() == ErrorKind::NotFound {
                     r.raw_missing = true;
@@ -288,18 +309,28 @@ pub fn check_dir_heads(dir: &Path) -> Result<(Report, BTreeMap<u64, String>), St
                     raw_missing_reported = true;
                 }
             }
-            Ok(raw_bytes) => {
+            Ok(rh) => {
                 let Some(end) = offset.checked_add(len) else {
                     r.errors.push(format!("chunk {seq}: raw slice offset overflow"));
                     continue;
                 };
-                if end > raw_bytes.len() as u64 {
-                    r.errors.push(format!("chunk {seq}: {RAW_FILE} truncated (slice {offset}..{end} exceeds file length {})", raw_bytes.len()));
+                if end > rh.len {
+                    r.errors.push(format!("chunk {seq}: {RAW_FILE} truncated (slice {offset}..{end} exceeds file length {})", rh.len));
                     continue;
                 }
+                let Ok(len_usize) = usize::try_from(len) else {
+                    r.errors.push(format!("chunk {seq}: raw slice length {len} exceeds addressable memory"));
+                    continue;
+                };
                 r.raw_slices += 1;
-                let slice = &raw_bytes[offset as usize..end as usize];
-                if ev::sha256_hex(slice) != want_sha {
+                let mut slice = vec![0u8; len_usize];
+                if len_usize > 0 {
+                    if let Err(e) = rh.file.seek(SeekFrom::Start(offset)).and_then(|_| rh.file.read_exact(&mut slice)) {
+                        r.errors.push(format!("chunk {seq}: raw file {RAW_FILE} unreadable ({e})"));
+                        continue;
+                    }
+                }
+                if ev::sha256_hex(&slice) != want_sha {
                     r.errors.push(format!("chunk {seq}: raw slice SHA-256 does not match"));
                 }
                 if len > 0 {
@@ -330,11 +361,12 @@ pub fn check_dir_heads(dir: &Path) -> Result<(Report, BTreeMap<u64, String>), St
             }
         }
     }
+    r.file_sha256 = ev::hex(&file_hasher.finalize());
     if raw_active_seen {
-        if let Some(Ok(raw_bytes)) = &raw_cache {
+        if let Some(Ok(rh)) = &raw_handle {
             r.raw_files = 1;
-            if (raw_bytes.len() as u64) > expected_raw_offset {
-                r.warnings.push(format!("{RAW_FILE}: {} trailing byte(s) after sealed offset {expected_raw_offset} (UNMEASURED unsealed tail, not counted, never padded)", raw_bytes.len() as u64 - expected_raw_offset));
+            if rh.len > expected_raw_offset {
+                r.warnings.push(format!("{RAW_FILE}: {} trailing byte(s) after sealed offset {expected_raw_offset} (UNMEASURED unsealed tail, not counted, never padded)", rh.len - expected_raw_offset));
             }
         }
     } else if raw_off_only && raw_path.exists() {

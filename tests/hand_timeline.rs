@@ -996,3 +996,51 @@ fn open_windows_stay_bounded_when_unsealed() {
     tl.finish(500_000).unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn streaming_finish_and_checker_verify_multi_chunk_raw_and_detect_middle_tamper() {
+    let dir = tmp("streaming-multi-chunk");
+    let mut tl = HandTimeline::open(cfg(&dir, true, Some(edge()))).unwrap();
+    // Emit enough analog/button changes across 3 chunks so hand_timeline.v0.jsonl exceeds 64 KiB.
+    for i in 0..700u64 {
+        let mut p = Pad::neutral();
+        p.counter = i as u8;
+        p.sensor_ts = (i as u32) * 500;
+        p.rx = ((i * 7) % 256) as u8;
+        p.r2 = (i % 256) as u8;
+        p.buttons = if i % 2 == 0 { CROSS } else { CIRCLE };
+        let mut raw = hid::pack_usb(&p);
+        raw[51] = if i % 2 == 0 { 0x28 } else { 0x48 };
+        tl.on_report(10_000 + i * 4_000, Some(100_000 + i * 40_000), &raw);
+    }
+    let fin = tl.finish(2_900_000).unwrap();
+    let disk_bytes = std::fs::read(dir.join(FILE_NAME)).unwrap();
+    assert!(disk_bytes.len() > 64 * 1024, "expected >64 KiB timeline to cross BufReader boundary, got {}", disk_bytes.len());
+    assert_eq!(fin.file_sha256, ev::sha256_hex(&disk_bytes));
+
+    let rep = check_dir(&dir).unwrap();
+    assert!(rep.pass(), "{:?}", rep.errors);
+    assert_eq!(rep.file_sha256, fin.file_sha256);
+    assert_eq!(rep.chunks, 3);
+    assert_eq!(rep.raw_slices, 3);
+
+    // Tamper 1 byte inside chunk 1's slice of hand_raw.v0.bin and verify seeking check catches only chunk 1.
+    let rp = dir.join(RAW_FILE);
+    let mut raw_bytes = std::fs::read(&rp).unwrap();
+    let flip_at = (300 * RAW_RECORD_BYTES) + 20;
+    raw_bytes[flip_at] ^= 0x55;
+    std::fs::write(&rp, &raw_bytes).unwrap();
+    let tampered = check_dir(&dir).unwrap();
+    assert!(!tampered.pass());
+    assert!(tampered.errors.iter().any(|e| e.contains("chunk 1: raw slice SHA-256 does not match")), "{:?}", tampered.errors);
+
+    // Verify non-UTF-8 timeline still returns exact UTF-8 error under streaming reader.
+    let bad_dir = tmp("streaming-bad-utf8");
+    std::fs::create_dir_all(&bad_dir).unwrap();
+    std::fs::write(bad_dir.join(FILE_NAME), [0xFF, 0xFE, b'\n']).unwrap();
+    let err = check_dir(&bad_dir).unwrap_err();
+    assert_eq!(err, format!("{FILE_NAME} is not UTF-8"));
+
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&bad_dir);
+}
