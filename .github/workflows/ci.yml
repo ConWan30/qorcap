@@ -10,6 +10,8 @@ jobs:
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/setup-python@v5
         with:
@@ -28,6 +30,14 @@ jobs:
           if bad:
               raise SystemExit("carriage return in:\n" + "\n".join(bad))
           PY
+      # Guardrails (T-0030, Integration #5): frozen surface, LF endings,
+      # listen-only HID, banned wording. Fails closed; --self-test verifies
+      # each rule catches a synthetic violation.
+      - name: Guardrails (frozen files, LF, listen-only HID, banned wording)
+        shell: bash
+        run: |
+          python tools/check_guardrails.py
+          python tools/check_guardrails.py --self-test
       # ffmpeg and the pinned QorTime verifier run inside `cargo test` (clip credentials).
       # The receipt check is the real `python -m qor_receipt.cli verify`, not a stub.
       # ffmpeg + ffprobe for the steps below (found on PATH). Pinned static build from BtbN/FFmpeg-Builds
