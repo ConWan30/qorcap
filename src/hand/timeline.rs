@@ -22,10 +22,26 @@ use crate::evidence::{self as ev, GENESIS};
 use crate::frameclock::FrameStamp;
 use crate::hid::{self, CIRCLE, CROSS, SQUARE, TRIANGLE, FN_LEFT, FN_RIGHT, BACK_LEFT, BACK_RIGHT};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
-use std::io::Write;
+use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
+
+pub(crate) fn sha256_file_streaming(path: &Path) -> std::io::Result<String> {
+    let file = File::open(path)?;
+    let mut reader = BufReader::with_capacity(64 * 1024, file);
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = reader.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(ev::hex(&hasher.finalize()))
+}
 
 /// Create a new file, refusing a pre-existing path (write-once). On Unix the mode is 0600
 /// (owner read/write only). On Windows the process default ACL is used (no extra restriction).
@@ -667,8 +683,7 @@ impl HandTimeline {
             self.seal(self.next_seal, partial)?;
         }
         self.closed = true;
-        let bytes = std::fs::read(&self.path).map_err(|e| format!("hand timeline re-read: {e}"))?;
-        let file_sha256 = ev::sha256_hex(&bytes);
+        let file_sha256 = sha256_file_streaming(&self.path).map_err(|e| format!("hand timeline re-read: {e}"))?;
         let raw_file_str = if self.cfg.raw_usb { Some(RAW_FILE.to_string()) } else { None };
         let mut summary = json!({"schema": SUMMARY_SCHEMA, "file": FILE_NAME, "sha256": file_sha256, "head": self.head,
             "first_seq": self.first_seq, "last_seq": self.last_sealed, "chunks": self.chunks, "raw_usb": self.cfg.raw_usb, "raw_paused": self.raw_pause,
