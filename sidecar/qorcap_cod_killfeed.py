@@ -439,6 +439,20 @@ def _classify_victim(cv2, np, hsv, ink, vx0, r0, r1, scale, tag, *, self_only: b
     return res, gold, fit.x, fit.x + fit.template.shape[1]
 
 
+def _merge_large_text_retry(base_res: dict, base_gold, large_out, side: str) -> dict:
+    """Use 1.25x result on SELF match or gold near-miss UNREADABLE (never keep scale-mismatched NOT_SELF)."""
+    if isinstance(large_out, dict):
+        return base_res
+    l_res, l_gold = large_out[0], large_out[1]
+    l_verdict = l_res.get(side)
+    gold_hit = (l_gold is not None and l_gold >= GOLD_MIN) or (base_gold is not None and base_gold >= GOLD_MIN)
+    if l_verdict == SELF or (l_verdict == UNREADABLE and gold_hit):
+        merged = dict(l_res)
+        merged[f"{side}_hud_scale"] = LARGE_TEXT_SCALE
+        return merged
+    return base_res
+
+
 def _row_runs_with_large_split(strip, scale: float):
     """Standard row runs plus splitting oversized halo-bridged Large-Text blocks."""
     min_h = int(LINE_MIN_H * scale)
@@ -527,9 +541,7 @@ def read_killfeed_lines(img, tag: str | None = None) -> dict:
                 if ink_large is None:
                     ink_large = _tophat(cv2, np, hsv[:, :, 2], large_scale)
                 kl_out = _classify_killer(cv2, np, hsv, ink_large, left, icon_x0, r0, r1, large_scale, tag, self_only=True)
-                if not isinstance(kl_out, dict) and kl_out[0].get("killer") == SELF:
-                    k_res = kl_out[0]
-                    k_res["killer_hud_scale"] = LARGE_TEXT_SCALE
+                k_res = _merge_large_text_retry(k_res, k_gold, kl_out, "killer")
             line.update(k_res)
         line["killer_sig"] = _signature(cv2, np, ink, left - 1, r0, 16 * pitch, scale)
         # Victim: the tag is slid across the stretch after the icon. Skull or
@@ -544,9 +556,7 @@ def read_killfeed_lines(img, tag: str | None = None) -> dict:
                 if ink_large is None:
                     ink_large = _tophat(cv2, np, hsv[:, :, 2], large_scale)
                 vl_out = _classify_victim(cv2, np, hsv, ink_large, vx0, r0, r1, large_scale, tag, self_only=True)
-                if not isinstance(vl_out, dict) and vl_out[0].get("victim") == SELF:
-                    v_res = vl_out[0]
-                    v_res["victim_hud_scale"] = LARGE_TEXT_SCALE
+                v_res = _merge_large_text_retry(v_res, v_gold, vl_out, "victim")
             line.update(v_res)
         line["victim_sig"] = _signature(cv2, np, ink, icon_x0, r0, 18 * pitch, scale)
         lines.append(line)
