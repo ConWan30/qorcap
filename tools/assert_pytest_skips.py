@@ -121,6 +121,7 @@ LINUX_FILES = (
     "sidecar/test_qorcap_cod_calib.py",
     "sidecar/test_qorcap_cod_endstop.py",
     "sidecar/test_qorcap_cod_rowdigits.py",
+    "sidecar/test_qorcap_cod_post_nov21.py",
     "sidecar/test_qorcap_void_201029.py",
     "sidecar/test_qordata_fixtures.py",
     "sidecar/test_qordata_product.py",
@@ -200,6 +201,7 @@ WINDOWS_FILES = (
     "sidecar/test_qorcap_cod_calib.py",
     "sidecar/test_qorcap_cod_endstop.py",
     "sidecar/test_qorcap_cod_rowdigits.py",
+    "sidecar/test_qorcap_cod_post_nov21.py",
     "sidecar/test_qorcap_void_201029.py",
     "sidecar/test_qordata_fixtures.py",
     "sidecar/test_qordata_product.py",
@@ -233,8 +235,9 @@ WINDOWS_FILES = (
 # revived qortime #80 tree, still collects 49 tests (7 on main, +42).
 # Windows does not run this file, so only the Linux floor rises: 1392+42 / 1373.
 # Updated for tools/test_hand_timeline_contract.py (+5 tests on both suites): 1439 / 1378.
-LINUX_MIN_COLLECTED = 1439
-WINDOWS_MIN_COLLECTED = 1378
+# Updated for sidecar/test_qorcap_cod_post_nov21.py (+9 tests on both suites): 1448 / 1387.
+LINUX_MIN_COLLECTED = 1448
+WINDOWS_MIN_COLLECTED = 1387
 
 # Absent from both sidecar suites. A reason is required; whitespace does not count.
 EXCLUDED_TEST_FILES = {

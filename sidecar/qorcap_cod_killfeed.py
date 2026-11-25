@@ -57,9 +57,12 @@ VICTIM_PITCH_RANGE = (6.45, 6.80)
 PITCH_STEP = 0.05
 # A thin bright stroke on a 7x7 top-hat of brightness is ink.
 INK_MIN = 40
-# A line's glyph rows span this many px at 720p.
+# A line's glyph rows span this many px at 720p (Large Text stacks can reach 20 px and bridge by 2-4 halo cols).
 LINE_MIN_H = 8
 LINE_MAX_H = 16
+LARGE_TEXT_SCALE = 1.25
+LARGE_LINE_MAX_H = 21
+VALLEY_COLS_MIN = 5
 # The victim name starts within this many pitches after the icon.
 VICTIM_SPAN_PITCH = 8
 # Killer names (clan tag included) are at most this many characters, so the
@@ -168,12 +171,18 @@ def font_bank():
     return bank
 
 
+_WORD_CACHE: dict = {}
+
+
 def word_template(text: str, pitch: float, scale: float = 1.0):
     """The word laid out from font glyphs at ``pitch`` px per character (720p px times scale)."""
     cv2, np = _libs()
     bank = font_bank()
     if bank is None:
         return None
+    key = (text, round(float(pitch), 4), round(float(scale), 4))
+    if key in _WORD_CACHE:
+        return _WORD_CACHE[key]
     ss = bank["supersample"]
     glyphs = bank["glyphs"]
     cell_w = next(iter(glyphs.values())).shape[1]
@@ -192,7 +201,9 @@ def word_template(text: str, pitch: float, scale: float = 1.0):
         canvas[:, x:x + w] = np.maximum(canvas[:, x:x + w], g[:, :w])
     out_w = max(1, int(round(width / ss * scale)))
     out_h = max(1, int(round(cell_h / ss * scale)))
-    return cv2.resize(canvas, (out_w, out_h), interpolation=cv2.INTER_AREA)
+    out = cv2.resize(canvas, (out_w, out_h), interpolation=cv2.INTER_AREA)
+    _WORD_CACHE[key] = out
+    return out
 
 
 def _as_bgr(img):
@@ -261,7 +272,7 @@ def _fit_tag(cv2, np, ink, x0, y0, scale, tag, jx, jy, pitches=PITCH_RANGE):
     best = _Fit()
     p = pitches[0]
     while p <= pitches[1] + 1e-9:
-        t = word_template(tag, p * scale)
+        t = word_template(tag, p, scale=scale)
         if t is not None:
             ys, xs = max(0, y0 - jy), max(0, x0 - jx)
             patch = ink[ys:y0 + t.shape[0] + jy, xs:x0 + t.shape[1] + jx]
@@ -273,14 +284,60 @@ def _fit_tag(cv2, np, ink, x0, y0, scale, tag, jx, jy, pitches=PITCH_RANGE):
 
 
 _CELL_CACHE: dict = {}
+_MAT_CACHE: dict = {}
 
 
-def _glyph_templates(pitch_px: float):
-    key = round(pitch_px, 3)
+def _glyph_templates(pitch_px: float, scale: float = 1.0):
+    key = (round(pitch_px, 3), round(scale, 3))
     if key not in _CELL_CACHE:
         bank = font_bank()
-        _CELL_CACHE[key] = {c: word_template(c, pitch_px) for c in bank["glyphs"]}
+        _CELL_CACHE[key] = {c: word_template(c, pitch_px, scale=scale) for c in bank["glyphs"]}
     return _CELL_CACHE[key]
+
+
+def _glyph_matrix(np, pitch_px: float, scale: float = 1.0):
+    """Precomputed normalized template matrix for batched multi-glyph NCC."""
+    key = (round(pitch_px, 3), round(scale, 3))
+    if key in _MAT_CACHE:
+        return _MAT_CACHE[key]
+    temps = _glyph_templates(pitch_px, scale=scale)
+    t0 = next((t for t in temps.values() if t is not None), None)
+    if t0 is None:
+        return None
+    th, tw = t0.shape
+    chars = []
+    cols = []
+    for c, t in temps.items():
+        if t is None or t.shape != (th, tw):
+            continue
+        flat = t.ravel().astype(np.float64)
+        flat = flat - flat.mean()
+        norm = float(np.linalg.norm(flat))
+        cols.append((flat / norm) if norm >= 1e-6 else np.zeros_like(flat))
+        chars.append(c)
+    if not chars:
+        return None
+    mat = np.stack(cols, axis=1)  # (th*tw, n_glyphs)
+    idx_map = {c: i for i, c in enumerate(chars)}
+    val = (chars, idx_map, mat, th, tw)
+    _MAT_CACHE[key] = val
+    return val
+
+
+def _patch_glyph_max(np, patch, mat_info) -> tuple[float, np.ndarray | None]:
+    """Exact batched TM_CCOEFF_NORMED max per glyph across all sliding shifts in patch."""
+    _chars, _idx_map, mat, th, tw = mat_info
+    if patch.shape[0] < th or patch.shape[1] < tw:
+        return -1.0, None
+    wins = np.lib.stride_tricks.sliding_window_view(patch, (th, tw)).reshape(-1, th * tw).astype(np.float64)
+    wz = wins - wins.mean(axis=1, keepdims=True)
+    wn = np.linalg.norm(wz, axis=1, keepdims=True)
+    valid = (wn >= 1e-6).ravel()
+    scores = np.zeros((wins.shape[0], mat.shape[1]), dtype=np.float64)
+    if valid.any():
+        scores[valid] = (wz[valid] / wn[valid]) @ mat
+    per_glyph = scores.max(axis=0)
+    return float(per_glyph.max()), per_glyph
 
 
 def _cell_check(cv2, np, ink, fit: _Fit, scale, tag):
@@ -290,7 +347,8 @@ def _cell_check(cv2, np, ink, fit: _Fit, scale, tag):
     the cell where that happens, and the glyph that came closest.
     """
     pitch = fit.pitch * scale
-    temps = _glyph_templates(pitch)
+    temps = _glyph_templates(fit.pitch, scale=scale)
+    mat_info = _glyph_matrix(np, fit.pitch, scale=scale)
     lead = None
     where = None
     rival = None
@@ -300,20 +358,27 @@ def _cell_check(cv2, np, ink, fit: _Fit, scale, tag):
     _cell_check.rivals = None
     for i, ch in enumerate(tag):
         t0 = temps.get(ch)
-        if t0 is None:
+        if t0 is None or mat_info is None:
             return None, i, None
         cx = int(round(fit.x + i * pitch))
         patch = ink[max(0, fit.y - 1):fit.y + t0.shape[0] + 1, max(0, cx - 1):cx + t0.shape[1] + 1]
-        own, _ = _ncc(cv2, patch, t0)
+        chars, idx_map, _mat, _th, _tw = mat_info
+        _mx, per_glyph = _patch_glyph_max(np, patch, mat_info)
+        if per_glyph is None:
+            own = -1.0
+            if own < CELL_MIN:
+                return own - 1.0, i, None
+        own_idx = idx_map.get(ch)
+        if own_idx is None:
+            return None, i, None
+        own = float(per_glyph[own_idx])
         if own < CELL_MIN:
             return own - 1.0, i, None
-        best_other, best_c = -1.0, None
-        for c, t in temps.items():
-            if c == ch or t is None or t.shape != t0.shape:
-                continue
-            s, _ = _ncc(cv2, patch, t)
-            if s > best_other:
-                best_other, best_c = s, c
+        tmp = per_glyph.copy()
+        tmp[own_idx] = -2.0
+        best_idx = int(np.argmax(tmp))
+        best_other = float(tmp[best_idx])
+        best_c = chars[best_idx]
         d = own - best_other
         leads.append(round(d, 3))
         rivals.append(best_c)
@@ -324,9 +389,83 @@ def _cell_check(cv2, np, ink, fit: _Fit, scale, tag):
     return lead, where, rival
 
 
+def _is_colored_non_gold(hsv, ink, x0, x1, y0, y1) -> bool:
+    """True when saturated non-gold colour pixels rule out the local player's gold ink."""
+    x0, x1 = max(0, int(x0)), max(0, int(x1))
+    y0, y1 = max(0, int(y0)), max(0, int(y1))
+    if x1 <= x0 or y1 <= y0:
+        return False
+    m = ink[y0:y1, x0:x1] > INK_MIN
+    px = hsv[y0:y1, x0:x1][m]
+    strong = px[px[:, 1] > GOLD_SAT]
+    if strong.shape[0] < 10:
+        return False
+    hue = strong[:, 0]
+    gold = float(((hue >= GOLD_HUE[0]) & (hue <= GOLD_HUE[1])).mean())
+    return gold <= NOT_GOLD_MAX
+
+
 def _side(cv2, np, ink, x0, y_top, scale, tag, jx):
     fit = _fit_tag(cv2, np, ink, x0, y_top - int(round(1 * scale)), scale, tag, jx, int(round(3 * scale)))
     return fit
+
+
+def _classify_killer(cv2, np, hsv, ink, left, icon_x0, r0, r1, scale, tag, *, self_only: bool = False):
+    """Fit and classify killer side at a single scale."""
+    cols = np.nonzero((ink[r0:r1 + 1, left - 1:max(left, icon_x0 - 1)] > INK_MIN).any(axis=0))[0]
+    if cols.size == 0:
+        return {"killer_reason": "no_killer_ink"}
+    killer_end = left - 1 + int(cols.max())
+    fit = _side(cv2, np, ink, left, r0, scale, tag, int(round(3 * scale)))
+    gold = _gold_share(cv2, np, hsv, ink, left - 1, icon_x0 - 1, r0, r1 + 1)
+    res = _classify(cv2, np, ink, fit, scale, tag, killer_end, icon_x0, "killer", word_x0=left, gold=gold, self_only=self_only)
+    return res, gold, left - 1, icon_x0 - 1
+
+
+def _classify_victim(cv2, np, hsv, ink, vx0, r0, r1, scale, tag, *, self_only: bool = False):
+    """Fit and classify victim side at a single scale."""
+    pitch = 7.0 * scale
+    span = int(round(VICTIM_SPAN_PITCH * pitch))
+    fit = _fit_tag(
+        cv2, np, ink, vx0 + span // 2, r0 - int(round(scale)), scale, tag,
+        span // 2, int(round(3 * scale)), VICTIM_PITCH_RANGE,
+    )
+    if fit.template is None:
+        return {"victim_reason": "font_pack_missing"}
+    vcols = np.nonzero((ink[r0:r1 + 1, fit.x:] > INK_MIN).any(axis=0))[0]
+    victim_end = fit.x + int(_word_end(vcols, pitch))
+    gold = _gold_share(cv2, np, hsv, ink, fit.x, fit.x + fit.template.shape[1], r0, r1 + 1)
+    res = _classify(cv2, np, ink, fit, scale, tag, victim_end, None, "victim", gold=gold, self_only=self_only)
+    return res, gold, fit.x, fit.x + fit.template.shape[1]
+
+
+def _row_runs_with_large_split(strip, scale: float):
+    """Standard row runs plus splitting oversized halo-bridged Large-Text blocks."""
+    min_h = int(LINE_MIN_H * scale)
+    max_h = int(round(LINE_MAX_H * scale))
+    large_max_h = int(round(LARGE_LINE_MAX_H * scale))
+    counts = strip.sum(axis=1)
+    profile = counts >= 2
+    runs = _row_runs(profile, min_h, max_h)
+    oversized = _row_runs(profile, max_h + 1, int(round(80 * scale)))
+    if not oversized:
+        return runs
+    seen = set(runs)
+    for s0, s1 in oversized:
+        if s1 - s0 + 1 <= large_max_h:
+            cand = (s0, s1)
+            if cand not in seen:
+                runs.append(cand)
+                seen.add(cand)
+            continue
+        sub_profile = counts[s0:s1 + 1] >= max(VALLEY_COLS_MIN, int(round(VALLEY_COLS_MIN * scale)))
+        for sub0, sub1 in _row_runs(sub_profile, min_h, large_max_h):
+            cand = (s0 + sub0, s0 + sub1)
+            if cand not in seen:
+                runs.append(cand)
+                seen.add(cand)
+    runs.sort()
+    return runs
 
 
 def read_killfeed_lines(img, tag: str | None = None) -> dict:
@@ -348,15 +487,16 @@ def read_killfeed_lines(img, tag: str | None = None) -> dict:
     band = bgr[y0b:y1b, :x1b]
     hsv = cv2.cvtColor(band, cv2.COLOR_BGR2HSV)
     ink = _tophat(cv2, np, hsv[:, :, 2], scale)
+    ink_large = None
     on = ink > INK_MIN
     left = int(round(FEED_LEFT_X * scale))
     pitch = 7.0 * scale
     strip = on[:, max(0, left - 1):left + int(round(2.5 * pitch))]
-    profile = strip.sum(axis=1) >= 2
-    runs = _row_runs(profile, int(LINE_MIN_H * scale), int(round(LINE_MAX_H * scale)))
+    runs = _row_runs_with_large_split(strip, scale)
     white = ((hsv[:, :, 1] < ICON_SAT_MAX) & (hsv[:, :, 2] > ICON_VAL_MIN)).astype(np.uint8)
     white = cv2.morphologyEx(white, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (5, 3)))
     lines = []
+    large_scale = scale * LARGE_TEXT_SCALE
     for r0, r1 in runs:
         ya, yb = max(0, r0 - 2), min(band.shape[0], r1 + 3)
         n, lab, st, _ = cv2.connectedComponentsWithStats(white[ya:yb, :], connectivity=8)
@@ -373,33 +513,41 @@ def read_killfeed_lines(img, tag: str | None = None) -> dict:
         if icon is None:
             continue
         icon_x0, icon_w = icon
-        killer_cols = np.nonzero(on[r0:r1 + 1, left - 1:max(left, icon_x0 - 1)].any(axis=0))[0]
         line = {
             "y": int(y0b + r0), "h": int(r1 - r0 + 1), "icon_x": int(icon_x0),
             "killer": UNREADABLE, "killer_conf": 0.0, "killer_reason": None,
             "victim": UNREADABLE, "victim_conf": 0.0, "victim_reason": None,
         }
-        if killer_cols.size == 0:
-            line["killer_reason"] = "no_killer_ink"
+        k_out = _classify_killer(cv2, np, hsv, ink, left, icon_x0, r0, r1, scale, tag)
+        if isinstance(k_out, dict):
+            line.update(k_out)
         else:
-            killer_end = left - 1 + int(killer_cols.max())
-            fit = _side(cv2, np, ink, left, r0, scale, tag, int(round(3 * scale)))
-            gold = _gold_share(cv2, np, hsv, ink, left - 1, icon_x0 - 1, r0, r1 + 1)
-            line.update(_classify(cv2, np, ink, fit, scale, tag, killer_end, icon_x0, "killer", word_x0=left, gold=gold))
+            k_res, k_gold, kx0, kx1 = k_out
+            if k_res.get("killer") != SELF and not _is_colored_non_gold(hsv, ink, kx0, kx1, r0, r1 + 1):
+                if ink_large is None:
+                    ink_large = _tophat(cv2, np, hsv[:, :, 2], large_scale)
+                kl_out = _classify_killer(cv2, np, hsv, ink_large, left, icon_x0, r0, r1, large_scale, tag, self_only=True)
+                if not isinstance(kl_out, dict) and kl_out[0].get("killer") == SELF:
+                    k_res = kl_out[0]
+                    k_res["killer_hud_scale"] = LARGE_TEXT_SCALE
+            line.update(k_res)
         line["killer_sig"] = _signature(cv2, np, ink, left - 1, r0, 16 * pitch, scale)
         # Victim: the tag is slid across the stretch after the icon. Skull or
         # headshot marks can sit between the icon and the name.
         vx0 = icon_x0 + icon_w
-        span = int(round(VICTIM_SPAN_PITCH * pitch))
-        fit = _fit_tag(cv2, np, ink, vx0 + span // 2, r0 - int(round(scale)), scale, tag,
-                       span // 2, int(round(3 * scale)), VICTIM_PITCH_RANGE)
-        if fit.template is None:
-            line["victim_reason"] = "font_pack_missing"
+        v_out = _classify_victim(cv2, np, hsv, ink, vx0, r0, r1, scale, tag)
+        if isinstance(v_out, dict):
+            line.update(v_out)
         else:
-            vcols = np.nonzero(on[r0:r1 + 1, fit.x:].any(axis=0))[0]
-            victim_end = fit.x + int(_word_end(vcols, pitch))
-            gold = _gold_share(cv2, np, hsv, ink, fit.x, fit.x + fit.template.shape[1], r0, r1 + 1)
-            line.update(_classify(cv2, np, ink, fit, scale, tag, victim_end, None, "victim", gold=gold))
+            v_res, v_gold, vx_a, vx_b = v_out
+            if v_res.get("victim") != SELF and not _is_colored_non_gold(hsv, ink, vx_a, vx_b, r0, r1 + 1):
+                if ink_large is None:
+                    ink_large = _tophat(cv2, np, hsv[:, :, 2], large_scale)
+                vl_out = _classify_victim(cv2, np, hsv, ink_large, vx0, r0, r1, large_scale, tag, self_only=True)
+                if not isinstance(vl_out, dict) and vl_out[0].get("victim") == SELF:
+                    v_res = vl_out[0]
+                    v_res["victim_hud_scale"] = LARGE_TEXT_SCALE
+            line.update(v_res)
         line["victim_sig"] = _signature(cv2, np, ink, icon_x0, r0, 18 * pitch, scale)
         lines.append(line)
     return {"ok": True, "reason": "read", "lines": lines, "scale": scale}
@@ -434,27 +582,33 @@ def _signature(cv2, np, ink, x0, r0, width, scale):
     return None if n < 1e-6 else (v / n)
 
 
-def _legibility(cv2, np, ink, x0, y_top, n_cells, pitch):
+def _legibility(cv2, np, ink, x0, y_top, n_cells, base_pitch, scale=1.0):
     """How much the stretch reads as font text: 20th percentile of the best glyph per cell."""
-    temps = _glyph_templates(pitch)
-    t0 = next(iter(temps.values()))
+    mat_info = _glyph_matrix(np, base_pitch, scale=scale)
+    if mat_info is None:
+        return 0.0
+    _chars, _idx_map, _mat, th, tw = mat_info
+    pitch = base_pitch * scale
     best = []
     for i in range(max(1, n_cells)):
         cx = int(round(x0 + i * pitch))
-        patch = ink[max(0, y_top - 2):y_top + t0.shape[0] + 1, max(0, cx - 1):cx + t0.shape[1] + 1]
-        best.append(max(_ncc(cv2, patch, t)[0] for t in temps.values() if t is not None))
+        patch = ink[max(0, y_top - 2):y_top + th + 1, max(0, cx - 1):cx + tw + 1]
+        best.append(_patch_glyph_max(np, patch, mat_info)[0])
     return float(np.percentile(best, 20))
 
 
-def _glyph_after(cv2, np, ink, fit: _Fit, pitch, scale, n):
+def _glyph_after(cv2, np, ink, fit: _Fit, base_pitch, scale, n):
     """True when the cell right after the tag holds a font glyph, not a speck."""
-    temps = _glyph_templates(pitch)
-    t0 = temps.get("o")
+    mat_info = _glyph_matrix(np, base_pitch, scale=scale)
+    if mat_info is None:
+        return False
+    _chars, _idx_map, _mat, th, tw = mat_info
+    pitch = base_pitch * scale
     cx = int(round(fit.x + n * pitch))
-    patch = ink[max(0, fit.y - 1):fit.y + t0.shape[0] + 1, max(0, cx - 1):cx + t0.shape[1] + 1]
+    patch = ink[max(0, fit.y - 1):fit.y + th + 1, max(0, cx - 1):cx + tw + 1]
     if int((patch > INK_MIN).sum()) < int(round(6 * scale * scale)):
         return False
-    best = max(_ncc(cv2, patch, t)[0] for t in temps.values() if t is not None)
+    best, _ = _patch_glyph_max(np, patch, mat_info)
     return best >= NEXT_GLYPH_MIN
 
 
@@ -495,12 +649,15 @@ def _gold_share(cv2, np, hsv, ink, x0, x1, y0, y1):
     return float(((hue >= GOLD_HUE[0]) & (hue <= GOLD_HUE[1])).mean())
 
 
-def _classify(cv2, np, ink, fit: _Fit, scale, tag, word_end, icon_x0, side, word_x0=None, gold=None):
+def _classify(cv2, np, ink, fit: _Fit, scale, tag, word_end, icon_x0, side, word_x0=None, gold=None, *, self_only: bool = False):
     """self, not_self or unreadable for one side of a line. Never a guess."""
     out = {f"{side}_score": round(fit.score, 4), f"{side}_gold": None if gold is None else round(gold, 3)}
     val, conf, why = side, f"{side}_conf", f"{side}_reason"
     if fit.template is None:
         out[val], out[conf], out[why] = UNREADABLE, 0.0, "font_pack_missing"
+        return out
+    if self_only and fit.score < SELF_MIN:
+        out[val], out[conf], out[why] = UNREADABLE, round(fit.score, 4), "below_self_min"
         return out
     pitch = fit.pitch * scale
     x0 = fit.x if word_x0 is None else word_x0
@@ -508,7 +665,7 @@ def _classify(cv2, np, ink, fit: _Fit, scale, tag, word_end, icon_x0, side, word
     chars = (word_end - x0 + 1 + 1.0 * scale) / pitch
     out[f"{side}_chars"] = round(chars, 2)
     if fit.score >= SELF_MIN:
-        if _glyph_after(cv2, np, ink, fit, pitch, scale, len(tag)):
+        if _glyph_after(cv2, np, ink, fit, fit.pitch, scale, len(tag)):
             # A glyph follows the tag before the icon: a longer name, not this tag.
             out[val], out[conf], out[why] = NOT_SELF, round(fit.score, 4), "longer_name"
             return out
@@ -529,7 +686,7 @@ def _classify(cv2, np, ink, fit: _Fit, scale, tag, word_end, icon_x0, side, word
             out[val], out[conf], out[why] = UNREADABLE, round(fit.score, 4), note
         return out
     n_cells = max(1, int(round(chars)))
-    legible = _legibility(cv2, np, ink, x0, fit.y + int(round(scale)), n_cells, pitch)
+    legible = _legibility(cv2, np, ink, x0, fit.y + int(round(scale)), n_cells, fit.pitch, scale=scale)
     out[f"{side}_legibility"] = round(legible, 4)
     if legible >= LEGIBLE_MIN and fit.score <= NOT_SELF_MAX:
         out[val], out[conf], out[why] = NOT_SELF, round(min(legible, 1.0 - fit.score), 4), "tag_mismatch"
