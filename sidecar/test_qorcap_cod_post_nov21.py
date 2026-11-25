@@ -308,3 +308,26 @@ def test_reconcile_events_and_burst_windows():
     assert bursts[0]["events"] == ["HIT", "KILL"]
     assert bursts[0]["clock_note"] == "same clock domain; residual UNMEASURED"
     assert bursts[0]["info_only"] is True and bursts[0]["counted"] is False
+
+
+def test_killfeed_large_text_gold_near_miss_returns_unreadable():
+    """#199 N1: 1.25x gold look-alike near-miss must return UNREADABLE, never NOT_SELF."""
+    frame = _canvas()
+    gold = (30, 195, 245)
+    red = (40, 40, 235)
+    # Gold 1.25x near-miss killer look-alike ("Qortrola31") + red victim
+    _paste_word(frame, "Qortrola31", 30, 450, pitch=7.0, scale=1.25, bgr=gold)
+    cv2.rectangle(frame, (132, 453), (156, 463), (245, 245, 245), -1)
+    _paste_word(frame, "TargetOne", 162, 450, pitch=6.6, scale=1.25, bgr=red)
+    # Non-gold cyan rival at 1.0x still returns not_self
+    cyan = (230, 190, 30)
+    _paste_word(frame, "AllyTag99", 30, 492, pitch=7.0, scale=1.0, bgr=cyan)
+    cv2.rectangle(frame, (118, 494), (144, 502), (240, 240, 240), -1)
+    _paste_word(frame, "OtherFoe", 150, 492, pitch=7.0, scale=1.0, bgr=red)
+
+    res = kf.read_killfeed_lines(frame)
+    assert res["ok"] is True
+    assert len(res["lines"]) == 2
+    assert res["lines"][0]["killer"] == kf.UNREADABLE
+    assert res["lines"][0].get("killer_hud_scale") == 1.25
+    assert res["lines"][1]["killer"] == kf.NOT_SELF
