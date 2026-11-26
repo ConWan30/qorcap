@@ -52,6 +52,10 @@ ENV_LANE = "QORCAP_LANE"
 ENV_FLAG = "QORCAP_SHADOW_MNV4"
 ENV_MODEL = "QORCAP_SHADOW_MNV4_MODEL"
 ENV_MODEL_ID = "QORCAP_SHADOW_MNV4_MODEL_ID"
+ENV_METRICS = "QORCAP_SHADOW_MNV4_METRICS"
+ENV_TEMPERATURE = "QORCAP_SHADOW_MNV4_TEMPERATURE"
+ENV_TAU_LOW_BPS = "QORCAP_SHADOW_MNV4_TAU_LOW_BPS"
+ENV_TAU_HIGH_BPS = "QORCAP_SHADOW_MNV4_TAU_HIGH_BPS"
 ENV_SPLIT = "QORCAP_SHADOW_SPLIT"
 ENV_DB = "QORCAP_SHADOW_DB"
 ENV_OUT = "QORCAP_SHADOW_OUT"
@@ -558,6 +562,191 @@ def verdict_from_bps(
     if confidence_bps <= tau_low_bps:
         return "NO_HIT"
     return "ABSTAIN"
+
+
+def validate_calibration(
+    temperature: float,
+    tau_low_bps: int,
+    tau_high_bps: int,
+) -> tuple[float, int, int]:
+    """Validate softmax temperature (> 0, finite) and integer decision gates (0 <= low < high <= 10000)."""
+    if isinstance(temperature, bool) or not isinstance(temperature, (int, float)):
+        raise ShadowRunnerError(f"invalid temperature {temperature!r}; expected positive finite number")
+    temp_f = float(temperature)
+    if not math.isfinite(temp_f) or temp_f <= 0.0:
+        raise ShadowRunnerError(f"invalid temperature {temperature!r}; must be > 0 and finite")
+    for name, val in (("tau_low_bps", tau_low_bps), ("tau_high_bps", tau_high_bps)):
+        if isinstance(val, bool) or not isinstance(val, int):
+            raise ShadowRunnerError(f"invalid {name} {val!r}; expected integer basis points")
+    if not (0 <= tau_low_bps < tau_high_bps <= 10000):
+        raise ShadowRunnerError(
+            f"invalid thresholds tau_low_bps={tau_low_bps}, tau_high_bps={tau_high_bps}; require 0 <= low < high <= 10000"
+        )
+    return temp_f, tau_low_bps, tau_high_bps
+
+
+def _parse_gate_bps(data: dict, bps_key: str, float_key: str) -> int:
+    if bps_key in data and data[bps_key] is not None:
+        raw = data[bps_key]
+        if isinstance(raw, bool) or not isinstance(raw, int):
+            raise ShadowRunnerError(f"metrics field {bps_key!r} must be an integer, got {raw!r}")
+        return raw
+    gate = data.get("calibrated_gate")
+    if isinstance(gate, dict) and float_key in gate and gate[float_key] is not None:
+        raw_f = gate[float_key]
+        if isinstance(raw_f, bool) or not isinstance(raw_f, (int, float)):
+            raise ShadowRunnerError(f"metrics field calibrated_gate.{float_key} must be numeric, got {raw_f!r}")
+        val_f = float(raw_f)
+        if not math.isfinite(val_f):
+            raise ShadowRunnerError(f"metrics field calibrated_gate.{float_key} is non-finite: {raw_f!r}")
+        return int(round(val_f * 10000.0))
+    raise ShadowRunnerError(
+        f"metrics JSON missing required threshold {bps_key!r} (or calibrated_gate.{float_key})"
+    )
+
+
+def load_model_calibration(
+    metrics_path: Path,
+    *,
+    expected_model_sha256: str | None = None,
+) -> dict:
+    """Load and validate temperature, tau_low_bps, tau_high_bps, and optional onnx_sha256 from metrics JSON."""
+    mp = Path(metrics_path)
+    if not mp.is_file():
+        raise ShadowRunnerError(f"metrics JSON file not found: {mp}")
+    try:
+        data = json.loads(mp.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise ShadowRunnerError(f"failed to parse metrics JSON {mp}: {exc}") from exc
+    if not isinstance(data, dict):
+        raise ShadowRunnerError(f"metrics JSON {mp} must be a JSON object")
+
+    metrics_sha = data.get("onnx_sha256")
+    if metrics_sha is not None:
+        if not isinstance(metrics_sha, str) or len(metrics_sha.strip()) != 64:
+            raise ShadowRunnerError(f"invalid onnx_sha256 in metrics JSON {mp}: {metrics_sha!r}")
+        try:
+            int(metrics_sha.strip(), 16)
+        except ValueError as exc:
+            raise ShadowRunnerError(f"non-hex onnx_sha256 in metrics JSON {mp}: {metrics_sha!r}") from exc
+        norm_metrics_sha = metrics_sha.strip().lower()
+        if expected_model_sha256 is not None and norm_metrics_sha != expected_model_sha256.strip().lower():
+            raise ShadowRunnerError(
+                f"metrics JSON {mp} onnx_sha256 ({norm_metrics_sha}) does not match model SHA-256 ({expected_model_sha256.lower()})"
+            )
+    else:
+        norm_metrics_sha = None
+
+    if "temperature" not in data or data["temperature"] is None:
+        raise ShadowRunnerError(f"metrics JSON {mp} missing required field 'temperature'")
+
+    tau_low_bps = _parse_gate_bps(data, "tau_low_bps", "tau_low")
+    tau_high_bps = _parse_gate_bps(data, "tau_high_bps", "tau_high")
+    temp_f, tau_low_i, tau_high_i = validate_calibration(data["temperature"], tau_low_bps, tau_high_bps)
+
+    raw_model_id = data.get("model_id")
+    model_id = raw_model_id.strip() if isinstance(raw_model_id, str) and raw_model_id.strip() else None
+
+    return {
+        "model_id": model_id,
+        "temperature": temp_f,
+        "tau_low_bps": tau_low_i,
+        "tau_high_bps": tau_high_i,
+        "onnx_sha256": norm_metrics_sha,
+        "metrics_path": str(mp),
+    }
+
+
+def resolve_calibration(
+    *,
+    metrics_path: Path | None = None,
+    model_id: str | None = None,
+    temperature: float | None = None,
+    tau_low_bps: int | None = None,
+    tau_high_bps: int | None = None,
+    expected_model_sha256: str | None = None,
+    environ=None,
+) -> dict:
+    """Resolve model calibration with precedence: explicit > env vars > metrics JSON > legacy v2 defaults."""
+    env = os.environ if environ is None else environ
+    resolved_model_id = DEFAULT_MODEL_ID
+    resolved_temp = DEFAULT_TEMPERATURE
+    resolved_low = DEFAULT_TAU_LOW_BPS
+    resolved_high = DEFAULT_TAU_HIGH_BPS
+    sources: list[str] = []
+    resolved_metrics_path: str | None = None
+
+    eff_metrics = metrics_path
+    if eff_metrics is None:
+        raw_env_metrics = env.get(ENV_METRICS)
+        if isinstance(raw_env_metrics, str) and raw_env_metrics.strip():
+            eff_metrics = Path(raw_env_metrics.strip())
+    if eff_metrics is not None:
+        loaded = load_model_calibration(eff_metrics, expected_model_sha256=expected_model_sha256)
+        if loaded["model_id"]:
+            resolved_model_id = loaded["model_id"]
+        resolved_temp = loaded["temperature"]
+        resolved_low = loaded["tau_low_bps"]
+        resolved_high = loaded["tau_high_bps"]
+        resolved_metrics_path = loaded["metrics_path"]
+        sources.append("metrics_json")
+
+    env_used = False
+    raw_env_mid = env.get(ENV_MODEL_ID)
+    if isinstance(raw_env_mid, str) and raw_env_mid.strip():
+        resolved_model_id = raw_env_mid.strip()
+        env_used = True
+    raw_env_temp = env.get(ENV_TEMPERATURE)
+    if isinstance(raw_env_temp, str) and raw_env_temp.strip():
+        try:
+            resolved_temp = float(raw_env_temp.strip())
+        except ValueError as exc:
+            raise ShadowRunnerError(f"invalid {ENV_TEMPERATURE}={raw_env_temp!r}") from exc
+        env_used = True
+    raw_env_low = env.get(ENV_TAU_LOW_BPS)
+    if isinstance(raw_env_low, str) and raw_env_low.strip():
+        try:
+            resolved_low = int(raw_env_low.strip(), 10)
+        except ValueError as exc:
+            raise ShadowRunnerError(f"invalid {ENV_TAU_LOW_BPS}={raw_env_low!r}") from exc
+        env_used = True
+    raw_env_high = env.get(ENV_TAU_HIGH_BPS)
+    if isinstance(raw_env_high, str) and raw_env_high.strip():
+        try:
+            resolved_high = int(raw_env_high.strip(), 10)
+        except ValueError as exc:
+            raise ShadowRunnerError(f"invalid {ENV_TAU_HIGH_BPS}={raw_env_high!r}") from exc
+        env_used = True
+    if env_used:
+        sources.append("env")
+
+    explicit_used = False
+    if model_id is not None:
+        if not isinstance(model_id, str) or not model_id.strip():
+            raise ShadowRunnerError(f"invalid model_id {model_id!r}")
+        resolved_model_id = model_id.strip()
+        explicit_used = True
+    if temperature is not None:
+        resolved_temp = temperature
+        explicit_used = True
+    if tau_low_bps is not None:
+        resolved_low = tau_low_bps
+        explicit_used = True
+    if tau_high_bps is not None:
+        resolved_high = tau_high_bps
+        explicit_used = True
+    if explicit_used:
+        sources.append("explicit")
+
+    temp_f, low_i, high_i = validate_calibration(resolved_temp, resolved_low, resolved_high)
+    return {
+        "model_id": resolved_model_id,
+        "temperature": temp_f,
+        "tau_low_bps": low_i,
+        "tau_high_bps": high_i,
+        "calibration_source": "+".join(sources) if sources else "default_v2",
+        "metrics_path": resolved_metrics_path,
+    }
 
 
 def _make_onnx_infer_fn(model_path: Path, temperature: float = DEFAULT_TEMPERATURE):
@@ -1074,17 +1263,19 @@ def run_shadow_on_match(
     *,
     dataset_split: str,
     model_path: Path | None = None,
-    model_id: str = DEFAULT_MODEL_ID,
+    metrics_path: Path | None = None,
+    model_id: str | None = None,
     out_root: Path | None = None,
     db_path: Path | None = None,
     inputs_path: Path | None = None,
     infer_fn=None,
-    temperature: float = DEFAULT_TEMPERATURE,
-    tau_low_bps: int = DEFAULT_TAU_LOW_BPS,
-    tau_high_bps: int = DEFAULT_TAU_HIGH_BPS,
+    temperature: float | None = None,
+    tau_low_bps: int | None = None,
+    tau_high_bps: int | None = None,
     corroboration_window_ms: int = CORROBORATION_WINDOW_MS,
     corrob_sample_interval_ms: int = CORROBORATION_SAMPLE_INTERVAL_MS,
     extract_clips: bool = True,
+    environ=None,
 ) -> dict:
     """Execute post-match shadow inference, SQL sync, and review pack generation strictly outside ``match_dir``."""
     import cv2
@@ -1096,18 +1287,38 @@ def run_shadow_on_match(
     session_id = require_safe_leaf(match_dir.name)
     split = validate_dataset_split(dataset_split)
 
-    resolved_out = Path(out_root) if out_root is not None else default_out_root()
-    resolved_db = Path(db_path) if db_path is not None else default_db_path()
+    resolved_out = Path(out_root) if out_root is not None else default_out_root(environ)
+    resolved_db = Path(db_path) if db_path is not None else default_db_path(environ)
     session_out = resolved_out / session_id
     review_dir = resolved_out / REVIEW_ROOT_NAME / session_id
     _ensure_out_outside_match(session_out, match_dir)
     _ensure_out_outside_match(review_dir, match_dir)
     _ensure_out_outside_match(resolved_db, match_dir)
 
+    real_model_sha: str | None = (
+        _sha256_file(Path(model_path))
+        if (model_path is not None and Path(model_path).is_file())
+        else None
+    )
+    if infer_fn is None and real_model_sha is None:
+        raise ShadowRunnerError(f"shadow model file missing: {model_path!r}")
+
+    calibration = resolve_calibration(
+        metrics_path=metrics_path,
+        model_id=model_id,
+        temperature=temperature,
+        tau_low_bps=tau_low_bps,
+        tau_high_bps=tau_high_bps,
+        expected_model_sha256=real_model_sha,
+        environ=environ,
+    )
+    model_id = calibration["model_id"]
+    temperature = calibration["temperature"]
+    tau_low_bps = calibration["tau_low_bps"]
+    tau_high_bps = calibration["tau_high_bps"]
+
     if infer_fn is None:
-        if model_path is None or not Path(model_path).is_file():
-            raise ShadowRunnerError(f"shadow model file missing: {model_path!r}")
-        model_sha256 = _sha256_file(Path(model_path))
+        model_sha256 = real_model_sha
         runner = _make_onnx_infer_fn(Path(model_path), temperature=temperature)
     else:
         if model_path is not None and Path(model_path).is_file():
@@ -1397,6 +1608,11 @@ def run_shadow_on_match(
         "dataset_split": split,
         "model_id": model_id,
         "model_sha256": model_sha256,
+        "temperature": temperature,
+        "tau_low_bps": tau_low_bps,
+        "tau_high_bps": tau_high_bps,
+        "calibration_source": calibration["calibration_source"],
+        "metrics_path": calibration["metrics_path"],
         "total_events_logged": len(events),
         "review_queue_count": len(manifest_items),
         "items": manifest_items,
@@ -1407,6 +1623,11 @@ def run_shadow_on_match(
     return {
         "session_id": session_id,
         "dataset_split": split,
+        "model_id": model_id,
+        "temperature": temperature,
+        "tau_low_bps": tau_low_bps,
+        "tau_high_bps": tau_high_bps,
+        "calibration_source": calibration["calibration_source"],
         "db_path": str(resolved_db),
         "shadow_jsonl": str(jsonl_path),
         "review_dir": str(review_dir),
@@ -1572,10 +1793,10 @@ def maybe_run_cod_mnv4_shadow(
             Path(bundle),
             dataset_split=env[ENV_SPLIT].strip(),
             model_path=Path(env[ENV_MODEL].strip()),
-            model_id=(env.get(ENV_MODEL_ID) or DEFAULT_MODEL_ID).strip(),
             out_root=Path(out_root) if out_root is not None else default_out_root(env),
             db_path=Path(db_path) if db_path is not None else default_db_path(env),
             infer_fn=infer_fn,
+            environ=env,
         )
         if say is not None:
             say(
@@ -1601,7 +1822,11 @@ def main(argv=None) -> int:
     p_an.add_argument("--match-dir", required=True)
     p_an.add_argument("--split", required=True, choices=VALID_SPLITS)
     p_an.add_argument("--model", required=True)
-    p_an.add_argument("--model-id", default=DEFAULT_MODEL_ID)
+    p_an.add_argument("--metrics", help="Optional model train_metrics_*.json with temperature & tau gates")
+    p_an.add_argument("--model-id", default=None)
+    p_an.add_argument("--temperature", type=float, default=None, help="Override softmax temperature (> 0)")
+    p_an.add_argument("--tau-low-bps", type=int, default=None, help="Override NO_HIT threshold (0..10000)")
+    p_an.add_argument("--tau-high-bps", type=int, default=None, help="Override GUNFIRE_HIT threshold (0..10000)")
     p_an.add_argument("--out", help="Output root outside match folder")
     p_an.add_argument("--db", help="SQLite DB path")
     p_an.add_argument("--inputs", help="Optional explicit inputs.jsonl or hand_timeline.v0.jsonl path")
@@ -1630,7 +1855,11 @@ def main(argv=None) -> int:
             Path(args.match_dir),
             dataset_split=args.split,
             model_path=Path(args.model),
+            metrics_path=Path(args.metrics) if args.metrics else None,
             model_id=args.model_id,
+            temperature=args.temperature,
+            tau_low_bps=args.tau_low_bps,
+            tau_high_bps=args.tau_high_bps,
             out_root=Path(args.out) if args.out else None,
             db_path=Path(args.db) if args.db else None,
             inputs_path=Path(args.inputs) if args.inputs else None,
