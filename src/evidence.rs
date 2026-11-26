@@ -276,6 +276,33 @@ mod tests {
         assert!(jcs(&json!({"x": 1.5})).is_err());
     }
     #[test]
+    fn shadow_hit_v0_jcs_no_floats() {
+        let ok = json!({
+            "schema": "qor.shadow_hit.v0",
+            "info_only": true,
+            "frame_idx": 14822,
+            "t_ammo_ms": 247033,
+            "model_id": "cod_gunfire_hit_v2",
+            "model_sha256": "c".repeat(64),
+            "ammo_gate_passed": true,
+            "verdict": "GUNFIRE_HIT",
+            "confidence_bps": 8412,
+            "combat_state": {"ads_active": true, "fire_mode": "FULL_AUTO_SPRAY"},
+            "triage_reason": "DISAGREEMENT_FP"
+        });
+        let canon = jcs(&ok).unwrap();
+        assert_eq!(
+            canon,
+            format!(
+                "{{\"ammo_gate_passed\":true,\"combat_state\":{{\"ads_active\":true,\"fire_mode\":\"FULL_AUTO_SPRAY\"}},\"confidence_bps\":8412,\"frame_idx\":14822,\"info_only\":true,\"model_id\":\"cod_gunfire_hit_v2\",\"model_sha256\":\"{}\",\"schema\":\"qor.shadow_hit.v0\",\"t_ammo_ms\":247033,\"triage_reason\":\"DISAGREEMENT_FP\",\"verdict\":\"GUNFIRE_HIT\"}}",
+                "c".repeat(64)
+            )
+        );
+        let mut with_float = ok.clone();
+        with_float["confidence_bps"] = json!(0.8412);
+        assert!(jcs(&with_float).is_err());
+    }
+    #[test]
     fn pattern_matches_python() {
         assert_eq!(pattern_for("00112233445566778899aabbccddeeff").unwrap(), ["OPTIONS", "CROSS", "SQUARE", "DOWN", "SQUARE"]);
         assert_eq!(pattern_for("ffffffffffffffffffffffffffffffff").unwrap(), ["OPTIONS", "SQUARE", "LEFT", "DOWN", "UP"]);
