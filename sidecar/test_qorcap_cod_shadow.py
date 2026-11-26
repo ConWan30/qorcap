@@ -538,3 +538,163 @@ def test_equipment_l1_r1_excluded_and_lane_gating(tmp_path):
     assert qorcap_match.maybe_run_cod_mnv4_shadow(
         match_dir, "madden", environ={"QORCAP_LANE": "practice", "QORCAP_SHADOW_MNV4_MODEL": str(fake_model), "QORCAP_SHADOW_SPLIT": "train_pool"}
     ) is False
+
+
+# ----------------------------------------------------------------- 9. AG-SCOUT B1-B3 regression tests
+def _write_custom_video_match(
+    match_dir: Path,
+    *,
+    mag_schedule: list[int],
+    r2_end_us: int = 1_200_000,
+) -> Path:
+    """Create a synthetic match folder with configurable per-frame magazine ammo sequence."""
+    match_dir.mkdir(parents=True, exist_ok=True)
+    w, h = 320, 240
+    fps = 60
+    n_frames = len(mag_schedule)
+    video_path = match_dir / "video.mp4"
+    writer = cv2.VideoWriter(str(video_path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
+    assert writer.isOpened()
+    try:
+        for mag in mag_schedule:
+            writer.write(_make_digit_img(mag, w, h))
+    finally:
+        writer.release()
+
+    fc_lines = [
+        json.dumps({"type": "frame", "file": "video.mp4", "frame": idx, "pts_90k": idx * 1500, "t_mono_us": idx * 16667})
+        for idx in range(n_frames)
+    ]
+    (match_dir / "frame_clock.jsonl").write_text("\n".join(fc_lines) + "\n", encoding="utf-8")
+    in_rows = [
+        {"type": "hb", "t_us": 0, "faults": 0},
+        {"type": "in", "t_us": 50_000, "r2": 220, "l2": 220, "buttons": []},
+        {"type": "in", "t_us": r2_end_us, "r2": 0, "l2": 0, "buttons": []},
+        {"type": "hb", "t_us": r2_end_us + 50_000, "faults": 0},
+    ]
+    (match_dir / "inputs.jsonl").write_text("\n".join(json.dumps(r) for r in in_rows) + "\n", encoding="utf-8")
+    return video_path
+
+
+def test_b1_multi_round_ammo_drop_logged(tmp_path):
+    """B1: 2..5 round drops per step are logged; huge jumps (>5) are excluded as reloads/glitches."""
+    # Frame 6: 30->28 (-2), Frame 16: 28->24 (-4), Frame 26: 24->10 (-14, ignored)
+    schedule = [30] * 6 + [28] * 10 + [24] * 10 + [10] * 15
+    match_dir = tmp_path / "sess_b1"
+    _write_custom_video_match(match_dir, mag_schedule=schedule, r2_end_us=900_000)
+
+    db_path = tmp_path / "index.sqlite"
+    res = shadow.run_shadow_on_match(
+        match_dir,
+        dataset_split="train_pool",
+        out_root=tmp_path / "out",
+        db_path=db_path,
+        infer_fn=lambda _t: 8500,
+        extract_clips=False,
+    )
+    assert res["events_count"] == 2
+    conn = shadow.init_shadow_db(db_path)
+    try:
+        frames = [r["frame_idx"] for r in conn.execute("SELECT frame_idx FROM shadow_hit_events ORDER BY frame_idx").fetchall()]
+    finally:
+        conn.close()
+    assert frames == [6, 16]
+
+
+def test_b2_killfeed_corroborates_without_match_json(tmp_path, monkeypatch):
+    """B2: read_killfeed_lines runs with tag=None (OWNER_TAG fallback) even without match.json."""
+    import qorcap_cod_killfeed as kf_mod
+
+    schedule = [30] * 8 + [29] * 22
+    match_dir = tmp_path / "sess_b2"
+    _write_custom_video_match(match_dir, mag_schedule=schedule)
+    assert not (match_dir / "match.json").exists()
+
+    seen_tags = []
+
+    def _fake_kf(_frame, tag=None):
+        seen_tags.append(tag)
+        return {"ok": True, "lines": [{"killer": kf_mod.SELF, "victim": kf_mod.NOT_SELF}]}
+
+    monkeypatch.setattr(kf_mod, "read_killfeed_lines", _fake_kf)
+
+    db_path = tmp_path / "index.sqlite"
+    shadow.run_shadow_on_match(
+        match_dir,
+        dataset_split="train_pool",
+        out_root=tmp_path / "out",
+        db_path=db_path,
+        infer_fn=lambda _t: 9100,
+        extract_clips=False,
+    )
+    assert seen_tags and all(t is None for t in seen_tags)
+    conn = shadow.init_shadow_db(db_path)
+    try:
+        row = dict(conn.execute("SELECT * FROM shadow_hit_events").fetchone())
+    finally:
+        conn.close()
+    assert row["killfeed_corroborated"] == 1
+    assert row["triage_reason"] != "DISAGREEMENT_FP"
+
+
+def test_b3_delayed_xp_and_killfeed_corroboration_within_2000ms(tmp_path, monkeypatch):
+    """B3: XP popup / killfeed arriving +500 ms after t_ammo (well past t_ammo+8=133ms) is still captured."""
+    import qorcap_cod_killfeed as kf_mod
+    import qorcap_cod_post_nov21 as cod199_mod
+
+    # 60 frames = ~1000 ms @ 60fps; t_ammo at frame 8 (~133 ms), t_ammo+8 at frame 16 (~266 ms),
+    # delayed XP + killfeed arrive during frames 36..44 (~600..733 ms, i.e. +467..+600 ms after t_ammo).
+    schedule = [30] * 8 + [29] * 52
+    match_dir = tmp_path / "sess_b3"
+    _write_custom_video_match(match_dir, mag_schedule=schedule, r2_end_us=950_000)
+
+    # Encode frame tag brightness in top-left pixel so fake readers know which frame is decoded
+    cap = cv2.VideoCapture(str(match_dir / "video.mp4"))
+    frames = []
+    while True:
+        ok, fr = cap.read()
+        if not ok:
+            break
+        frames.append(fr)
+    cap.release()
+    writer = cv2.VideoWriter(str(match_dir / "video.mp4"), cv2.VideoWriter_fourcc(*"mp4v"), 60, (320, 240))
+    for i, fr in enumerate(frames):
+        if 36 <= i <= 44:
+            fr[0:20, 0:20] = (0, 240, 240)
+        writer.write(fr)
+    writer.release()
+
+    def _fake_xp(frame):
+        # Delayed XP marker well after frame 16 (t_ammo + 8)
+        if int(frame[5, 5, 1]) > 180:
+            return {"ok": True, "state": "XP_POPUP", "xp_value": 100}
+        return {"ok": True, "state": "NONE", "xp_value": None}
+
+    def _fake_kf(frame, tag=None):
+        del tag
+        if int(frame[5, 5, 2]) > 180:
+            return {"ok": True, "lines": [{"killer": kf_mod.SELF}]}
+        return {"ok": True, "lines": []}
+
+    monkeypatch.setattr(cod199_mod, "read_kill_xp_popup", _fake_xp)
+    monkeypatch.setattr(kf_mod, "read_killfeed_lines", _fake_kf)
+
+    db_path = tmp_path / "index.sqlite"
+    shadow.run_shadow_on_match(
+        match_dir,
+        dataset_split="train_pool",
+        out_root=tmp_path / "out",
+        db_path=db_path,
+        inputs_path=match_dir / "inputs.jsonl",
+        infer_fn=lambda _t: 8900,
+        extract_clips=False,
+    )
+    conn = shadow.init_shadow_db(db_path)
+    try:
+        row = dict(conn.execute("SELECT * FROM shadow_hit_events").fetchone())
+    finally:
+        conn.close()
+    assert row["xp_popup_corroborated"] == 1
+    assert row["killfeed_corroborated"] == 1
+    assert row["triage_reason"] != "DISAGREEMENT_FP"
+

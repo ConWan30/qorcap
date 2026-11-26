@@ -72,6 +72,9 @@ R1_BIT = 1 << 5
 EQUIPMENT_PRE_US = 500_000
 EQUIPMENT_POST_US = 1_000_000
 SINGLE_TAP_MAX_US = 160_000
+MAX_AMMO_DROP_PER_STEP = 5
+CORROBORATION_WINDOW_MS = 2000
+CORROBORATION_SAMPLE_INTERVAL_MS = 100
 FRAME_FILE = "video.mp4"
 
 VALID_SPLITS = ("train_pool", "fresh_holdout")
@@ -598,14 +601,19 @@ def _hold_spans(samples: list[tuple[int, int]], last_t_us: int, threshold: int =
     return spans
 
 
-def parse_match_inputs(match_dir: Path) -> dict:
-    """Parse ``inputs.jsonl`` or ``hand_timeline.v0.jsonl`` for R2/L2 holds and L1/R1 presses."""
-    ip = match_dir / "inputs.jsonl"
-    if not ip.is_file():
-        hp = match_dir / "hand_timeline.v0.jsonl"
-        if not hp.is_file():
-            raise ShadowRunnerError(f"missing inputs.jsonl in {match_dir}")
-        ip = hp
+def parse_match_inputs(match_dir: Path, *, inputs_path: Path | None = None) -> dict:
+    """Parse ``inputs.jsonl``, optional ``--inputs`` override, or ``hand_timeline.v0.jsonl`` for R2/L2 and L1/R1."""
+    if inputs_path is not None:
+        ip = Path(inputs_path)
+        if not ip.is_file():
+            raise ShadowRunnerError(f"inputs override file not found: {ip}")
+    else:
+        ip = match_dir / "inputs.jsonl"
+        if not ip.is_file():
+            hp = match_dir / "hand_timeline.v0.jsonl"
+            if not hp.is_file():
+                raise ShadowRunnerError(f"missing inputs.jsonl in {match_dir}")
+            ip = hp
 
     r2_rows: list[tuple[int, int]] = []
     l2_rows: list[tuple[int, int]] = []
@@ -1069,10 +1077,13 @@ def run_shadow_on_match(
     model_id: str = DEFAULT_MODEL_ID,
     out_root: Path | None = None,
     db_path: Path | None = None,
+    inputs_path: Path | None = None,
     infer_fn=None,
     temperature: float = DEFAULT_TEMPERATURE,
     tau_low_bps: int = DEFAULT_TAU_LOW_BPS,
     tau_high_bps: int = DEFAULT_TAU_HIGH_BPS,
+    corroboration_window_ms: int = CORROBORATION_WINDOW_MS,
+    corrob_sample_interval_ms: int = CORROBORATION_SAMPLE_INTERVAL_MS,
     extract_clips: bool = True,
 ) -> dict:
     """Execute post-match shadow inference, SQL sync, and review pack generation strictly outside ``match_dir``."""
@@ -1105,7 +1116,7 @@ def run_shadow_on_match(
             model_sha256 = hashlib.sha256(str(model_id).encode("utf-8")).hexdigest()
         runner = infer_fn
 
-    inputs_info = parse_match_inputs(match_dir)
+    inputs_info = parse_match_inputs(match_dir, inputs_path=inputs_path)
     frame_pairs = parse_match_frame_clock(match_dir)
     video_path = match_dir / FRAME_FILE
     if not video_path.is_file():
@@ -1134,25 +1145,32 @@ def run_shadow_on_match(
     cbt = CenterBoxTrigger()
     events: list[dict] = []
     window_assets: dict[str, tuple] = {}
-    jsonl_records: list[str] = []
+    jsonl_records: list[tuple[int, str]] = []
 
-    pending: list[dict] = []  # windows collecting [t_ammo..t_ammo+8]
+    pending: list[dict] = []  # collecting 9-frame crops [t_ammo..t_ammo+8]
+    open_corrob: list[dict] = []  # awaiting XP/killfeed corroboration until t_ammo_ms + corroboration_window_ms
     ring_crops: collections.deque = collections.deque(maxlen=WINDOW_FRAMES)
     prev_mag: int | None = None
     last_span_anchor: int = -1
+    last_corrob_sample_ms: int | None = None
     created_at = _utc_now_iso()
 
-    def _finalize_pending(p: dict) -> None:
+    def _run_window_onnx(p: dict) -> dict:
         tensor, luma = build_tensor_and_luma_from_center_crops(p["crops"])
         bps = int(runner(tensor))
         mnv4_v = verdict_from_bps(bps, tau_low_bps=tau_low_bps, tau_high_bps=tau_high_bps)
         r199_v = _summarize_199_window(p["states_199"])
-        ev = {
-            "event_id": f"{session_id}_f{p['frame_idx']:06d}",
+        eid = f"{session_id}_f{p['frame_idx']:06d}"
+        window_assets[eid] = (tensor, luma)
+        # Drop crop buffers immediately once inference + asset creation finish
+        p["crops"].clear()
+        return {
+            "event_id": eid,
             "session_id": session_id,
             "dataset_split": split,
             "frame_idx": p["frame_idx"],
             "t_ammo_ms": p["t_ammo_ms"],
+            "corrob_until_ms": p["t_ammo_ms"] + int(corroboration_window_ms),
             "model_id": model_id,
             "model_sha256": model_sha256,
             "ads_active": 1 if p["ads_active"] else 0,
@@ -1170,11 +1188,13 @@ def run_shadow_on_match(
             "human_labeled_at_utc": None,
             "created_at_utc": created_at,
         }
+
+    def _finalize_corrob_event(ev: dict) -> None:
+        ev.pop("corrob_until_ms", None)
         ev["triage_reason"] = assign_triage_reason(
             ev, tau_low_bps=tau_low_bps, tau_high_bps=tau_high_bps
         )
         events.append(ev)
-        window_assets[ev["event_id"]] = (tensor, luma)
         rec = build_shadow_hit_record(
             frame_idx=ev["frame_idx"],
             t_ammo_ms=ev["t_ammo_ms"],
@@ -1187,7 +1207,7 @@ def run_shadow_on_match(
             fire_mode=ev["fire_mode"],
             triage_reason=ev["triage_reason"],
         )
-        jsonl_records.append(canonical_shadow_json(rec))
+        jsonl_records.append((ev["frame_idx"], canonical_shadow_json(rec)))
 
     try:
         frame_idx = 0
@@ -1216,18 +1236,35 @@ def run_shadow_on_match(
             cbt_res = cbt.step(frame, t_us=t_us)
             state_199 = cbt_res.get("state", "ABSTAIN")
 
-            # Check XP + killfeed only while pending windows exist or inside active R2 span
+            # B3 + B2: Decoupled streaming XP + killfeed corroboration (~10 Hz when windows are open;
+            # read_killfeed_lines falls back to OWNER_TAG ("Qortrola30") when match.json is absent).
             xp_hit = False
             kf_hit = False
-            if pending or span is not None:
+            due_for_sample = (
+                last_corrob_sample_ms is None
+                or (t_ammo_ms - last_corrob_sample_ms) >= corrob_sample_interval_ms
+            )
+            if (pending or open_corrob) and due_for_sample:
+                last_corrob_sample_ms = t_ammo_ms
                 xp_res = read_kill_xp_popup(frame)
                 xp_hit = xp_res.get("state") == "XP_POPUP"
-                if killfeed_tag:
-                    try:
-                        kf_res = read_killfeed_lines(frame, tag=killfeed_tag)
-                        kf_hit = any(ln.get("killer") == SELF for ln in kf_res.get("lines") or [])
-                    except Exception:
-                        kf_hit = False
+                try:
+                    kf_res = read_killfeed_lines(frame, tag=killfeed_tag)
+                    kf_hit = any(ln.get("killer") == SELF for ln in kf_res.get("lines") or [])
+                except Exception:
+                    kf_hit = False
+
+            still_open: list[dict] = []
+            for oc in open_corrob:
+                if t_ammo_ms <= oc["corrob_until_ms"]:
+                    if xp_hit:
+                        oc["xp_popup_corroborated"] = 1
+                    if kf_hit:
+                        oc["killfeed_corroborated"] = 1
+                    still_open.append(oc)
+                else:
+                    _finalize_corrob_event(oc)
+            open_corrob = still_open
 
             still_pending = []
             for p in pending:
@@ -1236,15 +1273,15 @@ def run_shadow_on_match(
                 p["xp_corrob"] = p["xp_corrob"] or xp_hit
                 p["kf_corrob"] = p["kf_corrob"] or kf_hit
                 if len(p["crops"]) == WINDOW_FRAMES:
-                    _finalize_pending(p)
+                    open_corrob.append(_run_window_onnx(p))
                 else:
                     still_pending.append(p)
             pending = still_pending
 
-            # External deterministic ammo decrement check
+            # B1: External deterministic multi-round ammo decrement gate (1..5 rounds per frame step)
             ammo_res = read_ammo_counter(frame)
             mag = ammo_res.get("mag") if ammo_res.get("ok") else None
-            if mag is not None and prev_mag is not None and mag == prev_mag - 1:
+            if mag is not None and prev_mag is not None and 0 < (prev_mag - mag) <= MAX_AMMO_DROP_PER_STEP:
                 if span is not None and frame_idx != last_span_anchor:
                     last_span_anchor = frame_idx
                     if span["equipment_excluded"]:
@@ -1289,6 +1326,13 @@ def run_shadow_on_match(
 
             del frame
             frame_idx += 1
+
+        # Flush any events whose corroboration window extends past EOF
+        for oc in open_corrob:
+            _finalize_corrob_event(oc)
+        open_corrob.clear()
+        events.sort(key=lambda e: int(e["frame_idx"]))
+        jsonl_records.sort(key=lambda pair: pair[0])
     finally:
         cap.release()
 
@@ -1300,7 +1344,7 @@ def run_shadow_on_match(
 
     session_out.mkdir(parents=True, exist_ok=True)
     jsonl_path = session_out / SHADOW_JSONL_NAME
-    _atomic_write_text(jsonl_path, "".join(line + "\n" for line in jsonl_records))
+    _atomic_write_text(jsonl_path, "".join(line + "\n" for _, line in jsonl_records))
 
     queue = select_review_queue(
         events,
@@ -1560,6 +1604,7 @@ def main(argv=None) -> int:
     p_an.add_argument("--model-id", default=DEFAULT_MODEL_ID)
     p_an.add_argument("--out", help="Output root outside match folder")
     p_an.add_argument("--db", help="SQLite DB path")
+    p_an.add_argument("--inputs", help="Optional explicit inputs.jsonl or hand_timeline.v0.jsonl path")
     p_an.add_argument("--no-clips", action="store_true")
 
     p_lbl = sub.add_parser("label", help="Write H/N/S confirmation label back into SQLite")
@@ -1567,6 +1612,11 @@ def main(argv=None) -> int:
     p_lbl.add_argument("--event-id", required=True)
     p_lbl.add_argument("--key", required=True, help="H=GUNFIRE_HIT, N=NO_HIT, S=SKIP")
     p_lbl.add_argument("--manifest")
+
+    p_srv = sub.add_parser("serve", help="Serve 2-minute review pack on 127.0.0.1 loopback")
+    p_srv.add_argument("--review-dir", required=True)
+    p_srv.add_argument("--db", required=True)
+    p_srv.add_argument("--port", type=int, default=8765)
 
     p_exp = sub.add_parser("export-colab", help="Export train_pool human-labeled rows for Colab")
     p_exp.add_argument("--db", required=True)
@@ -1583,6 +1633,7 @@ def main(argv=None) -> int:
             model_id=args.model_id,
             out_root=Path(args.out) if args.out else None,
             db_path=Path(args.db) if args.db else None,
+            inputs_path=Path(args.inputs) if args.inputs else None,
             extract_clips=not args.no_clips,
         )
         print(json.dumps(res, sort_keys=True))
@@ -1595,6 +1646,17 @@ def main(argv=None) -> int:
             manifest_path=Path(args.manifest) if args.manifest else None,
         )
         print(lbl)
+        return 0
+    if args.cmd == "serve":
+        srv = serve_review_pack(Path(args.review_dir), Path(args.db), port=args.port)
+        actual_port = srv.server_address[1]
+        print(f"Serving practice review pack at http://127.0.0.1:{actual_port}/review.html")
+        try:
+            srv.serve_forever()
+        except KeyboardInterrupt:
+            pass
+        finally:
+            srv.server_close()
         return 0
     if args.cmd == "export-colab":
         res = export_train_pool_for_colab(

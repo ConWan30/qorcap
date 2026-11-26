@@ -237,9 +237,9 @@ WINDOWS_FILES = (
 # revived qortime #80 tree, still collects 49 tests (7 on main, +42).
 # Windows does not run this file, so only the Linux floor rises: 1392+42 / 1373.
 # Updated for tools/test_hand_timeline_contract.py (+5 tests on both suites): 1439 / 1378.
-# Updated for sidecar/test_qorcap_cod_post_nov21.py (+9 tests -> 1448 / 1387), T-0052 N1 test (+1 -> 1449 / 1388), and T-0055 shadow tests (+9 -> 1458 / 1397).
-LINUX_MIN_COLLECTED = 1458
-WINDOWS_MIN_COLLECTED = 1397
+# Updated for sidecar/test_qorcap_cod_post_nov21.py (+9 tests -> 1448 / 1387), T-0052 N1 test (+1 -> 1449 / 1388), and T-0055 shadow tests (+12 -> 1461 / 1400).
+LINUX_MIN_COLLECTED = 1461
+WINDOWS_MIN_COLLECTED = 1400
 
 # Absent from both sidecar suites. A reason is required; whitespace does not count.
 EXCLUDED_TEST_FILES = {
