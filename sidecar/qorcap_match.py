@@ -456,6 +456,59 @@ def maybe_write_engagement_windows(bundle: Path, game: str, *, environ=None, out
         return False
 
 
+def maybe_run_cod_mnv4_shadow(
+    bundle: Path,
+    game: str,
+    *,
+    environ=None,
+    out_root=None,
+    db_path=None,
+    infer_fn=None,
+) -> bool:
+    """Info-only post-match CoD MNv4 shadow runner after stop. Never Counted; never raises.
+
+    Off unless ``QORCAP_LANE=practice``, ``game == 'cod'``, ``QORCAP_SHADOW_MNV4_MODEL`` points
+    to an ONNX file, and ``QORCAP_SHADOW_SPLIT`` is ``train_pool`` or ``fresh_holdout``.
+    Writes strictly outside the match folder. The bundle, seal, receipt, and #199 verdicts are
+    never altered. See ``qorcap_cod_shadow``.
+    """
+    try:
+        env = os.environ if environ is None else environ
+        lane = env.get("QORCAP_LANE")
+        flag = env.get("QORCAP_SHADOW_MNV4")
+        model = env.get("QORCAP_SHADOW_MNV4_MODEL")
+        split = env.get("QORCAP_SHADOW_SPLIT")
+        if (
+            game != "cod"
+            or not (isinstance(lane, str) and lane.strip().lower() == "practice")
+            or (isinstance(flag, str) and flag.strip().lower() in ("0", "false", "no", "off"))
+            or not (isinstance(model, str) and model.strip())
+            or split not in ("train_pool", "fresh_holdout")
+        ):
+            return False
+        here = str(HERE)
+        if here not in sys.path:
+            sys.path.insert(0, here)
+        from qorcap_cod_shadow import maybe_run_cod_mnv4_shadow as _shadow
+        return bool(
+            _shadow(
+                bundle,
+                game,
+                environ=env,
+                out_root=out_root,
+                db_path=db_path,
+                infer_fn=infer_fn,
+                say=say,
+            )
+        )
+    except Exception as e:
+        try:
+            say(f"  CoD MNv4 shadow did not run (info only; the match is unaffected): {type(e).__name__}: {e}")
+        except Exception:
+            pass
+        return False
+
+
 def mark_health_sealed(state: dict) -> None:
     """Drop later reader_health rows. The receipt is about to be signed."""
     state["health_sealed"] = True
@@ -2086,6 +2139,11 @@ def main(argv=None) -> int:
         # Info-only PWEC index: practice lane + CoD only, written outside the match folder.
         try:
             maybe_write_engagement_windows(bundle, game)
+        except Exception:
+            pass
+        # Info-only MNv4 shadow runner: practice lane + CoD only, written outside the match folder.
+        try:
+            maybe_run_cod_mnv4_shadow(bundle, game)
         except Exception:
             pass
 
