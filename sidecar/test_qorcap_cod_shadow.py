@@ -698,3 +698,296 @@ def test_b3_delayed_xp_and_killfeed_corroboration_within_2000ms(tmp_path, monkey
     assert row["killfeed_corroborated"] == 1
     assert row["triage_reason"] != "DISAGREEMENT_FP"
 
+
+# ----------------------------------------------------------------- 10. N4 configurable T / tau gates
+def test_n4_load_model_calibration_and_fail_closed(tmp_path):
+    model_sha = "ab" * 32
+    metrics_v2_2 = tmp_path / "train_metrics_v2_2.json"
+    metrics_v2_2.write_text(
+        json.dumps({
+            "model_id": "cod_gunfire_hit_v2_2",
+            "temperature": 1.0,
+            "tau_low_bps": 4500,
+            "tau_high_bps": 7900,
+            "onnx_sha256": model_sha.upper(),
+        }),
+        encoding="utf-8",
+    )
+    cal = shadow.load_model_calibration(metrics_v2_2, expected_model_sha256=model_sha)
+    assert cal["model_id"] == "cod_gunfire_hit_v2_2"
+    assert cal["temperature"] == 1.0
+    assert cal["tau_low_bps"] == 4500
+    assert cal["tau_high_bps"] == 7900
+    assert cal["onnx_sha256"] == model_sha
+
+    # Legacy fallback via calibrated_gate.{tau_low, tau_high}
+    metrics_gate = tmp_path / "gate_only.json"
+    metrics_gate.write_text(
+        json.dumps({
+            "temperature": 3.2001,
+            "calibrated_gate": {"tau_low": 0.4, "tau_high": 0.6},
+        }),
+        encoding="utf-8",
+    )
+    cal_gate = shadow.load_model_calibration(metrics_gate)
+    assert cal_gate["temperature"] == pytest.approx(3.2001)
+    assert cal_gate["tau_low_bps"] == 4000
+    assert cal_gate["tau_high_bps"] == 6000
+
+    # Fail closed on SHA mismatch, missing file, non-positive temperature, and bad gates
+    with pytest.raises(shadow.ShadowRunnerError):
+        shadow.load_model_calibration(metrics_v2_2, expected_model_sha256="cd" * 32)
+    with pytest.raises(shadow.ShadowRunnerError):
+        shadow.load_model_calibration(tmp_path / "missing.json")
+    for bad_payload in (
+        {"temperature": 0.0, "tau_low_bps": 3000, "tau_high_bps": 7000},
+        {"temperature": -1.5, "tau_low_bps": 3000, "tau_high_bps": 7000},
+        {"temperature": True, "tau_low_bps": 3000, "tau_high_bps": 7000},
+        {"temperature": 1.0, "tau_low_bps": 7000, "tau_high_bps": 7000},
+        {"temperature": 1.0, "tau_low_bps": -1, "tau_high_bps": 7000},
+        {"temperature": 1.0, "tau_low_bps": 3000, "tau_high_bps": 10001},
+        {"temperature": 1.0, "tau_low_bps": True, "tau_high_bps": 7000},
+        {"tau_low_bps": 3000, "tau_high_bps": 7000},
+    ):
+        bad_file = tmp_path / "bad.json"
+        bad_file.write_text(json.dumps(bad_payload), encoding="utf-8")
+        with pytest.raises(shadow.ShadowRunnerError):
+            shadow.load_model_calibration(bad_file)
+
+
+def test_n4_resolve_calibration_precedence(tmp_path):
+    # 1. Defaults (v2 backwards-compatible)
+    cfg_def = shadow.resolve_calibration(environ={})
+    assert cfg_def["model_id"] == shadow.DEFAULT_MODEL_ID
+    assert cfg_def["temperature"] == shadow.DEFAULT_TEMPERATURE
+    assert cfg_def["tau_low_bps"] == shadow.DEFAULT_TAU_LOW_BPS
+    assert cfg_def["tau_high_bps"] == shadow.DEFAULT_TAU_HIGH_BPS
+    assert cfg_def["calibration_source"] == "default_v2"
+
+    # 2. Metrics JSON overrides defaults
+    mp = tmp_path / "m.json"
+    mp.write_text(
+        json.dumps({"model_id": "cod_gunfire_hit_v2_2", "temperature": 1.0, "tau_low_bps": 4500, "tau_high_bps": 7900}),
+        encoding="utf-8",
+    )
+    cfg_m = shadow.resolve_calibration(metrics_path=mp, environ={})
+    assert (cfg_m["model_id"], cfg_m["temperature"], cfg_m["tau_low_bps"], cfg_m["tau_high_bps"]) == (
+        "cod_gunfire_hit_v2_2",
+        1.0,
+        4500,
+        7900,
+    )
+    assert cfg_m["calibration_source"] == "metrics_json"
+
+    # 3. Env overrides metrics JSON
+    env = {
+        shadow.ENV_METRICS: str(mp),
+        shadow.ENV_TEMPERATURE: "1.25",
+        shadow.ENV_TAU_HIGH_BPS: "8200",
+    }
+    cfg_env = shadow.resolve_calibration(environ=env)
+    assert (cfg_env["temperature"], cfg_env["tau_low_bps"], cfg_env["tau_high_bps"]) == (1.25, 4500, 8200)
+    assert cfg_env["calibration_source"] == "metrics_json+env"
+
+    # 4. Explicit overrides env + metrics JSON
+    cfg_exp = shadow.resolve_calibration(
+        model_id="cod_custom",
+        tau_low_bps=4000,
+        tau_high_bps=8500,
+        environ=env,
+    )
+    assert (cfg_exp["model_id"], cfg_exp["temperature"], cfg_exp["tau_low_bps"], cfg_exp["tau_high_bps"]) == (
+        "cod_custom",
+        1.25,
+        4000,
+        8500,
+    )
+    assert cfg_exp["calibration_source"] == "metrics_json+env+explicit"
+
+
+def test_n4_shadow_runner_hook_and_cli_respect_v2_2_calibration(tmp_path, monkeypatch):
+    match_dir = tmp_path / "sess_n4"
+    _write_synthetic_match(match_dir)
+    fake_model = tmp_path / "cod_gunfire_hit_v2_2.onnx"
+    fake_model.write_bytes(b"fake-v22-onnx")
+    model_sha = _sha256(fake_model)
+
+    metrics_path = tmp_path / "train_metrics_v2_2.json"
+    metrics_path.write_text(
+        json.dumps({
+            "model_id": "cod_gunfire_hit_v2_2",
+            "temperature": 1.0,
+            "tau_low_bps": 4500,
+            "tau_high_bps": 7900,
+            "onnx_sha256": model_sha,
+        }),
+        encoding="utf-8",
+    )
+
+    # Under legacy v2 (3500/6500), confidence=7200 -> GUNFIRE_HIT; under v2.2 (4500/7900), 7200 -> ABSTAIN
+    out_root = tmp_path / "out_hook"
+    db_path = tmp_path / "index.sqlite"
+    ran = qorcap_match.maybe_run_cod_mnv4_shadow(
+        match_dir,
+        "cod",
+        environ={
+            "QORCAP_LANE": "practice",
+            "QORCAP_SHADOW_MNV4_MODEL": str(fake_model),
+            "QORCAP_SHADOW_MNV4_METRICS": str(metrics_path),
+            "QORCAP_SHADOW_SPLIT": "train_pool",
+        },
+        out_root=out_root,
+        db_path=db_path,
+        infer_fn=lambda _t: 7200,
+    )
+    assert ran is True
+
+    # Strict no-float check on hashed shadow_hits.jsonl
+    jsonl_lines = (out_root / match_dir.name / shadow.SHADOW_JSONL_NAME).read_text(encoding="utf-8").splitlines()
+    assert jsonl_lines
+    def _reject_float(tok: str):
+        raise AssertionError(f"float emitted in shadow_hits.jsonl: {tok}")
+    for line in jsonl_lines:
+        rec = json.loads(line, parse_float=_reject_float)
+        assert rec["model_id"] == "cod_gunfire_hit_v2_2"
+        assert rec["verdict"] == "ABSTAIN"
+        assert rec["confidence_bps"] == 7200
+
+    manifest = json.loads((out_root / shadow.REVIEW_ROOT_NAME / match_dir.name / "manifest.json").read_text(encoding="utf-8"))
+    shadow.assert_no_floats(manifest)
+    assert "temperature" not in manifest
+    assert manifest["temperature_milli"] == 1000
+    assert manifest["tau_low_bps"] == 4500
+    assert manifest["tau_high_bps"] == 7900
+    assert manifest["calibration_source"] == "metrics_json"
+
+    # Verify CLI analyze passes resolved temperature to _make_onnx_infer_fn & applies --tau-high-bps override
+    seen_temps: list[float] = []
+    def _stub_ort(_mpath, temperature: float = shadow.DEFAULT_TEMPERATURE):
+        seen_temps.append(temperature)
+        return lambda _t: shadow.logits_to_confidence_bps([0.0, 0.9], temperature=temperature)
+
+    monkeypatch.setattr(shadow, "_make_onnx_infer_fn", _stub_ort)
+    # logits [0.0, 0.9] @ T=1.0 -> sigmoid(0.9)=7109 bps (ABSTAIN at 7900, GUNFIRE_HIT with --tau-high-bps 7000)
+    rc = shadow.main([
+        "analyze",
+        "--match-dir", str(match_dir),
+        "--split", "train_pool",
+        "--model", str(fake_model),
+        "--metrics", str(metrics_path),
+        "--tau-high-bps", "7000",
+        "--out", str(tmp_path / "out_cli"),
+        "--db", str(tmp_path / "cli.sqlite"),
+        "--no-clips",
+    ])
+    assert rc == 0
+    assert seen_temps == [1.0]
+    cli_lines = (tmp_path / "out_cli" / match_dir.name / shadow.SHADOW_JSONL_NAME).read_text(encoding="utf-8").splitlines()
+    cli_rec = json.loads(cli_lines[0], parse_float=_reject_float)
+    assert cli_rec["confidence_bps"] == 7109
+    assert cli_rec["verdict"] == "GUNFIRE_HIT"
+
+
+def test_n4_b1_unknown_model_without_calibration_fails_closed_and_n2_n3(tmp_path):
+    match_dir = tmp_path / "sess_b1_guard"
+    _write_synthetic_match(match_dir)
+    unknown_onnx = tmp_path / "unknown_v2_2.onnx"
+    unknown_onnx.write_bytes(b"unknown-onnx-bytes")
+    unknown_sha = _sha256(unknown_onnx)
+    assert unknown_sha != shadow.V2_LEGACY_MODEL_SHA256
+
+    # B1: legacy v2 SHA allows default_v2 without metrics; any other SHA fails closed
+    cfg_v2 = shadow.resolve_calibration(expected_model_sha256=shadow.V2_LEGACY_MODEL_SHA256, environ={})
+    assert cfg_v2["calibration_source"] == "default_v2"
+    assert cfg_v2["temperature_milli"] == 2929
+
+    with pytest.raises(shadow.ShadowRunnerError, match="calibration required"):
+        shadow.resolve_calibration(expected_model_sha256=unknown_sha, environ={})
+
+    # Partial env override without metrics JSON must still fail closed on unknown SHA
+    with pytest.raises(shadow.ShadowRunnerError, match="calibration required"):
+        shadow.resolve_calibration(
+            expected_model_sha256=unknown_sha,
+            environ={shadow.ENV_TAU_HIGH_BPS: "8000"},
+        )
+
+    # B1 in run_shadow_on_match (infer_fn=None) and maybe_run_cod_mnv4_shadow hook
+    with pytest.raises(shadow.ShadowRunnerError, match="calibration required"):
+        shadow.run_shadow_on_match(
+            match_dir,
+            dataset_split="train_pool",
+            model_path=unknown_onnx,
+            out_root=tmp_path / "out_bad",
+            db_path=tmp_path / "bad.sqlite",
+            extract_clips=False,
+        )
+
+    msgs: list[str] = []
+    ran = shadow.maybe_run_cod_mnv4_shadow(
+        match_dir,
+        "cod",
+        environ={
+            "QORCAP_LANE": "practice",
+            "QORCAP_SHADOW_MNV4_MODEL": str(unknown_onnx),
+            "QORCAP_SHADOW_SPLIT": "train_pool",
+        },
+        out_root=tmp_path / "out_hook_bad",
+        db_path=tmp_path / "hook_bad.sqlite",
+        say=msgs.append,
+    )
+    assert ran is False
+    assert any("calibration required" in m for m in msgs)
+    assert qorcap_match.maybe_run_cod_mnv4_shadow(
+        match_dir,
+        "cod",
+        environ={
+            "QORCAP_LANE": "practice",
+            "QORCAP_SHADOW_MNV4_MODEL": str(unknown_onnx),
+            "QORCAP_SHADOW_SPLIT": "train_pool",
+        },
+        out_root=tmp_path / "out_hook_bad",
+        db_path=tmp_path / "hook_bad.sqlite",
+    ) is False
+
+    # N3: unbound metrics JSON without onnx_sha256 rejected when bound against a real model SHA
+    unbound_metrics = tmp_path / "unbound_metrics.json"
+    unbound_metrics.write_text(
+        json.dumps({"temperature": 1.0, "tau_low_bps": 4500, "tau_high_bps": 7900}),
+        encoding="utf-8",
+    )
+    with pytest.raises(shadow.ShadowRunnerError, match="missing required 'onnx_sha256'"):
+        shadow.load_model_calibration(unbound_metrics, expected_model_sha256=unknown_sha)
+
+    # N2: warn via say when env overrides metrics JSON
+    bound_metrics = tmp_path / "bound_metrics.json"
+    bound_metrics.write_text(
+        json.dumps({
+            "model_id": "cod_gunfire_hit_v2_2",
+            "temperature": 1.0,
+            "tau_low_bps": 4500,
+            "tau_high_bps": 7900,
+            "onnx_sha256": unknown_sha,
+        }),
+        encoding="utf-8",
+    )
+    warn_msgs: list[str] = []
+    ran_ovr = shadow.maybe_run_cod_mnv4_shadow(
+        match_dir,
+        "cod",
+        environ={
+            "QORCAP_LANE": "practice",
+            "QORCAP_SHADOW_MNV4_MODEL": str(unknown_onnx),
+            "QORCAP_SHADOW_MNV4_METRICS": str(bound_metrics),
+            "QORCAP_SHADOW_MNV4_TAU_HIGH_BPS": "8200",
+            "QORCAP_SHADOW_SPLIT": "train_pool",
+        },
+        out_root=tmp_path / "out_hook_ovr",
+        db_path=tmp_path / "hook_ovr.sqlite",
+        infer_fn=lambda _t: 8000,
+        say=warn_msgs.append,
+    )
+    assert ran_ovr is True
+    assert any("WARNING:" in m and "metrics_json+env" in m for m in warn_msgs)
+
+
+
