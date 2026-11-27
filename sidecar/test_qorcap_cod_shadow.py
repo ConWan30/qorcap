@@ -854,7 +854,9 @@ def test_n4_shadow_runner_hook_and_cli_respect_v2_2_calibration(tmp_path, monkey
         assert rec["confidence_bps"] == 7200
 
     manifest = json.loads((out_root / shadow.REVIEW_ROOT_NAME / match_dir.name / "manifest.json").read_text(encoding="utf-8"))
-    assert manifest["temperature"] == 1.0
+    shadow.assert_no_floats(manifest)
+    assert "temperature" not in manifest
+    assert manifest["temperature_milli"] == 1000
     assert manifest["tau_low_bps"] == 4500
     assert manifest["tau_high_bps"] == 7900
     assert manifest["calibration_source"] == "metrics_json"
@@ -884,5 +886,97 @@ def test_n4_shadow_runner_hook_and_cli_respect_v2_2_calibration(tmp_path, monkey
     cli_rec = json.loads(cli_lines[0], parse_float=_reject_float)
     assert cli_rec["confidence_bps"] == 7109
     assert cli_rec["verdict"] == "GUNFIRE_HIT"
+
+
+def test_n4_b1_unknown_model_without_calibration_fails_closed_and_n2_n3(tmp_path):
+    match_dir = tmp_path / "sess_b1_guard"
+    _write_synthetic_match(match_dir)
+    unknown_onnx = tmp_path / "unknown_v2_2.onnx"
+    unknown_onnx.write_bytes(b"unknown-onnx-bytes")
+    unknown_sha = _sha256(unknown_onnx)
+    assert unknown_sha != shadow.V2_LEGACY_MODEL_SHA256
+
+    # B1: legacy v2 SHA allows default_v2 without metrics; any other SHA fails closed
+    cfg_v2 = shadow.resolve_calibration(expected_model_sha256=shadow.V2_LEGACY_MODEL_SHA256, environ={})
+    assert cfg_v2["calibration_source"] == "default_v2"
+    assert cfg_v2["temperature_milli"] == 2929
+
+    with pytest.raises(shadow.ShadowRunnerError, match="calibration required"):
+        shadow.resolve_calibration(expected_model_sha256=unknown_sha, environ={})
+
+    # Partial env override without metrics JSON must still fail closed on unknown SHA
+    with pytest.raises(shadow.ShadowRunnerError, match="calibration required"):
+        shadow.resolve_calibration(
+            expected_model_sha256=unknown_sha,
+            environ={shadow.ENV_TAU_HIGH_BPS: "8000"},
+        )
+
+    # B1 in run_shadow_on_match (infer_fn=None) and maybe_run_cod_mnv4_shadow hook
+    with pytest.raises(shadow.ShadowRunnerError, match="calibration required"):
+        shadow.run_shadow_on_match(
+            match_dir,
+            dataset_split="train_pool",
+            model_path=unknown_onnx,
+            out_root=tmp_path / "out_bad",
+            db_path=tmp_path / "bad.sqlite",
+            extract_clips=False,
+        )
+
+    msgs: list[str] = []
+    ran = qorcap_match.maybe_run_cod_mnv4_shadow(
+        match_dir,
+        "cod",
+        environ={
+            "QORCAP_LANE": "practice",
+            "QORCAP_SHADOW_MNV4_MODEL": str(unknown_onnx),
+            "QORCAP_SHADOW_SPLIT": "train_pool",
+        },
+        out_root=tmp_path / "out_hook_bad",
+        db_path=tmp_path / "hook_bad.sqlite",
+        say=msgs.append,
+    )
+    assert ran is False
+    assert any("calibration required" in m for m in msgs)
+
+    # N3: unbound metrics JSON without onnx_sha256 rejected when bound against a real model SHA
+    unbound_metrics = tmp_path / "unbound_metrics.json"
+    unbound_metrics.write_text(
+        json.dumps({"temperature": 1.0, "tau_low_bps": 4500, "tau_high_bps": 7900}),
+        encoding="utf-8",
+    )
+    with pytest.raises(shadow.ShadowRunnerError, match="missing required 'onnx_sha256'"):
+        shadow.load_model_calibration(unbound_metrics, expected_model_sha256=unknown_sha)
+
+    # N2: warn via say when env overrides metrics JSON
+    bound_metrics = tmp_path / "bound_metrics.json"
+    bound_metrics.write_text(
+        json.dumps({
+            "model_id": "cod_gunfire_hit_v2_2",
+            "temperature": 1.0,
+            "tau_low_bps": 4500,
+            "tau_high_bps": 7900,
+            "onnx_sha256": unknown_sha,
+        }),
+        encoding="utf-8",
+    )
+    warn_msgs: list[str] = []
+    ran_ovr = qorcap_match.maybe_run_cod_mnv4_shadow(
+        match_dir,
+        "cod",
+        environ={
+            "QORCAP_LANE": "practice",
+            "QORCAP_SHADOW_MNV4_MODEL": str(unknown_onnx),
+            "QORCAP_SHADOW_MNV4_METRICS": str(bound_metrics),
+            "QORCAP_SHADOW_MNV4_TAU_HIGH_BPS": "8200",
+            "QORCAP_SHADOW_SPLIT": "train_pool",
+        },
+        out_root=tmp_path / "out_hook_ovr",
+        db_path=tmp_path / "hook_ovr.sqlite",
+        infer_fn=lambda _t: 8000,
+        say=warn_msgs.append,
+    )
+    assert ran_ovr is True
+    assert any("WARNING:" in m and "metrics_json+env" in m for m in warn_msgs)
+
 
 

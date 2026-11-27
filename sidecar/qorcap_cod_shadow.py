@@ -60,6 +60,7 @@ ENV_SPLIT = "QORCAP_SHADOW_SPLIT"
 ENV_DB = "QORCAP_SHADOW_DB"
 ENV_OUT = "QORCAP_SHADOW_OUT"
 
+V2_LEGACY_MODEL_SHA256 = "1e2ec29dfbfc9478e4e50a23a252d230f67fca129a6914de91e870788407a0f3"
 DEFAULT_MODEL_ID = "cod_gunfire_hit_v2"
 DEFAULT_TEMPERATURE = 2.9292
 DEFAULT_TAU_LOW_BPS = 3500
@@ -635,6 +636,10 @@ def load_model_calibration(
                 f"metrics JSON {mp} onnx_sha256 ({norm_metrics_sha}) does not match model SHA-256 ({expected_model_sha256.lower()})"
             )
     else:
+        if expected_model_sha256 is not None:
+            raise ShadowRunnerError(
+                f"metrics JSON {mp} missing required 'onnx_sha256' to bind against model SHA-256 ({expected_model_sha256.lower()})"
+            )
         norm_metrics_sha = None
 
     if "temperature" not in data or data["temperature"] is None:
@@ -667,12 +672,15 @@ def resolve_calibration(
     expected_model_sha256: str | None = None,
     environ=None,
 ) -> dict:
-    """Resolve model calibration with precedence: explicit > env vars > metrics JSON > legacy v2 defaults."""
+    """Resolve model calibration (explicit > env > metrics JSON > legacy v2 defaults for v2 SHA only)."""
     env = os.environ if environ is None else environ
     resolved_model_id = DEFAULT_MODEL_ID
     resolved_temp = DEFAULT_TEMPERATURE
     resolved_low = DEFAULT_TAU_LOW_BPS
     resolved_high = DEFAULT_TAU_HIGH_BPS
+    provided_temp = False
+    provided_low = False
+    provided_high = False
     sources: list[str] = []
     resolved_metrics_path: str | None = None
 
@@ -688,6 +696,9 @@ def resolve_calibration(
         resolved_temp = loaded["temperature"]
         resolved_low = loaded["tau_low_bps"]
         resolved_high = loaded["tau_high_bps"]
+        provided_temp = True
+        provided_low = True
+        provided_high = True
         resolved_metrics_path = loaded["metrics_path"]
         sources.append("metrics_json")
 
@@ -702,6 +713,7 @@ def resolve_calibration(
             resolved_temp = float(raw_env_temp.strip())
         except ValueError as exc:
             raise ShadowRunnerError(f"invalid {ENV_TEMPERATURE}={raw_env_temp!r}") from exc
+        provided_temp = True
         env_used = True
     raw_env_low = env.get(ENV_TAU_LOW_BPS)
     if isinstance(raw_env_low, str) and raw_env_low.strip():
@@ -709,6 +721,7 @@ def resolve_calibration(
             resolved_low = int(raw_env_low.strip(), 10)
         except ValueError as exc:
             raise ShadowRunnerError(f"invalid {ENV_TAU_LOW_BPS}={raw_env_low!r}") from exc
+        provided_low = True
         env_used = True
     raw_env_high = env.get(ENV_TAU_HIGH_BPS)
     if isinstance(raw_env_high, str) and raw_env_high.strip():
@@ -716,6 +729,7 @@ def resolve_calibration(
             resolved_high = int(raw_env_high.strip(), 10)
         except ValueError as exc:
             raise ShadowRunnerError(f"invalid {ENV_TAU_HIGH_BPS}={raw_env_high!r}") from exc
+        provided_high = True
         env_used = True
     if env_used:
         sources.append("env")
@@ -728,20 +742,33 @@ def resolve_calibration(
         explicit_used = True
     if temperature is not None:
         resolved_temp = temperature
+        provided_temp = True
         explicit_used = True
     if tau_low_bps is not None:
         resolved_low = tau_low_bps
+        provided_low = True
         explicit_used = True
     if tau_high_bps is not None:
         resolved_high = tau_high_bps
+        provided_high = True
         explicit_used = True
     if explicit_used:
         sources.append("explicit")
+
+    # B1: fail closed on non-v2 ONNX models unless all 3 calibration params were supplied
+    if expected_model_sha256 is not None:
+        norm_sha = expected_model_sha256.strip().lower()
+        if norm_sha != V2_LEGACY_MODEL_SHA256 and not (provided_temp and provided_low and provided_high):
+            raise ShadowRunnerError(
+                f"calibration required for non-v2 model sha {norm_sha}; "
+                f"supply --metrics / {ENV_METRICS} or explicit temperature, tau_low_bps, and tau_high_bps"
+            )
 
     temp_f, low_i, high_i = validate_calibration(resolved_temp, resolved_low, resolved_high)
     return {
         "model_id": resolved_model_id,
         "temperature": temp_f,
+        "temperature_milli": int(round(temp_f * 1000.0)),
         "tau_low_bps": low_i,
         "tau_high_bps": high_i,
         "calibration_source": "+".join(sources) if sources else "default_v2",
@@ -1303,13 +1330,16 @@ def run_shadow_on_match(
     if infer_fn is None and real_model_sha is None:
         raise ShadowRunnerError(f"shadow model file missing: {model_path!r}")
 
+    has_metrics_cfg = metrics_path is not None or bool(
+        environ is not None and isinstance(environ.get(ENV_METRICS), str) and environ.get(ENV_METRICS).strip()
+    )
     calibration = resolve_calibration(
         metrics_path=metrics_path,
         model_id=model_id,
         temperature=temperature,
         tau_low_bps=tau_low_bps,
         tau_high_bps=tau_high_bps,
-        expected_model_sha256=real_model_sha,
+        expected_model_sha256=real_model_sha if (infer_fn is None or has_metrics_cfg) else None,
         environ=environ,
     )
     model_id = calibration["model_id"]
@@ -1608,7 +1638,7 @@ def run_shadow_on_match(
         "dataset_split": split,
         "model_id": model_id,
         "model_sha256": model_sha256,
-        "temperature": temperature,
+        "temperature_milli": calibration["temperature_milli"],
         "tau_low_bps": tau_low_bps,
         "tau_high_bps": tau_high_bps,
         "calibration_source": calibration["calibration_source"],
@@ -1625,6 +1655,7 @@ def run_shadow_on_match(
         "dataset_split": split,
         "model_id": model_id,
         "temperature": temperature,
+        "temperature_milli": calibration["temperature_milli"],
         "tau_low_bps": tau_low_bps,
         "tau_high_bps": tau_high_bps,
         "calibration_source": calibration["calibration_source"],
@@ -1799,6 +1830,14 @@ def maybe_run_cod_mnv4_shadow(
             environ=env,
         )
         if say is not None:
+            if "metrics_json" in res.get("calibration_source", "") and (
+                "env" in res["calibration_source"] or "explicit" in res["calibration_source"]
+            ):
+                say(
+                    f"  CoD MNv4 shadow WARNING: calibration source {res['calibration_source']} "
+                    f"overrode metrics JSON (temperature_milli={res['temperature_milli']}, "
+                    f"tau={res['tau_low_bps']}/{res['tau_high_bps']})"
+                )
             say(
                 f"  CoD MNv4 shadow (info only, not Counted): "
                 f"{res['events_count']} events, {res['review_queue_count']} queued in {res['review_dir']}"
