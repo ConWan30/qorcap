@@ -242,9 +242,9 @@ WINDOWS_FILES = (
 # Windows does not run this file, so only the Linux floor rises: 1392+42 / 1373.
 # Updated for tools/test_hand_timeline_contract.py (+5 tests on both suites): 1439 / 1378.
 # Updated for sidecar/test_qorcap_cod_post_nov21.py (+9 tests -> 1448 / 1387), T-0052 N1 test (+1 -> 1449 / 1388), T-0055 shadow tests (+12 -> 1461 / 1400), and T-0056 play-style tests (+5 -> 1466 / 1405) after merging origin/main 0ba004e (#201). Re-collected with QORTIME pin 0204e6d.
-# Updated for T-0062 sidecar/test_qorcap_cod_blind_pack.py (+9 tests on both suites): 1475 / 1414.
-LINUX_MIN_COLLECTED = 1475
-WINDOWS_MIN_COLLECTED = 1414
+# Updated for T-0062 sidecar/test_qorcap_cod_blind_pack.py (+11 tests on both suites): 1477 / 1416.
+LINUX_MIN_COLLECTED = 1477
+WINDOWS_MIN_COLLECTED = 1416
 
 # Absent from both sidecar suites. A reason is required; whitespace does not count.
 EXCLUDED_TEST_FILES = {

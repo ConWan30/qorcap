@@ -51,14 +51,30 @@ def _frames(schedule: list[int]) -> list[np.ndarray]:
     return [_digit_frame(m, seed=i) for i, m in enumerate(schedule)]
 
 
-def _write_video(match_dir: Path, frames: list[np.ndarray]) -> None:
-    wr = cv2.VideoWriter(str(match_dir / "video.mp4"), cv2.VideoWriter_fourcc(*"mp4v"), 60, (W, H))
-    assert wr.isOpened()
-    try:
-        for f in frames:
-            wr.write(f)
-    finally:
-        wr.release()
+class _InMemoryCapture:
+    """Stand-in for ``cv2.VideoCapture`` that serves in-memory frames (no media file is decoded)."""
+
+    frames: list = []
+
+    def __init__(self, _path):
+        self._i = 0
+
+    def isOpened(self):
+        return True
+
+    def grab(self):
+        return self._i < len(self.frames)
+
+    def retrieve(self):
+        f = self.frames[self._i]
+        self._i += 1
+        return True, f.copy()
+
+    def get(self, _prop):
+        return 60.0
+
+    def release(self):
+        pass
 
 
 # 30->28 (-2) at 6, 28->24 (-4) at 16, 24->10 (-14 reload/glitch, gated out) at 26
@@ -69,9 +85,8 @@ def _synthetic_pack(tmp_path: Path, name: str, seed: int) -> Path:
     match_dir = tmp_path / "practice_synth"
     if not match_dir.exists():
         _write_sidecar_files(match_dir, len(SCHEDULE), r2_end_us=900_000)
-        _write_video(match_dir, _frames(SCHEDULE))
     out = tmp_path / name
-    bp.build_session_pack(match_dir, out, seed=seed)
+    bp.build_session_pack(match_dir, out, seed=seed, frames=_frames(SCHEDULE))
     return out
 
 
@@ -81,10 +96,12 @@ def _png_size(path: Path) -> tuple[int, int]:
     return int.from_bytes(data[16:20], "big"), int.from_bytes(data[20:24], "big")
 
 
-def test_gate_matches_current_shadow_runner(tmp_path):
+def test_gate_matches_current_shadow_runner(tmp_path, monkeypatch):
     match_dir = tmp_path / "practice_gate"
     _write_sidecar_files(match_dir, len(SCHEDULE), r2_end_us=900_000)
-    _write_video(match_dir, _frames(SCHEDULE))
+    (match_dir / "video.mp4").write_bytes(b"")  # empty marker for the existence check; never decoded
+    _InMemoryCapture.frames = _frames(SCHEDULE)
+    monkeypatch.setattr(cv2, "VideoCapture", _InMemoryCapture)
     db_path = tmp_path / "index.sqlite"
     shadow.run_shadow_on_match(
         match_dir, dataset_split="train_pool", out_root=tmp_path / "shadow_out", db_path=db_path,
@@ -95,9 +112,47 @@ def test_gate_matches_current_shadow_runner(tmp_path):
         shadow_frames = [r["frame_idx"] for r in conn.execute("SELECT frame_idx FROM shadow_hit_events ORDER BY frame_idx")]
     finally:
         conn.close()
-    blind_frames = [w["frame_idx"] for w in bp.iter_gated_windows(match_dir)]
-    assert blind_frames == shadow_frames
-    assert blind_frames and all(f in (6, 16) for f in blind_frames)
+    blind_frames = [w["frame_idx"] for w in bp.iter_gated_windows(match_dir, frames=_frames(SCHEDULE))]
+    assert blind_frames == shadow_frames == [6, 16]
+    assert bp.iter_gated_windows.__code__.co_names.count("AmmoGatedWindowBuilder") == 1
+    assert "AmmoGatedWindowBuilder" in shadow.run_shadow_on_match.__code__.co_names
+
+
+def _scaled_digit_frame(val: int, w: int, h: int) -> np.ndarray:
+    img = np.zeros((h, w, 3), dtype=np.uint8)
+    cv2.putText(img, str(val), (int(0.70 * w), int(0.86 * h)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (250, 250, 250), 2, cv2.LINE_AA)
+    return img
+
+
+def test_center_crop_never_overlaps_ammo_roi():
+    for w in range(96, 3841, 8):
+        for h in (96, 120, 160, 178, 180, 240, 360, 480, 720, 1080, 1440, 2160):
+            try:
+                shadow.assert_center_crop_excludes_ammo_roi(w, h)
+            except shadow.ShadowRunnerError:
+                continue
+            cx0, cx1, cy0, cy1 = shadow.center_crop_box(w, h)
+            ax0, ax1, ay0, ay1 = shadow.ammo_roi_box(w, h)
+            assert cx1 <= ax0 or cy1 <= ay0, (w, h)
+    for w, h in ((1920, 1080), (1280, 720), (320, 240)):
+        shadow.assert_center_crop_excludes_ammo_roi(w, h)
+    for w, h in ((216, 160), (95, 200), (200, 95), (64, 64)):
+        with pytest.raises(shadow.ShadowRunnerError):
+            shadow.assert_center_crop_excludes_ammo_roi(w, h)
+
+
+def test_small_frames_with_ammo_in_crop_are_rejected(tmp_path):
+    # Scout T-0063 witness geometry: at 216x160 the ammo digits fall inside the center crop.
+    match_dir = tmp_path / "practice_small"
+    _write_sidecar_files(match_dir, 20, r2_end_us=900_000)
+    frames = [_scaled_digit_frame(30, 216, 160)] * 6 + [_scaled_digit_frame(28, 216, 160)] * 14
+    with pytest.raises(shadow.ShadowRunnerError, match="ammo-corner ROI"):
+        list(bp.iter_gated_windows(match_dir, frames=frames))
+    # At 320x240 changing only the ammo digits leaves every crop identical.
+    a = list(bp.iter_gated_windows(match_dir, frames=[_scaled_digit_frame(30, 320, 240)] * 6 + [_scaled_digit_frame(28, 320, 240)] * 14))
+    blank = np.zeros((96, 96, 3), dtype=np.uint8)
+    assert [x["frame_idx"] for x in a] == [6]
+    assert all(np.array_equal(c, blank) for c in a[0]["crops"])
 
 
 def test_in_memory_gate_excludes_equipment_and_outside_span(tmp_path):
@@ -150,14 +205,14 @@ def test_con_facing_leak_scan_clean_and_detects(tmp_path):
 
     dirty = tmp_path / "dirty"
     shutil.copytree(review, dirty)
-    (dirty / "manifest.json").write_text('{"confidence_bps": 9100, "source_tier": 2}', encoding="utf-8")
+    (dirty / "manifest.json").write_text('{"confidence_bps": 9100, "source_tier": 2, "a": "match-123456", "b": "20990101-000000"}', encoding="utf-8")
     (dirty / "strips" / "s001_verdict.png").write_bytes(b"x")
     chunk = b"tEXt" + b"Comment\x00p_cal=0.93"
     png = (dirty / "strips" / "s002.png").read_bytes()
     text = len(chunk[4:]).to_bytes(4, "big") + chunk + zlib.crc32(chunk).to_bytes(4, "big")
     (dirty / "strips" / "s002.png").write_bytes(png[:33] + text + png[33:])
     hits = " ".join(bp.scan_for_leaks(dirty))
-    for token in ("confidence", "source_tier", "verdict", "p_cal"):
+    for token in ("confidence", "source_tier", "verdict", "p_cal", "session:match-123456", "session:20990101-000000"):
         assert token in hits
 
 

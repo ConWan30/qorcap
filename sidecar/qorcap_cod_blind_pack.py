@@ -63,12 +63,14 @@ LEAK_TOKENS = (
     "model", "model_id", "mnv4", "onnx", "score", "scores", "pred", "prediction",
     "predictions", "prob", "probability", "source_tier", "tier", "triage",
     "triage_reason", "frame_idx", "t_ammo", "t_ammo_ms", "session_id",
-    "event_id", "reader_199", "dataset_split", "match-",
+    "event_id", "reader_199", "dataset_split",
 )
 _LEAK_RE = re.compile(
     r"(?<![A-Za-z0-9])(" + "|".join(re.escape(t) for t in LEAK_TOKENS) + r")(?![A-Za-z0-9])",
     re.IGNORECASE,
 )
+# Session-shaped strings: ``match-<digits>`` and ``YYYYMMDD-HHMMSS`` stamps.
+_SESSION_RE = re.compile(r"match-\d+|(?<!\d)\d{8}-\d{6}(?!\d)", re.IGNORECASE)
 REFUSED_FLAGS = (
     "--model", "--model-id", "--metrics", "--onnx", "--pt", "--weights",
     "--checkpoint", "--temperature", "--tau", "--tau-low-bps", "--tau-high-bps",
@@ -112,12 +114,10 @@ def _video_frames(video_path: Path):
 def iter_gated_windows(match_dir: Path, *, inputs_path: Path | None = None, frames=None):
     """Yield ``{frame_idx, t_ammo_ms, crops}`` for every non-equipment ammo-gated window.
 
-    Mirrors the frame loop in ``qorcap_cod_shadow.run_shadow_on_match`` without
-    #199, XP or killfeed reads and without any inference. ``frames`` (an iterable
-    of BGR frames) replaces ``video.mp4`` for in-memory tests.
+    Uses ``qorcap_cod_shadow.AmmoGatedWindowBuilder``, the same window builder and gate as
+    ``run_shadow_on_match``, without #199 / XP / killfeed reads and without inference.
+    ``frames`` (an iterable of BGR frames) replaces ``video.mp4`` for in-memory use.
     """
-    import cv2
-
     from qorcap_cod_post_nov21 import read_ammo_counter
 
     match_dir = Path(match_dir)
@@ -128,55 +128,16 @@ def iter_gated_windows(match_dir: Path, *, inputs_path: Path | None = None, fram
         if not video_path.is_file():
             raise BlindPackError(f"missing {shadow.FRAME_FILE} in {match_dir}")
         frames = _video_frames(video_path)
-
-    r2_spans = inputs_info["r2_spans"]
-    frame_to_span: dict[int, dict] = {}
-    span_idx = 0
-    for fidx, t_us in frame_pairs:
-        while span_idx < len(r2_spans) and t_us > r2_spans[span_idx]["end_us"]:
-            span_idx += 1
-        if span_idx < len(r2_spans):
-            sp = r2_spans[span_idx]
-            if sp["start_us"] <= t_us <= sp["end_us"]:
-                frame_to_span[fidx] = sp
-    t_us_by_frame = {fidx: int(round(t_us)) for fidx, t_us in frame_pairs}
-    t0_us = int(round(frame_pairs[0][1])) if frame_pairs else 0
-
-    pending: list[dict] = []
-    prev_mag = None
-    last_span_anchor = -1
-    half = shadow.CROP_SIZE // 2
+    windows = shadow.AmmoGatedWindowBuilder(frame_pairs, inputs_info["r2_spans"])
     for frame_idx, frame in enumerate(frames):
         if frame is None:
             continue
-        h, w = frame.shape[:2]
-        cy, cx = h // 2, w // 2
-        if h >= shadow.CROP_SIZE and w >= shadow.CROP_SIZE:
-            crop = frame[cy - half : cy + half, cx - half : cx + half].copy()
-        else:
-            crop = cv2.resize(frame, (shadow.CROP_SIZE, shadow.CROP_SIZE))
-        t_us = t_us_by_frame.get(frame_idx, t0_us + frame_idx * 16667)
-        t_ammo_ms = max(0, (t_us - t0_us) // 1000)
-        span = frame_to_span.get(frame_idx)
-
-        still = []
-        for p in pending:
-            p["crops"].append(crop)
-            if len(p["crops"]) == shadow.WINDOW_FRAMES:
-                yield p
-            else:
-                still.append(p)
-        pending = still
-
+        crop, _t_us, t_ammo_ms, span = windows.prepare(frame_idx, frame)
+        for w in windows.feed(crop):
+            yield {"frame_idx": w["frame_idx"], "t_ammo_ms": int(w["t_ammo_ms"]), "crops": w["crops"]}
         ammo_res = read_ammo_counter(frame)
         mag = ammo_res.get("mag") if ammo_res.get("ok") else None
-        if mag is not None and prev_mag is not None and 0 < (prev_mag - mag) <= shadow.MAX_AMMO_DROP_PER_STEP:
-            if span is not None and frame_idx != last_span_anchor:
-                last_span_anchor = frame_idx
-                if not span["equipment_excluded"]:
-                    pending.append({"frame_idx": frame_idx, "t_ammo_ms": int(t_ammo_ms), "crops": [crop]})
-        if mag is not None:
-            prev_mag = mag
+        windows.gate(frame_idx, int(t_ammo_ms), span, mag, crop)
 
 
 # ----------------------------------------------------------------- shuffle, strips, manifests
@@ -315,13 +276,14 @@ def _write_review(out_root: Path, title: str, windows: list[dict], key_extra: di
             "hash_manifest": str(out_root / HASH_MANIFEST), "files": len(hashes["files"])}
 
 
-def build_session_pack(match_dir: Path, out_root: Path, *, seed: int, inputs_path: Path | None = None) -> dict:
+def build_session_pack(match_dir: Path, out_root: Path, *, seed: int, inputs_path: Path | None = None,
+                       frames=None) -> dict:
     match_dir = Path(match_dir)
     session = shadow.require_safe_leaf(match_dir.name)
     out_root = Path(out_root)
     shadow._ensure_out_outside_match(out_root, match_dir)
     windows = []
-    for w in iter_gated_windows(match_dir, inputs_path=inputs_path):
+    for w in iter_gated_windows(match_dir, inputs_path=inputs_path, frames=frames):
         tensor, luma = shadow.build_tensor_and_luma_from_center_crops(w["crops"])
         windows.append({"session": session, "frame": w["frame_idx"], "t_ammo_ms": w["t_ammo_ms"],
                         "tensor": tensor, "luma": luma})
@@ -381,13 +343,18 @@ def scan_for_leaks(review_dir: Path) -> list[str]:
         rel = p.relative_to(review_dir).as_posix()
         for m in _LEAK_RE.finditer(rel):
             hits.append(f"{rel}: name:{m.group(1)}")
+        for m in _SESSION_RE.finditer(rel):
+            hits.append(f"{rel}: name:session:{m.group(0)}")
         if not p.is_file():
             continue
         data = p.read_bytes()
         texts = _png_text_chunks(data) if p.suffix.lower() == ".png" else [data]
         for t in texts:
-            for m in _LEAK_RE.finditer(t.decode("utf-8", errors="replace")):
+            txt = t.decode("utf-8", errors="replace")
+            for m in _LEAK_RE.finditer(txt):
                 hits.append(f"{rel}: {m.group(1)}")
+            for m in _SESSION_RE.finditer(txt):
+                hits.append(f"{rel}: session:{m.group(0)}")
     return sorted(set(hits))
 
 
