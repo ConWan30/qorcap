@@ -1285,6 +1285,103 @@ def _summarize_199_window(frame_states: list[str]) -> str:
     return "ABSTAIN"
 
 
+# Bottom-right magazine box read by ``qorcap_cod_post_nov21.read_ammo_counter`` (x0, x1, y0, y1 fractions).
+AMMO_ROI_FRAC = (0.70, 0.92, 0.77, 0.94)
+
+
+def ammo_roi_box(w: int, h: int) -> tuple[int, int, int, int]:
+    fx0, fx1, fy0, fy1 = AMMO_ROI_FRAC
+    return int(fx0 * w), int(fx1 * w), int(fy0 * h), int(fy1 * h)
+
+
+def center_crop_box(w: int, h: int, crop_size: int = CROP_SIZE) -> tuple[int, int, int, int]:
+    half = crop_size // 2
+    cx, cy = w // 2, h // 2
+    return cx - half, cx + half, cy - half, cy + half
+
+
+def assert_center_crop_excludes_ammo_roi(w: int, h: int, crop_size: int = CROP_SIZE) -> None:
+    """Fail closed unless the center crop is a plain slice that never touches the ammo box.
+
+    The ammo corner is an external gate / timing anchor only; its pixels must never reach the tensor.
+    """
+    if w < crop_size or h < crop_size:
+        raise ShadowRunnerError(f"frame {w}x{h} smaller than {crop_size}x{crop_size} center crop")
+    cx0, cx1, cy0, cy1 = center_crop_box(w, h, crop_size)
+    ax0, ax1, ay0, ay1 = ammo_roi_box(w, h)
+    if cx0 < ax1 and ax0 < cx1 and cy0 < ay1 and ay0 < cy1:
+        raise ShadowRunnerError(f"frame {w}x{h}: center crop overlaps the ammo-corner ROI")
+
+
+class AmmoGatedWindowBuilder:
+    """Shared 9-frame window builder behind the external ammo-decrease gate.
+
+    Per frame: ``prepare`` -> (caller's own per-frame reads) -> ``feed`` -> ``gate``.
+    Used by ``run_shadow_on_match`` and the blind label pack builder so both emit the same windows.
+    """
+
+    def __init__(self, frame_pairs: list, r2_spans: list[dict]):
+        self.frame_to_span: dict[int, dict] = {}
+        span_idx = 0
+        for fidx, t_us in frame_pairs:
+            while span_idx < len(r2_spans) and t_us > r2_spans[span_idx]["end_us"]:
+                span_idx += 1
+            if span_idx < len(r2_spans):
+                sp = r2_spans[span_idx]
+                if sp["start_us"] <= t_us <= sp["end_us"]:
+                    self.frame_to_span[fidx] = sp
+        self.t_us_by_frame = {fidx: int(round(t_us)) for fidx, t_us in frame_pairs}
+        self.t0_us = int(round(frame_pairs[0][1])) if frame_pairs else 0
+        self.pending: list[dict] = []
+        self.prev_mag: int | None = None
+        self.last_span_anchor = -1
+        self._checked_sizes: set[tuple[int, int]] = set()
+
+    def prepare(self, frame_idx: int, frame):
+        """Return ``(crop, t_us, t_ammo_ms, span)``; raises if the crop could touch the ammo ROI."""
+        h, w = frame.shape[:2]
+        if (w, h) not in self._checked_sizes:
+            assert_center_crop_excludes_ammo_roi(w, h)
+            self._checked_sizes.add((w, h))
+        x0, x1, y0, y1 = center_crop_box(w, h)
+        crop = frame[y0:y1, x0:x1].copy()
+        t_us = self.t_us_by_frame.get(frame_idx, self.t0_us + frame_idx * 16667)
+        t_ammo_ms = max(0, (t_us - self.t0_us) // 1000)
+        return crop, t_us, t_ammo_ms, self.frame_to_span.get(frame_idx)
+
+    def feed(self, crop) -> list[dict]:
+        """Append ``crop`` to every pending window; return the windows that reached 9 frames."""
+        done, still = [], []
+        for p in self.pending:
+            p["crops"].append(crop)
+            (done if len(p["crops"]) == WINDOW_FRAMES else still).append(p)
+        self.pending = still
+        return done
+
+    def gate(self, frame_idx: int, t_ammo_ms: int, span: dict | None, mag: int | None, crop):
+        """Apply the ammo-decrease gate. Returns ``("anchor", window)``, ``("equipment", None)`` or ``(None, None)``."""
+        result = (None, None)
+        prev = self.prev_mag
+        if mag is not None and prev is not None and 0 < (prev - mag) <= MAX_AMMO_DROP_PER_STEP:
+            if span is not None and frame_idx != self.last_span_anchor:
+                self.last_span_anchor = frame_idx
+                if span["equipment_excluded"]:
+                    result = ("equipment", None)
+                else:
+                    win = {
+                        "frame_idx": frame_idx,
+                        "t_ammo_ms": t_ammo_ms,
+                        "ads_active": span["ads_active"],
+                        "fire_mode": span["fire_mode"],
+                        "crops": [crop],
+                    }
+                    self.pending.append(win)
+                    result = ("anchor", win)
+        if mag is not None:
+            self.prev_mag = mag
+        return result
+
+
 def run_shadow_on_match(
     match_dir: Path,
     *,
@@ -1363,20 +1460,7 @@ def run_shadow_on_match(
     if not video_path.is_file():
         raise ShadowRunnerError(f"missing {FRAME_FILE} in {match_dir}")
 
-    # Map each frame_idx -> matching R2 span (or None)
-    r2_spans = inputs_info["r2_spans"]
-    frame_to_span: dict[int, dict] = {}
-    span_idx = 0
-    for fidx, t_us in frame_pairs:
-        while span_idx < len(r2_spans) and t_us > r2_spans[span_idx]["end_us"]:
-            span_idx += 1
-        if span_idx < len(r2_spans):
-            sp = r2_spans[span_idx]
-            if sp["start_us"] <= t_us <= sp["end_us"]:
-                frame_to_span[fidx] = sp
-
-    t_us_by_frame = {fidx: int(round(t_us)) for fidx, t_us in frame_pairs}
-    t0_us = int(round(frame_pairs[0][1])) if frame_pairs else 0
+    windows = AmmoGatedWindowBuilder(frame_pairs, inputs_info["r2_spans"])
     killfeed_tag = _load_match_killfeed_tag(match_dir)
 
     cap = cv2.VideoCapture(str(video_path))
@@ -1388,11 +1472,8 @@ def run_shadow_on_match(
     window_assets: dict[str, tuple] = {}
     jsonl_records: list[tuple[int, str]] = []
 
-    pending: list[dict] = []  # collecting 9-frame crops [t_ammo..t_ammo+8]
     open_corrob: list[dict] = []  # awaiting XP/killfeed corroboration until t_ammo_ms + corroboration_window_ms
     ring_crops: collections.deque = collections.deque(maxlen=WINDOW_FRAMES)
-    prev_mag: int | None = None
-    last_span_anchor: int = -1
     last_corrob_sample_ms: int | None = None
     created_at = _utc_now_iso()
 
@@ -1461,19 +1542,9 @@ def run_shadow_on_match(
                 frame_idx += 1
                 continue
 
-            h, w = frame.shape[:2]
-            half = CROP_SIZE // 2
-            cy, cx = h // 2, w // 2
-            if h >= CROP_SIZE and w >= CROP_SIZE:
-                crop = frame[cy - half : cy + half, cx - half : cx + half].copy()
-            else:
-                crop = cv2.resize(frame, (CROP_SIZE, CROP_SIZE))
+            crop, t_us, t_ammo_ms, span = windows.prepare(frame_idx, frame)
             ring_crops.append(crop)
 
-            t_us = t_us_by_frame.get(frame_idx, t0_us + frame_idx * 16667)
-            t_ammo_ms = max(0, (t_us - t0_us) // 1000)
-
-            span = frame_to_span.get(frame_idx)
             cbt_res = cbt.step(frame, t_us=t_us)
             state_199 = cbt_res.get("state", "ABSTAIN")
 
@@ -1485,7 +1556,7 @@ def run_shadow_on_match(
                 last_corrob_sample_ms is None
                 or (t_ammo_ms - last_corrob_sample_ms) >= corrob_sample_interval_ms
             )
-            if (pending or open_corrob) and due_for_sample:
+            if (windows.pending or open_corrob) and due_for_sample:
                 last_corrob_sample_ms = t_ammo_ms
                 xp_res = read_kill_xp_popup(frame)
                 xp_hit = xp_res.get("state") == "XP_POPUP"
@@ -1507,63 +1578,47 @@ def run_shadow_on_match(
                     _finalize_corrob_event(oc)
             open_corrob = still_open
 
-            still_pending = []
-            for p in pending:
-                p["crops"].append(crop)
+            for p in windows.pending:
                 p["states_199"].append(state_199)
                 p["xp_corrob"] = p["xp_corrob"] or xp_hit
                 p["kf_corrob"] = p["kf_corrob"] or kf_hit
-                if len(p["crops"]) == WINDOW_FRAMES:
-                    open_corrob.append(_run_window_onnx(p))
-                else:
-                    still_pending.append(p)
-            pending = still_pending
+            for p in windows.feed(crop):
+                open_corrob.append(_run_window_onnx(p))
 
             # B1: External deterministic multi-round ammo decrement gate (1..5 rounds per frame step)
             ammo_res = read_ammo_counter(frame)
             mag = ammo_res.get("mag") if ammo_res.get("ok") else None
-            if mag is not None and prev_mag is not None and 0 < (prev_mag - mag) <= MAX_AMMO_DROP_PER_STEP:
-                if span is not None and frame_idx != last_span_anchor:
-                    last_span_anchor = frame_idx
-                    if span["equipment_excluded"]:
-                        # Explicit L1/R1 exclusion fence: log exclusion, skip ONNX inference
-                        ev = {
-                            "event_id": f"{session_id}_f{frame_idx:06d}",
-                            "session_id": session_id,
-                            "dataset_split": split,
-                            "frame_idx": frame_idx,
-                            "t_ammo_ms": t_ammo_ms,
-                            "model_id": model_id,
-                            "model_sha256": model_sha256,
-                            "ads_active": 1 if span["ads_active"] else 0,
-                            "fire_mode": span["fire_mode"],
-                            "equipment_window_excluded": 1,
-                            "ammo_gate_passed": 1,
-                            "reader_199_verdict": state_199,
-                            "mnv4_verdict": "ABSTAIN",
-                            "confidence_bps": 0,
-                            "xp_popup_corroborated": 1 if xp_hit else 0,
-                            "killfeed_corroborated": 1 if kf_hit else 0,
-                            "audio_peak_ms": None,
-                            "triage_reason": "EQUIPMENT_EXCLUDED",
-                            "human_label": None,
-                            "human_labeled_at_utc": None,
-                            "created_at_utc": created_at,
-                        }
-                        events.append(ev)
-                    else:
-                        pending.append({
-                            "frame_idx": frame_idx,
-                            "t_ammo_ms": t_ammo_ms,
-                            "ads_active": span["ads_active"],
-                            "fire_mode": span["fire_mode"],
-                            "crops": [crop],
-                            "states_199": [state_199],
-                            "xp_corrob": xp_hit,
-                            "kf_corrob": kf_hit,
-                        })
-            if mag is not None:
-                prev_mag = mag
+            gate_state, win = windows.gate(frame_idx, t_ammo_ms, span, mag, crop)
+            if gate_state == "equipment":
+                # Explicit L1/R1 exclusion fence: log exclusion, skip ONNX inference
+                ev = {
+                    "event_id": f"{session_id}_f{frame_idx:06d}",
+                    "session_id": session_id,
+                    "dataset_split": split,
+                    "frame_idx": frame_idx,
+                    "t_ammo_ms": t_ammo_ms,
+                    "model_id": model_id,
+                    "model_sha256": model_sha256,
+                    "ads_active": 1 if span["ads_active"] else 0,
+                    "fire_mode": span["fire_mode"],
+                    "equipment_window_excluded": 1,
+                    "ammo_gate_passed": 1,
+                    "reader_199_verdict": state_199,
+                    "mnv4_verdict": "ABSTAIN",
+                    "confidence_bps": 0,
+                    "xp_popup_corroborated": 1 if xp_hit else 0,
+                    "killfeed_corroborated": 1 if kf_hit else 0,
+                    "audio_peak_ms": None,
+                    "triage_reason": "EQUIPMENT_EXCLUDED",
+                    "human_label": None,
+                    "human_labeled_at_utc": None,
+                    "created_at_utc": created_at,
+                }
+                events.append(ev)
+            elif gate_state == "anchor":
+                win["states_199"] = [state_199]
+                win["xp_corrob"] = xp_hit
+                win["kf_corrob"] = kf_hit
 
             del frame
             frame_idx += 1
