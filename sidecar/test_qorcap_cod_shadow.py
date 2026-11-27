@@ -923,7 +923,7 @@ def test_n4_b1_unknown_model_without_calibration_fails_closed_and_n2_n3(tmp_path
         )
 
     msgs: list[str] = []
-    ran = qorcap_match.maybe_run_cod_mnv4_shadow(
+    ran = shadow.maybe_run_cod_mnv4_shadow(
         match_dir,
         "cod",
         environ={
@@ -937,6 +937,17 @@ def test_n4_b1_unknown_model_without_calibration_fails_closed_and_n2_n3(tmp_path
     )
     assert ran is False
     assert any("calibration required" in m for m in msgs)
+    assert qorcap_match.maybe_run_cod_mnv4_shadow(
+        match_dir,
+        "cod",
+        environ={
+            "QORCAP_LANE": "practice",
+            "QORCAP_SHADOW_MNV4_MODEL": str(unknown_onnx),
+            "QORCAP_SHADOW_SPLIT": "train_pool",
+        },
+        out_root=tmp_path / "out_hook_bad",
+        db_path=tmp_path / "hook_bad.sqlite",
+    ) is False
 
     # N3: unbound metrics JSON without onnx_sha256 rejected when bound against a real model SHA
     unbound_metrics = tmp_path / "unbound_metrics.json"
@@ -960,7 +971,7 @@ def test_n4_b1_unknown_model_without_calibration_fails_closed_and_n2_n3(tmp_path
         encoding="utf-8",
     )
     warn_msgs: list[str] = []
-    ran_ovr = qorcap_match.maybe_run_cod_mnv4_shadow(
+    ran_ovr = shadow.maybe_run_cod_mnv4_shadow(
         match_dir,
         "cod",
         environ={
