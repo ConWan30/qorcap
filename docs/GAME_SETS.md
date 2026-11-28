@@ -62,6 +62,15 @@ The final uses a different read: Qortrola30's row on the end scoreboard (also ma
 
 These tags are not written onto input rows. Input rows stay in the checkpoint hash, and this set does not change them.
 
+### Post-match shadow runner and blind label pack (practice lane, info-only)
+
+Two opt-in, post-match practice tools sit outside the match folder and never alter `receipt.v0`, `bundle.json`, locks, or #199 verdicts:
+
+- `sidecar/qorcap_cod_shadow.py` (default OFF) runs CPU ONNX shadow scoring with configurable calibration (`--metrics` / `QORCAP_SHADOW_MNV4_METRICS`, env vars, or CLI overrides; non-v2 ONNX SHAs fail closed without explicit calibration; [#203](https://github.com/ConWan30/qorcap/pull/203)).
+- `sidecar/qorcap_cod_blind_pack.py` builds a model-free, leak-scanned blind H/N/S label pack and loopback review server (`127.0.0.1:8780`) sharing `AmmoGatedWindowBuilder` and the fail-closed center-crop / ammo-ROI isolation guard ([#204](https://github.com/ConWan30/qorcap/pull/204)).
+
+See [docs/COD_SHADOW_AND_BLIND_PACK.md](COD_SHADOW_AND_BLIND_PACK.md) for the pipeline diagram, calibration rules, environment variables, output layout, and CLI usage.
+
 ### Receipt
 
 Agreement across the signals above is a checkable record of the match. Disagreement is flagged a mismatch, or the signal is not Counted. The recorder does not stamp a hosted verification on its own. A local signature stays on the path Start Match already uses.
