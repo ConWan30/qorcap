@@ -51,7 +51,7 @@ PR #203 replaced hard-coded legacy v2 calibration with configurable calibration 
 - **Metrics JSON binding (`load_model_calibration`):** Reads `temperature`, `tau_low_bps` / `tau_high_bps` (or falls back to `calibrated_gate.tau_low` / `calibrated_gate.tau_high`, rounded to integer basis points), and optional `model_id`. When checked against a real ONNX file, `onnx_sha256` (64 hex chars) is required and must match the model file's SHA-256.
 - **Bounds (`validate_calibration`):** `temperature` must be a finite number `> 0`; `tau_low_bps` and `tau_high_bps` must be integers with `0 <= tau_low_bps < tau_high_bps <= 10000`.
 - **Override warning:** When `maybe_run_cod_mnv4_shadow` runs with both a metrics JSON and an env/explicit override, it prints a warning with the effective `calibration_source`, `temperature_milli`, and `tau` bounds.
-- **No floats in canonical output:** Canonical `qor.shadow_hit.v0` JCS records reject floats (`assert_no_floats`); `review_manifest.json` records `temperature_milli` (integer `round(temperature * 1000)`), `tau_low_bps`, `tau_high_bps`, `calibration_source`, and `metrics_path`.
+- **No floats in canonical output:** Canonical `qor.shadow_hit.v0` JCS records reject floats (`assert_no_floats`); `practice_reviews/<session_id>/manifest.json` records `temperature_milli` (integer `round(temperature * 1000)`), `tau_low_bps`, `tau_high_bps`, `calibration_source`, and `metrics_path`.
 
 ### Shadow runner environment variables
 
